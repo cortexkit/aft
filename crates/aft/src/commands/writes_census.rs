@@ -84,5 +84,10 @@ mod tests {
         assert!(response.success, "{}", response.data);
         assert_eq!(response.data["writers"][0]["domain"], "logs");
         assert_eq!(response.data["writers"][0]["logical_bytes"], 17);
+        assert!(response.data["attributed_physical_bytes"].is_u64());
+        assert!(response.data["unmeasurable"].is_array());
+        assert!(response.data["unmeasurable_physical_bytes_estimate"].is_u64());
+        assert!(response.data.get("unexplained_physical_bytes").is_some());
+        assert!(response.data.get("unattributed_physical_bytes").is_none());
     }
 }

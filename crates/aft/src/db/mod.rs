@@ -28,7 +28,23 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+
+const MIGRATION_V12: &str = r#"
+CREATE TABLE IF NOT EXISTS write_ledger_unmeasurable_minutes (
+  minute_ts INTEGER NOT NULL,
+  root_id TEXT NOT NULL,
+  seam TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  estimate_basis TEXT,
+  observations INTEGER NOT NULL,
+  estimated_physical_bytes INTEGER NOT NULL,
+  estimate_available INTEGER NOT NULL,
+  PRIMARY KEY (minute_ts, root_id, seam)
+);
+CREATE INDEX IF NOT EXISTS idx_write_ledger_unmeasurable_window
+  ON write_ledger_unmeasurable_minutes (minute_ts);
+"#;
 
 const MIGRATION_V11: &str = r#"
 CREATE TABLE IF NOT EXISTS write_ledger_minutes (
@@ -530,6 +546,15 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
                 |row| row.get::<_, u32>(0),
             )
             .map(|object_count| object_count == 4),
+        12 => conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE (type = 'table' AND name = 'write_ledger_unmeasurable_minutes')
+                    OR (type = 'index' AND name = 'idx_write_ledger_unmeasurable_window')",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .map(|object_count| object_count == 2),
         _ => Ok(false),
     }
 }
@@ -547,6 +572,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         9 => conn.execute_batch(MIGRATION_V9),
         10 => conn.execute_batch(MIGRATION_V10),
         11 => conn.execute_batch(MIGRATION_V11),
+        12 => conn.execute_batch(MIGRATION_V12),
         _ => Ok(()),
     }
 }
@@ -580,6 +606,10 @@ mod tests {
         "host_state",
         "standing_roots",
         "standing_root_freshness",
+        "write_ledger_minutes",
+        "write_ledger_process_minutes",
+        "write_ledger_meta",
+        "write_ledger_unmeasurable_minutes",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[
@@ -601,6 +631,8 @@ mod tests {
         "idx_backups_session_order",
         "idx_backups_session_path_order",
         "idx_standing_root_freshness_needs_verify",
+        "idx_write_ledger_minutes_window",
+        "idx_write_ledger_unmeasurable_window",
     ];
 
     #[test]

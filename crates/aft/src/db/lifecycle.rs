@@ -18,10 +18,14 @@ use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 
-const CLOSE_CHECKPOINT_RESIDUAL: &str =
-    "db::TrackedConnection::drop: close-time WAL checkpoint bytes remain uncredited because measuring them would reopen a live SQLite file set";
-const AMBIGUOUS_WAL_RESTART_RESIDUAL: &str =
-    "db::tracked_wal_hook: WAL restart credit remains conservative when commit frame counts cannot distinguish a restart from append growth";
+const CLOSE_CHECKPOINT_SEAM: &str = "db::TrackedConnection::drop";
+const CLOSE_CHECKPOINT_REASON: &str =
+    "the close-time checkpoint result is unavailable without reopening the live SQLite file set, which would release this process's POSIX locks";
+const CLOSE_CHECKPOINT_ESTIMATE_BASIS: &str =
+    "upper-bound estimate from outstanding WAL frames observed by the existing hook times the database page size; repeated database pages can make the actual backfill smaller";
+const AMBIGUOUS_WAL_RESTART_SEAM: &str = "db::tracked_wal_hook";
+const AMBIGUOUS_WAL_RESTART_REASON: &str =
+    "commit frame counts cannot distinguish append growth from a restarted WAL that grew past the prior generation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalCheckpointMode {
@@ -121,23 +125,118 @@ pub struct SqliteConnectionSnapshot {
     pub uninstrumented_openers: Vec<String>,
 }
 
-/// Production `rusqlite::Connection::open*` call sites that intentionally do
-/// not pass through [`TrackedConnection`]. Read-only probes are listed because
-/// they retain SQLite's built-in WAL policy; write-capable seams name the
-/// accounting mechanism or residual explicitly. These seams have identity-only
-/// RAII records in `file_identity`; this list concerns WAL/health accounting,
-/// not the database replacement detector.
-pub const SQLITE_UNINSTRUMENTED_OPENERS: &[&str] = &[
-    "alias::AliasStore::open: WAL writer retains SQLite's built-in autocheckpoint and remains a named residual",
-    "alias::ManifestSqliteStore::open: rollback-journal bytes remain a named residual",
-    "gc::sweep_plane: WAL blob-store writer retains SQLite's built-in autocheckpoint and remains a named residual",
-    "views::assembly::assemble: derived WAL keeper; durability and checkpointing stay inside SQLite's VFS",
-    "views::generation::checkpoint_derived: raw WAL connection; FULL checkpoint bytes remain a named residual because TRUNCATE returns no prior backfill count",
-    "views::materialization::materialize: raw WAL connection; publication phase process-I/O attribution",
-    "views::ViewStore::open_pointer_connection: raw WAL connection; publication phase process-I/O attribution",
-    "path_status::PathStatusStore::open_at: rollback-journal bytes remain a named residual",
-    "commands::semantic_search::view_semantic_search: read-only WAL opener retains SQLite's built-in policy",
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UninstrumentedOpenerClass {
+    Unmeasurable,
+    AttributedElsewhere,
+    NoWrites,
+}
+
+impl UninstrumentedOpenerClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unmeasurable => "unmeasurable",
+            Self::AttributedElsewhere => "attributed_elsewhere",
+            Self::NoWrites => "no_writes",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SqliteUninstrumentedOpener {
+    pub seam: &'static str,
+    pub class: UninstrumentedOpenerClass,
+    pub reason: &'static str,
+}
+
+/// Production raw SQLite openers, classified from the operations at each site.
+/// They still register connection identity so replacement protection sees their
+/// lock lifetimes, but they do not install WAL byte-attribution hooks. The class
+/// says whether each opener can produce unmeasurable write bytes.
+pub const SQLITE_UNINSTRUMENTED_OPENERS: &[SqliteUninstrumentedOpener] = &[
+    SqliteUninstrumentedOpener {
+        seam: "alias::AliasStore::open",
+        class: UninstrumentedOpenerClass::Unmeasurable,
+        reason: "the raw WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "alias::ManifestSqliteStore::open",
+        class: UninstrumentedOpenerClass::Unmeasurable,
+        reason: "the raw rollback-journal connection exposes no pager byte counter",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "gc::sweep_plane",
+        class: UninstrumentedOpenerClass::Unmeasurable,
+        reason: "the raw blob-store WAL writer uses SQLite's built-in autocheckpoint and installs no attribution hook",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::assembly::assemble",
+        class: UninstrumentedOpenerClass::NoWrites,
+        reason: "the connection only keeps the derived WAL alive and reads sqlite_schema; checkpointing is classified at checkpoint_derived",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::generation::clone_derived source",
+        class: UninstrumentedOpenerClass::NoWrites,
+        reason: "the SQLite backup source is read-only at this seam",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::generation::clone_derived destination",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the enclosing publication clone phase credits its process-I/O delta to views_derived",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::generation::checkpoint_derived",
+        class: UninstrumentedOpenerClass::Unmeasurable,
+        reason: "a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::materialization::materialize",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the enclosing publication materialize phase credits its process-I/O delta to views_derived",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::materialization::blob_reader",
+        class: UninstrumentedOpenerClass::NoWrites,
+        reason: "the materializer uses this connection only to read immutable blob payloads",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::ViewStore::open_pointer_connection",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the enclosing publication closure phase credits the pointer transaction's process-I/O delta to views_closure",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::sync_database_with_passive_checkpoint",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::checkpoint_and_sync_database",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the enclosing publication closure phase credits the durability checkpoint's process-I/O delta to views_closure",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "views::checkpoint_pointer_after_cas",
+        class: UninstrumentedOpenerClass::AttributedElsewhere,
+        reason: "the publication profile remains in its closure phase until the pointer checkpoint completes",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "path_status::PathStatusStore::open_at",
+        class: UninstrumentedOpenerClass::Unmeasurable,
+        reason: "the raw rollback-journal connection exposes no pager byte counter",
+    },
+    SqliteUninstrumentedOpener {
+        seam: "commands::semantic_search::view_semantic_search",
+        class: UninstrumentedOpenerClass::NoWrites,
+        reason: "the connection is opened read-only and executes only search queries",
+    },
 ];
+
+pub(crate) fn uninstrumented_opener(seam: &str) -> Option<SqliteUninstrumentedOpener> {
+    SQLITE_UNINSTRUMENTED_OPENERS
+        .iter()
+        .copied()
+        .find(|opener| opener.seam == seam)
+}
 
 fn live_counts() -> &'static Mutex<BTreeMap<SqliteStore, u64>> {
     static COUNTS: OnceLock<Mutex<BTreeMap<SqliteStore, u64>>> = OnceLock::new();
@@ -213,7 +312,14 @@ pub fn connection_snapshot() -> SqliteConnectionSnapshot {
         open_by_store,
         uninstrumented_openers: SQLITE_UNINSTRUMENTED_OPENERS
             .iter()
-            .map(|opener| (*opener).to_string())
+            .map(|opener| {
+                format!(
+                    "{}: {} ({})",
+                    opener.seam,
+                    opener.reason,
+                    opener.class.as_str()
+                )
+            })
             .collect(),
     }
 }
@@ -289,14 +395,23 @@ impl WalHookState {
         self.restart_possible.store(false, Ordering::Relaxed);
     }
 
-    fn note_residuals_before_close(&self) {
-        if self.outstanding_frames() > 0 {
-            self.residual_counter
-                .note_seam_label(CLOSE_CHECKPOINT_RESIDUAL);
+    fn note_residuals_before_close(&self, is_last_file_handle: bool) {
+        let outstanding_frames = self.outstanding_frames();
+        if is_last_file_handle && outstanding_frames > 0 {
+            self.residual_counter.note_unmeasurable(
+                CLOSE_CHECKPOINT_SEAM,
+                CLOSE_CHECKPOINT_REASON,
+                Some(self.bytes_for_frames(outstanding_frames)),
+                Some(CLOSE_CHECKPOINT_ESTIMATE_BASIS),
+            );
         }
         if self.generation_credit_ambiguous.load(Ordering::Relaxed) {
-            self.residual_counter
-                .note_seam_label(AMBIGUOUS_WAL_RESTART_RESIDUAL);
+            self.residual_counter.note_unmeasurable(
+                AMBIGUOUS_WAL_RESTART_SEAM,
+                AMBIGUOUS_WAL_RESTART_REASON,
+                None,
+                None,
+            );
         }
     }
 
@@ -607,7 +722,12 @@ impl Drop for TrackedConnection {
         // connection API that reports its result afterward. Reopening any member
         // of the file set to infer it would release this process's advisory locks,
         // so those bytes intentionally remain in the ledger's residual.
-        self.wal_hook.note_residuals_before_close();
+        let is_last_file_handle = self
+            .file_identity_key
+            .as_deref()
+            .is_some_and(|key| crate::db::file_identity::registered_connections_for_key(key) == 1);
+        self.wal_hook
+            .note_residuals_before_close(is_last_file_handle);
         // Drop the SQLite handle before decrementing so the counter never says
         // closed while rusqlite still owns the descriptor and page cache.
         drop(self.connection.take());
@@ -993,10 +1113,21 @@ mod tests {
             main_growth > 0 && main_growth % page_size == 0,
             "fixture did not make the close checkpoint write the main file: {main_growth}"
         );
+        let unmeasurable = crate::write_ledger::unmeasurable_for_test(&root);
+        let close = unmeasurable
+            .iter()
+            .find(|entry| entry.seam == CLOSE_CHECKPOINT_SEAM)
+            .expect("close-time checkpoint must be classified as unmeasurable");
+        let estimate = close
+            .estimated_physical_bytes
+            .expect("close-time WAL frames provide an estimate");
         assert!(
-            crate::write_ledger::seam_labels_for_test(WriteDomain::Other, &root)
-                .iter()
-                .any(|label| label == CLOSE_CHECKPOINT_RESIDUAL)
+            estimate >= main_growth && estimate - main_growth <= page_size,
+            "frame estimate {estimate} should bound main-file growth {main_growth} within one page"
+        );
+        assert_eq!(
+            close.estimate_basis.as_deref(),
+            Some(CLOSE_CHECKPOINT_ESTIMATE_BASIS)
         );
 
         let standalone = dir.path().join("standalone.sqlite");
@@ -1013,7 +1144,7 @@ mod tests {
     /// tracked one pins that: both have to reach the close having checkpointed
     /// the same number of times and leave the same main file behind.
     #[test]
-    fn leaving_close_checkpoint_bytes_unattributed_does_not_add_a_checkpoint() {
+    fn classifying_close_checkpoint_bytes_as_unmeasurable_does_not_add_a_checkpoint() {
         const THRESHOLD: i64 = 8;
         let dir = tempfile::tempdir().unwrap();
 
@@ -1144,11 +1275,10 @@ mod tests {
             credited < backfilled_frames * page_size,
             "the ambiguous restarted frames must remain uncredited"
         );
-        assert!(
-            crate::write_ledger::seam_labels_for_test(WriteDomain::Other, &root)
-                .iter()
-                .any(|label| label == AMBIGUOUS_WAL_RESTART_RESIDUAL)
-        );
+        assert!(crate::write_ledger::unmeasurable_for_test(&root)
+            .iter()
+            .any(|entry| entry.seam == AMBIGUOUS_WAL_RESTART_SEAM
+                && entry.reason == AMBIGUOUS_WAL_RESTART_REASON));
     }
 
     #[test]
@@ -1175,14 +1305,75 @@ mod tests {
     }
 
     #[test]
-    fn every_uninstrumented_production_opener_is_documented() {
-        assert!(SQLITE_UNINSTRUMENTED_OPENERS.iter().any(|opener| {
-            opener.contains("path_status::PathStatusStore::open_at")
-                && opener.contains("rollback-journal")
-        }));
-        assert!(SQLITE_UNINSTRUMENTED_OPENERS.iter().any(|opener| {
-            opener.contains("views::generation::checkpoint_derived")
-                && opener.contains("named residual")
-        }));
+    fn every_uninstrumented_production_opener_is_classified() {
+        let classified = SQLITE_UNINSTRUMENTED_OPENERS
+            .iter()
+            .map(|opener| (opener.seam, opener.class))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classified,
+            vec![
+                (
+                    "alias::AliasStore::open",
+                    UninstrumentedOpenerClass::Unmeasurable
+                ),
+                (
+                    "alias::ManifestSqliteStore::open",
+                    UninstrumentedOpenerClass::Unmeasurable
+                ),
+                ("gc::sweep_plane", UninstrumentedOpenerClass::Unmeasurable),
+                (
+                    "views::assembly::assemble",
+                    UninstrumentedOpenerClass::NoWrites
+                ),
+                (
+                    "views::generation::clone_derived source",
+                    UninstrumentedOpenerClass::NoWrites
+                ),
+                (
+                    "views::generation::clone_derived destination",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "views::generation::checkpoint_derived",
+                    UninstrumentedOpenerClass::Unmeasurable
+                ),
+                (
+                    "views::materialization::materialize",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "views::materialization::blob_reader",
+                    UninstrumentedOpenerClass::NoWrites
+                ),
+                (
+                    "views::ViewStore::open_pointer_connection",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "views::sync_database_with_passive_checkpoint",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "views::checkpoint_and_sync_database",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "views::checkpoint_pointer_after_cas",
+                    UninstrumentedOpenerClass::AttributedElsewhere
+                ),
+                (
+                    "path_status::PathStatusStore::open_at",
+                    UninstrumentedOpenerClass::Unmeasurable
+                ),
+                (
+                    "commands::semantic_search::view_semantic_search",
+                    UninstrumentedOpenerClass::NoWrites
+                ),
+            ]
+        );
+        assert!(SQLITE_UNINSTRUMENTED_OPENERS
+            .iter()
+            .all(|opener| !opener.reason.is_empty()));
     }
 }

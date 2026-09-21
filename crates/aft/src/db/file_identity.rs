@@ -284,6 +284,16 @@ impl IdentityConnection {
 
     pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
         let record = OpenRecord::new(&connection, SqliteStore::Unmapped(seam));
+        if let Some(opener) = crate::db::lifecycle::uninstrumented_opener(seam) {
+            if opener.class == crate::db::lifecycle::UninstrumentedOpenerClass::Unmeasurable {
+                crate::write_ledger::note_process_unmeasurable(
+                    opener.seam,
+                    opener.reason,
+                    None,
+                    None,
+                );
+            }
+        }
         Self {
             connection,
             _record: record,
@@ -373,6 +383,14 @@ fn replacement_hazard(key: &Path, entry: &OpenDatabase, opener: &Opener) -> Opti
 /// Number of registered connections at `path` or at another name for its inode.
 /// Hold [`filesystem_guard`] across this query and any file-set mutation so an
 /// opener cannot appear between checking the registry and changing the files.
+pub(crate) fn registered_connections_for_key(key: &Path) -> usize {
+    open_databases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .map_or(0, |entry| entry.openers.len())
+}
+
 pub fn open_connections(path: &Path) -> usize {
     let key = registry_key(path);
     let identity = identity_of(&key);

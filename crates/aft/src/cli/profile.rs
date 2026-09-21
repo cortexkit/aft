@@ -555,7 +555,58 @@ fn subtract_write_census(
             .zip(before["process"][field].as_u64())
             .map(|(after, before)| after.saturating_sub(before))
     };
+    let keyed_unmeasurable = |value: &serde_json::Value| {
+        value
+            .get("unmeasurable")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                Some((
+                    (
+                        row.get("root_id")?.as_str()?.to_owned(),
+                        row.get("seam")?.as_str()?.to_owned(),
+                    ),
+                    row.clone(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before_unmeasurable = keyed_unmeasurable(before);
+    let unmeasurable = keyed_unmeasurable(after)
+        .into_iter()
+        .filter_map(|((root_id, seam), row)| {
+            let previous = before_unmeasurable.get(&(root_id.clone(), seam.clone()));
+            let observations = row["observations"].as_u64().unwrap_or(0).saturating_sub(
+                previous
+                    .and_then(|value| value["observations"].as_u64())
+                    .unwrap_or(0),
+            );
+            if observations == 0 {
+                return None;
+            }
+            let estimated_physical_bytes = row["estimated_physical_bytes"].as_u64().map(|bytes| {
+                bytes.saturating_sub(
+                    previous
+                        .and_then(|value| value["estimated_physical_bytes"].as_u64())
+                        .unwrap_or(0),
+                )
+            });
+            Some(serde_json::json!({
+                "root_id": root_id,
+                "seam": seam,
+                "reason": row["reason"],
+                "observations": observations,
+                "estimated_physical_bytes": estimated_physical_bytes,
+                "estimate_basis": row["estimate_basis"],
+            }))
+        })
+        .collect::<Vec<_>>();
+    let unmeasurable_estimate = unmeasurable.iter().fold(0_u64, |total, row| {
+        total.saturating_add(row["estimated_physical_bytes"].as_u64().unwrap_or(0))
+    });
     let process_physical = delta_field("physical_bytes");
+    let classified = attributed.saturating_add(unmeasurable_estimate);
     serde_json::json!({
         "since_ms": after["until_ms"].as_u64().unwrap_or(0).saturating_sub(elapsed_ms),
         "until_ms": after["until_ms"],
@@ -567,8 +618,10 @@ fn subtract_write_census(
             "physical_bytes": process_physical,
         },
         "attributed_physical_bytes": attributed,
-        "unattributed_physical_bytes": process_physical.map(|physical| {
-            let difference = i128::from(physical) - i128::from(attributed);
+        "unmeasurable": unmeasurable,
+        "unmeasurable_physical_bytes_estimate": unmeasurable_estimate,
+        "unexplained_physical_bytes": process_physical.map(|physical| {
+            let difference = i128::from(physical) - i128::from(classified);
             difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         }),
         "coverage": after["coverage"],
@@ -618,19 +671,52 @@ pub fn render_writes_census_human(value: &serde_json::Value) -> String {
             }
         }
     }
-    let physical = process_physical
-        .map(human_bytes)
-        .unwrap_or_else(|| "unavailable".to_owned());
-    let logical = value["process"]["logical_bytes"]
+    let attributed = value["attributed_physical_bytes"]
         .as_u64()
         .map(human_bytes)
         .unwrap_or_else(|| "unavailable".to_owned());
-    let unattributed = value["unattributed_physical_bytes"]
+    let unmeasurable_estimate = value["unmeasurable_physical_bytes_estimate"]
+        .as_u64()
+        .map(human_bytes)
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let unexplained = value["unexplained_physical_bytes"]
         .as_i64()
         .map(human_bytes_signed)
         .unwrap_or_else(|| "unavailable".to_owned());
-    let _ = writeln!(output, "process: physical={physical} logical={logical}");
-    let _ = writeln!(output, "unattributed physical: {unattributed}");
+    let unmeasurable = value
+        .get("unmeasurable")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let without_estimate = unmeasurable
+        .iter()
+        .filter(|row| row["estimated_physical_bytes"].as_u64().is_none())
+        .count();
+    let _ = writeln!(output, "attributed physical: {attributed}");
+    let suffix = if without_estimate == 0 {
+        String::new()
+    } else {
+        format!("; {without_estimate} seam(s) have no byte estimate")
+    };
+    let _ = writeln!(
+        output,
+        "unmeasurable physical (estimate): {unmeasurable_estimate}{suffix}"
+    );
+    for row in unmeasurable {
+        let seam = row["seam"].as_str().unwrap_or("unknown");
+        let root = row["root_id"].as_str().unwrap_or("unknown");
+        let reason = row["reason"].as_str().unwrap_or("reason unavailable");
+        let estimate = row["estimated_physical_bytes"]
+            .as_u64()
+            .map(|bytes| format!("; estimate={}", human_bytes(bytes)))
+            .unwrap_or_default();
+        let basis = row["estimate_basis"]
+            .as_str()
+            .map(|basis| format!(" ({basis})"))
+            .unwrap_or_default();
+        let _ = writeln!(output, "  - {seam} [{root}]: {reason}{estimate}{basis}");
+    }
+    let _ = writeln!(output, "unexplained physical: {unexplained}");
     if value["coverage"]["complete"].as_bool() == Some(false) {
         let _ = writeln!(
             output,
@@ -2197,7 +2283,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_profile_args_and_renderer_keep_filters_gap_and_unattributed() {
+    fn writes_profile_args_and_renderer_keep_filters_gap_and_residual_split() {
         let parsed = ProfileArgs::parse(vec![
             OsString::from("--writes"),
             OsString::from("--since"),
@@ -2221,14 +2307,67 @@ mod tests {
                 "physical_bytes": 1024,
                 "seam_labels": []
             }],
-            "process": {"available": true, "logical_bytes": 8192, "physical_bytes": 2048},
-            "unattributed_physical_bytes": 1024,
+            "process": {"available": true, "logical_bytes": 8192, "physical_bytes": 4096},
+            "attributed_physical_bytes": 1024,
+            "unmeasurable": [{
+                "root_id": "/repo",
+                "seam": "db::TrackedConnection::drop",
+                "reason": "reopening the live SQLite file set would release POSIX locks",
+                "observations": 1,
+                "estimated_physical_bytes": 2048,
+                "estimate_basis": "outstanding WAL frames times page size"
+            }],
+            "unmeasurable_physical_bytes_estimate": 2048,
+            "unexplained_physical_bytes": 1024,
             "coverage": {"complete": false, "gap_ms": 3000}
         }));
         assert!(rendered.contains("semantic_delta"));
-        assert!(rendered.contains("50.0%"));
-        assert!(rendered.contains("unattributed physical: 1.00 KiB"));
+        assert!(rendered.contains("25.0%"));
+        assert!(rendered.contains("attributed physical: 1.00 KiB"));
+        assert!(rendered.contains("unmeasurable physical (estimate): 2.00 KiB"));
+        assert!(rendered.contains("db::TrackedConnection::drop"));
+        assert!(rendered.contains("unexplained physical: 1.00 KiB"));
         assert!(rendered.contains("coverage gap"));
+    }
+
+    #[test]
+    fn live_write_profile_subtracts_the_unmeasurable_estimate_from_unexplained() {
+        let census = |until_ms, physical, attributed, observations, estimate| {
+            serde_json::json!({
+                "since_ms": 0,
+                "until_ms": until_ms,
+                "root": null,
+                "writers": [{
+                    "domain": "callgraph_refresh",
+                    "root_id": "/repo",
+                    "logical_bytes": attributed,
+                    "physical_bytes": attributed,
+                    "seam_labels": []
+                }],
+                "process": {
+                    "available": true,
+                    "logical_bytes": physical,
+                    "physical_bytes": physical
+                },
+                "unmeasurable": [{
+                    "root_id": "/repo",
+                    "seam": "db::TrackedConnection::drop",
+                    "reason": "close result unavailable",
+                    "observations": observations,
+                    "estimated_physical_bytes": estimate,
+                    "estimate_basis": "outstanding frames"
+                }],
+                "coverage": {"complete": true, "gap_ms": 0}
+            })
+        };
+        let before = census(1_000, 200, 100, 1, 50);
+        let after = census(3_000, 260, 140, 2, 70);
+
+        let live = subtract_write_census(&after, &before, 2_000);
+        assert_eq!(live["attributed_physical_bytes"], 40);
+        assert_eq!(live["unmeasurable_physical_bytes_estimate"], 20);
+        assert_eq!(live["unexplained_physical_bytes"], 0);
+        assert_eq!(live["unmeasurable"][0]["observations"], 1);
     }
 
     #[test]

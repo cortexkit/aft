@@ -68,7 +68,7 @@ export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
-  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
   /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
   ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
 };
@@ -361,7 +361,7 @@ export function detectStorage(sample: SentinelSample, state: SentinelState): Fin
 export function writeGrowthAttribution(sample: SentinelSample, state: SentinelState, writeDelta: number): string {
   if (writeDelta <= 0) return "";
   const ledger = sample.writes_census?.writers ?? metrics(sample).write_ledger_top_10m;
-  if (Array.isArray(ledger) && ledger.length > 0) {
+  if (Array.isArray(ledger) && (ledger.length > 0 || sample.writes_census)) {
     // The ledger rows come from the census's own window (10 minutes), not the
     // sentinel's sampling interval, so shares are taken against that window's
     // process total; against the interval delta they summed past 100%.
@@ -378,11 +378,20 @@ export function writeGrowthAttribution(sample: SentinelSample, state: SentinelSt
       const share = windowTotal > 0 ? Math.min(100, bytes / windowTotal * 100) : 0;
       return `${index + 1}. ${(bytes / GB).toFixed(2)} GiB ${entry.domain ?? "other"} (${entry.root_id ?? "unknown"}); ${share.toFixed(0)}% of the ${windowMinutes}-minute window`;
     });
-    const unattributed = Number(census?.unattributed_physical_bytes ?? 0);
-    if (unattributed > 0 && windowTotal > 0) {
-      lines.push(`unattributed: ${(unattributed / GB).toFixed(2)} GiB; ${Math.min(100, unattributed / windowTotal * 100).toFixed(0)}% of the ${windowMinutes}-minute window`);
+    const unmeasurable = Number(census?.unmeasurable_physical_bytes_estimate ?? 0);
+    const seamNames = Array.isArray(census?.unmeasurable)
+      ? census.unmeasurable.map((entry: Record<string, unknown>) => String(entry.seam ?? "unknown")).join(", ")
+      : "";
+    if (unmeasurable > 0 || seamNames) {
+      const share = windowTotal > 0 ? `; ${Math.min(100, unmeasurable / windowTotal * 100).toFixed(0)}% of the ${windowMinutes}-minute window` : "";
+      lines.push(`unmeasurable (estimate): ${(unmeasurable / GB).toFixed(2)} GiB${share}${seamNames ? `; seams: ${seamNames}` : ""}`);
     }
-    return `\n${lines.join("\n")}`;
+    const unexplained = Number(census?.unexplained_physical_bytes ?? 0);
+    if (unexplained > 0) {
+      const share = windowTotal > 0 ? `; ${Math.min(100, unexplained / windowTotal * 100).toFixed(0)}% of the ${windowMinutes}-minute window` : "";
+      lines.push(`unexplained: ${(unexplained / GB).toFixed(2)} GiB${share}`);
+    }
+    return lines.length > 0 ? `\n${lines.join("\n")}` : "";
   }
   const current = sample.disk?.artifact_sizes ?? {};
   const previous = state.previous?.artifact_sizes ?? {};
@@ -401,25 +410,30 @@ export function writeGrowthAttribution(sample: SentinelSample, state: SentinelSt
   return lines.length > 0 ? `\n${lines.join("\n")}` : "\nremainder: in-place rewrites (WAL churn)";
 }
 
-const WRITE_RATE_CEILING = GB;
-// One window of hard writing is a build, a branch switch, or a worktree warming
-// its indexes. The regression this watches for -- an O(corpus) rewrite on an
-// O(1) event -- does not stop after one window.
+const UNEXPLAINED_WRITE_RATE_CEILING = GB;
+// The 1 GiB/h ceiling now applies only to bytes left unexplained after both
+// attributed writers and known-by-construction seam estimates are removed.
+// One hot window can still be normal, so the alert remains sustained-only.
 const WRITE_RATE_SUSTAINED_RUNS = 2;
 
-/**
- * How many consecutive windows the write rate has stayed above the ceiling,
- * including this one. Zero resets it.
- *
- * Shared by the detector and the state writer so the count they act on and the
- * count they persist cannot drift apart.
- */
+function unexplainedWriteRate(sample: SentinelSample): number | undefined {
+  const census = sample.writes_census;
+  const unexplained = census?.unexplained_physical_bytes;
+  const since = census?.since_ms;
+  const until = census?.until_ms;
+  if (typeof unexplained !== "number" || !Number.isFinite(unexplained)
+    || typeof since !== "number" || typeof until !== "number" || until <= since) return undefined;
+  const hours = Math.max(1 / 3600, (until - since) / 3_600_000);
+  return Math.max(0, unexplained) / hours;
+}
+
+/** Consecutive census windows above the unexplained-write ceiling. */
 function writeRateRunCount(sample: SentinelSample, previous: SentinelState["previous"]): number {
-  const written = sample.process?.bytes_written;
-  if (typeof written !== "number" || typeof previous?.bytes_written !== "number" || !previous.sampled_at_ms) return 0;
-  const hours = Math.max(1 / 3600, (sample.now_ms - previous.sampled_at_ms) / 3_600_000);
-  const rate = (written - previous.bytes_written) / hours;
-  return rate > WRITE_RATE_CEILING ? (previous.write_rate_runs ?? 0) + 1 : 0;
+  const rate = unexplainedWriteRate(sample);
+  if (rate === undefined) return 0;
+  return rate > UNEXPLAINED_WRITE_RATE_CEILING
+    ? (previous?.unexplained_write_rate_runs ?? 0) + 1
+    : 0;
 }
 
 export function detectProcess(sample: SentinelSample, state: SentinelState): Finding[] {
@@ -428,24 +442,20 @@ export function detectProcess(sample: SentinelSample, state: SentinelState): Fin
   const proc = sample.process ?? {};
   if (Number(proc.phys_footprint_bytes ?? 0) > 6 * GB) out.push(finding("process.footprint", "WARNING", `process:${proc.pid ?? "aft"}:footprint`, `AFT physical footprint is ${(Number(proc.phys_footprint_bytes) / GB).toFixed(1)} GiB`, "physical footprint is at most 6 GiB"));
   if (Number(proc.cpu_percent ?? 0) > 150) out.push(finding("process.cpu", "WARNING", `process:${proc.pid ?? "aft"}:cpu`, `AFT CPU averaged ${proc.cpu_percent}% over the interval`, "interval CPU is at most 150%"));
-  const previous = state.previous;
-  if (typeof proc.bytes_written === "number" && typeof previous?.bytes_written === "number" && previous.sampled_at_ms) {
-    const hours = Math.max(1 / 3600, (sample.now_ms - previous.sampled_at_ms) / 3_600_000);
-    const writeDelta = proc.bytes_written - previous.bytes_written;
-    const rate = writeDelta / hours;
-    // Fire on SUSTAINED amplification, not on a burst. A build, a branch
-    // switch, or a mason worktree warming its indexes all write hard for one
-    // window and then stop; the regression this watches for -- an O(corpus)
-    // rewrite on an O(1) event -- does not stop. Requiring two consecutive
-    // windows costs one interval of delay on a real regression and removes the
-    // class of alert that trains a reader to ignore the channel. (Three fired
-    // in one evening at 2.9, 1.6 and 1.1 GiB/h, every one of them a build.)
-    const consecutive = writeRateRunCount(sample, previous);
+  const rate = unexplainedWriteRate(sample);
+  if (sample.writes_error) {
+    out.push(instrument("writes-census", sample.writes_error));
+  } else if (sample.writes_census && rate === undefined) {
+    out.push(instrument("writes-census", "unexplained physical bytes or census window is unavailable"));
+  }
+  if (rate !== undefined) {
+    const consecutive = writeRateRunCount(sample, state.previous);
     if (consecutive >= WRITE_RATE_SUSTAINED_RUNS) {
-      const attribution = writeGrowthAttribution(sample, state, writeDelta);
-      out.push(finding("process.writes", "WARNING", `process:${proc.pid ?? "aft"}:writes`, `AFT physical write rate is ${(rate / GB).toFixed(1)} GiB/h across ${consecutive} consecutive windows${attribution}`, "physical write rate is at most 1 GiB/h sustained"));
+      const windowBytes = Number(sample.writes_census?.process?.physical_bytes ?? 0);
+      const attribution = writeGrowthAttribution(sample, state, windowBytes);
+      out.push(finding("process.writes", "WARNING", `process:${proc.pid ?? "aft"}:writes`, `AFT unexplained physical write rate is ${(rate / GB).toFixed(1)} GiB/h across ${consecutive} consecutive windows${attribution}`, "unexplained physical write rate is at most 1 GiB/h sustained"));
     }
-  } else if (proc.bytes_written === undefined) out.push(instrument("process-writes", "health metrics.process_io has no available bytes-written counter"));
+  }
   return out;
 }
 
@@ -862,7 +872,7 @@ function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelSta
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const executor = executorHealth(sample);
   const previous = state.previous;
-  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {

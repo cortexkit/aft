@@ -215,8 +215,9 @@ static DEFERRED_CHECKPOINTS: OnceLock<Mutex<HashMap<PathBuf, DeferredCheckpointJ
     OnceLock::new();
 static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 const DEFERRED_CHECKPOINT_IDLE_DELAY: Duration = Duration::from_millis(250);
-const DERIVED_CHECKPOINT_RESIDUAL: &str =
-    "views::generation::checkpoint_derived: checkpoint bytes remain uncredited because a successful TRUNCATE result does not expose the prior backfill count";
+const DERIVED_CHECKPOINT_SEAM: &str = "views::generation::checkpoint_derived";
+const DERIVED_CHECKPOINT_REASON: &str =
+    "a successful TRUNCATE checkpoint returns zero frame counts and the raw connection has no earlier WAL-hook baseline";
 
 fn checkpoint_lock(path: &Path) -> Arc<Mutex<()>> {
     let mut locks = CHECKPOINT_LOCKS
@@ -267,7 +268,12 @@ fn checkpoint_derived(
             crate::write_ledger::Domain::Other,
             root.display().to_string(),
         )
-        .note_seam_label(DERIVED_CHECKPOINT_RESIDUAL);
+        .note_unmeasurable(
+            DERIVED_CHECKPOINT_SEAM,
+            DERIVED_CHECKPOINT_REASON,
+            None,
+            None,
+        );
     }
     if busy != 0 {
         return Err(ViewError::InvalidManifest(format!(
@@ -476,29 +482,23 @@ mod tests {
             0,
             "an unknowable TRUNCATE quantity must not receive guessed credit"
         );
-        // The residual label is recorded when the accounting window closes, which
-        // happens after the WAL is truncated and the keeper connection is dropped.
-        // A zero-length WAL therefore does not yet prove the seam was credited, so
-        // wait on the label itself rather than on a proxy for it.
-        while !crate::write_ledger::seam_labels_for_test(
-            crate::write_ledger::Domain::Other,
-            &source.parent().unwrap().display().to_string(),
-        )
-        .iter()
-        .any(|label| label == DERIVED_CHECKPOINT_RESIDUAL)
+        // Classification is recorded after the WAL is truncated and the keeper
+        // is dropped. Wait on that record rather than a lagging WAL-length proxy.
+        let ledger_root = source.parent().unwrap().display().to_string();
+        while !crate::write_ledger::unmeasurable_for_test(&ledger_root)
+            .iter()
+            .any(|entry| entry.seam == DERIVED_CHECKPOINT_SEAM)
         {
             assert!(
                 Instant::now() < deadline,
-                "detached derived checkpoint never recorded its residual seam label"
+                "detached derived checkpoint never recorded its unmeasurable seam"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(crate::write_ledger::seam_labels_for_test(
-            crate::write_ledger::Domain::Other,
-            &source.parent().unwrap().display().to_string(),
-        )
-        .iter()
-        .any(|label| label == DERIVED_CHECKPOINT_RESIDUAL));
+        assert!(crate::write_ledger::unmeasurable_for_test(&ledger_root)
+            .iter()
+            .any(|entry| entry.seam == DERIVED_CHECKPOINT_SEAM
+                && entry.reason == DERIVED_CHECKPOINT_REASON));
         assert_eq!(
             Connection::open(&source)
                 .unwrap()

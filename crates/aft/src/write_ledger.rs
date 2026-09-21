@@ -108,6 +108,31 @@ struct Entry {
     seam_labels: Mutex<BTreeSet<String>>,
 }
 
+#[derive(Debug)]
+struct UnmeasurableEntry {
+    root_id: String,
+    seam: String,
+    reason: String,
+    estimate_basis: Option<String>,
+    observations: AtomicU64,
+    estimated_physical_bytes: AtomicU64,
+    folded_observations: AtomicU64,
+    folded_estimated_physical_bytes: AtomicU64,
+}
+
+impl UnmeasurableEntry {
+    fn pending(&self) -> (u64, u64) {
+        (
+            self.observations
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.folded_observations.load(Ordering::Relaxed)),
+            self.estimated_physical_bytes
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.folded_estimated_physical_bytes.load(Ordering::Relaxed)),
+        )
+    }
+}
+
 impl Entry {
     fn pending(&self) -> (u64, u64) {
         (
@@ -150,6 +175,24 @@ impl Counter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(label.to_owned());
     }
+
+    /// Record a write seam whose bytes cannot be measured without changing the
+    /// operation being observed. Estimates stay separate from attributed bytes.
+    pub fn note_unmeasurable(
+        &self,
+        seam: &str,
+        reason: &str,
+        estimated_physical_bytes: Option<u64>,
+        estimate_basis: Option<&str>,
+    ) {
+        note_unmeasurable(
+            self.0.root_id.clone(),
+            seam,
+            reason,
+            estimated_physical_bytes,
+            estimate_basis,
+        );
+    }
 }
 
 fn saturating_add(value: &AtomicU64, delta: u64) {
@@ -176,6 +219,7 @@ struct RecentRow {
 struct Registry {
     started_ms: u64,
     entries: Mutex<BTreeMap<(Domain, String), Arc<Entry>>>,
+    unmeasurable_entries: Mutex<BTreeMap<(String, String), Arc<UnmeasurableEntry>>>,
     process_baseline: Mutex<ProcessBaseline>,
     fold_lock: Mutex<()>,
     recent: Mutex<VecDeque<RecentRow>>,
@@ -196,6 +240,7 @@ fn registry() -> &'static Registry {
         Registry {
             started_ms,
             entries: Mutex::new(BTreeMap::new()),
+            unmeasurable_entries: Mutex::new(BTreeMap::new()),
             process_baseline: Mutex::new(ProcessBaseline {
                 bytes: Bytes::capture(),
                 sampled_at_ms: started_ms,
@@ -237,6 +282,59 @@ pub fn credit(domain: Domain, root_id: impl Into<String>, logical: u64, physical
     register(domain, root_id).credit(logical, physical);
 }
 
+fn note_unmeasurable(
+    root_id: String,
+    seam: &str,
+    reason: &str,
+    estimated_physical_bytes: Option<u64>,
+    estimate_basis: Option<&str>,
+) {
+    debug_assert_eq!(estimated_physical_bytes.is_some(), estimate_basis.is_some());
+    let key = (root_id.clone(), seam.to_owned());
+    let entry = {
+        let mut entries = registry()
+            .unmeasurable_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(UnmeasurableEntry {
+                    root_id,
+                    seam: seam.to_owned(),
+                    reason: reason.to_owned(),
+                    estimate_basis: estimate_basis.map(str::to_owned),
+                    observations: AtomicU64::new(0),
+                    estimated_physical_bytes: AtomicU64::new(0),
+                    folded_observations: AtomicU64::new(0),
+                    folded_estimated_physical_bytes: AtomicU64::new(0),
+                })
+            })
+            .clone()
+    };
+    debug_assert_eq!(entry.reason, reason);
+    debug_assert_eq!(entry.estimate_basis.as_deref(), estimate_basis);
+    saturating_add(&entry.observations, 1);
+    if let Some(bytes) = estimated_physical_bytes {
+        saturating_add(&entry.estimated_physical_bytes, bytes);
+    }
+}
+
+pub fn note_process_unmeasurable(
+    seam: &str,
+    reason: &str,
+    estimated_physical_bytes: Option<u64>,
+    estimate_basis: Option<&str>,
+) {
+    note_unmeasurable(
+        PROCESS_ROOT.to_owned(),
+        seam,
+        reason,
+        estimated_physical_bytes,
+        estimate_basis,
+    );
+}
+
 pub fn process_root_counter(domain: Domain) -> Counter {
     register(domain, PROCESS_ROOT)
 }
@@ -249,6 +347,17 @@ pub struct WriterRow {
     pub physical_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seam_labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnmeasurableSeam {
+    pub root_id: String,
+    pub seam: String,
+    pub reason: String,
+    pub observations: u64,
+    pub estimated_physical_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_basis: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,13 +383,25 @@ pub struct Census {
     pub writers: Vec<WriterRow>,
     pub process: ProcessTotals,
     pub attributed_physical_bytes: u64,
-    pub unattributed_physical_bytes: Option<i64>,
+    pub unmeasurable: Vec<UnmeasurableSeam>,
+    pub unmeasurable_physical_bytes_estimate: u64,
+    pub unexplained_physical_bytes: Option<i64>,
     pub coverage: Coverage,
 }
 
 fn entries_snapshot() -> Vec<Arc<Entry>> {
     registry()
         .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .cloned()
+        .collect()
+}
+
+fn unmeasurable_entries_snapshot() -> Vec<Arc<UnmeasurableEntry>> {
+    registry()
+        .unmeasurable_entries
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
@@ -379,6 +500,13 @@ fn fold_minute_with_sample(
             (logical > 0 || physical > 0).then_some((entry, logical, physical))
         })
         .collect::<Vec<_>>();
+    let folded_unmeasurable = unmeasurable_entries_snapshot()
+        .into_iter()
+        .filter_map(|entry| {
+            let (observations, estimated_physical_bytes) = entry.pending();
+            (observations > 0).then_some((entry, observations, estimated_physical_bytes))
+        })
+        .collect::<Vec<_>>();
     let baseline = registry()
         .process_baseline
         .lock()
@@ -407,6 +535,31 @@ fn fold_minute_with_sample(
             ],
         )?;
     }
+    for (entry, observations, estimated_physical_bytes) in &folded_unmeasurable {
+        tx.execute(
+            "INSERT INTO write_ledger_unmeasurable_minutes
+             (minute_ts, root_id, seam, reason, estimate_basis, observations,
+              estimated_physical_bytes, estimate_available)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(minute_ts, root_id, seam) DO UPDATE SET
+               reason = excluded.reason,
+               estimate_basis = excluded.estimate_basis,
+               observations = observations + excluded.observations,
+               estimated_physical_bytes = estimated_physical_bytes
+                 + excluded.estimated_physical_bytes,
+               estimate_available = MAX(estimate_available, excluded.estimate_available)",
+            rusqlite::params![
+                minute_ts,
+                entry.root_id,
+                entry.seam,
+                entry.reason,
+                entry.estimate_basis,
+                observations,
+                estimated_physical_bytes,
+                u8::from(entry.estimate_basis.is_some()),
+            ],
+        )?;
+    }
     if let Some(delta) = process_delta {
         tx.execute(
             "INSERT INTO write_ledger_process_minutes
@@ -431,11 +584,22 @@ fn fold_minute_with_sample(
         "DELETE FROM write_ledger_process_minutes WHERE minute_ts < ?1",
         [cutoff],
     )?;
+    tx.execute(
+        "DELETE FROM write_ledger_unmeasurable_minutes WHERE minute_ts < ?1",
+        [cutoff],
+    )?;
     tx.commit()?;
 
     for (entry, logical, physical) in &folded {
         saturating_add(&entry.folded_logical, *logical);
         saturating_add(&entry.folded_physical, *physical);
+    }
+    for (entry, observations, estimated_physical_bytes) in &folded_unmeasurable {
+        saturating_add(&entry.folded_observations, *observations);
+        saturating_add(
+            &entry.folded_estimated_physical_bytes,
+            *estimated_physical_bytes,
+        );
     }
     *registry()
         .process_baseline
@@ -535,6 +699,67 @@ fn census_with_sample(
         .iter()
         .fold(0_u64, |total, row| total.saturating_add(row.physical_bytes));
 
+    let mut unmeasurable_by_seam = BTreeMap::<(String, String), UnmeasurableSeam>::new();
+    {
+        let mut statement = conn.prepare(
+            "SELECT root_id, seam, MAX(reason), MAX(estimate_basis),
+                    SUM(observations), SUM(estimated_physical_bytes), MAX(estimate_available)
+             FROM write_ledger_unmeasurable_minutes
+             WHERE minute_ts >= ?1 AND minute_ts <= ?2
+               AND (?3 IS NULL OR root_id = ?3)
+             GROUP BY root_id, seam",
+        )?;
+        let rows = statement.query_map(rusqlite::params![minute_since, until_ms, root], |row| {
+            let estimate_available = row.get::<_, u8>(6)? != 0;
+            Ok(UnmeasurableSeam {
+                root_id: row.get(0)?,
+                seam: row.get(1)?,
+                reason: row.get(2)?,
+                estimate_basis: row.get(3)?,
+                observations: row.get(4)?,
+                estimated_physical_bytes: estimate_available.then(|| row.get(5)).transpose()?,
+            })
+        })?;
+        for row in rows {
+            let row = row?;
+            unmeasurable_by_seam.insert((row.root_id.clone(), row.seam.clone()), row);
+        }
+    }
+    for entry in unmeasurable_entries_snapshot() {
+        if root.is_some_and(|root| root != entry.root_id) {
+            continue;
+        }
+        let (observations, estimated_physical_bytes) = entry.pending();
+        if observations == 0 {
+            continue;
+        }
+        let row = unmeasurable_by_seam
+            .entry((entry.root_id.clone(), entry.seam.clone()))
+            .or_insert_with(|| UnmeasurableSeam {
+                root_id: entry.root_id.clone(),
+                seam: entry.seam.clone(),
+                reason: entry.reason.clone(),
+                observations: 0,
+                estimated_physical_bytes: entry.estimate_basis.as_ref().map(|_| 0),
+                estimate_basis: entry.estimate_basis.clone(),
+            });
+        row.observations = row.observations.saturating_add(observations);
+        if let Some(estimate) = &mut row.estimated_physical_bytes {
+            *estimate = estimate.saturating_add(estimated_physical_bytes);
+        }
+    }
+    let mut unmeasurable = unmeasurable_by_seam.into_values().collect::<Vec<_>>();
+    unmeasurable.sort_by(|left, right| {
+        right
+            .estimated_physical_bytes
+            .cmp(&left.estimated_physical_bytes)
+            .then_with(|| left.seam.cmp(&right.seam))
+            .then_with(|| left.root_id.cmp(&right.root_id))
+    });
+    let unmeasurable_physical_bytes_estimate = unmeasurable.iter().fold(0_u64, |total, row| {
+        total.saturating_add(row.estimated_physical_bytes.unwrap_or(0))
+    });
+
     let persisted_process = conn.query_row(
         "SELECT COALESCE(SUM(logical_bytes), 0), COALESCE(SUM(physical_bytes), 0)
          FROM write_ledger_process_minutes WHERE minute_ts >= ?1 AND minute_ts <= ?2",
@@ -579,9 +804,11 @@ fn census_with_sample(
         complete: since_ms >= available_since_ms,
         gap_ms: available_since_ms.saturating_sub(since_ms),
     };
-    let unattributed_physical_bytes = process
+    let classified_physical_bytes =
+        attributed_physical_bytes.saturating_add(unmeasurable_physical_bytes_estimate);
+    let unexplained_physical_bytes = process
         .physical_bytes
-        .map(|physical| signed_difference(physical, attributed_physical_bytes));
+        .map(|physical| signed_difference(physical, classified_physical_bytes));
 
     Ok(Census {
         since_ms,
@@ -590,7 +817,9 @@ fn census_with_sample(
         writers,
         process,
         attributed_physical_bytes,
-        unattributed_physical_bytes,
+        unmeasurable,
+        unmeasurable_physical_bytes_estimate,
+        unexplained_physical_bytes,
         coverage,
     })
 }
@@ -633,6 +862,28 @@ pub(crate) fn seam_labels_for_test(domain: Domain, root_id: &str) -> Vec<String>
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn unmeasurable_for_test(root_id: &str) -> Vec<UnmeasurableSeam> {
+    unmeasurable_entries_snapshot()
+        .into_iter()
+        .filter(|entry| entry.root_id == root_id)
+        .filter_map(|entry| {
+            let (observations, estimated_physical_bytes) = entry.pending();
+            (observations > 0).then(|| UnmeasurableSeam {
+                root_id: entry.root_id.clone(),
+                seam: entry.seam.clone(),
+                reason: entry.reason.clone(),
+                observations,
+                estimated_physical_bytes: entry
+                    .estimate_basis
+                    .as_ref()
+                    .map(|_| estimated_physical_bytes),
+                estimate_basis: entry.estimate_basis.clone(),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -763,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn census_reports_coverage_gap_and_same_window_unattributed_delta() {
+    fn census_reports_coverage_gap_and_same_window_unexplained_delta() {
         let _guard = test_lock();
         let dir = tempfile::tempdir().unwrap();
         let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
@@ -789,7 +1040,46 @@ mod tests {
         assert!(report.coverage.gap_ms > 0);
         assert_eq!(report.attributed_physical_bytes, 40);
         assert_eq!(report.process.physical_bytes, Some(100));
-        assert_eq!(report.unattributed_physical_bytes, Some(60));
+        assert_eq!(report.unmeasurable_physical_bytes_estimate, 0);
+        assert_eq!(report.unexplained_physical_bytes, Some(60));
+    }
+
+    #[test]
+    fn census_excludes_known_unmeasurable_seam_from_unexplained() {
+        let _guard = test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let root = test_root("known-unmeasurable");
+        let counter = register(Domain::CallgraphRefresh, root.clone());
+        let minute = now_ms() / MINUTE_MS * MINUTE_MS;
+        let before = Bytes::capture().unwrap_or_default();
+        set_process_baseline_for_test(Some(before), minute);
+        counter.credit(25, 40);
+        counter.note_unmeasurable(
+            "db::TrackedConnection::drop",
+            "the close-time checkpoint result is unavailable without reopening the live SQLite file set",
+            Some(50),
+            Some("estimated from outstanding WAL frames observed by the existing hook times the database page size"),
+        );
+        fold_minute_with_sample(
+            &mut conn,
+            minute,
+            Some(Bytes {
+                logical: before.logical + 75,
+                written: before.written + 100,
+                read: before.read,
+            }),
+        )
+        .unwrap();
+
+        let report =
+            census_with_sample(&conn, minute, Some(&root), minute + MINUTE_MS, None).unwrap();
+        assert_eq!(report.attributed_physical_bytes, 40);
+        assert_eq!(report.unmeasurable_physical_bytes_estimate, 50);
+        assert_eq!(report.unexplained_physical_bytes, Some(10));
+        assert_eq!(report.unmeasurable.len(), 1);
+        assert_eq!(report.unmeasurable[0].seam, "db::TrackedConnection::drop");
+        assert_eq!(report.unmeasurable[0].estimated_physical_bytes, Some(50));
     }
 
     #[test]

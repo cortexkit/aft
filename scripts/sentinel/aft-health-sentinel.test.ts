@@ -279,16 +279,17 @@ describe("health sentinel pure detectors", () => {
     ]);
   });
 
-  test("write attribution shares are taken against the census window, not the interval delta", () => {
+  test("write attribution shares use the census window and split its residual", () => {
     // The ledger rows cover the census's 10-minute window while the sentinel's
-    // delta covers its 2-minute interval; on 2026-09-19 the shares summed to
-    // 161% because they were divided by the smaller delta. The window's own
-    // process total is the denominator, and the unattributed remainder is a row.
+    // process interval can differ. Every share therefore uses the census total.
     const input = sample({ writes_census: {
       since_ms: NOW - 600_000,
       until_ms: NOW,
       process: { available: true, physical_bytes: 4 * 1024 ** 3 },
-      unattributed_physical_bytes: 1024 ** 3,
+      attributed_physical_bytes: 3 * 1024 ** 3,
+      unmeasurable_physical_bytes_estimate: 0.75 * 1024 ** 3,
+      unexplained_physical_bytes: 0.25 * 1024 ** 3,
+      unmeasurable: [{ seam: "db::TrackedConnection::drop" }],
       writers: [
         { domain: "callgraph_refresh", root_id: "/root/a", physical_bytes: 2 * 1024 ** 3 },
         { domain: "semantic_compaction", root_id: "/root/b", physical_bytes: 1024 ** 3 },
@@ -297,29 +298,66 @@ describe("health sentinel pure detectors", () => {
     const rendered = writeGrowthAttribution(input, cleanState(), 0.5 * 1024 ** 3);
     expect(rendered).toContain("callgraph_refresh (/root/a); 50% of the 10-minute window");
     expect(rendered).toContain("semantic_compaction (/root/b); 25% of the 10-minute window");
-    expect(rendered).toContain("unattributed: 1.00 GiB; 25% of the 10-minute window");
+    expect(rendered).toContain("unmeasurable (estimate): 0.75 GiB; 19% of the 10-minute window; seams: db::TrackedConnection::drop");
+    expect(rendered).toContain("unexplained: 0.25 GiB; 6% of the 10-minute window");
     expect(rendered).not.toContain("of write delta");
   });
 
-  test("process footprint, cpu, and write rate are independent", () => {
-    // The write rate now needs a prior window already over the ceiling, because
-    // one hard-writing window is a build rather than a regression.
-    const state: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0, write_rate_runs: 1 } };
-    expect(rules(detectProcess(sample({ process: { pid: 42, phys_footprint_bytes: 7 * 1024 ** 3, cpu_percent: 151, bytes_written: 2 * 1024 ** 3 } }), state))).toEqual(expect.arrayContaining(["process.footprint", "process.cpu", "process.writes"]));
+  test("process footprint, cpu, and unexplained write rate are independent", () => {
+    const state: SentinelState = { findings: {}, previous: { unexplained_write_rate_runs: 1 } };
+    const writes_census = {
+      since_ms: NOW - 3_600_000,
+      until_ms: NOW,
+      process: { physical_bytes: 2 * 1024 ** 3 },
+      unexplained_physical_bytes: 2 * 1024 ** 3,
+      writers: [],
+    };
+    expect(rules(detectProcess(sample({ process: { pid: 42, phys_footprint_bytes: 7 * 1024 ** 3, cpu_percent: 151 }, writes_census }), state))).toEqual(expect.arrayContaining(["process.footprint", "process.cpu", "process.writes"]));
   });
 
-  test("one window over the write ceiling is a burst, two consecutive is a regression", () => {
-    const busy = { pid: 42, bytes_written: 2 * 1024 ** 3 };
-    const firstWindow: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0 } };
-    expect(rules(detectProcess(sample({ process: busy }), firstWindow))).not.toContain("process.writes");
+  test("one window over the unexplained-write ceiling is a burst, two consecutive is a regression", () => {
+    const busy = {
+      since_ms: NOW - 3_600_000,
+      until_ms: NOW,
+      process: { physical_bytes: 2 * 1024 ** 3 },
+      unexplained_physical_bytes: 2 * 1024 ** 3,
+      writers: [],
+    };
+    const firstWindow: SentinelState = { findings: {}, previous: {} };
+    expect(rules(detectProcess(sample({ writes_census: busy }), firstWindow))).not.toContain("process.writes");
 
-    const secondWindow: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0, write_rate_runs: 1 } };
-    expect(rules(detectProcess(sample({ process: busy }), secondWindow))).toContain("process.writes");
+    const secondWindow: SentinelState = { findings: {}, previous: { unexplained_write_rate_runs: 1 } };
+    const finding = detectProcess(sample({ writes_census: busy }), secondWindow).find((value) => value.rule === "process.writes");
+    expect(finding?.text).toContain("unexplained physical write rate is 2.0 GiB/h");
+    expect(finding?.clears_when).toContain("unexplained physical write rate");
 
     // A quiet window clears the streak, so a later burst starts over rather
     // than firing on the strength of an unrelated build an hour ago.
-    const quiet: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 2 * 1024 ** 3, write_rate_runs: 1 } };
-    expect(rules(detectProcess(sample({ process: busy }), quiet))).not.toContain("process.writes");
+    const quiet = { ...busy, unexplained_physical_bytes: 0 };
+    const priorHot: SentinelState = { findings: {}, previous: { unexplained_write_rate_runs: 1 } };
+    expect(rules(detectProcess(sample({ writes_census: quiet }), priorHot))).not.toContain("process.writes");
+  });
+
+  test("an unavailable unexplained line raises an instrumentation finding", () => {
+    const missingLine = detectProcess(sample({ writes_census: { since_ms: NOW - 600_000, until_ms: NOW } }), cleanState());
+    expect(missingLine.find((value) => value.fingerprint === "instrument:writes-census")?.text).toContain("unexplained physical bytes");
+    const failedCensus = detectProcess(sample({ writes_error: "profile failed" }), cleanState());
+    expect(failedCensus.find((value) => value.fingerprint === "instrument:writes-census")?.text).toContain("profile failed");
+  });
+
+  test("tonight's 3.8 GiB per hour window does not alert when its residual is known-unmeasurable", () => {
+    const writes_census = {
+      since_ms: NOW - 3_600_000,
+      until_ms: NOW,
+      process: { physical_bytes: 3.8 * 1024 ** 3 },
+      attributed_physical_bytes: 0.988 * 1024 ** 3,
+      unmeasurable_physical_bytes_estimate: 2.812 * 1024 ** 3,
+      unexplained_physical_bytes: 0,
+      unmeasurable: [{ seam: "db::TrackedConnection::drop" }],
+      writers: [],
+    };
+    const state: SentinelState = { findings: {}, previous: { unexplained_write_rate_runs: 1 } };
+    expect(rules(detectProcess(sample({ writes_census }), state))).not.toContain("process.writes");
   });
 
   test("degraded search ratio and slow-call count are root scoped", () => {
