@@ -31,6 +31,8 @@ export interface HostProviderConfigContract {
   host_version: string;
   observed_run_id: string;
   provider_config: Record<string, unknown>;
+  /** The opencode.json key the observed provider object was accepted under. */
+  config_key: string;
   model: string;
 }
 
@@ -135,21 +137,41 @@ export async function loadHostCliContract(
   };
 }
 
-export async function loadHostProviderConfigContract(
-  contractRoot: string,
+/**
+ * The provider object a host generation was observed to accept, and where.
+ *
+ * Both the shape and the key it goes under are host-generation specific, so
+ * each generation has its own captured file rather than one shape reused by
+ * assumption. `config_key` is read back off the captured `opencode_json` so
+ * the harness writes the key the transcript actually shows working.
+ */
+async function readProviderConfigContract(
+  path: string,
   pinnedVersion: string,
+  label: string,
 ): Promise<HostProviderConfigContract> {
-  const path = join(contractRoot, "host-provider-config.json");
   await access(path).catch(() => {
-    fail("contract_uncaptured", "host_provider_config", { path }, true);
+    fail("contract_uncaptured", label, { path }, true);
   });
   const record = asRecord(await readJson(path));
   if (record?.schema_version !== 1) {
-    fail("contract_uncaptured", "host_provider_config schema", { path }, true);
+    fail("contract_uncaptured", `${label} schema`, { path }, true);
   }
-  contractIdentity(record, pinnedVersion, "host_provider_config");
+  contractIdentity(record, pinnedVersion, label);
   if (!asRecord(record.provider_config)) {
     fail("contract_uncaptured", `${path}: provider_config observation is missing`);
+  }
+  const opencodeJson = asRecord(record.opencode_json);
+  const configKeys = Object.keys(opencodeJson ?? {}).filter(
+    (key) => key !== "$schema" && key !== "plugin",
+  );
+  if (configKeys.length !== 1) {
+    fail(
+      "contract_uncaptured",
+      `${path}: opencode_json must show exactly one provider key`,
+      { observed_keys: configKeys },
+      true,
+    );
   }
   const runCommand = record.run_command;
   const modelFlag = Array.isArray(runCommand) ? runCommand.indexOf("--model") : -1;
@@ -157,7 +179,30 @@ export async function loadHostProviderConfigContract(
   if (modelFlag === -1 || typeof model !== "string" || model.length === 0) {
     fail("contract_uncaptured", `${path}: run_command model observation is missing`);
   }
-  return { ...record, model } as unknown as HostProviderConfigContract;
+  return { ...record, config_key: configKeys[0], model } as unknown as HostProviderConfigContract;
+}
+
+export async function loadHostProviderConfigContract(
+  contractRoot: string,
+  pinnedVersion: string,
+): Promise<HostProviderConfigContract> {
+  return readProviderConfigContract(
+    join(contractRoot, "host-provider-config.json"),
+    pinnedVersion,
+    "host_provider_config",
+  );
+}
+
+/** The same observation for the V1 host, which the T7 parity trajectory also runs. */
+export async function loadV1HostProviderConfigContract(
+  contractRoot: string,
+  pinnedVersion: string,
+): Promise<HostProviderConfigContract> {
+  return readProviderConfigContract(
+    join(contractRoot, "host1-provider-config.json"),
+    pinnedVersion,
+    "host1_provider_config",
+  );
 }
 
 

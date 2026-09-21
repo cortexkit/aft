@@ -10,6 +10,7 @@ import {
   loadHostCliContract,
   loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
+  loadV1HostProviderConfigContract,
 } from "./contracts.js";
 import {
   assertThreeStateRestore,
@@ -193,6 +194,7 @@ describe("scenario isolation and liveness", () => {
           models: { "mock-model": { name: "Mock" } },
         },
       },
+      providerConfigKey: "providers",
     });
     for (const key of [
       "HOME",
@@ -236,7 +238,20 @@ describe("scenario isolation and liveness", () => {
       pluginVersion: "1.2.3-test",
       hostGeneration: "v1",
       mockBaseUrl: "http://127.0.0.1:1234",
+      providerConfig: {
+        mock: {
+          api: "openai",
+          options: { baseURL: "{{AIMOCK_BASE_URL}}/v1" },
+          models: { "mock-model": { name: "Mock" } },
+        },
+      },
+      providerConfigKey: "provider",
     });
+    const legacyConfig = JSON.parse(await readFile(legacy.host_config, "utf8"));
+    // The V1 host reads `provider`; it logs `providers` as an unsupported key
+    // and then has no provider to resolve the run's model against.
+    expect(legacyConfig.provider.mock.options.baseURL).toBe("http://127.0.0.1:1234/v1");
+    expect(legacyConfig.providers).toBeUndefined();
     const legacyWrapper = await readFile(
       join(legacy.config, "aft-opencode-wrapper", "index.mjs"),
       "utf8",
@@ -1105,7 +1120,26 @@ describe("producer-backed executable provenance", () => {
   });
 });
 
-test("provider contract supplies the observed run model to the harness", async () => {
+test("provider contract supplies the observed run model and config key to the harness", async () => {
+  const contractRoot = await root();
+  await writeFile(
+    join(contractRoot, "host-provider-config.json"),
+    JSON.stringify({
+      schema_version: 1,
+      host_version: "0.0.0-beta-test",
+      observed_run_id: "probe-run",
+      provider_config: { openai: {} },
+      opencode_json: { providers: { openai: {} } },
+      run_command: ["opencode2", "run", "--model", "openai/mock-model", "message"],
+    }),
+  );
+
+  const contract = await loadHostProviderConfigContract(contractRoot, "0.0.0-beta-test");
+  expect(contract.model).toBe("openai/mock-model");
+  expect(contract.config_key).toBe("providers");
+});
+
+test("a provider contract that does not show its config key is rejected", async () => {
   const contractRoot = await root();
   await writeFile(
     join(contractRoot, "host-provider-config.json"),
@@ -1117,9 +1151,29 @@ test("provider contract supplies the observed run model to the harness", async (
       run_command: ["opencode2", "run", "--model", "openai/mock-model", "message"],
     }),
   );
+  await expectCode(
+    () => loadHostProviderConfigContract(contractRoot, "0.0.0-beta-test"),
+    "contract_uncaptured",
+  );
+});
 
-  const contract = await loadHostProviderConfigContract(contractRoot, "0.0.0-beta-test");
-  expect(contract.model).toBe("openai/mock-model");
+test("the V1 leg reads its own provider contract, under its own key", async () => {
+  const contractRoot = await root();
+  await writeFile(
+    join(contractRoot, "host1-provider-config.json"),
+    JSON.stringify({
+      schema_version: 1,
+      host_version: "1.18.30",
+      observed_run_id: "probe-run",
+      provider_config: { mock: { npm: "@ai-sdk/openai-compatible" } },
+      opencode_json: { provider: { mock: { npm: "@ai-sdk/openai-compatible" } } },
+      run_command: ["opencode", "run", "--model", "mock/mock-model", "message"],
+    }),
+  );
+
+  const contract = await loadV1HostProviderConfigContract(contractRoot, "1.18.30");
+  expect(contract.model).toBe("mock/mock-model");
+  expect(contract.config_key).toBe("provider");
 });
 
 test("legacy host CLI capture names every field required by the runner", async () => {

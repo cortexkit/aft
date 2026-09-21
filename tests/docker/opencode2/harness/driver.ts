@@ -4,7 +4,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseE2EConcurrency, mapWithConcurrency } from "./concurrency.js";
-import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts.js";
+import {
+  loadHostCliContract,
+  loadHostProviderConfigContract,
+  loadV1HostProviderConfigContract,
+} from "./contracts.js";
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { fail, HarnessError } from "./errors.js";
@@ -33,7 +37,7 @@ import {
   controlPlans,
   sessionPermissionRules,
 } from "./permission-plan.js";
-import { readPinnedHostVersion } from "./pin.js";
+import { readPinnedHostVersion, readPinnedV1HostVersion } from "./pin.js";
 import { ProcessObserver } from "./process-observer.js";
 import { reportTable } from "./report.js";
 import { AftTaskProbe } from "./task-probe.js";
@@ -420,8 +424,9 @@ async function runOneScenario(options: {
   hostGeneration?: "v1" | "v2";
   hostExecutable?: string;
   applyComparison?: boolean;
-  providerConfig?: Record<string, unknown>;
-  providerModel?: string;
+  providerConfig: Record<string, unknown>;
+  providerConfigKey: string;
+  providerModel: string;
 }): Promise<{
   result: ScenarioResult;
   smokeRan: boolean;
@@ -646,9 +651,9 @@ async function runOneScenario(options: {
       hostGeneration,
       binaryPath: config.nativeExecutable,
       mockBaseUrl: mock.url,
-      model: (scenario.model ?? "openai/mock-model").split("/").at(-1),
       projectConfig: scenario.project_config,
-      providerConfig: hostGeneration === "v2" ? options.providerConfig : undefined,
+      providerConfig: options.providerConfig,
+      providerConfigKey: options.providerConfigKey,
     });
     if (transportDeadWindow) {
       transportDeadStub = await makeTransportDeadStub(isolation.root, config.executable);
@@ -697,7 +702,7 @@ async function runOneScenario(options: {
       contract: options.hostContract,
       server,
       hostGeneration,
-      model: hostGeneration === "v2" ? options.providerModel : undefined,
+      model: options.providerModel,
     });
     observeHostStream(client.child, controlPathValues);
     if (options.runSmoke && server && options.hostContract) {
@@ -1025,6 +1030,9 @@ async function main(): Promise<void> {
     `${JSON.stringify({ schema_version: 1, controls: controlEvidence }, null, 2)}\n`,
   );
 
+  const contractRoot = join(repoRoot, "tests", "docker", "opencode2", "contract");
+  const providerContract = await loadHostProviderConfigContract(contractRoot, pinnedHostVersion);
+
   if (config.captureSchemaObservation) {
     const observed = await runOneScenario({
       scenario: HOST_SCHEMA_REJECTION_PROBE,
@@ -1033,6 +1041,9 @@ async function main(): Promise<void> {
       pluginVersion: await readPackageVersion(),
       extensions: [],
       runSmoke: false,
+      providerConfig: providerContract.provider_config,
+      providerConfigKey: providerContract.config_key,
+      providerModel: providerContract.model,
     });
     if (observed.result.status === "failed") {
       throw new Error(
@@ -1063,14 +1074,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  const hostContract = await loadHostCliContract(
-    join(repoRoot, "tests", "docker", "opencode2", "contract"),
-    pinnedHostVersion,
-  );
-  const providerContract = await loadHostProviderConfigContract(
-    join(repoRoot, "tests", "docker", "opencode2", "contract"),
-    pinnedHostVersion,
-  );
+  const hostContract = await loadHostCliContract(contractRoot, pinnedHostVersion);
+  // T7 runs each row on both hosts, and the V1 leg gets its own captured
+  // provider observation. The two hosts take different provider shapes under
+  // different keys, and handing V1 the V2 one leaves it with no provider.
+  const v1ProviderContract = scenarios.some((scenario) => scenario.trajectory === "T7")
+    ? await loadV1HostProviderConfigContract(
+        contractRoot,
+        await readPinnedV1HostVersion(repoRoot),
+      )
+    : undefined;
   const pluginVersion = await readPackageVersion();
   const smokeScenarioId = scenarios.find(
     (scenario) => scenario.execution === "shared-server" && scenario.trajectory !== "T7",
@@ -1090,31 +1103,36 @@ async function main(): Promise<void> {
         runSmoke: false,
         hostGeneration: "v2",
         providerConfig: providerContract.provider_config,
+        providerConfigKey: providerContract.config_key,
         providerModel: providerContract.model,
         applyComparison: true,
       });
-      const v1 = config.v1HostExecutable
-        ? await runOneScenario({
-            scenario,
-            config,
-            pinnedHostVersion,
-            pluginVersion,
-            extensions,
-            runSmoke: false,
-            hostGeneration: "v1",
-            hostExecutable: config.v1HostExecutable,
-            applyComparison: false,
-          })
-        : {
-            result: {
-              id: scenario.id,
-              status: "failed" as const,
-              failure: { code: "host_failed", message: "OPENCODE1_BIN is required for T7" },
-              forensic_dir: dirname(v2.result.forensic_dir),
-            },
-            smokeRan: false,
-            observedTexts: {},
-          };
+      const v1 =
+        config.v1HostExecutable && v1ProviderContract
+          ? await runOneScenario({
+              scenario,
+              config,
+              pinnedHostVersion,
+              pluginVersion,
+              extensions,
+              runSmoke: false,
+              hostGeneration: "v1",
+              hostExecutable: config.v1HostExecutable,
+              providerConfig: v1ProviderContract.provider_config,
+              providerConfigKey: v1ProviderContract.config_key,
+              providerModel: v1ProviderContract.model,
+              applyComparison: false,
+            })
+          : {
+              result: {
+                id: scenario.id,
+                status: "failed" as const,
+                failure: { code: "host_failed", message: "OPENCODE1_BIN is required for T7" },
+                forensic_dir: dirname(v2.result.forensic_dir),
+              },
+              smokeRan: false,
+              observedTexts: {},
+            };
       result = v2.result.status === "failed" ? v2.result : v1.result;
       if (v2.result.status === "passed" && v1.result.status === "passed") {
         try {
@@ -1154,6 +1172,7 @@ async function main(): Promise<void> {
         hostContract,
         extensions,
         providerConfig: providerContract.provider_config,
+        providerConfigKey: providerContract.config_key,
         providerModel: providerContract.model,
         runSmoke: scenario.id === smokeScenarioId,
       });

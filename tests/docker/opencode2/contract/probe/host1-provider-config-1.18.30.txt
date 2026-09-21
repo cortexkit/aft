@@ -1,0 +1,102 @@
+OpenCode 1 provider configuration probe for the T7 parity leg
+run_id: oc1-1.18.30-20260921-t7-parity
+image: aft-e2e-opencode2-linux built from AFT_GIT_SHA ebbcd34839b2a14bf1e9e05e939d32e783ac7a37
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: opencode-ai@1.18.30 at /opt/opencode1/node_modules/.bin/opencode
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+provider: @copilotkit/aimock@1.24.0, the same deterministic mock the harness drives
+
+Three candidate provider blocks were written to opencode.json in turn and run
+against the same mock. Only the third is a shape this host both routes and
+speaks the harness's wire protocol to.
+
+
+1. The V2 GA block under the "providers" key — what the harness was sending
+   this host — leaves it with no provider at all.
+
+{
+  "providers": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:<mock>/v1", "apiKey": "{env:OPENAI_API_KEY}" },
+      "models": { "mock-model": { "name": "Mock Model" } }
+    }
+  }
+}
+
+$ OPENAI_API_KEY=sk-opencode2-harness opencode run --print-logs --format json --model openai/mock-model "say hello"
+timestamp=2026-09-21T05:21:47.864Z level=INFO message=loading path=.../xdg-config/opencode/opencode.json
+timestamp=2026-09-21T05:21:47.878Z level=WARN message="configuration compatibility diagnostic" source=.../xdg-config/opencode/opencode.json path="[\"providers\"]" kind=unsupported action="Omitted native setting that cannot be represented in V1"
+timestamp=2026-09-21T05:21:48.878Z level=ERROR message="share subscriber failed" type=message.updated cause="Cause([Fail(ProviderModelNotFoundError: Model not found: openai/mock-model.)])"
+timestamp=2026-09-21T05:21:48.908Z level=ERROR message=failed ref=err_df0bc786 error="ProviderModelNotFoundError: Model not found: openai/mock-model." cause="... at SessionPrompt.getModel ..."
+timestamp=2026-09-21T05:21:48.909Z level=INFO message="disposing instance"
+{"type":"error","timestamp":1789968108909,"sessionID":"ses_f3d9634a2ffeGBauRujgIzSGHo","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details.","ref":"err_df0bc786"}}}
+[exit 1; mock received 0 requests]
+
+Without --print-logs the single line above is the host's whole account of
+itself: stderr is empty and stdout carries only the opaque UnknownError.
+
+
+2. The "provider" key with an "api" alias routes, but through the Responses
+   API, which is not the protocol the harness reads.
+
+{
+  "provider": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "api": "openai",
+      "options": { "baseURL": "http://127.0.0.1:<mock>/v1", "apiKey": "{env:OPENAI_API_KEY}" },
+      "models": { "mock-model": { "name": "Mock Model" } }
+    }
+  }
+}
+
+$ OPENAI_API_KEY=sk-opencode2-harness opencode run --print-logs --format json --model openai/mock-model "say hello"
+[exit 0; mock received 2 requests]
+first request: POST /v1/responses  user-agent=opencode/1.18.30 ai-sdk/provider-utils/4.0.40
+
+The harness matches scripted turns and reads tool results out of chat
+messages (role "tool", tool_call_id). A /v1/responses body carries neither, so
+this shape would run the host and still fail every row.
+
+
+3. The captured shape: the "provider" key with an explicit npm provider. It
+   routes to the mock and speaks /v1/chat/completions, the same protocol the
+   V2 leg uses, so both legs of a parity row are read the same way.
+
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "mock": {
+      "name": "Deterministic aimock",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:32945/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  }
+}
+
+$ OPENAI_API_KEY=sk-opencode2-harness opencode run --print-logs --format json --model mock/mock-model "say hello"
+timestamp=2026-09-21T05:21:54.040Z level=INFO message=loading path=.../xdg-config/opencode/opencode.json
+timestamp=2026-09-21T05:21:54.547Z level=INFO message=created id=ses_f3d961c8effe5ZOBjhE5GX7jI7 version=1.18.30
+timestamp=2026-09-21T05:21:55.134Z level=INFO message=stream providerID=mock modelID=mock-model session.id=ses_f3d961c8effe5ZOBjhE5GX7jI7 small=true agent=title mode=primary
+timestamp=2026-09-21T05:21:55.152Z level=INFO message="llm runtime selected" llm.runtime=ai-sdk llm.provider=mock llm.model=mock-model
+timestamp=2026-09-21T05:21:55.661Z level=INFO message=stream providerID=mock modelID=mock-model session.id=ses_f3d961c8effe5ZOBjhE5GX7jI7 small=false agent=build mode=primary
+{"type":"step_start","timestamp":1789968115712,"sessionID":"ses_f3d961c8effe5ZOBjhE5GX7jI7",...}
+{"type":"text",...,"text":"Scenario complete"}
+{"type":"step_finish",...,"reason":"stop"}
+[exit 0; mock received 2 requests]
+
+first request: POST /v1/chat/completions  user-agent=opencode/1.18.30 ai-sdk/provider-utils/4.0.23
+body: {"model":"mock-model","max_tokens":32000,"messages":[{"role":"system","content":"You are a title generator. ..."}]}
+
+The title-generation request arrives as a chat message, which is what
+isTitleGenerationRequest() looks for; a turn is therefore not consumed by it.

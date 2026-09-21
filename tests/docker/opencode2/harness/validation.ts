@@ -5,9 +5,11 @@ import {
   loadHostCliContract,
   loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
+  loadV1HostProviderConfigContract,
 } from "./contracts.js";
 import { fail } from "./errors.js";
 import { readPermissionAskInventory, validatePermissionInventory } from "./inventory.js";
+import { readPinnedV1HostVersion } from "./pin.js";
 import { TRUNCATION_TRAILER_PATTERN } from "./projection.js";
 import type {
   HarnessValidationContext,
@@ -857,6 +859,15 @@ export async function validateHarnessInputs(options: {
   if (!options.observationOnly) {
     await loadHostCliContract(contractRoot, options.pinnedHostVersion);
     await loadHostProviderConfigContract(contractRoot, options.pinnedHostVersion);
+    // T7 runs its rows on the V1 host as well, and that host needs its own
+    // captured provider observation; without it the leg would be configured by
+    // guess.
+    if (options.scenarios.some((scenario) => scenario.trajectory === "T7")) {
+      await loadV1HostProviderConfigContract(
+        contractRoot,
+        await readPinnedV1HostVersion(options.repoRoot),
+      );
+    }
     if (options.scenarios.some((scenario) => scenario.error_origin === "host")) {
       await loadHostSchemaRejectionContract(contractRoot, options.pinnedHostVersion);
     }

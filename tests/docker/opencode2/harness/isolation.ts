@@ -49,9 +49,11 @@ export async function createScenarioIsolation(options: {
   hostGeneration: "v1" | "v2";
   binaryPath?: string;
   mockBaseUrl: string;
-  model?: string;
   projectConfig?: Record<string, unknown>;
-  providerConfig?: Record<string, unknown>;
+  /** The provider object this host generation was observed to accept. */
+  providerConfig: Record<string, unknown>;
+  /** The opencode.json key that provider object goes under. */
+  providerConfigKey: string;
 }): Promise<ScenarioIsolation> {
   const safeId = options.scenarioId.replaceAll(/[^a-zA-Z0-9_.-]+/g, "-");
   await mkdir(options.parent, { recursive: true });
@@ -136,19 +138,7 @@ export async function createScenarioIsolation(options: {
     writeFile(join(pluginWrapper, "index.mjs"), wrapperModule(pluginEntry)),
   ]);
   const pluginDirectoryUrl = pathToFileURL(pluginWrapper).href;
-  const providerConfig = options.providerConfig
-    ? materializeProviderConfig(options.providerConfig, options.mockBaseUrl)
-    : {
-        openai: {
-          package: "@opencode/ai/providers/openai-compatible",
-          name: "deterministic aimock",
-          settings: {
-            baseURL: `${options.mockBaseUrl.replace(/\/$/, "")}/v1`,
-            apiKey: "{env:OPENAI_API_KEY}",
-          },
-          models: { [options.model ?? "mock-model"]: { name: "Deterministic mock" } },
-        },
-      };
+  const providerConfig = materializeProviderConfig(options.providerConfig, options.mockBaseUrl);
   const opencodeDir = join(paths.config, "opencode");
   await mkdir(opencodeDir, { recursive: true });
   const hostConfig = join(opencodeDir, "opencode.json");
@@ -158,7 +148,11 @@ export async function createScenarioIsolation(options: {
       {
         $schema: "https://opencode.ai/config.json",
         plugin: [pluginDirectoryUrl],
-        providers: providerConfig,
+        // Which key holds the providers is part of the captured contract, not a
+        // harness choice: V2 reads `providers`, V1 reads `provider` and logs
+        // `["providers"]` as "unsupported" before leaving itself with no
+        // provider at all, so the run dies on a model it cannot resolve.
+        [options.providerConfigKey]: providerConfig,
       },
       null,
       2,
