@@ -140,7 +140,7 @@ describe("the break-glass ask belongs to the fallback path alone", () => {
     ).toThrow("raised no host-fallback ask");
   });
 
-  test("an allowed fallback row that raised the ask took the declared path", () => {
+  test("an allowed fallback row that raised the ask reached the break-glass path", () => {
     expect(() =>
       assertBashFallbackAskIdentity(scenario("bash/T3/fallback_ask_allow"), {
         resultText: "",
@@ -149,7 +149,7 @@ describe("the break-glass ask belongs to the fallback path alone", () => {
     ).not.toThrow();
   });
 
-  test("a loop row with neither mark took the declared path", () => {
+  test("a loop row with neither mark ran through AFT, as its configuration declares", () => {
     expect(() =>
       assertBashFallbackAskIdentity(scenario("bash/T3/loop_ask_allow"), {
         resultText: "loop permission fixture",

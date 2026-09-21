@@ -824,8 +824,9 @@ async function runOneScenario(options: {
     // rows have been watched doing the same thing.
     if (scenario.id.startsWith("bash/T3/")) assertConfigDenyHidesTool(scenario, mock.exchanges);
     // Ahead of the generic permission assertion: when a bash row's declared
-    // path is the one that raises its own ask, "which ask is missing" is the
-    // more specific account of the same absence.
+    // execution path (the AFT loop, or the break-glass fallback) is the one
+    // that raises its own ask, "which ask is missing" is the more specific
+    // account of the same absence.
     assertBashFallbackAskIdentity(scenario, {
       resultText: scriptedResultText(scenario, mock.exchanges),
       events: hostEvents?.events ?? [],

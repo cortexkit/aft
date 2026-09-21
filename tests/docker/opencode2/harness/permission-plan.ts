@@ -243,7 +243,7 @@ export function bashHostFallbackObserved(observed: BashPermissionPathObservation
   );
 }
 
-/** Which of the two declared bash permission paths a row is, if either. */
+/** Which of the two declared bash execution paths a row is, if either. */
 function bashPermissionFamily(scenario: ScenarioDefinition): "loop" | "fallback" | undefined {
   if (scenario.id.startsWith("bash/T3/loop_")) return "loop";
   if (scenario.id.startsWith("bash/T3/fallback_")) return "fallback";
@@ -256,7 +256,7 @@ function bashPermissionAllowed(scenario: ScenarioDefinition): boolean {
 }
 
 /**
- * Assert which path a bash permission row actually took.
+ * Assert which of the two execution paths a bash permission row took.
  *
  * The two families are selected by declared configuration, and each has its
  * own ask site. The loop family keeps AFT's transport alive, so the engine
