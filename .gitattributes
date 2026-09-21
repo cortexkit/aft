@@ -13,3 +13,12 @@ crates/aft/tests/fixtures/callgraph/truncation/*.txt text eol=lf
 # Bash-surface fixtures: input.txt is the compressor input and is compared
 # line-for-line against the rendered output; keep LF on every platform.
 crates/aft/tests/fixtures/bash/** text eol=lf
+# The real-query vector pack and the digest-pinned JSON beside it are hashed
+# byte-for-byte against pins captured from LF bytes (`embedding_pack_sha256`
+# in the manifest, `manifest.sha256`, and the sibling definition digests
+# imports_resolve.py checks). A default Windows checkout with
+# `core.autocrlf=true` writes CRLF and fails those pins before the gate can
+# run, so the checked-out bytes have to be the pinned bytes on every autocrlf
+# setting.
+benchmarks/aft-search/*.json text eol=lf
+benchmarks/aft-search/manifest.sha256 text eol=lf
