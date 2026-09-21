@@ -77,6 +77,13 @@ human-readable log message is used as a gate input.
   structured `slow tool_call` records whose total is greater than two seconds.
 - A regression prints the metric, baseline, observed minimum, allowed limit, and
   the three largest numeric `index_event` deltas for the selected observation.
+- Every repository also prints an `OBSERVED` line with both runs' values for
+  every metric, on every run, whether or not it is about to fail. Printing values
+  only beside a regression censors the record exactly where a noise question
+  needs it, because the runs that passed are the runs whose numbers are missing.
+  The run additionally prints the core count and total memory it measured on,
+  since peak RSS and CPU seconds depend on both and the job log names only the
+  runner image.
 
 The committed tolerance is per metric. Timing uses a 3,000 ms floor because
 process startup and the first scheduler poll dominate tiny runs.
@@ -177,24 +184,133 @@ already failing for an unrelated reason. A gate that is always red cannot
 report a regression; that is the whole cost of leaving a broken baseline in
 place.
 
-### Open: `jupyterlab` peak RSS, 2026-09-21
+### The second step: `jupyterlab` peak RSS, still open on cause
 
-One finding survives the re-capture. On 2026-09-21 `jupyterlab` moved from
-596.3/598.0 MB to 719.8/753.2 MB with CPU seconds going 119/120 to 137/138 and
-callgraph wall time up only 2.8%. Both runs moved together, so it is not a
-single noisy sample, and it is more CPU for nearly the same wall time.
+On 2026-09-21 `jupyterlab` moved from 596.3/598.0 MB to 719.8/753.2 MB with CPU
+seconds going 119/120 to 137/138 and callgraph wall time up only 2.8%. Both
+runs moved together, so it was never a single noisy sample. The previous entry
+left it open because an A/B of the two nightly revisions built and measured
+locally gave 540.5 → 556.1 MB, +2.9%: the effect did not reproduce off the
+runner, and the next step it named was to bisect it on the runner.
 
-What is known: the runner image was identical on both nights
-(`20260907.300.1`); `synthetic-24k` did not move; the other three repositories
-moved 1.7–6.4% while `jupyterlab` moved 20.7%. An A/B of the two nightly
-revisions built and measured locally gives 540.5 → 556.1 MB, +2.9%, inside the
-run-to-run band — the effect does not reproduce off the runner.
+Measured on the runner it reproduces exactly, and it is a code step rather than
+noise or a change of machine.
 
-Because it does not reproduce locally, the next step is to bisect it *on the
-runner*: dispatch this workflow with `repo: jupyterlab` at the two nightly
-heads (`7a936156c` and `8802cf0fb`) and bisect the 146 commits between them
-from there. The gate keeps reporting it in the meantime, which is the correct
-behaviour for a step nobody has explained.
+#### The A/B
+
+`workflow_dispatch` on the two heads, with the comparator, the baseline and the
+workflow held at their current versions in every case. `oss-matrix.py`, which
+does the measuring, is byte-identical across the whole window, so the binary is
+the only thing that varies. Every run below is github-hosted `ubuntu-24.04`,
+image `20260907.300.1`, 4 cores, 15.6 GiB, and every dispatch ran on
+2026-09-21 between 15:01 and 16:35 UTC.
+
+| Head | Context | Peak RSS MB (run-1/run-2) | CPU s | callgraph ms |
+| --- | --- | ---: | ---: | ---: |
+| `7a936156c` | full matrix, nightly `35497655316` (09-20) | 596.3 / 598.0 | 119/120 | 96,667 |
+| `7a936156c` | full matrix, dispatch `35622032508` | 606.1 / 599.3 | 130/129 | 106,834/106,546 |
+| `8802cf0fb` | full matrix, nightly `35575393418` (09-21) | 719.8 / 753.2 | 137/138 | 99,290 |
+| `947a55b59` (`main`) | full matrix, dispatch `35618067728` | 779.5 / 729.8 | 138/138 | 99,270/99,469 |
+| `947a55b59` (`main`) | full matrix, dispatch `35620290379` | 669.8 / 701.2 | 84/85 | 71,150/69,802 |
+| `947a55b59` (`main`) | **`--repo jupyterlab` alone**, dispatch `35616093361` | 599.3 / 598.8 | 78/76 | 68,417/67,559 |
+
+Four full-matrix observations at the old head span 596.3–606.1 MB, a spread of
+1.6%. Six at the new head span 669.8–779.5 MB. **The two ranges do not
+overlap**, and the gap between them is larger than either. This is not the tail
+of a wide distribution; it is two distributions.
+
+#### Why it never reproduced
+
+The last row is the reason. Current `main` measuring `jupyterlab` **on its
+own** reads 599.3/598.8 — the old head's number, from a binary that contains the
+step. The extra memory only appears when `jupyterlab` is indexed inside the full
+five-repository matrix. Any A/B that measures the repository by itself, locally
+or on the runner, sees nothing, which is exactly what the earlier +2.9% local
+comparison reported.
+
+What the matrix adds is machine state, not AFT state: each repository gets a
+fresh process and a cold storage directory, but the job clones all five
+repositories up front and `jupyterlab` is indexed third, after `redox` and
+`typescript-eslint` have already run. Naming the mechanism means naming which
+part of that the step is sensitive to, and that is not yet established.
+
+#### It is only `jupyterlab`, and it is not the host
+
+The same runs, old head against `main`, for every other repository:
+
+| Repo | `7a936156c` | `main` dispatch A | `main` dispatch B |
+| --- | ---: | ---: | ---: |
+| `redox` | 131.9 / 126.2 | 129.2 / 134.9 | 119.6 / 123.4 |
+| `typescript-eslint` | 801.4 / 848.6 | 821.2 / 817.1 | 815.6 / 841.0 |
+| `hugo` | 420.7 / 421.1 | 430.4 / 424.7 | 432.1 / 458.1 |
+| `synthetic-24k` | 59.3 / 59.9 | 59.1 / 59.7 | 60.1 / 60.2 |
+
+Every one of those overlaps between the two heads. Only `jupyterlab` separates.
+
+Host speed is not the variable either, and the two `main` runs prove it: they
+differ by 100 seconds of job wall time (402.2 s against 299.6 s) and by 54 CPU
+seconds on `jupyterlab` itself, yet both land in the high range. The old head
+ran on the slowest host of the five dispatches (438.3 s, and the longest
+`jupyterlab` callgraph build of any run at 106.8 s) and still landed in the low
+range. A slower machine did not produce more memory; a different binary did.
+
+#### Where the bisect stands
+
+Classifying a candidate by the gate's own statistic, the two-run minimum:
+
+| Position in the 146-commit window | Commit | Peak RSS MB | Verdict |
+| ---: | --- | ---: | --- |
+| 0 | `7a936156c` | 596.3 / 598.0, 606.1 / 599.3 | before the step |
+| 73 | `f5c051dd4` | 601.2 / 668.0 | before the step |
+| 146 | `8802cf0fb` | 719.8 / 753.2 | after the step |
+
+Commit 73 is classified by its two-run minimum of 601.2, but it deserves a
+warning label: its two runs sit 66.8 MB apart, where the old head's four runs
+sit within 9.8 MB of each other. A candidate whose own two runs straddle the gap
+is not cleanly on either side, so the upper-half conclusion rests on one
+measurement that a second dispatch should confirm before anything is built on
+it.
+
+The remaining window is commits 74–146. It contains a cluster of SQLite WAL and
+mapping changes (`914d42a9c` "protect live SQLite file sets and persist
+callgraph WAL", `7625ae313` "drop unnecessary persistent WAL policy",
+`1c8e5df50` "keep view durability inside SQLite", `cd55a386e` "preserve SQLite
+locks during WAL accounting"). That is a candidate mechanism and not a finding:
+a WAL that is retained rather than checkpointed is a file-backed mapping, and
+`ps` counts resident file-backed pages in RSS, which would charge the largest
+callgraph database in the matrix the most. `jupyterlab` has that database.
+Nobody has measured this; it is written down to say where to look next, not to
+claim the answer.
+
+#### The row stays red
+
+The baseline is unchanged at 596.3 MB and `jupyterlab` keeps failing at
+719.8 MB against a 715.6 MB limit.
+
+That is deliberate. The number the gate reports is real, reproducible, caused by
+a change in our code, and still present in `main` — which is the definition of
+something a cost gate should be red about. Re-baselining it to 730 MB would
+record the step as a price without anyone having established what was bought,
+and this file already says why that is the wrong move: blessing a number you
+cannot explain is how a detector becomes a rubber stamp. A deliberate price gets
+re-baselined with its reason; a defect gets fixed; this one is not yet sorted
+into either, so it stays red until the bisect names the commit.
+
+The tolerance is also untouched. The observed spread at a fixed head is 1.6%
+against a 20% band, so nothing here is evidence that the band is too tight.
+Widening it to fit 730 MB would take a measured 20% step and declare it inside
+the noise, when the measurement says the noise is an order of magnitude smaller.
+
+#### A caveat about this metric's instrument
+
+Worth recording while it is in view: `peak_rss_mb` is the maximum of a
+`ps -o rss=` poll taken every two seconds, not the kernel's high-water mark from
+`/proc/<pid>/status`. Over a 70–107 second callgraph build that is 35–50 samples
+of a moving value, so the reported peak is a sample of the peak and never
+exceeds it. `VmHWM` is exact, free, and already available on the only platform
+this gate runs on. Changing it would invalidate all five baselines at once, so
+it is not part of this change, but it is the reason a single dispatch is weak
+evidence about a metric whose two runs disagree by 66.8 MB.
 
 ## Blessing an intentional cost change
 
