@@ -130,8 +130,8 @@
     {
       "scenario": "write/T7/happy",
       "tool": "write",
-      "field": "fixture_marker",
-      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+      "field": "write_outcome",
+      "reason": "Comparison projects the outcome line the write reports because host transports add presentation text around the tool result."
     }
   ]
 }

@@ -50,14 +50,12 @@
         "rules": [
           {
             "kind": "field",
-            "field": "fixture_marker",
-            "pattern": "^(?=[\\s\\S]*(?<value>created\\.txt))[\\s\\S]+$",
-            "min_lines": 1,
-            "max_lines": 10000
+            "field": "write_outcome",
+            "pattern": "^(?<value>Created new file\\.)$"
           }
         ],
         "expected": {
-          "fixture_marker": "created.txt"
+          "write_outcome": "Created new file."
         }
       }
     },
