@@ -10,14 +10,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import select
+import platform
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from ndjson_stream import NdjsonStream
 
 
 TOP_K = 5
@@ -53,7 +54,9 @@ class AftClient:
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
-        self._buf = b""
+        if self.proc.stdout is None:
+            raise AftProtocolError("aft stdout is closed")
+        self._stream = NdjsonStream(self.proc.stdout)
         self._next_id = 0
 
     def close(self) -> None:
@@ -149,26 +152,11 @@ class AftClient:
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 raise AftProtocolError(f"aft exited with code {self.proc.returncode}")
-            if self.proc.stdout is None:
-                raise AftProtocolError("aft stdout is closed")
-            ready, _, _ = select.select([self.proc.stdout], [], [], 0.1)
-            if ready:
-                chunk = os.read(self.proc.stdout.fileno(), 65536)
-                if chunk:
-                    self._buf += chunk
-            while b"\n" in self._buf:
-                line, self._buf = self._buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    frame = json.loads(line.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
-                    continue
-                if frame.get("id") == request_id:
-                    return frame
-                # Push/progress frames have no matching id and are intentionally
-                # ignored by the benchmark transport.
+            frame = self._stream.read_frame(0.1)
+            if frame is not None and frame.get("id") == request_id:
+                return frame
+            # Push/progress frames have no matching id and are intentionally
+            # ignored by the benchmark transport.
         raise TimeoutError(f"timed out waiting for aft response id={request_id}")
 
 

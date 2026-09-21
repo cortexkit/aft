@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import select
 import shutil
 import subprocess
 import sys
@@ -20,6 +19,7 @@ from typing import Any, Iterator, Mapping, Optional, Sequence
 
 from embedding_fixture_server import Server
 from evidence_tree import evidence_tree_sha256
+from ndjson_stream import NdjsonStream
 from provision_evidence import evidence_root
 from search_quality_lib import (
     EVIDENCE_SHA,
@@ -72,7 +72,9 @@ class NdjsonClient:
             stderr=self._stderr,
             bufsize=0,
         )
-        self._buffer = b""
+        if self.proc.stdout is None:
+            raise AftProtocolError("aft_protocol:pipes_unavailable")
+        self._stream = NdjsonStream(self.proc.stdout)
         self._next_id = 0
 
     def close(self) -> None:
@@ -99,19 +101,9 @@ class NdjsonClient:
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 raise AftProtocolError(f"aft_protocol:process_exit:{self.proc.returncode}:{self.stderr_text()}")
-            ready, _, _ = select.select([self.proc.stdout], [], [], min(0.1, deadline - time.monotonic()))
-            if ready:
-                chunk = os.read(self.proc.stdout.fileno(), 65536)
-                if chunk:
-                    self._buffer += chunk
-            while b"\n" in self._buffer:
-                line, self._buffer = self._buffer.split(b"\n", 1)
-                try:
-                    frame = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if str(frame.get("id")) == request_id:
-                    return frame
+            frame = self._stream.read_frame(min(0.1, deadline - time.monotonic()))
+            if frame is not None and str(frame.get("id")) == request_id:
+                return frame
         raise AftProtocolError(f"aft_protocol:timeout:{command}:{self.stderr_text()}")
 
     def stderr_text(self) -> str:
