@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -66,6 +67,12 @@ DEFAULT_METRICS: dict[str, tuple[float, float]] = {
     "callgraph_first_query_ms": (25.0, 3_000.0),
 }
 WAITING_DEFAULT = (25.0, 1.0)
+# Peak RSS, CPU time and wall time are all properties of the machine that runs
+# the matrix, not only of the code under test.  A baseline captured on one
+# platform cannot bound another: the first seventeen scheduled runs compared a
+# macOS arm64 capture against a Linux x86_64 runner and reported the difference
+# between the two machines as a code regression every night.
+PLATFORM_KEY = "measured_on"
 WAITING_CAUSES = ("build", "limiter", "artifact_load", "resolver")
 COMPACT_RE = re.compile(r"^\d+/([^/]+)/[^/]+$")
 INDEX_EVENT_RE = re.compile(r"\bindex_event(?P<body>(?: [a-z_]+=[^ =]+)+)")
@@ -235,6 +242,16 @@ def read_run_csv(path: Path) -> list[RunData]:
     return result
 
 
+def current_platform() -> str:
+    """The identity a baseline must carry to be comparable with this run."""
+    return f"{platform.system().lower()}-{platform.machine()}"
+
+
+def metric_is_gated(value: Any) -> bool:
+    """False for a metric whose value is recorded but deliberately not compared."""
+    return not (isinstance(value, dict) and value.get("gated") is False)
+
+
 def baseline_metric(value: Any, metric: str) -> tuple[float, float, float]:
     if isinstance(value, dict):
         raw_value = value.get("value")
@@ -257,6 +274,10 @@ def baseline_metric(value: Any, metric: str) -> tuple[float, float, float]:
 
 
 def event_deltas(baseline: dict[str, Any], observed: dict[str, float]) -> list[tuple[str, float, float, float]]:
+    # With no recorded counts to compare against, every observed event would
+    # print as a change from zero and read as a regression diagnosis.
+    if not baseline:
+        return []
     deltas: list[tuple[str, float, float, float]] = []
     for key in set(baseline) | set(observed):
         try:
@@ -280,6 +301,11 @@ def compare_repo(repo: str, baseline_repo: dict[str, Any], runs: list[RunData]) 
     if not isinstance(raw_metrics, dict) or not raw_metrics:
         raise ValueError(f"baseline for {repo} has no metrics; run --write-baseline first")
     for metric, raw_baseline in sorted(raw_metrics.items()):
+        # A metric can be recorded without being compared.  The alternative --
+        # dropping it from the baseline -- loses the observation as well as the
+        # comparison, and hides that a deliberate decision was made.
+        if not metric_is_gated(raw_baseline):
+            continue
         before, tolerance, floor = baseline_metric(raw_baseline, metric)
         candidates = [(run.metrics.get(metric, 0.0 if metric.startswith("waiting_on.") else None), run) for run in ready_runs]
         available = [(value, run) for value, run in candidates if value is not None]
@@ -296,6 +322,9 @@ def compare_repo(repo: str, baseline_repo: dict[str, Any], runs: list[RunData]) 
 def validate_baseline(payload: dict[str, Any]) -> None:
     if payload.get("schema") != SCHEMA_VERSION:
         raise ValueError(f"baseline schema must be {SCHEMA_VERSION}")
+    measured_on = payload.get(PLATFORM_KEY)
+    if not isinstance(measured_on, dict) or not isinstance(measured_on.get("platform"), str) or not measured_on["platform"]:
+        raise ValueError(f"baseline must record {PLATFORM_KEY}.platform, the platform string it was captured on")
     repos = payload.get("repos")
     if not isinstance(repos, dict) or tuple(repos) != REPO_ORDER:
         # JSON object order is intentional here: it makes the fixed matrix
@@ -315,6 +344,11 @@ def validate_baseline(payload: dict[str, Any]) -> None:
                 raise ValueError(f"baseline repository {name} must carry a 40-character commit SHA")
         elif config.get("version") != SYNTHETIC_VERSION:
             raise ValueError(f"baseline synthetic repository must be {SYNTHETIC_VERSION}")
+        for metric, raw in (config.get("metrics") or {}).items():
+            # Leaving a metric out of the gate is a decision someone has to be
+            # able to read back, so the reason travels with the exclusion.
+            if not metric_is_gated(raw) and not str(raw.get("ungated_reason", "")).strip():
+                raise ValueError(f"baseline metric {name}.{metric} is ungated without an ungated_reason")
 
 
 def load_baseline(path: Path) -> dict[str, Any]:
@@ -475,7 +509,38 @@ def metric_object(raw: Any, metric: str, value: float) -> dict[str, float]:
         _old, tolerance, floor = baseline_metric(raw, metric)
     else:
         tolerance, floor = DEFAULT_METRICS.get(metric, WAITING_DEFAULT)
-    return {"value": round(value, 3), "tolerance_pct": tolerance, "absolute_floor": floor}
+    written: dict[str, Any] = {"value": round(value, 3), "tolerance_pct": tolerance, "absolute_floor": floor}
+    # A re-capture records a fresh number for an ungated metric but must not
+    # quietly put it back under the gate: the reason it was excluded is about
+    # the metric, not about the values of any one capture.
+    if isinstance(raw, dict) and raw.get("gated") is False:
+        written["gated"] = False
+        written["ungated_reason"] = raw.get("ungated_reason", "")
+    return written
+
+
+def repo_metrics_from_runs(name: str, config: dict[str, Any], runs: list[RunData]) -> dict[str, Any]:
+    """The two-run minimum per metric, in the shape the baseline stores."""
+    ready = [run for run in runs if run.ready]
+    if not ready:
+        raise RuntimeError(f"cannot write baseline: {name} was not ready in either run")
+    old_metrics = config.get("metrics", {}) if isinstance(config.get("metrics", {}), dict) else {}
+    all_metrics = set(old_metrics)
+    for run in ready:
+        all_metrics.update(run.metrics)
+    # Every fixed repo must carry every core metric, even if a future runner
+    # emitted a gap.  Baseline generation fails rather than blessing n/a.
+    for metric in DEFAULT_METRICS:
+        if not all(metric in run.metrics for run in ready):
+            raise RuntimeError(f"cannot write baseline: {name} missing {metric}")
+        all_metrics.add(metric)
+    metrics: dict[str, Any] = {}
+    for metric in sorted(all_metrics):
+        values = [value for value in (run.metrics.get(metric) for run in ready) if value is not None]
+        if not values:
+            continue
+        metrics[metric] = metric_object(old_metrics.get(metric), metric, min(values))
+    return metrics
 
 
 def write_baseline(
@@ -494,34 +559,63 @@ def write_baseline(
         "source_commit": run_command(["git", "rev-parse", "HEAD"], cwd=repo_root, timeout=30).stdout.strip(),
         "date": date.today().isoformat(),
     }
+    payload[PLATFORM_KEY] = {
+        "platform": current_platform(),
+        "provenance": f"local --write-baseline on {current_platform()}",
+    }
     for name in names:
         runs = runs_by_repo[name]
-        ready = [run for run in runs if run.ready]
-        if not ready:
-            raise RuntimeError(f"cannot write baseline: {name} was not ready in either run")
         config = payload["repos"][name]
-        old_metrics = config.get("metrics", {}) if isinstance(config.get("metrics", {}), dict) else {}
-        all_metrics = set(old_metrics)
-        for run in ready:
-            all_metrics.update(run.metrics)
-        # Every fixed repo must carry every core metric, even if a future runner
-        # emitted a gap.  Baseline generation fails rather than blessing n/a.
-        for metric in DEFAULT_METRICS:
-            if not all(metric in run.metrics for run in ready):
-                raise RuntimeError(f"cannot write baseline: {name} missing {metric}")
-            all_metrics.add(metric)
-        metrics: dict[str, Any] = {}
-        for metric in sorted(all_metrics):
-            values = [run.metrics.get(metric) for run in ready]
-            values = [value for value in values if value is not None]
-            if not values:
-                continue
-            metrics[metric] = metric_object(old_metrics.get(metric), metric, min(values))
-        config["metrics"] = metrics
+        config["metrics"] = repo_metrics_from_runs(name, config, runs)
         config["index_events"] = best_run(runs).events
         config["sample"] = {"runs": 2, "selection": "minimum observed value per metric"}
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     print(f"wrote baseline {path}")
+
+
+def write_baseline_from_results(
+    path: Path,
+    old_payload: dict[str, Any],
+    results_dir: Path,
+    measured_on: str,
+    provenance: str,
+) -> int:
+    """Bless a matrix that already ran elsewhere, from its uploaded CSVs.
+
+    The scheduled workflow measures on its own runner and a developer machine
+    cannot reproduce those numbers, so the blessing path has to be able to take
+    the runner's own results rather than re-measuring here.
+    """
+    csv_paths = sorted(results_dir.rglob("oss-matrix-run-*.csv"))
+    if len(csv_paths) != 2:
+        raise RuntimeError(f"expected exactly two oss-matrix-run-*.csv files under {results_dir}, found {len(csv_paths)}")
+    runs_by_repo: dict[str, list[RunData]] = defaultdict(list)
+    for csv_path in csv_paths:
+        for run in read_run_csv(csv_path):
+            runs_by_repo[run.repo].append(run)
+    incomplete = [name for name in REPO_ORDER if len(runs_by_repo.get(name, [])) != 2]
+    if incomplete:
+        raise RuntimeError(f"results are not a complete two-run matrix; incomplete: {', '.join(incomplete)}")
+    payload = json.loads(json.dumps(old_payload))
+    payload["schema"] = SCHEMA_VERSION
+    payload["generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    payload[PLATFORM_KEY] = {"platform": measured_on, "provenance": provenance}
+    for name in REPO_ORDER:
+        config = payload["repos"][name]
+        config["metrics"] = repo_metrics_from_runs(name, config, runs_by_repo[name])
+        # Event counts are parsed from the per-repo AFT logs, which are only
+        # present when the artifact carried them.  Keeping another capture's
+        # counts here would make the regression diagnostics describe a run that
+        # never happened, so an absent log set records as absent.
+        events = best_run(runs_by_repo[name]).events
+        config["index_events"] = events
+        config["sample"] = {"runs": 2, "selection": "minimum observed value per metric"}
+        if not events:
+            print(f"note: {name} index_event counts are not in these results; event deltas will be omitted until the next capture")
+    validate_baseline(payload)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    print(f"wrote baseline {path} from {results_dir} (measured on {measured_on})")
+    return 0
 
 
 def print_regressions(repo: str, regressions: list[Regression], baseline_repo: dict[str, Any]) -> None:
@@ -614,10 +708,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget-min", type=float, default=float(os.environ.get("AFT_COST_GATE_BUDGET_MIN", "45")))
     parser.add_argument("--repo", choices=REPO_ORDER, help="Run and compare one fixed repository")
     parser.add_argument("--write-baseline", action="store_true", help="Bless the two-run minimum as the committed baseline")
+    parser.add_argument("--write-baseline-from", type=Path, help="Bless an already-measured results directory (a downloaded workflow artifact) instead of measuring here")
+    parser.add_argument("--measured-on", help="Platform string those results were captured on, for example linux-x86_64 (required with --write-baseline-from)")
+    parser.add_argument("--provenance", help="Where those results came from, recorded in the baseline (required with --write-baseline-from)")
+    parser.add_argument("--ignore-platform", action="store_true", help="Compare against a baseline captured on another platform; the numbers are not comparable, so this never gates")
     parser.add_argument("--self-test", action="store_true", help="Run the synthetic comparator self-test")
     args = parser.parse_args()
     if args.budget_min <= 0:
         parser.error("--budget-min must be greater than zero")
+    if args.write_baseline_from and not (args.measured_on and args.provenance):
+        parser.error("--write-baseline-from requires --measured-on and --provenance")
     return args
 
 
@@ -627,6 +727,23 @@ def main() -> int:
         return self_test()
     repo_root = Path(__file__).resolve().parents[2]
     baseline = load_baseline(args.baseline.resolve())
+    if args.write_baseline_from:
+        return write_baseline_from_results(
+            args.baseline.resolve(), baseline, args.write_baseline_from.expanduser().resolve(),
+            args.measured_on, args.provenance,
+        )
+    # Peak RSS, CPU seconds and wall times are properties of the machine as much
+    # as of the code.  Comparing across platforms does not produce a weaker
+    # signal, it produces a wrong one, so say which two platforms disagree
+    # instead of reporting the gap between them as a regression.
+    recorded_platform = baseline[PLATFORM_KEY]["platform"]
+    if recorded_platform != current_platform() and not args.ignore_platform:
+        print(
+            f"cost-gate: baseline was captured on {recorded_platform}; this run measures on {current_platform()}. "
+            f"Re-capture on this platform, or pass --ignore-platform to measure without gating.",
+            file=sys.stderr,
+        )
+        return 2
     names = [args.repo] if args.repo else list(REPO_ORDER)
     cache_dir = args.cache_dir.expanduser().resolve()
     results_dir = args.results_dir.expanduser().resolve()
@@ -656,6 +773,9 @@ def main() -> int:
             print_regressions(name, regressions, baseline["repos"][name])
         else:
             print(f"PASS {name}: two-run minimum is within baseline")
+    if args.ignore_platform and recorded_platform != current_platform():
+        print(f"cost-gate: measured on {current_platform()} against a {recorded_platform} baseline; not gating", file=sys.stderr)
+        return 0
     return 1 if failed else 0
 
 

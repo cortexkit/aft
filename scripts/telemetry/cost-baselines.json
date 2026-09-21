@@ -6,6 +6,10 @@
     "source_commit": "84907c391b51e0bd826c71d2150cea785402a9b3",
     "date": "2026-09-04"
   },
+  "measured_on": {
+    "platform": "darwin-arm64",
+    "provenance": "local --write-baseline on the development machine, 2026-09-04"
+  },
   "repos": {
     "redox": {
       "kind": "git",
@@ -464,7 +468,9 @@
         "callgraph_resolution_share_pct": {
           "value": 1.724,
           "tolerance_pct": 20.0,
-          "absolute_floor": 5.0
+          "absolute_floor": 5.0,
+          "gated": false,
+          "ungated_reason": "The synthetic tree holds one Rust file, so its callgraph build finishes in about 10 ms and the resolution stage rounds to 1 ms. The share is then 1 divided by the whole build, and every value this metric has reported on this corpus is one of 1/9, 1/10, 1/11, 1/12, 1/13 or 1/14 - a smallest possible step of roughly 8 percentage points against a 20 percent tolerance band. The 2026-09-04 capture read 1/58 only because that machine took 58 ms for the same build. No baseline value survives a metric whose quantum is larger than its tolerance, so the number is recorded and not compared; the timing metrics it is derived from stay gated."
         },
         "cpu_seconds": {
           "value": 6.97,
