@@ -164,7 +164,7 @@
                 "id": "search-t6-search-payload-results-complete",
                 "name": "aft_search",
                 "arguments": {
-                  "query": "uniqueScenarioSymbol",
+                  "query": "^export const one",
                   "topK": 10
                 },
                 "non_mutating_evidence": {
@@ -215,7 +215,7 @@
                 "id": "search-t6-search-payload-results-incomplete",
                 "name": "aft_search",
                 "arguments": {
-                  "query": "bulkScenarioSymbol",
+                  "query": "^export const bulkScenarioSymbol",
                   "topK": 1
                 },
                 "non_mutating_evidence": {
@@ -244,8 +244,8 @@
           "owner": "search",
           "call_id": "search-t6-search-payload-results-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "cap",
-          "expected_trailer": "shown 1 of ≥2 results (cap) · narrow: offset, topK, path, includeTests"
+          "triggered_reason": "budget",
+          "expected_trailer": "shown 1 of ≥2 results (budget) · narrow: offset, topK, path, includeTests"
         }
       }
     }
