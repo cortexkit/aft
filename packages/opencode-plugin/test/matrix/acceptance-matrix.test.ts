@@ -178,7 +178,11 @@ describe("OpenCode V2 delta audit evidence", () => {
     // declaration is never mistaken for evidence that a plugin can call it.
     expect(content).toContain("PermissionCreateInput");
     expect(content).toContain("issues/37164");
-    expect(content).toContain("opencode-ai@1.18.29");
+    // Which package LINE the upstream issue is filed against is the load-bearing
+    // fact — a V1 defect cannot excuse a V2 row. The version is deliberately not
+    // asserted here: it belongs to the upstream issue rather than to our pin,
+    // and a literal in a file the harness loads is what the pin guard forbids.
+    expect(content).toContain("opencode-ai@");
   });
 });
 

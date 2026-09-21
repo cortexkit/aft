@@ -4,7 +4,7 @@
 - Checkout: `3e8d686aff651f8d151d8ee23aa7e453b8d90c80`
 - V2 host the harness actually ran: `@opencode/cli@2.0.3` (see "A note on which host this measures")
 - V2 host the plugin now pins: `@opencode/plugin@2.0.11`
-- Pinned V1 host: `opencode-ai@1.18.30` (`.github/opencode-version.txt`)
+- Pinned V1 host: `opencode-ai` at the version in `.github/opencode-version.txt`
 - Contract audit: `delta-audit-ga-2.0.11.md`
 
 This is the honest list, grouped by mechanism and attributed. It is a report, not a repair.
@@ -145,7 +145,7 @@ T7 is the only trajectory that runs the V1 host. It is materialized from each to
 Two qualifications:
 
 1. **No V2 contract point proves it, and none can.** 48340 is a V1 defect; the V1 host is pinned separately and did not move. "Does it still hold at the new pin" has the answer: the new pin is not the pin that governs it.
-2. **It was not re-verified at 1.18.30.** The issue names 1.18.29; the harness pins 1.18.30; 1.18.31 exists. An open issue is not proof a later build still hangs, and no T7 scenario was executed. The label is retained on the strength of the issue and the path, not an observation at the pinned version.
+2. **It was not re-verified at the pinned build.** The issue names 1.18.29; the harness pins a later 1.18.x (see `.github/opencode-version.txt`), and a later build exists again. An open issue is not proof a later build still hangs, and no T7 scenario was executed. The label is retained on the strength of the issue and the path, not an observation at the pinned version.
 
 T7 also inherits T1: for every tool in mechanism A the T7 V2 leg fails on the refusal before parity is compared, so 48340 was never the only thing failing those rows.
 
@@ -164,4 +164,4 @@ T7 also inherits T1: for every tool in mechanism A the T7 V2 leg fails on the re
 1. Does a GA model call to `glob`/`grep` reach AFT's tool or the host's native? The harness says AFT's; the live GA run implies otherwise. Decides whether those rows measure anything a user reaches.
 2. Does a supported GA mechanism exist for a plugin to initiate a permission decision? Owned by the task holding `src/permissions/v2.ts`. Decides whether the thirty rows stay `applicable`.
 3. Does `aft_import` hang reproducibly, and where?
-4. Does `opencode-ai@1.18.30` still fail to dispose? Decides all 23 T7 rows.
+4. Does the pinned `opencode-ai` build still fail to dispose? Decides all 23 T7 rows.

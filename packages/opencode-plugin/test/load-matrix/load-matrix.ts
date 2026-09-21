@@ -1414,6 +1414,12 @@ describe("packed module shapes", () => {
     const files = await fixtureFiles(join(pluginRoot, "test"));
     const literals: string[] = [];
     for (const path of files) {
+      // Prose is exempt. The guard exists so nothing the harness LOADS carries
+      // a second copy of the pin that can drift from the repository's one
+      // source; a written record cites versions as evidence — which upstream
+      // issue named which build — and stripping those would destroy the
+      // finding rather than protect it.
+      if (path.endsWith(".md")) continue;
       const text = await readFile(path, "utf8");
       if (/\b1\.18\.\d+\b/.test(text)) literals.push(path);
     }
