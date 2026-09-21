@@ -33,4 +33,6 @@ pub use phase_log::{
     format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectPhaseLogSnapshot,
 };
-pub use tier2_scheduler::{Tier2DispatchBlock, Tier2RefreshScheduler, Tier2TriggerReason};
+pub use tier2_scheduler::{
+    Tier2DispatchBlock, Tier2ExternalGates, Tier2RefreshScheduler, Tier2TriggerReason,
+};

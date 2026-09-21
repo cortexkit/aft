@@ -48,6 +48,8 @@ pub enum Tier2DispatchBlock {
     InFlight,
     /// The semantic cold seed owns the machine until it finishes.
     SemanticColdSeed,
+    /// This root's callgraph store is still being cold-built.
+    CallgraphColdBuild,
     /// The first scan after configure is still inside its cold-cache delay.
     ColdCacheDelay,
     /// A dispatch the cold-build limiter turned away is waiting out its retry
@@ -64,11 +66,29 @@ impl Tier2DispatchBlock {
             Self::ReadOnly => "read_only",
             Self::InFlight => "tier2_in_flight",
             Self::SemanticColdSeed => "semantic_cold_seed",
+            Self::CallgraphColdBuild => "callgraph_cold_build",
             Self::ColdCacheDelay => "cold_cache_delay",
             Self::DeferralBackoff => "deferral_backoff",
             Self::NoTrigger => "deadline_without_trigger",
         }
     }
+}
+
+/// Work on the same root, outside this scheduler, that a dispatch must wait
+/// for. These are conditions other planes own, so they are passed in on every
+/// tick rather than remembered here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Tier2ExternalGates {
+    /// The semantic cold seed owns the machine until it finishes.
+    pub semantic_cold_seed_active: bool,
+    /// This root's callgraph store is being built from cold in the background.
+    ///
+    /// A Tier-2 scan reads the very store that build is still filling, and its
+    /// own peak memory lands on top of the build's instead of after it, so the
+    /// two together cost far more than either alone. Waiting costs nothing the
+    /// scan needs: the demand stays pending and dispatches once the build
+    /// publishes.
+    pub callgraph_cold_build_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -142,16 +162,22 @@ impl Tier2RefreshScheduler {
         can_write: bool,
         in_flight: bool,
     ) -> Option<Tier2TriggerReason> {
-        self.tick_with_semantic_gate(now, changed_path_count, can_write, in_flight, false)
+        self.tick_with_gates(
+            now,
+            changed_path_count,
+            can_write,
+            in_flight,
+            Tier2ExternalGates::default(),
+        )
     }
 
-    pub fn tick_with_semantic_gate(
+    pub fn tick_with_gates(
         &mut self,
         now: Instant,
         changed_path_count: usize,
         can_write: bool,
         in_flight: bool,
-        semantic_cold_seed_active: bool,
+        gates: Tier2ExternalGates,
     ) -> Option<Tier2TriggerReason> {
         if changed_path_count > 0 {
             self.record_changes(now, changed_path_count);
@@ -161,7 +187,11 @@ impl Tier2RefreshScheduler {
             return None;
         }
 
-        if semantic_cold_seed_active {
+        if gates.semantic_cold_seed_active {
+            return None;
+        }
+
+        if gates.callgraph_cold_build_active {
             return None;
         }
 
@@ -290,7 +320,7 @@ impl Tier2RefreshScheduler {
         now: Instant,
         can_write: bool,
         in_flight: bool,
-        semantic_cold_seed_active: bool,
+        gates: Tier2ExternalGates,
     ) -> Option<Tier2DispatchBlock> {
         let due = self.dispatch_due(now);
         if !due {
@@ -301,8 +331,10 @@ impl Tier2RefreshScheduler {
             Tier2DispatchBlock::ReadOnly
         } else if in_flight {
             Tier2DispatchBlock::InFlight
-        } else if semantic_cold_seed_active {
+        } else if gates.semantic_cold_seed_active {
             Tier2DispatchBlock::SemanticColdSeed
+        } else if gates.callgraph_cold_build_active {
+            Tier2DispatchBlock::CallgraphColdBuild
         } else if self.deferral_backoff_pending(now) {
             Tier2DispatchBlock::DeferralBackoff
         } else if !self.cold_delay_elapsed(now) {
@@ -408,6 +440,24 @@ mod tests {
         let mut scheduler = Tier2RefreshScheduler::new();
         scheduler.reset_after_configure(base);
         (scheduler, base)
+    }
+
+    fn no_gates() -> Tier2ExternalGates {
+        Tier2ExternalGates::default()
+    }
+
+    fn semantic_cold_seed() -> Tier2ExternalGates {
+        Tier2ExternalGates {
+            semantic_cold_seed_active: true,
+            ..Tier2ExternalGates::default()
+        }
+    }
+
+    fn callgraph_cold_build() -> Tier2ExternalGates {
+        Tier2ExternalGates {
+            callgraph_cold_build_active: true,
+            ..Tier2ExternalGates::default()
+        }
     }
 
     #[test]
@@ -545,7 +595,7 @@ mod tests {
         let warm = base + TIER2_REFRESH_COLD_CACHE_DELAY;
 
         assert_eq!(
-            scheduler.tick_with_semantic_gate(warm, 0, true, false, true),
+            scheduler.tick_with_gates(warm, 0, true, false, semantic_cold_seed()),
             None
         );
         assert!(
@@ -553,18 +603,18 @@ mod tests {
             "configure-warm scan must remain pending while a cold semantic seed is active"
         );
         assert_eq!(
-            scheduler.tick_with_semantic_gate(warm + Duration::from_secs(1), 0, true, false, false),
+            scheduler.tick_with_gates(warm + Duration::from_secs(1), 0, true, false, no_gates()),
             Some(Tier2TriggerReason::ConfigureWarm)
         );
 
         assert!(scheduler.request_pull(true));
         assert_eq!(
-            scheduler.tick_with_semantic_gate(
+            scheduler.tick_with_gates(
                 warm + TIER2_REFRESH_MIN_INTERVAL,
                 0,
                 true,
                 false,
-                true
+                semantic_cold_seed()
             ),
             None
         );
@@ -573,13 +623,81 @@ mod tests {
             "pull demand must not be consumed while a cold semantic seed is active"
         );
         assert_eq!(
-            scheduler.tick_with_semantic_gate(
+            scheduler.tick_with_gates(
                 warm + TIER2_REFRESH_MIN_INTERVAL + Duration::from_secs(1),
                 0,
                 true,
                 false,
-                false,
+                no_gates(),
             ),
+            Some(Tier2TriggerReason::Pull)
+        );
+    }
+
+    /// A Tier-2 scan reads the callgraph store the cold build is still filling,
+    /// and pays its own peak memory on top of the build's. The scan is held, not
+    /// dropped: it runs as soon as the build publishes.
+    #[test]
+    fn callgraph_cold_build_defers_the_scan_until_the_build_finishes() {
+        let (mut scheduler, base) = configured_scheduler();
+        let warm = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+
+        assert_eq!(
+            scheduler.tick_with_gates(warm, 0, true, false, callgraph_cold_build()),
+            None,
+            "a configure-warm scan must not start on top of the callgraph cold build"
+        );
+        assert!(
+            scheduler.configure_warm_pending,
+            "the deferred scan must stay pending rather than being dropped"
+        );
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(
+                warm + Duration::from_secs(1),
+                true,
+                false,
+                callgraph_cold_build()
+            ),
+            Some(Tier2DispatchBlock::CallgraphColdBuild),
+            "an operator must be able to see which build the refresh is waiting on"
+        );
+
+        // A build that outlives the timer by minutes keeps holding the scan;
+        // the trigger is the build finishing, not a longer delay.
+        assert_eq!(
+            scheduler.tick_with_gates(
+                warm + Duration::from_secs(300),
+                0,
+                true,
+                false,
+                callgraph_cold_build()
+            ),
+            None
+        );
+
+        assert_eq!(
+            scheduler.tick_with_gates(warm + Duration::from_secs(301), 0, true, false, no_gates()),
+            Some(Tier2TriggerReason::ConfigureWarm),
+            "the held scan must dispatch as soon as the cold build completes"
+        );
+    }
+
+    #[test]
+    fn callgraph_cold_build_does_not_consume_pull_demand() {
+        let (mut scheduler, base) = configured_scheduler();
+        let warm = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+
+        assert!(scheduler.request_pull(true));
+        assert_eq!(
+            scheduler.tick_with_gates(warm, 0, true, false, callgraph_cold_build()),
+            None
+        );
+        assert!(
+            scheduler.pull_demand_pending(),
+            "pull demand must survive a callgraph cold-build deferral"
+        );
+        assert_eq!(
+            scheduler.tick_with_gates(warm + Duration::from_secs(1), 0, true, false, no_gates()),
             Some(Tier2TriggerReason::Pull)
         );
     }
@@ -719,14 +837,14 @@ mod tests {
                 deadline - Duration::from_secs(1),
                 true,
                 false,
-                false
+                no_gates()
             ),
             None,
             "a deadline that has not arrived is not overdue"
         );
 
         assert_eq!(
-            scheduler.take_overdue_dispatch_block(deadline, true, true, false),
+            scheduler.take_overdue_dispatch_block(deadline, true, true, no_gates()),
             Some(Tier2DispatchBlock::InFlight)
         );
         assert_eq!(
@@ -734,7 +852,7 @@ mod tests {
                 deadline + Duration::from_secs(1),
                 true,
                 true,
-                false
+                no_gates()
             ),
             None,
             "one overdue stretch reports once"
@@ -749,7 +867,7 @@ mod tests {
                 deadline + Duration::from_secs(3),
                 true,
                 true,
-                false
+                no_gates()
             ),
             None,
             "a dispatched refresh ends the overdue stretch"
@@ -766,11 +884,11 @@ mod tests {
         assert_eq!(
             scheduler
                 .clone()
-                .take_overdue_dispatch_block(deadline, false, false, false),
+                .take_overdue_dispatch_block(deadline, false, false, no_gates()),
             Some(Tier2DispatchBlock::ReadOnly)
         );
         assert_eq!(
-            scheduler.take_overdue_dispatch_block(deadline, true, false, true),
+            scheduler.take_overdue_dispatch_block(deadline, true, false, semantic_cold_seed()),
             Some(Tier2DispatchBlock::SemanticColdSeed)
         );
     }
@@ -804,7 +922,7 @@ mod tests {
                 retry_at - Duration::from_secs(1),
                 true,
                 false,
-                false
+                no_gates()
             ),
             None
         );

@@ -24,7 +24,8 @@ use crate::checkpoint::CheckpointStore;
 use crate::config::Config;
 use crate::harness::Harness;
 use crate::inspect::{
-    InspectCategory, InspectManager, InspectSnapshot, Tier2RefreshScheduler, Tier2TriggerReason,
+    InspectCategory, InspectManager, InspectSnapshot, Tier2ExternalGates, Tier2RefreshScheduler,
+    Tier2TriggerReason,
 };
 use crate::language::LanguageProvider;
 use crate::lsp::manager::{LspManager, StaleDiagnosticsMark};
@@ -5726,6 +5727,23 @@ impl AppContext {
         &self.callgraph_store_rx
     }
 
+    /// True while this root has background callgraph-store work in flight: a
+    /// cold build, a forced rebuild, or a legacy migration. The receiver is
+    /// installed when the worker is spawned and cleared when its terminal event
+    /// is drained, so it answers "is the store still being built" for exactly
+    /// this context's root.
+    pub fn callgraph_cold_build_active(&self) -> bool {
+        self.callgraph_store_rx.lock().is_some()
+    }
+
+    /// The same question without waiting for the receiver lock. `None` means a
+    /// concurrent holder has it, so the answer is not available right now.
+    fn try_callgraph_cold_build_active(&self) -> Option<bool> {
+        self.callgraph_store_rx
+            .try_lock()
+            .map(|receiver| receiver.is_some())
+    }
+
     /// Commit a dequeued result only while its lifecycle and receiver identity
     /// remain current. Lifecycle admission is intentionally acquired first,
     /// matching worker-start paths and preventing a lock-order cycle.
@@ -6477,25 +6495,18 @@ impl AppContext {
             && self.heavy_root_work_allowed()
             && manager.automatic_tier2_refresh_allowed();
         let in_flight = manager.tier2_any_in_flight();
-        let semantic_cold_seed_active = self.semantic_cold_seed_active();
+        let gates = Tier2ExternalGates {
+            semantic_cold_seed_active: self.semantic_cold_seed_active(),
+            callgraph_cold_build_active: self.callgraph_cold_build_active(),
+        };
         let mut scheduler = self.tier2_refresh_scheduler.lock();
-        let decision = scheduler.tick_with_semantic_gate(
-            now,
-            changed_path_count,
-            can_write,
-            in_flight,
-            semantic_cold_seed_active,
-        );
+        let decision =
+            scheduler.tick_with_gates(now, changed_path_count, can_write, in_flight, gates);
         // A deadline the daemon publishes and then does not honour is invisible
         // in the daemon's own log; only the external health sentinel sees it.
         // Name the predicate that held it, once per overdue stretch.
         let overdue_block = if decision.is_none() {
-            scheduler.take_overdue_dispatch_block(
-                now,
-                can_write,
-                in_flight,
-                semantic_cold_seed_active,
-            )
+            scheduler.take_overdue_dispatch_block(now, can_write, in_flight, gates)
         } else {
             None
         };
@@ -6529,8 +6540,8 @@ impl AppContext {
     /// so on a root that falls quiet after its last edit, the debounce deadline
     /// passes with nothing left to observe it and the refresh waits for the
     /// next file change. Mirroring the dispatch gates here keeps a blocked root
-    /// (read-only, scan in flight, cold seed) from asking for a drain pass
-    /// several times a second.
+    /// (read-only, scan in flight, cold seed, callgraph cold build) from asking
+    /// for a drain pass several times a second.
     pub fn tier2_refresh_dispatch_due(&self) -> bool {
         if !self.inspect_writer()
             || self.try_heavy_root_work_allowed() != Some(true)
@@ -6542,6 +6553,9 @@ impl AppContext {
         // A contended source is busy with the very work a dispatch would wait
         // for; the next maintenance tick re-probes.
         if self.inspect_manager.try_tier2_any_in_flight() != Some(false) {
+            return false;
+        }
+        if self.try_callgraph_cold_build_active() != Some(false) {
             return false;
         }
         self.tier2_refresh_scheduler
@@ -9437,6 +9451,49 @@ mod callgraph_store_for_ops_tests {
             ),
             Some(Tier2TriggerReason::ConfigureWarm),
             "root B must not inherit root A's semantic cold gate"
+        );
+    }
+
+    /// The ninety-second warm timer and a long callgraph cold build can overlap:
+    /// on a large repository the build is still running when the timer comes
+    /// due, and a five-category scan then reads the store the build is still
+    /// writing while its peak memory adds to the build's. Hold the scan until
+    /// the build publishes instead.
+    #[test]
+    fn callgraph_cold_build_defers_the_tier2_warm_scan_for_the_same_root() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let other_root = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let base = Instant::now();
+        ctx.reset_tier2_refresh_scheduler_at(base);
+        other_root.reset_tier2_refresh_scheduler_at(base);
+        let warm = base + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
+
+        let (_build_events, receiver) = crossbeam_channel::unbounded::<CallGraphStoreBuildEvent>();
+        *ctx.callgraph_store_rx.lock() = Some(receiver);
+        assert!(ctx.callgraph_cold_build_active());
+
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(warm, 0),
+            None,
+            "the warm scan must not start while this root's callgraph cold build runs"
+        );
+        assert!(
+            ctx.tier2_trigger_reason().is_none(),
+            "a deferred scan must leave no recorded trigger: it has not run yet"
+        );
+        assert_eq!(
+            other_root.tick_tier2_refresh_scheduler_at(warm, 0),
+            Some(Tier2TriggerReason::ConfigureWarm),
+            "one root's callgraph build must not hold another root's refresh"
+        );
+
+        // The drain clears the receiver before it asks for a Tier-2 pull, so by
+        // the time a completed build kicks the scheduler the gate is already open.
+        *ctx.callgraph_store_rx.lock() = None;
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(warm + Duration::from_secs(1), 0),
+            Some(Tier2TriggerReason::ConfigureWarm),
+            "the held scan must dispatch as soon as the callgraph build completes"
         );
     }
 
