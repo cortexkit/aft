@@ -40,15 +40,17 @@ function askedFor(text: string): HostEvent {
 }
 
 /**
- * What the plugin hands the model when the standalone transport dies.
+ * What the plugin hands the model when the standalone transport dies, as one
+ * bash/T3 fallback row recorded it.
  *
  * The bridge writes the request to the binary it spawned, so a binary that
  * then crashes or is killed leaves the outcome undetermined; the message
  * carries that disposition, and it is the whole reason bash refuses rather
- * than re-running the command in the host.
+ * than re-running the command in the host. The log path is the running
+ * scenario's own and is elided here.
  */
 const refusal =
-  "[aft-plugin] Binary crashed (restarts: 0): spawn aft-removed ENOENT (see plugin.log) " +
+  "[aft-bridge] Binary crashed (restarts: 0) (see /tmp/aft-plugin.log) " +
   "The standalone AFT transport failed after this call may have been sent, so its outcome is " +
   "UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never " +
   "blind-retry a mutation.";
@@ -230,7 +232,7 @@ describe("a refusing row refused, in the model's own view of the call", () => {
   test("a bare transport failure leaves the agent with nothing to act on", () => {
     expect(() =>
       assertBashDeadTransportRefusal(scenario("bash/T3/fallback_ask_allow"), {
-        resultText: "[aft-plugin] Binary crashed (restarts: 0): spawn aft-removed ENOENT",
+        resultText: "[aft-bridge] Binary crashed (restarts: 0) (see /tmp/aft-plugin.log)",
         events: [],
       }),
     ).toThrow("does not name outcome is UNKNOWN");
