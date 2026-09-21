@@ -618,6 +618,57 @@ def write_baseline_from_results(
     return 0
 
 
+def runner_facts() -> str:
+    """Describe the machine this run measured on, for the workflow log.
+
+    Peak RSS and CPU seconds depend on how many cores the process found: the
+    callgraph cold build sizes its parse pool from the core count, so two hosts
+    with different core counts produce different numbers from identical code.
+    The runner image version is printed by the job, but the core count and
+    memory are not, which leaves the question unanswerable after the fact.
+    """
+    cpus: str
+    try:
+        # The scheduler affinity mask, not the machine's core count: a cgroup or
+        # affinity-restricted job gets fewer cores than the host advertises, and
+        # the restricted number is the one the pool sizing sees.
+        cpus = str(len(os.sched_getaffinity(0)))  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        cpus = str(os.cpu_count() or "unknown")
+    memory = "unknown"
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                memory = f"{int(line.split()[1]) / 1024 / 1024:.1f} GiB"
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    return f"runner: platform={current_platform()} cpus={cpus} memory={memory}"
+
+
+def observation_line(repo: str, runs: list[RunData]) -> str:
+    """Render what both runs measured, whether or not the gate is about to fail.
+
+    Printing values only beside a regression censors the record exactly where a
+    noise question needs it: the nights that passed are the nights whose numbers
+    are missing, so no run-to-run spread can be reconstructed from the logs, and
+    answering "is this step larger than the usual scatter?" means downloading
+    half a gigabyte of artifacts per night. Both runs are shown rather than the
+    compared minimum, because the gap between them is the within-night spread.
+    """
+    metrics = sorted({metric for run in runs if run.ready for metric in run.metrics})
+    if not metrics:
+        return f"OBSERVED {repo}: no ready run"
+    parts: list[str] = []
+    for metric in metrics:
+        values = []
+        for run in runs:
+            value = run.metrics.get(metric) if run.ready else None
+            values.append("n/a" if value is None else f"{value:g}")
+        parts.append(f"{metric}={'/'.join(values)}")
+    return f"OBSERVED {repo}: " + " ".join(parts)
+
+
 def print_regressions(repo: str, regressions: list[Regression], baseline_repo: dict[str, Any]) -> None:
     for regression in regressions:
         observed_events = regression.run.events if regression.run else {}
@@ -743,6 +794,15 @@ def self_test() -> int:
         assert event_deltas({}, {"callgraph.build_ready.count": 1.0}) == []
         assert event_deltas({"callgraph.build_ready.count": 0.0}, {"callgraph.build_ready.count": 1.0})
 
+        # A night that passes must still record what it measured.  Both runs
+        # appear, because the distance between them is the within-night spread
+        # that any "is this noise?" question is asked against.
+        line = observation_line("fixture", runs)
+        assert line.startswith("OBSERVED fixture: "), line
+        assert "peak_rss_mb=119/118" in line, line
+        assert "cpu_seconds=13/12" in line, line
+        assert observation_line("fixture", []) == "OBSERVED fixture: no ready run"
+
         print("cost-gate self-test metrics: pass=6 fail=3")
         print("cost-gate self-test passed")
         return 0
@@ -802,6 +862,7 @@ def main() -> int:
     cache_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
     binary = ensure_release_binary(repo_root, args.aft_binary)
+    print(runner_facts())
     print(f"release binary: {binary} sha256={sha256(binary)}")
     repo_paths = prepare_repositories(baseline, names, cache_dir)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -814,6 +875,11 @@ def main() -> int:
     runs_by_repo = {name: [first[index], second[index]] for index, name in enumerate(names)}
     print(f"cost-gate wall time: {all_elapsed:.1f}s")
     print(f"artifacts: {output_root}")
+    # Print before any comparison, so a run that regenerates the baseline and a
+    # run whose numbers are within limits both record what they measured,
+    # exactly as a run that exceeds them does.
+    for name in names:
+        print(observation_line(name, runs_by_repo[name]))
     if args.write_baseline:
         write_baseline(args.baseline.resolve(), baseline, names, runs_by_repo, binary, repo_root)
         return 0
