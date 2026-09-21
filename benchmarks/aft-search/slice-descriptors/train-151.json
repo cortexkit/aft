@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "tier2-defer-on-cold-build",
+    "issue-327-content-arms",
+    "release-notes-0570"
+  ],
+  "note": "Tier-2 refresh scheduling and an investigation record. No ranking, scoring, chunking or result-selection code changed."
+}
