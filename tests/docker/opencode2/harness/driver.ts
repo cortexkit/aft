@@ -884,24 +884,30 @@ async function runOneScenario(options: {
     const acceptedExitCodes = Array.isArray(scenario.metadata?.accepted_exit_codes)
       ? scenario.metadata.accepted_exit_codes
       : [0];
+    const servedTurns = mock.exchanges.length;
+    const scriptedTurns = scenario.turns.length;
+    const pace = `served ${servedTurns} of ${scriptedTurns} scripted turns; the model received ${mock.requests.length} request(s)`;
     if (!acceptedExitCodes.includes(host.exit_code)) {
       const mechanism = hostFailureMechanism(host);
-      // A host that ran out of time without ever reaching the model has not
-      // failed at anything the row is about: it never started serving. Saying
-      // so by name is what lets a reader tell a stalled start from a product
-      // failure at a glance, instead of reading the same "still running" line
-      // for both. The two counts are the evidence for the name.
-      if (host.timed_out && mock.exchanges.length === 0 && mock.requests.length === 0) {
+      // A host that ran out of time without answering a single scripted turn
+      // did not fail at what the row measures: nothing the row measures had
+      // been asked for yet. Saying so by name is what lets a reader tell a
+      // start that never got going from a failure in the tool under test,
+      // instead of reading the same "still running" line for both. The name
+      // says where the run stopped, not whose fault it was — a plugin that
+      // hangs while registering stalls a start too — and the counts beside it
+      // are what a reader checks that against.
+      if (host.timed_out && servedTurns === 0) {
         fail(
           "host_startup_stall",
-          `${scenario.id}: the host served zero turns and the model saw zero requests in ${hostTimeoutMs}ms${
+          `${scenario.id}: the host ran out its ${hostTimeoutMs}ms budget having ${pace}${
             mechanism ? `; host said: ${mechanism}` : ""
           }`,
           {
             host_generation: hostGeneration,
             mock_requests: mock.requests.length,
-            scripted_turns: scenario.turns.length,
-            served_turns: mock.exchanges.length,
+            scripted_turns: scriptedTurns,
+            served_turns: servedTurns,
             timeout_ms: hostTimeoutMs,
           },
         );
@@ -914,7 +920,12 @@ async function runOneScenario(options: {
         : host.timed_out
           ? `host was still running after ${hostTimeoutMs}ms and was killed`
           : `host exited ${host.exit_code}`;
-      if (options.excludedHostExit) {
+      // An exclusion covers the ending of a host that has already served the
+      // whole scenario. One that was still mid-scenario when its time ran out
+      // has not earned it: that ending is the failure, and reporting it here
+      // keeps it from surfacing further down as a missing tool result, which
+      // describes the consequence rather than what happened.
+      if (options.excludedHostExit && servedTurns >= scriptedTurns) {
         // The row says this host's exit is not part of its verdict, so the
         // ending is recorded and the run carries on to the checks that are.
         // Nothing else is relaxed: the assertions below still require this
@@ -932,7 +943,7 @@ async function runOneScenario(options: {
         await forensics.writeJson("excluded-host-exit.json", excludedHostExit);
       } else {
         throw new Error(
-          `${ending}; accepted ${acceptedExitCodes.join(",")}${
+          `${ending}; ${pace}; accepted ${acceptedExitCodes.join(",")}${
             mechanism ? `; host said: ${mechanism}` : ""
           }`,
         );
