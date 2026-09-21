@@ -359,8 +359,11 @@ describe("exact OpenCode config pins", () => {
 
   // A developer who registered a checkout keeps that checkout after a host
   // upgrade, in the entry shape the new host can read: V1 pairs options in a
-  // tuple, V2 in a `package`/`options` object.
-  test("carries a local checkout to the host's key in that key's entry shape", () => {
+  // tuple, V2 in a `package`/`options` object. The entry MOVES rather than
+  // being copied: GA's compatibility path converts a V1 `plugin` list into
+  // `plugins`, so the same checkout under both keys is ambiguous. Every other
+  // plugin's entry stays exactly where the user wrote it.
+  test("moves a local checkout to the host's key in that key's entry shape", () => {
     const local = "/dev/aft/packages/opencode-plugin";
     const value: Record<string, unknown> = {
       plugin: ["other-plugin", [local, { enabled: true }]],
@@ -375,7 +378,7 @@ describe("exact OpenCode config pins", () => {
 
     expect(update.action).toBe("added");
     expect(value.plugins).toEqual([{ package: local, options: { enabled: true } }]);
-    expect(value.plugin).toEqual(["other-plugin", [local, { enabled: true }]]);
+    expect(value.plugin).toEqual(["other-plugin"]);
   });
 
   test("rewrites AFT's own V1 tuple under the V2 key and leaves another plugin's alone", () => {
