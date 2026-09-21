@@ -419,12 +419,21 @@ def build_output(
 ) -> JsonObject:
     project_root = Path(args.project_root).resolve()
     binary = Path(args.binary).resolve()
+    ignore_file = project_root / "benchmarks/aft-search/.aftignore"
+    excluded = "excluded from" if ignore_file.is_file() else "present in"
     return {
         "schema_version": 1,
         "benchmark": "aft-search",
         "mode": "baseline",
         "top_k": TOP_K,
         "generated_at_unix": int(time.time()),
+        "measured_on": {
+            "platform": f"{platform.system().lower()}-{platform.machine()}",
+            "provenance": (
+                "local `python3 run.py` capture; benchmark answer-key files were "
+                f"{excluded} the indexed corpus (benchmarks/aft-search/.aftignore)"
+            ),
+        },
         "binary": {
             "path": args.binary,
             "version": protocol_version or binary_version(binary),
@@ -459,6 +468,7 @@ def canonicalize_for_reproducible_diff(output: JsonObject, out_path: Path, defau
             canonical[key] = baseline[key]
     canonical["binary"] = baseline.get("binary", canonical.get("binary"))
     canonical["project"] = baseline.get("project", canonical.get("project"))
+    canonical["measured_on"] = baseline.get("measured_on", canonical.get("measured_on"))
     canonical["semantic_index"] = baseline.get("semantic_index", canonical.get("semantic_index"))
 
     baseline_results = {item["query"]: item for item in baseline.get("results", [])}
