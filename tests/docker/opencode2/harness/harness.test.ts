@@ -6,10 +6,12 @@ import { pathToFileURL } from 'node:url';
 
 import { mapWithConcurrency, parseE2EConcurrency } from "./concurrency.js";
 import {
+  assertV1HostEditFamilyGate,
   type HostCliContract,
   loadHostCliContract,
   loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
+  loadV1HostEditFamilyGateContract,
   loadV1HostProviderConfigContract,
 } from "./contracts.js";
 import {
@@ -44,6 +46,7 @@ import {
   sessionPermissionRules,
 } from "./permission-plan.js";
 import { ProcessObserver, processGroupRunning } from "./process-observer.js";
+import { readPinnedV1HostVersion } from "./pin.js";
 import { parentDisposition, reportTable } from "./report.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import {
@@ -1479,6 +1482,7 @@ describe("a killed process group is not a running writer", () => {
 
 describe("a row may take one named thing out of its own verdict", () => {
   const UPSTREAM = "https://github.com/anomalyco/opencode/issues/48340";
+  const HOST_SOURCE = "contract/host1-edit-family-gate.json";
 
   const exclusion = (overrides: Record<string, unknown> = {}) => ({
     subject: "v1_host_process_exit",
@@ -1552,6 +1556,73 @@ describe("a row may take one named thing out of its own verdict", () => {
     );
   });
 
+  // A subject about deliberate host behaviour has no report to follow, so it
+  // carries the captured reading of the host's own code instead. Naming an
+  // issue for it would invent a defect that nobody filed.
+  test("a subject that rests on host source is refused when it cites an issue instead", async () => {
+    const directory = await matrixRoot({
+      tool: "apply_patch",
+      verdict_exclusions: {
+        T7: { subject: "v1_host_edit_family_gate", issue: UPSTREAM, reason: "The host gates it." },
+      },
+    });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "v1_host_edit_family_gate rests on host source, not an upstream issue",
+    );
+  });
+
+  test("a subject that rests on host source is refused when it cites nothing", async () => {
+    const directory = await matrixRoot({
+      tool: "apply_patch",
+      verdict_exclusions: {
+        T7: { subject: "v1_host_edit_family_gate", reason: "The host gates it." },
+      },
+    });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "a verdict exclusion needs the captured host source it rests on",
+    );
+  });
+
+  test("a subject that rests on an upstream issue is refused when it cites host source", async () => {
+    const directory = await matrixRoot({
+      tool: "bash",
+      verdict_exclusions: {
+        T7: {
+          subject: "v1_host_process_exit",
+          host_source: HOST_SOURCE,
+          reason: "The host never exits.",
+        },
+      },
+    });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "v1_host_process_exit rests on an upstream issue, not host source",
+    );
+  });
+
+  test("the host-source subject reads back what the row cites", async () => {
+    const matrix = await loadApplicabilityMatrix(
+      await matrixRoot({
+        tool: "apply_patch",
+        verdict_exclusions: {
+          T7: {
+            subject: "v1_host_edit_family_gate",
+            host_source: HOST_SOURCE,
+            reason: "The host picks its edit family from the model id.",
+          },
+        },
+      }),
+    );
+
+    expect(matrix?.rows[0].verdict_exclusions?.T7).toEqual({
+      subject: "v1_host_edit_family_gate",
+      host_source: HOST_SOURCE,
+      reason: "The host picks its edit family from the model id.",
+    });
+  });
+
   test("a row that already expects failure cannot also exclude part of its verdict", async () => {
     const directory = await matrixRoot({
       tool: "bash",
@@ -1605,6 +1676,63 @@ describe("a row may take one named thing out of its own verdict", () => {
     );
     expect(report.text).toContain("bash/T7/happy | passed | excluded v1_host_process_exit");
     expect(report.failed).toBe(false);
+  });
+
+  // The V1 host publishes either apply_patch or edit/write, never both, and
+  // decides from the model id before the plugin is consulted. The capture that
+  // says so is only evidence while the installed host still contains it.
+  describe("the edit-family gate is held against the host it is about", () => {
+    const SELECTOR =
+      'let F=D.modelID.includes("gpt-")&&!D.modelID.includes("oss")&&!D.modelID.includes("gpt-4");if(A.id===xr.id)return F;if(A.id===Hr.id||A.id===vr.id)return!F;';
+    const captured = {
+      schema_version: 1 as const,
+      host_version: "1.18.30",
+      observed_run_id: "oc1-1.18.30-test",
+      executable: "/opt/opencode1/node_modules/opencode-ai/bin/opencode.exe",
+      selector_source: SELECTOR,
+      tool_selectors: [{ tool: "apply_patch", source: 'xr=j("apply_patch"' }],
+    };
+
+    async function hostBundle(body: string): Promise<string> {
+      const directory = await root();
+      const path = join(directory, "opencode.exe");
+      await writeFile(path, body);
+      return path;
+    }
+
+    test("a host that still contains every captured fragment satisfies the check", async () => {
+      const path = await hostBundle(`prelude\n${SELECTOR}\nmiddle\nxr=j("apply_patch",1)\ntail`);
+
+      expect(await assertV1HostEditFamilyGate(captured, path)).toBeUndefined();
+    });
+
+    test("a host that no longer contains the selector ends the run instead", async () => {
+      const path = await hostBundle('prelude\nxr=j("apply_patch",1)\ntail');
+
+      await expect(assertV1HostEditFamilyGate(captured, path)).rejects.toThrow(
+        "no longer contains its captured selector_source",
+      );
+    });
+
+    test("the check cannot be satisfied without the host", async () => {
+      await expect(assertV1HostEditFamilyGate(captured, undefined)).rejects.toThrow(
+        "cannot be checked without the pinned V1 executable",
+      );
+    });
+
+    test("the committed capture is the one the pinned host version carries", async () => {
+      const contract = await loadV1HostEditFamilyGateContract(
+        join(import.meta.dir, "..", "contract"),
+        await readPinnedV1HostVersion(join(import.meta.dir, "..", "..", "..", "..")),
+      );
+
+      expect(contract.selector_source).toContain('modelID.includes("gpt-")');
+      expect(contract.tool_selectors.map((selector) => selector.tool).sort()).toEqual([
+        "apply_patch",
+        "edit",
+        "write",
+      ]);
+    });
   });
 });
 

@@ -1,0 +1,68 @@
+OpenCode 1 edit-family gate, read out of the host's own bundle
+run_id: oc1-1.18.30-20260921-edit-family-gate
+image: aft-e2e-opencode2-linux (the harness image; the V1 host it installs)
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: opencode-ai@1.18.30, bundled single file
+  /opt/opencode1/node_modules/opencode-ai/bin/opencode.exe
+  sha256 87bd160e053af86b5b409daabf71f8dc05bbc3a2a3a5f563f36011cdf706a999
+  `opencode --version` prints 1.18.30
+
+Why this was read
+-----------------
+The apply_patch T7 row ran its V1 leg and the host answered:
+
+  Model tried to call unavailable tool 'apply_patch'. Available tools:
+  aft_callgraph, ... write.
+
+`write` being offered is the tell: this host publishes either apply_patch or
+edit/write, never both, and the choice is made from the model id before any
+plugin is consulted. The lines below are that choice, read out of the
+installed executable rather than inferred from the error text.
+
+How it was read
+---------------
+  docker run --rm --platform linux/amd64 --entrypoint bash \
+    aft-e2e-opencode2-linux -c \
+    'grep -a -o ".\{400\}includes(\"gpt-\").\{600\}" \
+       /opt/opencode1/node_modules/opencode-ai/bin/opencode.exe'
+
+Each fragment quoted here occurs exactly once in the executable (`grep -a -o -c`
+returns 1 for all four).
+
+What it says
+------------
+Inside the tool registry (`s.fn("ToolRegistry.tools")`), the catalogue the
+host will publish is filtered:
+
+  f=s.fn("ToolRegistry.tools")(function*(D){
+    let Q=(yield*W()).filter((A)=>{
+      if(A.id===re.id)return St(D.providerID,{exa:i.enableExa,parallel:i.enableParallel});
+      let F=D.modelID.includes("gpt-")&&!D.modelID.includes("oss")&&!D.modelID.includes("gpt-4");
+      if(A.id===xr.id)return F;
+      if(A.id===Hr.id||A.id===vr.id)return!F;
+      return!0
+    }), ...
+
+and the three minified tools it switches on are defined as:
+
+  xr=j("apply_patch", ...
+  Hr=j("edit", ...
+  vr=j("write", ...
+
+So `F` is true only for a GPT-5-shaped model id: it must contain "gpt-" and
+must not contain "oss" or "gpt-4". When `F` is true the host publishes
+apply_patch and withholds edit and write; when it is false it publishes edit
+and write and withholds apply_patch. The plugin is never asked.
+
+What that means for the harness
+-------------------------------
+The V1 leg runs `--model mock/mock-model` (see host1-provider-config.json) and
+the V2 leg runs `--model openai/mock-model`. Neither contains "gpt-", so `F` is
+false on this host and apply_patch structurally cannot be offered to the V1
+leg in this harness.
+
+Renaming the mock model to a gpt-5 shape would flip the same switch the other
+way: apply_patch would appear and edit and write would disappear, so the
+apply_patch row would be bought with the edit and write rows. That is why
+apply_patch/T7 excludes its V1 leg instead, and why this file exists — so the
+rename is not tried again.

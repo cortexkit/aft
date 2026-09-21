@@ -16,9 +16,9 @@
       },
       "verdict_exclusions": {
         "T7": {
-          "subject": "v1_host_process_exit",
-          "issue": "https://github.com/anomalyco/opencode/issues/48340",
-          "reason": "The pinned OpenCode 1 host serves the whole scenario and then never terminates inside a git repository, which every scenario project is, so the harness kills it at the row timeout. This row compares tool behaviour across the two host generations, and the served scenario answers that in full, so the V1 process exit and the kill that follows it are left out of the verdict. Serving is still required: both turns must be delivered and the tool result must arrive and match the other host, or the row fails."
+          "subject": "v1_host_edit_family_gate",
+          "host_source": "contract/host1-edit-family-gate.json",
+          "reason": "The pinned OpenCode 1 host picks one edit family from the model id inside its own tool registry, before any plugin is consulted: a GPT-5-shaped id is offered apply_patch and loses edit and write, and every other id is offered edit and write and loses apply_patch. The harness drives a mock model, so this host cannot offer apply_patch at all and refuses the scripted call outright; renaming the mock to earn it would take edit and write off the V1 host and cost those two rows instead. The V1 leg of this row is therefore left out of the verdict, and with it the cross-host comparison. The V2 leg still decides the row: the tool must be registered, called, and its result must match what the scenario declares."
         }
       }
     }

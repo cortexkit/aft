@@ -1,6 +1,7 @@
 import type { ScenarioResult } from "./types.js";
 import { TRAJECTORIES } from "./types.js";
 import type { ApplicabilityMatrix, MatrixClassification } from "./validation.js";
+import { verdictExclusionBasis } from "./validation.js";
 
 export type RowDisposition = "expected_fail" | "fail" | "n/a" | "pass";
 
@@ -92,7 +93,7 @@ export function reportTable(
       // reading the result is indistinguishable from a check quietly dropped.
       const applicability =
         (classification.startsWith("n/a:") ? classification : "applicable") +
-        (exclusion ? ` (excludes ${exclusion.subject}: ${exclusion.issue})` : "");
+        (exclusion ? ` (excludes ${exclusion.subject}: ${verdictExclusionBasis(exclusion)})` : "");
       const renderedDisposition =
         disposition === "expected_fail"
           ? classification

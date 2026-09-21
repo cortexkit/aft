@@ -2,9 +2,11 @@ import { access, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  assertV1HostEditFamilyGate,
   loadHostCliContract,
   loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
+  loadV1HostEditFamilyGateContract,
   loadV1HostProviderConfigContract,
 } from "./contracts.js";
 import { fail } from "./errors.js";
@@ -33,24 +35,54 @@ export type MatrixClassification = "applicable" | `expected_fail:${string}` | `n
 export interface VerdictExclusion {
   /** What is left out. Only the subjects below can be named. */
   subject: string;
-  /** The upstream report the exclusion rests on. */
-  issue: string;
+  /** The upstream report the exclusion rests on, when it rests on a defect. */
+  issue?: string;
+  /**
+   * The captured observation of the host's own code the exclusion rests on,
+   * when the behaviour is deliberate rather than a defect. There is no report
+   * to follow for something the host means to do, so the citation is the
+   * source that does it, held against the pinned binary on every run.
+   */
+  host_source?: string;
   /** Why leaving it out does not change what the row measures. */
   reason: string;
 }
 
 /**
- * Every subject a row may exclude, and the trajectories where the harness
- * knows how to leave it out.
+ * What kind of evidence a subject's exclusion has to carry.
+ *
+ * A defect is followed through the report that tracks it, and the exclusion
+ * ends when the report does. Deliberate host behaviour has no such report, so
+ * naming one would be a fiction; what a reader needs there is the host code
+ * that decides it, which is why `host_source` points at a captured observation
+ * the run re-checks against the pinned executable.
+ */
+export type VerdictExclusionBasis = "upstream_issue" | "host_source";
+
+export interface VerdictExclusionSubject {
+  /** The trajectories whose run knows how to leave this subject out. */
+  trajectories: readonly Trajectory[];
+  basis: VerdictExclusionBasis;
+}
+
+/**
+ * Every subject a row may exclude, the trajectories where the harness knows
+ * how to leave it out, and the evidence it has to rest on.
  *
  * A row cannot invent an exclusion: naming anything absent from this table, or
  * naming one of these on a trajectory that does not apply it, fails
  * validation. That keeps an exclusion from widening into a blanket excuse for
  * whatever a row happens to fail on.
  */
-export const VERDICT_EXCLUSION_SUBJECTS: Readonly<Record<string, readonly Trajectory[]>> = {
-  v1_host_process_exit: ["T7"],
+export const VERDICT_EXCLUSION_SUBJECTS: Readonly<Record<string, VerdictExclusionSubject>> = {
+  v1_host_process_exit: { trajectories: ["T7"], basis: "upstream_issue" },
+  v1_host_edit_family_gate: { trajectories: ["T7"], basis: "host_source" },
 };
+
+/** What the row cites for an exclusion, for the report line. */
+export function verdictExclusionBasis(exclusion: VerdictExclusion): string {
+  return exclusion.issue ?? exclusion.host_source ?? "";
+}
 
 export interface MatrixRow {
   tool: string;
@@ -160,31 +192,59 @@ function parseVerdictExclusions(
     const entry = asRecord(value);
     if (
       typeof entry?.subject !== "string" ||
-      typeof entry.issue !== "string" ||
       typeof entry.reason !== "string" ||
       entry.reason.trim().length === 0
     ) {
-      fail("matrix_invalid", `${label}: a verdict exclusion needs a subject, issue, and reason`);
+      fail("matrix_invalid", `${label}: a verdict exclusion needs a subject and a reason`);
     }
-    const appliedOn = VERDICT_EXCLUSION_SUBJECTS[entry.subject];
-    if (!appliedOn) {
+    const subject = VERDICT_EXCLUSION_SUBJECTS[entry.subject];
+    if (!subject) {
       fail("matrix_invalid", `${label}: the harness excludes nothing called ${entry.subject}`);
     }
-    if (!appliedOn.includes(trajectory)) {
+    if (!subject.trajectories.includes(trajectory)) {
       fail(
         "matrix_invalid",
-        `${label}: ${entry.subject} is only excluded on ${appliedOn.join(",")}`,
+        `${label}: ${entry.subject} is only excluded on ${subject.trajectories.join(",")}`,
       );
     }
-    // The issue is what a reader follows to check the exclusion is still the
-    // right call, so it has to name one report rather than a project page.
-    if (!/^https:\/\/\S+\/\d+$/.test(entry.issue)) {
-      fail("matrix_invalid", `${label}: a verdict exclusion needs the upstream issue it rests on`);
+    if (subject.basis === "upstream_issue") {
+      if (entry.host_source !== undefined) {
+        fail(
+          "matrix_invalid",
+          `${label}: ${entry.subject} rests on an upstream issue, not host source`,
+        );
+      }
+      // The issue is what a reader follows to check the exclusion is still the
+      // right call, so it has to name one report rather than a project page.
+      if (typeof entry.issue !== "string" || !/^https:\/\/\S+\/\d+$/.test(entry.issue)) {
+        fail("matrix_invalid", `${label}: a verdict exclusion needs the upstream issue it rests on`);
+      }
+    } else {
+      if (entry.issue !== undefined) {
+        fail(
+          "matrix_invalid",
+          `${label}: ${entry.subject} rests on host source, not an upstream issue`,
+        );
+      }
+      // Deliberate host behaviour has no report to follow, so the row cites the
+      // captured host source instead and the run holds that capture against the
+      // pinned executable.
+      if (typeof entry.host_source !== "string" || entry.host_source.trim().length === 0) {
+        fail(
+          "matrix_invalid",
+          `${label}: a verdict exclusion needs the captured host source it rests on`,
+        );
+      }
     }
     if (trajectories[trajectory] !== "applicable") {
       fail("matrix_invalid", `${label}: only an applicable row excludes part of its verdict`);
     }
-    exclusions[trajectory] = { subject: entry.subject, issue: entry.issue, reason: entry.reason };
+    exclusions[trajectory] = {
+      subject: entry.subject,
+      ...(typeof entry.issue === "string" ? { issue: entry.issue } : {}),
+      ...(typeof entry.host_source === "string" ? { host_source: entry.host_source } : {}),
+      reason: entry.reason,
+    };
   }
   return exclusions;
 }
@@ -253,6 +313,18 @@ export function verdictExclusionFor(
   trajectory: Trajectory,
 ): VerdictExclusion | undefined {
   return matrix.rows.find((row) => row.tool === tool)?.verdict_exclusions?.[trajectory];
+}
+
+/** The scenarios whose own row takes one named subject out of the verdict. */
+export function scenariosExcluding(
+  matrix: ApplicabilityMatrix,
+  scenarios: readonly ScenarioDefinition[],
+  subject: string,
+): ScenarioDefinition[] {
+  return scenarios.filter(
+    (scenario) =>
+      verdictExclusionFor(matrix, scenario.tool, scenario.trajectory)?.subject === subject,
+  );
 }
 
 async function firstExisting(paths: string[]): Promise<string | undefined> {
@@ -971,6 +1043,8 @@ export async function validateHarnessInputs(options: {
   testMode?: boolean;
   observationOnly?: boolean;
   fullRun?: boolean;
+  /** The pinned V1 host, for the captures that are read out of it. */
+  v1HostExecutable?: string;
 }): Promise<ValidatedInputs> {
   const platform = options.platform ?? process.platform;
   const matrixRoot = join(options.repoRoot, "tests", "docker", "opencode2", "matrix");
@@ -1044,6 +1118,18 @@ export async function validateHarnessInputs(options: {
       await loadV1HostProviderConfigContract(
         contractRoot,
         await readPinnedV1HostVersion(options.repoRoot),
+      );
+    }
+    // A row that leaves its V1 leg out because the host withholds the tool from
+    // this model has to show that gate in the host it is about, and the capture
+    // is only evidence for as long as the installed binary still contains it.
+    if (matrix && scenariosExcluding(matrix, options.scenarios, "v1_host_edit_family_gate").length > 0) {
+      await assertV1HostEditFamilyGate(
+        await loadV1HostEditFamilyGateContract(
+          contractRoot,
+          await readPinnedV1HostVersion(options.repoRoot),
+        ),
+        options.v1HostExecutable,
       );
     }
     if (options.scenarios.some((scenario) => scenario.error_origin === "host")) {

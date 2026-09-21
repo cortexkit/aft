@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "run_id": "oc1-1.18.30-20260921-edit-family-gate",
+  "observed_run_id": "oc1-1.18.30-20260921-edit-family-gate",
+  "host_version": "1.18.30",
+  "host": "opencode1",
+  "platform": "linux-x64",
+  "transcript": "probe/host1-edit-family-gate-1.18.30.txt",
+  "executable": "/opt/opencode1/node_modules/opencode-ai/bin/opencode.exe",
+  "executable_sha256": "87bd160e053af86b5b409daabf71f8dc05bbc3a2a3a5f563f36011cdf706a999",
+  "registry_function": "s.fn(\"ToolRegistry.tools\")",
+  "selector_source": "let F=D.modelID.includes(\"gpt-\")&&!D.modelID.includes(\"oss\")&&!D.modelID.includes(\"gpt-4\");if(A.id===xr.id)return F;if(A.id===Hr.id||A.id===vr.id)return!F;",
+  "tool_selectors": [
+    { "tool": "apply_patch", "source": "xr=j(\"apply_patch\"" },
+    { "tool": "edit", "source": "Hr=j(\"edit\"" },
+    { "tool": "write", "source": "vr=j(\"write\"" }
+  ],
+  "harness_models": {
+    "v1_leg": "mock/mock-model",
+    "v2_leg": "openai/mock-model"
+  },
+  "reading": "F is true only for a GPT-5-shaped model id. True publishes apply_patch and withholds edit and write; false publishes edit and write and withholds apply_patch. Neither harness model contains \"gpt-\", so the V1 leg is never offered apply_patch, and renaming the model to earn it would cost the edit and write rows instead."
+}

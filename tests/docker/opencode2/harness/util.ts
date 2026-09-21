@@ -25,6 +25,34 @@ export async function sha256File(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
+/**
+ * Whether a file contains a literal fragment, read a chunk at a time.
+ *
+ * The pinned V1 host ships as one ~185MB bundled executable, so this keeps the
+ * carry between chunks instead of holding the file in memory. `latin1` maps
+ * each byte to one character, which is what makes an ASCII fragment match the
+ * bytes exactly rather than through a decoder that could fold them.
+ */
+export async function fileContainsText(path: string, needle: string): Promise<boolean> {
+  if (needle.length === 0) throw new Error("an empty fragment matches everything");
+  return new Promise<boolean>((resolvePromise, reject) => {
+    const stream = createReadStream(path, { encoding: "latin1" });
+    let carry = "";
+    let found = false;
+    stream.on("data", (chunk) => {
+      const window = carry + String(chunk);
+      if (window.includes(needle)) {
+        found = true;
+        stream.destroy();
+        return;
+      }
+      carry = needle.length > 1 ? window.slice(1 - needle.length) : "";
+    });
+    stream.once("error", reject);
+    stream.once("close", () => resolvePromise(found));
+  });
+}
+
 export function fixtureRelativePath(root: string, candidate: string): string {
   const absolute = resolve(root, candidate);
   const rel = relative(root, absolute).replaceAll("\\", "/");

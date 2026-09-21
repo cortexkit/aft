@@ -1135,9 +1135,44 @@ function v1ExitExclusion(
   matrix: ValidatedInputs["matrix"],
   scenario: ScenarioDefinition,
 ): VerdictExclusion | undefined {
+  return declaredExclusion(matrix, scenario, "v1_host_process_exit");
+}
+
+/**
+ * The V1 leg itself, when the host cannot be asked the row's question.
+ *
+ * The pinned OpenCode 1 build chooses between `apply_patch` and `edit`/`write`
+ * from the model id, inside its own tool registry and before any plugin is
+ * consulted: a GPT-5-shaped id gets apply_patch and loses edit and write, and
+ * every other id gets edit and write and loses apply_patch. The harness drives
+ * a mock model, so the V1 leg of an apply_patch row is offered a catalogue
+ * that cannot contain the tool under test, and the host refuses the scripted
+ * call before the plugin is reached. Renaming the mock to earn apply_patch
+ * would flip the same switch the other way and take edit and write off the V1
+ * host, so the row would be bought with two others.
+ *
+ * A row may therefore declare that its V1 leg is not its business, and the
+ * harness runs the V2 leg alone and leaves the cross-host comparison out. The
+ * V2 leg is unchanged: the tool still has to be registered, called, and its
+ * result still has to match what the scenario declares, or the row fails. The
+ * gate the exclusion rests on is read back out of the pinned host's own bundle
+ * on every run (`contract/host1-edit-family-gate.json`).
+ */
+function v1EditFamilyExclusion(
+  matrix: ValidatedInputs["matrix"],
+  scenario: ScenarioDefinition,
+): VerdictExclusion | undefined {
+  return declaredExclusion(matrix, scenario, "v1_host_edit_family_gate");
+}
+
+function declaredExclusion(
+  matrix: ValidatedInputs["matrix"],
+  scenario: ScenarioDefinition,
+  subject: string,
+): VerdictExclusion | undefined {
   if (!matrix) return undefined;
   const declared = verdictExclusionFor(matrix, scenario.tool, scenario.trajectory);
-  return declared?.subject === "v1_host_process_exit" ? declared : undefined;
+  return declared?.subject === subject ? declared : undefined;
 }
 
 function assertDualHostParity(
@@ -1232,6 +1267,7 @@ async function main(): Promise<void> {
     pinnedHostVersion,
     platform: "linux",
     fullRun: config.selector === undefined,
+    v1HostExecutable: config.v1HostExecutable,
   });
   const extensions = await loadHarnessExtensions(join(repoRoot, "tests", "docker", "opencode2"));
   for (const extension of extensions) await extension.validate?.(validated.context);
@@ -1277,6 +1313,21 @@ async function main(): Promise<void> {
         providerModel: providerContract.model,
         applyComparison: true,
       });
+      const editFamilyExclusion = v1EditFamilyExclusion(validated.matrix, scenario);
+      if (editFamilyExclusion) {
+        // The V1 host withholds this row's tool from the model the harness
+        // drives, so there is no second leg to compare. What the V2 leg proved
+        // still stands, and the report says which subject was left out.
+        result = {
+          ...v2.result,
+          exclusions: [editFamilyExclusion.subject],
+          ...(v2.result.status === "passed"
+            ? { forensic_dir: dirname(v2.result.forensic_dir) }
+            : {}),
+        };
+        result.elapsed_ms = Date.now() - startedAt;
+        return { result, smokeRan };
+      }
       const v1 =
         config.v1HostExecutable && v1ProviderContract
           ? await runOneScenario({

@@ -2,7 +2,7 @@ import { access } from "node:fs/promises";
 import { join } from "node:path";
 
 import { fail } from "./errors.js";
-import { asRecord, readJson } from "./util.js";
+import { asRecord, fileContainsText, readJson } from "./util.js";
 
 export interface HandoffContract {
   kind: "env" | "flag" | "header";
@@ -203,6 +203,110 @@ export async function loadV1HostProviderConfigContract(
     pinnedVersion,
     "host1_provider_config",
   );
+}
+
+/**
+ * The V1 host's own code for choosing between `apply_patch` and `edit`/`write`.
+ *
+ * The pinned OpenCode 1 build picks one edit family or the other from the
+ * model id, before any plugin is consulted, so a harness whose model is not a
+ * GPT-5 name cannot be offered `apply_patch` at all. A row that leaves its V1
+ * leg out of the verdict for that reason cites this capture, and the run holds
+ * the capture against the installed executable so the citation cannot quietly
+ * rot into a claim about a host that no longer behaves that way.
+ */
+export interface HostEditFamilyGateContract {
+  schema_version: 1;
+  host_version: string;
+  observed_run_id: string;
+  /** Where inside the installed package the fragments were read. */
+  executable: string;
+  /** The selector that reads the model id and picks the family. */
+  selector_source: string;
+  /** The bundle's own name for each tool the selector switches on. */
+  tool_selectors: Array<{ tool: string; source: string }>;
+}
+
+export async function loadV1HostEditFamilyGateContract(
+  contractRoot: string,
+  pinnedVersion: string,
+): Promise<HostEditFamilyGateContract> {
+  const path = join(contractRoot, "host1-edit-family-gate.json");
+  await access(path).catch(() => {
+    fail("contract_uncaptured", "host1_edit_family_gate", { path }, true);
+  });
+  const record = asRecord(await readJson(path));
+  if (record?.schema_version !== 1) {
+    fail("contract_uncaptured", "host1_edit_family_gate schema", { path }, true);
+  }
+  const identity = contractIdentity(record, pinnedVersion, "host1_edit_family_gate");
+  const selectors = Array.isArray(record.tool_selectors) ? record.tool_selectors : [];
+  const parsedSelectors = selectors.flatMap((value) => {
+    const entry = asRecord(value);
+    return typeof entry?.tool === "string" && typeof entry.source === "string"
+      ? [{ tool: entry.tool, source: entry.source }]
+      : [];
+  });
+  if (
+    typeof record.executable !== "string" ||
+    typeof record.selector_source !== "string" ||
+    record.selector_source.length === 0 ||
+    parsedSelectors.length !== selectors.length ||
+    parsedSelectors.length === 0
+  ) {
+    fail(
+      "contract_uncaptured",
+      "host1_edit_family_gate observations",
+      { path, observed_selectors: parsedSelectors.length },
+      true,
+    );
+  }
+  return {
+    schema_version: 1,
+    host_version: identity.hostVersion,
+    observed_run_id: identity.runId,
+    executable: record.executable,
+    selector_source: record.selector_source,
+    tool_selectors: parsedSelectors,
+  };
+}
+
+/**
+ * Hold the captured gate against the executable this run would have used.
+ *
+ * A capture that is no longer in the binary means the reason a row gives for
+ * leaving its V1 leg out is a claim about some other build. That is worth
+ * ending the run over: every other outcome would be judged against a host the
+ * exclusion was never written for.
+ */
+export async function assertV1HostEditFamilyGate(
+  contract: HostEditFamilyGateContract,
+  executable: string | undefined,
+): Promise<void> {
+  if (!executable) {
+    fail(
+      "contract_uncaptured",
+      "host1_edit_family_gate cannot be checked without the pinned V1 executable",
+      { executable_env: "OPENCODE1_BIN" },
+      true,
+    );
+  }
+  const fragments = [
+    { label: "selector_source", text: contract.selector_source },
+    ...contract.tool_selectors.map((selector) => ({
+      label: `tool_selectors.${selector.tool}`,
+      text: selector.source,
+    })),
+  ];
+  for (const fragment of fragments) {
+    if (await fileContainsText(executable, fragment.text)) continue;
+    fail(
+      "contract_uncaptured",
+      `the pinned V1 host no longer contains its captured ${fragment.label}; re-observe the edit-family gate before trusting the exclusion that rests on it`,
+      { executable, host_version: contract.host_version, fragment: fragment.text },
+      true,
+    );
+  }
 }
 
 

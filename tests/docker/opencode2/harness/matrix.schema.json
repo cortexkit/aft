@@ -22,16 +22,18 @@
             }
           },
           "verdict_exclusions": {
-            "description": "Parts of a trajectory's verdict this row does not judge. Unlike expected_fail it claims nothing about the outcome: it names one thing the harness leaves out, the upstream issue it rests on, and why leaving it out does not change what the row measures. Only subjects the harness implements may be named.",
+            "description": "Parts of a trajectory's verdict this row does not judge. Unlike expected_fail it claims nothing about the outcome: it names one thing the harness leaves out, the evidence it rests on, and why leaving it out does not change what the row measures. Only subjects the harness implements may be named. A subject about a defect cites the upstream issue; a subject about deliberate host behaviour cites the captured host source instead, which the run re-reads out of the pinned binary.",
             "type": "object",
             "additionalProperties": {
               "type": "object",
-              "required": ["subject", "issue", "reason"],
+              "required": ["subject", "reason"],
               "properties": {
-                "subject": { "enum": ["v1_host_process_exit"] },
+                "subject": { "enum": ["v1_host_process_exit", "v1_host_edit_family_gate"] },
                 "issue": { "type": "string", "pattern": "^https://\\S+/[0-9]+$" },
+                "host_source": { "type": "string", "minLength": 1 },
                 "reason": { "type": "string", "minLength": 1 }
               },
+              "oneOf": [{ "required": ["issue"] }, { "required": ["host_source"] }],
               "additionalProperties": false
             }
           }
