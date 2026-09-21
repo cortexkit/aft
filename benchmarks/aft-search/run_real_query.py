@@ -44,11 +44,38 @@ ROOT = HERE.parents[1]
 DEFAULT_BINARY = os.environ.get("AFT_BINARY_PATH", str(ROOT / "target/release/aft"))
 DEFAULT_SCHEMA = ROOT / "packages/pi-plugin/src/tools/semantic.ts"
 PROBE_TEXT = "semantic index fingerprint probe"
+# Exit code reserved for "this platform cannot evaluate the reference pair", so
+# a caller can tell it apart from an ordinary input fault (2).
+PLATFORM_UNSUPPORTED_EXIT = 3
 JsonObject = dict[str, Any]
 
 
 class AftProtocolError(RuntimeError):
     """A standalone-AFT protocol failure."""
+
+
+class UnsupportedPlatform(RuntimeError):
+    """This platform cannot evaluate the Unix-captured reference pair."""
+
+
+def assert_reference_platform(platform: Optional[str] = None) -> None:
+    """Stop before the index build when the reference pair cannot be reproduced.
+
+    The checked-in vector pack and baseline were captured on Unix, and the text
+    AFT embeds bakes the OS-native relative path into every chunk header. A
+    Windows run therefore hashes `tests\\fixtures\\...` where the pack holds
+    `tests/fixtures/...`, and no vector in the pack can ever be found. Without
+    this check the run spends the whole index build to fail on an opaque
+    `vector_missing:<digest>` line that says nothing about the platform.
+    """
+    platform = platform or sys.platform
+    if platform.startswith("win") or platform == "cygwin":
+        raise UnsupportedPlatform(
+            f"real_query_platform_unsupported:{platform}: the real-query reference pair "
+            "(real-query-vectors.json and real-query-baseline.json) is Unix-captured and "
+            "cannot be evaluated on this platform. Run this gate on Linux or macOS; CI "
+            "runs it on ubuntu-latest."
+        )
 
 
 class NdjsonClient:
@@ -532,6 +559,7 @@ def ensure_binary(binary: Path) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
+    assert_reference_platform()
     manifest_path = Path(args.manifest).resolve()
     binary = Path(args.binary).resolve()
     ensure_binary(binary)
@@ -577,6 +605,9 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     try:
         return run(parser().parse_args())
+    except UnsupportedPlatform as error:
+        print(str(error), file=sys.stderr)
+        return PLATFORM_UNSUPPORTED_EXIT
     except (AftProtocolError, InputFault, OSError, KeyError, ValueError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)
         return 2
