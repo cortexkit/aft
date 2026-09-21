@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 
 import { fail } from "./errors.js";
 
@@ -41,14 +42,58 @@ const TERMINAL_TASK_STATES = new Set([
   "timed_out",
 ]);
 
+/**
+ * Whether any member of a process group is still a process that can run.
+ *
+ * A killed process stays in the process table as a zombie until its parent
+ * reaps it, and a background task whose parent died is reparented onto the
+ * process the container started with, which never waits for it. Signalling
+ * cannot tell those apart — `kill(-pgid, 0)` succeeds for a group of zombies
+ * exactly as it does for a group doing work — so a task left behind by a host
+ * the harness had to kill would read as still writing forever.
+ *
+ * Reading the kernel's own view of each member settles it: a zombie has
+ * already exited and can touch nothing. `undefined` means this system does not
+ * publish process state under `/proc`, and the caller keeps the signal answer.
+ */
+export function processGroupRunning(pgid: number, procRoot = "/proc"): boolean | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(procRoot);
+  } catch {
+    return undefined;
+  }
+  let members = 0;
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat: string;
+    try {
+      stat = readFileSync(`${procRoot}/${entry}/stat`, "utf8");
+    } catch {
+      continue;
+    }
+    // The command name sits in parentheses and may contain spaces, so the
+    // fields after it are read from the last closing parenthesis onwards:
+    // state, then parent pid, then process group.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    if (Number(fields[2]) !== pgid) continue;
+    members += 1;
+    if (fields[0] !== "Z") return true;
+  }
+  // A group the kernel reports as present but whose members cannot be listed
+  // is treated as running, so an unreadable process is never mistaken for a
+  // stopped one.
+  return members === 0 ? true : false;
+}
+
 export function processGroupAlive(pgid: number): boolean {
   if (!Number.isInteger(pgid) || pgid <= 0) return false;
   try {
     process.kill(-pgid, 0);
-    return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
   }
+  return processGroupRunning(pgid) ?? true;
 }
 
 /**
@@ -111,17 +156,36 @@ export class ProcessObserver {
         await this.taskProbe.cancel(task.id);
       }
     }
-    for (const processRecord of this.processes) {
-      if (!processGroupAlive(processRecord.pgid)) {
-        processRecord.terminal = true;
-        continue;
-      }
+    for (const pgid of this.#groupsToStop(tasks)) {
+      if (!processGroupAlive(pgid)) continue;
       try {
-        process.kill(-processRecord.pgid, "SIGTERM");
+        process.kill(-pgid, "SIGTERM");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }
     }
+    for (const processRecord of this.processes) {
+      if (!processGroupAlive(processRecord.pgid)) processRecord.terminal = true;
+    }
+  }
+
+  /**
+   * Every process group this run is responsible for ending.
+   *
+   * A background task runs in a group of its own so it can outlive the call
+   * that started it, which also means killing the host's group does not reach
+   * it. Cancelling through the task probe only works while something is alive
+   * to act on the cancellation: a host that had to be killed takes the daemon
+   * with it, and the task is left running with nobody to stop it. Naming the
+   * task groups here is what makes the harness finish what its own kill
+   * started, instead of reporting a tree it left running.
+   */
+  #groupsToStop(tasks: readonly TaskState[]): number[] {
+    const groups = this.processes.map((processRecord) => processRecord.pgid);
+    for (const task of tasks) {
+      if (task.pgid !== undefined && !groups.includes(task.pgid)) groups.push(task.pgid);
+    }
+    return groups;
   }
 
   async waitForTermination(timeoutMs = 30_000): Promise<QuiescenceEvidence> {
@@ -165,10 +229,10 @@ export class ProcessObserver {
     await this.cancelSurvivors();
     let evidence = await this.waitForTermination(Math.min(timeoutMs, 5_000));
     if (evidence.stopped) return evidence;
-    for (const processRecord of this.processes) {
-      if (!processGroupAlive(processRecord.pgid)) continue;
+    for (const pgid of this.#groupsToStop(evidence.tasks)) {
+      if (!processGroupAlive(pgid)) continue;
       try {
-        process.kill(-processRecord.pgid, "SIGKILL");
+        process.kill(-pgid, "SIGKILL");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
       }

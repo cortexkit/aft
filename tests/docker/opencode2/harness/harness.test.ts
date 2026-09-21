@@ -43,7 +43,7 @@ import {
   permissionAction,
   sessionPermissionRules,
 } from "./permission-plan.js";
-import { ProcessObserver } from "./process-observer.js";
+import { ProcessObserver, processGroupRunning } from "./process-observer.js";
 import { parentDisposition, reportTable } from "./report.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import {
@@ -1435,6 +1435,45 @@ describe("permission scenarios reach the host's own rules", () => {
         }),
       "host_failed",
     );
+  });
+});
+
+describe("a killed process group is not a running writer", () => {
+  async function procRoot(entries: Array<{ pid: number; state: string; pgid: number }>) {
+    const directory = await root();
+    for (const entry of entries) {
+      await mkdir(join(directory, String(entry.pid)), { recursive: true });
+      await writeFile(
+        join(directory, String(entry.pid), "stat"),
+        `${entry.pid} (sleep 600) ${entry.state} 1 ${entry.pgid} 0 0 -1 4194304\n`,
+      );
+    }
+    return directory;
+  }
+
+  test("a group whose members have all exited counts as stopped", async () => {
+    const directory = await procRoot([{ pid: 345, state: "Z", pgid: 345 }]);
+
+    expect(processGroupRunning(345, directory)).toBe(false);
+  });
+
+  test("one member still scheduled keeps the whole group running", async () => {
+    const directory = await procRoot([
+      { pid: 345, state: "Z", pgid: 345 },
+      { pid: 346, state: "S", pgid: 345 },
+    ]);
+
+    expect(processGroupRunning(345, directory)).toBe(true);
+  });
+
+  test("a group with no listable member is left as running", async () => {
+    const directory = await procRoot([{ pid: 999, state: "Z", pgid: 999 }]);
+
+    expect(processGroupRunning(345, directory)).toBe(true);
+  });
+
+  test("a system that does not publish process state gives no answer", () => {
+    expect(processGroupRunning(345, join(tmpdir(), "opencode2-absent-proc"))).toBeUndefined();
   });
 });
 
