@@ -1,0 +1,19 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oc2-bash-t3",
+    "oc2-bash-fallback-rescope",
+    "v2-sidebar-parity",
+    "v2-theme-shape",
+    "sandbox-param-surface",
+    "oc2-plugin-config-key"
+  ],
+  "note": "No ranking-fence file changes: OpenCode 2 harness rows, the V2 sidebar panel and its host-recorded theme fixture, the bash host-escape argument surface, and the generation-aware plugin config key with the ONNX platform-table hint."
+}
