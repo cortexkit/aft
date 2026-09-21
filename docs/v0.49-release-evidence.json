@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S6-ACTIVATION-EVIDENCE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "aec2b32e71afb8dd2fbcc9115ebfe523bcad35dd",
+  "source_commit": "2727fe8a5bc7d5e38e8b9884626d2deb4bfa5697",
   "previous_version": "0.48.1",
   "candidate_version": "0.49.0",
   "capture_rule": "Each prefix and generated-subc value is a complete byte snapshot. A valid profile has exactly old -> candidate and no mixed snapshot.",
