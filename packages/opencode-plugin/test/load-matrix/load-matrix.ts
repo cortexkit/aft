@@ -638,6 +638,347 @@ const v2TuiSetupOutcome =
 // appears in the log at all.
 const v2TuiSettled = /message="plugin reconciliation completed"[^\n]*\bid=3\b/;
 
+/**
+ * The status snapshot the sidebar probe below renders.
+ *
+ * It is deliberately full: every optional health category is present, both
+ * compression scopes have events, and the semantic index has failed with an
+ * explanation, so every section the sidebar knows how to draw is reachable
+ * from this one payload.
+ */
+const sidebarProbeStatus = {
+  success: true,
+  version: "0.56.2",
+  project_root: "/probe/project",
+  canonical_root: "/probe/project",
+  cache_role: "main",
+  degraded: false,
+  degraded_reasons: [],
+  features: {},
+  search_index: { status: "ready", files: 1234, trigrams: 5678 },
+  semantic_index: {
+    status: "failed",
+    stage: null,
+    refreshing_count: 0,
+    entries: 0,
+    dimension: 384,
+    error: "no embedding backend is configured or reachable",
+  },
+  disk: { storage_dir: "/probe/cache", trigram_disk_bytes: 2500000, semantic_disk_bytes: 900000 },
+  lsp_servers: 1,
+  runtime: { live_watchers: 1, live_actor_roots: 1, open_routes: 1 },
+  symbol_cache: { local_entries: 2, warm_entries: 3 },
+  storage_dir: "/probe/cache",
+  checkpoints_total: 2,
+  session: { id: "ses_probe", tracked_files: 3, checkpoints: 1 },
+  compression: {
+    project: {
+      events: 1234,
+      original_tokens: 567000,
+      compressed_tokens: 234000,
+      savings_tokens: 333000,
+    },
+    session: { events: 12, original_tokens: 5600, compressed_tokens: 2300, savings_tokens: 3300 },
+  },
+  status_bar: {
+    errors: 2,
+    warnings: 3,
+    dead_code: 4,
+    unused_exports: 5,
+    duplicates: 6,
+    todos: 7,
+    tier2_stale: false,
+  },
+  message: "",
+};
+
+/**
+ * Every section header and row label the sidebar draws for the payload above.
+ *
+ * This list is the independent expectation the parity row checks against: the
+ * two sidebars render one shared component, so a section deleted from it
+ * disappears from both at once and comparing them to each other alone would
+ * stay green. Adding a section here without rendering it, or deleting a
+ * rendered one without deleting it here, is what turns that row red.
+ */
+const sidebarSections = [
+  "Search Index",
+  "Semantic Index",
+  "Code Health",
+  "Compression",
+  "Status",
+  "Files",
+  "Disk",
+  "Entries",
+  "Errors",
+  "Warnings",
+  "Dead Code",
+  "Unused Exports",
+  "Duplicates",
+  "TODOs",
+  "Session",
+  "Project",
+  "Tokens Saved",
+  "Compression Ratio",
+];
+
+/**
+ * A TUI entry that renders the sidebar and reports what came out of it.
+ *
+ * The host only mounts `sidebar.content` inside a session view, which a
+ * headless probe never reaches, so this entry keeps the sidebar slot claim the
+ * plugin registers and renders it itself from inside the `app` slot -- the one
+ * place that is provably inside the host's component tree, which is what the
+ * renderer and Solid's owner need. The status snapshot arrives through a stub
+ * of the plugin's own RPC client, so the real component takes its real data
+ * path to a payload the row controls.
+ *
+ * `themeMode` also picks the colours handed over as the host's resolved theme,
+ * because the host resolves a theme for the active mode before a plugin sees
+ * it. The same palette is offered twice, once in each host's theme shape, so
+ * the two sidebars can be rendered side by side from one payload.
+ *
+ * What gets recorded is read off the renderables the render produced: each
+ * text line's resolved foreground and the background in effect behind it, not
+ * the colour constant the source asked for. A line with no foreground at all
+ * still resolves to the renderer's default white, which is precisely the
+ * failure this exists to catch.
+ */
+function v2TuiSidebarProbeEntry(themeMode: "dark" | "light"): string {
+  return `
+import { appendFileSync } from "node:fs";
+import original from "./src/entry/tui.mjs";
+
+const record = (line) =>
+  appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, String(line).replace(/[\\r\\n]+/g, " ") + "\\n");
+
+const THEME_MODE = ${JSON.stringify(themeMode)};
+const STATUS = ${JSON.stringify(sidebarProbeStatus)};
+
+const PALETTES = {
+  light: {
+    text: "#1f2328",
+    muted: "#59636e",
+    success: "#1a7f37",
+    warning: "#9a6700",
+    error: "#cf222e",
+    accent: "#0969da",
+    background: "#ffffff",
+    border: "#d1d9e0",
+  },
+  dark: {
+    text: "#e6edf3",
+    muted: "#9198a1",
+    success: "#3fb950",
+    warning: "#d29922",
+    error: "#f85149",
+    accent: "#1f6feb",
+    background: "#0d1117",
+    border: "#3d444d",
+  },
+};
+const COLORS = PALETTES[THEME_MODE];
+
+// The shape Context.theme carries: nested token groups.
+const hostTheme = {
+  text: {
+    base: COLORS.text,
+    muted: COLORS.muted,
+    feedback: {
+      success: { base: COLORS.success },
+      warning: { base: COLORS.warning },
+      error: { base: COLORS.error },
+      info: { base: COLORS.accent },
+    },
+  },
+  background: { base: COLORS.background, action: { primary: { base: COLORS.accent } } },
+  border: { base: COLORS.border },
+};
+
+// The shape the slot-plugin host publishes: one flat colour per role.
+const flatTheme = {
+  text: COLORS.text,
+  textMuted: COLORS.muted,
+  success: COLORS.success,
+  warning: COLORS.warning,
+  error: COLORS.error,
+  accent: COLORS.accent,
+  background: COLORS.background,
+  borderActive: COLORS.border,
+};
+
+const rpcStub = {
+  async getStatus() {
+    return STATUS;
+  },
+  events: { on: () => () => {} },
+};
+
+// The compiled TUI binds the host's single Solid/OpenTUI runtime through this
+// registry; taking createRoot from anywhere else would hand the rendered
+// components a different Solid than the one that owns them. Resolving it up
+// front keeps the render itself synchronous, so it happens inside the host's
+// own render pass.
+let runtime = null;
+let runtimeError = null;
+try {
+  runtime = {
+    solid: await import("opentui:runtime-module:" + encodeURIComponent("solid-js")),
+    view: await import("./src/tui-compiled/sidebar-view.tsx"),
+    legacy: await import("./src/tui-compiled/sidebar.tsx"),
+    prefs: await import("./src/tui-compiled/preferences.ts"),
+    status: await import("./src/shared/status.ts"),
+  };
+} catch (error) {
+  runtimeError = String(error);
+}
+
+let sidebarClaim = null;
+let probeStarted = false;
+
+function observe(context) {
+  const ui = new Proxy(context.ui, {
+    get(target, property) {
+      if (property !== "slot") return Reflect.get(target, property, target);
+      return (claim) => {
+        if (claim.append === "sidebar.content") {
+          sidebarClaim = claim;
+          return target.slot(claim);
+        }
+        if (claim.append !== "app") return target.slot(claim);
+        // The app slot is the one render that provably happens inside the
+        // host's component tree, which is where the renderer and a Solid owner
+        // exist. The sidebar claim is already registered by then, because both
+        // are claimed during setup and nothing renders until setup returns.
+        return target.slot({
+          ...claim,
+          render: (input) => {
+            const node = claim.render(input);
+            if (!probeStarted) {
+              probeStarted = true;
+              probe();
+            }
+            return node;
+          },
+        });
+      };
+    },
+  });
+  const client = { rpc: () => rpcStub };
+  return new Proxy(context, {
+    get(target, property) {
+      if (property === "ui") return ui;
+      if (property === "client") return client;
+      if (property === "theme") return hostTheme;
+      if (property === "themeMode") return THEME_MODE;
+      return Reflect.get(target, property, target);
+    },
+  });
+}
+
+// 0-255 per channel, the one spelling both a parsed hex string and OpenTUI's
+// own RGBA can be compared in.
+const HEX = /^#?([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+function colorKey(value) {
+  if (value === undefined || value === null) return "unset";
+  if (typeof value === "string") {
+    const match = HEX.exec(value.trim());
+    if (!match) return "literal:" + value;
+    const hex = match[1];
+    const rgb = parseInt(hex.slice(0, 6), 16);
+    const alpha = hex.length === 8 ? parseInt(hex.slice(6, 8), 16) : 255;
+    return [(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, alpha].join(",");
+  }
+  if (typeof value.toInts === "function") return value.toInts().join(",");
+  if (typeof value.r === "number") {
+    return [value.r, value.g, value.b, value.a === undefined ? 1 : value.a]
+      .map((channel) => Math.round(channel * 255))
+      .join(",");
+  }
+  return "opaque";
+}
+
+function isOpaque(key) {
+  const parts = key.split(",");
+  return parts.length === 4 && Number(parts[3]) > 0;
+}
+
+function collect(node, inheritedBackground, which) {
+  if (!node || typeof node !== "object") return;
+  let background = inheritedBackground;
+  const ownBackground = colorKey(node.backgroundColor);
+  if (isOpaque(ownBackground)) background = ownBackground;
+  if (typeof node.plainText === "string") {
+    const textBackground = colorKey(node.bg);
+    const effective = isOpaque(textBackground) ? textBackground : background;
+    const text = node.plainText.replace(/\\s+/g, " ").trim();
+    if (text) record("sidebar-row:" + which + ":" + colorKey(node.fg) + ":" + effective + ":" + text);
+  }
+  let children = [];
+  try {
+    children = typeof node.getChildren === "function" ? node.getChildren() : [];
+  } catch {
+    children = [];
+  }
+  for (const child of children) collect(child, background, which);
+}
+
+function probe() {
+  try {
+    if (!runtime) {
+      record("sidebar-probe-error:runtime unavailable: " + runtimeError);
+      return;
+    }
+    if (!sidebarClaim) {
+      record("sidebar-probe-error:no sidebar.content claim was registered");
+      return;
+    }
+
+    const rootBackground = colorKey(COLORS.background);
+    runtime.solid.createRoot((dispose) => {
+      const fromClaim = sidebarClaim.render({ sessionID: "ses_probe" });
+      const fromPanel = runtime.view.AftSidebarPanel({
+        palette: runtime.legacy.resolveV1Palette(flatTheme),
+        snapshot: runtime.status.coerceAftStatus(STATUS),
+        prefs: runtime.prefs.DEFAULT_PREFS,
+        collapsed: false,
+        onToggleCollapsed: () => {},
+        pluginVersion: "probe",
+      });
+      // The claim's component fetches its snapshot, so its rows only settle
+      // once that promise has resolved and Solid has flushed the update.
+      setTimeout(() => {
+        try {
+          collect(fromClaim, rootBackground, "claim");
+          collect(fromPanel, rootBackground, "panel");
+          record("sidebar-probe-mode:" + THEME_MODE);
+          record("sidebar-probe-background:" + rootBackground);
+        } catch (error) {
+          record("sidebar-probe-error:" + String(error));
+        }
+        try {
+          dispose();
+        } catch {}
+        record("sidebar-probe-complete");
+      }, 1500);
+    });
+  } catch (error) {
+    record("sidebar-probe-error:" + String(error));
+  }
+}
+
+export default {
+  ...original,
+  setup: async (context) => {
+    record("tui-setup-start");
+    const cleanup = await original.setup(observe(context));
+    record("tui-setup-complete");
+    return cleanup;
+  },
+};
+`;
+}
+
 async function runV2TuiHost(input: {
   label: string;
   packageRoot: string;
@@ -717,6 +1058,63 @@ async function runV2TuiHost(input: {
   console.log(`[${input.label}-transcript]\n${transcript}`);
   console.log(`[${input.label}-events]\n${events.trim()}`);
   return { transcript: result, events };
+}
+
+type SidebarProbeRow = {
+  /** "claim" is the sidebar the host mounts; "panel" is the slot-plugin one. */
+  which: string;
+  /** Resolved foreground, 0-255 per channel, or "unset" if none was asked for. */
+  fg: string;
+  /** The colour behind that line: the nearest opaque ancestor, else the theme. */
+  background: string;
+  text: string;
+};
+
+function parseSidebarProbe(events: string): {
+  rows: SidebarProbeRow[];
+  background: string;
+  errors: string[];
+} {
+  const rows: SidebarProbeRow[] = [];
+  const errors: string[] = [];
+  let background = "";
+  for (const line of events.split(/\r?\n/)) {
+    if (line.startsWith("sidebar-probe-error:")) {
+      errors.push(line.slice("sidebar-probe-error:".length));
+    } else if (line.startsWith("sidebar-probe-background:")) {
+      background = line.slice("sidebar-probe-background:".length);
+    } else if (line.startsWith("sidebar-row:")) {
+      // Only the first three fields are fixed; the rendered text is whatever
+      // is left, colons included.
+      const parts = line.slice("sidebar-row:".length).split(":");
+      const [which, fg, rowBackground] = parts;
+      rows.push({
+        which: which ?? "",
+        fg: fg ?? "",
+        background: rowBackground ?? "",
+        text: parts.slice(3).join(":"),
+      });
+    }
+  }
+  return { rows, background, errors };
+}
+
+async function runV2SidebarProbe(
+  label: string,
+  themeMode: "dark" | "light",
+): Promise<ReturnType<typeof parseSidebarProbe> & { transcript: string }> {
+  const { v2 } = await ensureHostInstalls();
+  const packageRoot = await copyInstalledPlugin(v2, label);
+  await writeFile(join(packageRoot, "tui.js"), v2TuiSidebarProbeEntry(themeMode));
+
+  const { transcript, events } = await runV2TuiHost({
+    label,
+    packageRoot,
+    ready: (observed) => observed.includes("sidebar-probe-complete"),
+    timeoutMs: 240_000,
+  });
+
+  return { ...parseSidebarProbe(events), transcript };
 }
 
 /**
@@ -1888,6 +2286,47 @@ export default { id: original.id, effect };
     expect(events).not.toContain("slot-render-failed:");
   }, 240_000);
 
+  test("GA TUI host sidebar draws no line in the background colour under a light theme", async () => {
+    const probe = await runV2SidebarProbe("v2-tui-light-theme", "light");
+
+    expect(probe.errors).toEqual([]);
+    // The probe hands the host a light theme, so the colour behind the panel
+    // is white; a row that fails below is a row the user cannot read.
+    expect(probe.background).toBe("255,255,255,255");
+
+    const rendered = probe.rows.filter((row) => row.which === "claim");
+    expect(rendered.length).toBeGreaterThan(10);
+
+    // Read off the rendered text lines, not off the source: a line that asks
+    // for no foreground at all still resolves to the renderer's default white,
+    // which under this theme is exactly the background behind it.
+    const unreadable = rendered
+      .filter((row) => row.fg === row.background)
+      .map((row) => `${row.text} (fg ${row.fg} on ${row.background})`);
+    expect(unreadable).toEqual([]);
+    expect(rendered.filter((row) => row.fg === "unset")).toEqual([]);
+  }, 300_000);
+
+  test("GA TUI host sidebar carries the same sections as the slot-plugin sidebar", async () => {
+    const probe = await runV2SidebarProbe("v2-tui-sidebar-parity", "dark");
+
+    expect(probe.errors).toEqual([]);
+    const textsOf = (which: string): string[] =>
+      probe.rows.filter((row) => row.which === which).map((row) => row.text);
+    const hostSidebar = textsOf("claim");
+    const slotPluginSidebar = textsOf("panel");
+    expect(hostSidebar.length).toBeGreaterThan(10);
+
+    // Same payload, same lines: the two hosts may differ in how the component
+    // is mounted and where its colours come from, never in what it draws.
+    expect(hostSidebar).toEqual(slotPluginSidebar);
+
+    // And neither may quietly shrink. `sidebarSections` is the expectation the
+    // comparison above cannot supply, because both sidebars lose a deleted
+    // section together.
+    expect(sidebarSections.filter((section) => !hostSidebar.includes(section))).toEqual([]);
+  }, 300_000);
+
   test("GA TUI host loads a directory target through its root tui entrypoint", async () => {
     const { v2 } = await ensureHostInstalls();
     const packageRoot = await copyInstalledPlugin(v2, "v2-tui-directory");
@@ -2205,6 +2644,8 @@ export default entry;
       "v2-lifecycle",
       "v2-permission-prompt",
       "v2-tui-keymap",
+      "v2-tui-light-theme",
+      "v2-tui-sidebar-parity",
       "v2-tui-directory",
       "v2-tool-ownership",
       "v1-root-mutation",
