@@ -102,6 +102,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
             &req.id,
             serde_json::json!({
                 "text": text,
+                "discovered": true,
                 "complete": !discovery.walk_truncated
                     && !discovery.collection_truncated
                     && discovery.skipped_foreign_mounts == 0,

@@ -1747,18 +1747,21 @@ fn format_outline_text(data: &Value) -> String {
     };
 
     // A directory outline discovers its own files; an explicit `files` request
-    // does not. Only the walk reports `walk_truncated`, so its presence says
-    // whether the caller chose these paths or we found them.
+    // does not. The command says which it was, rather than the renderer
+    // inferring it from some other field's presence.
     //
-    // That decides how much a skip is worth saying. If the caller named a file,
-    // "I could not parse it" answers their request and belongs in the reply. If
-    // we walked a repository, every .gitignore, LICENSE and lockfile is an
-    // unsupported language, and naming each one spends the caller's context to
-    // tell them something they never asked about: 27 such lines prompted this
-    // change. Those are counted instead, while genuine gaps — unreadable,
-    // unparseable, vanished — keep their names in both modes, because those are
-    // the ones that change what a reader does next.
-    let discovered = data.get("walk_truncated").is_some();
+    // That distinction decides how much a skip is worth saying. If the caller
+    // named a file, "I could not parse it" answers their request and belongs in
+    // the reply. If we walked a repository, every .gitignore, LICENSE and
+    // lockfile is an unsupported language, and naming each one spends the
+    // caller's context to tell them something they never asked about: 27 such
+    // lines prompted this change. Those are counted instead, while genuine gaps
+    // — unreadable, unparseable, vanished — keep their names in both modes,
+    // because those are the ones that change what a reader does next.
+    let discovered = data
+        .get("discovered")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut named: Vec<String> = Vec::new();
     let mut unsupported = 0_usize;
     for item in skipped {
@@ -3637,7 +3640,7 @@ mod outline_format_tests {
     fn directory_outline_counts_unsupported_files_instead_of_naming_them() {
         let data = serde_json::json!({
             "text": "src/\n  lib.rs",
-            "walk_truncated": false,
+            "discovered": true,
             "skipped_files": [
                 { "file": ".gitignore", "reason": "unsupported_language" },
                 { "file": "LICENSE", "reason": "unsupported_language" },
