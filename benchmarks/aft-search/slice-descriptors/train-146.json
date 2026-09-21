@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "bench-answer-key-exclusion",
+    "bench-windows-transport",
+    "aft-index-binary-resolution"
+  ],
+  "note": "No ranking-fence file changes. Bench-side only: the benchmark's own answer key excluded from the indexed corpus with baseline.json re-recorded on one binary, the Windows harness defects (select on a pipe, verbatim paths, autocrlf hash pin, ORT dll), and CLI binary resolution searching the cache directory doctor --fix installs into."
+}
