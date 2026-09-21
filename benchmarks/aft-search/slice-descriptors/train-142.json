@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oc2-permission-approve-hang",
+    "sentinel-log-silent-gating"
+  ],
+  "note": "No ranking-fence file changes: the V2 permission prompt now attaches its event subscription before announcing the request (V2 subscriptions are lazy and the host keeps no backlog, so an approval reply was lost and the call hung), the reply wait is bounded and refuses with what it observed, and the health sentinel reports a silent daemon log only when the log actually grew."
+}
