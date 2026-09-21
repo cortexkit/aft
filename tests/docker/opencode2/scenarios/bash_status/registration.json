@@ -70,14 +70,16 @@
         "rules": [
           {
             "kind": "field",
-            "field": "fixture_marker",
-            "pattern": "^(?=[\\s\\S]*(?<value>task))[\\s\\S]+$",
-            "min_lines": 1,
-            "max_lines": 10000
+            "field": "task_state",
+            "pattern": "^Task bash-[0-9a-f]+: (?<value>running)$"
+          },
+          {
+            "kind": "ignore",
+            "pattern": "^A completion reminder will be delivered automatically; don't poll\\.$"
           }
         ],
         "expected": {
-          "fixture_marker": "task"
+          "task_state": "running"
         }
       }
     },

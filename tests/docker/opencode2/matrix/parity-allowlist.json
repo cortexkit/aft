@@ -76,20 +76,20 @@
     {
       "scenario": "bash_kill/T7/happy",
       "tool": "bash_kill",
-      "field": "fixture_marker",
-      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+      "field": "task_state",
+      "reason": "Comparison projects the task state the tool reports because host transports add presentation text around the tool result."
     },
     {
       "scenario": "bash_status/T7/happy",
       "tool": "bash_status",
-      "field": "fixture_marker",
-      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+      "field": "task_state",
+      "reason": "Comparison projects the task state the tool reports because host transports add presentation text around the tool result."
     },
     {
       "scenario": "bash_watch/T7/happy",
       "tool": "bash_watch",
-      "field": "fixture_marker",
-      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+      "field": "task_state",
+      "reason": "Comparison projects the task state the tool reports because host transports add presentation text around the tool result."
     },
     {
       "scenario": "bash_write/T7/happy",
