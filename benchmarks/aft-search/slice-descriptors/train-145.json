@@ -1,0 +1,20 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oc2-matrix-rows",
+    "oc2-bash-metadata",
+    "doctor-generation",
+    "cost-gate-baselines",
+    "v2-theme-shape",
+    "oc2-plugin-config-key",
+    "issue-327-harness"
+  ],
+  "note": "No ranking-fence file changes: the OpenCode 2 matrix rows and the undefined-metadata fix behind them, generation-aware doctor, re-captured cost baselines with a scheduled-failure detector, the host-recorded V2 theme fixture, and the semantic embed RSS harness."
+}
