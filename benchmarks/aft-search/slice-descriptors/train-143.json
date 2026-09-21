@@ -1,0 +1,17 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oc2-t7-v1-host-exit",
+    "v1-oneshot-hang-ownership",
+    "bun-rpc-unref",
+    "release-notes-v0.57.0"
+  ],
+  "note": "No ranking-fence file changes: the OpenCode 2 harness now hands the V1 host a provider block and a plugin wrapper it accepts and prints its logs, the V1 one-shot non-exit is recorded as the host's with the git-project trigger, the Bun RPC listener is unreffed to match the Node path, and the release notes gain their OpenCode 2 section."
+}
