@@ -11215,7 +11215,11 @@ public class Greeter {
     /// status, health, and search surfaces named on the constant.
     #[test]
     fn semantic_status_words_include_the_labels_this_module_produces() {
-        let index = SemanticIndex::new(PathBuf::from("/tmp/project"), 384);
+        // A tempdir rather than a literal: `SemanticIndex::new` requires an
+        // absolute root, and a Unix-rooted literal like `/tmp/project` is not
+        // absolute on Windows, where a path needs a drive or UNC prefix.
+        let project = tempfile::tempdir().expect("tempdir");
+        let index = SemanticIndex::new(project.path().to_path_buf(), 384);
         assert_eq!(index.status_label(&SemanticIndexStatus::ready()), "ready");
         for label in ["disabled", "failed", "loading", "ready"] {
             assert!(
