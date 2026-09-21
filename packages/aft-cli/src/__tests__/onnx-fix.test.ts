@@ -64,6 +64,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
       cachedCompatible: null,
       platform: "linux-x64",
       installHint: "AFT auto-downloads",
+      autoDownloadable: true,
       requirement: ">=1.20",
     },
     logFile: { path: "/tmp/aft.log", exists: false, sizeKb: 0 },

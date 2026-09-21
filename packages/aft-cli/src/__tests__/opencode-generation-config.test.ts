@@ -629,6 +629,7 @@ function doctorFixture(
       cachedCompatible: null,
       platform: "fixture",
       installHint: "fixture",
+      autoDownloadable: true,
       requirement: "fixture",
     },
     logFile: { path: join(root, "aft-plugin.log"), exists: false, sizeKb: 0 },

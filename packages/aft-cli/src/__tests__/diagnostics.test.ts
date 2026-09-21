@@ -53,6 +53,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
       cachedCompatible: null,
       platform: "test-test",
       installHint: "install onnx",
+      autoDownloadable: true,
       requirement: ">=1.20",
     },
     logFile: { path: "/tmp/aft-test/aft.log", exists: false, sizeKb: 0 },
@@ -77,6 +78,51 @@ function makeReport(harness: HarnessDiagnostic): DiagnosticReport {
     },
   };
 }
+
+describe("missing ONNX Runtime remediation", () => {
+  const missingOnnx = (
+    overrides: Partial<HarnessDiagnostic["onnxRuntime"]>,
+  ): string | undefined => {
+    const report = makeReport(
+      makeHarness({
+        onnxRuntime: { ...makeHarness().onnxRuntime, required: true, ...overrides },
+      }),
+    );
+    return collectDiagnosticIssues(report).find((issue) => issue.code === "onnx_missing")
+      ?.remediation;
+  };
+
+  // Apple Silicon is an auto-download platform, and the advice used to read
+  // "install ONNX Runtime manually (AFT auto-downloads ONNX Runtime on Apple
+  // Silicon)", which tells the user to do by hand the thing it says is
+  // automatic.
+  test("sends a platform AFT downloads for to doctor --fix and nowhere else", () => {
+    const remediation = missingOnnx({
+      autoDownloadable: true,
+      platform: "darwin-arm64",
+      installHint: "AFT auto-downloads ONNX Runtime on Apple Silicon",
+    });
+
+    expect(remediation).toBe(
+      "Run `npx @cortexkit/aft doctor --fix` to download the AFT-managed ONNX Runtime.",
+    );
+    expect(remediation).not.toContain("manual");
+  });
+
+  // Microsoft publishes no macOS x64 build, so there is nothing for --fix to
+  // fetch and Homebrew really is the route.
+  test("keeps the manual route where there is no published build to download", () => {
+    const remediation = missingOnnx({
+      autoDownloadable: false,
+      platform: "darwin-x64",
+      installHint: "brew install onnxruntime (Intel Mac — no published build)",
+    });
+
+    expect(remediation).toContain("brew install onnxruntime");
+    expect(remediation).toContain("darwin-x64");
+    expect(remediation).not.toContain("doctor --fix");
+  });
+});
 
 describe("diagnostic issue summaries", () => {
   test("reports plugin/CLI version skew as a high-severity issue", () => {

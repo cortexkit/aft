@@ -7,7 +7,10 @@ import {
   readSync,
   statSync,
 } from "node:fs";
-import { resolveCortexKitProjectConfigPath } from "@cortexkit/aft-bridge";
+import {
+  isOrtAutoDownloadSupported,
+  resolveCortexKitProjectConfigPath,
+} from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
@@ -99,6 +102,12 @@ export interface HarnessDiagnostic {
     cachedCompatible: boolean | null;
     platform: string;
     installHint: string;
+    /**
+     * True when AFT downloads and manages the runtime itself on this
+     * platform/arch. Where it is false there is no published build AFT can
+     * fetch, and installing by hand is the only route.
+     */
+    autoDownloadable: boolean;
     requirement: string;
   };
   logFile: {
@@ -226,6 +235,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       cachedCompatible: cachedVersion ? isOrtVersionCompatible(cachedVersion) : null,
       platform: `${process.platform}-${process.arch}`,
       installHint: getManualInstallHint(),
+      autoDownloadable: isOrtAutoDownloadSupported(),
       requirement: `>=${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}`,
     },
     logFile: {
@@ -437,7 +447,14 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
           message: h.onnxRuntime.ignoredSystemPath
             ? `ONNX Runtime at ${h.onnxRuntime.ignoredSystemPath} has a ${h.onnxRuntime.ignoredSystemReason}; no compatible runtime was detected.`
             : "ONNX Runtime is required for semantic search but was not detected.",
-          remediation: `Run \`${CLI} doctor --fix\` or install ONNX Runtime manually (${h.onnxRuntime.installHint}).`,
+          // Only send the user to a manual install where AFT has nothing to
+          // download for them. On a platform AFT fetches the runtime for,
+          // `doctor --fix` is the whole remediation, and offering a manual
+          // install beside the sentence that says AFT does it automatically
+          // contradicts itself.
+          remediation: h.onnxRuntime.autoDownloadable
+            ? `Run \`${CLI} doctor --fix\` to download the AFT-managed ONNX Runtime.`
+            : `Install ONNX Runtime manually (${h.onnxRuntime.installHint}); AFT has no ONNX Runtime download for ${h.onnxRuntime.platform}.`,
         });
       }
       if (h.onnxRuntime.cachedCompatible === false) {

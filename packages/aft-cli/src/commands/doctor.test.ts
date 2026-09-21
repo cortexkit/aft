@@ -96,6 +96,7 @@ function makeHarness(overrides: Partial<HarnessDiagnostic> = {}): HarnessDiagnos
       cachedCompatible: null,
       platform: "test-test",
       installHint: "install onnx",
+      autoDownloadable: true,
       requirement: ">=1.20",
     },
     logFile: { path: "/tmp/aft-test/aft.log", exists: false, sizeKb: 0 },
