@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -320,33 +320,71 @@ function errorRecord(error: unknown): ScenarioResult["failure"] {
 }
 
 interface TransportDeadStub {
+  /** The path handed to the plugin as `AFT_BINARY_PATH` for the whole run. */
   executable: string;
-  marker: string;
+  /** The real binary that path points at while the transport is alive. */
+  live: string;
+  /** The missing path it points at while the transport is dead. */
+  dead: string;
 }
 
+/**
+ * Build the switchable `aft` the transport-dead window points the plugin at.
+ *
+ * Two things have to be true at once, and a single stub file cannot do both.
+ *
+ * The plugin has to START: it registers its tools once, at plugin load, and
+ * the bridge resolver refuses any `AFT_BINARY_PATH` that is not a native
+ * executable — a deliberate guard against a `which aft` PATH lookup finding
+ * the npm CLI's own `#!` shim and recursing into it. A shell stub installed
+ * under that variable for the whole scenario threw during registration, and
+ * the host ended up holding none of AFT's tools rather than a bash whose
+ * transport dies mid-run.
+ *
+ * The dead state has to prove the command never reached AFT: bash only falls
+ * back to host execution for failures that happened BEFORE dispatch. A stub
+ * that starts and exits is not one of them — the bridge has already written
+ * the request to it, so the outcome is unknown and the product refuses to
+ * re-run the command anywhere. A binary that is not there at all cannot have
+ * been sent anything, and the spawn failure is what the fallback path is
+ * written against.
+ *
+ * So the variable names a symlink: the real binary while the plugin starts and
+ * registers, a path that does not exist for the declared window.
+ */
 async function makeTransportDeadStub(
   isolationRoot: string,
-  configuredExecutable: string,
+  nativeExecutable: string,
 ): Promise<TransportDeadStub> {
   const stateRoot = join(isolationRoot, ".harness-state");
-  const executable = join(stateRoot, "aft-transport-window");
-  const marker = join(stateRoot, "transport-dead");
   await mkdir(stateRoot, { recursive: true });
-  await writeFile(
-    executable,
-    `#!/bin/sh\nif { [ "\${1:-}" != "--version" ] && [ "\${1:-}" != "-V" ]; } && [ -f ${JSON.stringify(
-      marker,
-    )} ]; then\n  echo "AFT harness transport unavailable" >&2\n  exit 3\nfi\nexec ${JSON.stringify(
-      configuredExecutable,
-    )} "$@"\n`,
-  );
-  await chmod(executable, 0o755);
-  return { executable, marker };
+  const stub: TransportDeadStub = {
+    executable: join(stateRoot, "aft"),
+    live: nativeExecutable,
+    dead: join(stateRoot, "aft-removed"),
+  };
+  await rm(stub.dead, { force: true });
+  await pointTransportDeadStub(stub, false);
+  return stub;
+}
+
+/**
+ * Point the scenario's `aft` at the real binary or at the missing one.
+ *
+ * The swap is a rename over the symlink so anything about to spawn it sees one
+ * state or the other, and so a process already running the old target keeps
+ * running rather than dying halfway.
+ */
+async function pointTransportDeadStub(stub: TransportDeadStub, dead: boolean): Promise<void> {
+  const pending = `${stub.executable}.pending`;
+  await rm(pending, { force: true });
+  await symlink(dead ? stub.dead : stub.live, pending);
+  await rename(pending, stub.executable);
 }
 
 async function killAftBridgeDescendants(
   serverPid: number | undefined,
-  configuredExecutable: string,
+  configuredExecutables: readonly string[],
 ): Promise<void> {
   if (!serverPid) return;
   const processList = await runCommand("ps", ["-eo", "pid=,ppid=,command="], {
@@ -374,7 +412,12 @@ async function killAftBridgeDescendants(
     }
   }
   for (const row of rows) {
-    if (!descendants.has(row.pid) || !row.command.includes(configuredExecutable)) continue;
+    if (
+      !descendants.has(row.pid) ||
+      !configuredExecutables.some((candidate) => row.command.includes(candidate))
+    ) {
+      continue;
+    }
     try {
       process.kill(row.pid, "SIGKILL");
     } catch (error) {
@@ -539,11 +582,12 @@ async function runOneScenario(options: {
         if (transportDeadWindow && transportDeadStub) {
           const shouldBeDead = transportDeadAtTurn(scenario, transportDeadWindow, turn.label);
           if (shouldBeDead !== transportDeadActive) {
+            await pointTransportDeadStub(transportDeadStub, shouldBeDead);
             if (shouldBeDead) {
-              await writeFile(transportDeadStub.marker, "transport unavailable\n");
-              await killAftBridgeDescendants(server?.child.pid, config.executable);
-            } else {
-              await rm(transportDeadStub.marker, { force: true });
+              await killAftBridgeDescendants(server?.child.pid, [
+                transportDeadStub.executable,
+                config.nativeExecutable,
+              ]);
             }
             transportDeadActive = shouldBeDead;
           }
@@ -656,7 +700,7 @@ async function runOneScenario(options: {
       providerConfigKey: options.providerConfigKey,
     });
     if (transportDeadWindow) {
-      transportDeadStub = await makeTransportDeadStub(isolation.root, config.executable);
+      transportDeadStub = await makeTransportDeadStub(isolation.root, config.nativeExecutable);
       isolation.env.AFT_BINARY_PATH = transportDeadStub.executable;
     } else {
       isolation.env.AFT_BINARY_PATH = config.nativeExecutable;
@@ -808,7 +852,7 @@ async function runOneScenario(options: {
   } catch (error) {
     recordFailure(error);
   } finally {
-    if (transportDeadStub) await rm(transportDeadStub.marker, { force: true });
+    if (transportDeadStub) await pointTransportDeadStub(transportDeadStub, false);
     await Promise.allSettled(controlPromises);
     if (mock) {
       try {
