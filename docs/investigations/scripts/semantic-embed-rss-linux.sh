@@ -13,7 +13,7 @@
 # cpu.max reads "max" and the quota branch of the thread-count derivation never
 # executes, which would leave one of the three Linux-only paths untested.
 #
-# The binary is built once with tests/docker/Dockerfile.build-linux and staged
+# The binary is built once with semantic-embed-rss-build.Dockerfile and staged
 # into the runtime image, rather than compiled inside it. Under amd64 emulation
 # on an arm64 host, compiling twice is the difference between minutes and
 # tens of minutes.
@@ -63,8 +63,8 @@ else
   docker build \
     --platform "$PLATFORM" \
     --build-arg "CARGO_PROFILE=$PROFILE" \
-    -f "$REPO_ROOT/tests/docker/Dockerfile.build-linux" \
-    -t "$BUILD_IMAGE" \
+    -f "$SCRIPT_DIR/semantic-embed-rss-build.Dockerfile" \
+    -t "$BUILD_IMAGE-${PLATFORM##*/}" \
     "$REPO_ROOT"
 
   # `cargo build --profile dev` lands in target/debug, every other profile in
@@ -74,7 +74,7 @@ else
   else
     BUILT_PATH="/build/target/$PROFILE/aft"
   fi
-  container="$(docker create --platform "$PLATFORM" "$BUILD_IMAGE")"
+  container="$(docker create --platform "$PLATFORM" "$BUILD_IMAGE-${PLATFORM##*/}")"
   docker cp "$container:$BUILT_PATH" "$STAGE_DIR/artifact/aft"
   docker rm -f "$container" >/dev/null
 fi
@@ -83,7 +83,7 @@ cp "$SCRIPT_DIR/semantic-embed-rss.py" "$STAGE_DIR/semantic-embed-rss.py"
 cp "$SCRIPT_DIR/semantic-embed-rss-linux.Dockerfile" "$STAGE_DIR/Dockerfile"
 
 printf 'Building the runtime image...\n'
-docker build --platform "$PLATFORM" -t "$RUN_IMAGE" "$STAGE_DIR"
+docker build --platform "$PLATFORM" -t "$RUN_IMAGE-${PLATFORM##*/}" "$STAGE_DIR"
 
 mkdir -p "$OUT_DIR"
 printf 'Running the harness (cpus=%s, results in %s)...\n' "$CPUS" "$OUT_DIR"
@@ -94,7 +94,7 @@ docker run --rm \
   --platform "$PLATFORM" \
   --cpus "$CPUS" \
   -v "$OUT_DIR:/results" \
-  "$RUN_IMAGE" \
+  "$RUN_IMAGE-${PLATFORM##*/}" \
   --binary /usr/local/bin/aft \
   --workdir /results/run \
   "$@"

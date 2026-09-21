@@ -103,13 +103,29 @@ def write_corpus(root: Path, files: int, symbols: int) -> None:
         (src / f"module_{index}.rs").write_text("".join(parts), encoding="utf-8")
 
 
-def write_config(root: Path, workdir: Path, base_url: str, batch: int) -> Path:
+def write_config(
+    root: Path, workdir: Path, base_url: str, batch: int, backend: str
+) -> Path:
     project = {"semantic_search": True}
     target = root / ".cortexkit"
     target.mkdir(parents=True, exist_ok=True)
     (target / "aft.jsonc").write_text(json.dumps(project, indent=2), encoding="utf-8")
-    user = {
-        "semantic": {
+
+    if backend == "fastembed":
+        # The local backend embeds in-process through ONNX. It ignores base_url
+        # and only accepts the bundled model, so the stub server sits idle for
+        # these runs and batch pacing comes from real inference instead of
+        # --delay-ms. This is the only configuration that instantiates the local
+        # embedder, and therefore the only one that reads the cgroup CPU quota.
+        semantic = {
+            "backend": "fastembed",
+            "model": "all-MiniLM-L6-v2",
+            "max_batch_size": batch,
+            "max_files": 50000,
+            "timeout_ms": 600000,
+        }
+    else:
+        semantic = {
             "backend": "openai_compatible",
             "model": "stub-embedding",
             "base_url": base_url,
@@ -118,9 +134,14 @@ def write_config(root: Path, workdir: Path, base_url: str, batch: int) -> Path:
             "timeout_ms": 600000,
             "max_input_tokens": 512,
         }
-    }
+
+    # `semantic.backend` is user-scoped. A project-scoped .cortexkit/aft.jsonc
+    # drops it without complaint and the daemon falls back to the local backend,
+    # so a run meant to measure the remote lane would silently measure the local
+    # one. Writing it into a user config and passing the path is what makes the
+    # requested backend actually take effect.
     user_path = workdir / "user-aft.jsonc"
-    user_path.write_text(json.dumps(user, indent=2), encoding="utf-8")
+    user_path.write_text(json.dumps({"semantic": semantic}, indent=2), encoding="utf-8")
     return user_path
 
 
@@ -209,6 +230,14 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=10.0)
     parser.add_argument("--calls-per-second", type=float, default=2.0)
     parser.add_argument("--reconfigure-every", type=float, default=0.0)
+    parser.add_argument(
+        "--backend",
+        choices=["openai_compatible", "fastembed"],
+        default="openai_compatible",
+        help="fastembed runs the in-process ONNX embedder and needs its model "
+        "downloaded once; --delay-ms has no effect there because real "
+        "inference sets the pace",
+    )
     parser.add_argument("--label", default="agent")
     args = parser.parse_args()
 
@@ -226,7 +255,7 @@ def main() -> int:
 
     server, base_url = start_stub()
     write_corpus(root, args.files, args.symbols)
-    user_config = write_config(root, workdir, base_url, args.batch_size)
+    user_config = write_config(root, workdir, base_url, args.batch_size, args.backend)
     subprocess.run(["git", "add", "-A"], cwd=root, check=True)
     subprocess.run(
         ["git", "-c", "user.email=h@x", "-c", "user.name=h", "commit", "-qm", "corpus"],

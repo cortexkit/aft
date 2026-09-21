@@ -15,8 +15,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     git \
     procps \
+    curl \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# The local fastembed backend loads ONNX Runtime through ORT_DYLIB_PATH. AFT
+# normally downloads it into its storage directory on first use; fetching it at
+# image build time instead keeps the measured run free of a one-off download,
+# and ORT_DYLIB_PATH is the documented explicit override so the resolver
+# short-circuits rather than searching the tree.
+#
+# The version and asset naming follow packages/aft-bridge/src/onnx-runtime.ts,
+# which is the source of truth for what AFT expects.
+ARG ORT_VERSION=1.24.4
+RUN set -eux; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) ort_arch=x64 ;; \
+      arm64) ort_arch=aarch64 ;; \
+      *) echo "no ONNX Runtime asset for $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    asset="onnxruntime-linux-${ort_arch}-${ORT_VERSION}"; \
+    curl -fsSL -o /tmp/ort.tgz \
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${asset}.tgz"; \
+    mkdir -p /opt/onnxruntime; \
+    tar -xzf /tmp/ort.tgz -C /opt/onnxruntime --strip-components=1; \
+    rm /tmp/ort.tgz; \
+    ls /opt/onnxruntime/lib/libonnxruntime.so*
+ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
 
 RUN git config --global user.email "harness@test.invalid" && \
     git config --global user.name "Harness" && \
