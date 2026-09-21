@@ -122,7 +122,10 @@ def gate_arguments(args: argparse.Namespace, score_path: Path) -> list[str]:
 def run(args: argparse.Namespace) -> int:
     if args.self_test:
         command([sys.executable, str(HERE / "search_quality.py"), "--self-test"])
-        command([sys.executable, "-m", "unittest", "-v", "test_run_real_query.py", "test_search_quality.py"], cwd=HERE)
+        command(
+            [sys.executable, "-m", "unittest", "-v", "test_run_real_query.py", "test_search_quality.py", "test_harness_integrity.py"],
+            cwd=HERE,
+        )
         return 0
 
     corpus_path = Path(args.corpus).resolve()
