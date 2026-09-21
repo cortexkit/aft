@@ -1,0 +1,17 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "oc2-t7-final-three",
+    "oc2-bash-t3-transport-window",
+    "semantic-status-leftovers",
+    "cost-gate-tier2-attribution",
+    "windows-absolute-root-test",
+    "real-query-reference-recapture"
+  ],
+  "note": "Fence files are status vocabulary and a test-only absolute-path fix. The real-query reference was re-recorded in this train after commit 0b14e8b2d was proven to have changed the indexed corpus."
+}
