@@ -6,11 +6,17 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  daemonMissingRuntimePrefix,
+  daemonSemanticStatusWords,
+} from "../../../aft-bridge/src/__tests__/test-utils/daemon-status-words.js";
+import {
   coerceAftStatus,
   formatBytes,
   formatCacheRoleLabel,
+  formatSemanticIndexStatus,
   formatStatusDialogMessage,
   formatStatusMarkdown,
+  semanticIndexStatusKind,
 } from "../shared/status.js";
 
 describe("shared status helpers", () => {
@@ -159,5 +165,52 @@ describe("shared status helpers", () => {
     expect(markdown).toContain("shared repo index (built by the main checkout)");
     expect(dialog.toLowerCase()).not.toContain("degraded");
     expect(markdown.toLowerCase()).not.toContain("degraded");
+  });
+});
+
+/**
+ * Both plugin hosts render the daemon's semantic status through one
+ * implementation in @cortexkit/aft-bridge; its own tests cover the formatting
+ * rules. What this harness has to prove is that the implementation it imports
+ * is that one — this file used to hold a private copy that still rendered a
+ * dead index as a rebuild, and a copy that has not kept up is what fails here.
+ */
+describe("semantic index status as this harness imports it", () => {
+  test("classifies every status word the daemon can emit", () => {
+    const unrenderable = daemonSemanticStatusWords().filter(
+      (word) => semanticIndexStatusKind(word) === "unrecognized",
+    );
+
+    expect(unrenderable).toEqual([]);
+  });
+
+  test("a dead index is not rendered as a rebuild", () => {
+    const label = formatSemanticIndexStatus(
+      "building",
+      "fingerprint_change",
+      `${daemonMissingRuntimePrefix()} dlopen('libonnxruntime.dylib') failed: image not found`,
+    );
+
+    expect(label).not.toBe("Rebuilding (model changed)");
+    expect(label).toContain("ONNX Runtime");
+  });
+
+  test("a backend outage reads as words rather than a wire token", () => {
+    expect(formatSemanticIndexStatus("backend_unavailable", null)).toBe("backend unavailable");
+  });
+
+  test("the status dialog names a missing runtime instead of a build stage", () => {
+    const status = coerceAftStatus({
+      semantic_index: {
+        status: "failed",
+        stage: "fingerprint_change",
+        error: `${daemonMissingRuntimePrefix()} Run \`npx @cortexkit/aft doctor --fix\``,
+      },
+    });
+
+    const dialog = formatStatusDialogMessage(status);
+
+    expect(dialog).toContain("ONNX Runtime missing");
+    expect(dialog).not.toContain("- status: failed");
   });
 });

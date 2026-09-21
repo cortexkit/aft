@@ -1,3 +1,18 @@
+import {
+  formatSemanticIndexStatus,
+  type SemanticIndexStatusKind,
+  semanticIndexStatusKind,
+} from "@cortexkit/aft-bridge";
+
+/**
+ * The semantic-index status formatter lives in @cortexkit/aft-bridge because
+ * both plugin hosts render it and two copies is how the same defect once
+ * shipped twice: this file used to hold its own version, which still rendered a
+ * dead index as a rebuild long after the other host was fixed. Re-exported here
+ * so this module stays the one status import for the rest of the plugin.
+ */
+export { formatSemanticIndexStatus, type SemanticIndexStatusKind, semanticIndexStatusKind };
+
 export interface StatusCompressionAggregate {
   events: number;
   original_tokens: number;
@@ -185,13 +200,6 @@ export function formatCacheRoleLabel(role: string): string {
   return role;
 }
 
-export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
-  if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
-    return "Rebuilding (model changed)";
-  }
-  return status;
-}
-
 export function formatSemanticRefreshing(refreshingCount: number): string | null {
   if (!Number.isFinite(refreshingCount) || refreshingCount <= 0) return null;
   if (refreshingCount > 20) return "Ready (many files refreshing)";
@@ -313,7 +321,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
+    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}`,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {
@@ -416,7 +424,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
+    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}\``,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {

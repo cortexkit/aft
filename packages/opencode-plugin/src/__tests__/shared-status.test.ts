@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  daemonMissingRuntimePrefix,
+  daemonSemanticStatusWords,
+} from "../../../aft-bridge/src/__tests__/test-utils/daemon-status-words.js";
 import {
   coerceAftStatus,
   formatCacheRoleLabel,
@@ -168,66 +170,23 @@ describe("formatStatus* output", () => {
 });
 
 /**
- * The daemon's own semantic-index vocabulary and the prefix it puts on every
- * missing-runtime message, read from the source that defines them. Parsed
- * rather than copied so a word added on the daemon side turns into a failing
- * test here instead of an unexplained word in the sidebar.
+ * Both plugin hosts render the daemon's semantic status through one
+ * implementation in @cortexkit/aft-bridge; its own tests cover the formatting
+ * rules. What this harness has to prove is that the implementation it imports
+ * is that one — if this plugin ever grows a private copy again, the copy is
+ * what these assertions run against, and a copy that has not kept up fails
+ * here.
  */
-const daemonSemanticIndexSource = join(
-  import.meta.dir,
-  "../../../../crates/aft/src/semantic_index.rs",
-);
-
-function readDaemonSource(): string {
-  const source = readFileSync(daemonSemanticIndexSource, "utf8");
-  if (source.length === 0) {
-    throw new Error(`empty daemon source at ${daemonSemanticIndexSource}`);
-  }
-  return source;
-}
-
-function daemonSemanticStatusWords(): string[] {
-  const source = readDaemonSource();
-  const declaration = source.indexOf("pub const SEMANTIC_INDEX_STATUS_WORDS");
-  const open = source.indexOf("&[", declaration);
-  const close = source.indexOf("];", open);
-  if (declaration < 0 || open < 0 || close < 0) {
-    throw new Error("SEMANTIC_INDEX_STATUS_WORDS not found in the daemon source");
-  }
-  const words = [...source.slice(open, close).matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
-  // The daemon lists ready/building/failed and several more; a handful of
-  // matches means the parse drifted, and an empty list would make the coverage
-  // assertion below pass without checking anything.
-  if (words.length < 5) {
-    throw new Error(`parsed only ${words.length} daemon status word(s): ${words.join(", ")}`);
-  }
-  return words;
-}
-
-function daemonMissingRuntimePrefix(): string {
-  const match = readDaemonSource().match(/ONNX_RUNTIME_MISSING_PREFIX: &str = "([^"]+)"/);
-  if (!match) {
-    throw new Error("ONNX_RUNTIME_MISSING_PREFIX not found in the daemon source");
-  }
-  return match[1];
-}
-
-describe("formatSemanticIndexStatus", () => {
-  test("a model change still reports as a rebuild", () => {
-    // The rebuild wording is correct when a rebuild is really running; the
-    // failure handling below must not cost us this case.
-    expect(formatSemanticIndexStatus("building", "fingerprint_change")).toBe(
-      "Rebuilding (model changed)",
+describe("semantic index status as this harness imports it", () => {
+  test("classifies every status word the daemon can emit", () => {
+    const unrenderable = daemonSemanticStatusWords().filter(
+      (word) => semanticIndexStatusKind(word) === "unrecognized",
     );
-    expect(formatSemanticIndexStatus("loading", "fingerprint_change")).toBe(
-      "Rebuilding (model changed)",
-    );
+
+    expect(unrenderable).toEqual([]);
   });
 
-  test("a failed index is never reported as a rebuild", () => {
-    // A build that dies leaves its stage behind. Reading the stage alone turns
-    // a dead attempt into "Rebuilding (model changed)" and tells the user to
-    // wait for a build that stopped.
+  test("a dead index is not rendered as a rebuild", () => {
     const label = formatSemanticIndexStatus(
       "building",
       "fingerprint_change",
@@ -238,52 +197,7 @@ describe("formatSemanticIndexStatus", () => {
     expect(label).toContain("ONNX Runtime");
   });
 
-  test("names the missing runtime and the command that installs it", () => {
-    const label = formatSemanticIndexStatus(
-      "failed",
-      null,
-      `${daemonMissingRuntimePrefix()} Run \`npx @cortexkit/aft doctor --fix\``,
-    );
-
-    expect(label).toContain("ONNX Runtime");
-    expect(label).toContain("doctor --fix");
-    // No platform-specific install advice: whether AFT can download the runtime
-    // here is answered by the downloader, and `doctor --fix` is what asks it.
-    expect(label).not.toContain("brew");
-    expect(label).not.toContain("apt");
-  });
-
-  test("a missing runtime carried in the build stage is not progress", () => {
-    const label = formatSemanticIndexStatus(
-      "loading",
-      `waiting_for_embedding_backend: ${daemonMissingRuntimePrefix()} dlopen failed`,
-    );
-
-    expect(label).not.toBe("loading");
-    expect(label).toContain("ONNX Runtime");
-  });
-
-  test("an ordinary failure keeps its word and gains no progress wording", () => {
-    expect(formatSemanticIndexStatus("failed", "fingerprint_change")).toBe("failed");
+  test("a backend outage reads as words rather than a wire token", () => {
     expect(formatSemanticIndexStatus("backend_unavailable", null)).toBe("backend unavailable");
-    expect(formatSemanticIndexStatus("ready", null)).toBe("ready");
-  });
-
-  test("classifies every status word the daemon can emit", () => {
-    const unrenderable = daemonSemanticStatusWords().filter(
-      (word) => semanticIndexStatusKind(word) === "unrecognized",
-    );
-
-    expect(unrenderable).toEqual([]);
-  });
-
-  test("no daemon status word is classified as progress and failure at once", () => {
-    // The two kinds decide opposite advice (wait vs act), so the sets that
-    // define them must not overlap.
-    const progress = daemonSemanticStatusWords().filter(
-      (word) => semanticIndexStatusKind(word) === "progress",
-    );
-
-    expect(progress).toEqual(["building", "loading"]);
   });
 });

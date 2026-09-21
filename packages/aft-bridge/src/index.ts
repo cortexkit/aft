@@ -208,6 +208,9 @@ export type {
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
+// --- semantic-index status vocabulary (shared by both plugin hosts) ---
+export type { SemanticIndexStatusKind } from "./semantic-status.js";
+export { formatSemanticIndexStatus, semanticIndexStatusKind } from "./semantic-status.js";
 export {
   resolveAftLogPath,
   resolveAftStorageRoot,
