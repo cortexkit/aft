@@ -1259,8 +1259,12 @@ async function main(): Promise<void> {
     let result: ScenarioResult;
     let smokeRan = false;
     if (scenario.trajectory === "T7") {
+      // Each leg gets its own copy of the script. A turn's placeholders are
+      // filled in on the turn itself as the run observes the ids it names, so
+      // two legs sharing one scenario would leave the second calling the
+      // first's background task instead of its own.
       const v2 = await runOneScenario({
-        scenario,
+        scenario: structuredClone(scenario),
         config,
         pinnedHostVersion,
         pluginVersion,
@@ -1276,7 +1280,7 @@ async function main(): Promise<void> {
       const v1 =
         config.v1HostExecutable && v1ProviderContract
           ? await runOneScenario({
-              scenario,
+              scenario: structuredClone(scenario),
               config,
               pinnedHostVersion,
               pluginVersion,
