@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-327-prewarm-tree-eviction",
+    "exact-recall-corpus-provisioning"
+  ],
+  "note": "Symbol prewarm evicts each parse tree after extraction (issue #327); exact-recall gate provisions its repo corpus. No ranking, scoring or corpus content changed."
+}
