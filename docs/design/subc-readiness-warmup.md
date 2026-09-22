@@ -66,11 +66,12 @@ Facts from SUBC's reading of the daemon (2026-09-22):
 Daemon obligations, both SUBC's (not yet built):
 
 1. Store the canonical `project_root` on `RouteBinding` and on the pending reservation.
-2. Add a channel-0 query that reads it back per module, which the incoming module can call while still not ready. HelloAck would freeze a snapshot at registration, too early for a swap: the incumbent keeps taking routes while the candidate warms.
+2. Add a query the incoming module can make over its own module connection while still not ready. HelloAck would freeze a snapshot at registration, too early for a swap: the incumbent keeps taking routes while the candidate warms.
 
 Still to specify: nothing on the query itself. SUBC's half is written in the subconscious repository at `docs/designs/module-readiness-and-swap.md` (master `d5cb856a`), section "The warm set" and slice E:
 
-- Query `supervisor.live_roots { module_id }` returns `LiveRoots { module_id, roots: [{project_root, bound, pending}], unknown_root_bindings, total_bindings }`. `total_bindings` makes "no routes at all" a positive statement rather than an inference from two zeros. The root is `Option<ProjectRootId>` on the binding, so a pre-change binding stays unknown rather than absent.
+- The query is a module-originated op on the module's own connection, beside `catalog.update` (the only module op the dispatcher accepted before): request `ModuleControlRequestFromModule::LiveRoots {}`, reply `ModuleControlResponseToModule::LiveRoots { roots: [{project_root, bound, pending}], unknown_root_bindings, total_bindings }`. It carries no module id: the daemon answers for the caller's own registration, so a module can only see its own routes. (An earlier draft used a control-plane `supervisor.live_roots` op; control-plane ops are unreachable from a module connection, corrected on subconscious master `6de30a0d`.) `total_bindings == sum(bound + pending) + unknown_root_bindings`, read under one lock, which is also the swap cutover's linearization point, and it makes "no routes at all" a positive statement rather than an inference from two zeros. The root is `Option<ProjectRootId>` on the binding, so a pre-change binding stays unknown rather than absent.
+- Versions: `ready` ships in subc-protocol 0.22; the LiveRoots types arrive one minor later (0.23) with slice E.
 - The query describes whichever endpoint is routable when answered: before cutover, the incumbent. The reply is a snapshot; routes the incumbent takes after the query warm lazily after cutover. Re-querying before the flip is allowed; polling is not needed.
 - Slice E (store the root, add the query) is daemon-only and independent of the swap machinery, so it can land first.
 
