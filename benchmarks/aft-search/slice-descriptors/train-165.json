@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "subc-readiness-warmup-design"
+  ],
+  "note": "Design note for module readiness and warm-up ahead of blue/green swaps. Documentation only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
