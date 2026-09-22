@@ -151,6 +151,14 @@ if [[ ! -s "$NOTES_FILE" ]]; then
   exit 1
 fi
 
+# GitHub renders release bodies with breaks:true, so a paragraph hard-wrapped
+# at 80 columns ships as a column of ragged short lines. It looks correct in an
+# editor and only manifests on the published page. v0.57.1 went out that way.
+if ! node scripts/check-release-notes.mjs "$NOTES_FILE"; then
+  echo "  → Release notes would render with stray line breaks on GitHub. Fix and retry."
+  exit 1
+fi
+
 ANN_OC=$(grep -oE 'ANNOUNCEMENT_VERSION = "[^"]*"' packages/opencode-plugin/src/index.ts 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"/\1/')
 ANN_PI=$(grep -oE 'ANNOUNCEMENT_VERSION = "[^"]*"' packages/pi-plugin/src/index.ts 2>/dev/null | head -1 | sed -E 's/.*"([^"]*)"/\1/')
 

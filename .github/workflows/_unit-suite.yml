@@ -153,6 +153,13 @@ jobs:
       - name: Validate npm package shapes
         run: node scripts/validate-packages.mjs
 
+      # Same reasoning one step down: release notes land on main in a train,
+      # often days before release.sh reads them as the GitHub release body.
+      # GitHub renders that body with breaks:true, so a hard-wrapped paragraph
+      # ships as ragged short lines (v0.57.1 did). Catch it at train time.
+      - name: Validate release-notes rendering
+        run: node scripts/check-release-notes.mjs .alfonso/release-notes/v*.md
+
       - name: Build aft-bridge dist (workspace consumers depend on it)
         run: bun run --cwd packages/aft-bridge build
 
