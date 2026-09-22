@@ -225,12 +225,24 @@ jobs:
             echo "::error title=search-quality-gate::could not resolve a merge-base with main for ${{ github.sha }}; the gate cannot classify the diff"
             exit 2
           fi
-          mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}")"
-          echo "search-quality-gate: base=$base mode=$mode"
+          # The selector's account of a fault is on its stderr, and a bare
+          # command substitution under `bash -e` discards it: the step aborts
+          # at this line carrying only the exit code, which is what made three
+          # earlier rounds unreadable. Capture both streams and report them.
+          mkdir -p benchmarks/aft-search/.bench/search-quality
+          set +e
+          mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}" 2>benchmarks/aft-search/.bench/search-quality/mode.err)"
+          mode_status=$?
+          set -e
+          echo "search-quality-gate: base=$base head=${{ github.sha }} mode='$mode' selector_exit=$mode_status"
+          if [ $mode_status -ne 0 ] || [ -z "$mode" ]; then
+            echo "::error title=search-quality-gate::mode selector failed (exit $mode_status): $(cat benchmarks/aft-search/.bench/search-quality/mode.err)"
+            cp benchmarks/aft-search/.bench/search-quality/mode.err benchmarks/aft-search/.bench/search-quality/gate.log
+            exit 2
+          fi
           # The gate's own stderr is the only account of an input fault, and a
           # failed step's log is not always retrievable afterwards. Keep it on
           # disk so the upload below carries it whatever the outcome.
-          mkdir -p benchmarks/aft-search/.bench/search-quality
           set -o pipefail
           scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}" 2>&1 \
             | tee benchmarks/aft-search/.bench/search-quality/gate.log
