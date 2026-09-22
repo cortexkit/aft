@@ -40,6 +40,15 @@ fn large_ts_class_source() -> String {
     source
 }
 
+fn large_ts_interface_source() -> String {
+    let mut source = String::from("interface BigInterface {\n  primary(): number;\n");
+    for i in 0..155 {
+        source.push_str(&format!("  field{i}: string;\n"));
+    }
+    source.push_str("  callback: (value: number) => void;\n}\n");
+    source
+}
+
 #[cfg(unix)]
 fn create_dir_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
@@ -418,6 +427,118 @@ fn outline_multi_file_truncates_when_output_exceeds_30kb() {
 }
 
 #[test]
+fn outline_and_zoom_resolve_typescript_callable_members() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "issue-329.ts",
+        r#"export interface Shape {
+  area(): number;
+  scale(f: number): Shape;
+}
+export const helper = {
+  compute: function doCompute(x: number) { return x * 2; },
+  arrow: (y: number) => y + 1,
+};
+export function plain(n: number) { return n; }
+"#,
+    );
+
+    let mut aft = AftProcess::spawn();
+    let outline = send(
+        &mut aft,
+        json!({"id": "outline-issue-329", "command": "outline", "file": &file}),
+    );
+    assert_eq!(
+        outline["success"], true,
+        "outline should succeed: {outline:?}"
+    );
+    let text = outline["text"].as_str().expect("outline text");
+    assert_eq!(
+        text.lines().skip(1).count(),
+        8,
+        "fixture should produce exactly eight outline symbols: {text}"
+    );
+    for name in [
+        "Shape",
+        "area",
+        "scale",
+        "helper",
+        "compute",
+        "doCompute",
+        "arrow",
+        "plain",
+    ] {
+        assert!(text.contains(name), "outline should contain {name}: {text}");
+    }
+
+    let area = send(
+        &mut aft,
+        json!({"id": "zoom-area", "command": "zoom", "file": &file, "symbol": "area"}),
+    );
+    assert_eq!(area["success"], true, "area zoom should succeed: {area:?}");
+    assert_eq!(area["kind"], "method");
+    assert_eq!(area["content"], "  area(): number;");
+
+    let named_expression = send(
+        &mut aft,
+        json!({"id": "zoom-do-compute", "command": "zoom", "file": &file, "symbol": "doCompute"}),
+    );
+    assert_eq!(
+        named_expression["success"], true,
+        "named expression zoom should succeed: {named_expression:?}"
+    );
+    assert!(named_expression["content"]
+        .as_str()
+        .unwrap()
+        .contains("function doCompute"));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_existing_large_interface_is_a_nested_member_menu() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("packages/aft-bridge/src/subc-transport.ts");
+    let mut aft = AftProcess::spawn();
+    let outline = send(
+        &mut aft,
+        json!({"id": "outline-existing-interface", "command": "outline", "file": file}),
+    );
+
+    assert_eq!(
+        outline["success"], true,
+        "existing interface outline should succeed: {outline:?}"
+    );
+    let text = outline["text"].as_str().expect("outline text");
+    let interface_line = text
+        .lines()
+        .find(|line| line.contains("interface SubcTransportPoolOptions"))
+        .expect("SubcTransportPoolOptions interface entry");
+    assert!(
+        interface_line.starts_with("  ") && !interface_line.starts_with("    "),
+        "interface should remain a top-level menu entry: {interface_line}"
+    );
+    for member in ["connect", "onBgEventsNudge", "lifecycleDemandCheck"] {
+        let member_line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!(".{member}")))
+            .unwrap_or_else(|| panic!("missing nested {member} member: {text}"));
+        assert!(
+            member_line.starts_with("    ."),
+            "{member} should remain nested under its interface: {member_line}"
+        );
+    }
+    assert!(
+        !text.contains("Called when an idle bg-completion WAKE arrives"),
+        "outline should render a member menu, not dump interface source: {text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn zoom_symbol_lookup_returns_content_and_call_graph_annotations() {
     let dir = TempDir::new().unwrap();
     let file = write_file(
@@ -517,6 +638,38 @@ fn zoom_large_container_returns_member_signature_menu() {
     assert!(
         !content.contains("visibleMethodBodyLine"),
         "menu must not include method bodies: {content}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn zoom_large_interface_returns_member_signature_menu() {
+    let dir = TempDir::new().unwrap();
+    let file = write_file(
+        dir.path(),
+        "large-interface.ts",
+        &large_ts_interface_source(),
+    );
+
+    let mut aft = AftProcess::spawn();
+    let resp = send(
+        &mut aft,
+        json!({"id": "zoom-large-interface", "command": "zoom", "file": file, "symbol": "BigInterface"}),
+    );
+
+    assert_eq!(resp["success"], true, "large interface zoom: {resp:?}");
+    assert_eq!(resp["kind"], "interface");
+    let content = resp["content"].as_str().expect("zoom content");
+    assert!(
+        content.contains("member-signature menu; zoom a member for its body"),
+        "large interface should remain a member menu: {content}"
+    );
+    assert!(content.contains("BigInterface.primary(): number"));
+    assert!(content.contains("BigInterface.callback: (value: number) => void"));
+    assert!(
+        !content.contains("field154"),
+        "non-callable fields must not be dumped into the member menu: {content}"
     );
 
     assert!(aft.shutdown().success());

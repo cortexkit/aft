@@ -1352,6 +1352,47 @@ fn callgraph_call_tree_resolves_same_file_calls() {
 }
 
 #[test]
+fn callgraph_callers_find_named_function_assigned_to_object_property() {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("zod-shape.ts"),
+        r#"export const ZodType = {
+  parse: function _parse(input: unknown) { return input; },
+};
+const { parse } = ZodType;
+
+export function parseInput(input: unknown): unknown {
+  return parse(input);
+}
+"#,
+    )
+    .unwrap();
+
+    let mut aft = AftProcess::spawn();
+    configure_project(&mut aft, root);
+    let resp = aft.send(&format!(
+        r#"{{"id":"object-property-callers","command":"callers","file":{},"symbol":"parse","depth":1}}"#,
+        crate::helpers::json_string(&root.join("zod-shape.ts").display())
+    ));
+
+    assert_eq!(resp["success"], true, "callers should succeed: {resp:?}");
+    assert_eq!(
+        resp["total_callers"], 1,
+        "property callable should have one caller: {resp:?}"
+    );
+    let callers = flattened_caller_entries(&resp);
+    assert!(
+        callers
+            .iter()
+            .any(|caller| caller["symbol"] == "parseInput" && caller["line"] == 7),
+        "property callable should resolve its real call site: {callers:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn callgraph_workspace_package_cache_refreshes_after_reconfigure() {
     let temp = tempdir().unwrap();
     let root = temp.path();

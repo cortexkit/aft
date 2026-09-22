@@ -55,9 +55,62 @@ const TS_QUERY: &str = r#"
     (method_definition
       name: (property_identifier) @method.name) @method.def))
 
-;; interface declarations
+;; callable fields inside classes
+(class_declaration
+  name: (type_identifier) @class_property.class_name
+  body: (class_body
+    (public_field_definition
+      name: (_) @class_property.name
+      value: (arrow_function) @class_property.value) @class_property.def))
+(class_declaration
+  name: (type_identifier) @class_property.class_name
+  body: (class_body
+    (public_field_definition
+      name: (_) @class_property.name
+      value: (function_expression) @class_property.value) @class_property.def))
+
+;; interface declarations and callable members
 (interface_declaration
   name: (type_identifier) @interface.name) @interface.def
+(interface_declaration
+  name: (type_identifier) @interface_member.interface_name
+  body: (interface_body
+    (method_signature
+      name: (_) @interface_member.name) @interface_member.def))
+(interface_declaration
+  name: (type_identifier) @interface_property.interface_name
+  body: (interface_body
+    (property_signature
+      name: (_) @interface_property.name) @interface_property.def))
+
+;; callable object-literal properties
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (pair
+        key: (_) @object_property.name
+        value: (arrow_function) @object_property.value) @object_property.def)))
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (pair
+        key: (_) @object_property.name
+        value: (function_expression) @object_property.value) @object_property.def)))
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (pair
+        key: (_) @object_property.name
+        value: (generator_function) @object_property.value) @object_property.def)))
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @object_property.object_name
+    value: (object
+      (method_definition
+        name: (_) @object_property.name) @object_property.def)))
 
 ;; enum declarations
 (enum_declaration
@@ -2102,6 +2155,44 @@ fn push_default_export_symbol(
     });
 }
 
+fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            if node_contains_descendant_kind(&cursor.node(), kind) {
+                return true;
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    false
+}
+
+fn push_ts_member_symbol(
+    symbols: &mut Vec<Symbol>,
+    source: &str,
+    name_node: Node<'_>,
+    def_node: Node<'_>,
+    parent_name: &str,
+    kind: SymbolKind,
+) {
+    symbols.push(Symbol {
+        name: node_text(source, &name_node).to_string(),
+        kind,
+        range: node_range_with_decorators(&def_node, source, LangId::TypeScript),
+        signature: Some(extract_signature(source, &def_node)),
+        scope_chain: vec![parent_name.to_string()],
+        exported: false,
+        parent: Some(parent_name.to_string()),
+    });
+}
+
 /// Extract symbols from TypeScript / TSX source.
 fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
     let lang = LangId::TypeScript;
@@ -2129,8 +2220,21 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         let mut method_class_name_node = None;
         let mut method_name_node = None;
         let mut method_def_node = None;
+        let mut class_property_class_name_node = None;
+        let mut class_property_name_node = None;
+        let mut class_property_def_node = None;
         let mut interface_name_node = None;
         let mut interface_def_node = None;
+        let mut interface_member_interface_name_node = None;
+        let mut interface_member_name_node = None;
+        let mut interface_member_def_node = None;
+        let mut interface_property_interface_name_node = None;
+        let mut interface_property_name_node = None;
+        let mut interface_property_def_node = None;
+        let mut object_property_object_name_node = None;
+        let mut object_property_name_node = None;
+        let mut object_property_value_node = None;
+        let mut object_property_def_node = None;
         let mut enum_name_node = None;
         let mut enum_def_node = None;
         let mut type_alias_name_node = None;
@@ -2156,8 +2260,25 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 "method.class_name" => method_class_name_node = Some(cap.node),
                 "method.name" => method_name_node = Some(cap.node),
                 "method.def" => method_def_node = Some(cap.node),
+                "class_property.class_name" => class_property_class_name_node = Some(cap.node),
+                "class_property.name" => class_property_name_node = Some(cap.node),
+                "class_property.def" => class_property_def_node = Some(cap.node),
                 "interface.name" => interface_name_node = Some(cap.node),
                 "interface.def" => interface_def_node = Some(cap.node),
+                "interface_member.interface_name" => {
+                    interface_member_interface_name_node = Some(cap.node)
+                }
+                "interface_member.name" => interface_member_name_node = Some(cap.node),
+                "interface_member.def" => interface_member_def_node = Some(cap.node),
+                "interface_property.interface_name" => {
+                    interface_property_interface_name_node = Some(cap.node)
+                }
+                "interface_property.name" => interface_property_name_node = Some(cap.node),
+                "interface_property.def" => interface_property_def_node = Some(cap.node),
+                "object_property.object_name" => object_property_object_name_node = Some(cap.node),
+                "object_property.name" => object_property_name_node = Some(cap.node),
+                "object_property.value" => object_property_value_node = Some(cap.node),
+                "object_property.def" => object_property_def_node = Some(cap.node),
                 "enum.name" => enum_name_node = Some(cap.node),
                 "enum.def" => enum_def_node = Some(cap.node),
                 "type_alias.name" => type_alias_name_node = Some(cap.node),
@@ -2232,6 +2353,23 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
             });
         }
 
+        // Callable class property
+        if let (Some(class_name_node), Some(name_node), Some(def_node)) = (
+            class_property_class_name_node,
+            class_property_name_node,
+            class_property_def_node,
+        ) {
+            let class_name = node_text(source, &class_name_node);
+            push_ts_member_symbol(
+                &mut symbols,
+                source,
+                name_node,
+                def_node,
+                class_name,
+                SymbolKind::Method,
+            );
+        }
+
         // Interface declaration
         if let (Some(name_node), Some(def_node)) = (interface_name_node, interface_def_node) {
             symbols.push(Symbol {
@@ -2243,6 +2381,76 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
                 exported: is_exported(&def_node, &export_ranges),
                 parent: None,
             });
+        }
+
+        // Interface method signature
+        if let (Some(interface_name_node), Some(name_node), Some(def_node)) = (
+            interface_member_interface_name_node,
+            interface_member_name_node,
+            interface_member_def_node,
+        ) {
+            let interface_name = node_text(source, &interface_name_node);
+            push_ts_member_symbol(
+                &mut symbols,
+                source,
+                name_node,
+                def_node,
+                interface_name,
+                SymbolKind::Method,
+            );
+        }
+
+        // Function-valued interface property signature
+        if let (Some(interface_name_node), Some(name_node), Some(def_node)) = (
+            interface_property_interface_name_node,
+            interface_property_name_node,
+            interface_property_def_node,
+        ) {
+            if node_contains_descendant_kind(&def_node, "function_type") {
+                let interface_name = node_text(source, &interface_name_node);
+                push_ts_member_symbol(
+                    &mut symbols,
+                    source,
+                    name_node,
+                    def_node,
+                    interface_name,
+                    SymbolKind::Method,
+                );
+            }
+        }
+
+        // Callable object-literal property. The property key is the public callable name.
+        if let (Some(object_name_node), Some(name_node), Some(def_node)) = (
+            object_property_object_name_node,
+            object_property_name_node,
+            object_property_def_node,
+        ) {
+            let object_name = node_text(source, &object_name_node);
+            let property_name = node_text(source, &name_node);
+            push_ts_member_symbol(
+                &mut symbols,
+                source,
+                name_node,
+                def_node,
+                object_name,
+                SymbolKind::Method,
+            );
+
+            // A named function expression also has a lexical name that callers may search for.
+            if let Some(value_node) = object_property_value_node {
+                if let Some(function_name_node) = value_node.child_by_field_name("name") {
+                    if node_text(source, &function_name_node) != property_name {
+                        push_ts_member_symbol(
+                            &mut symbols,
+                            source,
+                            function_name_node,
+                            value_node,
+                            object_name,
+                            SymbolKind::Function,
+                        );
+                    }
+                }
+            }
         }
 
         // Enum declaration
@@ -8155,6 +8363,14 @@ mod tests {
             .join(name)
     }
 
+    fn symbols_from_source(source: &str, lang: LangId) -> Vec<Symbol> {
+        let grammar = grammar_for(lang);
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        extract_symbols_from_tree(source, &tree, lang).unwrap()
+    }
+
     /// The export walk must not spend stack per tree depth. This runs it on a
     /// deliberately small thread over a tree nested far deeper than the old
     /// recursive walk survived at that size; a return to recursion overflows
@@ -9037,6 +9253,116 @@ pub(crate) mod outer {
             );
             assert_eq!(method.parent.as_deref(), Some("UserService"));
         }
+    }
+
+    #[test]
+    fn ts_extracts_interface_callable_signatures_without_bodies() {
+        let symbols = symbols_from_source(
+            r#"export interface Shape {
+  area(): number;
+  scale(f: number): Shape;
+  transform: (point: number) => number;
+  label: string;
+}
+"#,
+            LangId::TypeScript,
+        );
+
+        let members = symbols
+            .iter()
+            .filter(|symbol| symbol.parent.as_deref() == Some("Shape"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            members
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["area", "scale", "transform"]
+        );
+        for member in members {
+            assert_eq!(member.kind, SymbolKind::Method);
+            assert_eq!(member.scope_chain, vec!["Shape"]);
+            assert_eq!(member.range.start_line, member.range.end_line);
+            assert!(
+                !member.signature.as_deref().unwrap().contains('{'),
+                "interface signature must not imply an implementation: {member:?}"
+            );
+        }
+        assert!(symbols.iter().all(|symbol| symbol.name != "label"));
+    }
+
+    #[test]
+    fn ts_extracts_object_property_callables_and_named_alias() {
+        let symbols = symbols_from_source(
+            r#"export const helper = {
+  compute: function doCompute(x: number) { return x * 2; },
+  arrow: (y: number) => y + 1,
+  shorthand(z: number) { return z - 1; },
+};
+class Calculator {
+  multiply = (x: number) => x * 2;
+}
+"#,
+            LangId::TypeScript,
+        );
+
+        for name in ["compute", "doCompute", "arrow", "shorthand"] {
+            let symbol = symbols.iter().find(|symbol| symbol.name == name).unwrap();
+            assert_eq!(symbol.parent.as_deref(), Some("helper"), "{name}");
+            assert_eq!(symbol.scope_chain, vec!["helper"], "{name}");
+        }
+        let compute = symbols
+            .iter()
+            .find(|symbol| symbol.name == "compute")
+            .unwrap();
+        assert_eq!(compute.kind, SymbolKind::Method);
+        assert!(compute
+            .signature
+            .as_deref()
+            .unwrap()
+            .starts_with("compute:"));
+        let alias = symbols
+            .iter()
+            .find(|symbol| symbol.name == "doCompute")
+            .unwrap();
+        assert_eq!(alias.kind, SymbolKind::Function);
+        assert!(alias
+            .signature
+            .as_deref()
+            .unwrap()
+            .starts_with("function doCompute"));
+
+        let class_field = symbols
+            .iter()
+            .find(|symbol| symbol.name == "multiply")
+            .unwrap();
+        assert_eq!(class_field.kind, SymbolKind::Method);
+        assert_eq!(class_field.parent.as_deref(), Some("Calculator"));
+    }
+
+    #[test]
+    fn tsx_extracts_interface_and_object_property_callables() {
+        let symbols = symbols_from_source(
+            r#"interface Props {
+  render(): JSX.Element;
+  onSelect: (value: number) => void;
+}
+const helpers = {
+  render: () => <div />,
+};
+"#,
+            LangId::Tsx,
+        );
+
+        assert!(symbols.iter().any(|symbol| {
+            symbol.name == "onSelect" && symbol.parent.as_deref() == Some("Props")
+        }));
+        assert!(symbols.iter().any(|symbol| {
+            symbol.name == "render" && symbol.parent.as_deref() == Some("Props")
+        }));
+        assert!(symbols.iter().any(|symbol| {
+            symbol.name == "render" && symbol.parent.as_deref() == Some("helpers")
+        }));
     }
 
     #[test]
