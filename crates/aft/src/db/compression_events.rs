@@ -1091,6 +1091,11 @@ mod tests {
         assert_eq!(sweep.remaining_eligible_rows, Some(0));
         assert_eq!(sweep.count_skip, None);
         assert!(sweep.worst_count_lock_micros < RETENTION_LOCK_BUDGET_MICROS);
+        assert!(sweep.worst_lock_micros < RETENTION_LOCK_BUDGET_MICROS);
+        eprintln!(
+            "retention opening retry contention: attempts={} worst_count_lock_us={} worst_lock_us={}",
+            opening_attempts, sweep.worst_count_lock_micros, sweep.worst_lock_micros
+        );
     }
 
     #[test]
@@ -1151,6 +1156,10 @@ mod tests {
         );
         assert!((2..=RETENTION_COUNT_LOCK_MAX_ATTEMPTS).contains(&skip.attempts));
         assert_eq!(last_retention_sweep_skip_reason(&db), Some(skip.reason));
+        eprintln!(
+            "retention closing contention: attempts={} waited_us={} configured_retry_budget_us={}",
+            skip.attempts, skip.waited_micros, RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
+        );
         drop(held.take());
     }
 
