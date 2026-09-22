@@ -673,19 +673,24 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
 ///
 /// 1. A checkout's `.git` directory owns slot zero; linked worktrees use a
 ///    `.git` file and do not seed that path.
-/// 2. Directories that exist outrank names that do not, whatever the source.
-///    Only an existing directory can be producing the events that fill the
-///    kernel queue, so a live `packages/plugin/node_modules` beats a reserved
-///    slot for the `target/` a TypeScript repository will never create. Absent
-///    seeds keep their ecosystem order among themselves.
-/// 3. Inside each of those two groups: ecosystem names first, then directories
-///    the overflow ring actually observed, then the remaining ignored
-///    boundaries in ignore-file order.
+/// 2. When no candidate has observed event volume, one representative of
+///    every enabled ecosystem name ranks before a second copy of any name.
+///    This fallback breadth keeps one workspace ecosystem from spending the
+///    whole kernel budget on sibling directories. An absent representative is
+///    deliberate: watcher backends accept absent exclusions, which begin
+///    covering the path if a build creates it later.
+/// 3. Representatives follow ecosystem priority. On an exact-path backend the
+///    representative is the largest existing copy; on a subtree backend it is
+///    the shallowest copy because that path covers its descendants.
+/// 4. Remaining candidates preserve the ordinary storm ranking: directories
+///    that exist before names that do not, then ecosystem names, observed
+///    directories, and ignored boundaries in their source-specific order.
 ///
 /// Ecosystem names are bare (`node_modules`), and a bare gitignore pattern
-/// matches at every depth, so every copy that exists down to
-/// `WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH` is seeded with its own path. Copies of
-/// one name are ordered by a cheap size signal.
+/// matches at every depth, so every existing copy of each ecosystem directory
+/// is seeded with its own path through `WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH`
+/// when slots remain. Additional exact-path copies are ordered by a cheap size
+/// signal.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn derive_watcher_exclusion_plan(
     root: &Path,
@@ -972,10 +977,65 @@ fn derive_exclusion_plan(
     }
 
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
+
+    // When no event-volume evidence exists, reserve breadth before depth. The
+    // representative set is computed before the final sort so a repeated name
+    // cannot push another ecosystem behind the slot cap merely because its
+    // directories already exist.
+    let has_observed_candidates = candidates
+        .iter()
+        .any(|candidate| candidate.source == WatcherExclusionSource::Observed);
+    let mut ecosystem_representatives = BTreeMap::<usize, usize>::new();
+    for (candidate_index, candidate) in candidates.iter().enumerate() {
+        if candidate.ecosystem_priority == usize::MAX {
+            continue;
+        }
+        ecosystem_representatives
+            .entry(candidate.ecosystem_priority)
+            .and_modify(|representative_index| {
+                let representative = &candidates[*representative_index];
+                let candidate_depth = candidate.relative.components().count();
+                let representative_depth = representative.relative.components().count();
+                let candidate_is_better = match coverage {
+                    WatcherExclusionCoverage::Subtree => candidate_depth
+                        .cmp(&representative_depth)
+                        .then_with(|| representative.exists.cmp(&candidate.exists))
+                        .then_with(|| representative.size_signal.cmp(&candidate.size_signal))
+                        .then_with(|| candidate.path.cmp(&representative.path))
+                        .is_lt(),
+                    WatcherExclusionCoverage::ExactPath => representative
+                        .exists
+                        .cmp(&candidate.exists)
+                        .then_with(|| representative.size_signal.cmp(&candidate.size_signal))
+                        .then_with(|| candidate.path.cmp(&representative.path))
+                        .is_lt(),
+                };
+                if candidate_is_better {
+                    *representative_index = candidate_index;
+                }
+            })
+            .or_insert(candidate_index);
+    }
+    let ecosystem_representatives = ecosystem_representatives
+        .into_values()
+        .map(|index| candidates[index].relative.clone())
+        .collect::<BTreeSet<_>>();
+
     candidates.sort_by(|left, right| {
-        left.exists
-            .cmp(&right.exists)
-            .reverse()
+        let left_is_representative =
+            !has_observed_candidates && ecosystem_representatives.contains(&left.relative);
+        let right_is_representative =
+            !has_observed_candidates && ecosystem_representatives.contains(&right.relative);
+        right_is_representative
+            .cmp(&left_is_representative)
+            .then_with(|| {
+                if left_is_representative && right_is_representative {
+                    left.ecosystem_priority.cmp(&right.ecosystem_priority)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| left.exists.cmp(&right.exists).reverse())
             .then_with(|| left.source.priority().cmp(&right.source.priority()))
             .then_with(|| match left.source {
                 WatcherExclusionSource::Ecosystem => left
@@ -2137,20 +2197,21 @@ mod tests {
             .iter()
             .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
 
-        // Absent seeds hold slots only while nothing that exists wants one.
-        // `generated/` is ignored and not an ecosystem name, and it still
-        // outranks both reserved names once it exists.
+        // Ecosystem representatives stay ahead of the generic `generated`
+        // boundary even when their directories do not yet exist. If a later
+        // build creates `target` or `node_modules`, the reserved exclusion
+        // covers its writes immediately.
         std::fs::create_dir(canonical_root.join("generated")).unwrap();
         let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, None);
 
         assert_eq!(
             watcher_exclusion_paths(&exclusions),
-            ["generated", "target", "node_modules"]
+            ["target", "node_modules", "generated"]
                 .iter()
                 .map(|name| canonical_root.join(name))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Gitignore);
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
     }
 
     /// A TypeScript worktree whose only heavy ignored directory is a nested
@@ -2377,18 +2438,19 @@ mod tests {
 
         let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, Some(3));
 
-        // `node_modules` exists and is an ecosystem name, so it outranks the
-        // ignored boundary; `target` does not exist yet and ranks behind both.
+        // Each enabled ecosystem gets a representative before a second slot
+        // goes to a generic ignored boundary. The absent target seed is safe
+        // and begins covering that path if the first Rust build creates it.
         assert_eq!(
             watcher_exclusion_paths(&exclusions),
-            ["node_modules", "generated", "target"]
+            ["target", "node_modules", "generated"]
                 .iter()
                 .map(|name| canonical_root.join(name))
                 .collect::<Vec<_>>()
         );
         assert_eq!(exclusions[0].source(), WatcherExclusionSource::Ecosystem);
-        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Gitignore);
-        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Ecosystem);
+        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Ecosystem);
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
 
         std::fs::create_dir(canonical_root.join("target")).unwrap();
         let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, Some(3));
@@ -2401,6 +2463,54 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
+    }
+
+    #[test]
+    fn exact_path_seed_keeps_rust_and_js_covered_when_node_modules_fill_every_slot() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        let node_modules = [
+            "packages/plugin/node_modules",
+            "packages/pi-plugin/node_modules",
+            "packages/cli/node_modules",
+            "packages/dashboard/node_modules",
+            "packages/e2e-tests/node_modules",
+            "packages/docs/node_modules",
+            "node_modules",
+            "packages/retina-local-fs/node_modules",
+        ];
+        for relative in node_modules {
+            std::fs::create_dir_all(root.path().join(relative)).unwrap();
+        }
+        std::fs::write(root.path().join(".gitignore"), "node_modules\ntarget/\n").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        let target = canonical_root.join("target");
+
+        let exclusions = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::ExactPath,
+        )
+        .selected;
+
+        assert!(!target.exists(), "the fresh target seed must remain absent");
+        assert!(
+            exclusions
+                .iter()
+                .any(|exclusion| exclusion.path() == target),
+            "the Rust ecosystem lost every slot: {:?}",
+            watcher_exclusion_paths(&exclusions)
+        );
+        assert!(
+            exclusions.iter().any(|exclusion| {
+                exclusion.path().file_name() == Some(std::ffi::OsStr::new("node_modules"))
+            }),
+            "the JavaScript ecosystem lost every slot: {:?}",
+            watcher_exclusion_paths(&exclusions)
+        );
     }
 
     #[test]

@@ -677,14 +677,21 @@ mod tests {
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
         std::fs::create_dir(root.path().join("node_modules")).unwrap();
-        let packages = ["one", "two", "three", "four", "five", "six"];
-        for package in packages {
-            std::fs::create_dir_all(root.path().join(format!("packages/{package}/node_modules")))
-                .unwrap();
+        let nested_node_modules = [
+            "packages/plugin/node_modules",
+            "packages/pi-plugin/node_modules",
+            "packages/cli/node_modules",
+            "packages/dashboard/node_modules",
+            "packages/e2e-tests/node_modules",
+            "packages/docs/node_modules",
+            "packages/retina-local-fs/node_modules",
+        ];
+        for relative in nested_node_modules {
+            std::fs::create_dir_all(root.path().join(relative)).unwrap();
         }
-        let nested_ignores = packages
+        let nested_ignores = nested_node_modules
             .iter()
-            .map(|package| format!("/packages/{package}/node_modules/\n"))
+            .map(|relative| format!("/{relative}/\n"))
             .collect::<String>();
         std::fs::write(
             root.path().join(".gitignore"),
@@ -699,14 +706,14 @@ mod tests {
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusion_paths = watcher_exclusion_paths(&exclusions);
-        // The absent `target` seed still holds a slot, behind the ignored
-        // directories that exist: this root's `node_modules` copies.
+        // Although eight existing `node_modules` paths could consume every
+        // exclusion slot, retaining the absent `target` path reserves one for
+        // Rust and lets FSEvents apply it if the build creates `target` later.
         assert!(
             exclusion_paths.contains(&target),
             "absent target seed lost its slot: {exclusion_paths:?}"
         );
         assert!(exclusion_paths.contains(&canonical_root.join("node_modules")));
-        assert!(exclusion_paths.contains(&canonical_root.join("packages/one/node_modules")));
         assert!(!target.exists());
 
         let (tx, rx) = mpsc::channel();
