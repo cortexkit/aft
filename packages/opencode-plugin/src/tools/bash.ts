@@ -71,12 +71,18 @@ async function abortForegroundWhenRegistered(
   while (!disposed() && Date.now() < deadline) {
     attempts += 1;
     try {
-      lastResponse = await callBashBridge(ctx, runtime, "bash_abort_inflight", {}, {
-        transportTimeoutMs: Math.max(
-          1,
-          Math.min(ABORT_ATTEMPT_TIMEOUT_MS, deadline - Date.now()),
-        ),
-      });
+      lastResponse = await callBashBridge(
+        ctx,
+        runtime,
+        "bash_abort_inflight",
+        {},
+        {
+          transportTimeoutMs: Math.max(
+            1,
+            Math.min(ABORT_ATTEMPT_TIMEOUT_MS, deadline - Date.now()),
+          ),
+        },
+      );
       lastError = undefined;
       if (typeof lastResponse.killed === "number" && lastResponse.killed > 0) return;
     } catch (error) {
