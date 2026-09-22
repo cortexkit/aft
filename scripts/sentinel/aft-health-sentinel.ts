@@ -741,6 +741,38 @@ const CI_RUN_WINDOW = 30;
 // today's.
 const SCHEDULED_LISTING_MAX_AGE = 2 * 24 * 60 * 60_000;
 
+function newestRunMs(runs: ScheduledRun[]): number {
+  return Math.max(0, ...runs.map((run) => Date.parse(run.created_at ?? "") || 0));
+}
+
+/**
+ * Fetch the scheduled-run listing, refetching when the first answer looks stale.
+ *
+ * GitHub's filtered run listing (`--event schedule --branch main`) sometimes
+ * serves an out-of-date result: on 2026-09-22 one call returned a listing whose
+ * newest row was 2026-09-15, with every run from the following week missing,
+ * while the same command minutes later (and 20 consecutive calls after that)
+ * returned the 2026-09-22 run. Because a listing is reused for a whole poll
+ * interval, one stale answer produced a quarter hour of "instrument unavailable"
+ * warnings. When the first answer is older than the staleness bound, ask again
+ * and keep the freshest listing seen. If every attempt is stale, the stale
+ * listing is returned unchanged and detectScheduledCi still refuses a verdict,
+ * so a listing that is genuinely behind is never judged.
+ */
+export function freshestScheduledListing(
+  fetch: () => ScheduledRun[],
+  nowMs: number,
+  attempts = 3,
+): ScheduledRun[] {
+  let best = fetch();
+  for (let attempt = 1; attempt < attempts; attempt += 1) {
+    if (nowMs - newestRunMs(best) <= SCHEDULED_LISTING_MAX_AGE) break;
+    const next = fetch();
+    if (newestRunMs(next) > newestRunMs(best)) best = next;
+  }
+  return best;
+}
+
 function collectScheduledRuns(): ScheduledRun[] {
   const gh = GH_CANDIDATES.find((path) => existsSync(path)) ?? "gh";
   const rows = commandJson(gh, [
@@ -887,7 +919,7 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     cursors.ci = state.ci;
   } else {
     try {
-      sample.ci_runs = collectScheduledRuns();
+      sample.ci_runs = freshestScheduledListing(collectScheduledRuns, sample.now_ms);
     } catch (error) { sample.ci_error = String(error); }
     cursors.ci = { checked_at_ms: sample.now_ms, runs: sample.ci_runs, error: sample.ci_error };
   }

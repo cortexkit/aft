@@ -18,6 +18,7 @@ import {
   detectRetention,
   detectSearchAndTools,
   detectScheduledCi,
+  freshestScheduledListing,
   detectStorage,
   detectTier2Overlong,
   detectWakes,
@@ -594,6 +595,44 @@ test("preserved tier2 wedge replay raises the three causal findings", () => {
   replay.log_lines = [...limiterLines, `2026-09-17T10:42:27Z [aft] inspect-triggered cold-build slot acquired after 1ms wait: request=inspect:${worktree}:1 kind=explicit inspect Tier-2 run`];
   const found = [...detectLimiter({ ...replay, log_lines: limiterLines }), ...detectIndexes(replay), ...detectTier2Overlong({ ...replay, log_lines: replay.log_lines })];
   expect(rules(found)).toEqual(expect.arrayContaining(["limiter.saturated", "index.stuck", "tier2.pass_overlong"]));
+});
+
+describe("scheduled listing freshness", () => {
+  const now = Date.parse("2026-09-22T18:00:00Z");
+  const stale = [{ workflow: "Nightly OSS cost gate", created_at: "2026-09-15T07:43:31Z", conclusion: "failure" }];
+  const fresh = [{ workflow: "Nightly OSS cost gate", created_at: "2026-09-22T07:41:53Z", conclusion: "success" }];
+
+  test("a stale first answer is refetched and the fresh one is kept", () => {
+    // The shape GitHub served on 2026-09-22: one listing a week behind, then
+    // the correct one on the next call.
+    const answers = [stale, fresh];
+    let calls = 0;
+    const listing = freshestScheduledListing(() => answers[calls++] ?? fresh, now);
+    expect(listing).toBe(fresh);
+    expect(calls).toBe(2);
+  });
+
+  test("a fresh first answer costs exactly one call", () => {
+    let calls = 0;
+    const listing = freshestScheduledListing(() => {
+      calls += 1;
+      return fresh;
+    }, now);
+    expect(listing).toBe(fresh);
+    expect(calls).toBe(1);
+  });
+
+  test("a listing that stays stale is returned unchanged, so no verdict is judged from it", () => {
+    let calls = 0;
+    const listing = freshestScheduledListing(() => {
+      calls += 1;
+      return stale;
+    }, now);
+    expect(calls).toBe(3);
+    expect(listing).toBe(stale);
+    const findings = detectScheduledCi(sample({ now_ms: now, ci_runs: listing }));
+    expect(findings.every((finding) => finding.rule === "instrument")).toBe(true);
+  });
 });
 
 describe("daemon pid discovery", () => {
