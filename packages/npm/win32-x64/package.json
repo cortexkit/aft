@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-win32-x64",
-  "version": "0.57.0",
+  "version": "0.57.1",
   "description": "AFT binary for Windows x64",
   "os": [
     "win32"
