@@ -536,17 +536,30 @@ describe("exact OpenCode config pins", () => {
       const serverPath = join(root, "opencode.json");
       const tuiPath = join(root, "tui.json");
       const server = readConfig(serverPath);
-      const tui = readConfig(tuiPath);
       expect(server).toEqual({ [key]: [pinnedPluginEntry(getSelfVersion())] });
-      expect(tui).toEqual({ [key]: [pinnedPluginEntry(getSelfVersion())] });
       expect(server[other]).toBeUndefined();
-      expect(tui[other]).toBeUndefined();
+      // V1 needs the TUI sidebar registered in its own config; OpenCode 2
+      // loads that plugin from the package's `tui` entrypoint and never reads
+      // a TUI config file, so writing one there would leave a file the host
+      // ignores. GA 2.0.14 contains no reference to tui.json or tui.jsonc.
+      if (generation === "v1") {
+        const tui = readConfig(tuiPath);
+        expect(tui).toEqual({ [key]: [pinnedPluginEntry(getSelfVersion())] });
+        expect(tui[other]).toBeUndefined();
+      } else {
+        expect(existsSync(tuiPath)).toBe(false);
+      }
       expect(adapter.hasPluginEntry()).toBe(true);
       expect(lines.join("\n")).toContain(`host generation ${generation === "v1" ? "V1" : "V2"}`);
 
-      const before = [readFileSync(serverPath, "utf8"), readFileSync(tuiPath, "utf8")];
+      // Idempotence covers whichever files this generation actually owns: on
+      // V2 the TUI config is deliberately absent, and re-running setup must
+      // keep it absent rather than creating one on the second pass.
+      const paths = generation === "v1" ? [serverPath, tuiPath] : [serverPath];
+      const before = paths.map((path) => readFileSync(path, "utf8"));
       expect(await runSetup([], options)).toBe(0);
-      expect([readFileSync(serverPath, "utf8"), readFileSync(tuiPath, "utf8")]).toEqual(before);
+      expect(paths.map((path) => readFileSync(path, "utf8"))).toEqual(before);
+      if (generation === "v2") expect(existsSync(tuiPath)).toBe(false);
     }
   });
 
@@ -979,8 +992,10 @@ describe("OpenCode plugin registration follows the host's key", () => {
     expect(result.server).toEqual({ plugins: ["other-plugin", entry] });
     expect(result.server.plugin).toBeUndefined();
     expect(result.adapter.hasPluginEntry()).toBe(true);
-    // The TUI config is created by the same rule, under the same key.
-    expect(readConfig(join(result.root, "tui.json"))).toEqual({ plugins: [entry] });
+    // No TUI config on V2: the host loads that plugin from the package's own
+    // `tui` entrypoint and reads no TUI config file, so creating one would be
+    // a repair that writes something OpenCode 2 ignores.
+    expect(existsSync(join(result.root, "tui.json"))).toBe(false);
   });
 
   test("doctor --fix keeps a V1 `plugin` registration and writes no `plugins` key", async () => {

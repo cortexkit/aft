@@ -290,9 +290,24 @@ export class OpenCodeAdapter implements HarnessAdapter {
    * Register the TUI sidebar plugin in tui.json(c). Only setup/doctor call
    * this: the plugin itself must never auto-inject the entry at load time,
    * because that silently undoes a user's deliberate removal on every launch.
+   *
+   * V1 only. OpenCode 2 resolves a TUI plugin from the package's own `tui`
+   * entrypoint, so there is nothing to register: the GA CLI (checked against
+   * 2.0.14) contains no reference to `tui.json` or `tui.jsonc` at all. Writing
+   * the file there left a config the host never reads, which reads to a user
+   * like a setup step that did something.
    */
   async ensureTuiPluginEntry(): Promise<PluginEntryResult> {
     const paths = this.detectConfigPaths();
+    if (this.configGeneration() === "v2") {
+      return {
+        ok: true,
+        action: "already_present",
+        message:
+          "OpenCode 2 loads the TUI plugin from its own entrypoint; no TUI config entry needed",
+        configPath: paths.tuiConfig ?? paths.configDir,
+      };
+    }
     if (!paths.tuiConfig) {
       return {
         ok: false,
@@ -305,6 +320,10 @@ export class OpenCodeAdapter implements HarnessAdapter {
   }
 
   needsTuiPluginEntryUpdate(): boolean {
+    // V2 has no TUI config to update: the host loads the plugin from its own
+    // entrypoint, so reporting work here would make doctor offer a repair that
+    // writes a file OpenCode 2 never reads.
+    if (this.configGeneration() === "v2") return false;
     const paths = this.detectConfigPaths();
     return paths.tuiConfig
       ? this.configEntryNeedsUpdate(paths.tuiConfig, paths.tuiConfigFormat ?? "none")
