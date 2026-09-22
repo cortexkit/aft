@@ -226,7 +226,14 @@ jobs:
             exit 2
           fi
           mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}")"
-          scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}"
+          echo "search-quality-gate: base=$base mode=$mode"
+          # The gate's own stderr is the only account of an input fault, and a
+          # failed step's log is not always retrievable afterwards. Keep it on
+          # disk so the upload below carries it whatever the outcome.
+          mkdir -p benchmarks/aft-search/.bench/search-quality
+          set -o pipefail
+          scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}" 2>&1 \
+            | tee benchmarks/aft-search/.bench/search-quality/gate.log
       - name: Upload search-quality score and behavior diff
         if: always()
         uses: actions/upload-artifact@v4
@@ -235,5 +242,6 @@ jobs:
           path: |
             benchmarks/aft-search/.bench/search-quality/score.json
             benchmarks/aft-search/.bench/search-quality/score.diff.txt
+            benchmarks/aft-search/.bench/search-quality/gate.log
           if-no-files-found: warn
           retention-days: 14
