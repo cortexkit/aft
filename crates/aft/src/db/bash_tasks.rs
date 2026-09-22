@@ -13,6 +13,12 @@ pub const TERMINAL_ROW_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const MAX_TERMINAL_PRUNE_ROWS: usize = 500;
 const LAYOUT_CREATION_GRACE: Duration = Duration::from_secs(5 * 60);
 
+const TERMINAL_ROW_PREDICATE: &str = "
+    status IN ('completed', 'failed', 'killed', 'timed_out')
+    AND completed_at IS NOT NULL
+    AND completed_at < ?1
+    AND completion_delivered = 1";
+
 const TERMINAL_PRUNE_PREDICATE: &str = "
     status IN ('completed', 'failed', 'killed', 'timed_out')
     AND completed_at IS NOT NULL
@@ -38,6 +44,9 @@ struct TerminalPruneCandidate {
     harness: String,
     session_id: String,
     task_id: String,
+    pid: Option<i64>,
+    pgid: Option<i64>,
+    started_at: i64,
     stdout_path: Option<String>,
     stderr_path: Option<String>,
 }
@@ -191,6 +200,39 @@ pub(crate) fn prune_terminal_rows_guarded(
     delete_prepared_terminal_rows(conn, prepared)
 }
 
+/// Count rows that meet the SQL retention predicate without filesystem or PID checks.
+pub fn terminal_rows_eligible_count(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
+    let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
+    let terminal_rows = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
+             WHERE {TERMINAL_ROW_PREDICATE}"
+        ),
+        [cutoff],
+        |row| row.get::<_, i64>(0),
+    )?;
+    // Start from the normally tiny watch table instead of running a correlated
+    // watch lookup for every retained task row in a large backlog.
+    let watched_terminal_rows = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM (
+                SELECT task.harness, task.session_id, task.task_id
+                FROM bash_pattern_watches AS watch
+                JOIN bash_tasks AS task
+                  ON task.harness = watch.harness
+                 AND task.session_id = watch.session_id
+                 AND task.task_id = watch.task_id
+                WHERE {TERMINAL_ROW_PREDICATE}
+                GROUP BY task.harness, task.session_id, task.task_id
+             )"
+        ),
+        [cutoff],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let eligible = terminal_rows.saturating_sub(watched_terminal_rows);
+    Ok(usize::try_from(eligible).unwrap_or(usize::MAX))
+}
+
 pub(crate) fn select_terminal_prune_candidates(
     conn: &Connection,
     now_ms: i64,
@@ -201,8 +243,9 @@ pub(crate) fn select_terminal_prune_candidates(
     let probe_limit = bounded_limit.saturating_add(1);
     let mut candidates = conn
         .prepare(&format!(
-            "SELECT harness, session_id, task_id, stdout_path, stderr_path
-             FROM bash_tasks
+            "SELECT harness, session_id, task_id, pid, pgid, started_at,
+                    stdout_path, stderr_path
+             FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
              WHERE {TERMINAL_PRUNE_PREDICATE}
              LIMIT ?2"
         ))?
@@ -213,8 +256,11 @@ pub(crate) fn select_terminal_prune_candidates(
                     harness: row.get(0)?,
                     session_id: row.get(1)?,
                     task_id: row.get(2)?,
-                    stdout_path: row.get(3)?,
-                    stderr_path: row.get(4)?,
+                    pid: row.get(3)?,
+                    pgid: row.get(4)?,
+                    started_at: row.get(5)?,
+                    stdout_path: row.get(6)?,
+                    stderr_path: row.get(7)?,
                 })
             },
         )?
@@ -252,6 +298,7 @@ pub(crate) fn prepare_terminal_prune_observed(
         .into_iter()
         .filter(|candidate| {
             !is_registered_in_process(&candidate.task_id)
+                && !candidate_process_is_alive(candidate)
                 && task_layout_is_gone(plan.storage_root.as_deref(), candidate)
         })
         .collect();
@@ -304,6 +351,16 @@ pub(crate) fn delete_prepared_terminal_rows(
         removed,
         remaining_candidates: prepared.probed_candidates.saturating_sub(removed),
     })
+}
+
+fn candidate_process_is_alive(candidate: &TerminalPruneCandidate) -> bool {
+    let started_at = u64::try_from(candidate.started_at).unwrap_or_default();
+    candidate
+        .pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .into_iter()
+        .chain(candidate.pgid.and_then(|pid| u32::try_from(pid).ok()))
+        .any(|pid| crate::bash_background::process::is_recorded_process_alive(pid, started_at))
 }
 
 fn task_layout_is_gone(storage_root: Option<&Path>, candidate: &TerminalPruneCandidate) -> bool {
@@ -548,6 +605,29 @@ mod tests {
         assert!(
             !plan.contains("TEMP B-TREE"),
             "session history must not spill task rows: {plan}"
+        );
+    }
+
+    #[test]
+    fn terminal_retention_count_uses_the_age_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*)
+                 FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
+                 WHERE {TERMINAL_ROW_PREDICATE}"
+            ))
+            .unwrap()
+            .query_map([i64::MAX], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+
+        assert!(
+            plan.contains("idx_bash_tasks_terminal_retention"),
+            "terminal retention count did not use its age index: {plan}"
         );
     }
 }

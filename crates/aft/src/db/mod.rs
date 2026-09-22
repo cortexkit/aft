@@ -28,7 +28,15 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+
+const MIGRATION_V13: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_bash_tasks_terminal_retention
+  ON bash_tasks (completed_at)
+  WHERE completion_delivered = 1
+    AND completed_at IS NOT NULL
+    AND status IN ('completed', 'failed', 'killed', 'timed_out');
+"#;
 
 const MIGRATION_V12: &str = r#"
 CREATE TABLE IF NOT EXISTS write_ledger_unmeasurable_minutes (
@@ -555,6 +563,14 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
                 |row| row.get::<_, u32>(0),
             )
             .map(|object_count| object_count == 2),
+        13 => conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_bash_tasks_terminal_retention'",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .map(|object_count| object_count == 1),
         _ => Ok(false),
     }
 }
@@ -573,6 +589,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         10 => conn.execute_batch(MIGRATION_V10),
         11 => conn.execute_batch(MIGRATION_V11),
         12 => conn.execute_batch(MIGRATION_V12),
+        13 => conn.execute_batch(MIGRATION_V13),
         _ => Ok(()),
     }
 }
@@ -621,6 +638,7 @@ mod tests {
         "idx_bash_pattern_watches_task",
         "idx_bash_tasks_started_activity",
         "idx_bash_tasks_non_terminal_pid",
+        "idx_bash_tasks_terminal_retention",
         "idx_backups_created_activity",
         "idx_compression_session",
         "idx_compression_session_created",

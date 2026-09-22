@@ -887,6 +887,10 @@ impl HealthDiagnosticRollup {
                 "since_ms": Value::Null,
             },
             "memory": memory_rollup_metrics(None),
+            "bash_task_retention": {
+                "eligible_but_unpruned_rows": Value::Null,
+                "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
+            },
             "mutating_lanes": { "scheduler_busy": true },
             "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
             "roots": [],
@@ -1236,6 +1240,23 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
+fn bash_task_retention_metrics(shared_app: &App) -> Value {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
+    let eligible_but_unpruned_rows = shared_app.db().and_then(|db| {
+        crate::db::compression_events::terminal_rows_eligible_count_nonblocking(&db, now_ms)
+            .ok()
+            .flatten()
+    });
+    json!({
+        "eligible_but_unpruned_rows": eligible_but_unpruned_rows,
+        "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
+    })
+}
+
 fn build_health_diagnostic_rollup(
     cache: &HealthRollupCache,
     executor: &Executor,
@@ -1524,6 +1545,7 @@ fn build_health_diagnostic_rollup(
             "since_ms": embedding_backend_since_ms,
         },
         "memory": memory,
+        "bash_task_retention": bash_task_retention_metrics(shared_app),
         "mutating_lanes": mutating_lanes_metrics(executor),
         "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
         "roots": roots,
@@ -1867,6 +1889,47 @@ mod tests {
         }
         samples.sort_unstable();
         samples[samples.len() / 2]
+    }
+
+    #[test]
+    fn health_check_reports_eligible_but_unpruned_bash_task_rows() {
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let conn = crate::db::open(&storage.path().join("aft.db")).expect("open database");
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let old_completed_at = i64::try_from(now_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(crate::db::bash_tasks::TERMINAL_ROW_RETENTION_AGE_MS)
+            .saturating_sub(1);
+        for task_id in ["bash-0000000000000001", "bash-0000000000000002"] {
+            conn.execute(
+                "INSERT INTO bash_tasks (
+                    harness, session_id, task_id, project_key, command, cwd, status,
+                    started_at, completed_at, completion_delivered
+                 ) VALUES ('opencode', 'health-session', ?1, 'project', 'true', '.',
+                           'completed', 1, ?2, 1)",
+                rusqlite::params![task_id, old_completed_at],
+            )
+            .expect("insert eligible bash task");
+        }
+        let app = crate::context::App::default_shared();
+        app.set_db(Arc::new(std::sync::Mutex::new(conn)));
+
+        let report = test_health_report(
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let retention = &report.metrics.expect("health metrics")["bash_task_retention"];
+
+        assert_eq!(retention["eligible_but_unpruned_rows"].as_u64(), Some(2));
+        assert_eq!(
+            retention["steady_state_ceiling"].as_u64(),
+            Some(crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS as u64)
+        );
     }
 
     #[test]

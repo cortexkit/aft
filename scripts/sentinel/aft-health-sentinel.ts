@@ -193,6 +193,20 @@ export function detectLimiter(sample: SentinelSample): Finding[] {
   return [finding("limiter.saturated", "CRITICAL", "limiter:cold-build", `${deferred.length} cold-build deferrals with no acquisition in 15m; holders: ${holderText}`, "a slot is acquired or fewer than five deferrals occur in the 15-minute window")];
 }
 
+export function detectRetention(sample: SentinelSample): Finding[] {
+  const retention = metrics(sample).bash_task_retention;
+  const eligible = retention?.eligible_but_unpruned_rows;
+  const steadyCeiling = retention?.steady_state_ceiling;
+  if (!Number.isFinite(eligible) || !Number.isFinite(steadyCeiling) || eligible <= steadyCeiling) return [];
+  return [finding(
+    "retention.backlog",
+    "WARNING",
+    "retention:bash-tasks",
+    `${eligible} bash task rows are eligible but unpruned; steady-state capacity is ${steadyCeiling} rows per tick`,
+    `eligible bash task rows fall to ${steadyCeiling} or fewer`,
+  )];
+}
+
 export function detectIndexes(sample: SentinelSample): Finding[] {
   const out: Finding[] = [];
   const healthMetrics = metrics(sample);
@@ -568,8 +582,8 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
 
 export function detectAll(sample: SentinelSample, state: SentinelState): Finding[] {
   return [
-    ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample), ...detectIndexes(sample),
-    ...detectTier2Overlong(sample), ...detectExecutor(sample, state), ...detectWakes(sample), ...detectWatcher(sample, state),
+    ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample), ...detectRetention(sample),
+    ...detectIndexes(sample), ...detectTier2Overlong(sample), ...detectExecutor(sample, state), ...detectWakes(sample), ...detectWatcher(sample, state),
     ...detectStorage(sample, state), ...detectProcess(sample, state), ...detectSearchAndTools(sample), ...detectDeadSessions(sample), ...detectDsym(sample),
     ...detectScheduledCi(sample),
   ].filter((value, index, all) => all.findIndex((other) => other.fingerprint === value.fingerprint) === index);

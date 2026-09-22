@@ -15,6 +15,7 @@ import {
   detectLimiter,
   detectLogHealth,
   detectProcess,
+  detectRetention,
   detectSearchAndTools,
   detectScheduledCi,
   detectStorage,
@@ -161,6 +162,22 @@ describe("health sentinel pure detectors", () => {
     expect(findings.filter((value) => value.rule === "index.stuck")).toHaveLength(0);
     expect(findings[0].severity).toBe("WARNING");
     expect(findings[0].text).toContain(roots.join(", "));
+  });
+
+  test("bash task retention backlog alerts only above steady-state capacity", () => {
+    const retention = (eligible_but_unpruned_rows: number) => sample({
+      health: { metrics: { bash_task_retention: {
+        eligible_but_unpruned_rows,
+        steady_state_ceiling: 250,
+      } } },
+    });
+
+    expect(detectRetention(retention(250))).toEqual([]);
+    expect(detectRetention(retention(251))).toEqual([expect.objectContaining({
+      rule: "retention.backlog",
+      severity: "WARNING",
+      fingerprint: "retention:bash-tasks",
+    })]);
   });
 
   test("building index with recent progress is not stuck", () => {

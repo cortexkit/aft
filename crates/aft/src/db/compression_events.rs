@@ -337,9 +337,10 @@ fn compression_event_watermark_before(
 /// Raw history is kept for thirty days; lifetime counters survive in rollups.
 pub const RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const RETENTION_BATCH: i64 = 500;
-// Probe up to 500 filesystem rows without holding the shared database mutex.
-// Capping the write phase at 250 keeps total connection lock holds below 100 ms.
-const BASH_TASK_MUTATION_BATCH: usize = 250;
+// Production selects, stats, and mutates at most 250 rows per transaction;
+// filesystem checks still run after releasing the shared database mutex.
+pub const BASH_TASK_STEADY_STATE_ROWS: usize = 250;
+const RETENTION_LOCK_BUDGET_MICROS: u128 = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionTick {
@@ -362,12 +363,31 @@ impl RetentionPhaseTimings {
         self.selection_lock_micros
             .saturating_add(self.mutation_lock_micros)
     }
+
+    pub fn worst_lock_micros(self) -> u128 {
+        self.selection_lock_micros.max(self.mutation_lock_micros)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionPass {
     pub tick: RetentionTick,
     pub timings: RetentionPhaseTimings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSweep {
+    pub initial_eligible_rows: usize,
+    pub remaining_eligible_rows: Option<usize>,
+    pub row_ceiling: usize,
+    pub passes: usize,
+    pub bash_tasks_removed: usize,
+    pub compression_events_removed: usize,
+    pub worst_count_lock_micros: u128,
+    pub worst_selection_lock_micros: u128,
+    pub worst_mutation_lock_micros: u128,
+    pub worst_lock_micros: u128,
+    pub elapsed_micros: u128,
 }
 
 const RETENTION_CANDIDATES: &str = "
@@ -541,18 +561,42 @@ fn prune_retention_once_observed(
     use std::sync::TryLockError;
     use std::time::Instant;
 
-    let conn = match db.try_lock() {
-        Ok(conn) => conn,
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Poisoned(_)) => {
-            return Err("retention database mutex poisoned".to_string())
-        }
-    };
     let selection_started = Instant::now();
-    let plan = crate::db::bash_tasks::select_terminal_prune_candidates(&conn, now_ms, 500)
-        .map_err(|error| error.to_string())?;
-    drop(conn);
-    let selection_lock_micros = selection_started.elapsed().as_micros();
+    let (path, in_memory_plan, selection_lock_micros) = {
+        let conn = match db.try_lock() {
+            Ok(conn) => conn,
+            Err(TryLockError::WouldBlock) => return Ok(None),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("retention database mutex poisoned".to_string())
+            }
+        };
+        let path = conn.path().map(std::path::PathBuf::from);
+        let plan = if path.is_none() {
+            Some(
+                crate::db::bash_tasks::select_terminal_prune_candidates(
+                    &conn,
+                    now_ms,
+                    BASH_TASK_STEADY_STATE_ROWS,
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
+        (path, plan, selection_started.elapsed().as_micros())
+    };
+    let plan = if let Some(plan) = in_memory_plan {
+        plan
+    } else {
+        let conn = crate::db::open_readonly(path.as_deref().expect("checked database path"))
+            .map_err(|error| error.to_string())?;
+        crate::db::bash_tasks::select_terminal_prune_candidates(
+            &conn,
+            now_ms,
+            BASH_TASK_STEADY_STATE_ROWS,
+        )
+        .map_err(|error| error.to_string())?
+    };
 
     let stat_started = Instant::now();
     let mut prepared = crate::db::bash_tasks::prepare_terminal_prune_observed(
@@ -566,7 +610,7 @@ fn prune_retention_once_observed(
         },
         observe_stat_phase,
     );
-    crate::db::bash_tasks::cap_prepared_terminal_rows(&mut prepared, BASH_TASK_MUTATION_BATCH);
+    crate::db::bash_tasks::cap_prepared_terminal_rows(&mut prepared, BASH_TASK_STEADY_STATE_ROWS);
     let stat_micros = stat_started.elapsed().as_micros();
 
     let mut conn = match db.try_lock() {
@@ -595,8 +639,133 @@ fn prune_retention_once_observed(
     }))
 }
 
+fn eligible_terminal_rows(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+) -> Result<Option<(usize, u128)>, String> {
+    use std::sync::TryLockError;
+    use std::time::Instant;
+
+    let shared_lock_started = Instant::now();
+    let conn = match db.try_lock() {
+        Ok(conn) => conn,
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err("retention database mutex poisoned".to_string())
+        }
+    };
+    let path = conn.path().map(std::path::PathBuf::from);
+    let rows_without_path = if path.is_none() {
+        Some(
+            crate::db::bash_tasks::terminal_rows_eligible_count(&conn, now_ms)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    drop(conn);
+    let shared_lock_micros = shared_lock_started.elapsed().as_micros();
+    let rows = if let Some(rows) = rows_without_path {
+        rows
+    } else {
+        let conn = crate::db::open_readonly(path.as_deref().expect("checked database path"))
+            .map_err(|error| error.to_string())?;
+        crate::db::bash_tasks::terminal_rows_eligible_count(&conn, now_ms)
+            .map_err(|error| error.to_string())?
+    };
+    Ok(Some((rows, shared_lock_micros)))
+}
+
+/// Count eligible terminal rows on a separate read-only connection when the
+/// shared connection has a file path, holding its mutex only long enough to copy that path.
+pub fn terminal_rows_eligible_count_nonblocking(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+) -> Result<Option<usize>, String> {
+    eligible_terminal_rows(db, now_ms).map(|count| count.map(|(rows, _)| rows))
+}
+
+fn retention_row_ceiling(eligible_rows: usize) -> usize {
+    if eligible_rows > BASH_TASK_STEADY_STATE_ROWS {
+        eligible_rows
+    } else {
+        BASH_TASK_STEADY_STATE_ROWS
+    }
+}
+
+/// Drain a retention backlog through independently committed, bounded transactions.
+/// Contention between batches stops the sweep so interactive work always wins the mutex.
+pub fn prune_retention_sweep(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+) -> Result<Option<RetentionSweep>, String> {
+    use std::time::Instant;
+
+    let sweep_started = Instant::now();
+    let Some((initial_eligible_rows, initial_count_lock_micros)) =
+        eligible_terminal_rows(db, now_ms)?
+    else {
+        return Ok(None);
+    };
+    let row_ceiling = retention_row_ceiling(initial_eligible_rows);
+    let catch_up = initial_eligible_rows > BASH_TASK_STEADY_STATE_ROWS;
+    let mut passes = 0usize;
+    let mut bash_tasks_removed = 0usize;
+    let mut compression_events_removed = 0usize;
+    let mut worst_count_lock_micros = initial_count_lock_micros;
+    let mut worst_selection_lock_micros = 0u128;
+    let mut worst_mutation_lock_micros = 0u128;
+    let mut worst_lock_micros = initial_count_lock_micros;
+
+    loop {
+        let Some(pass) = prune_retention_once(db, now_ms, registries)? else {
+            break;
+        };
+        passes = passes.saturating_add(1);
+        bash_tasks_removed = bash_tasks_removed.saturating_add(pass.tick.bash_tasks.removed);
+        compression_events_removed =
+            compression_events_removed.saturating_add(pass.tick.compression_events_removed);
+        worst_selection_lock_micros =
+            worst_selection_lock_micros.max(pass.timings.selection_lock_micros);
+        worst_mutation_lock_micros =
+            worst_mutation_lock_micros.max(pass.timings.mutation_lock_micros);
+        worst_lock_micros = worst_lock_micros.max(pass.timings.worst_lock_micros());
+
+        if !catch_up
+            || bash_tasks_removed >= row_ceiling
+            || pass.tick.bash_tasks.removed == 0
+            || pass.tick.bash_tasks.remaining_candidates == 0
+        {
+            break;
+        }
+        // A waiter that arrived during filesystem checks gets an acquisition
+        // opportunity before retention starts the next bounded transaction.
+        std::thread::yield_now();
+    }
+
+    let remaining = eligible_terminal_rows(db, now_ms)?;
+    if let Some((_, lock_micros)) = remaining {
+        worst_count_lock_micros = worst_count_lock_micros.max(lock_micros);
+        worst_lock_micros = worst_lock_micros.max(lock_micros);
+    }
+    Ok(Some(RetentionSweep {
+        initial_eligible_rows,
+        remaining_eligible_rows: remaining.map(|(rows, _)| rows),
+        row_ceiling,
+        passes,
+        bash_tasks_removed,
+        compression_events_removed,
+        worst_count_lock_micros,
+        worst_selection_lock_micros,
+        worst_mutation_lock_micros,
+        worst_lock_micros,
+        elapsed_micros: sweep_started.elapsed().as_micros(),
+    }))
+}
+
 /// Schedule bounded retention away from the daemon and standalone request loops.
-/// A process can have only one pass in flight and attempts at most once a minute.
+/// A process can have only one sweep in flight and attempts at most once a minute.
 pub fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
     registries: Option<Vec<crate::bash_background::BgTaskRegistry>>,
@@ -625,21 +794,36 @@ pub fn maybe_spawn_retention(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            match prune_retention_once(
+            match prune_retention_sweep(
                 &db,
                 i64::try_from(now).unwrap_or(i64::MAX),
                 registries.as_deref(),
             ) {
-                Ok(Some(pass)) => {
+                Ok(Some(sweep)) => {
                     crate::slog_info!(
-                        "bash task retention: removed={} remaining_candidates={}",
-                        pass.tick.bash_tasks.removed,
-                        pass.tick.bash_tasks.remaining_candidates
+                        "bash task retention: initial_eligible={} removed={} remaining_eligible={:?} passes={} row_ceiling={} worst_count_lock_us={} worst_selection_lock_us={} worst_mutation_lock_us={} worst_lock_us={} elapsed_us={}",
+                        sweep.initial_eligible_rows,
+                        sweep.bash_tasks_removed,
+                        sweep.remaining_eligible_rows,
+                        sweep.passes,
+                        sweep.row_ceiling,
+                        sweep.worst_count_lock_micros,
+                        sweep.worst_selection_lock_micros,
+                        sweep.worst_mutation_lock_micros,
+                        sweep.worst_lock_micros,
+                        sweep.elapsed_micros
                     );
-                    if pass.tick.compression_events_removed > 0 {
+                    if sweep.worst_lock_micros > RETENTION_LOCK_BUDGET_MICROS {
+                        crate::slog_warn!(
+                            "bash task retention lock budget exceeded: worst_lock_us={} budget_us={}",
+                            sweep.worst_lock_micros,
+                            RETENTION_LOCK_BUDGET_MICROS
+                        );
+                    }
+                    if sweep.compression_events_removed > 0 {
                         crate::slog_info!(
                             "compression retention: folded {} raw events",
-                            pass.tick.compression_events_removed
+                            sweep.compression_events_removed
                         );
                     }
                 }
