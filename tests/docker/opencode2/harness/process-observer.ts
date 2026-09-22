@@ -20,6 +20,8 @@ export interface TaskStatusWaitEvidence {
   elapsed_ms: number;
   task: TaskState;
   observed: TaskState[];
+  probe_errors: number;
+  last_probe_error?: string;
 }
 
 /** Wait until the task registry proves a task reached the requested state. */
@@ -31,21 +33,30 @@ export async function waitForTaskStatus(
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   let observed: TaskState[] = [];
+  let probeErrors = 0;
+  let lastProbeError: string | undefined;
 
   for (;;) {
-    observed = await probe.states();
-    const task = observed.find((candidate) => candidate.status === status);
-    if (task) {
-      return {
-        expected_status: status,
-        elapsed_ms: Date.now() - startedAt,
-        task,
-        observed,
-      };
+    try {
+      observed = await probe.states();
+      const task = observed.find((candidate) => candidate.status === status);
+      if (task) {
+        return {
+          expected_status: status,
+          elapsed_ms: Date.now() - startedAt,
+          task,
+          observed,
+          probe_errors: probeErrors,
+          last_probe_error: lastProbeError,
+        };
+      }
+    } catch (error) {
+      probeErrors += 1;
+      lastProbeError = error instanceof Error ? error.message : String(error);
     }
     if (Date.now() >= deadline) {
       throw new Error(
-        `task probe did not observe status ${JSON.stringify(status)} within ${timeoutMs}ms; observed ${JSON.stringify(observed)}`,
+        `task probe did not observe status ${JSON.stringify(status)} within ${timeoutMs}ms; observed ${JSON.stringify(observed)}; probe errors ${probeErrors}${lastProbeError ? `; last probe error ${JSON.stringify(lastProbeError)}` : ""}`,
       );
     }
     await Bun.sleep(Math.min(25, deadline - Date.now()));

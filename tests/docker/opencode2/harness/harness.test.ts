@@ -168,7 +168,8 @@ describe("task readiness conditions", () => {
     const probe: TaskProbe = {
       states: async () => {
         reads += 1;
-        return reads === 1 ? [] : [{ id: "bash-ready", status: "running", pgid: 42 }];
+        if (reads === 1) throw new Error("database is locked");
+        return reads === 2 ? [] : [{ id: "bash-ready", status: "running", pgid: 42 }];
       },
     };
 
@@ -176,7 +177,9 @@ describe("task readiness conditions", () => {
 
     expect(evidence.task).toEqual({ id: "bash-ready", status: "running", pgid: 42 });
     expect(evidence.observed).toEqual([evidence.task]);
-    expect(reads).toBe(2);
+    expect(evidence.probe_errors).toBe(1);
+    expect(evidence.last_probe_error).toBe("database is locked");
+    expect(reads).toBe(3);
   });
 
   test("a timeout reports the task states it actually observed", async () => {
@@ -185,7 +188,7 @@ describe("task readiness conditions", () => {
     };
 
     await expect(waitForTaskStatus(probe, "running", 1)).rejects.toThrow(
-      'did not observe status "running" within 1ms; observed [{"id":"bash-finished","status":"completed"}]',
+      'did not observe status "running" within 1ms; observed [{"id":"bash-finished","status":"completed"}]; probe errors 0',
     );
   });
 });
