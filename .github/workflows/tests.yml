@@ -207,15 +207,16 @@ jobs:
           if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           else
-            # A depth-1 fetch names main's tip but carries none of the history
-            # the three-dot diff walks, so the mode selector reports the diff
-            # unresolvable and the gate faults on an input rather than judging
-            # the change. Deepen until the merge-base and both sides of the
-            # diff are present locally.
-            git fetch --no-tags --deepen=200 origin main >/dev/null 2>&1 || true
+            # actions/checkout fetches only the pushed ref, and a refspec-less
+            # `git fetch origin main` writes FETCH_HEAD WITHOUT creating
+            # refs/remotes/origin/main - so `merge-base origin/main` had no ref
+            # to read and returned empty. Name the destination explicitly, and
+            # deepen until the merge-base and both sides of the three-dot diff
+            # are present locally.
+            git fetch --no-tags --deepen=200 origin +refs/heads/main:refs/remotes/origin/main >/dev/null 2>&1 || true
             base="$(git merge-base origin/main "${{ github.sha }}" 2>/dev/null || true)"
             if [ -z "$base" ]; then
-              git fetch --no-tags --unshallow origin main >/dev/null 2>&1 || true
+              git fetch --no-tags --unshallow origin +refs/heads/main:refs/remotes/origin/main >/dev/null 2>&1 || true
               base="$(git merge-base origin/main "${{ github.sha }}" 2>/dev/null || true)"
             fi
           fi
