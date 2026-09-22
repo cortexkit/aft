@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-327-prewarm-tree-eviction"
+  ],
+  "note": "Symbol prewarm evicts each parse tree after extraction. No search ranking, scoring or corpus content changed; parser.rs change is a new narrow eviction method that invalidate_symbols delegates to."
+}
