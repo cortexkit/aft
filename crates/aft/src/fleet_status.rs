@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use subc_client_rs::{
-    CallOptions, CloseRouteOptions, ConnectionState, ConsumerOptions, RouteHandle, SubcConsumer,
+    CallOptions, CatalogList, CloseRouteOptions, ConnectionState, ConsumerOptions, PushEvent,
+    RouteHandle, SubcConsumer,
 };
 use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
@@ -351,6 +352,73 @@ async fn run_fleet_status_dial(
         }
     };
 
+    run_connected_status_dial(consumer, client, wire_rx, route_identity, pending_request).await;
+}
+
+// Keep the dial's discovery and publish loop identical for the real transport and
+// the clock-driven test consumer; the latter can return actual bind errors.
+trait StatusConsumer {
+    type Route;
+
+    fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static);
+    async fn catalog_list(&self) -> Result<CatalogList, String>;
+    async fn open_route(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+    ) -> Result<Self::Route, String>;
+    fn push_events(&self, route: &Self::Route) -> Result<mpsc::Receiver<PushEvent>, String>;
+    async fn close_handle(&self, route: &Self::Route) -> Result<(), String>;
+    async fn request(&self, route: &Self::Route, body: Vec<u8>) -> Result<Vec<u8>, String>;
+}
+
+impl StatusConsumer for SubcConsumer {
+    type Route = RouteHandle;
+
+    fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static) {
+        SubcConsumer::on_connection_state(self, cb);
+    }
+
+    async fn catalog_list(&self) -> Result<CatalogList, String> {
+        SubcConsumer::catalog_list(self)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn open_route(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+    ) -> Result<Self::Route, String> {
+        SubcConsumer::open_route(self, target, identity, CallOptions::default())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    fn push_events(&self, route: &Self::Route) -> Result<mpsc::Receiver<PushEvent>, String> {
+        SubcConsumer::push_events(self, route).map_err(|error| error.to_string())
+    }
+
+    async fn close_handle(&self, route: &Self::Route) -> Result<(), String> {
+        SubcConsumer::close_handle(self, route, CloseRouteOptions::default())
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn request(&self, route: &Self::Route, body: Vec<u8>) -> Result<Vec<u8>, String> {
+        SubcConsumer::request(self, route, body, CallOptions::default())
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+async fn run_connected_status_dial<C: StatusConsumer>(
+    consumer: C,
+    client: FleetStatusClient,
+    mut wire_rx: mpsc::Receiver<StatusWireRequest>,
+    route_identity: FleetRouteIdentity,
+    mut pending_request: Option<StatusWireRequest>,
+) {
     let (connection_state_tx, mut connection_state_rx) = mpsc::unbounded_channel();
     let connection_state_client = client.clone();
     consumer.on_connection_state(move |state| {
@@ -358,7 +426,7 @@ async fn run_fleet_status_dial(
         let _ = connection_state_tx.send(state);
     });
 
-    let mut route: Option<RouteHandle> = None;
+    let mut route: Option<C::Route> = None;
     let mut route_events = None;
     let mut next_discovery_at = tokio::time::Instant::now();
     let mut discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
@@ -366,7 +434,6 @@ async fn run_fleet_status_dial(
         if tokio::time::Instant::now() >= next_discovery_at {
             match consumer.catalog_list().await {
                 Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
-                    discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
                     if route.is_none() {
                         let identity = BindIdentity {
                             project_root: route_identity.project_root.clone().into(),
@@ -379,7 +446,6 @@ async fn run_fleet_status_dial(
                                     module_id: STATUS_HOLDER_MODULE.to_string(),
                                 },
                                 identity,
-                                CallOptions::default(),
                             )
                             .await
                         {
@@ -387,6 +453,7 @@ async fn run_fleet_status_dial(
                                 Ok(events) => {
                                     route_events = Some(events);
                                     route = Some(opened_route);
+                                    discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
                                 }
                                 Err(error) => {
                                     log::debug!(
@@ -402,13 +469,16 @@ async fn run_fleet_status_dial(
                         }
                     }
                     client.set_route_live(route.is_some());
-                    next_discovery_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                    if route.is_some() {
+                        next_discovery_at = tokio::time::Instant::now() + STATUS_CADENCE;
+                    } else {
+                        next_discovery_at = tokio::time::Instant::now() + discovery_backoff;
+                        discovery_backoff = next_discovery_backoff(discovery_backoff);
+                    }
                 }
                 Ok(_) => {
                     if let Some(opened_route) = route.take() {
-                        let _ = consumer
-                            .close_handle(&opened_route, CloseRouteOptions::default())
-                            .await;
+                        let _ = consumer.close_handle(&opened_route).await;
                     }
                     route_events = None;
                     client.set_route_live(false);
@@ -438,10 +508,7 @@ async fn run_fleet_status_dial(
                     continue;
                 }
             };
-            match consumer
-                .request(opened_route, body, CallOptions::default())
-                .await
-            {
+            match consumer.request(opened_route, body).await {
                 Ok(response) => {
                     if !complete_status_publish_call(request, &response) {
                         route = None;
@@ -616,6 +683,155 @@ mod tests {
             }],
             control_ops: Vec::new(),
         }
+    }
+
+    struct RejectingConsumer {
+        attempts: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+        succeeds_on: Option<usize>,
+        connection_callback: Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
+        push_sender: parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>,
+    }
+
+    impl StatusConsumer for RejectingConsumer {
+        type Route = usize;
+
+        fn on_connection_state(&self, cb: impl Fn(ConnectionState) + Send + 'static) {
+            *self.connection_callback.lock() = Some(Box::new(cb));
+        }
+
+        async fn catalog_list(&self) -> Result<CatalogList, String> {
+            Ok(CatalogList {
+                generation: 1,
+                modules: vec![status_catalog_entry(
+                    STATUS_HOLDER_MODULE,
+                    STATUS_LINE_OPERATION,
+                )],
+                subc_ops: Vec::new(),
+            })
+        }
+
+        async fn open_route(
+            &self,
+            _target: RouteTarget,
+            _identity: BindIdentity,
+        ) -> Result<usize, String> {
+            let mut attempts = self.attempts.lock();
+            attempts.push(tokio::time::Instant::now());
+            if self.succeeds_on == Some(attempts.len()) {
+                Ok(attempts.len())
+            } else {
+                Err("module_rejected/classification_unavailable".to_owned())
+            }
+        }
+
+        fn push_events(&self, _route: &usize) -> Result<mpsc::Receiver<PushEvent>, String> {
+            let (tx, rx) = mpsc::channel(1);
+            *self.push_sender.lock() = Some(tx);
+            Ok(rx)
+        }
+
+        async fn close_handle(&self, _route: &usize) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn request(&self, _route: &usize, _body: Vec<u8>) -> Result<Vec<u8>, String> {
+            Err("not used in discovery test".to_owned())
+        }
+    }
+
+    async fn dial_with_rejections(
+        succeeds_on: Option<usize>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+        Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
+    ) {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
+        let first_request = wire_rx.try_recv().expect("first discovery request");
+        let identity = FleetRouteIdentity::from(&first_request);
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let callback = Arc::new(parking_lot::Mutex::new(None));
+        let consumer = RejectingConsumer {
+            attempts: attempts.clone(),
+            succeeds_on,
+            connection_callback: callback.clone(),
+            push_sender: parking_lot::Mutex::new(None),
+        };
+        let task = tokio::spawn(run_connected_status_dial(
+            consumer,
+            client,
+            wire_rx,
+            identity,
+            Some(first_request),
+        ));
+        tokio::task::yield_now().await;
+        (task, attempts, callback)
+    }
+
+    async fn advance_and_observe(
+        attempts: &Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+        elapsed: Duration,
+        expected: usize,
+    ) {
+        tokio::time::advance(elapsed).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts.lock().len(),
+            expected,
+            "attempt count after {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rejected_binds_back_off_to_cap() {
+        let (task, attempts, _) = dial_with_rejections(None).await;
+        let start = attempts.lock()[0];
+        for (elapsed, expected) in [
+            (Duration::from_millis(250), 2),
+            (Duration::from_millis(500), 3),
+            (Duration::from_secs(1), 4),
+            (Duration::from_secs(2), 5),
+            (Duration::from_secs(4), 6),
+            (Duration::from_secs(5), 7),
+            (Duration::from_secs(5), 8),
+        ] {
+            advance_and_observe(&attempts, elapsed, expected).await;
+        }
+        let observed: Vec<_> = attempts.lock().iter().map(|at| *at - start).collect();
+        assert_eq!(
+            observed,
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(250),
+                Duration::from_millis(750),
+                Duration::from_millis(1750),
+                Duration::from_millis(3750),
+                Duration::from_millis(7750),
+                Duration::from_millis(12750),
+                Duration::from_millis(17750),
+            ]
+        );
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn successful_bind_resets_rejection_backoff() {
+        let (task, attempts, callback) = dial_with_rejections(Some(4)).await;
+        for (elapsed, expected) in [
+            (Duration::from_millis(250), 2),
+            (Duration::from_millis(500), 3),
+            (Duration::from_secs(1), 4),
+        ] {
+            advance_and_observe(&attempts, elapsed, expected).await;
+        }
+        callback.lock().as_ref().expect("connection callback")(ConnectionState::Dropped);
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.lock().len(), 5, "drop rediscovers immediately");
+        let fifth = attempts.lock()[4];
+        advance_and_observe(&attempts, Duration::from_millis(250), 6).await;
+        assert_eq!(attempts.lock()[5] - fifth, DISCOVERY_INITIAL_BACKOFF);
+        task.abort();
     }
 
     #[test]

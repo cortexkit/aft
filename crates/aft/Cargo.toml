@@ -158,6 +158,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
 rcgen = "0.13"
