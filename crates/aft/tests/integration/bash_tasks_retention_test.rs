@@ -13,7 +13,7 @@ use aft::db::bash_tasks::{
     TERMINAL_ROW_RETENTION_AGE_MS,
 };
 use aft::db::compression_events::{
-    prune_retention_sweep, prune_retention_tick, BASH_TASK_STEADY_STATE_ROWS,
+    prune_retention_sweep, prune_retention_tick, RetentionSweepOutcome, BASH_TASK_STEADY_STATE_ROWS,
 };
 use aft::db::TrackedConnection as Connection;
 use rusqlite::params;
@@ -204,9 +204,11 @@ fn retention_sweep_drains_backlog_in_bounded_transactions() {
     }
     let db = Arc::new(Mutex::new(conn));
 
-    let sweep = prune_retention_sweep(&db, NOW_MS, Some(&[]))
-        .expect("retention sweep")
-        .expect("uncontended retention sweep");
+    let RetentionSweepOutcome::Completed(sweep) =
+        prune_retention_sweep(&db, NOW_MS, Some(&[])).expect("retention sweep")
+    else {
+        panic!("uncontended retention sweep was skipped");
+    };
 
     assert_eq!(sweep.initial_eligible_rows, backlog);
     assert_eq!(sweep.row_ceiling, backlog);
@@ -231,9 +233,11 @@ fn retention_steady_state_keeps_single_batch_ceiling_without_backlog() {
     }
     let db = Arc::new(Mutex::new(conn));
 
-    let sweep = prune_retention_sweep(&db, NOW_MS, Some(&[]))
-        .expect("retention sweep")
-        .expect("uncontended retention sweep");
+    let RetentionSweepOutcome::Completed(sweep) =
+        prune_retention_sweep(&db, NOW_MS, Some(&[])).expect("retention sweep")
+    else {
+        panic!("uncontended retention sweep was skipped");
+    };
 
     assert_eq!(sweep.initial_eligible_rows, 3);
     assert_eq!(sweep.row_ceiling, BASH_TASK_STEADY_STATE_ROWS);
@@ -263,9 +267,11 @@ fn retention_catch_up_never_deletes_a_row_for_a_live_pid() {
     }
     let db = Arc::new(Mutex::new(conn));
 
-    let sweep = prune_retention_sweep(&db, NOW_MS, Some(&[]))
-        .expect("retention sweep")
-        .expect("uncontended retention sweep");
+    let RetentionSweepOutcome::Completed(sweep) =
+        prune_retention_sweep(&db, NOW_MS, Some(&[])).expect("retention sweep")
+    else {
+        panic!("uncontended retention sweep was skipped");
+    };
 
     assert!(sweep.initial_eligible_rows > BASH_TASK_STEADY_STATE_ROWS);
     assert_eq!(sweep.bash_tasks_removed, BASH_TASK_STEADY_STATE_ROWS + 1);
@@ -342,9 +348,11 @@ fn measure_terminal_pruner_on_database_copy() {
     let before_eligible = terminal_rows_eligible_count(&db.lock().expect("database lock"), now_ms)
         .expect("count eligible rows");
     let started = Instant::now();
-    let sweep = prune_retention_sweep(&db, now_ms, Some(&[]))
-        .expect("retention sweep")
-        .expect("uncontended retention sweep");
+    let RetentionSweepOutcome::Completed(sweep) =
+        prune_retention_sweep(&db, now_ms, Some(&[])).expect("retention sweep")
+    else {
+        panic!("uncontended retention sweep was skipped");
+    };
     let elapsed_micros = started.elapsed().as_micros();
     eprintln!(
         "bash task retention measurement: before_rows={before_rows} after_rows={} before_eligible={before_eligible} after_eligible={:?} removed={} passes={} row_ceiling={} worst_count_lock_us={} worst_selection_lock_us={} worst_mutation_lock_us={} worst_lock_us={} elapsed_us={elapsed_micros}",

@@ -341,6 +341,36 @@ const RETENTION_BATCH: i64 = 500;
 // filesystem checks still run after releasing the shared database mutex.
 pub const BASH_TASK_STEADY_STATE_ROWS: usize = 250;
 const RETENTION_LOCK_BUDGET_MICROS: u128 = 100_000;
+const RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS: u128 = 5_000;
+const RETENTION_COUNT_LOCK_MAX_ATTEMPTS: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionSweepSkipReason {
+    OpeningCountLockBudgetExhausted,
+    ClosingCountLockBudgetExhausted,
+}
+
+impl RetentionSweepSkipReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpeningCountLockBudgetExhausted => "opening_count_lock_budget_exhausted",
+            Self::ClosingCountLockBudgetExhausted => "closing_count_lock_budget_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionSweepSkip {
+    pub reason: RetentionSweepSkipReason,
+    pub attempts: usize,
+    pub waited_micros: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionSweepOutcome {
+    Completed(RetentionSweep),
+    Skipped(RetentionSweepSkip),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionTick {
@@ -379,6 +409,7 @@ pub struct RetentionPass {
 pub struct RetentionSweep {
     pub initial_eligible_rows: usize,
     pub remaining_eligible_rows: Option<usize>,
+    pub count_skip: Option<RetentionSweepSkip>,
     pub row_ceiling: usize,
     pub passes: usize,
     pub bash_tasks_removed: usize,
@@ -639,21 +670,96 @@ fn prune_retention_once_observed(
     }))
 }
 
-fn eligible_terminal_rows(
-    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
-    now_ms: i64,
-) -> Result<Option<(usize, u128)>, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionCountPhase {
+    Opening,
+    Closing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EligibleTerminalRows {
+    Count {
+        rows: usize,
+        lock_micros: u128,
+    },
+    LockBudgetExhausted {
+        attempts: usize,
+        waited_micros: u128,
+    },
+}
+
+enum RetentionCountLock<'a> {
+    Acquired(std::sync::MutexGuard<'a, crate::db::TrackedConnection>),
+    BudgetExhausted {
+        attempts: usize,
+        waited_micros: u128,
+    },
+}
+
+fn try_retention_count_lock_observed<'a>(
+    db: &'a std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    phase: RetentionCountPhase,
+    observe_attempt: &mut impl FnMut(RetentionCountPhase, usize),
+) -> Result<RetentionCountLock<'a>, String> {
     use std::sync::TryLockError;
     use std::time::Instant;
 
-    let shared_lock_started = Instant::now();
-    let conn = match db.try_lock() {
-        Ok(conn) => conn,
-        Err(TryLockError::WouldBlock) => return Ok(None),
-        Err(TryLockError::Poisoned(_)) => {
-            return Err("retention database mutex poisoned".to_string())
+    let started = Instant::now();
+    let mut attempts = 0usize;
+    loop {
+        if attempts > 0 {
+            if attempts >= RETENTION_COUNT_LOCK_MAX_ATTEMPTS
+                || (attempts > 1
+                    && started.elapsed().as_micros() >= RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS)
+            {
+                return Ok(RetentionCountLock::BudgetExhausted {
+                    attempts,
+                    waited_micros: started.elapsed().as_micros(),
+                });
+            }
+            std::thread::yield_now();
+        }
+
+        attempts = attempts.saturating_add(1);
+        observe_attempt(phase, attempts);
+        match db.try_lock() {
+            Ok(conn) => return Ok(RetentionCountLock::Acquired(conn)),
+            Err(TryLockError::WouldBlock) => {}
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("retention database mutex poisoned".to_string())
+            }
+        }
+    }
+}
+
+fn eligible_terminal_rows(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+) -> Result<EligibleTerminalRows, String> {
+    eligible_terminal_rows_observed(db, now_ms, RetentionCountPhase::Opening, &mut |_, _| {})
+}
+
+fn eligible_terminal_rows_observed(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+    phase: RetentionCountPhase,
+    observe_attempt: &mut impl FnMut(RetentionCountPhase, usize),
+) -> Result<EligibleTerminalRows, String> {
+    use std::time::Instant;
+
+    let conn = match try_retention_count_lock_observed(db, phase, observe_attempt)? {
+        RetentionCountLock::Acquired(conn) => conn,
+        RetentionCountLock::BudgetExhausted {
+            attempts,
+            waited_micros,
+        } => {
+            return Ok(EligibleTerminalRows::LockBudgetExhausted {
+                attempts,
+                waited_micros,
+            })
         }
     };
+    let lock_started = Instant::now();
     let path = conn.path().map(std::path::PathBuf::from);
     let rows_without_path = if path.is_none() {
         Some(
@@ -664,7 +770,7 @@ fn eligible_terminal_rows(
         None
     };
     drop(conn);
-    let shared_lock_micros = shared_lock_started.elapsed().as_micros();
+    let lock_micros = lock_started.elapsed().as_micros();
     let rows = if let Some(rows) = rows_without_path {
         rows
     } else {
@@ -673,16 +779,54 @@ fn eligible_terminal_rows(
         crate::db::bash_tasks::terminal_rows_eligible_count(&conn, now_ms)
             .map_err(|error| error.to_string())?
     };
-    Ok(Some((rows, shared_lock_micros)))
+    Ok(EligibleTerminalRows::Count { rows, lock_micros })
 }
 
-/// Count eligible terminal rows on a separate read-only connection when the
-/// shared connection has a file path, holding its mutex only long enough to copy that path.
+fn retention_db_key(db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>) -> usize {
+    std::sync::Arc::as_ptr(db) as usize
+}
+
+fn retention_skip_reasons() -> &'static Mutex<HashMap<usize, RetentionSweepSkipReason>> {
+    static SKIPS: std::sync::OnceLock<Mutex<HashMap<usize, RetentionSweepSkipReason>>> =
+        std::sync::OnceLock::new();
+    SKIPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_retention_sweep_skip(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    reason: Option<RetentionSweepSkipReason>,
+) {
+    let mut skips = retention_skip_reasons().lock();
+    match reason {
+        Some(reason) => {
+            skips.insert(retention_db_key(db), reason);
+        }
+        None => {
+            skips.remove(&retention_db_key(db));
+        }
+    }
+}
+
+pub fn last_retention_sweep_skip_reason(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+) -> Option<RetentionSweepSkipReason> {
+    retention_skip_reasons()
+        .lock()
+        .get(&retention_db_key(db))
+        .copied()
+}
+
+/// Use a separate read-only connection when the shared connection has a database file path;
+/// retry only up to the configured limit for counting retention-eligible rows, and hold the
+/// shared mutex only long enough to copy that path.
 pub fn terminal_rows_eligible_count_nonblocking(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
 ) -> Result<Option<usize>, String> {
-    eligible_terminal_rows(db, now_ms).map(|count| count.map(|(rows, _)| rows))
+    eligible_terminal_rows(db, now_ms).map(|count| match count {
+        EligibleTerminalRows::Count { rows, .. } => Some(rows),
+        EligibleTerminalRows::LockBudgetExhausted { .. } => None,
+    })
 }
 
 fn retention_row_ceiling(eligible_rows: usize) -> usize {
@@ -699,14 +843,38 @@ pub fn prune_retention_sweep(
     db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
     now_ms: i64,
     registries: Option<&[crate::bash_background::BgTaskRegistry]>,
-) -> Result<Option<RetentionSweep>, String> {
+) -> Result<RetentionSweepOutcome, String> {
+    prune_retention_sweep_observed(db, now_ms, registries, |_, _| {})
+}
+
+fn prune_retention_sweep_observed(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+    mut observe_count_attempt: impl FnMut(RetentionCountPhase, usize),
+) -> Result<RetentionSweepOutcome, String> {
     use std::time::Instant;
 
     let sweep_started = Instant::now();
-    let Some((initial_eligible_rows, initial_count_lock_micros)) =
-        eligible_terminal_rows(db, now_ms)?
-    else {
-        return Ok(None);
+    let (initial_eligible_rows, initial_count_lock_micros) = match eligible_terminal_rows_observed(
+        db,
+        now_ms,
+        RetentionCountPhase::Opening,
+        &mut observe_count_attempt,
+    )? {
+        EligibleTerminalRows::Count { rows, lock_micros } => (rows, lock_micros),
+        EligibleTerminalRows::LockBudgetExhausted {
+            attempts,
+            waited_micros,
+        } => {
+            let skip = RetentionSweepSkip {
+                reason: RetentionSweepSkipReason::OpeningCountLockBudgetExhausted,
+                attempts,
+                waited_micros,
+            };
+            record_retention_sweep_skip(db, Some(skip.reason));
+            return Ok(RetentionSweepOutcome::Skipped(skip));
+        }
     };
     let row_ceiling = retention_row_ceiling(initial_eligible_rows);
     let catch_up = initial_eligible_rows > BASH_TASK_STEADY_STATE_ROWS;
@@ -744,14 +912,35 @@ pub fn prune_retention_sweep(
         std::thread::yield_now();
     }
 
-    let remaining = eligible_terminal_rows(db, now_ms)?;
-    if let Some((_, lock_micros)) = remaining {
-        worst_count_lock_micros = worst_count_lock_micros.max(lock_micros);
-        worst_lock_micros = worst_lock_micros.max(lock_micros);
-    }
-    Ok(Some(RetentionSweep {
+    let (remaining_eligible_rows, count_skip) = match eligible_terminal_rows_observed(
+        db,
+        now_ms,
+        RetentionCountPhase::Closing,
+        &mut observe_count_attempt,
+    )? {
+        EligibleTerminalRows::Count { rows, lock_micros } => {
+            worst_count_lock_micros = worst_count_lock_micros.max(lock_micros);
+            worst_lock_micros = worst_lock_micros.max(lock_micros);
+            (Some(rows), None)
+        }
+        EligibleTerminalRows::LockBudgetExhausted {
+            attempts,
+            waited_micros,
+        } => (
+            None,
+            Some(RetentionSweepSkip {
+                reason: RetentionSweepSkipReason::ClosingCountLockBudgetExhausted,
+                attempts,
+                waited_micros,
+            }),
+        ),
+    };
+    record_retention_sweep_skip(db, count_skip.map(|skip| skip.reason));
+
+    Ok(RetentionSweepOutcome::Completed(RetentionSweep {
         initial_eligible_rows,
-        remaining_eligible_rows: remaining.map(|(rows, _)| rows),
+        remaining_eligible_rows,
+        count_skip,
         row_ceiling,
         passes,
         bash_tasks_removed,
@@ -799,7 +988,7 @@ pub fn maybe_spawn_retention(
                 i64::try_from(now).unwrap_or(i64::MAX),
                 registries.as_deref(),
             ) {
-                Ok(Some(sweep)) => {
+                Ok(RetentionSweepOutcome::Completed(sweep)) => {
                     crate::slog_info!(
                         "bash task retention: initial_eligible={} removed={} remaining_eligible={:?} passes={} row_ceiling={} worst_count_lock_us={} worst_selection_lock_us={} worst_mutation_lock_us={} worst_lock_us={} elapsed_us={}",
                         sweep.initial_eligible_rows,
@@ -813,6 +1002,15 @@ pub fn maybe_spawn_retention(
                         sweep.worst_lock_micros,
                         sweep.elapsed_micros
                     );
+                    if let Some(skip) = sweep.count_skip {
+                        crate::slog_warn!(
+                            "bash task retention count skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
+                            skip.reason.as_str(),
+                            skip.attempts,
+                            skip.waited_micros,
+                            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
+                        );
+                    }
                     if sweep.worst_lock_micros > RETENTION_LOCK_BUDGET_MICROS {
                         crate::slog_warn!(
                             "bash task retention lock budget exceeded: worst_lock_us={} budget_us={}",
@@ -827,7 +1025,13 @@ pub fn maybe_spawn_retention(
                         );
                     }
                 }
-                Ok(None) => {}
+                Ok(RetentionSweepOutcome::Skipped(skip)) => crate::slog_warn!(
+                    "bash task retention skipped: reason={} attempts={} waited_us={} retry_budget_us={}",
+                    skip.reason.as_str(),
+                    skip.attempts,
+                    skip.waited_micros,
+                    RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
+                ),
                 Err(error) => crate::slog_warn!("retention failed: {}", error),
             }
             IN_FLIGHT.store(false, Ordering::Release);
@@ -842,6 +1046,113 @@ pub fn maybe_spawn_retention(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn insert_eligible_retention_task(conn: &crate::db::TrackedConnection, task_id: &str) {
+        conn.execute(
+            "INSERT INTO bash_tasks (
+                harness, session_id, task_id, project_key, command, cwd, status,
+                started_at, completed_at, completion_delivered
+             ) VALUES ('opencode', 'session', ?1, 'project', 'true', '.',
+                       'completed', 1, 1, 1)",
+            [task_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retention_sweep_retries_contended_opening_count() {
+        let dir = tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        insert_eligible_retention_task(&conn, "bash-0000000000000100");
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let mut held = Some(db.lock().unwrap());
+        let mut opening_attempts = 0usize;
+
+        let outcome = prune_retention_sweep_observed(
+            &db,
+            crate::db::bash_tasks::TERMINAL_ROW_RETENTION_AGE_MS + 100,
+            Some(&[]),
+            |phase, attempt| {
+                if phase == RetentionCountPhase::Opening {
+                    opening_attempts = opening_attempts.max(attempt);
+                    if attempt == 2 {
+                        drop(held.take());
+                    }
+                }
+            },
+        )
+        .unwrap();
+        let RetentionSweepOutcome::Completed(sweep) = outcome else {
+            panic!("opening contention abandoned the retention sweep: {outcome:?}");
+        };
+
+        assert!(opening_attempts >= 2);
+        assert_eq!(sweep.bash_tasks_removed, 1);
+        assert_eq!(sweep.remaining_eligible_rows, Some(0));
+        assert_eq!(sweep.count_skip, None);
+        assert!(sweep.worst_count_lock_micros < RETENTION_LOCK_BUDGET_MICROS);
+    }
+
+    #[test]
+    fn retention_sweep_reports_opening_lock_retry_exhaustion() {
+        let dir = tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let _held = db.lock().unwrap();
+
+        let outcome = prune_retention_sweep(&db, RETENTION_AGE_MS + 100, Some(&[])).unwrap();
+        let RetentionSweepOutcome::Skipped(skip) = outcome else {
+            panic!("exhausted opening contention was not reported: {outcome:?}");
+        };
+
+        assert_eq!(
+            skip.reason,
+            RetentionSweepSkipReason::OpeningCountLockBudgetExhausted
+        );
+        assert!((2..=RETENTION_COUNT_LOCK_MAX_ATTEMPTS).contains(&skip.attempts));
+        assert!(
+            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS * 10 < RETENTION_LOCK_BUDGET_MICROS,
+            "count retry budget must remain far below the mutex hold budget"
+        );
+        assert_eq!(last_retention_sweep_skip_reason(&db), Some(skip.reason));
+        eprintln!(
+            "retention opening contention: attempts={} waited_us={} configured_retry_budget_us={}",
+            skip.attempts, skip.waited_micros, RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS
+        );
+    }
+
+    #[test]
+    fn retention_sweep_reports_closing_lock_retry_exhaustion() {
+        let dir = tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let mut held = None;
+
+        let outcome = prune_retention_sweep_observed(
+            &db,
+            RETENTION_AGE_MS + 100,
+            Some(&[]),
+            |phase, attempt| {
+                if phase == RetentionCountPhase::Closing && attempt == 1 {
+                    held = Some(db.lock().unwrap());
+                }
+            },
+        )
+        .unwrap();
+        let RetentionSweepOutcome::Completed(sweep) = outcome else {
+            panic!("sweep did not reach its closing count: {outcome:?}");
+        };
+        let skip = sweep.count_skip.expect("closing count skip");
+
+        assert_eq!(sweep.remaining_eligible_rows, None);
+        assert_eq!(
+            skip.reason,
+            RetentionSweepSkipReason::ClosingCountLockBudgetExhausted
+        );
+        assert!((2..=RETENTION_COUNT_LOCK_MAX_ATTEMPTS).contains(&skip.attempts));
+        assert_eq!(last_retention_sweep_skip_reason(&db), Some(skip.reason));
+        drop(held.take());
+    }
 
     #[test]
     fn retention_releases_database_mutex_before_layout_stats() {
