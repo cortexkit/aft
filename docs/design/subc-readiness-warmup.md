@@ -54,7 +54,7 @@ Both are named constants in the module, not daemon config.
 
 ## Open questions
 
-1. **Which budget applies.** The module must know whether it was started for a swap or a plain restart to pick between the two budgets above. Is that visible to it (HelloAck, the live-roots reply, or the launch environment)? If not, it must assume a plain restart and use the 10 s budget, which is safe in both cases.
+1. **Which budget applies.** Answered by SUBC (subconscious master `74e4a1f3`, slice C): the supervisor decides a spawn is a swap before it starts the process, and sets `SUBC_SPAWN_ROLE=swap_candidate` in the candidate's environment only. The variable is absent on every other spawn, and absence means a plain restart, so the module reads it before HELLO and picks the 90 s budget only when it is present. It selects a budget and nothing else: it is not an authority, the daemon never trusts it, and the swap-token check at HELLO remains the proof that a candidate is the one the supervisor minted. Nothing security-relevant may be keyed on it.
 2. **Warm order.** If the daemon can report route count or last activity per root, warm the busiest roots first. Optional.
 
 ## Daemon half (SUBC)
