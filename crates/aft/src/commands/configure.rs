@@ -2093,6 +2093,15 @@ fn spawn_symbol_cache_prewarm(
     });
 }
 
+fn prewarm_symbol_cache_file(
+    parser: &mut crate::parser::FileParser,
+    path: &Path,
+) -> Result<bool, crate::error::AftError> {
+    let result = parser.extract_symbols_with_cache_status(path);
+    parser.evict_parse_tree(path);
+    result.map(|(_, cache_changed)| cache_changed)
+}
+
 fn prewarm_symbol_cache_from_search_files(
     root: PathBuf,
     symbol_cache: SharedSymbolCache,
@@ -2141,9 +2150,9 @@ fn prewarm_symbol_cache_from_search_files(
             skipped_files += 1;
             continue;
         }
-        match parser.extract_symbols_with_cache_status(path) {
-            Ok((_, true)) => warmed_files += 1,
-            Ok((_, false)) => skipped_files += 1,
+        match prewarm_symbol_cache_file(&mut parser, path) {
+            Ok(true) => warmed_files += 1,
+            Ok(false) => skipped_files += 1,
             Err(_) => {}
         }
     }
@@ -6164,6 +6173,60 @@ mod tests {
             .modified()
             .expect("source mtime");
         (path.to_path_buf(), modified)
+    }
+
+    #[test]
+    fn configure_symbol_cache_prewarm_evicts_finished_trees_without_changing_symbols() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let sources = [
+            write_symbol_cache_source(
+                project.path(),
+                "src/first.rs",
+                "pub fn first() {}\npub struct First;\n",
+            ),
+            write_symbol_cache_source(
+                project.path(),
+                "src/second.rs",
+                "pub fn second() -> bool { true }\npub enum Second { Value }\n",
+            ),
+        ];
+
+        let mut baseline_parser = FileParser::new();
+        let expected_symbols = sources
+            .iter()
+            .map(|path| {
+                baseline_parser
+                    .extract_symbols(path)
+                    .expect("extract baseline symbols")
+            })
+            .collect::<Vec<_>>();
+
+        let shared = Arc::new(RwLock::new(SymbolCache::new()));
+        let mut prewarm_parser = FileParser::with_symbol_cache_generation(shared.clone(), Some(0));
+        for (path, expected) in sources.iter().zip(&expected_symbols) {
+            assert!(super::prewarm_symbol_cache_file(&mut prewarm_parser, path)
+                .expect("prewarm symbols"));
+            assert_eq!(
+                prewarm_parser.parse_tree_cache_len(),
+                0,
+                "a finished prewarm file must not leave its parse tree resident"
+            );
+
+            let modified = std::fs::metadata(path)
+                .expect("stat prewarmed source")
+                .modified()
+                .expect("source mtime");
+            let cached_symbols = shared
+                .read()
+                .expect("read symbol cache")
+                .get(path, modified)
+                .expect("prewarm retains extracted symbols");
+            assert_eq!(&cached_symbols, expected);
+        }
+
+        let cache = shared.read().expect("read final symbol cache");
+        assert_eq!(cache.len(), sources.len());
+        assert!(sources.iter().all(|path| cache.contains_key(path)));
     }
 
     #[test]

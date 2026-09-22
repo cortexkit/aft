@@ -1428,6 +1428,11 @@ impl FileParser {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
+    pub(crate) fn parse_tree_cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Shared symbol cache backing this parser.
     pub fn symbol_cache(&self) -> SharedSymbolCache {
         Arc::clone(&self.symbol_cache)
@@ -1636,12 +1641,21 @@ impl FileParser {
         Ok((symbols, cache_changed))
     }
 
+    /// Drop one local parse tree while preserving its shared extracted symbols.
+    ///
+    /// Whole-corpus prewarming visits each file once, so retaining finished trees
+    /// only increases its peak memory. Other parsing operations keep the default
+    /// tree-cache reuse behavior unless they explicitly call this method.
+    pub(crate) fn evict_parse_tree(&mut self, path: &Path) {
+        self.cache.remove(path);
+    }
+
     /// Invalidate cached symbols for a specific file (e.g., after an edit).
     pub fn invalidate_symbols(&mut self, path: &Path) {
         if let Ok(mut symbol_cache) = self.symbol_cache.write() {
             symbol_cache.invalidate(path);
         }
-        self.cache.remove(path);
+        self.evict_parse_tree(path);
     }
 }
 
