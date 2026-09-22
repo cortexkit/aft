@@ -2143,16 +2143,6 @@ impl DispatchNamesForFile<'_> {
             DispatchNamesForFile::GoMethods(methods) => methods.contains(name),
         }
     }
-
-    /// How many names this entry actually stores. A borrowed language set
-    /// stores none; only Go's per-file method set owns names. This is what
-    /// keeps the index O(files) instead of O(files x names).
-    fn materialized_name_count(&self) -> usize {
-        match self {
-            DispatchNamesForFile::Language(_) => 0,
-            DispatchNamesForFile::GoMethods(methods) => methods.len(),
-        }
-    }
 }
 
 /// Indexes each contributing file to the dispatch names that can make it a
@@ -4499,7 +4489,10 @@ mod tests {
                 "typescript".to_string(),
                 BTreeSet::from(["render".to_string(), "handle".to_string()]),
             ),
-            ("python".to_string(), BTreeSet::from(["process".to_string()])),
+            (
+                "python".to_string(),
+                BTreeSet::from(["process".to_string()]),
+            ),
             (
                 "go".to_string(),
                 BTreeSet::from(["Serve".to_string(), "Handle".to_string()]),
@@ -4543,31 +4536,52 @@ mod tests {
     fn dispatch_index_does_not_materialize_names_per_file() {
         // The defect this guards: every non-Go file used to receive a copy of
         // its language's whole dispatched-name set, so the index cost
-        // files x names. With 400 files and 400 names that is 160,000 stored
-        // names; the index must instead store none of them.
+        // files x names. With 400 files and 400 names that is 160,000 copied
+        // strings. The index must instead hold one entry per file that points
+        // at the language's own set.
         const FILES: usize = 400;
         const NAMES: usize = 400;
         let contributions = (0..FILES)
-            .map(|index| dispatch_contribution(&format!("src/file_{index}.ts"), &[]))
+            .map(|index| {
+                let extension = if index % 2 == 0 { "ts" } else { "py" };
+                dispatch_contribution(&format!("src/file_{index}.{extension}"), &[])
+            })
             .collect::<Vec<_>>();
-        let dispatched_method_names = MethodNamesByLanguage::from([(
-            "typescript".to_string(),
-            (0..NAMES).map(|index| format!("method_{index}")).collect(),
-        )]);
+        let names = (0..NAMES)
+            .map(|index| format!("method_{index}"))
+            .collect::<BTreeSet<_>>();
+        let dispatched_method_names = MethodNamesByLanguage::from([
+            ("typescript".to_string(), names.clone()),
+            ("python".to_string(), names),
+        ]);
 
-        let index = dispatch_live_source_names_by_file(&contributions, &dispatched_method_names);
+        let (index, allocations) = crate::test_allocations::count(|| {
+            dispatch_live_source_names_by_file(&contributions, &dispatched_method_names)
+        });
 
         assert_eq!(index.len(), FILES, "one entry per contributing file");
-        let materialized = index
-            .values()
-            .map(DispatchNamesForFile::materialized_name_count)
-            .sum::<usize>();
-        assert_eq!(
-            materialized, 0,
-            "non-Go files must borrow their language's name set, not copy it"
+        // Allocation count, not stored-name count: this catches any copy of the
+        // names, whatever type ends up holding it. Map nodes alone are a small
+        // fraction of the file count; one copied set is already NAMES strings.
+        assert!(
+            allocations < FILES,
+            "building the index allocated {allocations} times for {FILES} files; \
+             it must stay O(files), not O(files x names)"
         );
+        // Every non-Go entry must be the language's own set, not an equal copy.
+        for (file, entry) in &index {
+            let language = language_for_file(file);
+            let DispatchNamesForFile::Language(borrowed) = entry else {
+                panic!("{file} holds its own name set instead of borrowing {language}'s");
+            };
+            assert!(
+                std::ptr::eq(*borrowed, &dispatched_method_names[language]),
+                "{file} does not borrow {language}'s dispatched-name set"
+            );
+        }
         // Membership still answers from the language set.
         assert!(index["src/file_0.ts"].contains("method_399"));
+        assert!(index["src/file_1.py"].contains("method_0"));
         assert!(!index["src/file_0.ts"].contains("absent"));
     }
 
