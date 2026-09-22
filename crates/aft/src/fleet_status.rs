@@ -787,16 +787,16 @@ mod tests {
     async fn rejected_binds_back_off_to_cap() {
         let (task, attempts, _) = dial_with_rejections(None).await;
         let start = attempts.lock()[0];
-        for (elapsed, expected) in [
-            (Duration::from_millis(250), 2),
-            (Duration::from_millis(500), 3),
-            (Duration::from_secs(1), 4),
-            (Duration::from_secs(2), 5),
-            (Duration::from_secs(4), 6),
-            (Duration::from_secs(5), 7),
-            (Duration::from_secs(5), 8),
-        ] {
-            advance_and_observe(&attempts, elapsed, expected).await;
+        for tick in 1..=71 {
+            advance_and_observe(
+                &attempts,
+                DISCOVERY_INITIAL_BACKOFF,
+                1 + [1, 3, 7, 15, 31, 51, 71]
+                    .iter()
+                    .filter(|&&attempt_tick| attempt_tick <= tick)
+                    .count(),
+            )
+            .await;
         }
         let observed: Vec<_> = attempts.lock().iter().map(|at| *at - start).collect();
         assert_eq!(
