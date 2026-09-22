@@ -31,6 +31,7 @@ import {
   type ScheduledRun,
   daemonPidLog,
   isSubcDaemon,
+  nextPrevious,
 } from "./aft-health-sentinel";
 
 const NOW = Date.parse("2026-09-17T14:30:00Z");
@@ -261,7 +262,41 @@ describe("health sentinel pure detectors", () => {
     expect(detectStorage(sample(), cleanState())).toEqual([]);
   });
 
-  test("executor detector uses legacy maintenance fields when dispatch_liveness is absent", () => {
+    test("disk severity tracks the action it implies, and reports the trend", () => {
+      const GiB = 1024 ** 3;
+      // 39 GiB is above the operator's 25 GiB reclaim threshold: a night of
+      // normal mason traffic cycles the level through this band and recovers
+      // unaided, so it must not page CRITICAL.
+      const warn = detectStorage(sample({ disk: { free_bytes: 39 * GiB, sizes: {} } }), cleanState());
+      expect(warn[0].rule).toBe("disk.low");
+      expect(warn[0].severity).toBe("WARNING");
+      // At the threshold the operator actually acts on, it must page CRITICAL.
+      const crit = detectStorage(sample({ disk: { free_bytes: 24 * GiB, sizes: {} } }), cleanState());
+      expect(crit[0].severity).toBe("CRITICAL");
+      // The level alone cannot separate a build in flight from a leak, so the
+      // delta against the previous sample rides with it.
+      const falling = detectStorage(
+        sample({ disk: { free_bytes: 39 * GiB, sizes: {} } }),
+        { findings: {}, previous: { free_bytes: 42 * GiB } } as SentinelState,
+      );
+      expect(falling[0].text).toContain("falling 3.0 GiB");
+      const rising = detectStorage(
+        sample({ disk: { free_bytes: 42 * GiB, sizes: {} } }),
+        { findings: {}, previous: { free_bytes: 39 * GiB } } as SentinelState,
+      );
+      expect(rising[0].text).toContain("rising 3.0 GiB");
+      // A sample with no predecessor reports the level without inventing a trend.
+      expect(warn[0].text).not.toContain("falling");
+    });
+
+    test("the persisted sample carries the free byte count the trend needs", () => {
+      // The trend renders from state.previous.free_bytes; if the writer drops
+      // it the trend silently never appears, which is worse than absent.
+      const carried = nextPrevious(sample({ disk: { free_bytes: 7 * 1024 ** 3, sizes: {} } }), cleanState());
+      expect(carried.free_bytes).toBe(7 * 1024 ** 3);
+    });
+
+    test("executor detector uses legacy maintenance fields when dispatch_liveness is absent", () => {
     const legacy = sample({ health: { metrics: { maintenance_inflight: 2, maintenance_queue_oldest_age_ms: 45_000, running_maintenance: 0 } } });
     const result = detectExecutor(legacy, { findings: {}, previous: { sampled_at_ms: NOW - 1, phantom_inflight: true } } as any);
     expect(result[0].rule).toBe("executor.phantom");

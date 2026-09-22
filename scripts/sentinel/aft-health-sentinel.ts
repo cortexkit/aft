@@ -68,7 +68,7 @@ export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
-  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  previous?: { pid?: number; free_bytes?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
   /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
   ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
 };
@@ -361,8 +361,22 @@ export function detectStorage(sample: SentinelSample, state: SentinelState): Fin
   const out: Finding[] = [];
   const free = sample.disk?.free_bytes;
   if (typeof free !== "number") return [instrument("disk", "free byte count is absent")];
-  if (free < 40 * GB) out.push(finding("disk.low", "CRITICAL", "disk:aft-data", `AFT data volume has ${(free / GB).toFixed(1)} GiB free`, "free space reaches 40 GiB"));
-  else if (free < 80 * GB) out.push(finding("disk.low", "WARNING", "disk:aft-data", `AFT data volume has ${(free / GB).toFixed(1)} GiB free`, "free space reaches 80 GiB"));
+  // Severity is keyed to the action it implies, not to a round number.
+  // 25 GiB is where the operator's documented policy says to reclaim other
+  // seats' images; below that, acting beats watching. Above it, a night of
+  // normal mason traffic cycles the level by tens of gigabytes (34 -> 50 -> 39
+  // GiB on 2026-09-22) and every trough recovered unaided, so paging CRITICAL
+  // there trains the reader to skim the channel that has to work at 25.
+  // The delta against the previous sample separates a build in flight from a
+  // real leak, which the level alone cannot do.
+  const priorFree = state.previous?.free_bytes;
+  const trend =
+    typeof priorFree === "number" && Math.abs(free - priorFree) >= GB / 2
+      ? `, ${free < priorFree ? "falling" : "rising"} ${(Math.abs(free - priorFree) / GB).toFixed(1)} GiB since the last sample`
+      : "";
+  const freeText = `AFT data volume has ${(free / GB).toFixed(1)} GiB free${trend}`;
+  if (free < 25 * GB) out.push(finding("disk.low", "CRITICAL", "disk:aft-data", freeText, "free space reaches 25 GiB"));
+  else if (free < 50 * GB) out.push(finding("disk.low", "WARNING", "disk:aft-data", freeText, "free space reaches 50 GiB"));
   for (const [name, size] of Object.entries(sample.disk?.sizes ?? {})) {
     const prior = state.previous?.sizes?.[name];
     if (typeof prior === "number" && size - prior > 5 * GB) {
@@ -882,11 +896,11 @@ async function sendPeer(findings: Finding[]): Promise<string> {
 function notify(title: string, body: string): void {
   spawnSync("osascript", ["-e", `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`], { timeout: 5_000 });
 }
-function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelState["previous"] {
+export function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelState["previous"] {
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const executor = executorHealth(sample);
   const previous = state.previous;
-  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  return { pid: sample.supervisor?.pid, free_bytes: sample.disk?.free_bytes, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
