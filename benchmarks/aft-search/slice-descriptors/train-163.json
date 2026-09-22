@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oc2-bash-abort-registration-race"
+  ],
+  "note": "A foreground bash abort retries until Rust has registered the task, so an early interruption is no longer lost, and the OpenCode 2 abort scenario waits on an observed running task row instead of a fixed delay. Plugin bash tool and OpenCode 2 harness only; no file under the ranking fence is touched, and no engine, corpus or indexed-content change."
+}
