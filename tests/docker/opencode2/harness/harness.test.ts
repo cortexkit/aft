@@ -46,7 +46,12 @@ import {
   permissionAction,
   sessionPermissionRules,
 } from "./permission-plan.js";
-import { ProcessObserver, processGroupRunning } from "./process-observer.js";
+import {
+  ProcessObserver,
+  processGroupRunning,
+  type TaskProbe,
+  waitForTaskStatus,
+} from "./process-observer.js";
 import { readPinnedV1HostVersion } from "./pin.js";
 import { parentDisposition, reportTable } from "./report.js";
 import { verifyExecutableProvenance } from "./provenance.js";
@@ -154,6 +159,34 @@ describe("bounded scenario concurrency", () => {
     expect(await running).toEqual(["zero", "one", "two", "three"]);
     expect(completed).toEqual([1, 2, 3, 0]);
     expect(maximumActive).toBe(2);
+  });
+});
+
+describe("task readiness conditions", () => {
+  test("waits until a task reaches the requested state", async () => {
+    let reads = 0;
+    const probe: TaskProbe = {
+      states: async () => {
+        reads += 1;
+        return reads === 1 ? [] : [{ id: "bash-ready", status: "running", pgid: 42 }];
+      },
+    };
+
+    const evidence = await waitForTaskStatus(probe, "running", 1_000);
+
+    expect(evidence.task).toEqual({ id: "bash-ready", status: "running", pgid: 42 });
+    expect(evidence.observed).toEqual([evidence.task]);
+    expect(reads).toBe(2);
+  });
+
+  test("a timeout reports the task states it actually observed", async () => {
+    const probe: TaskProbe = {
+      states: async () => [{ id: "bash-finished", status: "completed" }],
+    };
+
+    await expect(waitForTaskStatus(probe, "running", 1)).rejects.toThrow(
+      'did not observe status "running" within 1ms; observed [{"id":"bash-finished","status":"completed"}]',
+    );
   });
 });
 

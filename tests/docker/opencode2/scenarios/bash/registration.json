@@ -757,7 +757,10 @@
         {
           "id": "bash-abort-control",
           "after_turn": "call-tool",
-          "delay_ms": 1000,
+          "wait_for_task": {
+            "status": "running",
+            "timeout_ms": 10000
+          },
           "method": "POST",
           "path": "/api/session/{{session_id}}/interrupt",
           "expected_status": 0,

@@ -68,6 +68,16 @@ describe("bash OpenCode 2 scenarios", () => {
   });
 });
 
+describe("bash abort ordering", () => {
+  test("waits for the Rust task row instead of guessing with a fixed delay", () => {
+    const abort = scenario("bash/T4/abort");
+    const control = abort.controls?.find((candidate) => candidate.purpose === "abort");
+
+    expect(control?.delay_ms).toBeUndefined();
+    expect(control?.wait_for_task).toEqual({ status: "running", timeout_ms: 10_000 });
+  });
+});
+
 describe("a configured denial hides the tool it names", () => {
   const denied = scenario("bash/T3/loop_config_deny");
 

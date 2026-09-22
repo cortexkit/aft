@@ -42,7 +42,7 @@ import {
   sessionPermissionRules,
 } from "./permission-plan.js";
 import { readPinnedHostVersion, readPinnedV1HostVersion } from "./pin.js";
-import { ProcessObserver } from "./process-observer.js";
+import { ProcessObserver, waitForTaskStatus } from "./process-observer.js";
 import { reportTable } from "./report.js";
 import { AftTaskProbe } from "./task-probe.js";
 import { assertComparison, assertT6Trailer, projectText } from "./projection.js";
@@ -496,6 +496,7 @@ async function runOneScenario(options: {
   const turnLogPath = join(forensics.directory, "turns.log");
   let disk: DiskStateObserver | undefined;
   let processObserver: ProcessObserver | undefined;
+  let taskProbe: AftTaskProbe | undefined;
   let threeState: ThreeStateRecorder | undefined;
   let server: SharedServerHandle | undefined;
   let hostEvents: HostEventRecorder | undefined;
@@ -701,6 +702,16 @@ async function runOneScenario(options: {
               endpoint: controlServer.endpoint,
               password: controlServer.password,
             };
+            if (control.wait_for_task) {
+              if (!taskProbe) throw new Error(`${scenario.id}: task probe is unavailable`);
+              const readiness = await waitForTaskStatus(
+                taskProbe,
+                control.wait_for_task.status,
+                control.wait_for_task.timeout_ms,
+              );
+              controlPathValues.task_id = readiness.task.id;
+              await forensics.writeJson(`control-${control.id}-task-readiness.json`, readiness);
+            }
             await discoverActiveSessionId(control, controlPathValues, apiOptions);
             await emit({ kind: "control_started", control, at: Date.now() });
             if (control.purpose === "abort") abortIssuedAt ??= Date.now();
@@ -751,10 +762,8 @@ async function runOneScenario(options: {
     if (scenario.restore_evidence) {
       threeState = new ThreeStateRecorder(isolation.project, scenario.restore_evidence.paths);
     }
-    processObserver = new ProcessObserver(
-      scenario.id,
-      new AftTaskProbe(join(isolation.data, "cortexkit", "aft", "aft.db")),
-    );
+    taskProbe = new AftTaskProbe(join(isolation.data, "cortexkit", "aft", "aft.db"));
+    processObserver = new ProcessObserver(scenario.id, taskProbe);
     lifecycleContext = {
       scenario,
       run_root: config.runRoot,

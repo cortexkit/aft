@@ -84,6 +84,10 @@ export interface ApiControlPlan {
   id: string;
   after_turn: string;
   delay_ms?: number;
+  wait_for_task?: {
+    status: string;
+    timeout_ms: number;
+  };
   method: string;
   path: string;
   body?: unknown;

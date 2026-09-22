@@ -214,6 +214,18 @@ export function validateScenarioDefinition(
       fail("scenario_invalid", `${scenario.id}: move restore evidence must declare both legs`);
     }
   }
+  for (const control of scenario.controls ?? []) {
+    const wait = control.wait_for_task;
+    if (!wait) continue;
+    if (
+      typeof wait.status !== "string" ||
+      wait.status.length === 0 ||
+      !Number.isInteger(wait.timeout_ms) ||
+      wait.timeout_ms < 1
+    ) {
+      fail("scenario_invalid", `${scenario.id}: control ${control.id} has invalid wait_for_task`);
+    }
+  }
   if (scenario.quiescence_timeout_ms !== undefined) {
     if (!Number.isInteger(scenario.quiescence_timeout_ms) || scenario.quiescence_timeout_ms < 1) {
       fail("scenario_invalid", `${scenario.id}: invalid quiescence_timeout_ms`);

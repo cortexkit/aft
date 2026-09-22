@@ -15,6 +15,43 @@ export interface TaskProbe {
   cancel?: (id: string) => Promise<void>;
 }
 
+export interface TaskStatusWaitEvidence {
+  expected_status: string;
+  elapsed_ms: number;
+  task: TaskState;
+  observed: TaskState[];
+}
+
+/** Wait until the task registry proves a task reached the requested state. */
+export async function waitForTaskStatus(
+  probe: TaskProbe,
+  status: string,
+  timeoutMs: number,
+): Promise<TaskStatusWaitEvidence> {
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let observed: TaskState[] = [];
+
+  for (;;) {
+    observed = await probe.states();
+    const task = observed.find((candidate) => candidate.status === status);
+    if (task) {
+      return {
+        expected_status: status,
+        elapsed_ms: Date.now() - startedAt,
+        task,
+        observed,
+      };
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `task probe did not observe status ${JSON.stringify(status)} within ${timeoutMs}ms; observed ${JSON.stringify(observed)}`,
+      );
+    }
+    await Bun.sleep(Math.min(25, deadline - Date.now()));
+  }
+}
+
 export interface TrackedProcess {
   id: string;
   pid: number;
