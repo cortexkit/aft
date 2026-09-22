@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "bash-tasks-retention-catchup"
+  ],
+  "note": "aft.db retention catch-up and an eligible-but-unpruned count in health. No engine, ranking or corpus change."
+}
