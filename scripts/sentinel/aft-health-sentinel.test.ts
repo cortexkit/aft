@@ -436,6 +436,44 @@ describe("health sentinel pure detectors", () => {
     expect(missing.fingerprint).toBe("dsym:2CD06659");
   });
 
+  test("an unreadable dSYM is an instrument failure, not a staleness verdict", () => {
+    // Live specimen 2026-09-22: a dSYM staged as bundle CONTENTS rather than an
+    // aft.dSYM bundle. dwarfdump refuses a plain directory, so no UUID could be
+    // read; the detector reported dsym.stale and rendered "is for an unreadable
+    // UUID, running image is 24D12B66...; re-stage" — a mismatch claim naming
+    // exactly one UUID, about an artifact whose DWARF was in fact correct.
+    const unreadable = detectDsym(
+      sample({ dsym: { requested_uuid: "24D12B66", path: "/dsym/24D12B66", unreadable: true } }),
+    )[0];
+    expect(unreadable.rule).toBe("instrument");
+    expect(unreadable.text).toContain("/dsym/24D12B66");
+    expect(unreadable.text).not.toContain("re-stage");
+  });
+
+  test("a staleness verdict always names both UUIDs it compared", () => {
+    // The unreadable branch must key on the ABSENT UUID, not on the collector's
+    // provenance flag: a sample carrying a path with no found_uuid is exactly
+    // the shape that produced the bad message, flag or no flag.
+    const noFlag = detectDsym(sample({ dsym: { requested_uuid: "24D12B66", path: "/dsym/24D12B66" } }))[0];
+    expect(noFlag.rule).toBe("instrument");
+
+    const stale = detectDsym(
+      sample({ dsym: { requested_uuid: "2CD06659", found_uuid: "E570EF4A", path: "/dsym/2CD06659/aft.dSYM" } }),
+    )[0];
+    // The rendered claim is a comparison, so both sides must be present and
+    // different. No phrasing may stand in for a side we never read.
+    expect(stale.text).toContain("2CD06659");
+    expect(stale.text).toContain("E570EF4A");
+    expect(stale.text).not.toContain("unreadable");
+  });
+
+  test("a dSYM whose UUID matches the running image is silent", () => {
+    const ok = detectDsym(
+      sample({ dsym: { requested_uuid: "24D12B66", found_uuid: "24D12B66", path: "/dsym/24D12B66/aft.dSYM" } }),
+    );
+    expect(ok).toHaveLength(0);
+  });
+
   test("a scheduled workflow raises only once its failures become a streak", () => {
     // Nightly runs, newest first. The gate runs on a schedule and blocks no
     // merge, so nothing else in the toolchain reports these.

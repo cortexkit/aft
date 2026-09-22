@@ -58,7 +58,7 @@ export type SentinelSample = {
   process_error?: string;
   disk?: { free_bytes?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; artifact_roots?: Record<string, string> };
   disk_error?: string;
-  dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; error?: string };
+  dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; unreadable?: boolean; error?: string };
   /** Newest-first scheduled workflow runs on the main branch; see detectScheduledCi. */
   ci_runs?: ScheduledRun[];
   ci_error?: string;
@@ -525,8 +525,18 @@ export function detectDsym(sample: SentinelSample): Finding[] {
   if (!dsym.path) {
     return [finding("dsym.missing", "WARNING", `dsym:${dsym.requested_uuid}`, `running image UUID ${dsym.requested_uuid} has no dSYM at its store key`, `a dSYM whose own LC_UUID is ${dsym.requested_uuid} is stored under that UUID`)];
   }
+  // Something is stored under the key but we could not read a UUID out of it.
+  // That is a failure of the instrument, not a determination about the
+  // artifact: reporting it as staleness asserts a mismatch we never observed,
+  // and the message would have to name the missing side, which historically
+  // rendered as "is for an unreadable UUID, running image is <X>; re-stage" —
+  // a mismatch naming one UUID and one blank. Absence above is determinate and
+  // stays a WARNING; unreadability is not.
+  if (!dsym.found_uuid) {
+    return [instrument("dsym", `no readable DWARF under ${dsym.path}`)];
+  }
   if (dsym.found_uuid !== dsym.requested_uuid) {
-    return [finding("dsym.stale", "WARNING", `dsym:${dsym.requested_uuid}`, `dSYM at ${dsym.path} is for ${dsym.found_uuid ?? "an unreadable UUID"}, running image is ${dsym.requested_uuid}; re-stage`, `the artifact at the running image key has LC_UUID ${dsym.requested_uuid}`)];
+    return [finding("dsym.stale", "WARNING", `dsym:${dsym.requested_uuid}`, `dSYM at ${dsym.path} is for ${dsym.found_uuid}, running image is ${dsym.requested_uuid}; re-stage`, `the artifact at the running image key has LC_UUID ${dsym.requested_uuid}`)];
   }
   return [];
 }
@@ -781,18 +791,42 @@ export function collectProcessMetrics(pid: number, sample: SentinelSample): NonN
   };
 }
 
+// dwarfdump reads a .dSYM bundle by its wrapper directory, but refuses a plain
+// directory ("Is a directory"), so a bundle staged without its .dSYM suffix is
+// unreadable by name alone even though its DWARF is intact. Offer the wrapper,
+// its children, and the Mach-O inside any of them, so a usable dSYM is found
+// whatever the staging layout — an unusable one then means genuinely unusable.
+function dwarfBinariesUnder(dir: string): string[] {
+  const dwarf = join(dir, "Contents", "Resources", "DWARF");
+  try {
+    return readdirSync(dwarf).map((name) => join(dwarf, name));
+  } catch {
+    return [];
+  }
+}
 function collectDsym(pid: number, image?: string): SentinelSample["dsym"] {
   const executable = image || spawnSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" }).stdout.trim();
   const requested = uuidOf(executable);
   if (!requested) return { error: `could not read LC_UUID from ${executable || `pid ${pid}`}` };
   const cache = join(AFT, "dsym", requested);
   if (!existsSync(cache)) return { requested_uuid: requested };
-  const candidates = [cache, ...readdirSync(cache).map((name) => join(cache, name))];
+  let children: string[] = [];
+  try {
+    children = readdirSync(cache).map((name) => join(cache, name));
+  } catch {
+    children = [];
+  }
+  const candidates = [
+    cache,
+    ...children,
+    ...dwarfBinariesUnder(cache),
+    ...children.flatMap((child) => dwarfBinariesUnder(child)),
+  ];
   for (const candidate of candidates) {
     const found = uuidOf(candidate);
     if (found) return { requested_uuid: requested, found_uuid: found, path: candidate };
   }
-  return { requested_uuid: requested, path: cache };
+  return { requested_uuid: requested, path: cache, unreadable: true };
 }
 function collectSample(state: SentinelState): { sample: SentinelSample; cursors: Partial<SentinelState> } {
   const now_ms = Date.now();
