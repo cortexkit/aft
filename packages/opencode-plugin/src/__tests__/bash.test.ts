@@ -757,6 +757,42 @@ describe("OpenCode bash adapter", () => {
     });
   });
 
+  test("foreground abort waits until Rust registers the task", async () => {
+    let abortAttempts = 0;
+    let settleBash: ((response: BridgeResponse) => void) | undefined;
+    const bashResponse = new Promise<BridgeResponse>((resolvePromise) => {
+      settleBash = resolvePromise;
+    });
+    const { calls, tool: bash } = createHarness((command) => {
+      if (command === "bash") return bashResponse;
+      if (command === "bash_abort_inflight") {
+        abortAttempts += 1;
+        if (abortAttempts < 3) return { success: true, killed: 0 };
+        settleBash?.({
+          success: true,
+          status: "killed",
+          task_id: "task-late-registration",
+          output: "",
+          truncated: false,
+        });
+        return { success: true, killed: 1 };
+      }
+      throw new Error(`unexpected command ${command}`);
+    });
+    const controller = new AbortController();
+
+    const result = bash.execute(
+      { command: "sleep 30" },
+      createMockSdkContext({ abort: controller.signal }),
+    );
+    controller.abort();
+
+    await result;
+    expect(abortAttempts).toBe(3);
+    expect(calls.filter((call) => call.command === "bash")).toHaveLength(1);
+    expect(calls.filter((call) => call.command === "bash_abort_inflight")).toHaveLength(3);
+  });
+
   test("normal foreground completion does not fire the abort cleanup call", async () => {
     const { calls, tool: bash } = createHarness(() => ({
       success: true,

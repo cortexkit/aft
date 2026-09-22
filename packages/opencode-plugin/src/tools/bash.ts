@@ -7,6 +7,7 @@ import {
   maybeAppendGrepSearchHint,
   resolveBashKillTimeout,
   runBashHostFallback,
+  sleep,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -27,6 +28,9 @@ const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 // The margin gives Rust time to promote or finalize the task and deliver the
 // final response after the server's foreground wait window or hard kill timeout.
 const BASH_TRANSPORT_MARGIN_MS = 10_000;
+const ABORT_REGISTRATION_WAIT_MS = 5_000;
+const ABORT_REGISTRATION_POLL_MS = 25;
+const ABORT_ATTEMPT_TIMEOUT_MS = 1_000;
 
 // Test-only override for the foreground wait window. Production resolves the
 // window from config (floored at 5000ms), but bun caps each test at 5000ms, so
@@ -53,6 +57,47 @@ function orchestratedTransportTimeoutMs(
   return waitBudget + BASH_TRANSPORT_MARGIN_MS;
 }
 
+async function abortForegroundWhenRegistered(
+  ctx: PluginContext,
+  runtime: ToolContext,
+  disposed: () => boolean,
+): Promise<void> {
+  const startedAt = Date.now();
+  const deadline = startedAt + ABORT_REGISTRATION_WAIT_MS;
+  let attempts = 0;
+  let lastResponse: Record<string, unknown> | undefined;
+  let lastError: string | undefined;
+
+  while (!disposed() && Date.now() < deadline) {
+    attempts += 1;
+    try {
+      lastResponse = await callBashBridge(ctx, runtime, "bash_abort_inflight", {}, {
+        transportTimeoutMs: Math.max(
+          1,
+          Math.min(ABORT_ATTEMPT_TIMEOUT_MS, deadline - Date.now()),
+        ),
+      });
+      lastError = undefined;
+      if (typeof lastResponse.killed === "number" && lastResponse.killed > 0) return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    if (disposed()) return;
+    if (Date.now() >= deadline) break;
+    await sleep(Math.min(ABORT_REGISTRATION_POLL_MS, deadline - Date.now()));
+  }
+
+  if (!disposed()) {
+    sessionLog(runtime.sessionID, "[bash] abort timed out waiting for foreground registration", {
+      attempts,
+      elapsed_ms: Date.now() - startedAt,
+      last_response: lastResponse,
+      last_error: lastError,
+    });
+  }
+}
+
 function listenForForegroundAbort(
   ctx: PluginContext,
   runtime: ToolContext,
@@ -61,20 +106,22 @@ function listenForForegroundAbort(
   if (!enabled) return () => {};
 
   let fired = false;
+  let disposed = false;
   const onAbort = () => {
     if (fired) return;
     fired = true;
-    // Match OpenCode's built-in ShellTool abort path: packages/opencode/src/tool/shell.ts:533-550
-    // calls its child handle.kill() when ctx.abort fires. Pi exposes a different abort
-    // surface, so this parity hook is intentionally OpenCode-only for now.
-    void callBashBridge(ctx, runtime, "bash_abort_inflight").catch(() => {
-      // The host may already be tearing down the transport; abort cleanup is best-effort.
-    });
+    // The host can interrupt this tool before Rust has registered the foreground
+    // task. Wait on the abort result instead of losing that early interruption.
+    // Pi exposes a different abort surface, so this parity hook is OpenCode-only.
+    void abortForegroundWhenRegistered(ctx, runtime, () => disposed);
   };
 
   runtime.abort.addEventListener("abort", onAbort, { once: true });
   if (runtime.abort.aborted) onAbort();
-  return () => runtime.abort.removeEventListener("abort", onAbort);
+  return () => {
+    disposed = true;
+    runtime.abort.removeEventListener("abort", onAbort);
+  };
 }
 
 /**
