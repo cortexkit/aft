@@ -352,6 +352,20 @@ fn acquire_with_config(
                 immediate_retry_budget = 1;
                 continue;
             }
+            // The same Windows contention the create arm above tolerates can
+            // land here instead: a lock file pending deletion is visible to
+            // the create attempt but denies the open that reads it. Only the
+            // create path recognised that spelling of "busy", so a race that
+            // was meant to be retried propagated as a hard failure and
+            // panicked a caller mid-write (Windows CI, 2026-09-22).
+            Err(ReadLockError::Io(error)) if is_transient_create_contention(&error) => {
+                transient_create_failures += 1;
+                if transient_create_failures > MAX_TRANSIENT_CREATE_RETRIES {
+                    return Err(error.into());
+                }
+                sleep_until_retry(deadline, config.poll_interval_ms)?;
+                continue;
+            }
             Err(ReadLockError::Io(error)) => return Err(error.into()),
             Err(ReadLockError::Malformed(error)) => {
                 // A just-created O_EXCL file is visible before its owner has
@@ -1525,6 +1539,42 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
+
+    /// A lock file whose metadata cannot be read because another actor is
+    /// mid-create/delete is contention, not a failure. The create arm already
+    /// treated it that way; the metadata read beside it did not, so on Windows
+    /// a pending-deletion lock denied the read and propagated a hard error to a
+    /// caller that then panicked mid-write. Permission-denied is classified as
+    /// contention on every platform, so this reproduces without Windows: with
+    /// the retry the acquisition spends its budget and times out; without it
+    /// the raw permission error escapes immediately.
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_lock_metadata_is_retried_as_contention_not_propagated() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("cache.lock");
+        std::fs::write(&path, b"{}\n").expect("seed lock file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+            .expect("deny reads");
+        if std::fs::read(&path).is_ok() {
+            // Running as a user that bypasses the mode bits (root in some CI
+            // images); the premise cannot hold, so assert nothing.
+            return;
+        }
+
+        let outcome = try_acquire(&path, Duration::from_millis(250));
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        match outcome {
+            Err(AcquireError::Timeout) => {}
+            Err(AcquireError::Io(error)) => panic!(
+                "contended metadata read propagated instead of retrying: {error:?}"
+            ),
+            Ok(_) => panic!("acquired a lock whose metadata could not be read"),
+        }
+    }
 
     fn test_config() -> LockConfig {
         LockConfig {
