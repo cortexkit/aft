@@ -8,6 +8,11 @@ benchmark_dir="$script_dir/../../benchmarks/aft-search"
 case "${1:-}" in
   --exact-recall)
     shift
+    # run_exact_recall validates a provisioning record that only provision_corpus
+    # writes. Its own clone path leaves no record, so a fresh checkout fails with
+    # corpus_missing:provision_record unless we provision first -- the same shape
+    # as --search-quality provisioning its evidence tree below.
+    python3 "$benchmark_dir/provision_corpus.py"
     exec python3 "$benchmark_dir/run_exact_recall.py" "$@"
     ;;
   --concept-recall)
