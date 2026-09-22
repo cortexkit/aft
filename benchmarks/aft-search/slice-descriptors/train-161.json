@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "retention-lock-contention",
+    "watcher-exclusion-breadth"
+  ],
+  "note": "TypeScript/TSX extraction gains interface callable members and function-valued object properties. parser.rs is outside the ranking fence; no engine, corpus or ranking change."
+}
