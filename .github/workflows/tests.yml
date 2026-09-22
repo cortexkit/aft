@@ -189,6 +189,13 @@ jobs:
           AFT_SEARCH_CACHE_DIR: ${{ runner.temp }}/empty-aft-search-cache
           AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
         run: |
+          # Capture this step from its FIRST line. Two earlier attempts put the
+          # capture partway down and the step died above it, leaving an empty
+          # artifact and an exit code that reads like a ranking verdict. A
+          # redirect here cannot be outrun by whatever fails below it.
+          mkdir -p benchmarks/aft-search/.bench/search-quality
+          exec > >(tee benchmarks/aft-search/.bench/search-quality/gate.log) 2>&1
+          set -x
           # Bootstrap arm: until B0 records the initial reference pair the
           # ordinary evaluate cannot run (a missing reference is never
           # downgraded to verify). Prove the pipeline end to end with the
