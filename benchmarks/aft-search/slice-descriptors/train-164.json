@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "sentinel-scheduled-listing-refetch",
+    "issue-330-measurement-record"
+  ],
+  "note": "The health sentinel refetches a stale scheduled-run listing before refusing a verdict, and the #330 projection-memory measurement document lands. Sentinel script and docs only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
