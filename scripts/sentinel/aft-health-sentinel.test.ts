@@ -468,6 +468,17 @@ describe("health sentinel pure detectors", () => {
     // One green night at the top ends the streak whatever came before it.
     const recovered = detectScheduledCi(sample({ ci_runs: [night(19, "success"), night(18, "failure"), night(17, "failure"), night(16, "failure")] }));
     expect(recovered).toEqual([]);
+
+    // A listing can be fetched successfully and still be stale. On 2026-09-22
+    // the live state held a three-minute-old fetch whose newest run was a week
+    // old, and this rule reported a streak a fresh run did not reproduce. Once
+    // stale rows are in hand they look exactly like current ones, so the age of
+    // the newest row is the only available tell.
+    const stale = detectScheduledCi(sample({ ci_runs: [night(10, "failure"), night(9, "failure"), night(8, "failure")] }));
+    expect(stale).toHaveLength(1);
+    expect(stale[0].fingerprint).toBe("instrument:scheduled-ci");
+    expect(stale[0].text).toContain("days old");
+    expect(stale[0].rule).not.toBe("ci.scheduled_failing");
   });
 
   test("the streak counts scheduled main runs only, and is a lower bound when every listed run failed", () => {

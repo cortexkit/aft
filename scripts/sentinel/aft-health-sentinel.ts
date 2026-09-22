@@ -559,7 +559,23 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
   if (sample.ci_error) return [instrument("scheduled-ci", sample.ci_error)];
   // collectSample always sets one of ci_runs/ci_error; undefined means this
   // sample came from a source that does not carry CI state (a --specimen file).
-  if (!sample.ci_runs) return [];
+    if (!sample.ci_runs) return [];
+    // A listing can be fetched successfully and still be stale: on 2026-09-22 the
+    // live state carried a three-minute-old fetch whose newest run was a week
+    // old, so this rule reported a streak that a fresh run did not reproduce.
+    // Stale rows are indistinguishable from current ones once they are in hand,
+    // so the age of the newest row is the only thing that can catch it — and a
+    // rule that cannot tell must say so rather than judge.
+    const newest = sample.ci_runs
+      .map((run) => Date.parse(run.created_at ?? "") || 0)
+      .reduce((left, right) => Math.max(left, right), 0);
+    if (newest > 0 && sample.now_ms - newest > SCHEDULED_LISTING_MAX_AGE) {
+      const days = ((sample.now_ms - newest) / 86_400_000).toFixed(1);
+      return [instrument(
+        "scheduled-ci",
+        `the scheduled-run listing is ${days} days old; its newest run predates the poll, so no verdict is available`,
+      )];
+    }
   const byWorkflow = new Map<string, ScheduledRun[]>();
   for (const run of sample.ci_runs) {
     const workflow = run.workflow?.trim();
@@ -709,6 +725,11 @@ const GH_CANDIDATES = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", join(HOME, "
 // between.
 const CI_POLL_INTERVAL = 15 * 60_000;
 const CI_RUN_WINDOW = 30;
+// A nightly workflow produces a run a day, so a listing whose newest row is
+// older than two days is not a slow schedule, it is a listing that stopped
+// tracking reality. Judging a streak from it reports last week's verdict as
+// today's.
+const SCHEDULED_LISTING_MAX_AGE = 2 * 24 * 60 * 60_000;
 
 function collectScheduledRuns(): ScheduledRun[] {
   const gh = GH_CANDIDATES.find((path) => existsSync(path)) ?? "gh";
