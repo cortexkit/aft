@@ -2156,22 +2156,23 @@ fn push_default_export_symbol(
 }
 
 fn node_contains_descendant_kind(node: &Node, kind: &str) -> bool {
-    if node.kind() == kind {
-        return true;
-    }
-
     let mut cursor = node.walk();
-    if cursor.goto_first_child() {
+    loop {
+        if cursor.node().kind() == kind {
+            return true;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
         loop {
-            if node_contains_descendant_kind(&cursor.node(), kind) {
-                return true;
-            }
-            if !cursor.goto_next_sibling() {
+            if cursor.goto_next_sibling() {
                 break;
+            }
+            if !cursor.goto_parent() {
+                return false;
             }
         }
     }
-    false
 }
 
 fn push_ts_member_symbol(
@@ -8403,6 +8404,33 @@ mod tests {
 
         assert!(exported.contains("deep"), "exports: {exported:?}");
         assert!(exported.contains("shallow"), "exports: {exported:?}");
+    }
+
+    /// Function-type detection must not spend stack per nested type node. A
+    /// property signature may legally contain thousands of nested generic types,
+    /// and extraction runs on executor workers with bounded stacks.
+    #[test]
+    fn interface_function_type_scan_survives_deep_types_on_a_small_stack() {
+        const DEPTH: usize = 3000;
+        let mut source = String::from("interface Deep {\n  handler: ");
+        source.push_str(&"Array<".repeat(DEPTH));
+        source.push_str("() => void");
+        source.push_str(&">".repeat(DEPTH));
+        source.push_str(";\n}\n");
+
+        let symbols = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || symbols_from_source(&source, LangId::TypeScript))
+            .unwrap()
+            .join()
+            .expect("interface member extraction must not overflow a 256 KiB stack");
+
+        assert!(
+            symbols.iter().any(|symbol| {
+                symbol.name == "handler" && symbol.parent.as_deref() == Some("Deep")
+            }),
+            "deep function-valued property should still be extracted: {symbols:?}"
+        );
     }
 
     #[test]
