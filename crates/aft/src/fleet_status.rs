@@ -835,6 +835,30 @@ mod tests {
     }
 
     #[test]
+    fn publish_ack_tolerates_fields_a_newer_holder_adds() {
+        // The status holder is a separately released module, and its publish
+        // ack is on every response's hot path. A newer holder adds fields (first
+        // `last_read_at_ms`, so aft can tell whether anything reads a scope);
+        // an ack decoder that refused unknown keys would turn that addition into
+        // a failed publish on every call. Pin that unknown keys are ignored.
+        let ack = StatusPublishAck::parse(
+            br#"{"epoch":3,"accepted_revision":7,"last_read_at_ms":1790115735811,"future_field":{"nested":true}}"#,
+        )
+        .expect("an ack carrying unknown keys still parses");
+        assert_eq!(
+            ack,
+            StatusPublishAck {
+                epoch: 3,
+                accepted_revision: 7
+            }
+        );
+        let null_read = StatusPublishAck::parse(
+            br#"{"epoch":3,"accepted_revision":7,"last_read_at_ms":null}"#,
+        );
+        assert!(null_read.is_some(), "a null last_read_at_ms still parses");
+    }
+
+    #[test]
     fn publish_ack_fixtures_drive_runtime_fencing() {
         let fixtures = fixtures();
         assert_eq!(fixtures.len(), 18, "fixture probe entry count changed");
