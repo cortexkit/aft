@@ -207,8 +207,23 @@ jobs:
           if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
             base="${{ github.event.pull_request.base.sha }}"
           else
-            git fetch --no-tags --depth=1 origin main >/dev/null 2>&1 || true
-            base="$(git merge-base origin/main "${{ github.sha }}")"
+            # A depth-1 fetch names main's tip but carries none of the history
+            # the three-dot diff walks, so the mode selector reports the diff
+            # unresolvable and the gate faults on an input rather than judging
+            # the change. Deepen until the merge-base and both sides of the
+            # diff are present locally.
+            git fetch --no-tags --deepen=200 origin main >/dev/null 2>&1 || true
+            base="$(git merge-base origin/main "${{ github.sha }}" 2>/dev/null || true)"
+            if [ -z "$base" ]; then
+              git fetch --no-tags --unshallow origin main >/dev/null 2>&1 || true
+              base="$(git merge-base origin/main "${{ github.sha }}" 2>/dev/null || true)"
+            fi
+          fi
+          # An unresolved base is a gate fault, and it must say so by name
+          # instead of handing the selector an empty string to fail on.
+          if [ -z "$base" ]; then
+            echo "::error title=search-quality-gate::could not resolve a merge-base with main for ${{ github.sha }}; the gate cannot classify the diff"
+            exit 2
           fi
           mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}")"
           scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}"
