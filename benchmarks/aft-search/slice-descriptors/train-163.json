@@ -8,7 +8,8 @@
     "paging"
   ],
   "slices": [
-    "oc2-bash-abort-registration-race"
+    "oc2-bash-abort-registration-race",
+    "windows-libtest-log-capture"
   ],
-  "note": "A foreground bash abort retries until Rust has registered the task, so an early interruption is no longer lost, and the OpenCode 2 abort scenario waits on an observed running task row instead of a fixed delay. Plugin bash tool and OpenCode 2 harness only; no file under the ranking fence is touched, and no engine, corpus or indexed-content change."
+  "note": "A foreground bash abort retries until Rust has registered the task, so an early interruption is no longer lost, and the OpenCode 2 abort scenario waits on an observed running task row instead of a fixed delay. Also captures the Windows libtest output as an artifact, because GitHub has twice failed to serve that job's log. Plugin bash tool, OpenCode 2 harness and CI only; no file under the ranking fence is touched, and no engine, corpus or indexed-content change."
 }
