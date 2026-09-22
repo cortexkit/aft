@@ -1,4 +1,6 @@
-use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{
+    btree_map::Entry as BTreeMapEntry, hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque,
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1895,8 +1897,8 @@ fn reachability_inputs(
         .keys()
         .filter(|source| {
             dispatch_live_source_names_by_file
-                .get(&source.0)
-                .is_some_and(|names| names.contains(symbol_liveness_name(&source.1)))
+                .get(source.0.as_str())
+                .is_some_and(|entry| entry.contains(symbol_liveness_name(&source.1)))
         })
         .cloned()
         .collect();
@@ -2123,32 +2125,77 @@ fn traverse_reachable_inner(
     reachable
 }
 
-fn dispatch_live_source_names_by_file(
-    contributions: &[DeadCodeContribution],
-    dispatched_method_names: &MethodNamesByLanguage,
-) -> BTreeMap<String, BTreeSet<String>> {
-    let mut by_file: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+/// Per-file dispatch membership for the reachability projection.
+///
+/// A non-Go file's dispatch roots are exactly the names in its language's
+/// dispatched-name set, so that set is borrowed once per language instead of
+/// being copied into every file's entry. Go is genuinely per-file: only the
+/// methods that file itself exports can be dispatch roots.
+enum DispatchNamesForFile<'a> {
+    Language(&'a BTreeSet<String>),
+    GoMethods(BTreeSet<String>),
+}
+
+impl DispatchNamesForFile<'_> {
+    fn contains(&self, name: &str) -> bool {
+        match self {
+            DispatchNamesForFile::Language(names) => names.contains(name),
+            DispatchNamesForFile::GoMethods(methods) => methods.contains(name),
+        }
+    }
+
+    /// How many names this entry actually stores. A borrowed language set
+    /// stores none; only Go's per-file method set owns names. This is what
+    /// keeps the index O(files) instead of O(files x names).
+    fn materialized_name_count(&self) -> usize {
+        match self {
+            DispatchNamesForFile::Language(_) => 0,
+            DispatchNamesForFile::GoMethods(methods) => methods.len(),
+        }
+    }
+}
+
+/// Indexes each contributing file to the dispatch names that can make it a
+/// dispatch root.
+///
+/// The previous shape copied a language's whole dispatched-name set into every
+/// file of that language, so its cost was files x names — 62.7 million entries
+/// at reporter scale. This index stores one entry per contributing file and
+/// answers non-Go membership from the language's set on demand.
+fn dispatch_live_source_names_by_file<'a>(
+    contributions: &'a [DeadCodeContribution],
+    dispatched_method_names: &'a MethodNamesByLanguage,
+) -> BTreeMap<&'a str, DispatchNamesForFile<'a>> {
+    let mut by_file: BTreeMap<&'a str, DispatchNamesForFile<'a>> = BTreeMap::new();
     for contribution in contributions {
         let language = language_for_file(&contribution.file);
         let Some(language_method_names) = dispatched_method_names.get(language) else {
             continue;
         };
         if language != "go" {
-            by_file
-                .entry(contribution.file.clone())
-                .or_default()
-                .extend(language_method_names.iter().cloned());
+            by_file.insert(
+                contribution.file.as_str(),
+                DispatchNamesForFile::Language(language_method_names),
+            );
             continue;
         }
 
+        let entry = match by_file.entry(contribution.file.as_str()) {
+            BTreeMapEntry::Occupied(entry) => entry.into_mut(),
+            BTreeMapEntry::Vacant(entry) => {
+                entry.insert(DispatchNamesForFile::GoMethods(BTreeSet::new()))
+            }
+        };
+        let DispatchNamesForFile::GoMethods(methods) = entry else {
+            // A file's language is a function of its path, so a Go file cannot
+            // already be indexed as a non-Go one.
+            continue;
+        };
         for export in &contribution.exports {
             if export_is_method(export)
                 && language_method_names.contains(symbol_liveness_name(&export.symbol))
             {
-                by_file
-                    .entry(contribution.file.clone())
-                    .or_default()
-                    .insert(symbol_liveness_name(&export.symbol).to_string());
+                methods.insert(symbol_liveness_name(&export.symbol).to_string());
             }
         }
     }
@@ -4490,6 +4537,38 @@ mod tests {
                 ("src/server.go".to_string(), "Serve".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn dispatch_index_does_not_materialize_names_per_file() {
+        // The defect this guards: every non-Go file used to receive a copy of
+        // its language's whole dispatched-name set, so the index cost
+        // files x names. With 400 files and 400 names that is 160,000 stored
+        // names; the index must instead store none of them.
+        const FILES: usize = 400;
+        const NAMES: usize = 400;
+        let contributions = (0..FILES)
+            .map(|index| dispatch_contribution(&format!("src/file_{index}.ts"), &[]))
+            .collect::<Vec<_>>();
+        let dispatched_method_names = MethodNamesByLanguage::from([(
+            "typescript".to_string(),
+            (0..NAMES).map(|index| format!("method_{index}")).collect(),
+        )]);
+
+        let index = dispatch_live_source_names_by_file(&contributions, &dispatched_method_names);
+
+        assert_eq!(index.len(), FILES, "one entry per contributing file");
+        let materialized = index
+            .values()
+            .map(DispatchNamesForFile::materialized_name_count)
+            .sum::<usize>();
+        assert_eq!(
+            materialized, 0,
+            "non-Go files must borrow their language's name set, not copy it"
+        );
+        // Membership still answers from the language set.
+        assert!(index["src/file_0.ts"].contains("method_399"));
+        assert!(!index["src/file_0.ts"].contains("absent"));
     }
 
     #[test]
