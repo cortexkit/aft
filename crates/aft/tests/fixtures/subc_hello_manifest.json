@@ -1,0 +1,188 @@
+{
+  "module_id": "aft",
+  "module_version": "<CARGO_PKG_VERSION>",
+  "protocol_ver": 2,
+  "trust_tier": "first_party",
+  "provides": [
+    {
+      "role": "tool_provider",
+      "tools": [
+        {
+          "name": "status",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "bash",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "powershell",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "read",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "write",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "edit",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "apply_patch",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "grep",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "glob",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "search",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "outline",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "zoom",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "inspect",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "callgraph",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "conflicts",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "ast_search",
+          "description": "<embedded description>",
+          "execution_mode": "pure",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "ast_replace",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "delete",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "move",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "import",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        },
+        {
+          "name": "safety",
+          "description": "<embedded description>",
+          "execution_mode": "mutating",
+          "schema": "<embedded schema>"
+        }
+      ],
+      "identity_scope": [
+        "session",
+        "project"
+      ],
+      "concurrency": "module_managed",
+      "emits_push": true,
+      "sub_supervises": true
+    },
+    {
+      "role": "management_surface",
+      "operations": [
+        {
+          "name": "health.digest",
+          "kind": "query"
+        },
+        {
+          "name": "memory.census",
+          "kind": "query"
+        },
+        {
+          "name": "writes.census",
+          "kind": "query"
+        }
+      ],
+      "config_schema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "observability": [],
+      "identity_scope": []
+    }
+  ],
+  "consumes": [],
+  "scheduled_tasks": [],
+  "bindings": {
+    "storage": {
+      "kind": "sqlite",
+      "scope": "project",
+      "owns_schema": true
+    },
+    "vault_grants": [],
+    "identity": {
+      "requires": [
+        "project"
+      ],
+      "optional": [
+        "session"
+      ]
+    }
+  }
+}

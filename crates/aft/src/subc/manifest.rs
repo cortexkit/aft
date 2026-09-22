@@ -586,6 +586,42 @@ mod tests {
         }
     }
 
+    /// Serializes the HELLO manifest with the two volatile parts replaced by
+    /// markers: the crate version (changes every release) and each tool's
+    /// embedded schema/description (regenerated from the plugin tool map).
+    /// Both are checked against their sources before being replaced, so the
+    /// snapshot still pins everything else AFT puts on the wire.
+    fn normalized_manifest_json() -> Value {
+        let mut manifest = serde_json::to_value(build_manifest()).expect("serialize manifest");
+        assert_eq!(manifest["module_version"], json!(env!("CARGO_PKG_VERSION")));
+        manifest["module_version"] = json!("<CARGO_PKG_VERSION>");
+        let tools = manifest["provides"][0]["tools"]
+            .as_array_mut()
+            .expect("tool provider tools");
+        for tool in tools {
+            let name = tool["name"].as_str().expect("tool name").to_string();
+            assert_eq!(tool["schema"], tool_schema(&name), "{name} schema");
+            assert_eq!(
+                tool["description"],
+                json!(tool_description(&name)),
+                "{name} description"
+            );
+            tool["schema"] = json!("<embedded schema>");
+            tool["description"] = json!("<embedded description>");
+        }
+        manifest
+    }
+
+    #[test]
+    fn hello_manifest_wire_shape_matches_snapshot() {
+        let actual = normalized_manifest_json();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/subc_hello_manifest.json"
+        ))
+        .expect("parse manifest snapshot");
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn subc_agent_lanes_classify_new_read_tools() {
         assert_eq!(command_lane("callgraph"), Lane::HeavyInit);
