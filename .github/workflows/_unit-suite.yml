@@ -790,12 +790,31 @@ jobs:
         # Keep the libtest and watcher invocations from the normal gate exactly:
         # libtest avoids per-test process fan-out, while watcher tests share
         # fixtures and must remain single-threaded.
-        run: ./scripts/rust-test-gate.sh
+        #
+        # Tee the output to a file because GitHub has repeatedly failed to serve
+        # this job's log: on trains 155 and 163 a failure here left only the
+        # annotation "Process completed with exit code 101", with `gh run view
+        # --job --log`, `--log-failed` and the raw actions/jobs/<id>/logs API all
+        # returning zero bytes. A Rust panic with no recoverable log names no
+        # test and no assertion, which makes any flake in this job
+        # undiagnosable; the artifact survives independently of the log service.
+        # pipefail keeps tee from masking the gate's exit code.
+        run: |
+          set -o pipefail
+          ./scripts/rust-test-gate.sh 2>&1 | tee "$RUNNER_TEMP/windows-libtest.log"
         shell: bash
         env:
           AFT_TEST_DIAG: "1"
           AFT_GATE_PHASES: lib,watcher
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+      - name: Upload Windows libtest output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-libtest-log
+          path: ${{ runner.temp }}/windows-libtest.log
+          if-no-files-found: warn
 
   unit-windows-cargo:
     name: Cargo integration shard ${{ matrix.shard }}/3 (Windows)
