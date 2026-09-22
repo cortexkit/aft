@@ -32,12 +32,17 @@ Warm-up must also respect the existing admission rules, so it cannot starve itse
 
 ## The budget
 
-The budget is a module-side constant, because only AFT knows what one root costs. Its value is **not yet set**. It will be derived from a measurement, not chosen:
+The budget is a module-side constant, because only AFT knows what one root costs. It differs by how the module was started, because the two cases differ in who is waiting.
 
-- On the live daemon, measure per-root artifact load time for the actual live root set: p50, p95, and the distribution of resident size, since load time tracks artifact size.
-- The budget should cover the p95 root across the live set at the parallelism warm-up actually gets, and never exceed a hard ceiling. A module stuck warming refuses every session, which is worse than today's behaviour, so the ceiling protects against that.
+**What was measured** (2026-09-22, the aft drain-restart at 21:12Z, from the new process's log): the existing lazy path loaded 25 symbol caches between 21:12:39 and 21:13:25 (46 s) and 17 semantic indexes between 21:12:40 and 21:13:19 (39 s), with loads admitted through the two cold-build slots while sessions were already rebinding and working. So warming the live set with today's admission took about **45 s end to end**.
 
-Until the measurement exists, this note proposes the shape, not the number.
+Caveats, so the number is not over-read: the log has one-second resolution and no per-load duration, so this is observed wall time for the whole burst, not an intrinsic per-root cost. It includes queueing behind the two-slot limiter and contention from live traffic. It is an upper-bound shape, good enough to size a budget, not a benchmark.
+
+**Plain restart.** Callers see `module_warming` while the module is not ready. Both subc SDKs retry that code only until the route-open retry deadline (30 s by default), after which the open fails. AFT's plugin transport is built on `@cortexkit/subc-client` (`isRetryableRouteOpenCode` includes `module_warming`), and `aft-bridge`'s error contract also classifies it as transient, so a warm-up window delays tool calls rather than failing them, but only inside that deadline. The measured full warm-up (~45 s) does not fit. Proposed budget: **10 s**, well under the deadline with room for the SDK's retry backoff. Roots not warm by then continue lazily, as today.
+
+**Swap.** The incumbent stays routable until cutover, so nobody sees `module_warming` and the budget does not delay callers. It can cover the full live set. Proposed budget: **90 s**, twice the measured burst, as a ceiling against a warm-up that hangs.
+
+Both are named constants in the module, not daemon config.
 
 ## Failure behaviour
 
@@ -49,7 +54,7 @@ Until the measurement exists, this note proposes the shape, not the number.
 
 ## Open questions
 
-1. **Client behaviour on `module_warming`.** A session whose route.open is refused while the module warms must retry, not fail the tool call. The plugin's subc transport already retries transient attach failures with backoff under a 60 s budget. Whether `module_warming` is classified as transient there has to be verified in `packages/aft-bridge/src/subc-transport.ts` before this ships.
+1. **Which budget applies.** The module must know whether it was started for a swap or a plain restart to pick between the two budgets above. Is that visible to it (HelloAck, the live-roots reply, or the launch environment)? If not, it must assume a plain restart and use the 10 s budget, which is safe in both cases.
 2. **Warm order.** If the daemon can report route count or last activity per root, warm the busiest roots first. Optional.
 
 ## Daemon half (SUBC)
@@ -63,7 +68,11 @@ Daemon obligations, both SUBC's (not yet built):
 1. Store the canonical `project_root` on `RouteBinding` and on the pending reservation.
 2. Add a channel-0 query that reads it back per module, which the incoming module can call while still not ready. HelloAck would freeze a snapshot at registration, too early for a swap: the incumbent keeps taking routes while the candidate warms.
 
-Still to specify: the query's name and reply shape, and how it behaves during a swap (whose route set it reports, and when traffic moves).
+Still to specify: nothing on the query itself. SUBC's half is written in the subconscious repository at `docs/designs/module-readiness-and-swap.md` (master `d5cb856a`), section "The warm set" and slice E:
+
+- Query `supervisor.live_roots { module_id }` returns `LiveRoots { module_id, roots: [{project_root, bound, pending}], unknown_root_bindings, total_bindings }`. `total_bindings` makes "no routes at all" a positive statement rather than an inference from two zeros. The root is `Option<ProjectRootId>` on the binding, so a pre-change binding stays unknown rather than absent.
+- The query describes whichever endpoint is routable when answered: before cutover, the incumbent. The reply is a snapshot; routes the incumbent takes after the query warm lazily after cutover. Re-querying before the flip is allowed; polling is not needed.
+- Slice E (store the root, add the query) is daemon-only and independent of the swap machinery, so it can land first.
 
 ### Bindings with no stored root
 
