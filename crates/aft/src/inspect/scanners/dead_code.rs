@@ -4404,6 +4404,94 @@ mod tests {
         current
     }
 
+    /// Builds a contribution the way the production path does — from the JSON
+    /// facts record — so every `#[serde(default)]` field keeps its default.
+    fn dispatch_contribution(file: &str, exports: &[(&str, &str)]) -> DeadCodeContribution {
+        serde_json::from_value(json!({
+            "file": file,
+            "exports": exports
+                .iter()
+                .map(|(symbol, kind)| json!({"symbol": symbol, "kind": kind, "line": 1}))
+                .collect::<Vec<_>>(),
+        }))
+        .expect("contribution facts")
+    }
+
+    /// One edge per source, all pointing at the same target: only the source
+    /// side of an edge decides whether it is a dispatch root.
+    fn dispatch_edges(sources: &[(&str, &str)]) -> BTreeMap<ExportNode, BTreeSet<ExportNode>> {
+        sources
+            .iter()
+            .map(|(file, symbol)| {
+                (
+                    ((*file).to_string(), (*symbol).to_string()),
+                    BTreeSet::from([("src/target.ts".to_string(), "target".to_string())]),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dispatch_roots_require_a_contribution_and_a_dispatched_name() {
+        // Two non-Go languages, Go, and a language with no dispatched names.
+        let contributions = vec![
+            dispatch_contribution("src/service.ts", &[("render", "method")]),
+            dispatch_contribution("src/worker.py", &[("process", "function")]),
+            dispatch_contribution(
+                "src/server.go",
+                &[
+                    ("Serve", "method"),
+                    ("Handle", "function"),
+                    ("helper", "method"),
+                ],
+            ),
+            dispatch_contribution("src/plain.zig", &[("render", "method")]),
+        ];
+        let dispatched_method_names = MethodNamesByLanguage::from([
+            (
+                "typescript".to_string(),
+                BTreeSet::from(["render".to_string(), "handle".to_string()]),
+            ),
+            ("python".to_string(), BTreeSet::from(["process".to_string()])),
+            (
+                "go".to_string(),
+                BTreeSet::from(["Serve".to_string(), "Handle".to_string()]),
+            ),
+        ]);
+        let edges = dispatch_edges(&[
+            // Non-Go: membership is the language's name set, with no
+            // method-kind gate.
+            ("src/service.ts", "render"),
+            ("src/service.ts", "handle"),
+            ("src/service.ts", "missing"),
+            ("src/worker.py", "process"),
+            // Go: only methods the file itself exports and that are dispatched.
+            ("src/server.go", "Serve"),
+            ("src/server.go", "Handle"),
+            ("src/server.go", "helper"),
+            // The file's language has no dispatched names at all.
+            ("src/plain.zig", "render"),
+            // The extension maps to a language that has the name, but the file
+            // is not a contribution, so it can never be a dispatch root.
+            ("src/absent.ts", "render"),
+            ("src/absent.py", "process"),
+            // Unknown extension.
+            ("src/absent.xyz", "render"),
+        ]);
+
+        let state = reachability_inputs(&contributions, edges, &dispatched_method_names);
+
+        assert_eq!(
+            state.dispatch_roots,
+            BTreeSet::from([
+                ("src/service.ts".to_string(), "render".to_string()),
+                ("src/service.ts".to_string(), "handle".to_string()),
+                ("src/worker.py".to_string(), "process".to_string()),
+                ("src/server.go".to_string(), "Serve".to_string()),
+            ])
+        );
+    }
+
     #[test]
     fn vanished_contribution_drops_its_fragment_without_a_changed_file_entry() {
         // A deleted file's contribution disappears from the set the rollup is
