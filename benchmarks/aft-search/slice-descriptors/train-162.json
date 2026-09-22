@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "opencode-v2-tui-config",
+    "release-notes-rendering-gate",
+    "sentinel-dsym-honesty"
+  ],
+  "note": "CLI setup stops writing a TUI config OpenCode 2 never reads; a release-notes renderer gate plus reflowed notes; the sentinel dSYM rule reports an unreadable artifact as an instrument failure instead of staleness. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
