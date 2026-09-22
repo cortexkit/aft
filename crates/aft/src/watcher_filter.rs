@@ -997,9 +997,17 @@ fn derive_exclusion_plan(
                 let candidate_depth = candidate.relative.components().count();
                 let representative_depth = representative.relative.components().count();
                 let candidate_is_better = match coverage {
-                    WatcherExclusionCoverage::Subtree => candidate_depth
-                        .cmp(&representative_depth)
-                        .then_with(|| representative.exists.cmp(&candidate.exists))
+                    // Shallower covers more only when the shallow path is an
+                    // ancestor of the deeper one. A root `dist` is not an
+                    // ancestor of `packages/plugin/dist`, so preferring depth
+                    // first would hand the slot to an absent sibling that
+                    // covers nothing while an existing copy takes the writes.
+                    // Existence decides first; depth breaks ties among paths
+                    // that are really there, where it does mean coverage.
+                    WatcherExclusionCoverage::Subtree => representative
+                        .exists
+                        .cmp(&candidate.exists)
+                        .then_with(|| candidate_depth.cmp(&representative_depth))
                         .then_with(|| representative.size_signal.cmp(&candidate.size_signal))
                         .then_with(|| candidate.path.cmp(&representative.path))
                         .is_lt(),
@@ -2463,6 +2471,48 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
+    }
+
+    /// A subtree backend must not hand an ecosystem's reserved slot to an
+    /// absent root copy when an existing nested copy is taking the writes.
+    /// Root `dist` is not an ancestor of `packages/plugin/dist`, so excluding
+    /// it covers nothing. This is pinned explicitly because the platform that
+    /// runs subtree coverage is not the platform most of us develop on: the
+    /// defect it guards reached CI green on macOS and failed only on Linux.
+    #[test]
+    fn subtree_representative_prefers_an_existing_copy_over_an_absent_root() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "dist\npackages/plugin/dist\nnode_modules\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("packages/plugin/dist")).unwrap();
+        std::fs::create_dir_all(root.path().join("packages/plugin/node_modules")).unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        assert!(!canonical_root.join("dist").exists());
+
+        let selected = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::Subtree,
+        )
+        .selected;
+        let paths = watcher_exclusion_paths(&selected);
+
+        assert!(
+            paths.contains(&canonical_root.join("packages/plugin/dist")),
+            "the existing nested copy lost its slot to an absent root: {paths:?}"
+        );
+        assert!(
+            !paths
+                .first()
+                .is_some_and(|first| first == &canonical_root.join("dist")),
+            "an absent root sibling took the first slot and covers nothing: {paths:?}"
+        );
     }
 
     #[test]
