@@ -889,6 +889,7 @@ impl HealthDiagnosticRollup {
             "memory": memory_rollup_metrics(None),
             "bash_task_retention": {
                 "eligible_but_unpruned_rows": Value::Null,
+                "last_sweep_skip_reason": Value::Null,
                 "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
             },
             "mutating_lanes": { "scheduler_busy": true },
@@ -1246,13 +1247,19 @@ fn bash_task_retention_metrics(shared_app: &App) -> Value {
         .unwrap_or_default()
         .as_millis();
     let now_ms = i64::try_from(now_ms).unwrap_or(i64::MAX);
-    let eligible_but_unpruned_rows = shared_app.db().and_then(|db| {
-        crate::db::compression_events::terminal_rows_eligible_count_nonblocking(&db, now_ms)
-            .ok()
-            .flatten()
-    });
+    let (eligible_but_unpruned_rows, last_sweep_skip_reason) = match shared_app.db() {
+        Some(db) => (
+            crate::db::compression_events::terminal_rows_eligible_count_nonblocking(&db, now_ms)
+                .ok()
+                .flatten(),
+            crate::db::compression_events::last_retention_sweep_skip_reason(&db)
+                .map(|reason| reason.as_str()),
+        ),
+        None => (None, None),
+    };
     json!({
         "eligible_but_unpruned_rows": eligible_but_unpruned_rows,
+        "last_sweep_skip_reason": last_sweep_skip_reason,
         "steady_state_ceiling": crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS,
     })
 }
@@ -1926,9 +1933,44 @@ mod tests {
         let retention = &report.metrics.expect("health metrics")["bash_task_retention"];
 
         assert_eq!(retention["eligible_but_unpruned_rows"].as_u64(), Some(2));
+        assert!(retention["last_sweep_skip_reason"].is_null());
         assert_eq!(
             retention["steady_state_ceiling"].as_u64(),
             Some(crate::db::compression_events::BASH_TASK_STEADY_STATE_ROWS as u64)
+        );
+    }
+
+    #[test]
+    fn health_check_reports_retention_sweep_lock_budget_skip() {
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let conn = crate::db::open(&storage.path().join("aft.db")).expect("open database");
+        let db = Arc::new(std::sync::Mutex::new(conn));
+        let held = db.lock().expect("hold database mutex");
+        let outcome =
+            crate::db::compression_events::prune_retention_sweep(&db, i64::MAX, Some(&[]))
+                .expect("retention sweep outcome");
+        drop(held);
+        let crate::db::compression_events::RetentionSweepOutcome::Skipped(skip) = outcome else {
+            panic!("contention was not reported as a skipped sweep: {outcome:?}");
+        };
+        assert_eq!(
+            skip.reason,
+            crate::db::compression_events::RetentionSweepSkipReason::OpeningCountLockBudgetExhausted
+        );
+
+        let app = crate::context::App::default_shared();
+        app.set_db(db);
+        let report = test_health_report(
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let retention = &report.metrics.expect("health metrics")["bash_task_retention"];
+
+        assert_eq!(
+            retention["last_sweep_skip_reason"].as_str(),
+            Some("opening_count_lock_budget_exhausted")
         );
     }
 
