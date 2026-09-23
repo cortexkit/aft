@@ -1,0 +1,17 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-332-reap-path-refresh",
+    "sentinel-limiter-window",
+    "train-push-common-git-dir",
+    "readiness-design-and-record"
+  ],
+  "note": "Reaps the login-shell PATH refresh helper so it stops leaving a zombie per aft process; the sentinel limiter rule judges a real 15-minute window; train-push keeps per-repository state in the common git dir; readiness design and measurement records. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
