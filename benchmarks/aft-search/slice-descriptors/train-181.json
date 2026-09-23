@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "windows-test-embedding-sockets"
+  ],
+  "note": "The only file is crates/aft/src/semantic_index.rs, changed in its test module only: the fake embedding servers switch accepted sockets back to blocking mode, because Windows gives an accepted socket the listener's non-blocking mode. No engine, corpus, indexed-content or ranking change."
+}
