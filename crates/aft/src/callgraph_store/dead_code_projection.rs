@@ -300,11 +300,21 @@ fn project_snapshot(
                     changed_files,
                 };
                 ensure_projection_not_cancelled()?;
+                crate::memory::issue330_memory_checkpoint("projection_start");
+                let files = project_files_from_store(&tx, &mut paths, None)?;
+                crate::memory::issue330_memory_checkpoint("projection_files");
+                let exported_symbols = exported_symbols_from_store(&tx, &mut paths, None)?;
+                crate::memory::issue330_memory_checkpoint("projection_exports");
+                let outbound_calls = outbound_calls_from_store(&tx, &mut paths)?;
+                crate::memory::issue330_memory_checkpoint("projection_outbound_calls");
+                let entry_point_symbols =
+                    entry_point_symbols_from_store(&tx, &mut paths, None)?;
+                crate::memory::issue330_memory_checkpoint("projection_entry_point_symbols");
                 (
-                    project_files_from_store(&tx, &mut paths, None)?,
-                    exported_symbols_from_store(&tx, &mut paths, None)?,
-                    outbound_calls_from_store(&tx, &mut paths)?,
-                    entry_point_symbols_from_store(&tx, &mut paths, None)?,
+                    files,
+                    exported_symbols,
+                    outbound_calls,
+                    entry_point_symbols,
                     verdict,
                 )
             }

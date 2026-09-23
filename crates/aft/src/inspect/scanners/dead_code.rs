@@ -376,6 +376,7 @@ fn run_dead_code_scan_with_oxc_started(
         return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
     }
 
+    crate::memory::issue330_memory_checkpoint("scan_contributions_collected");
     let public_api_files = collect_public_api_files(&job.project_root);
     if crate::executor::current_job_cancelled() {
         return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
@@ -733,7 +734,9 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         }
     }
 
+    crate::memory::issue330_memory_checkpoint("rollup_start");
     let parsed = parse_dead_code_contributions(contributions);
+    crate::memory::issue330_memory_checkpoint("rollup_parsed_contributions");
     let mut affected_files = changed_files
         .union(&changed_graph_files)
         .cloned()
@@ -764,8 +767,11 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         previous.map(|state| state.materialized.as_slice()),
         &affected_files,
     ));
+    crate::memory::issue330_memory_checkpoint("rollup_materialized_internal_calls");
     let all_edges = edges_by_source(materialized.as_ref(), false);
+    crate::memory::issue330_memory_checkpoint("rollup_all_edges");
     let production_edges = edges_by_source(materialized.as_ref(), true);
+    crate::memory::issue330_memory_checkpoint("rollup_production_edges");
     let dispatched_method_names =
         collect_dispatched_method_names_by_language(materialized.as_ref());
     let (all, all_incremental) = build_reachability_state(
@@ -775,6 +781,7 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         previous.map(|state| state.all.as_ref()),
         changed_files,
     );
+    crate::memory::issue330_memory_checkpoint("rollup_all_reachability");
     let (production, production_incremental) = build_reachability_state(
         materialized.as_ref(),
         production_edges,
@@ -782,6 +789,7 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         previous.map(|state| state.production.as_ref()),
         changed_files,
     );
+    crate::memory::issue330_memory_checkpoint("rollup_production_reachability");
     let verdict = if all_incremental && production_incremental {
         RollupVerdict {
             kind: RollupKind::Incremental,
@@ -845,6 +853,7 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
         drill_down_limit,
         contributions.len(),
     );
+    crate::memory::issue330_memory_checkpoint("rollup_aggregate_complete");
     (
         aggregate.clone(),
         DeadCodeRollupState {
@@ -1893,7 +1902,28 @@ fn reachability_inputs(
 
     let dispatch_live_source_names_by_file =
         dispatch_live_source_names_by_file(contributions, dispatched_method_names);
-    let dispatch_roots = edges
+    if std::env::var_os("AFT_ISSUE330_MEASURE").is_some() {
+        let (projected_names, materialized_names) = dispatch_live_source_names_by_file
+            .values()
+            .fold((0usize, 0usize), |(projected, owned), entry| match entry {
+                DispatchNamesForFile::Language(names) => (projected + names.len(), owned),
+                DispatchNamesForFile::GoMethods(methods) => {
+                    (projected + methods.len(), owned + methods.len())
+                }
+            });
+        eprintln!(
+            "issue330_dispatch_projection languages={} method_names={} files={} projected_names={} materialized_names={}",
+            dispatched_method_names.len(),
+            dispatched_method_names
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>(),
+            dispatch_live_source_names_by_file.len(),
+            projected_names,
+            materialized_names,
+        );
+    }
+    let dispatch_roots: BTreeSet<_> = edges
         .keys()
         .filter(|source| {
             dispatch_live_source_names_by_file
@@ -1902,7 +1932,15 @@ fn reachability_inputs(
         })
         .cloned()
         .collect();
-
+    if std::env::var_os("AFT_ISSUE330_MEASURE").is_some() {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&dispatch_roots, &mut hasher);
+        eprintln!(
+            "issue330_dispatch_roots count={} digest={:016x}",
+            dispatch_roots.len(),
+            std::hash::Hasher::finish(&hasher)
+        );
+    }
     ReachabilityState {
         edges,
         imported_by_file: imported_exports_by_file(contributions),
@@ -2092,6 +2130,9 @@ fn traverse_reachable_inner(
     frontier: Option<&BTreeSet<ExportNode>>,
 ) -> BTreeSet<ExportNode> {
     let mut queue = seeds.into_iter().collect::<VecDeque<_>>();
+    let mut enqueued = queue.len();
+    let mut peak_queue = queue.len();
+    let mut expanded = 0usize;
     let mut expanded_file_imports = reachable
         .iter()
         .map(|node| node.0.clone())
@@ -2100,6 +2141,8 @@ fn traverse_reachable_inner(
         if frontier.is_some_and(|nodes| !nodes.contains(&node)) || !reachable.insert(node.clone()) {
             continue;
         }
+        expanded += 1;
+        let queue_len_before = queue.len();
         if expanded_file_imports.insert(node.0.clone()) {
             queue.extend(
                 state
@@ -2120,6 +2163,15 @@ fn traverse_reachable_inner(
                 .flatten()
                 .filter(|target| !reachable.contains(*target))
                 .cloned(),
+        );
+        enqueued = enqueued.saturating_add(queue.len().saturating_sub(queue_len_before));
+        peak_queue = peak_queue.max(queue.len());
+    }
+    if std::env::var_os("AFT_ISSUE330_MEASURE").is_some() {
+        eprintln!(
+            "issue330_reachability expanded={expanded} enqueued={enqueued} peak_queue={peak_queue} reachable={} edges_sources={}",
+            reachable.len(),
+            state.edges.len()
         );
     }
     reachable
