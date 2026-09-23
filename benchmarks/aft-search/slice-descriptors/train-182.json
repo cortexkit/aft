@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "windows-test-embedding-sockets",
+    "callgraph-refresh-cold-equivalence",
+    "issue-336-pi-headless-exit",
+    "oc2-transport-dead-stand-in",
+    "watch-ci-oc2-gating"
+  ],
+  "note": "The only ranking-fence file is crates/aft/src/semantic_index.rs, changed in its test module only (Windows accepted sockets switched back to blocking mode). The rest does not touch the fence: callgraph_store refresh/cold-build resolution equivalence, the Pi and OpenCode plugin shutdown and signal handling, the OpenCode 2 harness stand-in, and scripts/watch-ci.sh. The callgraph change can alter stored edges but not search ranking inputs, so rows must stay byte-equal to the reference."
+}
