@@ -56,7 +56,12 @@ export type SentinelSample = {
   plugin_error?: string;
   process?: { pid?: number; phys_footprint_bytes?: number; cpu_percent?: number; bytes_written?: number; image?: string };
   process_error?: string;
-  disk?: { free_bytes?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; artifact_roots?: Record<string, string> };
+  /**
+   * free_bytes is what `df` reports, which excludes purgeable space.
+   * available_bytes is the purgeable-inclusive capacity (see
+   * availableForImportantUsage); available_error says why it is absent.
+   */
+  disk?: { free_bytes?: number; available_bytes?: number; available_error?: string; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; artifact_roots?: Record<string, string> };
   disk_error?: string;
   dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; unreadable?: boolean; error?: string };
   /** Newest-first scheduled workflow runs on the main branch; see detectScheduledCi. */
@@ -68,7 +73,7 @@ export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
-  previous?: { pid?: number; free_bytes?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  previous?: { pid?: number; free_bytes?: number; available_bytes?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
   /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
   ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
 };
@@ -369,14 +374,30 @@ export function detectStorage(sample: SentinelSample, state: SentinelState): Fin
   // there trains the reader to skim the channel that has to work at 25.
   // The delta against the previous sample separates a build in flight from a
   // real leak, which the level alone cannot do.
-  const priorFree = state.previous?.free_bytes;
+  //
+  // `df` free space excludes purgeable space (mostly local Time Machine
+  // snapshots), which macOS releases by itself when the volume runs low. On
+  // 2026-09-22 a df-based reading paged CRITICAL at 18 and 16 GiB minutes
+  // before macOS freed the snapshots (206 and 177 GiB free right after). The
+  // severity is therefore judged on the purgeable-inclusive capacity; df is
+  // kept in the text so a reader sees both. When the purgeable-inclusive probe
+  // failed, df is judged instead and the text says purgeable space is not
+  // counted, so a probe failure never silently drops the rule.
+  const available = sample.disk?.available_bytes;
+  const judged = typeof available === "number" ? available : free;
+  // Compare like with like: a purgeable-inclusive reading against the previous
+  // purgeable-inclusive reading, a df reading against the previous df reading.
+  const priorJudged = typeof available === "number" ? state.previous?.available_bytes : state.previous?.free_bytes;
   const trend =
-    typeof priorFree === "number" && Math.abs(free - priorFree) >= GB / 2
-      ? `, ${free < priorFree ? "falling" : "rising"} ${(Math.abs(free - priorFree) / GB).toFixed(1)} GiB since the last sample`
+    typeof priorJudged === "number" && Math.abs(judged - priorJudged) >= GB / 2
+      ? `, ${judged < priorJudged ? "falling" : "rising"} ${(Math.abs(judged - priorJudged) / GB).toFixed(1)} GiB since the last sample`
       : "";
-  const freeText = `AFT data volume has ${(free / GB).toFixed(1)} GiB free${trend}`;
-  if (free < 25 * GB) out.push(finding("disk.low", "CRITICAL", "disk:aft-data", freeText, "free space reaches 25 GiB"));
-  else if (free < 50 * GB) out.push(finding("disk.low", "WARNING", "disk:aft-data", freeText, "free space reaches 50 GiB"));
+  const gib = (bytes: number) => `${(bytes / GB).toFixed(1)} GiB`;
+  const freeText = typeof available === "number"
+    ? `AFT data volume has ${gib(available)} available including purgeable space (df free: ${gib(free)})${trend}`
+    : `AFT data volume has ${gib(free)} free by df; purgeable space is not counted (${sample.disk?.available_error ?? "purgeable-inclusive probe did not run"})${trend}`;
+  if (judged < 25 * GB) out.push(finding("disk.low", "CRITICAL", "disk:aft-data", freeText, "available space reaches 25 GiB"));
+  else if (judged < 50 * GB) out.push(finding("disk.low", "WARNING", "disk:aft-data", freeText, "available space reaches 50 GiB"));
   for (const [name, size] of Object.entries(sample.disk?.sizes ?? {})) {
     const prior = state.previous?.sizes?.[name];
     if (typeof prior === "number" && size - prior > 5 * GB) {
@@ -794,6 +815,36 @@ function collectScheduledRuns(): ScheduledRun[] {
   }));
 }
 
+/**
+ * Bytes the volume holding `path` can supply for important work, counting
+ * purgeable space that macOS reclaims on demand.
+ *
+ * Source choice: `diskutil info -plist /` reports APFSContainerFree, but that
+ * figure excludes purgeable space just like `df` does (both read about
+ * 206 GiB on a volume where this key reads 270 GiB), so it would not fix the
+ * false alarm. NSURLVolumeAvailableCapacityForImportantUsageKey is the
+ * Foundation figure that includes purgeable space. It is read through
+ * JavaScript for Automation (`osascript -l JavaScript`) rather than
+ * `swift -e`: osascript ships with every macOS install, needs no GUI session
+ * (only Foundation is bridged, no UI), and answers in about 0.2 s, while
+ * `swift -e` needs the developer toolchain and compiles on every call
+ * (about 1.4 s idle, far longer on a loaded machine).
+ */
+function availableForImportantUsage(path: string): number {
+  const script = [
+    'ObjC.import("Foundation");',
+    "const value = Ref();",
+    `const ok = $.NSURL.fileURLWithPath(${JSON.stringify(path)}).getResourceValueForKeyError(value, $.NSURLVolumeAvailableCapacityForImportantUsageKey, null);`,
+    'ok ? String(value[0].js) : "";',
+  ].join(" ");
+  const result = spawnSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", script], { encoding: "utf8", timeout: 10_000 });
+  if (result.status !== 0) throw new Error((result.stderr || `osascript exit ${result.status}`).trim());
+  const bytes = Number(result.stdout.trim());
+  if (!result.stdout.trim() || !Number.isFinite(bytes) || bytes <= 0) {
+    throw new Error(`osascript returned no capacity: ${JSON.stringify(result.stdout.trim())}`);
+  }
+  return bytes;
+}
 function diskFree(path: string): number {
   const result = spawnSync("df", ["-Pk", path], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr.trim());
@@ -902,8 +953,13 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
   } catch (error) { sample.writes_error = String(error); }
   try {
     const artifacts = artifactCensus(AFT);
+    let available_bytes: number | undefined;
+    let available_error: string | undefined;
+    try { available_bytes = availableForImportantUsage(AFT); } catch (error) { available_error = String(error); }
     sample.disk = {
       free_bytes: diskFree(AFT),
+      available_bytes,
+      available_error,
       sizes: Object.fromEntries(["aft.db", "logs", "inspect", "callgraph", "blobs", "views"].map((name) => [name, sizeOf(join(AFT, name))])),
       artifact_sizes: artifacts.sizes,
       artifact_roots: artifacts.roots,
@@ -987,7 +1043,7 @@ export function nextPrevious(sample: SentinelSample, state: SentinelState): Sent
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const executor = executorHealth(sample);
   const previous = state.previous;
-  return { pid: sample.supervisor?.pid, free_bytes: sample.disk?.free_bytes, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  return { pid: sample.supervisor?.pid, free_bytes: sample.disk?.free_bytes, available_bytes: sample.disk?.available_bytes, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {

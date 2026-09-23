@@ -297,6 +297,39 @@ describe("health sentinel pure detectors", () => {
       expect(carried.free_bytes).toBe(7 * 1024 ** 3);
     });
 
+    test("disk severity is judged on purgeable-inclusive capacity, with df shown beside it", () => {
+      const GiB = 1024 ** 3;
+      // The 2026-09-22 false page: df said 18 GiB while macOS could hand back
+      // 206 GiB of purgeable snapshots. That volume is healthy.
+      expect(detectStorage(sample({ disk: { free_bytes: 18 * GiB, available_bytes: 206 * GiB, sizes: {} } }), cleanState())).toEqual([]);
+      // Purgeable-inclusive capacity decides the band, whatever df says.
+      const warn = detectStorage(sample({ disk: { free_bytes: 10 * GiB, available_bytes: 30 * GiB, sizes: {} } }), cleanState());
+      expect(warn[0].severity).toBe("WARNING");
+      expect(warn[0].text).toContain("30.0 GiB available including purgeable space");
+      expect(warn[0].text).toContain("df free: 10.0 GiB");
+      const crit = detectStorage(sample({ disk: { free_bytes: 10 * GiB, available_bytes: 20 * GiB, sizes: {} } }), cleanState());
+      expect(crit[0].severity).toBe("CRITICAL");
+      // The trend compares purgeable-inclusive readings with each other.
+      const falling = detectStorage(
+        sample({ disk: { free_bytes: 10 * GiB, available_bytes: 30 * GiB, sizes: {} } }),
+        { findings: {}, previous: { free_bytes: 10 * GiB, available_bytes: 33 * GiB } } as SentinelState,
+      );
+      expect(falling[0].text).toContain("falling 3.0 GiB");
+      expect(nextPrevious(sample({ disk: { free_bytes: 1, available_bytes: 2, sizes: {} } }), cleanState()).available_bytes).toBe(2);
+    });
+
+    test("a failed purgeable probe falls back to df and says purgeable space is not counted", () => {
+      const GiB = 1024 ** 3;
+      const fallback = detectStorage(
+        sample({ disk: { free_bytes: 20 * GiB, available_error: "Error: osascript exit null", sizes: {} } }),
+        cleanState(),
+      );
+      expect(fallback[0].rule).toBe("disk.low");
+      expect(fallback[0].severity).toBe("CRITICAL");
+      expect(fallback[0].text).toContain("20.0 GiB free by df; purgeable space is not counted");
+      expect(fallback[0].text).toContain("osascript exit null");
+    });
+
     test("executor detector uses legacy maintenance fields when dispatch_liveness is absent", () => {
     const legacy = sample({ health: { metrics: { maintenance_inflight: 2, maintenance_queue_oldest_age_ms: 45_000, running_maintenance: 0 } } });
     const result = detectExecutor(legacy, { findings: {}, previous: { sampled_at_ms: NOW - 1, phantom_inflight: true } } as any);
