@@ -608,3 +608,39 @@ fn rust_value_refs_are_refreshed_with_their_target() {
     );
 }
 
+const RUST_REEXPORT_CRATE: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    ),
+    ("src/lib.rs", "pub mod git;\nmod app;\n"),
+    ("src/git/mod.rs", "mod cli;\npub use cli::{clone, other};\n"),
+    ("src/git/cli.rs", "pub fn other() {}\n"),
+    (
+        "src/app.rs",
+        "pub fn run() {\n    crate::git::clone();\n    crate::git::other();\n}\n",
+    ),
+];
+
+/// `pub use cli::{..}` in `git/mod.rs` names the module it declares with
+/// `mod cli;` (`git/cli.rs`). When `clone` appears there, the call in `app.rs`,
+/// which only reaches it through that re-export, must follow.
+#[test]
+fn rust_pub_use_of_declared_module_is_refreshed() {
+    let cold = assert_refresh_matches_cold(
+        "rust re-export of a declared module gains an item",
+        RUST_REEXPORT_CRATE,
+        &[&[(
+            "src/git/cli.rs",
+            Some("pub fn other() {}\npub fn clone() {}\n"),
+        )]],
+    );
+    assert!(
+        edges_to(&cold, "clone")
+            .iter()
+            .all(|target| target.0 == "src/git/cli.rs"),
+        "{:#?}",
+        edges_to(&cold, "clone")
+    );
+    assert!(!edges_to(&cold, "clone").is_empty(), "{:#?}", cold.edges);
+}

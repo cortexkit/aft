@@ -15368,8 +15368,7 @@ fn reexporters_of(
         let Some(module_path) = module_path else {
             continue;
         };
-        if module_dependencies_for_ref(project_root, &caller_file, &module_path).contains(rel_path)
-        {
+        if module_ref_can_name(project_root, &caller_file, &module_path, rel_path) {
             reexporters.push(ReexportRow {
                 caller_file,
                 full_ref,
@@ -15482,7 +15481,37 @@ fn reexport_consumer_refs(
         "SELECT ref_id, short_name FROM refs
          WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
     )?;
+    // Fully qualified Rust calls (`crate::git::clone()`) reach a barrel without
+    // any import row; when the barrel cannot place the name they are stored
+    // as resolved to the barrel itself.
+    let mut resolved_to = conn.prepare(
+        "SELECT ref_id, caller_file, short_name FROM refs
+         WHERE target_file = ?1 AND kind IN ('call', 'value_ref')",
+    )?;
     for (barrel, names) in &barrels {
+        let resolved = resolved_to
+            .query_map(params![barrel], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (ref_id, caller_file, short_name) in resolved {
+            let wanted = match names {
+                None => true,
+                Some(names) => short_name
+                    .as_deref()
+                    .is_some_and(|name| names.contains(callee_last_segment(name))),
+            };
+            if wanted {
+                selected.push(DependentRefSelection {
+                    ref_id,
+                    caller_file,
+                });
+            }
+        }
         let importers = importers_of
             .query_map(params![barrel], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -15502,9 +15531,7 @@ fn reexport_consumer_refs(
                     let Some(module_path) = module_path else {
                         continue;
                     };
-                    if !module_dependencies_for_ref(project_root, &importer, &module_path)
-                        .contains(barrel)
-                    {
+                    if !module_ref_can_name(project_root, &importer, &module_path, barrel) {
                         continue;
                     }
                     bound.extend(import_names_bound_to(
@@ -15522,9 +15549,10 @@ fn reexport_consumer_refs(
             for (ref_id, short_name) in calls {
                 let wanted = match names {
                     None => true,
-                    Some(names) => short_name
-                        .as_ref()
-                        .is_some_and(|name| names.contains(name) || bound.contains(name)),
+                    Some(names) => short_name.as_deref().is_some_and(|name| {
+                        let name = callee_last_segment(name);
+                        names.contains(name) || bound.contains(name)
+                    }),
                 };
                 if wanted {
                     selected.push(DependentRefSelection {
@@ -15810,6 +15838,15 @@ fn module_ref_target(
         .and_then(|ext| ext.to_str())
         == Some("rs")
     {
+        // `pub use cli::{..}` in a file that declares `mod cli;` names that
+        // module (Rust 2018 paths start from names in scope), wherever the
+        // path candidates below would look.
+        if let Some(target) =
+            rust_declared_module_path_target(project_root, caller_file, module_path, memo, facts)
+                .filter(|target| is_indexed(target))
+        {
+            return Some(target);
+        }
         return rust_module_candidates(project_root, &caller_path, module_path, facts)
             .into_iter()
             .find(|candidate| is_indexed(candidate));
@@ -15818,6 +15855,34 @@ fn module_ref_target(
     let resolved = callgraph::resolve_module_path_with_memo(caller_dir, module_path, memo, facts)?;
     let rel_path = relative_path(project_root, &resolved);
     is_indexed(&rel_path).then_some(rel_path)
+}
+
+/// The file a Rust `use` path reaches by following `mod` declarations from
+/// `caller_file`: its first segment (after an optional `self::`) must be a
+/// module the caller declares, and each further segment that the reached file
+/// declares as a module is followed too. The remaining segments name items.
+fn rust_declared_module_path_target(
+    project_root: &Path,
+    caller_file: &str,
+    module_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
+) -> Option<String> {
+    let path = rust_module_path_without_alias_or_use_list(module_path);
+    let path = path.strip_prefix("self::").unwrap_or(path);
+    let mut segments = path
+        .split("::")
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty());
+    let first = segments.next()?;
+    let mut current = rust_declared_module_target(project_root, caller_file, first, memo, facts)?;
+    for segment in segments {
+        match rust_declared_module_target(project_root, &current, segment, memo, facts) {
+            Some(next) => current = next,
+            None => break,
+        }
+    }
+    Some(current)
 }
 
 fn module_target_from_dependencies(
@@ -15898,17 +15963,42 @@ fn ref_dependency_row_depends_on(
         // to it even when its stored state points elsewhere or nowhere (a value
         // reference only resolves once its target is callable).
         "call" | "value_ref" => true,
-        "import" | "reexport" => row
-            .module_path
-            .as_deref()
-            .map(|module_path| {
-                module_dependencies_for_ref(project_root, &row.caller_file, module_path)
-                    .contains(rel_path)
-            })
-            .unwrap_or(false),
+        "import" | "reexport" => row.module_path.as_deref().is_some_and(|module_path| {
+            module_ref_can_name(project_root, &row.caller_file, module_path, rel_path)
+        }),
         "export_alias" => false,
         _ => false,
     }
+}
+
+/// Whether the import or re-export `module_path` in `caller_file` can name
+/// `rel_path`: one of its dependency paths, or for Rust the module its path
+/// reaches through `mod` declarations (see `rust_declared_module_path_target`).
+fn module_ref_can_name(
+    project_root: &Path,
+    caller_file: &str,
+    module_path: &str,
+    rel_path: &str,
+) -> bool {
+    if module_dependencies_for_ref(project_root, caller_file, module_path).contains(rel_path) {
+        return true;
+    }
+    Path::new(caller_file)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        == Some("rs")
+        && rust_declared_module_path_target(
+            project_root,
+            caller_file,
+            module_path,
+            &callgraph::ModuleResolutionMemo::default(),
+            &FactPaths {
+                root: project_root,
+                facts: &DiskFacts::new(project_root),
+            },
+        )
+        .as_deref()
+            == Some(rel_path)
 }
 
 fn module_dependencies_for_ref(
