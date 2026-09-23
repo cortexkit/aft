@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "worktree-overlay-reconcile",
+    "subfolder-artifact-key-and-info-exclude-fingerprint"
+  ],
+  "note": "search_index.rs changes are outside ranking and query code. The new reconcile_borrowed_snapshot_with_disk runs only for a borrowed snapshot with worktree.ram_overlay on. The artifact key changes only for sessions opened in a subfolder of a checkout, since top-level and worktree keys are byte-identical. The ignore fingerprint changes only how info/exclude is named, not what it contains. The loader gained a coverage check that refuses an artifact written from a different checkout position. The benchmark runs from a repository top level, so the corpus, indexed content and ranking are unchanged."
+}
