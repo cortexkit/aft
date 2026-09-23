@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-331-agent-status-bar",
+    "callgraph-large-refresh-measurement",
+    "drain-terminal-frames"
+  ],
+  "note": "The AFT status bar is rendered as a trailing line of agent tool-result text unless a fleet stamper recently read the project scope; every request AFT stops tracking during a drain (deleted-root reclaim, client Cancel) now gets its terminal frame; plus a measurement write-up under docs/investigations. Response finalization, the subc route loop, their tests and docs only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
