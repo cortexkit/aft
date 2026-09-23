@@ -66,6 +66,12 @@ export type SentinelSample = {
   dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; unreadable?: boolean; error?: string };
   /** Newest-first scheduled workflow runs on the main branch; see detectScheduledCi. */
   ci_runs?: ScheduledRun[];
+  /**
+   * Workflows whose own targeted listing could not be fetched, so their rows in
+   * ci_runs come from the combined listing. The combined listing has served
+   * stale per-workflow rows, so detectScheduledCi refuses a verdict for these.
+   */
+  ci_fallback?: string[];
   ci_error?: string;
 };
 export type FindingLedger = Record<string, { last_alerted_at: number; last_seen_at: number; severity: Severity; rule: string; text: string; cleared_at?: number }>;
@@ -78,7 +84,7 @@ export type SentinelState = {
   plugin_log?: { path?: string; offset?: number; size?: number };
   previous?: { pid?: number; free_bytes?: number; available_bytes?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
   /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
-  ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
+  ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; fallback?: string[]; error?: string };
   /** Consecutive ticks each instrument fingerprint has failed; see gateInstrumentFindings. */
   instrument_failures?: Record<string, number>;
   /** Rolling 15-minute window of limiter events, maintained across ticks by updateLimiterWindow. */
@@ -702,10 +708,13 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
       )];
     }
   const byWorkflow = new Map<string, ScheduledRun[]>();
+  const newestByWorkflow = new Map<string, number>();
   for (const run of sample.ci_runs) {
     const workflow = run.workflow?.trim();
     // A run on another branch or another trigger is a different subject.
     if (!workflow || run.event !== "schedule" || run.branch !== SCHEDULED_BRANCH) continue;
+    const createdMs = Date.parse(run.created_at ?? "") || 0;
+    if (createdMs > (newestByWorkflow.get(workflow) ?? 0)) newestByWorkflow.set(workflow, createdMs);
     const conclusion = String(run.conclusion ?? "");
     // A run still in flight has no conclusion yet, and `cancelled`/`skipped`
     // are not verdicts about the workflow's subject: none of the three extends
@@ -719,6 +728,33 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
     let streak = 0;
     while (streak < newestFirst.length && SCHEDULED_FAILED.has(String(newestFirst[streak].conclusion ?? ""))) streak++;
     if (streak < SCHEDULED_FAILURE_STREAK) continue;
+    // The verdict is per workflow, so its freshness has to be per workflow
+    // too: the combined listing has served a fresh newest row from one
+    // workflow while another workflow's newest runs were missing (the
+    // 2026-09-23 false alarm judged the cost gate on rows whose two newest
+    // successes the listing had never delivered). A workflow whose own newest
+    // row predates the bound may be judged on a stale window, so the rule
+    // says it cannot tell rather than reporting a streak it cannot stand
+    // behind.
+    const workflowNewest = newestByWorkflow.get(workflow) ?? 0;
+    if (workflowNewest > 0 && sample.now_ms - workflowNewest > SCHEDULED_LISTING_MAX_AGE) {
+      const days = ((sample.now_ms - workflowNewest) / 86_400_000).toFixed(1);
+      out.push(instrument(
+        `scheduled-ci:${workflow}`,
+        `the newest scheduled run listed for "${workflow}" is ${days} days old; its listing predates the poll, so no verdict is available for this workflow`,
+      ));
+      continue;
+    }
+    // Rows inherited from the combined listing because the workflow's own
+    // targeted fetch failed are exactly the input that produced the false
+    // alarm; a streak counted from them is not a verdict.
+    if (sample.ci_fallback?.includes(workflow)) {
+      out.push(instrument(
+        `scheduled-ci:${workflow}`,
+        `the targeted run listing for "${workflow}" could not be fetched, and the combined listing has served stale per-workflow rows, so no verdict is available for this workflow`,
+      ));
+      continue;
+    }
     // Every run we were given failed, so the real streak reaches back past the
     // listing; say so rather than reporting the page size as the length.
     const bounded = streak === newestFirst.length;
@@ -888,12 +924,14 @@ export function freshestScheduledListing(
   return best;
 }
 
-function collectScheduledRuns(): ScheduledRun[] {
-  const gh = GH_CANDIDATES.find((path) => existsSync(path)) ?? "gh";
-  const rows = commandJson(gh, [
+function ghBinary(): string {
+  return GH_CANDIDATES.find((path) => existsSync(path)) ?? "gh";
+}
+
+function ghRunList(args: string[]): ScheduledRun[] {
+  const rows = commandJson(ghBinary(), [
     "run", "list",
-    "--branch", SCHEDULED_BRANCH,
-    "--event", "schedule",
+    ...args,
     "--limit", String(CI_RUN_WINDOW),
     "--json", "workflowName,headBranch,event,status,conclusion,createdAt,databaseId",
   ]);
@@ -907,6 +945,52 @@ function collectScheduledRuns(): ScheduledRun[] {
     created_at: typeof row.createdAt === "string" ? row.createdAt : undefined,
     run_id: typeof row.databaseId === "number" ? row.databaseId : undefined,
   }));
+}
+
+function collectScheduledRuns(): ScheduledRun[] {
+  return ghRunList(["--branch", SCHEDULED_BRANCH, "--event", "schedule"]);
+}
+
+/** One workflow's own scheduled runs on the watched branch. */
+function collectWorkflowRuns(workflow: string): ScheduledRun[] {
+  return ghRunList(["--workflow", workflow, "--branch", SCHEDULED_BRANCH, "--event", "schedule"]);
+}
+
+/**
+ * Replace each workflow's rows in the combined listing with that workflow's
+ * own targeted listing.
+ *
+ * The combined listing is judged per workflow but fetched once for all of
+ * them, and GitHub's filtered listing has served rows that are fresh in
+ * aggregate while an individual workflow's newest runs are missing: on
+ * 2026-09-23 the combined listing's newest row came from another workflow
+ * while the cost gate's two newest successes were absent, and the streak rule
+ * reported 17 consecutive failures that a targeted `gh run list --workflow`
+ * query showed had ended the day before. Freshness therefore has to be
+ * established per workflow, so each workflow discovered in the combined
+ * listing gets its own query, with the same refetch-when-stale rule as the
+ * combined listing. A workflow whose targeted fetch fails keeps its combined
+ * rows and is named in `fallback`, so detectScheduledCi can refuse a verdict
+ * for it rather than judge it on the listing shape that produced the false
+ * alarm.
+ */
+export function resolveWorkflowListings(
+  combined: ScheduledRun[],
+  fetchWorkflow: (workflow: string) => ScheduledRun[],
+  nowMs: number,
+): { runs: ScheduledRun[]; fallback: string[] } {
+  const workflows = [...new Set(combined.map((run) => run.workflow?.trim()).filter((name): name is string => Boolean(name)))];
+  const runs: ScheduledRun[] = [];
+  const fallback: string[] = [];
+  for (const workflow of workflows) {
+    try {
+      runs.push(...freshestScheduledListing(() => fetchWorkflow(workflow), nowMs));
+    } catch {
+      fallback.push(workflow);
+      runs.push(...combined.filter((run) => run.workflow?.trim() === workflow));
+    }
+  }
+  return { runs, fallback };
 }
 
 /**
@@ -1065,13 +1149,21 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
   const ciAge = sample.now_ms - Number(state.ci?.checked_at_ms ?? 0);
   if (ciAge < CI_POLL_INTERVAL && (state.ci?.runs || state.ci?.error)) {
     sample.ci_runs = state.ci.runs;
+    sample.ci_fallback = state.ci.fallback;
     sample.ci_error = state.ci.error;
     cursors.ci = state.ci;
   } else {
     try {
-      sample.ci_runs = freshestScheduledListing(collectScheduledRuns, sample.now_ms);
+      // The combined listing discovers which scheduled workflows exist; each
+      // workflow is then judged on its own targeted listing, because the
+      // combined one has served fresh aggregate rows over stale per-workflow
+      // rows.
+      const combined = freshestScheduledListing(collectScheduledRuns, sample.now_ms);
+      const resolved = resolveWorkflowListings(combined, collectWorkflowRuns, sample.now_ms);
+      sample.ci_runs = resolved.runs;
+      sample.ci_fallback = resolved.fallback.length > 0 ? resolved.fallback : undefined;
     } catch (error) { sample.ci_error = String(error); }
-    cursors.ci = { checked_at_ms: sample.now_ms, runs: sample.ci_runs, error: sample.ci_error };
+    cursors.ci = { checked_at_ms: sample.now_ms, runs: sample.ci_runs, fallback: sample.ci_fallback, error: sample.ci_error };
   }
   return { sample, cursors };
 }
