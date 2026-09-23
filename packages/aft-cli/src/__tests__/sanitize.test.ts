@@ -1,8 +1,34 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { sanitizeContent, sanitizeValue } from "../lib/sanitize.js";
+import { redactSecrets, sanitizeContent, sanitizeValue } from "../lib/sanitize.js";
+
+// Cases shared with the Rust log redactor (crates/aft/src/log_redact.rs) so the
+// daemon's log files and `aft doctor --issue` mask secrets identically.
+const sharedRedactionCases = JSON.parse(
+  readFileSync(
+    new URL("../../../../crates/aft/tests/fixtures/log_redaction_cases.json", import.meta.url),
+    "utf8",
+  ),
+) as { masked: Array<{ input: string; expected: string }>; untouched: string[] };
+
+describe("redactSecrets shared fixture", () => {
+  test("masks every shared case exactly as the Rust redactor does", () => {
+    expect(sharedRedactionCases.masked.length).toBeGreaterThan(0);
+    for (const { input, expected } of sharedRedactionCases.masked) {
+      expect(redactSecrets(input)).toBe(expected);
+    }
+  });
+
+  test("leaves every shared untouched case unchanged", () => {
+    expect(sharedRedactionCases.untouched.length).toBeGreaterThan(0);
+    for (const input of sharedRedactionCases.untouched) {
+      expect(redactSecrets(input)).toBe(input);
+    }
+  });
+});
 
 describe("sanitizeContent", () => {
   const originalHome = homedir();

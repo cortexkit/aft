@@ -21,6 +21,31 @@ const SEGMENTED_KEY_WORD = /(?:^|[_.-])key(?:$|[_.-])/i;
 const CAMEL_CASE_KEY_WORD = /[a-z0-9]Key(?:$|[A-Z_.-])/;
 const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[A-Z0-9]{16}\b/g;
+// Credential query parameters inside a URL. The generic key/value passes below
+// cannot see these: they match the URL scheme (`https:`) as the key and swallow
+// the rest of the URL as its value. Kept identical to the Rust log redactor
+// (crates/aft/src/log_redact.rs); both suites read
+// crates/aft/tests/fixtures/log_redaction_cases.json.
+const CREDENTIAL_QUERY_PATTERN =
+  /([?&](?:[a-z0-9_-]*token|api[_-]?key|apikey|[a-z0-9_-]*secret|password|passwd|pwd)=)[^&\s#"'<>]+/gi;
+// `key=` is too generic to mask on its name alone; see looksLikeSecret.
+const KEY_QUERY_PATTERN = /([?&]key=)([^&\s#"'<>]+)/gi;
+
+/**
+ * A `key=` query value counts as a secret when it is long, uses only
+ * token-safe characters, and mixes digits with upper- and lower-case letters
+ * (an API key such as `AIzaSy…`). Words, paths and single-case hex hashes do
+ * not qualify.
+ */
+function looksLikeSecret(value: string): boolean {
+  return (
+    value.length >= 16 &&
+    /^[A-Za-z0-9_\-.~+/=]+$/.test(value) &&
+    /[0-9]/.test(value) &&
+    /[A-Z]/.test(value) &&
+    /[a-z]/.test(value)
+  );
+}
 
 const quotedSensitiveKeyValuePattern = new RegExp(
   String.raw`((['"])(${KEY_NAME})\2[^\S\r\n]*:[^\S\r\n]*)(['"])([^'"\r\n]+)\4`,
@@ -43,7 +68,12 @@ function isSensitiveKeyName(keyName: string): boolean {
   );
 }
 
-function redactSecrets(content: string): string {
+/**
+ * Mask credentials only (tokens, URL userinfo, credential key/values, email
+ * addresses), leaving paths alone. `sanitizeContent` adds the path and
+ * username passes on top.
+ */
+export function redactSecrets(content: string): string {
   let sanitized = content;
 
   sanitized = sanitized.replace(
@@ -51,13 +81,19 @@ function redactSecrets(content: string): string {
     `$1${SECRET_PLACEHOLDER}`,
   );
   sanitized = sanitized.replace(/\bgithub_pat_[A-Za-z0-9_]+\b/g, SECRET_PLACEHOLDER);
-  sanitized = sanitized.replace(/\bgh(?:p|o|s)_[A-Za-z0-9_]{16,}\b/g, SECRET_PLACEHOLDER);
+  sanitized = sanitized.replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}\b/g, SECRET_PLACEHOLDER);
   sanitized = sanitized.replace(
     /\bsk-(?:live-)?[A-Za-z0-9][A-Za-z0-9_-]{7,}\b/g,
     SECRET_PLACEHOLDER,
   );
   sanitized = sanitized.replace(JWT_PATTERN, SECRET_PLACEHOLDER);
   sanitized = sanitized.replace(AWS_ACCESS_KEY_ID_PATTERN, SECRET_PLACEHOLDER);
+  sanitized = sanitized.replace(CREDENTIAL_QUERY_PATTERN, `$1${SECRET_PLACEHOLDER}`);
+  sanitized = sanitized.replace(
+    KEY_QUERY_PATTERN,
+    (match: string, prefix: string, value: string) =>
+      looksLikeSecret(value) ? `${prefix}${SECRET_PLACEHOLDER}` : match,
+  );
   sanitized = sanitized.replace(
     quotedSensitiveKeyValuePattern,
     (match: string, prefix: string, _keyQuote: string, keyName: string, valueQuote: string) =>
