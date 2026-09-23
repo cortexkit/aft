@@ -219,10 +219,21 @@ fi
 # (Lifted from BROCA's train-push, d588cb6c.)
 # Absolute so locks and heartbeats remain addressable after the launch cwd is
 # removed; later diagnostics can also name a path usable from anywhere.
+#
+# Two directories, because a linked worktree has both. `git_dir` is THIS
+# worktree's (.git/worktrees/<name>): in-progress operations (MERGE_HEAD,
+# rebase-merge/) live there and are per-worktree. `git_common_dir` is the
+# repository's own .git, shared by every worktree: anything that is one fact
+# per repository (the train lock, the watch heartbeat, the trigger proof,
+# hooks) must live there, or each fresh worktree re-proves the trigger, two
+# worktrees can push the same train at once, and the repo's pre-push hook is
+# looked for in a directory that never has one.
 git_dir="$(git -C "$REPO" rev-parse --absolute-git-dir 2>/dev/null)"
-train_lock_dir="$git_dir/train-push-locks"
+git_common_dir="$(cd "$REPO" && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P)"
+[ -n "$git_common_dir" ] || git_common_dir="$git_dir"
+train_lock_dir="$git_common_dir/train-push-locks"
 watch_name="${train_name//\//-}"
-watch_heartbeat="$git_dir/train-push-$watch_name.watch"
+watch_heartbeat="$git_common_dir/train-push-$watch_name.watch"
 mkdir -p "$train_lock_dir" 2>/dev/null || true
 train_lock_held="$train_lock_dir/held"
 
@@ -603,7 +614,7 @@ fi
 # here to find out would be the very cost being warned about.
 warn_repo_local_pre_push() {
   local configured
-  local repo_local="$git_dir/hooks/pre-push"
+  local repo_local="$git_common_dir/hooks/pre-push"
   local hook
   local -a candidates
 
@@ -800,8 +811,10 @@ run_trigger_probe() {
     sleep "$probe_sleep"
   done
 
-  git -C "$REPO" push -q "$remote" --delete "$probe_ref" ||
-    printf 'train-push: warning — could not delete %s/%s\n' "$remote" "$probe_ref" >&2
+  local delete_error
+  if ! delete_error="$(git -C "$REPO" push -q "$remote" --delete "$probe_ref" 2>&1)"; then
+    printf 'train-push: warning — could not delete %s/%s: %s\n' "$remote" "$probe_ref" "$delete_error" >&2
+  fi
 
   if [ -z "$rid" ]; then
     refuse "no $tests_workflow_name run started for the probe on $probe_ref — the platform does not run it on train branches, whatever the workflow file says"

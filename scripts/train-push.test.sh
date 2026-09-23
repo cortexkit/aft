@@ -503,6 +503,18 @@ run_train "$dir" probe
 expect_rc 0 "the second train lands too"
 expect_no_out "first train in this repo" "second run skips the probe"
 
+# The proof is one fact per REPOSITORY. A linked worktree has its own git dir
+# (.git/worktrees/<name>), so a marker kept there made every fresh worktree
+# re-prove the trigger: one probe push and one extra CI run per train.
+git -C "$dir/work" worktree add -q -b wt-train "$dir/wt" HEAD
+add_train_commit "$dir/wt" "probe-from-worktree"
+TRAIN_PUSH_TEST_CWD="$dir/wt" run_train "$dir" probe-wt
+expect_rc 0 "a train from a linked worktree lands"
+expect_no_out "first train in this repo" \
+  "a linked worktree reads the repository's trigger proof"
+[ ! -e "$(git -C "$dir/wt" rev-parse --absolute-git-dir)/train-push-proven" ] ||
+  fail "the proof was written into the worktree's own git dir"
+
 # --- warning: a repo-local pre-push hook -----------------------------------
 # Such a hook would re-run the gate on every fix-and-repush and on the branch
 # deletion after a land, so it is reported - but never run, and never a refusal.
