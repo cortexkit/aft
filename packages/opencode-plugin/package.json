@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-opencode",
-  "version": "0.57.1",
+  "version": "0.57.2",
   "type": "module",
   "description": "OpenCode plugin for Agent File Tools (AFT) — tree-sitter and lsp powered code analysis",
   "main": "dist/index.js",
@@ -39,7 +39,7 @@
   },
   "dependencies": {
     "@clack/prompts": "^1.6.0",
-    "@cortexkit/aft-bridge": "0.57.1",
+    "@cortexkit/aft-bridge": "0.57.2",
     "@opencode/client": "2.0.11",
     "@opentui/core": "0.4.3",
     "@opentui/solid": "0.4.3",
@@ -50,12 +50,12 @@
     "zod": "^4.4.3"
   },
   "optionalDependencies": {
-    "@cortexkit/aft-darwin-arm64": "0.57.1",
-    "@cortexkit/aft-darwin-x64": "0.57.1",
-    "@cortexkit/aft-linux-arm64": "0.57.1",
-    "@cortexkit/aft-linux-x64": "0.57.1",
-    "@cortexkit/aft-win32-arm64": "0.57.1",
-    "@cortexkit/aft-win32-x64": "0.57.1"
+    "@cortexkit/aft-darwin-arm64": "0.57.2",
+    "@cortexkit/aft-darwin-x64": "0.57.2",
+    "@cortexkit/aft-linux-arm64": "0.57.2",
+    "@cortexkit/aft-linux-x64": "0.57.2",
+    "@cortexkit/aft-win32-arm64": "0.57.2",
+    "@cortexkit/aft-win32-x64": "0.57.2"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.11",

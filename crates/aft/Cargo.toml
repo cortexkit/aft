@@ -1,6 +1,6 @@
 [package]
 name = "agent-file-tools"
-version = "0.57.1"
+version = "0.57.2"
 edition = "2021"
 description = "Agent File Tools — tree-sitter powered code analysis for AI agents"
 license = "MIT"
@@ -94,7 +94,7 @@ oxc_str = "0.126"
 rustc-hash = "2"
 rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
-aft-tokenizer = { path = "../aft-tokenizer", version = "0.57.1" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.57.2" }
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
