@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-330-dispatch-fanout"
+  ],
+  "note": "Dead-code reachability borrows each language dispatched-name set instead of copying it into every file (issue #330). Inspect scanner only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
