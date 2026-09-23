@@ -322,7 +322,8 @@ impl AppContext {
         // agents get. `None` until the Tier-2 cache is populated at least once
         // (so we never render fabricated zeros) — emitted as JSON null then,
         // and the sidebar hides the section.
-        let status_bar = match self.status_bar_counts() {
+        let status_bar_values = self.status_bar_count_values();
+        let status_bar = match status_bar_values.legacy_projection() {
             Some(counts) => serde_json::json!({
                 "errors": counts.errors,
                 "warnings": counts.warnings,
@@ -334,6 +335,21 @@ impl AppContext {
             }),
             None => serde_json::Value::Null,
         };
+        // Per-category companion to `status_bar`: always an object once a
+        // snapshot exists, with each count either a number or null when its
+        // producer has not supplied a trustworthy value (for example dead-code
+        // while the callgraph store is unavailable). `status_bar` stays null in
+        // that case for consumers that need the full set; renderers use this
+        // field to show what is known instead of claiming startup forever.
+        let status_bar_values = serde_json::json!({
+            "errors": status_bar_values.errors,
+            "warnings": status_bar_values.warnings,
+            "dead_code": status_bar_values.dead_code,
+            "unused_exports": status_bar_values.unused_exports,
+            "duplicates": status_bar_values.duplicates,
+            "todos": status_bar_values.todos,
+            "tier2_stale": status_bar_values.tier2_stale,
+        });
         let memory_root = self
             .canonical_cache_root_opt()
             .or_else(|| config.project_root.clone());
@@ -393,6 +409,7 @@ impl AppContext {
             "search_index": search_index_info,
             "semantic_index": semantic_index_info,
             "status_bar": status_bar,
+            "status_bar_values": status_bar_values,
             "disk": disk_info,
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
@@ -684,5 +701,29 @@ mod tests {
         ctx.update_status_bar_tier2(Some(3), Some(2), Some(1), Some(5), false);
         let response = handle_status(&request(), &ctx);
         assert!(response.data["status_bar"].is_null());
+    }
+
+    // One unavailable producer (dead-code while the callgraph store is out)
+    // keeps `status_bar` null, so renderers need the per-category values to
+    // show what is known instead of reporting startup indefinitely.
+    #[test]
+    fn status_bar_values_report_each_category_independently() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.update_status_bar_tier2(None, Some(2), Some(1), Some(5), false);
+        let response = handle_status(&request(), &ctx);
+
+        assert!(response.data["status_bar"].is_null());
+        assert_eq!(
+            response.data["status_bar_values"],
+            serde_json::json!({
+                "errors": null,
+                "warnings": null,
+                "dead_code": null,
+                "unused_exports": 2,
+                "duplicates": 1,
+                "todos": 5,
+                "tier2_stale": false,
+            })
+        );
     }
 }

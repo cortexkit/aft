@@ -110,6 +110,14 @@ export interface AftStatusSnapshot {
   /** Human health counts. Each unproven category stays absent rather than zero. */
   status_bar?: StatusBar;
   /**
+   * Per-category health values from the same snapshot. The bridge sends
+   * `status_bar` only once every category has a value; this field carries the
+   * categories that do, so a renderer can show them while one producer (for
+   * example dead-code without a callgraph) is unavailable. Absent when the
+   * bridge predates the field or no category has a value yet.
+   */
+  status_bar_values?: StatusBar;
+  /**
    * Human-readable explanation for a synthetic snapshot (e.g.
    * `cache_role === "not_initialized"`). When the plugin returns a placeholder
    * because no bridge has been spawned yet, this message tells the user what
@@ -314,6 +322,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     },
     compression: readCompression(response.compression),
     status_bar: readStatusBar(response.status_bar),
+    status_bar_values: readStatusBar(response.status_bar_values),
     message: readString(response.message, ""),
   };
 }

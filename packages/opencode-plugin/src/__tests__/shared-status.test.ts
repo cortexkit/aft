@@ -110,6 +110,29 @@ describe("coerceAftStatus", () => {
     expect(status.status_bar).toBeUndefined();
   });
 
+  test("reads per-category status_bar_values, dropping null categories", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      status_bar: null,
+      status_bar_values: {
+        errors: 0,
+        warnings: null,
+        dead_code: null,
+        unused_exports: 3,
+        duplicates: 2,
+        todos: 1,
+        tier2_stale: false,
+      },
+    } as unknown as Record<string, unknown>);
+    expect(status.status_bar).toBeUndefined();
+    expect(status.status_bar_values).toEqual({
+      errors: 0,
+      unused_exports: 3,
+      duplicates: 2,
+      todos: 1,
+    });
+  });
+
   test("omits unproven health categories instead of coercing them to zero", () => {
     const status = coerceAftStatus({
       ...baseResponse,

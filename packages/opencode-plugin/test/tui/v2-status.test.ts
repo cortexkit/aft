@@ -58,6 +58,35 @@ describe("V2 TUI status presentation", () => {
     expect(formatAftStatusSegment(status)).toBe("AFT E? W2 | D? U? C? | T?");
   });
 
+  test("claims startup only before a real snapshot has arrived", () => {
+    expect(formatAftStatusSegment(null)).toBe("AFT starting…");
+    const placeholder = snapshot();
+    placeholder.cache_role = "not_initialized";
+    placeholder.status_bar = undefined;
+    expect(formatAftStatusSegment(placeholder)).toBe("AFT starting…");
+  });
+
+  test("shows known categories when one producer is unavailable", () => {
+    // The bridge withholds the complete status_bar while dead-code has no
+    // value (issue #334: callgraph unavailable), but still reports the rest.
+    const status = snapshot();
+    status.status_bar = undefined;
+    status.status_bar_values = {
+      errors: 0,
+      warnings: 1,
+      unused_exports: 4,
+      duplicates: 5,
+      todos: 6,
+    };
+    expect(formatAftStatusSegment(status)).toBe("AFT E0 W1 | D? U4 C5 | T6");
+  });
+
+  test("marks every category pending when a snapshot has no values yet", () => {
+    const status = snapshot();
+    status.status_bar = undefined;
+    expect(formatAftStatusSegment(status)).toBe("AFT E? W? | D? U? C? | T?");
+  });
+
   test("summarizes only the status data needed by the V2 sidebar slot", () => {
     expect(summarizeAftSidebar(snapshot())).toEqual({
       title: "AFT",

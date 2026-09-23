@@ -4,9 +4,16 @@ function count(value: number | undefined): string {
   return value === undefined ? "?" : String(value);
 }
 
+/**
+ * The V2 footer segment. "AFT starting…" is only true before the bridge has
+ * delivered a real snapshot. After that the footer shows every health category
+ * that has a value and `?` for any that does not, because a producer that is
+ * unavailable (for example dead-code when the callgraph store cannot be used)
+ * can leave the complete `status_bar` missing for the whole session.
+ */
 export function formatAftStatusSegment(status: AftStatusSnapshot | null): string {
-  const bar = status?.status_bar;
-  if (!bar) return "AFT starting…";
+  if (!status || status.cache_role === "not_initialized") return "AFT starting…";
+  const bar: StatusBar = status.status_bar ?? status.status_bar_values ?? {};
   const stale = bar.tier2_stale ? "~" : "";
   return (
     `AFT E${count(bar.errors)} W${count(bar.warnings)} | ` +

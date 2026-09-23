@@ -268,7 +268,7 @@ pub struct StatusBarCountValues {
 }
 
 impl StatusBarCountValues {
-    fn legacy_projection(&self) -> Option<StatusBarCounts> {
+    pub(crate) fn legacy_projection(&self) -> Option<StatusBarCounts> {
         let [Some(errors), Some(warnings), Some(dead_code), Some(unused_exports), Some(duplicates), Some(todos)] = [
             self.errors,
             self.warnings,
