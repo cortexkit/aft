@@ -1154,6 +1154,14 @@ fn normalize_text(text: &str, project_root: &Path, cache_dir: &Path) -> String {
         .replace_all(text, "building since <ts> (age_s=<n>)")
         .into_owned();
     let text = text.as_str();
+    // The trailing AFT status bar is appended by response finalization when a
+    // count changes, not by the formatter this test compares. Whether it
+    // appears depends on background Tier-2 timing, so drop it here.
+    let text = regex::Regex::new(r"\n\n\[AFT E[^\n]*\]$")
+        .expect("static regex")
+        .replace(text, "")
+        .into_owned();
+    let text = text.as_str();
     // Base root forms: the raw path plus its canonicalized form (macOS /var ->
     // /private/var, Windows verbatim prefixes, etc.).
     let mut base_roots = vec![
