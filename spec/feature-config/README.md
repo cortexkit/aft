@@ -1,6 +1,6 @@
 # Feature-config branch-point evidence (2026-09-23)
 
-These seven artifacts freeze the repository facts and target contracts before implementation. They are data for implementation and tests, not a claim that the current binary already implements the new policy.
+These artifacts freeze the repository facts and target contracts before implementation. They are data for implementation and tests, not a claim that the current binary already implements the new policy.
 
 | Artifact | Frozen evidence |
 | --- | --- |
@@ -9,7 +9,10 @@ These seven artifacts freeze the repository facts and target contracts before im
 | `loader-inventory.json` | Consumed paths, source-location migration paths, discovery boundaries and selector-to-existing-resolver mapping |
 | `parity-baseline.json` | All pre-change config parity fixture IDs and the measured count |
 | `consumer-responses.json` | Shared target-policy projections for each consumer in off, building, unavailable and partially-ready states |
-| `catalog-v1.json` | Ordered plan tuples, runtime prerequisites and explicit exclusions |
+| `catalog.json` | Ordered plan-v1 tuples, runtime prerequisites and explicit exclusions |
+| `harnesses.json` | Actual accepted CLI selectors and mapping to four registration adapters |
+| `inventory.md` | Human-readable gate-removal and raw-to-resolved carrier inventory |
+| `check-parity-baseline.ts` | Executable pinned-ID/count guard |
 | `migration-policy.json` | One shared new-policy version and exact retired-path/alias mapping |
 
 ## Registration provenance
@@ -20,7 +23,7 @@ The new registration target is exactly the 23 literal `canonical_tools` minus re
 
 ## Configuration and version provenance
 
-`packages/aft-bridge/src/config-tiers.ts` only reads the shared user and selected-project `.cortexkit/aft.jsonc` files. `packages/aft-bridge/src/paths.ts` additionally lists *location-migration sources*; these are not simultaneously loaded tiers. Read the loader inventory's boundary notes before implementing doctor --fix: it must not sweep inactive legacy paths. OpenCode's worktree/root-sentinel selection and Pi/OMP's cwd-origin selection are not identical to ancestor walking. OpenCode V1 and V2 share the resolver label `opencode`; OMP shares `pi`, but the four setup selectors remain distinct adapter identities.
+`packages/aft-bridge/src/config-tiers.ts` only reads the shared user and selected-project `.cortexkit/aft.jsonc` files. `packages/aft-bridge/src/paths.ts` additionally lists *location-migration sources*; these are not simultaneously loaded tiers. Read the loader inventory's boundary notes before implementing doctor --fix: it must not sweep inactive legacy paths. OpenCode's worktree/root-sentinel selection and Pi/OMP's cwd-origin selection are not identical to ancestor walking. OpenCode V1 and V2 share the current CLI selector and Rust resolver label `opencode`; OMP has CLI selector `omp` but maps to Rust `pi`. The current CLI accepts **three** selectors (`opencode`, `pi`, `omp`), not four: the four registration adapter projections are not four selector strings. `harnesses.json` is authoritative for selector mapping; the `accepted_setup_harness_ids` field in `loader-inventory.json` names projections rather than accepted CLI values.
 
 Package versions in `crates/aft/Cargo.toml` and the four npm package manifests are 0.57.2 at this branch point. The shipping new feature minor is therefore 0.58; the following reject minor is 0.59 (patch-insensitive). The already-retired `gh_read.enabled` and `gh_shim.enabled` aliases are explicitly excluded from this *new* release-policy artifact: they retain their prior v0.57.0 rejection schedule. The old `gh_shim.binary_path` remains. The chair ruling at spec lines 258-259 is applied for those aliases.
 
@@ -29,11 +32,11 @@ Package versions in `crates/aft/Cargo.toml` and the four npm package manifests a
 From the repository root, run this **before** snapshot regeneration and after it; it pins the old IDs rather than only checking a self-derived fixture count:
 
 ```sh
-python3 -c 'import json,pathlib,sys; b=json.loads(pathlib.Path("spec/feature-config/parity-baseline.json").read_text()); root=pathlib.Path("crates/aft/tests/fixtures/config_parity"); ids=b["fixture_ids"]; missing=[i for i in ids if not (root/i/"expected.json").is_file()]; actual=[x for x in root.iterdir() if x.is_dir()]; assert len(ids)==b["count"] and len(set(ids))==len(ids), "invalid pinned parity baseline"; assert not missing, f"missing baseline cases: {missing}"; assert len(actual)>=b["count"], "parity coverage regressed: {} < {}".format(len(actual), b["count"]); print(f"parity baseline: {len(ids)} pinned IDs present, {len(actual)} cases total")'
+bun spec/feature-config/check-parity-baseline.ts
 cargo test -p agent-file-tools --test integration config_resolver_matches_typescript_golden_fixtures
 ```
 
-The first command checks each pinned ID's `expected.json` and fails even if other new fixture directories replace a deleted baseline directory. Its predicate can be challenged without touching fixtures: changing one copied in-memory ID to `NONEXISTENT_BASELINE_CASE` must yield a missing-baseline assertion. The Rust test currently has only a floor of 52; subsequent implementation should connect this guard to its own CI test or run the documented two-command gate.
+The first command checks each pinned ID's `expected.json` and fails even if other new fixture directories replace a deleted baseline directory. For an isolated negative control, set `AFT_PARITY_FIXTURES_ROOT` to a temporary copy of the fixture tree with one pinned directory removed; the error names that missing baseline case. The Rust test currently has only a floor of 52; subsequent implementation should connect this guard to its own CI test or run the documented two-command gate.
 
 ## Consumer fixture interpretation
 

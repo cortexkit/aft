@@ -1,0 +1,24 @@
+{
+  "source": [
+    "packages/aft-cli/src/lib/harness-select.ts:5-10",
+    "packages/aft-cli/src/adapters/types.ts:15",
+    "packages/aft-cli/src/adapters/index.ts:1-24",
+    "packages/pi-plugin/src/harness.ts:5-82",
+    "crates/aft/src/harness.rs:7-13,160-188",
+    "packages/opencode-plugin/src/tool-registration.ts:165-198",
+    "packages/pi-plugin/src/tool-registration.ts:244-287"
+  ],
+  "accepted_setup_selectors_today": ["opencode", "pi", "omp"],
+  "registration_adapters": [
+    {"adapter": "opencode-v1", "setup_selector": "opencode", "rust_harness": "opencode", "plugin": "packages/opencode-plugin", "registration": "buildOpenCodeToolMap / buildAftToolDefinitions"},
+    {"adapter": "opencode-v2", "setup_selector": "opencode", "rust_harness": "opencode", "plugin": "packages/opencode-plugin", "registration": "registerAftTools over buildAftToolDefinitions"},
+    {"adapter": "pi", "setup_selector": "pi", "rust_harness": "pi", "plugin": "packages/pi-plugin", "registration": "registerPiToolSurface"},
+    {"adapter": "omp", "setup_selector": "omp", "rust_harness": "pi", "plugin": "packages/pi-plugin", "registration": "registerPiToolSurface; detectPiHarness returns omp for OMP-specific API"}
+  ],
+  "rust_harness_parser_today": {
+    "literal": ["opencode", "pi", "runner"],
+    "parameterized": ["mcp:<nonempty client>", "fed:<32-64 lowercase hex fingerprint>"],
+    "rejected": ["omp", "opencode-v1", "opencode-v2"],
+    "note": "The CLI setup adapter selector is distinct from Rust Harness::from_str. Do not forward omp verbatim to the Rust parser. OpenCode generation is host-detected, not a separate current --harness selector. runner/mcp/fed are Rust harness identities but are not CLI setup adapters."
+  }
+}
