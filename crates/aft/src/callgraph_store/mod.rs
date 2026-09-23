@@ -4558,6 +4558,10 @@ impl CallGraphStore {
         let mut selected_refs_by_caller = BTreeMap::new();
         let mut changed_extracts: HashMap<String, FileExtract> = HashMap::new();
         let mut fresh_metadata = BTreeMap::new();
+        // Surface-changed or deleted files with the exported names whose
+        // resolution changed (None: unknown), and files created by this batch.
+        let mut surface_changes: Vec<(String, Option<BTreeSet<String>>)> = Vec::new();
+        let mut created = BTreeSet::new();
 
         // Watchers cannot be the only source of deletions: a root can be
         // unbound, idle, or restarted while a delete occurs, so that event is
@@ -4571,6 +4575,11 @@ impl CallGraphStore {
             if deleted.insert(rel_path.clone()) && load_file_row(&conn, &rel_path)?.is_some() {
                 surface_changed.insert(rel_path.clone());
                 let started = Instant::now();
+                surface_changes.push((
+                    rel_path.clone(),
+                    ExportSurface::stored(&conn, &rel_path)?
+                        .changed_names(&ExportSurface::default()),
+                ));
                 let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
@@ -4601,6 +4610,11 @@ impl CallGraphStore {
                 if old_row.is_some() && deleted.insert(rel_path.clone()) {
                     surface_changed.insert(rel_path.clone());
                     let started = Instant::now();
+                    surface_changes.push((
+                        rel_path.clone(),
+                        ExportSurface::stored(&conn, &rel_path)?
+                            .changed_names(&ExportSurface::default()),
+                    ));
                     let dependent_refs =
                         ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                     profile.dependency_selection += started.elapsed();
@@ -4641,6 +4655,11 @@ impl CallGraphStore {
                         if deleted.insert(rel_path.clone()) {
                             surface_changed.insert(rel_path.clone());
                             let started = Instant::now();
+                            surface_changes.push((
+                                rel_path.clone(),
+                                ExportSurface::stored(&conn, &rel_path)?
+                                    .changed_names(&ExportSurface::default()),
+                            ));
                             let dependent_refs =
                                 ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                             profile.dependency_selection += started.elapsed();
@@ -4663,9 +4682,21 @@ impl CallGraphStore {
                 .as_ref()
                 .map(|row| row.surface_fingerprint != extract.surface_fingerprint)
                 .unwrap_or(true);
+            if old_row.is_none() {
+                created.insert(rel_path.clone());
+            }
             if surface_is_changed {
                 surface_changed.insert(rel_path.clone());
                 let started = Instant::now();
+                let stored_surface = if old_row.is_some() {
+                    ExportSurface::stored(&conn, &rel_path)?
+                } else {
+                    ExportSurface::default()
+                };
+                surface_changes.push((
+                    rel_path.clone(),
+                    stored_surface.changed_names(&ExportSurface::from_extract(&extract)),
+                ));
                 let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
@@ -4677,6 +4708,36 @@ impl CallGraphStore {
             candidate_own_refresh.insert(rel_path.clone());
             changed_extracts.insert(rel_path, extract);
         }
+
+        // Dependents the stored dependency rows cannot name: importers whose
+        // specifier only now resolves to a created file, and callers that reach
+        // a changed file through re-exporting barrels.
+        let started = Instant::now();
+        let (created_importers, created_reexporters) =
+            importers_of_created_files(&conn, &self.project_root, &created)?;
+        for (file, importers) in &created_importers {
+            for importer in importers {
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    caller_refs_depending_on(&conn, &self.project_root, importer, file)?,
+                );
+            }
+        }
+        for (file, changed_names) in surface_changes {
+            record_dependent_refs(
+                &mut selected_ref_ids,
+                &mut selected_refs_by_caller,
+                reexport_consumer_refs(
+                    &conn,
+                    &self.project_root,
+                    &file,
+                    changed_names,
+                    &created_reexporters,
+                )?,
+            );
+        }
+        profile.dependency_selection += started.elapsed();
 
         let dependency_selected_refs = selected_ref_ids.len();
         let mut touched_callers: BTreeSet<String> =
@@ -4842,6 +4903,10 @@ impl CallGraphStore {
                     continue;
                 };
                 if stored_node_ids_match_extract(&tx, &rel_path, extract)? {
+                    // The rows stay, but the importer's dependency set can
+                    // still have changed: a created file can now satisfy one
+                    // of its imports.
+                    sync_file_dependencies(&tx, extract, true)?;
                     continue;
                 }
 
@@ -12123,23 +12188,7 @@ fn delete_stale_file_extract_rows(tx: &Transaction<'_>, extract: &FileExtract) -
         &node_ids,
     )?;
 
-    let dependencies = extract
-        .raw_refs
-        .iter()
-        .flat_map(|raw| raw.dependencies.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let mut select_dependencies =
-        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
-    let stored_dependencies = select_dependencies
-        .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut delete_dependency =
-        tx.prepare("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
-    for dependency in stored_dependencies {
-        if !dependencies.contains(&dependency) {
-            delete_dependency.execute(params![extract.rel_path, dependency])?;
-        }
-    }
+    sync_file_dependencies(tx, extract, false)?;
 
     let hint_ids = extract
         .dispatch_hints
@@ -12153,6 +12202,41 @@ fn delete_stale_file_extract_rows(tx: &Transaction<'_>, extract: &FileExtract) -
         &extract.rel_path,
         &hint_ids,
     )?;
+    Ok(())
+}
+
+/// Makes the `file_dependencies` rows of `extract.rel_path` equal the union of
+/// its refs' dependency sets. Stale rows are always removed; missing rows are
+/// added only when `insert_missing` is set, since a full row rewrite inserts
+/// them itself.
+fn sync_file_dependencies(
+    tx: &Transaction<'_>,
+    extract: &FileExtract,
+    insert_missing: bool,
+) -> Result<()> {
+    let dependencies = extract
+        .raw_refs
+        .iter()
+        .flat_map(|raw| raw.dependencies.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut select_dependencies =
+        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+    let stored_dependencies = select_dependencies
+        .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let mut delete_dependency =
+        tx.prepare("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
+    for dependency in stored_dependencies.difference(&dependencies) {
+        delete_dependency.execute(params![extract.rel_path, dependency])?;
+    }
+    if insert_missing {
+        let mut insert_dependency = tx.prepare(
+            "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+        )?;
+        for dependency in dependencies.difference(&stored_dependencies) {
+            insert_dependency.execute(params![extract.rel_path, dependency])?;
+        }
+    }
     Ok(())
 }
 
@@ -15057,6 +15141,484 @@ fn ref_ids_depending_on(
     Ok(ids)
 }
 
+/// What one file offers to a resolution walk: each exported name with what it
+/// resolves to inside the file, and the file's re-export statements.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ExportSurface {
+    names: BTreeSet<(String, String)>,
+    reexports: BTreeSet<(Option<String>, Option<String>, bool)>,
+}
+
+impl ExportSurface {
+    fn stored(conn: &Connection, rel_path: &str) -> Result<Self> {
+        let mut surface = Self::default();
+        let mut nodes = conn.prepare(
+            "SELECT name, scoped_name, kind, exported, is_default_export
+             FROM nodes WHERE file_path = ?1",
+        )?;
+        let rows = nodes.query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?;
+        for row in rows {
+            let (name, scoped_name, kind, exported, is_default_export) = row?;
+            surface.note_node(&name, &scoped_name, &kind, exported, is_default_export);
+        }
+        let mut refs = conn.prepare(
+            "SELECT kind, module_path, full_ref, wildcard, local_name, requested_name
+             FROM refs WHERE caller_file = ?1 AND kind IN ('reexport', 'export_alias')",
+        )?;
+        let rows = refs.query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (kind, module_path, full_ref, wildcard, local_name, requested_name) = row?;
+            surface.note_ref(
+                &kind,
+                module_path,
+                full_ref,
+                wildcard,
+                local_name,
+                requested_name,
+            );
+        }
+        Ok(surface)
+    }
+
+    fn from_extract(extract: &FileExtract) -> Self {
+        let mut surface = Self::default();
+        for node in &extract.nodes {
+            surface.note_node(
+                &node.name,
+                &node.scoped_name,
+                &node.kind,
+                node.exported,
+                node.is_default_export,
+            );
+        }
+        for raw in &extract.raw_refs {
+            surface.note_ref(
+                &raw.kind,
+                raw.module_path.clone(),
+                raw.full_ref.clone(),
+                raw.wildcard,
+                raw.local_name.clone(),
+                raw.requested_name.clone(),
+            );
+        }
+        surface
+    }
+
+    fn note_node(
+        &mut self,
+        name: &str,
+        scoped_name: &str,
+        kind: &str,
+        exported: bool,
+        is_default_export: bool,
+    ) {
+        if exported {
+            let value = format!("node\t{scoped_name}\t{kind}");
+            self.names.insert((name.to_string(), value.clone()));
+            self.names.insert((scoped_name.to_string(), value));
+        }
+        if is_default_export {
+            self.names.insert((
+                "default".to_string(),
+                format!("default\t{scoped_name}\t{kind}"),
+            ));
+        }
+    }
+
+    fn note_ref(
+        &mut self,
+        kind: &str,
+        module_path: Option<String>,
+        full_ref: Option<String>,
+        wildcard: bool,
+        local_name: Option<String>,
+        requested_name: Option<String>,
+    ) {
+        match kind {
+            "export_alias" => {
+                if let (Some(exported), Some(source)) = (local_name, requested_name) {
+                    self.names.insert((exported, format!("alias\t{source}")));
+                }
+            }
+            "reexport" => {
+                self.reexports.insert((module_path, full_ref, wildcard));
+            }
+            _ => {}
+        }
+    }
+
+    /// Names whose resolution through this file differs between `self` and
+    /// `next`, or None when the file's own re-exports changed and the set of
+    /// names it passes on is therefore unknown.
+    fn changed_names(&self, next: &Self) -> Option<BTreeSet<String>> {
+        if self.reexports != next.reexports {
+            return None;
+        }
+        Some(
+            self.names
+                .symmetric_difference(&next.names)
+                .map(|(name, _)| name.clone())
+                .collect(),
+        )
+    }
+}
+
+/// A `reexport` row of some barrel file.
+#[derive(Debug, Clone)]
+struct ReexportRow {
+    caller_file: String,
+    full_ref: Option<String>,
+    wildcard: bool,
+}
+
+/// Barrel files with a re-export whose module can name `rel_path`.
+fn reexporters_of(
+    conn: &Connection,
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<Vec<ReexportRow>> {
+    let mut statement = conn.prepare(
+        "SELECT caller_file, module_path, full_ref, wildcard FROM refs
+         WHERE kind = 'reexport'
+           AND caller_file IN (SELECT file_path FROM file_dependencies WHERE dep_file = ?1)
+         ORDER BY caller_file, byte_start, ref_id",
+    )?;
+    let rows = statement.query_map(params![rel_path], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)? != 0,
+        ))
+    })?;
+    let mut reexporters = Vec::new();
+    for row in rows {
+        let (caller_file, module_path, full_ref, wildcard) = row?;
+        let Some(module_path) = module_path else {
+            continue;
+        };
+        if module_dependencies_for_ref(project_root, &caller_file, &module_path).contains(rel_path)
+        {
+            reexporters.push(ReexportRow {
+                caller_file,
+                full_ref,
+                wildcard,
+            });
+        }
+    }
+    Ok(reexporters)
+}
+
+/// The names a barrel passes on for `names` arriving through one of its
+/// re-exports (None: every name).
+fn names_through_reexport(
+    reexport: &ReexportRow,
+    names: Option<&BTreeSet<String>>,
+) -> Option<BTreeSet<String>> {
+    if reexport.wildcard {
+        // `export *` never forwards the default export.
+        return names.map(|names| {
+            names
+                .iter()
+                .filter(|name| name.as_str() != "default")
+                .cloned()
+                .collect()
+        });
+    }
+    let named = reexport
+        .full_ref
+        .as_deref()
+        .map(parse_reexport_names)
+        .unwrap_or_default();
+    Some(
+        named
+            .into_iter()
+            .filter(|(_, source)| names.is_none_or(|names| names.contains(source)))
+            .map(|(local, _)| local)
+            .collect(),
+    )
+}
+
+/// Refs that can resolve through `rel_path` without importing it: calls in
+/// files that import a barrel re-exporting `rel_path`, directly or through
+/// other barrels. Only refs named after a changed name (or bound to one by an
+/// aliased or default import) are selected; `changed` None selects every call
+/// in those importers. Direct importers are `ref_ids_depending_on`'s job.
+fn reexport_consumer_refs(
+    conn: &Connection,
+    project_root: &Path,
+    rel_path: &str,
+    changed: Option<BTreeSet<String>>,
+    created_reexporters: &BTreeMap<String, Vec<ReexportRow>>,
+) -> Result<Vec<DependentRefSelection>> {
+    if changed.as_ref().is_some_and(BTreeSet::is_empty) {
+        return Ok(Vec::new());
+    }
+    // Barrel -> names reaching it (None: all). Sets only grow and None absorbs,
+    // so the walk ends even on re-export cycles.
+    let mut barrels: BTreeMap<String, Option<BTreeSet<String>>> = BTreeMap::new();
+    let mut queue = VecDeque::from([(rel_path.to_string(), changed)]);
+    while let Some((file, names)) = queue.pop_front() {
+        let mut reexporters = reexporters_of(conn, project_root, &file)?;
+        if let Some(created) = created_reexporters.get(&file) {
+            reexporters.extend(created.iter().cloned());
+        }
+        for reexport in reexporters {
+            let forwarded = names_through_reexport(&reexport, names.as_ref());
+            if forwarded.as_ref().is_some_and(BTreeSet::is_empty)
+                || reexport.caller_file == rel_path
+            {
+                continue;
+            }
+            let grown = match barrels.get_mut(&reexport.caller_file) {
+                None => {
+                    barrels.insert(reexport.caller_file.clone(), forwarded.clone());
+                    true
+                }
+                Some(None) => false,
+                Some(existing @ Some(_)) => match forwarded.as_ref() {
+                    None => {
+                        *existing = None;
+                        true
+                    }
+                    Some(forwarded) => {
+                        let known = existing.as_mut().expect("matched Some");
+                        let before = known.len();
+                        known.extend(forwarded.iter().cloned());
+                        known.len() != before
+                    }
+                },
+            };
+            if grown {
+                let reached = barrels
+                    .get(&reexport.caller_file)
+                    .cloned()
+                    .expect("inserted above");
+                queue.push_back((reexport.caller_file, reached));
+            }
+        }
+    }
+
+    let mut selected = Vec::new();
+    let mut importers_of = conn.prepare(
+        "SELECT DISTINCT file_path FROM file_dependencies WHERE dep_file = ?1 ORDER BY file_path",
+    )?;
+    let mut imports_of = conn.prepare(
+        "SELECT module_path, local_name, requested_name FROM refs
+         WHERE caller_file = ?1 AND kind = 'import'",
+    )?;
+    let mut calls_of = conn.prepare(
+        "SELECT ref_id, short_name FROM refs
+         WHERE caller_file = ?1 AND kind IN ('call', 'value_ref')",
+    )?;
+    for (barrel, names) in &barrels {
+        let importers = importers_of
+            .query_map(params![barrel], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for importer in importers {
+            let mut bound = BTreeSet::new();
+            if let Some(names) = names {
+                let imports = imports_of
+                    .query_map(params![importer], |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                for (module_path, local_names, requested_names) in imports {
+                    let Some(module_path) = module_path else {
+                        continue;
+                    };
+                    if !module_dependencies_for_ref(project_root, &importer, &module_path)
+                        .contains(barrel)
+                    {
+                        continue;
+                    }
+                    bound.extend(import_names_bound_to(
+                        local_names.as_deref(),
+                        requested_names.as_deref(),
+                        names,
+                    ));
+                }
+            }
+            let calls = calls_of
+                .query_map(params![importer], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (ref_id, short_name) in calls {
+                let wanted = match names {
+                    None => true,
+                    Some(names) => short_name
+                        .as_ref()
+                        .is_some_and(|name| names.contains(name) || bound.contains(name)),
+                };
+                if wanted {
+                    selected.push(DependentRefSelection {
+                        ref_id,
+                        caller_file: importer.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Local names an import row binds to any of `names`. A row stores its local
+/// names as `[default?, namespace?, named...]` and its requested names as
+/// `[named...]`, so the named entries line up from the end; the leading
+/// default/namespace bindings count as bound to `default`.
+fn import_names_bound_to(
+    local_names: Option<&str>,
+    requested_names: Option<&str>,
+    names: &BTreeSet<String>,
+) -> Vec<String> {
+    let locals = local_names
+        .map(|value| value.split(',').collect::<Vec<_>>())
+        .unwrap_or_default();
+    let requested = requested_names
+        .map(|value| value.split(',').collect::<Vec<_>>())
+        .unwrap_or_default();
+    let offset = locals.len().saturating_sub(requested.len());
+    let mut bound = Vec::new();
+    if names.contains("default") {
+        bound.extend(locals[..offset].iter().map(|name| name.to_string()));
+    }
+    for (index, requested) in requested.iter().enumerate() {
+        if names.contains(*requested) {
+            if let Some(local) = locals.get(offset + index) {
+                bound.push(local.to_string());
+            }
+        }
+    }
+    bound
+}
+
+/// Import and re-export rows whose module can now name one of `created`.
+/// Before a file exists a bare or path-alias specifier (`@/late`, a workspace
+/// package) and a `.js` specifier for a `.ts` file resolve to nothing, so the
+/// importer's dependency set cannot name the file and `ref_ids_depending_on`
+/// does not find it. Returns the importing files per created file and the
+/// re-export rows among them.
+fn importers_of_created_files(
+    conn: &Connection,
+    project_root: &Path,
+    created: &BTreeSet<String>,
+) -> Result<(
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, Vec<ReexportRow>>,
+)> {
+    let mut importers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut reexporters: BTreeMap<String, Vec<ReexportRow>> = BTreeMap::new();
+    if created.is_empty() {
+        return Ok((importers, reexporters));
+    }
+    let memo = callgraph::ModuleResolutionMemo::default();
+    let disk = DiskFacts::new(project_root);
+    let facts = FactPaths {
+        root: project_root,
+        facts: &disk,
+    };
+    let mut statement = conn.prepare(
+        "SELECT caller_file, kind, module_path, full_ref, wildcard FROM refs
+         WHERE kind IN ('import', 'reexport') AND module_path IS NOT NULL
+         ORDER BY caller_file, byte_start, ref_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, i64>(4)? != 0,
+        ))
+    })?;
+    for row in rows {
+        let (caller_file, kind, module_path, full_ref, wildcard) = row?;
+        if created.contains(&caller_file) {
+            continue;
+        }
+        let dependencies = module_dependencies_with_memo(
+            project_root,
+            &project_root.join(&caller_file),
+            &module_path,
+            &memo,
+            &facts,
+        );
+        for file in dependencies.intersection(created) {
+            importers
+                .entry(file.clone())
+                .or_default()
+                .insert(caller_file.clone());
+            if kind == "reexport" {
+                reexporters
+                    .entry(file.clone())
+                    .or_default()
+                    .push(ReexportRow {
+                        caller_file: caller_file.clone(),
+                        full_ref: full_ref.clone(),
+                        wildcard,
+                    });
+            }
+        }
+    }
+    Ok((importers, reexporters))
+}
+
+/// The refs of `caller_file` that depend on `rel_path`, judged as if the
+/// caller's stored dependency set already named it.
+fn caller_refs_depending_on(
+    conn: &Connection,
+    project_root: &Path,
+    caller_file: &str,
+    rel_path: &str,
+) -> Result<Vec<DependentRefSelection>> {
+    let mut statement = conn.prepare(
+        "SELECT ref_id, kind, caller_file, module_path, target_file FROM refs
+         WHERE caller_file = ?1 ORDER BY ref_id",
+    )?;
+    let rows = statement.query_map(params![caller_file], |row| {
+        Ok(RefDependencyRow {
+            ref_id: row.get(0)?,
+            kind: row.get(1)?,
+            caller_file: row.get(2)?,
+            module_path: row.get(3)?,
+            target_file: row.get(4)?,
+        })
+    })?;
+    let mut selected = Vec::new();
+    for row in rows {
+        let row = row?;
+        if ref_dependency_row_depends_on(project_root, &row, rel_path) {
+            selected.push(DependentRefSelection {
+                ref_id: row.ref_id,
+                caller_file: row.caller_file,
+            });
+        }
+    }
+    Ok(selected)
+}
+
 fn record_dependent_refs(
     selected_ref_ids: &mut BTreeSet<String>,
     selected_refs_by_caller: &mut BTreeMap<String, BTreeSet<String>>,
@@ -15326,14 +15888,27 @@ fn module_dependencies(
     module_path: &str,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
-    let mut deps = rust_module_dependencies(project_root, abs_path, module_path, facts);
-    let caller_dir = abs_path.parent().unwrap_or(project_root);
-    if let Some(resolved) = callgraph::resolve_module_path_with_memo(
-        caller_dir,
+    module_dependencies_with_memo(
+        project_root,
+        abs_path,
         module_path,
         &callgraph::ModuleResolutionMemo::default(),
         facts,
-    ) {
+    )
+}
+
+fn module_dependencies_with_memo(
+    project_root: &Path,
+    abs_path: &Path,
+    module_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
+) -> BTreeSet<String> {
+    let mut deps = rust_module_dependencies(project_root, abs_path, module_path, facts);
+    let caller_dir = abs_path.parent().unwrap_or(project_root);
+    if let Some(resolved) =
+        callgraph::resolve_module_path_with_memo(caller_dir, module_path, memo, facts)
+    {
         deps.insert(relative_path(project_root, &resolved));
     }
     if module_path.starts_with('.') {

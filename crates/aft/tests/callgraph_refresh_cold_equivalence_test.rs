@@ -424,6 +424,94 @@ fn export_alias_rows_are_deterministic() {
     );
 }
 
+/// `main.ts` imports `foo` through a barrel that re-exports `impl.ts`. When
+/// `impl.ts` starts exporting `foo`, the call must move to it even though
+/// `main.ts` never imports `impl.ts` directly.
+#[test]
+fn transitive_reexport_consumers_are_refreshed() {
+    let cold = assert_refresh_matches_cold(
+        "export added behind a barrel",
+        &[
+            (
+                "main.ts",
+                "import { foo } from \"./barrel\";\nexport function main() { foo(); }\n",
+            ),
+            ("barrel.ts", "export * from \"./mid\";\n"),
+            (
+                "mid.ts",
+                "export { foo as foo } from \"./impl\";\nexport * from \"./impl\";\n",
+            ),
+            ("impl.ts", "export function bar() {}\n"),
+        ],
+        &[&[(
+            "impl.ts",
+            Some("export function bar() {}\nexport function foo() {}\n"),
+        )]],
+    );
+    assert!(
+        edges_to(&cold, "foo")
+            .iter()
+            .all(|target| target.0 == "impl.ts"),
+        "{:#?}",
+        edges_to(&cold, "foo")
+    );
+}
+
+/// The reverse: the export disappears behind the barrel.
+#[test]
+fn transitive_reexport_removal_is_refreshed() {
+    assert_refresh_matches_cold(
+        "export removed behind a barrel",
+        &[
+            (
+                "main.ts",
+                "import { foo } from \"./barrel\";\nexport function main() { foo(); }\n",
+            ),
+            ("barrel.ts", "export * from \"./impl\";\n"),
+            ("impl.ts", "export function foo() {}\n"),
+            ("other.ts", "export function foo() {}\n"),
+        ],
+        &[&[("impl.ts", Some("export function bar() {}\n"))]],
+    );
+}
+
+/// `@/late` does not resolve until `src/late.ts` exists, so the importer's
+/// dependency set could not name it. Creating the file must still re-resolve
+/// the importer.
+#[test]
+fn created_file_satisfies_path_alias_import() {
+    let cold = assert_refresh_matches_cold(
+        "path alias target created",
+        &[
+            (
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@/*\":[\"src/*\"]}}}\n",
+            ),
+            (
+                "src/main.ts",
+                "import { late } from \"@/late\";\nexport function main() { late(); }\n",
+            ),
+            ("src/other.ts", "export function other() {}\n"),
+        ],
+        &[&[("src/late.ts", Some("export function late() {}\n"))]],
+    );
+    assert_eq!(edges_to(&cold, "late").len(), 1);
+}
+
+/// The same for a TypeScript ESM specifier that names the emitted `.js` file.
+#[test]
+fn created_file_satisfies_js_extension_import() {
+    let cold = assert_refresh_matches_cold(
+        "ts file created for a .js specifier",
+        &[(
+            "main.ts",
+            "import { late } from \"./late.js\";\nexport function main() { late(); }\n",
+        )],
+        &[&[("late.ts", Some("export function late() {}\n"))]],
+    );
+    assert_eq!(edges_to(&cold, "late").len(), 1);
+}
+
 /// A method-dispatch edge records the target method's node id. Moving the
 /// method inside its file changes that id, and callers in untouched files must
 /// follow it.
