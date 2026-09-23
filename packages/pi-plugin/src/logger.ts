@@ -99,6 +99,21 @@ export function getLogFilePath(): string {
 }
 
 /**
+ * Write out buffered lines and wait until the file sink has persisted them.
+ * Lines are normally flushed by an unref'd timer, which never fires once a
+ * headless host starts exiting, so shutdown paths call this to keep the last
+ * lines of a run (the shutdown itself included) in the log.
+ */
+export async function flushLogs(): Promise<void> {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  flush();
+  await fileSink.drain();
+}
+
+/**
  * Adapter that exposes this logger as a {@link import("@cortexkit/aft-bridge").Logger}
  * for the shared bridge package.
  */

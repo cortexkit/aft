@@ -66,7 +66,7 @@ import {
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
-import { bridgeLogger, error, log, warn } from "./logger.js";
+import { bridgeLogger, error, flushLogs, log, warn } from "./logger.js";
 import {
   abortInFlightAutoInstalls,
   pushLspPathsAfterAutoInstall,
@@ -285,6 +285,29 @@ function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string 
   return typeof cwd === "string" && cwd.length > 0 ? cwd : fallback;
 }
 
+/** Longest the eager warmup waits for the ONNX Runtime before spawning without it. */
+const ONNX_WARMUP_WAIT_CAP_MS = 60_000;
+
+/**
+ * Wait for `promise`, but give up after `capMs`. The cap timer is cleared as
+ * soon as the promise settles and is unref'd while pending: it only bounds the
+ * wait and must never be the thing that keeps the host process alive. A plain
+ * `setTimeout` race here held every headless `pi -p` run open for the full
+ * minute after it had already answered and shut the bridge pool down.
+ */
+async function waitWithCap<T>(promise: Promise<T>, capMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const cap = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), capMs);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  try {
+    return await Promise.race([promise, cap]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // IMPORTANT: NOT exported as a named export — only via the __test__
 // namespace at the bottom. Pi's extension loader is different from
 // OpenCode's, but OpenCode's plugin loader walks every top-level
@@ -454,6 +477,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     storage_dir: storageDir,
   });
   let lspInstallCompletion: Promise<string[] | null> | null = null;
+  // Set once the host's session_shutdown (or a process signal) begins tearing
+  // the pool down. Startup work that is still pending at that point must not
+  // call into the pool afterwards: the pool revives on demand, and a bridge
+  // spawned after shutdown has no owner left to stop it, so a headless
+  // `pi -p` run would never exit.
+  let hostShutdownStarted = false;
   // _ort_dylib_dir is patched in asynchronously below once ensureOnnxRuntime
   // settles. Bridges spawned before that resolution don't get ORT and
   // semantic search returns "still building" until they restart.
@@ -781,10 +810,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       // the warmup permanently; the bridge still spawns without ORT after
       // the cap and semantic just fails honestly.
       if (onnxRuntimePromise) {
-        await Promise.race([
-          onnxRuntimePromise,
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 60_000)),
-        ]);
+        await waitWithCap(onnxRuntimePromise, ONNX_WARMUP_WAIT_CAP_MS);
+      }
+      if (hostShutdownStarted) {
+        log("Eager configure skipped: the host shut the session down before warmup ran.");
+        return;
       }
       const bridge = pool.getBridge(cwd);
       // No session_id: runs before any user session exists; configure
@@ -939,16 +969,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // shutdown when Pi's host Node process is killed directly (terminal close,
   // Ctrl+C, OS shutdown) rather than through the session_shutdown lifecycle.
   const unregisterShutdownCleanup = registerShutdownCleanup(async () => {
+    hostShutdownStarted = true;
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await pool.shutdown();
     } catch (err) {
       warn(`Error during process shutdown: ${err instanceof Error ? err.message : String(err)}`);
     }
+    await flushLogs();
   });
 
   // Clean up bridges on session shutdown.
   pi.on("session_shutdown", async () => {
+    hostShutdownStarted = true;
     try {
       await Promise.allSettled([abortInFlightAutoInstalls(), abortInFlightGithubInstalls()]);
       await pool.shutdown();
@@ -957,6 +990,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       warn(`Error during bridge shutdown: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       unregisterShutdownCleanup();
+      await flushLogs();
     }
   });
 
