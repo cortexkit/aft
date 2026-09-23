@@ -45,9 +45,14 @@ interface FakeDaemon {
 
 /**
  * Start a fake subc daemon. `now()` is the virtual clock the reload window is
- * measured against; `reply` builds the body answered to every route request.
+ * measured against; `reply` builds the body answered to every route request;
+ * `reloadWindowMs` is how long route.open keeps being refused.
  */
-async function startFakeDaemon(now: () => number, reply: () => unknown): Promise<FakeDaemon> {
+async function startFakeDaemon(
+  now: () => number,
+  reply: () => unknown,
+  reloadWindowMs: number = RELOAD_WINDOW_MS,
+): Promise<FakeDaemon> {
   const key = new Uint8Array(32).fill(7);
   const daemonId = new Uint8Array(16).fill(9);
   const sockets = new Set<Socket>();
@@ -141,7 +146,7 @@ async function startFakeDaemon(now: () => number, reply: () => unknown): Promise
             });
             continue;
           }
-          if (now() < RELOAD_WINDOW_MS) {
+          if (now() < reloadWindowMs) {
             state.refusals += 1;
             send(FrameType.Error, 0, 0, header.corr, {
               code: "module_reloading",
@@ -242,7 +247,7 @@ describe("route.open across a 5s module reload window (real SubcClient, fake dae
 
   test("an AFT tool call through the bridge waits out the reload window and succeeds", async () => {
     // The bridge opens routes with the client's single-shot routeOpen and runs
-    // its own reload-window loop (15 s cap), so this holds independently of the
+    // its own reload-window loop (bounded by the call's deadline), so this holds independently of the
     // managed-call retry policy pinned above.
     let virtualNowMs = 0;
     const daemon = await startFakeDaemon(
@@ -271,5 +276,87 @@ describe("route.open across a 5s module reload window (real SubcClient, fake dae
     expect(daemon.refusals).toBeGreaterThanOrEqual(6);
     expect(daemon.accepted).toBe(1);
     expect(daemon.requests).toBe(1);
+  });
+
+  // A real restart drains the old module for up to 30 s and then starts the new
+  // one, so the refusal window can outlast 30 s.
+  const LONG_RELOAD_WINDOW_MS = 35_000;
+
+  async function longReloadPool(): Promise<{
+    pool: SubcTransportPool;
+    daemon: FakeDaemon;
+    clock: { now: number };
+  }> {
+    const clock = { now: 0 };
+    const daemon = await startFakeDaemon(
+      () => clock.now,
+      () => ({
+        content: [{ type: "text", text: "live" }],
+        isError: false,
+        structuredContent: { id: "r", success: true, text: "live" },
+      }),
+      LONG_RELOAD_WINDOW_MS,
+    );
+    cleanups.push(() => daemon.close());
+    const pool = new SubcTransportPool({
+      connectionFile: daemon.connectionFile,
+      harness: "opencode",
+      consumerIdentity: null,
+      handshakeTimeoutMs: 2_000,
+      routeRetrySleep: async (ms) => {
+        clock.now += ms;
+      },
+    });
+    cleanups.push(() => pool.shutdown());
+    return { pool, daemon, clock };
+  }
+
+  test("a 35s reload is waited out when the call's deadline allows it", async () => {
+    const { pool, daemon, clock } = await longReloadPool();
+
+    const reply = await pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .toolCall("long-reload", "read", {}, { timeoutMs: 60_000 });
+    expect(JSON.stringify(reply)).toContain("live");
+    expect(clock.now).toBeGreaterThanOrEqual(LONG_RELOAD_WINDOW_MS);
+    expect(clock.now).toBeLessThan(60_000);
+    expect(daemon.accepted).toBe(1);
+    expect(daemon.requests).toBe(1);
+  });
+
+  test("a 35s reload surfaces the refusal once a shorter call deadline passes", async () => {
+    const { pool, daemon, clock } = await longReloadPool();
+
+    let surfaced: unknown;
+    try {
+      await pool
+        .getBridge(TEST_PROJECT_ROOT)
+        .toolCall("short-deadline", "read", {}, { timeoutMs: 20_000 });
+    } catch (error) {
+      surfaced = error;
+    }
+    // The refusal keeps its retryable code, so callers still classify it as a
+    // module outage and take their fallback.
+    expect((surfaced as { code?: string }).code).toBe("module_reloading");
+    expect((surfaced as Error).message).toContain("within this call's 20s deadline");
+    expect(clock.now).toBeLessThan(20_000);
+    expect(daemon.accepted).toBe(0);
+    expect(daemon.requests).toBe(0);
+  });
+
+  test("a call without its own timeout waits out the reload for the client's 30s default", async () => {
+    const { pool, daemon, clock } = await longReloadPool();
+
+    let surfaced: unknown;
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).toolCall("default-deadline", "read", {});
+    } catch (error) {
+      surfaced = error;
+    }
+    expect((surfaced as { code?: string }).code).toBe("module_reloading");
+    expect((surfaced as Error).message).toContain("within this call's 30s deadline");
+    expect(clock.now).toBeGreaterThan(15_000);
+    expect(clock.now).toBeLessThan(30_000);
+    expect(daemon.accepted).toBe(0);
   });
 });

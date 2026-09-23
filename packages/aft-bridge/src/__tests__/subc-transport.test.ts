@@ -575,7 +575,7 @@ describe("SubcTransport Rd reconnect", () => {
       surfaced = error;
     }
     expect((surfaced as Error).message).toBe(
-      "module_id 'aft' is reloading The AFT daemon module did not return within the 15s reload window.",
+      "module_id 'aft' is reloading The AFT daemon module did not return within this call's 30s deadline.",
     );
   });
 

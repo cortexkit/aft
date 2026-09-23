@@ -121,10 +121,17 @@ const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
 /** Every transport reconnect waits at least one event-loop turn and caps repeated failures. */
 const RECONNECT_RETRY_FLOOR_MS = 100;
 const RECONNECT_RETRY_CAP_MS = 2_000;
-/** Maximum total restart-burst delay a fresh route.open may absorb. */
-const ROUTE_OPEN_RELOAD_WAIT_CAP_MS = 15_000;
-const ROUTE_OPEN_RELOAD_WAIT_EXHAUSTED_SUFFIX =
-  " The AFT daemon module did not return within the 15s reload window.";
+/**
+ * Deadline of a route request that passes no explicit timeout. It mirrors
+ * subc-client's `DEFAULT_REQUEST_TIMEOUT_MS`, which the client applies to such a
+ * request and does not export, so the reload wait and the request share one budget.
+ */
+const SUBC_DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+function reloadWaitExhaustedSuffix(callDeadlineMs: number): string {
+  const seconds = Math.round(callDeadlineMs / 100) / 10;
+  return ` The AFT daemon module did not return within this call's ${seconds}s deadline.`;
+}
 
 /**
  * A bg subscription that stayed up at least this long before dropping is treated
@@ -632,16 +639,17 @@ function absentRootError(root: CanonicalRootPath): SubcError {
 }
 
 /** Preserve the daemon's final refusal while making the reload timeout actionable. */
-function reloadWindowExhaustedError(error: unknown): unknown {
+function reloadWindowExhaustedError(error: unknown, callDeadlineMs: number): unknown {
+  const suffix = reloadWaitExhaustedSuffix(callDeadlineMs);
   if (error instanceof Error) {
     try {
-      error.message += ROUTE_OPEN_RELOAD_WAIT_EXHAUSTED_SUFFIX;
+      error.message += suffix;
       return error;
     } catch {
       // A frozen SDK error cannot carry the suffix; retain its message in a wrapper.
     }
   }
-  return new Error(`${String(error)}${ROUTE_OPEN_RELOAD_WAIT_EXHAUSTED_SUFFIX}`);
+  return new Error(`${String(error)}${suffix}`);
 }
 
 /**
@@ -1550,20 +1558,28 @@ export class SubcTransportPool implements AftTransportPool {
         }
       };
 
+      // A module reload (drain, restart, warm-up) refuses route.open for as long
+      // as it lasts, which can exceed 30 s. The call waits it out for as long as
+      // its own deadline allows and only then surfaces the refusal (which lets a
+      // caller such as bash fall back). Time spent waiting comes out of the
+      // request's budget, so the call never outlives the deadline it was given.
+      const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
+      let reloadWaitedMs = 0;
       const openRouteAfterReloadWindow = async (): Promise<{
         route: RouteHandle;
         entry: RouteEntry;
       }> => {
-        let reloadWaitedMs = 0;
         while (true) {
           try {
             return await openRoute();
           } catch (error) {
             if (!isRouteOpenReloadWindowError(error)) throw error;
-            const { delayMs, wait } = this.waitForRouteReopenBackoff();
-            if (reloadWaitedMs + delayMs > ROUTE_OPEN_RELOAD_WAIT_CAP_MS) {
-              throw reloadWindowExhaustedError(error);
+            // Check the budget before starting (or joining) the shared retry
+            // timer, so a call that gives up leaves no orphan timer behind.
+            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= callDeadlineMs) {
+              throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
+            const { delayMs, wait } = this.waitForRouteReopenBackoff();
             reloadWaitedMs += delayMs;
             await wait;
           }
@@ -1617,7 +1633,8 @@ export class SubcTransportPool implements AftTransportPool {
         };
         abortSignal?.addEventListener("abort", onAbort, { once: true });
         try {
-          const request = client.request(route, body, { timeoutMs, onProgress });
+          const requestTimeoutMs = reloadWaitedMs > 0 ? callDeadlineMs - reloadWaitedMs : timeoutMs;
+          const request = client.request(route, body, { timeoutMs: requestTimeoutMs, onProgress });
           const reply = abortSignal ? await Promise.race([request, aborted]) : await request;
           // A legacy closeSession may intentionally let an already-delivered reply
           // settle. It must not mutate shared state or recreate a subscription.
@@ -1693,6 +1710,12 @@ export class SubcTransportPool implements AftTransportPool {
     this.routeReopenRetry = retry;
     this.routeReopenRetryMs = delayMs;
     return { delayMs, wait: retry };
+  }
+
+  /** The delay the next `waitForRouteReopenBackoff` call would wait, without starting it. */
+  private nextRouteReopenDelayMs(): number {
+    if (this.routeReopenRetry && this.routeReopenRetryMs !== null) return this.routeReopenRetryMs;
+    return this.routeReopenRetryDelayMs;
   }
 
   private resetRouteReopenBackoff(): void {
