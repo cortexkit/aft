@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-333-task-artifact-prompts"
+  ],
+  "note": "A session's own background-bash output files are exempt from external-directory prompts for reads, decided by the registry's exact session-scoped ownership check (bash_artifact_owned) instead of a path-shape match. Permissions only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
