@@ -4863,6 +4863,9 @@ impl CallGraphStore {
         profile.index_load += started.elapsed();
 
         let workspace_root = self.project_root.display().to_string();
+        // Re-resolved callers whose set of unresolved calls changed: only
+        // unresolved calls get method-dispatch edges.
+        let mut dispatch_status_changed = BTreeSet::new();
         {
             let mut inserts = ColdBuildInsertStatements::new(&tx)?;
             for rel_path in &candidate_own_refresh {
@@ -4935,6 +4938,7 @@ impl CallGraphStore {
                     .get(rel_path)
                     .cloned()
                     .unwrap_or_default();
+                let dispatch_inputs_before = unresolved_call_ref_ids(&tx, rel_path)?;
                 upsert_resolved_ref_delta(
                     &tx,
                     &mut inserts,
@@ -4942,21 +4946,19 @@ impl CallGraphStore {
                     &index,
                     Some(&selected_for_caller),
                 )?;
+                if unresolved_call_ref_ids(&tx, rel_path)? != dispatch_inputs_before {
+                    dispatch_status_changed.insert(rel_path.clone());
+                }
             }
             profile.ref_resolution += started.elapsed();
         }
 
         let started = Instant::now();
-        // Rewritten files, callers whose refs were re-resolved (a call can move
-        // between a direct and a dispatch edge), and callers whose candidate
-        // methods changed all get their dispatch edges recomputed.
+        // Rewritten files, re-resolved callers whose unresolved calls changed
+        // (a call can move between a direct and a dispatch edge), and callers
+        // whose candidate methods changed get their dispatch edges recomputed.
         let mut dispatch_roots = own_refresh.clone();
-        dispatch_roots.extend(
-            touched_callers
-                .iter()
-                .filter(|rel_path| !deleted.contains(*rel_path))
-                .cloned(),
-        );
+        dispatch_roots.extend(dispatch_status_changed);
         let mut changed_node_files = own_refresh.clone();
         changed_node_files.extend(deleted.iter().cloned());
         let dispatch_callers = dispatch_callers_to_recompute(
@@ -12697,32 +12699,76 @@ fn insert_method_dispatch_edge(
     Ok(edge_id)
 }
 
-/// Names of callable nodes in `rel_path` whose id set differs between the
-/// stored rows and `new_nodes` (None when the file is being deleted).
+/// Names under which `rel_path` offers a different set of method-dispatch
+/// candidates in `new_nodes` (None when the file is being deleted) than in its
+/// stored rows. Name matching chooses by candidate file, scoped name and kind
+/// (and how many share them), so a method that only moved within its file is
+/// not listed; the edges that point at its old node id are found through their
+/// target file instead.
 fn changed_dispatch_candidate_names(
     conn: &Connection,
     rel_path: &str,
     new_nodes: Option<&[NodeRecord]>,
 ) -> Result<BTreeSet<String>> {
+    fn by_name(
+        rows: impl Iterator<Item = (String, String, String)>,
+    ) -> BTreeMap<String, Vec<(String, String)>> {
+        let mut grouped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        for (name, scoped_name, kind) in rows {
+            grouped.entry(name).or_default().push((scoped_name, kind));
+        }
+        for candidates in grouped.values_mut() {
+            candidates.sort();
+        }
+        grouped
+    }
     let mut statement = conn.prepare(
-        "SELECT id, name FROM nodes
+        "SELECT name, scoped_name, kind FROM nodes
          WHERE file_path = ?1 AND kind IN ('method', 'function', 'kernel')",
     )?;
-    let stored = statement
-        .query_map(params![rel_path], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    let current = new_nodes
-        .unwrap_or_default()
-        .iter()
-        .filter(|node| matches!(node.kind.as_str(), "method" | "function" | "kernel"))
-        .map(|node| (node.id.clone(), node.name.clone()))
-        .collect::<BTreeSet<_>>();
+    let stored = by_name(
+        statement
+            .query_map(params![rel_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter(),
+    );
+    let current = by_name(
+        new_nodes
+            .unwrap_or_default()
+            .iter()
+            .filter(|node| matches!(node.kind.as_str(), "method" | "function" | "kernel"))
+            .map(|node| {
+                (
+                    node.name.clone(),
+                    node.scoped_name.clone(),
+                    node.kind.clone(),
+                )
+            }),
+    );
     Ok(stored
-        .symmetric_difference(&current)
-        .map(|(_, name)| name.clone())
+        .keys()
+        .chain(current.keys())
+        .filter(|name| stored.get(*name) != current.get(*name))
+        .cloned()
         .collect())
+}
+
+/// Ids of `rel_path`'s unresolved calls, the only refs that get
+/// method-dispatch edges.
+fn unresolved_call_ref_ids(tx: &Transaction<'_>, rel_path: &str) -> Result<BTreeSet<String>> {
+    let mut statement = tx.prepare_cached(
+        "SELECT ref_id FROM refs WHERE caller_file = ?1 AND kind = 'call' AND status = 'unresolved'",
+    )?;
+    let ids = statement
+        .query_map(params![rel_path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(ids)
 }
 
 /// Caller files whose method-dispatch edges a refresh must recompute: `roots`,
@@ -12747,13 +12793,21 @@ fn dispatch_callers_to_recompute(
             callers.insert(row?);
         }
     }
-    let mut by_name = tx.prepare(
-        "SELECT DISTINCT caller_file FROM refs
-         WHERE short_name = ?1 AND kind = 'call' AND status = 'unresolved'",
-    )?;
-    for name in changed_names {
-        for row in by_name.query_map(params![name], |row| row.get::<_, String>(0))? {
-            callers.insert(row?);
+    if !changed_names.is_empty() {
+        // A call's short name can be a whole path (`Type::method`), so match
+        // on its last segment, as name matching does.
+        let mut unresolved = tx.prepare(
+            "SELECT caller_file, short_name FROM refs
+             WHERE kind = 'call' AND status = 'unresolved' AND short_name IS NOT NULL",
+        )?;
+        let rows = unresolved.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (caller_file, short_name) = row?;
+            if changed_names.contains(callee_last_segment(&short_name)) {
+                callers.insert(caller_file);
+            }
         }
     }
     // A deleted caller's refs and edges are already gone.
@@ -15482,6 +15536,15 @@ fn reexport_consumer_refs(
         }
     }
     Ok(selected)
+}
+
+/// The name a call's short name ends in: `clone` for `crate::git::clone`,
+/// `save` for `store.save`.
+fn callee_last_segment(short_name: &str) -> &str {
+    short_name
+        .rsplit(|character| matches!(character, ':' | '.'))
+        .next()
+        .unwrap_or(short_name)
 }
 
 /// Local names an import row binds to any of `names`. A row stores its local

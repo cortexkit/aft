@@ -549,23 +549,39 @@ fn dispatch_edges_follow_new_candidate_methods() {
     );
 }
 
-/// A call re-resolved in an untouched caller can switch between a direct
-/// edge and a method-dispatch edge; both kinds must be recomputed.
+/// A call re-resolved in a caller the refresh does not rewrite can switch
+/// between a direct edge and a method-dispatch edge. `store.save()` binds by
+/// name to `lib.ts`'s exported `save` while there is one, and falls back to
+/// name matching (`Keeper::save`) when it goes away; both switches must be
+/// reflected.
 #[test]
 fn dispatch_edges_follow_dependent_status_changes() {
-    assert_refresh_matches_cold(
+    let with_save = "export function save() {}\nexport const store = { go() {} };\n";
+    let without_save = "export function keep() {}\nexport const store = { go() {} };\n";
+    let main = "import { store } from \"./lib\";\nexport function main() { store.save(); }\n";
+    let fixture: &[(&str, &str)] = &[
+        ("lib.ts", with_save),
+        ("other.ts", "export class Keeper {\n  save() {}\n}\n"),
+        ("main.ts", main),
+    ];
+    let cold = assert_refresh_matches_cold(
         "dependent call becomes a dispatch call",
+        fixture,
+        &[&[("lib.ts", Some(without_save))]],
+    );
+    assert!(
+        edges_to(&cold, "Keeper::save")
+            .iter()
+            .any(|edge| edge.2 == "name_match"),
+        "{:#?}",
+        cold.edges
+    );
+    assert_refresh_matches_cold(
+        "dispatch call becomes a direct call again",
+        fixture,
         &[
-            ("lib.ts", "export function save() {}\n"),
-            ("other.ts", "export class Keeper {\n  save() {}\n}\n"),
-            (
-                "main.ts",
-                "import * as ns from \"./lib\";\nexport function main() { ns.save(); }\n",
-            ),
-        ],
-        &[
-            &[("lib.ts", Some("export function keep() {}\n"))],
-            &[("lib.ts", Some("export function save() {}\n"))],
+            &[("lib.ts", Some(without_save))],
+            &[("lib.ts", Some(with_save))],
         ],
     );
 }
@@ -591,3 +607,4 @@ fn rust_value_refs_are_refreshed_with_their_target() {
         )]],
     );
 }
+
