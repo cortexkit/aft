@@ -4473,6 +4473,12 @@ impl CallGraphStore {
                 tx.commit()?;
                 note_cold_build_commit_barrier("extraction_batch_committed");
                 self.record_commit(total_changes_before, &conn);
+                // Credit the staging connection's measured write pages at each
+                // batch: a multi-minute build otherwise reports its pages only at
+                // close, and every census window during the build leaves them
+                // unexplained. This is the connection's own db-status counter, so
+                // no second fd is ever opened on the live staging file set.
+                conn.sample_write_pages();
                 completed_files = completed_files.saturating_add(batch_files);
                 ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
@@ -4561,6 +4567,7 @@ impl CallGraphStore {
             set_staged_u64(&tx, STAGED_RESOLVE_CURSOR, last_rowid)?;
             tx.commit()?;
             self.record_commit(total_changes_before, &conn);
+            conn.sample_write_pages();
             resolve_cursor = last_rowid;
             resolved_refs = resolved_refs.saturating_add(staged.len()).min(total_refs);
             ensure_cold_build_current("resolution", resolved_refs, total_refs)?;

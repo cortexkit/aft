@@ -23,6 +23,7 @@ const PROCESS_ROOT: &str = "<process>";
 #[serde(rename_all = "snake_case")]
 pub enum Domain {
     CallgraphCold,
+    CallgraphColdStaging,
     CallgraphRefresh,
     CallgraphCheckpoint,
     SearchIndexBuild,
@@ -44,8 +45,9 @@ pub enum Domain {
 }
 
 impl Domain {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::CallgraphCold,
+        Self::CallgraphColdStaging,
         Self::CallgraphRefresh,
         Self::CallgraphCheckpoint,
         Self::SearchIndexBuild,
@@ -69,6 +71,7 @@ impl Domain {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CallgraphCold => "callgraph_cold",
+            Self::CallgraphColdStaging => "callgraph_cold_staging",
             Self::CallgraphRefresh => "callgraph_refresh",
             Self::CallgraphCheckpoint => "callgraph_checkpoint",
             Self::SearchIndexBuild => "search_index_build",
@@ -1080,6 +1083,64 @@ mod tests {
         assert_eq!(report.unmeasurable.len(), 1);
         assert_eq!(report.unmeasurable[0].seam, "db::TrackedConnection::drop");
         assert_eq!(report.unmeasurable[0].estimated_physical_bytes, Some(50));
+    }
+
+    #[test]
+    fn callgraph_cold_staging_writes_land_in_the_named_domain_not_unexplained() {
+        let _guard = test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger_conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let root = test_root("callgraph-cold-staging");
+        // The path shape the cold builder stages under; the file itself is an
+        // ordinary database, and attribution must come from the writing
+        // connection's own measured pages, never from a second fd on it.
+        let staging_path = dir.path().join("corpus.staging.sqlite.tmp.resume");
+        let staging = crate::db::TrackedConnection::open_attributed(
+            &staging_path,
+            crate::db::SqliteStore::CallgraphColdGeneration,
+            root.clone(),
+        )
+        .unwrap();
+        staging
+            .execute_batch("CREATE TABLE symbols(id INTEGER PRIMARY KEY, name TEXT);")
+            .unwrap();
+        for id in 0..32 {
+            staging
+                .execute(
+                    "INSERT INTO symbols(id, name) VALUES (?1, ?2)",
+                    rusqlite::params![id, format!("name-{id}")],
+                )
+                .unwrap();
+        }
+        // The mid-build sample is what a census window during the build sees:
+        // before the connection closes, these bytes must already be attributed.
+        let credited = staging.sample_write_pages();
+        assert!(credited > 0, "the fixture's writes must be measured before close");
+
+        let minute = now_ms() / MINUTE_MS * MINUTE_MS;
+        let before = Bytes::capture().unwrap_or_default();
+        set_process_baseline_for_test(Some(before), minute);
+        fold_minute_with_sample(
+            &mut ledger_conn,
+            minute,
+            Some(Bytes {
+                logical: before.logical,
+                written: before.written + credited,
+                read: before.read,
+            }),
+        )
+        .unwrap();
+
+        let report = census_with_sample(&ledger_conn, minute, Some(&root), minute + MINUTE_MS, None)
+            .unwrap();
+        let row = report
+            .writers
+            .iter()
+            .find(|row| row.root_id == root)
+            .expect("staging writes must be attributed, not left unexplained");
+        assert_eq!(row.domain, Domain::CallgraphColdStaging.as_str());
+        assert_eq!(report.attributed_physical_bytes, credited);
+        assert_eq!(report.unexplained_physical_bytes, Some(0));
     }
 
     #[test]

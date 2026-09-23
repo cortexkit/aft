@@ -91,7 +91,11 @@ impl SqliteStore {
             Self::AftDb | Self::BreakerFile => Some(WriteDomain::AftDb),
             Self::BlobStore => Some(WriteDomain::ViewsBlob),
             Self::CallgraphGeneration => Some(WriteDomain::CallgraphRefresh),
-            Self::CallgraphColdGeneration => Some(WriteDomain::CallgraphCold),
+            // The cold-build staging connection writes `<key>.staging.sqlite.tmp.resume`
+            // and its WAL for minutes before the finished build is published under a
+            // generation name. Its measured pages get their own domain so a census
+            // window mid-build attributes them instead of leaving them unexplained.
+            Self::CallgraphColdGeneration => Some(WriteDomain::CallgraphColdStaging),
             Self::InspectScopeCache => Some(WriteDomain::InspectCache),
             Self::Unmapped(_) => None,
         }
