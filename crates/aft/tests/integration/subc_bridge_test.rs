@@ -2449,6 +2449,17 @@ fn subc_bridge_module_draining_answers_every_held_request_and_keeps_bash_running
 }
 
 #[test]
+fn subc_bridge_module_draining_closes_every_daemon_request_credit() {
+    run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
+        "subc_bridge_module_draining_closes_every_daemon_request_credit",
+        Duration::from_secs(90),
+        drive_module_draining_closes_every_daemon_credit_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+    );
+}
+
+#[test]
 fn subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe() {
     run_subc_bridge_test(
         "subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe",
@@ -7764,6 +7775,292 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
         line.ends_with(" quiesced_before_close=true"),
         "connection-end census line: {line}"
     );
+}
+
+/// Request credits kept the way the subc daemon keeps them: a credit opens when
+/// a Request is forwarded to the module on a route, and closes only when the
+/// module sends a Response, Error or StreamEnd with the same corr on the same
+/// route (channel and epoch). Nothing else closes it: not a client Cancel, not
+/// the module forgetting the request, not a StreamData. The daemon's drain waits
+/// for this count to reach zero.
+#[derive(Default)]
+struct DaemonCreditLedger {
+    open: HashMap<(u16, u32, u64), String>,
+    /// Terminal frames that matched no open credit (a second terminal for one
+    /// request, or a terminal for a request that was never sent).
+    unmatched_terminals: Vec<String>,
+}
+
+impl DaemonCreditLedger {
+    fn open(&mut self, channel: u16, corr: u64, label: impl Into<String>) {
+        let previous = self.open.insert((channel, 1, corr), label.into());
+        assert!(previous.is_none(), "credit {channel}/{corr} opened twice");
+    }
+
+    fn observe(&mut self, frame: &Frame) {
+        if frame.header.channel == 0
+            || !matches!(
+                frame.header.ty,
+                FrameType::Response | FrameType::Error | FrameType::StreamEnd
+            )
+        {
+            return;
+        }
+        let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
+        if self.open.remove(&key).is_none() {
+            self.unmatched_terminals.push(format!("{:?}", frame.header));
+        }
+    }
+
+    fn open_requests(&self) -> Vec<String> {
+        let mut open = self
+            .open
+            .iter()
+            .map(|((channel, epoch, corr), label)| {
+                format!("{label} ({channel}@{epoch} corr {corr})")
+            })
+            .collect::<Vec<_>>();
+        open.sort();
+        open
+    }
+}
+
+/// Reads module frames until `deadline`, or until no credit is open when
+/// `stop_when_quiesced` is set, closing credits as terminals arrive.
+async fn pump_daemon_credits(
+    stream: &mut tokio::net::TcpStream,
+    ledger: &mut DaemonCreditLedger,
+    deadline: Instant,
+    stop_when_quiesced: bool,
+    label: &str,
+) {
+    while !(stop_when_quiesced && ledger.open.is_empty()) {
+        let Some(frame) = read_any_frame_until(stream, deadline, label).await else {
+            return;
+        };
+        ledger.observe(&frame);
+    }
+}
+
+/// Reproduces a restart drain that ran to the daemon's forced-teardown ceiling
+/// while the module's own census reported quiescence. The daemon counts a request
+/// open until the module sends a terminal frame with the request's corr on the
+/// request's route, so a request the module stops tracking without such a frame
+/// holds the drain open and is invisible to the module's census.
+///
+/// The mix mirrors a busy module: held bg_events streams on many routes, three of
+/// them on a project root that is deleted and reclaimed while its routes stay
+/// bound at the daemon, two long `wait: true` bash calls, a pending permission
+/// ask, and a tool call the client cancelled. After `module.draining` every
+/// credit must close, each exactly once.
+async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        executor,
+        lifecycle_events,
+        ..
+    } = open_fake_daemon_session(input).await;
+    let mut lifecycle_events = lifecycle_events.expect("lifecycle probe installed");
+    let mut ledger = DaemonCreditLedger::default();
+    const WAIT_CHANNELS: [u16; 2] = [1, 6];
+    const ASK_CHANNEL: u16 = 2;
+    const CANCEL_CHANNEL: u16 = 3;
+    const LIVE_BG_CHANNELS: [u16; 6] = [101, 102, 103, 104, 105, 106];
+    const RECLAIMED_BG_CHANNELS: [u16; 3] = [121, 122, 123];
+    const BG_CORR: u64 = 950;
+    const ASK_CORR: u64 = 951;
+    const CANCEL_CORR: u64 = 952;
+    const WAIT_CORRS: [u64; 2] = [953, 954];
+    // Far below the daemon's 30 s drain ceiling. Every terminal is expected
+    // within one bash poll plus frame latency, so a credit still open at this
+    // bound is one no code path will ever close, not a slow one.
+    const TERMINAL_BOUND: Duration = Duration::from_secs(4);
+
+    let reclaimed_dir = tempfile::tempdir().expect("reclaimed root tempdir");
+    let reclaimed_root = reclaimed_dir.path().to_path_buf();
+    let reclaimed_root_id = ProjectRootId::from_path(&reclaimed_root).expect("reclaimed root id");
+
+    for channel in WAIT_CHANNELS {
+        send_route_bind_with_session(
+            &mut stream,
+            channel,
+            u64::from(channel) + 10,
+            &root1,
+            &format!("session-wait-{channel}"),
+        )
+        .await;
+        expect_route_bind_ack(&mut stream, u64::from(channel) + 10).await;
+    }
+    bind_untrusted_elicitation_route(&mut stream, ASK_CHANNEL, 20, &root1).await;
+    send_route_bind_with_session(&mut stream, CANCEL_CHANNEL, 30, &root2, "session-cancel").await;
+    expect_route_bind_ack(&mut stream, 30).await;
+    for channel in LIVE_BG_CHANNELS {
+        let session = format!("session-live-{channel}");
+        send_route_bind_with_session(&mut stream, channel, u64::from(channel), &root1, &session)
+            .await;
+        expect_route_bind_ack(&mut stream, u64::from(channel)).await;
+    }
+    for channel in RECLAIMED_BG_CHANNELS {
+        let session = format!("session-reclaimed-{channel}");
+        send_route_bind_with_session(
+            &mut stream,
+            channel,
+            u64::from(channel),
+            &reclaimed_root,
+            &session,
+        )
+        .await;
+        expect_route_bind_ack(&mut stream, u64::from(channel)).await;
+    }
+
+    // A pending permission ask on the untrusted route.
+    let never_touched = root1.join("credit-ask.txt");
+    send_tool_call(
+        &mut stream,
+        ASK_CHANNEL,
+        ASK_CORR,
+        "bash",
+        json!({ "command": touch_command(&never_touched), "compressed": false }),
+    )
+    .await;
+    ledger.open(ASK_CHANNEL, ASK_CORR, "permission ask");
+    expect_bash_elicitation_request(&mut stream, ASK_CHANNEL, "touch").await;
+
+    // A tool call the client gave up on: the daemon forwards the client's
+    // Cancel, but the credit stays open until the module answers the corr.
+    send_tool_call(
+        &mut stream,
+        CANCEL_CHANNEL,
+        CANCEL_CORR,
+        "semantic_search",
+        json!({ "case": "heavy" }),
+    )
+    .await;
+    ledger.open(CANCEL_CHANNEL, CANCEL_CORR, "cancelled tool call");
+    state.wait_until("cancelled call started", |inner| inner.heavy_started);
+    send_bg_events_cancel(&mut stream, CANCEL_CHANNEL, CANCEL_CORR).await;
+
+    // Held bg_events streams, on live routes and on the root about to go.
+    for channel in LIVE_BG_CHANNELS {
+        send_bg_events_subscribe(&mut stream, channel, BG_CORR).await;
+        ledger.open(channel, BG_CORR, "bg_events on a live root");
+    }
+    for channel in RECLAIMED_BG_CHANNELS {
+        send_bg_events_subscribe(&mut stream, channel, BG_CORR).await;
+        ledger.open(channel, BG_CORR, "bg_events on a reclaimed root");
+    }
+    pump_daemon_credits(
+        &mut stream,
+        &mut ledger,
+        Instant::now() + Duration::from_millis(800),
+        false,
+        "seeding held requests",
+    )
+    .await;
+
+    // The project directory disappears (a removed worktree, say) while its
+    // routes stay bound at the daemon; the module reclaims the root.
+    std::fs::remove_dir_all(&reclaimed_root).expect("delete reclaimed root");
+    let reclaim_deadline = Instant::now() + Duration::from_secs(15);
+    while executor.actor_registered(&reclaimed_root_id) {
+        assert!(
+            Instant::now() < reclaim_deadline,
+            "deleted root was never reclaimed"
+        );
+        pump_daemon_credits(
+            &mut stream,
+            &mut ledger,
+            Instant::now() + Duration::from_millis(100),
+            false,
+            "waiting for root reclaim",
+        )
+        .await;
+    }
+
+    // Two long foreground bash waits.
+    let mut done_markers = Vec::new();
+    for (channel, corr) in WAIT_CHANNELS.into_iter().zip(WAIT_CORRS) {
+        let started = root1.join(format!("credit-wait-{channel}-started"));
+        done_markers.push(root1.join(format!("credit-wait-{channel}-done")));
+        send_tool_call(
+            &mut stream,
+            channel,
+            corr,
+            "bash",
+            json!({
+                "command": format!(
+                    "printf s > credit-wait-{channel}-started; sleep 5; printf d > credit-wait-{channel}-done"
+                ),
+                "foreground_orchestrate": true,
+                "wait": true,
+                "timeout": 60_000,
+                "compressed": false,
+            }),
+        )
+        .await;
+        ledger.open(channel, corr, "bash wait");
+        wait_for_file(&started, "bash wait start marker").await;
+    }
+    pump_daemon_credits(
+        &mut stream,
+        &mut ledger,
+        Instant::now() + Duration::from_millis(300),
+        false,
+        "settling bash waits",
+    )
+    .await;
+
+    send_module_draining(&mut stream, Duration::from_secs(30)).await;
+    pump_daemon_credits(
+        &mut stream,
+        &mut ledger,
+        Instant::now() + TERMINAL_BOUND,
+        true,
+        "drain terminals",
+    )
+    .await;
+    let (_, _, start_line) =
+        next_drain_census(&mut lifecycle_events, "start", Duration::from_secs(1)).await;
+    eprintln!("{start_line}");
+    let open = ledger.open_requests();
+    assert!(
+        open.is_empty(),
+        "the daemon still counts {} request(s) in flight {TERMINAL_BOUND:?} after module.draining: {open:?}; module start census: {start_line}",
+        open.len()
+    );
+    assert!(
+        ledger.unmatched_terminals.is_empty(),
+        "terminal frames with no open request: {:?}",
+        ledger.unmatched_terminals
+    );
+    let (held, _, line) =
+        next_drain_census(&mut lifecycle_events, "quiesced", Duration::from_secs(3)).await;
+    assert_eq!(held, 0, "quiesced census: {line}");
+    assert!(!never_touched.exists(), "drained ask must not run");
+
+    // Let the cancelled job and the detached commands finish; none of them may
+    // produce a second terminal.
+    state.release_heavy();
+    for marker in &done_markers {
+        wait_for_file(marker, "detached bash completion sentinel").await;
+    }
+    pump_daemon_credits(
+        &mut stream,
+        &mut ledger,
+        Instant::now() + Duration::from_millis(500),
+        false,
+        "late frames",
+    )
+    .await;
+    assert!(
+        ledger.unmatched_terminals.is_empty(),
+        "late terminal frames with no open request: {:?}",
+        ledger.unmatched_terminals
+    );
+    send_connection_goodbye(&mut stream).await;
 }
 
 /// Ending a subscription on drain must not lose a completion that was queued
