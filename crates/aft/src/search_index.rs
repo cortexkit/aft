@@ -172,6 +172,9 @@ const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
 pub(crate) enum BorrowedIndexLoadStop {
     BudgetExceeded,
     Cancelled,
+    /// The snapshot was written for a different part of the checkout than the
+    /// loading root covers (see `checkout_position`).
+    CoverageMismatch,
 }
 
 #[derive(Debug)]
@@ -1633,6 +1636,9 @@ impl SearchIndex {
             BorrowedIndexLoad::Loaded(_, ignore_rules_differ) if *ignore_rules_differ => "partial",
             BorrowedIndexLoad::Loaded(_, _) => "ready",
             BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::BudgetExceeded) => "budget_stopped",
+            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::CoverageMismatch) => {
+                "coverage_mismatch"
+            }
             BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::Cancelled)
             | BorrowedIndexLoad::Invalid => "denied",
         };
@@ -1745,8 +1751,25 @@ impl SearchIndex {
         }
         let mut root_bytes = vec![0u8; root_len];
         reader.read_exact(&mut root_bytes).ok()?;
-        let _stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
+        let stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
         let project_root = current_canonical_root.to_path_buf();
+        // Snapshot paths are stored relative to the root that wrote them and
+        // are re-rooted onto the loading root. That is only sound when both
+        // roots sit at the same place in their checkouts: a snapshot written
+        // by a session in a subfolder, loaded at a checkout's top level (or
+        // the reverse), would present partial coverage as a complete index.
+        // Older versions published subfolder snapshots under the repository
+        // key, so such artifacts can still be on disk.
+        if !stored_project_root.as_os_str().is_empty()
+            && checkout_position(&stored_project_root) != checkout_position(&project_root)
+        {
+            if let Some(budget) = borrowed_load_budget {
+                budget
+                    .stop
+                    .set(Some(BorrowedIndexLoadStop::CoverageMismatch));
+            }
+            return None;
+        }
 
         if !reader_has_remaining(&mut reader, postings_body_end, ignore_fingerprint_len).ok()? {
             return None;
@@ -5275,7 +5298,9 @@ impl std::error::Error for ArtifactCacheKeyProbeError {}
 
 pub fn artifact_cache_key(project_root: &Path) -> String {
     let key = match repo_root_commit_with_retry(project_root) {
-        RootCommitResolution::Commit(root_commit) => artifact_key_from_git_identity(&root_commit),
+        RootCommitResolution::Commit(root_commit) => {
+            session_artifact_key_from_git_identity(project_root, &root_commit)
+        }
         RootCommitResolution::NotARepo => artifact_path_identity_key(project_root),
         RootCommitResolution::Failed(detail) => {
             crate::slog_warn!(
@@ -5306,7 +5331,7 @@ pub fn artifact_cache_key_with_memo(
 
     match repo_root_commit_with_retry(probe_root) {
         RootCommitResolution::Commit(root_commit) => {
-            let key = artifact_key_from_git_identity(&root_commit);
+            let key = session_artifact_key_from_git_identity(probe_root, &root_commit);
             record_derived_cache_key(memo_root, &key);
             if let Err(error) =
                 record_artifact_cache_key_memo(storage_root, &memo_root_key, &key, &root_commit)
@@ -5323,12 +5348,19 @@ pub fn artifact_cache_key_with_memo(
         RootCommitResolution::NotARepo => Ok(artifact_path_identity_key(probe_root)),
         RootCommitResolution::Failed(detail) => {
             if let Some(entry) = lookup_artifact_cache_key_memo(storage_root, &memo_root_key) {
+                // Re-derive from the memoized repository identity rather than
+                // trusting the memoized key: memos written by older versions
+                // hold the whole-repository key even for subfolder roots, and
+                // reusing it would let a subfolder session overwrite the
+                // repository's shared artifact again.
+                let key =
+                    session_artifact_key_from_git_identity(probe_root, &entry.git_root_commit);
                 crate::slog_warn!(
-                    "artifact cache key: probe failed, using memoized key {} for {}",
-                    entry.key,
+                    "artifact cache key: probe failed, using memoized identity (key {}) for {}",
+                    key,
                     memo_root.display()
                 );
-                return Ok(entry.key);
+                return Ok(key);
             }
 
             match git_marker_state {
@@ -5390,6 +5422,78 @@ pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>)
 /// Keep Git-top-level artifact derivation shared with standing roots byte-for-byte.
 pub(crate) fn artifact_key_from_git_identity(root_commit: &str) -> String {
     artifact_hash16(root_commit.as_bytes())
+}
+
+/// Artifact key for a session rooted at `project_root` inside the Git
+/// repository whose canonical root-commit identity is `root_commit`.
+///
+/// A session at a checkout's top level uses the whole-repository key, which
+/// the home checkout publishes and its linked worktrees borrow. A session
+/// opened in a subfolder indexes only that subfolder, so it must not publish
+/// under the whole-repository key: its snapshot would replace the full one and
+/// every borrower would silently lose the files outside the subfolder. It
+/// gets a key of its own instead, derived like a standing root below a
+/// checkout (`scoped_key::scoped_v1_key` over the repository identity and the
+/// forward-slash path below the top level). The same subfolder of the home
+/// checkout and of a linked worktree therefore still share one artifact.
+///
+/// The key is cut to the 16 hex characters every other session key has,
+/// because session storage (orphan sweeps, the key memo, transient caches)
+/// only recognises that shape. The full-length scoped key stays reserved for
+/// standing roots, so a session never co-writes a standing root's artifact.
+pub(crate) fn session_artifact_key_from_git_identity(
+    project_root: &Path,
+    root_commit: &str,
+) -> String {
+    match checkout_position(project_root) {
+        CheckoutPosition::TopLevel => artifact_key_from_git_identity(root_commit),
+        CheckoutPosition::Subdirectory(relative) => {
+            match crate::scoped_key::scoped_v1_key(root_commit, relative.as_bytes()) {
+                Ok(scoped) => scoped[..16].to_string(),
+                Err(_) => artifact_path_identity_key(project_root),
+            }
+        }
+        // A subfolder whose path cannot be spelled as a logical relative path
+        // still must not share the repository key; its own path is unique.
+        CheckoutPosition::Unrepresentable => artifact_path_identity_key(project_root),
+    }
+}
+
+/// Where a directory sits inside the Git checkout that contains it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CheckoutPosition {
+    /// The checkout's top level, or a directory with no enclosing checkout.
+    TopLevel,
+    /// A directory below the top level, as a forward-slash relative path.
+    Subdirectory(String),
+    /// A directory below the top level whose relative path is not valid
+    /// Unicode or otherwise cannot be written as a logical relative path.
+    Unrepresentable,
+}
+
+/// Locate `project_root` relative to the nearest enclosing checkout top level:
+/// the closest directory, starting at `project_root` itself, that holds a
+/// `.git` entry (a directory in a home checkout, a file in a linked worktree
+/// or submodule). This reads the filesystem only; it never runs git.
+///
+/// Both sides of any comparison are derived through this one function from
+/// the same canonicalized form, so the result is stable across the Windows
+/// verbatim and plain spellings of one path.
+pub(crate) fn checkout_position(project_root: &Path) -> CheckoutPosition {
+    let root = canonicalize_or_normalize(project_root);
+    let has_git_marker = |dir: &Path| fs::symlink_metadata(dir.join(".git")).is_ok();
+    if has_git_marker(&root) {
+        return CheckoutPosition::TopLevel;
+    }
+    for ancestor in root.ancestors().skip(1) {
+        if has_git_marker(ancestor) {
+            return match crate::scoped_key::scoped_relative_path(&root, ancestor) {
+                Ok(relative) => CheckoutPosition::Subdirectory(relative),
+                Err(_) => CheckoutPosition::Unrepresentable,
+            };
+        }
+    }
+    CheckoutPosition::TopLevel
 }
 
 /// Existing non-Git path-scope artifact derivation, exposed for the standing
@@ -8490,6 +8594,121 @@ mod tests {
 
         assert_eq!(rescued, expected_key);
         assert_ne!(rescued, artifact_path_identity_key(&root));
+    }
+
+    #[test]
+    fn subfolder_session_key_is_scoped_and_shared_by_the_same_subfolder_of_every_checkout() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let home = git_like_root(&dir, "home");
+        // A linked worktree's top level holds a `.git` file, not a directory.
+        let worktree = dir.path().join("wt");
+        fs::create_dir_all(&worktree).expect("create worktree root");
+        fs::write(worktree.join(".git"), "gitdir: elsewhere\n").expect("write .git file");
+        let mut roots = Vec::new();
+        for root in [&home, &worktree] {
+            for sub in ["", "sub1", "sub1/deeper", "sub2"] {
+                let path = if sub.is_empty() {
+                    root.clone()
+                } else {
+                    root.join(sub)
+                };
+                fs::create_dir_all(&path).expect("create session root");
+                roots.push(path);
+            }
+        }
+        let commit = "cccccccccccccccccccccccccccccccccccccccc".to_string();
+        let _override = force_git_root_commit_probe_commits_for_test(
+            roots
+                .iter()
+                .map(|root| (root.clone(), commit.clone()))
+                .collect(),
+        );
+
+        let repository_key = artifact_key_from_git_identity(&commit);
+        let key = |path: &Path| artifact_cache_key(path);
+        assert_eq!(key(&home), repository_key);
+        assert_eq!(key(&worktree), repository_key);
+        let sub1 = key(&home.join("sub1"));
+        let deeper = key(&home.join("sub1/deeper"));
+        let sub2 = key(&home.join("sub2"));
+        for scoped in [&sub1, &deeper, &sub2] {
+            assert_ne!(
+                scoped, &repository_key,
+                "a subfolder must not publish the repository artifact"
+            );
+            assert!(
+                artifact_key_looks_valid(scoped),
+                "session storage needs the 16-hex shape"
+            );
+        }
+        assert_ne!(sub1, sub2);
+        assert_ne!(sub1, deeper);
+        assert_eq!(
+            sub1,
+            crate::scoped_key::scoped_v1_key(&commit, b"sub1").unwrap()[..16]
+        );
+        assert_eq!(key(&worktree.join("sub1")), sub1);
+        assert_eq!(key(&worktree.join("sub1/deeper")), deeper);
+        assert_eq!(key(&worktree.join("sub2")), sub2);
+    }
+
+    #[test]
+    fn subfolder_probe_failure_ignores_a_repository_key_memoized_by_older_versions() {
+        let _probe_lock = git_root_commit_probe_override_lock_for_test();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let storage = dir.path().join("storage");
+        let home = git_like_root(&dir, "home");
+        let sub = home.join("sub1");
+        fs::create_dir_all(&sub).expect("create subfolder");
+        let commit = "dddddddddddddddddddddddddddddddddddddddd".to_string();
+        let repository_key = artifact_key_from_git_identity(&commit);
+        let mut seeded = BTreeMap::new();
+        seeded.insert(
+            sub.to_string_lossy().into_owned(),
+            ArtifactCacheKeyMemoEntry {
+                key: repository_key.clone(),
+                git_root_commit: commit.clone(),
+                recorded_at_ms: current_time_millis(),
+            },
+        );
+        write_cache_key_memo(&storage, &seeded);
+        let _override = force_git_root_commit_probe_transient_for_paths_for_test(
+            vec![sub.clone()],
+            "spawn failed: Too many open files (os error 24)",
+        );
+
+        let rescued = artifact_cache_key_with_memo(&sub, &sub, &storage, Some(&home.join(".git")))
+            .expect("memo should rescue transient probe failure");
+
+        assert_ne!(rescued, repository_key);
+        assert_eq!(
+            rescued,
+            crate::scoped_key::scoped_v1_key(&commit, b"sub1").unwrap()[..16]
+        );
+    }
+
+    #[test]
+    fn checkout_position_finds_the_nearest_git_marker() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let home = git_like_root(&dir, "home");
+        let nested = home.join("a/b");
+        let submodule = home.join("vendor/lib");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        fs::create_dir_all(submodule.join("src")).expect("create submodule dir");
+        fs::write(submodule.join(".git"), "gitdir: ../../.git/modules/lib\n")
+            .expect("write submodule marker");
+
+        assert_eq!(checkout_position(&home), CheckoutPosition::TopLevel);
+        assert_eq!(
+            checkout_position(&nested),
+            CheckoutPosition::Subdirectory("a/b".to_string())
+        );
+        assert_eq!(checkout_position(&submodule), CheckoutPosition::TopLevel);
+        assert_eq!(
+            checkout_position(&submodule.join("src")),
+            CheckoutPosition::Subdirectory("src".to_string())
+        );
     }
 
     #[test]

@@ -4064,7 +4064,7 @@ fn schedule_artifact_loads(
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Degraded(degradation) => {
                             slog_warn!(
-                                "search index is read-only but loading stopped at the interactive budget ({})",
+                                "search index is read-only and the shared snapshot was not adopted ({})",
                                 degradation.reason
                             );
                             None

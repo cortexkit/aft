@@ -29,6 +29,12 @@ pub(crate) struct ReadOnlyDegradation {
 pub(crate) const BORROWED_SEARCH_LOAD_DEGRADATION: ReadOnlyDegradation = ReadOnlyDegradation {
     reason: "borrowed_search_index_load_budget",
 };
+/// The shared snapshot covers a different part of the checkout than the
+/// borrowing root (for example it was written by a session opened in a
+/// subfolder), so adopting it would hide files without saying so.
+pub(crate) const BORROWED_SEARCH_COVERAGE_DEGRADATION: ReadOnlyDegradation = ReadOnlyDegradation {
+    reason: "borrowed_search_index_coverage_mismatch",
+};
 pub(crate) const BORROWED_SEMANTIC_LOAD_DEGRADATION: ReadOnlyDegradation = ReadOnlyDegradation {
     reason: "borrowed_semantic_index_load_budget",
 };
@@ -209,6 +215,9 @@ fn open_search_index_from_cache_dir_with_budget(
             BorrowedIndexLoad::Loaded(index, ignore_rules_differ) => (index, ignore_rules_differ),
             BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::BudgetExceeded) => {
                 return ReadOnlyArtifact::Degraded(BORROWED_SEARCH_LOAD_DEGRADATION);
+            }
+            BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::CoverageMismatch) => {
+                return ReadOnlyArtifact::Degraded(BORROWED_SEARCH_COVERAGE_DEGRADATION);
             }
             BorrowedIndexLoad::Stopped(BorrowedIndexLoadStop::Cancelled) => {
                 return ReadOnlyArtifact::Cancelled;
@@ -955,6 +964,40 @@ mod tests {
             other => panic!("expected a stale borrowed artifact, got {other:?}"),
         }
         assert!(SearchIndex::read_from_disk(&cache_dir, &root).is_none());
+    }
+
+    /// Older versions let a session opened in a subfolder publish its partial
+    /// snapshot under the repository key. Such an artifact must be reported as
+    /// a coverage mismatch to a borrowing worktree, and rebuilt by the owner,
+    /// rather than served as a complete index.
+    #[test]
+    fn repository_artifact_written_by_a_subfolder_session_is_not_adopted() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        let storage = tempfile::tempdir().expect("storage");
+        let sub = root.join("src");
+        let sub_cache = build_search_artifact(&sub, storage.path());
+        let repository_cache = resolve_cache_dir(&root, Some(storage.path()));
+        assert_ne!(sub_cache, repository_cache);
+        fs::create_dir_all(&repository_cache).expect("create repository cache dir");
+        fs::copy(
+            sub_cache.join("cache.bin"),
+            repository_cache.join("cache.bin"),
+        )
+        .expect("plant subfolder snapshot under the repository key");
+        let (_wt_dir, worktree) = linked_worktree(&root);
+
+        match open_search_index_read_only(&worktree, Some(storage.path())) {
+            ReadOnlyArtifact::Degraded(degradation) => {
+                assert_eq!(degradation, BORROWED_SEARCH_COVERAGE_DEGRADATION);
+            }
+            other => panic!("expected a coverage-mismatch degradation, got {other:?}"),
+        }
+        assert!(SearchIndex::read_from_disk(&repository_cache, &root).is_none());
+        assert!(
+            SearchIndex::read_from_disk(&sub_cache, &sub).is_some(),
+            "the subfolder's own artifact must stay usable for the subfolder"
+        );
     }
 
     #[test]
