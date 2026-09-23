@@ -787,9 +787,13 @@ struct TeeWriter {
 
 impl Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        io::stderr().write_all(buf)?;
+        // Mask credentials once, before either copy is written. The stderr copy
+        // is durable too: in standalone mode the plugin relays it into its own
+        // log file.
+        let line = crate::log_redact::aft_redact_bytes(buf);
+        io::stderr().write_all(&line)?;
         if let Some(tx) = self.file_tx.as_ref() {
-            match tx.try_send(LogMessage::Write(buf.to_vec())) {
+            match tx.try_send(LogMessage::Write(line.into_owned())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     PERF.file_lines_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1674,6 +1678,32 @@ mod tests {
         assert_eq!(format_epoch_secs(1_709_251_199), "2024-02-29T23:59:59Z");
         assert_eq!(format_epoch_secs(4_102_444_800), "2100-01-01T00:00:00Z");
         assert_eq!(format_epoch_secs(4_107_542_399), "2100-02-28T23:59:59Z");
+    }
+
+    #[test]
+    fn token_written_through_the_sink_is_masked_on_disk() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("aft-777.log");
+        let sink = RotatingFile::open(path.clone(), LOG_FILE_BYTES, 1, 1).unwrap();
+        let (tx, rx) = mpsc::sync_channel(8);
+        let writer = thread::spawn(move || run_file_writer(sink, rx));
+        let mut tee = TeeWriter { file_tx: Some(tx) };
+        let token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        tee.write_all(
+            format!("[aft] fetch https://bob:pw123@host.example/x?access_token=zz9 {token}\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        drop(tee);
+        writer.join().unwrap();
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            on_disk,
+            "[aft] fetch https://***@host.example/x?access_token=<REDACTED_SECRET> <REDACTED_SECRET>\n"
+        );
+        assert!(!on_disk.contains(token));
+        assert!(!on_disk.contains("pw123"));
     }
 
     #[test]

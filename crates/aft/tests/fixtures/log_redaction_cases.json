@@ -1,0 +1,65 @@
+{
+  "_comment": "Shared by the Rust log redactor (crates/aft/src/log_redact.rs) and the CLI issue sanitizer (packages/aft-cli/src/lib/sanitize.ts). Both must turn every masked input into exactly its expected output and leave every untouched input byte-for-byte unchanged.",
+  "masked": [
+    {
+      "input": "push failed: ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 rejected",
+      "expected": "push failed: <REDACTED_SECRET> rejected"
+    },
+    {
+      "input": "oauth gho_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+      "expected": "oauth <REDACTED_SECRET>"
+    },
+    {
+      "input": "user-to-server ghu_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 end",
+      "expected": "user-to-server <REDACTED_SECRET> end"
+    },
+    {
+      "input": "installation ghs_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 end",
+      "expected": "installation <REDACTED_SECRET> end"
+    },
+    {
+      "input": "refresh ghr_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8 end",
+      "expected": "refresh <REDACTED_SECRET> end"
+    },
+    {
+      "input": "GH_TOKEN github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV set",
+      "expected": "GH_TOKEN <REDACTED_SECRET> set"
+    },
+    {
+      "input": "fetch https://alice:hunter2@git.example.com/org/repo.git",
+      "expected": "fetch https://***@git.example.com/org/repo.git"
+    },
+    {
+      "input": "clone https://x-access-token:abc123@github.com/org/repo",
+      "expected": "clone https://***@github.com/org/repo"
+    },
+    {
+      "input": "GET https://api.example.com/v1/items?access_token=abc123DEF456&page=2",
+      "expected": "GET https://api.example.com/v1/items?access_token=<REDACTED_SECRET>&page=2"
+    },
+    {
+      "input": "GET https://api.example.com/v1/items?page=2&token=s3cr3tValue",
+      "expected": "GET https://api.example.com/v1/items?page=2&token=<REDACTED_SECRET>"
+    },
+    {
+      "input": "GET https://maps.example.com/api?api_key=abcdef0123456789",
+      "expected": "GET https://maps.example.com/api?api_key=<REDACTED_SECRET>"
+    },
+    {
+      "input": "GET https://maps.example.com/api?key=AIzaSyA1b2C3d4E5f6G7h8I9j0KlMnOpQrStUv&q=x",
+      "expected": "GET https://maps.example.com/api?key=<REDACTED_SECRET>&q=x"
+    }
+  ],
+  "untouched": [
+    "read crates/aft/src/commands/bash.rs:120",
+    "log at /tmp/aft/logs/aft-4242.log rotated",
+    "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "commit 3f2c9a1b7e4d5c6a8b9f0e1d2c3b4a5968778695",
+    "index_event plane=callgraph build_id=b1a2c3 session=ses_0123456789abcdef",
+    "identifiers ghost_writer github_patterns gh_cli ghp_short",
+    "https://github.com/cortexkit/aft/pull/12?tab=files&page=3",
+    "https://maps.example.com/api?key=src_main_rs",
+    "https://cdn.example.com/blob?key=9f86d081884c7d659a2feaa0c55ad015",
+    "search ?q=token+refresh+flow"
+  ]
+}

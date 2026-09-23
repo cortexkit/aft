@@ -99,6 +99,7 @@ pub mod list_envelope;
 pub mod list_surfaces;
 pub mod local_embed;
 pub mod log_ctx;
+pub mod log_redact;
 pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
