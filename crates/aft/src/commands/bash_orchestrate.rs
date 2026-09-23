@@ -81,6 +81,13 @@ pub fn format_wait_detach_message(task_id: &str) -> String {
     )
 }
 
+pub fn format_module_drain_detach_message(task_id: &str) -> String {
+    format!(
+        "Foreground bash is running in background as {}\nDetached because AFT is restarting; the command keeps running.",
+        format_background_handoff_tail(task_id)
+    )
+}
+
 /// Port of OpenCode `packages/opencode-plugin/src/tools/bash.ts` `formatBackgroundLaunch` (lines 593-601).
 pub fn format_background_launch(task_id: &str, pty: bool) -> String {
     if pty {
@@ -307,6 +314,33 @@ pub(crate) fn detach_wait_mode_bash(
 ) -> Response {
     match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => wait_detach_response(request_id, task_id),
+        Err(message) if message.contains("not found") => Response::error(
+            request_id,
+            "task_not_found",
+            crate::commands::bash_status::format_unknown_task_message(task_id),
+        ),
+        Err(message) => Response::error(request_id, "execution_failed", message),
+    }
+}
+
+/// Hands a still-running foreground command to the background because the
+/// module is about to restart. Same promotion as a user-message detach, so the
+/// task keeps running, is persisted, and delivers its completion later.
+pub(crate) fn detach_bash_for_module_drain(
+    ctx: &AppContext,
+    task_id: &str,
+    session_id: &str,
+    request_id: &str,
+) -> Response {
+    match ctx.bash_background().promote(task_id, session_id) {
+        Ok(_) => Response::success(
+            request_id,
+            json!({
+                "output": format_module_drain_detach_message(task_id),
+                "task_id": task_id,
+                "status": "running",
+            }),
+        ),
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",

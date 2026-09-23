@@ -463,6 +463,11 @@ impl PendingControlReplies {
         self.lock().remove(&corr);
     }
 
+    /// Number of requests still waiting for the daemon's reply.
+    pub(super) fn len(&self) -> usize {
+        self.lock().len()
+    }
+
     /// Deliver a channel-0 reply. Returns false when no request is waiting
     /// for its correlation id (a late reply after a timeout, for example).
     pub(super) fn resolve(&self, frame: Frame) -> bool {

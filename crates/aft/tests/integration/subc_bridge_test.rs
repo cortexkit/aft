@@ -2387,6 +2387,17 @@ fn subc_bridge_module_draining_ends_held_bg_streams_while_tool_call_finishes() {
 }
 
 #[test]
+fn subc_bridge_module_draining_answers_every_held_request_and_keeps_bash_running() {
+    run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
+        "subc_bridge_module_draining_answers_every_held_request_and_keeps_bash_running",
+        Duration::from_secs(90),
+        drive_module_draining_releases_every_held_request_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+    );
+}
+
+#[test]
 fn subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe() {
     run_subc_bridge_test(
         "subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe",
@@ -7089,6 +7100,304 @@ async fn drive_module_draining_ends_bg_streams_daemon(input: FakeDaemonInput) {
     send_bg_events_subscribe(&mut stream, 245, 840).await;
     let late = collect_bg_stream_ends(&mut stream, &[245], 840, STREAM_END_BOUND).await;
     assert_eq!(late, HashSet::from([245]));
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// Waits for the next drain census the module reports for `phase`.
+async fn next_drain_census(
+    events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
+    phase: &str,
+    bound: Duration,
+) -> (usize, Vec<(String, usize)>, String) {
+    let deadline = Instant::now() + bound;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::time::timeout(remaining, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no drain census phase={phase} within {bound:?}"))
+            .expect("lifecycle probe open");
+        if let SubcLifecycleEvent::DrainCensus {
+            phase: seen,
+            held,
+            counts,
+            line,
+        } = event
+        {
+            if seen == phase {
+                return (held, counts, line);
+            }
+        }
+    }
+}
+
+async fn wait_for_file(path: &std::path::Path, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{label} never appeared");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// At the moment of `module.draining` the module holds one of every long-lived
+/// request kind: a `wait: true` bash call, a `block_to_completion` bash call, an
+/// untrusted bash call waiting on the host's permission answer, a bg_events
+/// stream, and a short tool call still running. Every long-lived one must get
+/// its terminal frame well inside the daemon's 30 s drain ceiling; the two bash
+/// commands must keep running as background tasks and still deliver their
+/// completions; the short call must finish normally. The census the module logs
+/// must match exactly what it held.
+async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        lifecycle_events,
+        ..
+    } = open_fake_daemon_session(input).await;
+    let mut lifecycle_events = lifecycle_events.expect("lifecycle probe installed");
+    const WAIT_CHANNEL: u16 = 1;
+    const ASK_CHANNEL: u16 = 2;
+    const HEAVY_CHANNEL: u16 = 3;
+    // Channel 5 is reserved by the bridge dispatch for a failing configure.
+    const BLOCK_CHANNEL: u16 = 6;
+    const BG_CHANNEL: u16 = 245;
+    const WAIT_CORR: u64 = 901;
+    const ASK_CORR: u64 = 902;
+    const BLOCK_CORR: u64 = 903;
+    const BG_CORR: u64 = 904;
+    const HEAVY_CORR: u64 = 905;
+    // Well under the daemon's 30 s drain ceiling; the answers are expected
+    // within one 100 ms bash poll plus frame latency.
+    const TERMINAL_BOUND: Duration = Duration::from_secs(3);
+
+    bind_route1(&mut stream, &root1).await;
+    bind_untrusted_elicitation_route(&mut stream, ASK_CHANNEL, 20, &root1).await;
+    // The heavy call runs on its own root so it cannot occupy the read lane the
+    // bash waits poll on.
+    send_route_bind_with_session(&mut stream, HEAVY_CHANNEL, 30, &root2, "session-heavy").await;
+    expect_route_bind_ack(&mut stream, 30).await;
+    send_route_bind_with_session(&mut stream, BLOCK_CHANNEL, 60, &root1, "session-block").await;
+    expect_route_bind_ack(&mut stream, 60).await;
+    send_route_bind_with_session(&mut stream, BG_CHANNEL, 245, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 245).await;
+
+    // Pending permission ask on the untrusted route.
+    let never_touched = root1.join("drain-ask.txt");
+    send_tool_call(
+        &mut stream,
+        ASK_CHANNEL,
+        ASK_CORR,
+        "bash",
+        json!({ "command": touch_command(&never_touched), "compressed": false }),
+    )
+    .await;
+    let (_ask_corr, _) = expect_bash_elicitation_request(&mut stream, ASK_CHANNEL, "touch").await;
+
+    // Held bg_events stream.
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    settle_bg_streams(
+        &mut stream,
+        &[BG_CHANNEL],
+        BG_CORR,
+        Duration::from_millis(800),
+        "seeding bg_events subscription",
+    )
+    .await;
+
+    // Short tool call still in flight.
+    send_tool_call(
+        &mut stream,
+        HEAVY_CHANNEL,
+        HEAVY_CORR,
+        "semantic_search",
+        json!({ "case": "heavy" }),
+    )
+    .await;
+    state.wait_until("in-flight heavy call started", |inner| inner.heavy_started);
+
+    // Two long foreground bash waits. Each writes a marker as it starts, then
+    // runs well past the terminal bound, then leaves its own sentinel.
+    let wait_started = root1.join("drain-wait-started");
+    let wait_done = root1.join("drain-wait-done");
+    let block_started = root1.join("drain-block-started");
+    let block_done = root1.join("drain-block-done");
+    send_tool_call(
+        &mut stream,
+        WAIT_CHANNEL,
+        WAIT_CORR,
+        "bash",
+        json!({
+            "command": "printf s > drain-wait-started; sleep 6; printf d > drain-wait-done",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "timeout": 60_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    send_tool_call(
+        &mut stream,
+        BLOCK_CHANNEL,
+        BLOCK_CORR,
+        "bash",
+        json!({
+            "command": "printf s > drain-block-started; sleep 6; printf d > drain-block-done",
+            "foreground_orchestrate": true,
+            "block_to_completion": true,
+            "timeout": 60_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    wait_for_file(&wait_started, "wait:true bash start marker").await;
+    wait_for_file(&block_started, "block_to_completion bash start marker").await;
+    // Let both calls move from their spawn job into the foreground wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let drain_started = Instant::now();
+    send_module_draining(&mut stream, Duration::from_secs(30)).await;
+
+    // Every long-lived request answers within the bound.
+    let deadline = drain_started + TERMINAL_BOUND;
+    let mut answered: HashMap<u64, Frame> = HashMap::new();
+    let mut stream_ended = false;
+    while answered.len() < 3 || !stream_ended {
+        let Some(frame) = read_any_frame_until(&mut stream, deadline, "drain terminals").await
+        else {
+            let open = [WAIT_CORR, ASK_CORR, BLOCK_CORR]
+                .into_iter()
+                .filter(|corr| !answered.contains_key(corr))
+                .collect::<Vec<_>>();
+            panic!(
+                "requests still open {TERMINAL_BOUND:?} after module.draining: corrs {open:?}, bg_events ended: {stream_ended}"
+            );
+        };
+        match frame.header.ty {
+            FrameType::Push => {}
+            FrameType::StreamData if frame.header.corr == BG_CORR => {}
+            FrameType::StreamEnd if frame.header.corr == BG_CORR => stream_ended = true,
+            FrameType::Response
+                if [WAIT_CORR, ASK_CORR, BLOCK_CORR].contains(&frame.header.corr) =>
+            {
+                answered.insert(frame.header.corr, frame);
+            }
+            _ => panic!(
+                "unexpected frame while waiting for drain terminals: {:?}",
+                frame.header
+            ),
+        }
+    }
+    eprintln!(
+        "module.draining answered every held request in {:?}",
+        drain_started.elapsed()
+    );
+
+    // The census taken on the notice names exactly what was held.
+    let (held, counts, line) =
+        next_drain_census(&mut lifecycle_events, "start", Duration::from_secs(1)).await;
+    eprintln!("{line}");
+    let expected = vec![
+        ("bash:block".to_string(), 1),
+        ("bash:wait".to_string(), 1),
+        ("bg_events".to_string(), 1),
+        ("permission_ask".to_string(), 1),
+        ("tool:semantic_search".to_string(), 1),
+    ];
+    assert_eq!(counts, expected, "start census: {line}");
+    assert_eq!(held, 5, "start census: {line}");
+    assert!(line.contains("held=5 "), "census line: {line}");
+    for (kind, count) in &expected {
+        assert!(
+            line.contains(&format!("{kind}={count}")),
+            "census line should list {kind}={count}: {line}"
+        );
+    }
+
+    // Both bash waits were detached, not killed: the caller got the task id.
+    let mut task_ids = Vec::new();
+    for corr in [WAIT_CORR, BLOCK_CORR] {
+        let frame = &answered[&corr];
+        assert!(!tool_result_is_error(frame), "bash {corr} errored");
+        let text = tool_result_text(frame);
+        assert!(
+            text.contains("Detached because AFT is restarting"),
+            "bash {corr} text: {text:?}"
+        );
+        let response = tool_response_json(frame);
+        assert_eq!(response["status"], "running", "bash {corr}: {response}");
+        task_ids.push(
+            response["task_id"]
+                .as_str()
+                .expect("detached task id")
+                .to_string(),
+        );
+    }
+    // The permission ask was answered with the retryable restart error and the
+    // command never ran.
+    assert_untrusted_tool_error(
+        &answered[&ASK_CORR],
+        "AFT is restarting",
+        "drained permission ask",
+    );
+    assert!(!never_touched.exists(), "drained ask must not run");
+
+    // The detached tasks are still running.
+    send_tool_call(
+        &mut stream,
+        WAIT_CHANNEL,
+        910,
+        "bash_status",
+        json!({ "task_id": task_ids[0] }),
+    )
+    .await;
+    let status =
+        read_tool_response_allowing_bg_events(&mut stream, 910, BG_CHANNEL, BG_CORR, "status")
+            .await;
+    assert_eq!(
+        status["status"], "running",
+        "detached task status: {status}"
+    );
+    assert!(!wait_done.exists() && !block_done.exists());
+
+    // The short in-flight call was not cut short and completes normally.
+    state.release_heavy();
+    let heavy = read_tool_response_allowing_bg_events(
+        &mut stream,
+        HEAVY_CORR,
+        BG_CHANNEL,
+        BG_CORR,
+        "in-flight heavy response",
+    )
+    .await;
+    assert_eq!(heavy["success"], true);
+
+    // With every request answered the module reports the drain quiesced.
+    let (held, _, line) =
+        next_drain_census(&mut lifecycle_events, "quiesced", Duration::from_secs(3)).await;
+    assert_eq!(held, 0, "quiesced census: {line}");
+
+    // The commands ran to completion and their completions are delivered.
+    wait_for_file(&wait_done, "wait:true bash completion sentinel").await;
+    wait_for_file(&block_done, "block_to_completion bash completion sentinel").await;
+    drain_bg_completions_until(
+        &mut stream,
+        WAIT_CHANNEL,
+        1000,
+        &task_ids[..1],
+        BG_CHANNEL,
+        BG_CORR,
+    )
+    .await;
+    drain_bg_completions_until(
+        &mut stream,
+        BLOCK_CHANNEL,
+        1400,
+        &task_ids[1..],
+        BG_CHANNEL,
+        BG_CORR,
+    )
+    .await;
     send_connection_goodbye(&mut stream).await;
 }
 

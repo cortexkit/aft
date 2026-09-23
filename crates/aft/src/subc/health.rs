@@ -269,6 +269,8 @@ pub(super) struct DispatchPathMetrics {
     pub(super) bash_deferred_queued: AtomicUsize,
     pub(super) bash_poll_touch_queued: AtomicUsize,
     pub(super) deferred_bash_waits_in_flight: AtomicUsize,
+    /// Bash calls whose route request is still waiting for a terminal frame.
+    pub(super) held_bash_calls: super::drain::HeldBashCalls,
     pub(super) reliable_push_budget_deferrals: AtomicU64,
     pub(super) maintenance_budget_deferrals: AtomicU64,
     pub(super) response_tasks_live: AtomicUsize,
@@ -296,6 +298,7 @@ impl DispatchPathMetrics {
             bash_deferred_queued: AtomicUsize::new(0),
             bash_poll_touch_queued: AtomicUsize::new(0),
             deferred_bash_waits_in_flight: AtomicUsize::new(0),
+            held_bash_calls: super::drain::HeldBashCalls::default(),
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),

@@ -6,6 +6,9 @@ use super::*;
 pub(super) struct BashWaitCancel {
     pub(super) connection: PersistentCancelSignal,
     pub(super) route: PersistentCancelSignal,
+    /// Open while the daemon drains this module; a foreground wait that sees it
+    /// detaches its command into a background task and answers at once.
+    pub(super) drain: drain::ModuleDrainWindow,
 }
 
 impl BashWaitCancel {
@@ -246,6 +249,7 @@ pub(super) fn submit_deferred_bash(
     edit_slot_survives: Option<bool>,
     permissions_granted: Option<Vec<String>>,
 ) {
+    metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
     let root_for_spawn = root.clone();
@@ -478,6 +482,14 @@ pub(super) fn submit_deferred_bash(
                 wait_window_ms,
                 detach_on_user_message,
             }) => {
+                let phase = if detach_on_user_message {
+                    drain::BashHoldPhase::Wait
+                } else if block_to_completion {
+                    drain::BashHoldPhase::Block
+                } else {
+                    drain::BashHoldPhase::Foreground
+                };
+                task_metrics.held_bash_calls.set_phase(route, corr, phase);
                 let _deferred_wait = DeferredBashWaitGuard::new(&task_metrics);
                 run_deferred_bash_wait(
                     executor,
@@ -602,7 +614,13 @@ async fn run_deferred_bash_wait(
                 let detach_pending = detach_on_user_message
                     && registry.wait_mode_detach_pending(&session_id);
                 let promotion_due = !block_to_completion && Instant::now() >= deadline;
-                if !target_finished && !detach_pending && !promotion_due {
+                // While the module drains, every foreground wait (wait:true,
+                // block_to_completion, or a plain wait window) is detached into
+                // a background task so its request can answer before the drain
+                // deadline. The command keeps running and its completion is
+                // delivered like any promoted task's.
+                let drain_detach_due = cancel.drain.is_active();
+                if !target_finished && !detach_pending && !promotion_due && !drain_detach_due {
                     continue;
                 }
                 let (poll_control_tx, poll_control_rx) = oneshot::channel::<BashPollControl>();
@@ -658,6 +676,35 @@ async fn run_deferred_bash_wait(
                                 );
                             };
 
+                            if drain_detach_due && !snapshot.info.status.is_terminal() {
+                                let response =
+                                    crate::commands::bash_orchestrate::detach_bash_for_module_drain(
+                                        ctx,
+                                        &task_id_for_poll,
+                                        &session_for_poll,
+                                        &request_id_for_poll,
+                                    );
+                                if detach_on_user_message {
+                                    ctx.bash_background().end_wait_mode_session(
+                                        &session_for_poll,
+                                        &task_id_for_poll,
+                                    );
+                                } else {
+                                    ctx.bash_background().unregister_foreground_task(
+                                        &session_for_poll,
+                                        &task_id_for_poll,
+                                    );
+                                }
+                                return finish_bash_poll_done(
+                                    response,
+                                    ctx,
+                                    &session_for_poll,
+                                    &format_context_for_poll,
+                                    &mut poll_text_tx,
+                                    &mut poll_control_tx,
+                                    false,
+                                );
+                            }
                             if detach_on_user_message
                                 && !snapshot.info.status.is_terminal()
                                 && ctx
@@ -918,6 +965,7 @@ pub(super) async fn handle_bash_deferred_completion(
     shutdown: &Arc<Notify>,
     metrics: &DispatchPathMetrics,
 ) -> Result<(), SubcError> {
+    metrics.held_bash_calls.remove(done.route, done.corr);
     if let Some(meta) = live_roots.get_mut(&done.root) {
         meta.active_bash_waits = meta.active_bash_waits.saturating_sub(1);
         meta.note_activity();
@@ -976,6 +1024,31 @@ pub(super) fn bash_denied_untrusted_completion(
     format_context: crate::subc_format::FormatContext,
 ) -> BashDeferredCompletion {
     let response = bash_denied_untrusted_response(request_id.clone());
+    BashDeferredCompletion {
+        route,
+        corr,
+        flags,
+        ver,
+        root,
+        request_id,
+        result: Some(bash_result_from_response(response, &format_context)),
+        fatal: false,
+    }
+}
+
+/// Terminal for a bash call answered early because the module is draining. The
+/// command never ran, so the retryable error is safe to retry.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn bash_module_draining_completion(
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    format_context: crate::subc_format::FormatContext,
+) -> BashDeferredCompletion {
+    let response = drain::module_draining_response(&request_id, "bash");
     BashDeferredCompletion {
         route,
         corr,
@@ -1107,7 +1180,11 @@ mod grant_path_tests {
                     "timeout": 5_000,
                 }),
                 crate::subc_format::FormatContext::default(),
-                BashWaitCancel { connection, route },
+                BashWaitCancel {
+                    connection,
+                    route,
+                    drain: drain::ModuleDrainWindow::default(),
+                },
                 BindTrust::FirstParty,
                 crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
                 None,

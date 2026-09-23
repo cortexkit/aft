@@ -146,6 +146,7 @@ type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod bash;
+mod drain;
 mod health;
 mod manifest;
 mod push;
@@ -191,6 +192,14 @@ pub enum SubcLifecycleEvent {
         task_id: String,
         session_id: String,
     },
+    /// One drain census, exactly as logged: `held` route-held requests broken
+    /// down by kind in `counts`.
+    DrainCensus {
+        phase: String,
+        held: usize,
+        counts: Vec<(String, usize)>,
+        line: String,
+    },
 }
 
 /// Test-only observer for the detach/rebind lifecycle.
@@ -218,6 +227,15 @@ impl SubcTestLifecycleProbe {
             route_channel: route.channel,
             route_epoch: route.epoch,
             session_id: session_id.to_string(),
+        });
+    }
+
+    fn drain_census(&self, phase: &str, census: &drain::HeldRequestCensus, line: &str) {
+        let _ = self.events_tx.send(SubcLifecycleEvent::DrainCensus {
+            phase: phase.to_string(),
+            held: census.total(),
+            counts: census.counts(),
+            line: line.to_string(),
         });
     }
 
@@ -276,6 +294,9 @@ struct ActiveToolCall {
     root_id: ProjectRootId,
     cancellation: JobCancellation,
     detach_policy: RouteDetachPolicy,
+    /// Tool name and submission time, reported by the drain census.
+    tool: String,
+    started_at: Instant,
 }
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<(RouteChannel, u64), ActiveToolCall>>>;
@@ -320,6 +341,8 @@ struct PendingSubcResponse {
     pending: PendingResponse,
     surface_downgraded: bool,
     phase_trace: PhaseTrace,
+    /// When the deferred response was handed to the module loop.
+    held_since: Instant,
 }
 
 struct ResolvedSubcResponse {
@@ -416,6 +439,32 @@ impl PendingSubcResponses {
         resolved
     }
 
+    /// Answers every waiting deferred response at once because the module is
+    /// draining: each gets its own shutdown terminal, or a retryable
+    /// `module_reloading` error when it has none, and its background work is
+    /// cancelled. Deferred responses are read-only (`inspect`, LSP navigation),
+    /// so the caller can retry on the restarted module.
+    fn drain_for_module_drain(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
+        let mut resolved = Vec::with_capacity(self.entries.len());
+        for mut entry in self.entries.drain(..) {
+            if let Some(cancellation) = &entry.pending.cancellation {
+                cancellation.request_cancel();
+            }
+            let shutdown_terminal = executor.actor_context(&entry.root).and_then(|ctx| {
+                entry
+                    .pending
+                    .on_shutdown
+                    .as_mut()
+                    .map(|on_shutdown| on_shutdown(&ctx))
+            });
+            let response = shutdown_terminal.unwrap_or_else(|| {
+                drain::module_draining_response(&entry.pending.request_id, &entry.bare_name)
+            });
+            resolved.push(ResolvedSubcResponse { entry, response });
+        }
+        resolved
+    }
+
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -489,6 +538,7 @@ fn submit_active_tool_call(
     lane: Lane,
     request_id: String,
     detach_policy: RouteDetachPolicy,
+    tool: &str,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let (rx, cancellation) =
@@ -502,6 +552,8 @@ fn submit_active_tool_call(
                 root_id,
                 cancellation,
                 detach_policy,
+                tool: tool.to_string(),
+                started_at: Instant::now(),
             },
         );
     rx
@@ -902,6 +954,7 @@ struct PendingBashAsk {
     format_context: crate::subc_format::FormatContext,
     cancel: bash::BashWaitCancel,
     grants: Vec<String>,
+    asked_at: Instant,
     expires_at: Instant,
 }
 
@@ -1923,6 +1976,81 @@ async fn settle_all_pending_bash_asks(
     Ok(())
 }
 
+/// Answers every pending permission ask with the retryable restart error when
+/// the module starts draining. The host may never answer an ask, and each one
+/// keeps its bash call open; the command has not run, so a retry is safe. A late
+/// host reply finds no pending ask and is dropped.
+#[allow(clippy::too_many_arguments)]
+async fn settle_pending_bash_asks_for_module_drain(
+    tx: &WriterSender,
+    pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let pending = pending_bash_asks
+        .drain()
+        .map(|(_, pending)| pending)
+        .collect::<Vec<_>>();
+    for pending in pending {
+        let completion = bash::bash_module_draining_completion(
+            pending.route,
+            pending.tool_corr,
+            pending.tool_flags,
+            pending.tool_ver,
+            pending.root,
+            pending.request_id,
+            pending.format_context,
+        );
+        bash::handle_bash_deferred_completion(
+            tx,
+            completion,
+            routes,
+            live_roots,
+            route_bash_cancels,
+            shutdown,
+            metrics,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Sends a terminal for every waiting deferred response because the module is
+/// draining. Returns how many were answered.
+#[allow(clippy::too_many_arguments)]
+async fn answer_deferred_responses_for_module_drain(
+    tx: &WriterSender,
+    pending_responses: &mut PendingSubcResponses,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: &Executor,
+    active_tool_calls: &ActiveToolCalls,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+    tool_response_body_limit: usize,
+) -> Result<usize, SubcError> {
+    let resolved = pending_responses.drain_for_module_drain(executor);
+    let answered = resolved.len();
+    for resolved in resolved {
+        deliver_resolved_subc_response(
+            tx,
+            resolved,
+            routes,
+            live_roots,
+            executor,
+            active_tool_calls,
+            shutdown,
+            metrics,
+            tool_response_body_limit,
+        )
+        .await?;
+    }
+    Ok(answered)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn expire_pending_bash_asks(
     tx: &WriterSender,
@@ -2205,24 +2333,6 @@ async fn end_bg_subscription(
         push::send_reliable_bg_stream_end(writer_tx, metrics, channel, &sub).await?;
     }
     Ok(())
-}
-
-/// Upper bound on how long one `module.draining` notice keeps ending new
-/// bg_events subscriptions. The daemon's own drain ceiling is 30 s; the cap only
-/// guards against a nonsensical deadline leaving wakes switched off for good if
-/// the daemon abandons the drain and keeps this module.
-const MODULE_DRAINING_WINDOW_CAP: Duration = Duration::from_secs(120);
-
-/// Converts the daemon's wall-clock drain deadline (Unix milliseconds) into a
-/// local monotonic instant, capped by [`MODULE_DRAINING_WINDOW_CAP`]. A deadline
-/// already in the past yields `now`, which ends no later subscription.
-fn draining_window_end(deadline_ms: u64) -> Instant {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
-    Instant::now() + remaining.min(MODULE_DRAINING_WINDOW_CAP)
 }
 
 /// Ends every held bg_events subscription with a clean StreamEnd when the daemon
@@ -3170,9 +3280,11 @@ where
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
-    // Set by the daemon's `module.draining` notice; until then (bounded by the
-    // drain deadline) new bg_events subscriptions are ended immediately.
-    let mut module_draining_until: Option<Instant> = None;
+    // Opened by the daemon's `module.draining` notice (bounded by the drain
+    // deadline). While open, new bg_events subscriptions and permission asks
+    // are answered at once and foreground bash waits detach to the background.
+    let module_drain = drain::ModuleDrainWindow::default();
+    let mut drain_progress: Option<drain::DrainProgress> = None;
     let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
@@ -3298,6 +3410,36 @@ where
             }
 
             next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
+
+            if let Some(progress) = drain_progress.as_mut() {
+                if !progress.quiesced_reported || !progress.deadline_reported {
+                    let census = drain::held_request_census(
+                        &active_tool_calls,
+                        &pending_responses,
+                        &dispatch_path_metrics,
+                        &pending_bash_asks,
+                        &bg_subs,
+                        &pending_binds,
+                        control_replies.len(),
+                    );
+                    if !progress.quiesced_reported && census.total() == 0 {
+                        progress.quiesced_reported = true;
+                        drain::report_drain_census(
+                            drain::DRAIN_PHASE_QUIESCED,
+                            &census,
+                            lifecycle_probe.as_ref(),
+                        );
+                    }
+                    if !progress.deadline_reported && Instant::now() >= progress.until {
+                        progress.deadline_reported = true;
+                        drain::report_drain_census(
+                            drain::DRAIN_PHASE_DEADLINE,
+                            &census,
+                            lifecycle_probe.as_ref(),
+                        );
+                    }
+                }
+            }
         }
 
         // A lossy emitter may place its newest update in the overflow buffer
@@ -3562,8 +3704,7 @@ where
                                 &deferred_response_tx,
                                 allow_native_passthrough,
                                 tool_response_body_limit,
-                                module_draining_until
-                                    .is_some_and(|until| Instant::now() < until),
+                                &module_drain,
                             )
                             .await
                         };
@@ -3616,7 +3757,29 @@ where
                     FrameType::Push if frame.header.channel == 0 => {
                         match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
                             Ok(ModuleControlCommand::Draining { reason, deadline_ms }) => {
-                                module_draining_until = Some(draining_window_end(deadline_ms));
+                                let census = drain::held_request_census(
+                                    &active_tool_calls,
+                                    &pending_responses,
+                                    &dispatch_path_metrics,
+                                    &pending_bash_asks,
+                                    &bg_subs,
+                                    &pending_binds,
+                                    control_replies.len(),
+                                );
+                                drain::report_drain_census(
+                                    drain::DRAIN_PHASE_START,
+                                    &census,
+                                    lifecycle_probe.as_ref(),
+                                );
+                                let until = drain::draining_window_end(deadline_ms);
+                                // Opening the window is what detaches foreground
+                                // bash waits: each checks it on its next poll.
+                                module_drain.begin(until);
+                                drain_progress = Some(drain::DrainProgress {
+                                    until,
+                                    quiesced_reported: false,
+                                    deadline_reported: false,
+                                });
                                 let ended = match end_bg_subscriptions_for_drain(
                                     &writer_tx,
                                     &dispatch_path_metrics,
@@ -3630,8 +3793,52 @@ where
                                     Ok(ended) => ended,
                                     Err(error) => break Err(error),
                                 };
+                                let asks = pending_bash_asks.len();
+                                if let Err(error) = settle_pending_bash_asks_for_module_drain(
+                                    &writer_tx,
+                                    &mut pending_bash_asks,
+                                    &routes,
+                                    &mut live_roots,
+                                    &mut route_bash_cancels,
+                                    &shutdown,
+                                    &dispatch_path_metrics,
+                                )
+                                .await
+                                {
+                                    break Err(error);
+                                }
+                                let deferred = match answer_deferred_responses_for_module_drain(
+                                    &writer_tx,
+                                    &mut pending_responses,
+                                    &routes,
+                                    &mut live_roots,
+                                    executor.as_ref(),
+                                    &active_tool_calls,
+                                    &shutdown,
+                                    &dispatch_path_metrics,
+                                    tool_response_body_limit,
+                                )
+                                .await
+                                {
+                                    Ok(deferred) => deferred,
+                                    Err(error) => break Err(error),
+                                };
                                 log::info!(
-                                    "subc attach: module draining (reason={reason:?}); ended {ended} held bg_events stream(s) so the drain can quiesce"
+                                    "subc attach: module draining (reason={reason:?}); ended {ended} held bg_events stream(s), answered {asks} permission ask(s) and {deferred} deferred response(s), detaching foreground bash waits so the drain can quiesce"
+                                );
+                                let census = drain::held_request_census(
+                                    &active_tool_calls,
+                                    &pending_responses,
+                                    &dispatch_path_metrics,
+                                    &pending_bash_asks,
+                                    &bg_subs,
+                                    &pending_binds,
+                                    control_replies.len(),
+                                );
+                                drain::report_drain_census(
+                                    drain::DRAIN_PHASE_RELEASED,
+                                    &census,
+                                    lifecycle_probe.as_ref(),
                                 );
                             }
                             Err(error) => {
@@ -3656,6 +3863,25 @@ where
                     )
                 {
                     pending_responses.register(pending);
+                    // A deferred response that starts during a drain would hold
+                    // it open for up to its own two-minute deadline.
+                    if module_drain.is_active() {
+                        if let Err(error) = answer_deferred_responses_for_module_drain(
+                            &writer_tx,
+                            &mut pending_responses,
+                            &routes,
+                            &mut live_roots,
+                            executor.as_ref(),
+                            &active_tool_calls,
+                            &shutdown,
+                            &dispatch_path_metrics,
+                            tool_response_body_limit,
+                        )
+                        .await
+                        {
+                            break Err(error);
+                        }
+                    }
                 } else {
                     if let Some(cancellation) = &pending.pending.cancellation {
                         cancellation.request_cancel();
@@ -3907,6 +4133,22 @@ where
     };
 
     shared_app.set_open_route_count(0);
+    if drain_progress.is_some() {
+        let census = drain::held_request_census(
+            &active_tool_calls,
+            &pending_responses,
+            &dispatch_path_metrics,
+            &pending_bash_asks,
+            &bg_subs,
+            &pending_binds,
+            control_replies.len(),
+        );
+        drain::report_drain_census(
+            drain::DRAIN_PHASE_CONNECTION_END,
+            &census,
+            lifecycle_probe.as_ref(),
+        );
+    }
     health_rollup_worker.shutdown();
     // The flip retries until accepted; the connection ending is what stops it.
     if let Some(task) = readiness_task {
@@ -5401,8 +5643,9 @@ async fn handle_tool_call(
     deferred_response_tx: &mpsc::UnboundedSender<PendingSubcResponse>,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
-    module_draining: bool,
+    module_drain: &drain::ModuleDrainWindow,
 ) -> Result<(), SubcError> {
+    let module_draining = module_drain.is_active();
     let route_id = route_key(frame.header.channel, frame.header.epoch);
     if pending_binds.contains_key(&route_id) {
         let error = build_error_frame(
@@ -5653,6 +5896,28 @@ async fn handle_tool_call(
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
+        if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
+            // A permission ask sent now would hold this call open across the
+            // drain; the command has not run, so answer with the retryable
+            // restart error instead.
+            let response = drain::module_draining_response(&request_id, &bare_name);
+            let text = crate::subc_format::format_response_with_context(
+                &bare_name,
+                &response,
+                &format_context,
+            );
+            let result = ToolCallResult { text, response };
+            let response_frame = build_tool_response_frame_with_limit(
+                frame.header.ver,
+                route_id,
+                frame.header.corr,
+                frame.header.flags,
+                &result,
+                bind_trust,
+                tool_response_body_limit,
+            )?;
+            return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+        }
         if matches!(bind_trust, BindTrust::Untrusted) {
             let plan = match bash::prepare_bash_elicitation_plan(
                 &arguments,
@@ -5714,6 +5979,7 @@ async fn handle_tool_call(
             let cancel = bash::BashWaitCancel {
                 connection: connection_cancel.clone(),
                 route: route_cancel.token.clone(),
+                drain: module_drain.clone(),
             };
             pending_bash_asks.insert(
                 ReverseCorrKey {
@@ -5735,6 +6001,7 @@ async fn handle_tool_call(
                     format_context,
                     cancel,
                     grants: plan.grants,
+                    asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
             );
@@ -5759,6 +6026,7 @@ async fn handle_tool_call(
         let cancel = bash::BashWaitCancel {
             connection: connection_cancel.clone(),
             route: route_cancel.token.clone(),
+            drain: module_drain.clone(),
         };
 
         bash::submit_deferred_bash(
@@ -5921,6 +6189,7 @@ async fn handle_tool_call(
             lane,
             request_id.clone(),
             RouteDetachPolicy::CancelOnDetach,
+            &bare_name,
             job,
         );
 
@@ -5958,6 +6227,7 @@ async fn handle_tool_call(
                         pending,
                         surface_downgraded,
                         phase_trace,
+                        held_since: Instant::now(),
                     };
                     if let Err(error) = deferred_response_tx.send(pending) {
                         if let Some(cancellation) = &error.0.pending.cancellation {
@@ -6111,6 +6381,7 @@ async fn handle_tool_call(
         lane,
         request_id.clone(),
         RouteDetachPolicy::RetainForReplay,
+        &bare_name_for_frame,
         job,
     );
     let completion_tx = tx.clone();
@@ -6813,6 +7084,7 @@ pub(crate) mod test_support {
             pending,
             surface_downgraded: false,
             phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
         });
 
         assert!(registry.cancel_request(route, 71));
@@ -6896,6 +7168,8 @@ pub(crate) mod test_support {
                 root_id: root.clone(),
                 cancellation,
                 detach_policy: RouteDetachPolicy::CancelOnDetach,
+                tool: "inspect".to_string(),
+                started_at: Instant::now(),
             },
         );
         started_rx
@@ -7016,6 +7290,7 @@ pub(crate) mod test_support {
             Lane::PureRead,
             "tracked-search".to_string(),
             RouteDetachPolicy::RetainForReplay,
+            "search",
             Box::new(move |_| {
                 tracked_started_tx.send(()).expect("signal tracked search");
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -7051,6 +7326,7 @@ pub(crate) mod test_support {
             Lane::PureRead,
             "teardown-terminal".to_string(),
             RouteDetachPolicy::CancelOnDetach,
+            "inspect",
             Box::new(move |_| {
                 terminal_started_tx
                     .send(())
@@ -7160,6 +7436,7 @@ pub(crate) mod test_support {
             pending,
             surface_downgraded: false,
             phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
         });
         let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::from([(
             (route, 42),
@@ -7167,6 +7444,8 @@ pub(crate) mod test_support {
                 root_id: root.clone(),
                 cancellation,
                 detach_policy: RouteDetachPolicy::CancelOnDetach,
+                tool: "inspect".to_string(),
+                started_at: Instant::now(),
             },
         )])));
 
@@ -7185,6 +7464,152 @@ pub(crate) mod test_support {
         }
         assert!(active.lock().expect("active calls").is_empty());
         assert!(executor.actor_is_idle(&root));
+    }
+
+    /// On `module.draining` every waiting deferred response gets a terminal at
+    /// once: inspect its own shutdown terminal, navigation (which has none) the
+    /// retryable restart error. The census counts each deferred call once even
+    /// though it is also an active tool call, and reports ordinary calls apart.
+    #[test]
+    fn module_drain_answers_deferred_inspect_and_navigation_with_terminals() {
+        let _inspect_serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _navigation_serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let executor = Arc::new(Executor::new());
+        let (inspect_dir, inspect_root) = test_root("drain-deferred-inspect");
+        std::fs::write(inspect_dir.path().join("README.md"), "# Fixture\n").expect("fixture");
+        let inspect_ctx = inspect_context(inspect_dir.path());
+        executor.register_actor(inspect_root.clone(), Arc::clone(&inspect_ctx));
+        let (navigation_dir, navigation_root) = test_root("drain-deferred-navigation");
+        let (navigation_ctx, source) = cold_navigation_context(navigation_dir.path());
+        executor.register_actor(navigation_root.clone(), Arc::clone(&navigation_ctx));
+
+        let (inspect_started_rx, _inspect_release) =
+            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+        let (inspect_pending, inspect_cancellation) = submit_deferred_inspect_setup(
+            &executor,
+            &inspect_root,
+            &inspect_ctx,
+            "subc-inspect-drain",
+        );
+        inspect_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached inspect reaches its gate");
+        let (navigation_started_rx, _navigation_release) =
+            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+        let (navigation_pending, navigation_cancellation) = submit_deferred_navigation_setup(
+            &executor,
+            &navigation_root,
+            &navigation_ctx,
+            &source,
+            "subc-navigation-drain",
+        );
+        navigation_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached navigation reaches its gate");
+
+        let route = RouteChannel {
+            channel: 9,
+            epoch: 1,
+        };
+        let entry =
+            |corr: u64, root: &ProjectRootId, name: &str, dir: &Path, pending: PendingResponse| {
+                PendingSubcResponse {
+                    route,
+                    corr,
+                    flags: Flags::new(false, Priority::Passive, false),
+                    ver: PROTOCOL_VERSION,
+                    root: root.clone(),
+                    session_id: "drain-session".to_string(),
+                    bare_name: name.to_string(),
+                    format_context: crate::subc_format::FormatContext::from_tool_call(
+                        name,
+                        &json!({}),
+                        dir,
+                    ),
+                    bind_trust: BindTrust::FirstParty,
+                    pending,
+                    surface_downgraded: false,
+                    phase_trace: PhaseTrace::new(Instant::now()),
+                    held_since: Instant::now(),
+                }
+            };
+        let mut registry = PendingSubcResponses::default();
+        registry.register(entry(
+            51,
+            &inspect_root,
+            "inspect",
+            inspect_dir.path(),
+            inspect_pending,
+        ));
+        registry.register(entry(
+            52,
+            &navigation_root,
+            "lsp_hover",
+            navigation_dir.path(),
+            navigation_pending,
+        ));
+        let active_call = |root: &ProjectRootId, cancellation, tool: &str| ActiveToolCall {
+            root_id: root.clone(),
+            cancellation,
+            detach_policy: RouteDetachPolicy::CancelOnDetach,
+            tool: tool.to_string(),
+            started_at: Instant::now(),
+        };
+        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::from([
+            (
+                (route, 51),
+                active_call(&inspect_root, inspect_cancellation, "inspect"),
+            ),
+            (
+                (route, 52),
+                active_call(&navigation_root, navigation_cancellation, "lsp_hover"),
+            ),
+            (
+                (route, 53),
+                active_call(&inspect_root, JobCancellation::new(), "grep"),
+            ),
+        ])));
+
+        let census = drain::held_request_census(
+            &active,
+            &registry,
+            &DispatchPathMetrics::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            0,
+        );
+        assert_eq!(
+            census.counts(),
+            vec![
+                ("deferred:inspect".to_string(), 1),
+                ("deferred:lsp_hover".to_string(), 1),
+                ("tool:grep".to_string(), 1),
+            ]
+        );
+
+        let resolved = registry.drain_for_module_drain(executor.as_ref());
+        assert!(registry.is_empty());
+        let by_corr = resolved
+            .iter()
+            .map(|resolved| (resolved.entry.corr, &resolved.response))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_corr.len(), 2);
+        assert_eq!(by_corr[&51].data["failure_reason"], "daemon_shutdown");
+        assert!(!by_corr[&52].success);
+        assert_eq!(by_corr[&52].data["code"], drain::MODULE_DRAINING_ERROR_CODE);
+        assert_eq!(by_corr[&52].data["retryable"], true);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while crate::commands::inspect::deferred_inspect_root_count_for_test() != 0
+            || crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "drain did not cancel the detached deferred work"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     pub(super) fn wait_for_watcher_count(ctx: &AppContext, expected: usize) {
