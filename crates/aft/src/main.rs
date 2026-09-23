@@ -37,6 +37,9 @@ const SUBC_CONNECTION_LOST_EXIT_CODE: i32 = 3;
 /// Distinct from a lost connection so the supervisor's ledger separates "the
 /// daemon went away" from "a worker panicked"; both must respawn.
 const SUBC_ACTOR_FATAL_EXIT_CODE: i32 = 4;
+/// Cap on a request parse error's text in the log. serde's message is normally
+/// a short position report, but a type mismatch quotes the offending value.
+const PARSE_ERROR_LOG_BYTES: usize = 200;
 
 /// Parse `--subc <connection-file>` / `--subc=<path>` from argv. Returns `None`
 /// when absent (standalone mode). The presence of the flag is the subc-mode
@@ -466,7 +469,17 @@ fn main() {
                 }
             }
             Err(e) => {
-                aft::slog_error!("parse error: {} — input: {}", e, trimmed);
+                // Never log the raw line: a malformed request can still carry
+                // bash command text, file contents for write/edit, or search
+                // queries. Length and a short hash are enough to correlate it
+                // with a copy the client kept. The parser error itself is
+                // bounded because serde can quote a mistyped value in it.
+                let error_text = e.to_string();
+                aft::slog_error!(
+                    "parse error: {} ({})",
+                    aft::log_redact::truncate_for_log(&error_text, PARSE_ERROR_LOG_BYTES),
+                    aft::log_redact::unlogged_input_summary(trimmed)
+                );
                 Some(Response::error(
                     "_parse_error",
                     "parse_error",

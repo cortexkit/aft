@@ -122,6 +122,33 @@ pub fn aft_redact_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// Cut `text` to at most `max_bytes` (on a char boundary) and note how much
+/// was dropped as `…(+N bytes)`. Used for payloads that are useful to glimpse
+/// in a debug line but can be arbitrarily large (LSP params, parser errors).
+pub fn truncate_for_log(text: &str, max_bytes: usize) -> Cow<'_, str> {
+    if text.len() <= max_bytes {
+        return Cow::Borrowed(text);
+    }
+    let mut cut = max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Cow::Owned(format!(
+        "{}…(+{} bytes)",
+        &text[..cut],
+        text.len() - cut
+    ))
+}
+
+/// Describe a request line that must not itself be logged: its byte length and
+/// a short SHA-256 prefix, enough to correlate with a copy the caller kept.
+pub fn unlogged_input_summary(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let short: String = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("bytes={} sha256={short}", input.len())
+}
+
 /// A `key=` value is treated as a secret when it is long, uses only
 /// token-safe characters, and mixes digits with upper- and lower-case letters
 /// (an API key such as `AIzaSy…`). Words, paths and single-case hex hashes do
@@ -272,6 +299,22 @@ mod tests {
             let out = aft_redactor(line);
             assert!(matches!(out, Cow::Borrowed(_)), "mangled: {line} -> {out}");
         }
+    }
+
+    #[test]
+    fn truncate_for_log_bounds_bytes_and_reports_the_remainder() {
+        assert_eq!(truncate_for_log("short", 10), "short");
+        assert_eq!(truncate_for_log("abcdefghij", 4), "abcd…(+6 bytes)");
+        // "é" is two bytes; the cut backs off to the char boundary.
+        assert_eq!(truncate_for_log("aéb", 2), "a…(+3 bytes)");
+    }
+
+    #[test]
+    fn unlogged_input_summary_carries_length_and_hash_only() {
+        let summary = unlogged_input_summary("{\"command\":\"secret\"");
+        assert!(summary.starts_with("bytes=20 sha256="), "{summary}");
+        assert_eq!(summary.len(), "bytes=20 sha256=".len() + 12);
+        assert!(!summary.contains("secret"));
     }
 
     #[test]
