@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "log-content-hardening",
+    "contribution-gate-caller",
+    "sentinel-daemon-down",
+    "write-census-cold-staging",
+    "train-push-skew-classifier"
+  ],
+  "note": "The only fence file is crates/aft/src/lib.rs, which gains the `log_redact` module declaration for the durable-log credential redactor. The rest is logging, CI and tooling: no engine, corpus, indexed-content or ranking change."
+}
