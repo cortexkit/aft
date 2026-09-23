@@ -8696,6 +8696,10 @@ mod tests {
             {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows gives an accepted socket the listener's non-blocking mode, so a
+                        // read before the request arrives returns WouldBlock and the handler drops
+                        // the connection mid-request. Serve each request in blocking mode.
+                        let _ = stream.set_nonblocking(false);
                         requests_for_thread.fetch_add(1, Ordering::SeqCst);
                         handlers.push(thread::spawn(move || {
                             let mut request = [0u8; 4096];
@@ -8759,6 +8763,10 @@ mod tests {
                 while !thread_shutdown.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // Windows gives an accepted socket the listener's non-blocking mode, so a
+                            // read before the request arrives returns WouldBlock and the handler drops
+                            // the connection mid-request. Serve each request in blocking mode.
+                            let _ = stream.set_nonblocking(false);
                             let delay = Arc::clone(&thread_delay);
                             let never = Arc::clone(&thread_never);
                             let requests = Arc::clone(&thread_requests);
@@ -8992,6 +9000,10 @@ mod tests {
         rejection: &TestEmbeddingRejection,
         requests: &Arc<Mutex<Vec<Vec<String>>>>,
     ) {
+        // Windows gives an accepted socket the listener's non-blocking mode, so a
+        // read before the request arrives returns WouldBlock and the handler drops
+        // the connection mid-request. Serve each request in blocking mode.
+        let _ = stream.set_nonblocking(false);
         let mut buf = Vec::new();
         let mut chunk = [0u8; 4096];
         let mut header_end = None;
@@ -9221,6 +9233,10 @@ mod tests {
             while accepted < attempts && std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows gives an accepted socket the listener's non-blocking mode, so a
+                        // read before the request arrives returns WouldBlock and the handler drops
+                        // the connection mid-request. Serve each request in blocking mode.
+                        let _ = stream.set_nonblocking(false);
                         accepted += 1;
                         let mut buf = [0u8; 4096];
                         // The client (under test) uses a 250ms timeout and drops
