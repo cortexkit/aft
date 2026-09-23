@@ -1772,9 +1772,19 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   // disabled_tools governs WHICH AFT TOOLS the agent sees — a hostile repo
   // disabling tools is a mild annoyance, not a security boundary, so the
   // union is acceptable here.
+  const protectedTools = new Set([
+    "aft_safety",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "grep",
+    "glob",
+    "bash",
+  ]);
   const disabledTools = [
     ...(base.disabled_tools ?? []),
-    ...(override.disabled_tools ?? []).filter((tool: string) => tool !== "aft_safety"),
+    ...(override.disabled_tools ?? []).filter((tool: string) => !protectedTools.has(tool)),
   ];
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
@@ -1818,7 +1828,9 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     semantic,
     ...(bridge !== undefined ? { bridge } : {}),
     // Union — both levels contribute to the disabled set
-    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)].sort() } : {}),
+    ...(base.disabled_tools !== undefined || override.disabled_tools !== undefined
+      ? { disabled_tools: [...new Set(disabledTools)].sort() }
+      : {}),
   };
 }
 

@@ -1145,17 +1145,17 @@ fn merge_disabled_tools(base: &mut Option<Vec<String>>, override_tools: Option<V
             merged.push(tool.clone());
         }
     }
-    for tool in override_tools
-        .iter()
-        .filter(|tool| tool.as_str() != "aft_safety")
-    {
+    for tool in override_tools.iter().filter(|tool| {
+        !matches!(
+            tool.as_str(),
+            "aft_safety" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "bash"
+        )
+    }) {
         if seen.insert(tool.clone()) {
             merged.push(tool.clone());
         }
     }
-    if !merged.is_empty() {
-        *base = Some(merged);
-    }
+    *base = Some(merged);
 }
 
 fn merge_semantic_config(
@@ -3325,6 +3325,30 @@ mod tests {
             .disabled_tools
             .iter()
             .any(|tool| tool == "aft_search"));
+    }
+
+    #[test]
+    fn project_empty_disabled_list_preserves_explicit_presence() {
+        let result = resolve_config(&[
+            tier("user", r#"{ "disabled_tools": [] }"#),
+            tier("project", r#"{ "disabled_tools": [] }"#),
+        ]);
+        assert!(result.config.disabled_tools.is_empty());
+
+        let project_only = resolve_config(&[tier("project", r#"{ "disabled_tools": [] }"#)]);
+        assert!(project_only.config.disabled_tools.is_empty());
+    }
+
+    #[test]
+    fn project_disabled_tools_cannot_remove_host_slots() {
+        let result = resolve_config(&[
+            tier("user", r#"{ "disabled_tools": ["write"] }"#),
+            tier(
+                "project",
+                r#"{ "disabled_tools": ["read", "bash", "aft_safety", "aft_zoom"] }"#,
+            ),
+        ]);
+        assert_eq!(result.config.disabled_tools, ["write", "aft_zoom"]);
     }
 
     #[test]

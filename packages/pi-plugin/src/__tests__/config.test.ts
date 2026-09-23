@@ -67,6 +67,24 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("preserves explicit empty disables and ignores project host-slot disables", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ disabled_tools: [] }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ disabled_tools: [] }));
+    expect(
+      JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).disabled_tools,
+    ).toEqual([]);
+
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ disabled_tools: ["read", "bash", "aft_zoom"] }),
+    );
+    expect(
+      JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).disabled_tools,
+    ).toEqual(["aft_zoom"]);
+  });
+
   test("github honors only the user tier and warns for project overrides", () => {
     const fixture = createConfigFixture();
     const env = { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome };
