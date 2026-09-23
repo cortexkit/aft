@@ -76,6 +76,8 @@ export type SentinelState = {
   previous?: { pid?: number; free_bytes?: number; available_bytes?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
   /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
   ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
+  /** Consecutive ticks each instrument fingerprint has failed; see gateInstrumentFindings. */
+  instrument_failures?: Record<string, number>;
 };
 
 const HOME = homedir();
@@ -112,7 +114,50 @@ function finding(rule: string, severity: Severity, fingerprint: string, text: st
   return { rule, severity, fingerprint, text, clears_when };
 }
 function instrument(name: string, detail: string): Finding {
-  return finding("instrument", "WARNING", `instrument:${name}`, `instrument ${name} unavailable: ${detail}`, "the input is readable again");
+  return finding("instrument", "WARNING", `instrument:${name}`, `instrument ${name} unavailable: ${instrumentErrorText(detail)}`, "the input is readable again");
+}
+// The aft CLI writes its own log lines to stderr (for example
+// "[aft] log retention sweep: ..." or "[aft] login-shell PATH probe: ...",
+// optionally behind a UTC timestamp). A failing command's stderr therefore
+// carries those lines ahead of the line that explains the failure, and
+// String(error) prefixes the first one with "Error: ".
+const CLI_LOG_LINE = /^(?:Error:\s*)?(?:\d{4}-\d\d-\d\dT\S+\s+)?\[aft(?:-lsp)?\]\s/;
+/** Drop CLI log lines from an instrument error, keeping the lines that explain the failure. */
+export function instrumentErrorText(detail: string): string {
+  const kept = detail.split("\n").filter((line) => line.trim() !== "" && !CLI_LOG_LINE.test(line));
+  // If every line was a log line, the original text is still better than nothing.
+  return kept.length > 0 ? kept.join("\n").trim() : detail.trim();
+}
+// Under heavy load (load average 250-385 on 2026-09-22) the ps and gh spawns
+// time out and one tick loses an input for reasons unrelated to the input
+// itself. An instrument warning is raised only when the same instrument has
+// failed on this many consecutive ticks; one success resets the count.
+export const INSTRUMENT_FAILURE_STREAK = 3;
+/**
+ * Hold back instrument findings until their instrument has failed on
+ * INSTRUMENT_FAILURE_STREAK consecutive ticks.
+ *
+ * `prior` is the per-fingerprint count persisted from the previous tick. The
+ * returned `streaks` holds only instruments failing this tick, so an
+ * instrument that succeeded drops out and restarts from zero. Every tick is a
+ * fresh process, which is why the count lives in the state file.
+ */
+export function gateInstrumentFindings(
+  findings: Finding[],
+  prior: Record<string, number> = {},
+): { findings: Finding[]; streaks: Record<string, number> } {
+  const streaks: Record<string, number> = {};
+  const kept: Finding[] = [];
+  for (const value of findings) {
+    if (value.rule !== "instrument") {
+      kept.push(value);
+      continue;
+    }
+    const count = (prior[value.fingerprint] ?? 0) + 1;
+    streaks[value.fingerprint] = count;
+    if (count >= INSTRUMENT_FAILURE_STREAK) kept.push({ ...value, text: `${value.text} (failed ${count} consecutive ticks)` });
+  }
+  return { findings: kept, streaks };
 }
 function metrics(sample: SentinelSample): Record<string, any> { return sample.health?.metrics ?? sample.health?.health?.metrics ?? {}; }
 export function healthBytesWritten(sample: SentinelSample): { available: boolean; bytes?: number } {
@@ -1061,7 +1106,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     sample.log_lines = readFileSync(join(dir, "log-excerpt.txt"), "utf8").split("\n").filter(Boolean);
     sample.supervisor ??= { running: true, pid: 95277 };
   } else ({ sample, cursors } = collectSample(state));
-  const findings = detectAll(sample, state);
+  const gated = gateInstrumentFindings(detectAll(sample, state), state.instrument_failures);
+  const findings = gated.findings;
   // The full sample is diagnostic output for a hand-run; a launchd tick
   // prints only what changed so the stdout log stays readable.
   if (dryRun) {
@@ -1083,7 +1129,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
   }
   for (const value of reconciled.cleared) appendEvent({ ts: new Date(sample.now_ms).toISOString(), rule: value.prior.rule, state: "cleared", fingerprint: value.fingerprint, text: value.prior.text, severity: value.prior.severity });
-  const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, previous: nextPrevious(sample, state) };
+  const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, instrument_failures: gated.streaks, previous: nextPrevious(sample, state) };
   mkdirSync(dirname(STATE_FILE), { recursive: true });
   writeFileSync(STATE_FILE, JSON.stringify(next, null, 2));
   return 0;

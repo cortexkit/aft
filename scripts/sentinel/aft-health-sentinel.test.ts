@@ -19,6 +19,9 @@ import {
   detectSearchAndTools,
   detectScheduledCi,
   freshestScheduledListing,
+  gateInstrumentFindings,
+  INSTRUMENT_FAILURE_STREAK,
+  instrumentErrorText,
   detectStorage,
   detectTier2Overlong,
   detectWakes,
@@ -328,6 +331,50 @@ describe("health sentinel pure detectors", () => {
       expect(fallback[0].severity).toBe("CRITICAL");
       expect(fallback[0].text).toContain("20.0 GiB free by df; purgeable space is not counted");
       expect(fallback[0].text).toContain("osascript exit null");
+    });
+
+    test("an instrument warns only after consecutive failed ticks, and a success resets the count", () => {
+      expect(INSTRUMENT_FAILURE_STREAK).toBe(3);
+      const failing = () => detectDaemon(sample({ health_error: "Error: exit null" }), cleanState());
+      const other = { rule: "disk.low", severity: "WARNING" as const, fingerprint: "disk:aft-data", text: "low", clears_when: "space" };
+      const instrumentOf = (values: ReturnType<typeof detectAll>) => values.filter((value) => value.rule === "instrument");
+      // Tick 1 and tick 2: the failure is counted but not raised; other rules pass through.
+      const first = gateInstrumentFindings([...failing(), other], undefined);
+      expect(instrumentOf(first.findings)).toEqual([]);
+      expect(first.findings).toContainEqual(other);
+      expect(first.streaks["instrument:health-check"]).toBe(1);
+      const second = gateInstrumentFindings(failing(), first.streaks);
+      expect(instrumentOf(second.findings)).toEqual([]);
+      // Tick 3: the same instrument failed three ticks running, so it warns and says so.
+      const third = gateInstrumentFindings(failing(), second.streaks);
+      expect(instrumentOf(third.findings)).toHaveLength(1);
+      expect(third.findings[0].fingerprint).toBe("instrument:health-check");
+      expect(third.findings[0].text).toContain("failed 3 consecutive ticks");
+      // A success in between resets: two failures, one clean tick, two failures stays quiet.
+      const clean = gateInstrumentFindings([], second.streaks);
+      expect(clean.streaks).toEqual({});
+      const again = gateInstrumentFindings(failing(), gateInstrumentFindings(failing(), clean.streaks).streaks);
+      expect(instrumentOf(again.findings)).toEqual([]);
+      expect(again.streaks["instrument:health-check"]).toBe(2);
+      // Streaks are per instrument: another instrument failing does not advance this one.
+      const mixed = gateInstrumentFindings(detectDaemon(sample({ supervisor: undefined }), cleanState()), second.streaks);
+      expect(mixed.streaks).toEqual({ "instrument:supervisor": 1 });
+      expect(instrumentOf(mixed.findings)).toEqual([]);
+    });
+
+    test("instrument errors drop aft CLI log lines and keep the line that explains the failure", () => {
+      const stderr = [
+        "Error: [aft] log retention sweep: removed_files=0 bytes_freed=0 recycled_pids=0",
+        "2026-09-22T21:04:11Z [aft] login-shell PATH probe: resolved 14 entries",
+        "daemon returned an unsuccessful writes.census response: timed out",
+      ].join("\n");
+      expect(instrumentErrorText(stderr)).toBe("daemon returned an unsuccessful writes.census response: timed out");
+      const text = detectDaemon(sample({ health_error: stderr }), cleanState())
+        .find((value) => value.fingerprint === "instrument:health-check")?.text;
+      expect(text).toBe("instrument health-check unavailable: daemon returned an unsuccessful writes.census response: timed out");
+      // Text with no CLI log lines is untouched; text made only of log lines is kept rather than emptied.
+      expect(instrumentErrorText("Error: exit null")).toBe("Error: exit null");
+      expect(instrumentErrorText("[aft] only a log line")).toBe("[aft] only a log line");
     });
 
     test("executor detector uses legacy maintenance fields when dispatch_liveness is absent", () => {
