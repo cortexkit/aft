@@ -3108,11 +3108,11 @@ async fn drive_s1_rejection_daemon(
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root.clone(),
-            harness: "mcp:generic".to_string(),
-            session: "s1-session".to_string(),
-        },
+        identity: BindIdentity::new(
+            root.clone(),
+            "mcp:generic".to_string(),
+            "s1-session".to_string(),
+        ),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
@@ -6980,11 +6980,11 @@ async fn send_route_bind_with_elicitation_capability(
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root.to_path_buf(),
-            harness: "runner".to_string(),
-            session: format!("elicitation-session-{route_channel}"),
-        },
+        identity: BindIdentity::new(
+            root.to_path_buf(),
+            "runner".to_string(),
+            format!("elicitation-session-{route_channel}"),
+        ),
         principal: Some(subc_mcp_principal()),
         consumer_capabilities: Some(vec!["elicitation".to_string()]),
         admission_facts: Default::default(),
@@ -7948,11 +7948,11 @@ async fn drive_malformed_fed_harness_bind_production_daemon(
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root,
-            harness: "fed:".to_string(),
-            session: "fed-malformed-session".to_string(),
-        },
+        identity: BindIdentity::new(
+            root,
+            "fed:".to_string(),
+            "fed-malformed-session".to_string(),
+        ),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
@@ -9355,11 +9355,11 @@ async fn send_management_route_bind(
             target: RouteTarget::ManagementSurface {
                 module_id: "aft".to_string(),
             },
-            identity: BindIdentity {
-                project_root: identity_root.to_path_buf(),
-                harness: "prefrontal".to_string(),
-                session: "management-route-must-not-register-session".to_string(),
-            },
+            identity: BindIdentity::new(
+                identity_root.to_path_buf(),
+                "prefrontal".to_string(),
+                "management-route-must-not-register-session".to_string(),
+            ),
             principal,
             consumer_capabilities: None,
             admission_facts: Default::default(),
@@ -9570,11 +9570,7 @@ async fn send_route_bind_with_harness_session_principal_and_doc_epoch(
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root.to_path_buf(),
-            harness: harness.to_string(),
-            session: session.to_string(),
-        },
+        identity: BindIdentity::new(root.to_path_buf(), harness.to_string(), session.to_string()),
         principal,
         consumer_capabilities,
         admission_facts: Default::default(),

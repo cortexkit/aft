@@ -226,12 +226,15 @@ pub(super) fn build_manifest() -> ModuleManifest {
     // because spawning a detached process changes external state, and edit/write
     // produce observable file writes. Unfenceable stays unused here because AFT
     // schedules bash internally and releases the Mutating worker after spawn.
-    ModuleManifest {
-        module_id: "aft".to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_ver: PROTOCOL_VERSION,
-        trust_tier: TrustTier::FirstParty,
-        provides: vec![
+    //
+    // The builder leaves `ready`, `capabilities`, `self_signals` and
+    // `provenance` unset, so none of them reaches the wire. The empty
+    // `consumes` list is omitted by the protocol crate, which a subc daemon
+    // older than 0.17.20 rejects; that daemon version is the floor.
+    ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
+        .protocol_ver(PROTOCOL_VERSION)
+        .trust_tier(Some(TrustTier::FirstParty))
+        .provides(vec![
             ProviderRole::ToolProvider {
                 tools: vec![
                     tool("status", ExecutionMode::Pure),
@@ -261,22 +264,25 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 emits_push: true,
                 sub_supervises: true,
             },
-            // subc-protocol 0.10 manifest.rs:145-157 defines management
-            // operations as a name plus Query/Mutate kind. These queries carry
-            // their own optional root input and do not scope the route itself.
+            // subc-protocol defines management operations as a name plus a
+            // Query/Mutate kind. These queries carry their own optional root
+            // input and do not scope the route itself.
             ProviderRole::ManagementSurface {
                 operations: vec![
                     ManagementOperation {
                         name: crate::commands::health_digest::HEALTH_DIGEST_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
+                        description: None,
                     },
                     ManagementOperation {
                         name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
+                        description: None,
                     },
                     ManagementOperation {
                         name: crate::commands::writes_census::WRITES_CENSUS_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
+                        description: None,
                     },
                 ],
                 config_schema: json!({
@@ -286,11 +292,13 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 }),
                 observability: Vec::new(),
                 identity_scope: Vec::new(),
+                // Explicitly the value the daemon assumes when this field is
+                // absent: management calls keep the concurrent delivery they
+                // received before the protocol could express the choice.
+                concurrency: Concurrency::ModuleManaged,
             },
-        ],
-        consumes: Vec::new(),
-        scheduled_tasks: Vec::new(),
-        bindings: Bindings {
+        ])
+        .bindings(Some(Bindings {
             storage: StorageBinding {
                 kind: StorageKind::Sqlite,
                 scope: StorageScope::Project,
@@ -301,8 +309,8 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 requires: vec![IdentityScope::Project],
                 optional: vec![IdentityScope::Session],
             },
-        },
-    }
+        }))
+        .build()
 }
 
 pub(super) fn control_ops() -> Option<Vec<String>> {
@@ -612,13 +620,37 @@ mod tests {
         manifest
     }
 
+    /// The fixture is the manifest AFT sent on subc-protocol 0.10, captured
+    /// before the move to 0.22. Every difference the newer protocol crate
+    /// forces is applied to it explicitly below, so any other drift in what
+    /// AFT sends fails this test.
+    ///
+    /// The two removed keys are real wire differences, not equivalences: a
+    /// subc daemon older than 0.17.20 requires them and refuses the HELLO
+    /// ("missing field `consumes`"), so this manifest needs daemon 0.17.20 or
+    /// newer.
     #[test]
     fn hello_manifest_wire_shape_matches_snapshot() {
         let actual = normalized_manifest_json();
-        let expected: Value = serde_json::from_str(include_str!(
+        let mut expected: Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/subc_hello_manifest.json"
         ))
         .expect("parse manifest snapshot");
+        let top = expected.as_object_mut().expect("manifest object");
+        // The protocol crate omits an empty `consumes` list.
+        assert_eq!(top.remove("consumes"), Some(json!([])));
+        // The scheduled-task vocabulary was retired from the manifest.
+        assert_eq!(top.remove("scheduled_tasks"), Some(json!([])));
+        // The management role now always serializes its delivery concurrency;
+        // AFT declares the value the daemon assumes when the key is absent.
+        let management = expected["provides"][1]
+            .as_object_mut()
+            .expect("management surface role");
+        assert_eq!(management["role"], json!("management_surface"));
+        assert_eq!(
+            management.insert("concurrency".to_string(), json!("module_managed")),
+            None
+        );
         assert_eq!(actual, expected);
     }
 

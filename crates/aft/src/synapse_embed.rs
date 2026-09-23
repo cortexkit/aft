@@ -584,15 +584,11 @@ impl SynapseState {
                 RouteTarget::ManagementSurface {
                     module_id: SYNAPSE_MODULE_ID.to_string(),
                 },
-                BindIdentity {
-                    project_root: self
-                        .route_project_root
-                        .to_string_lossy()
-                        .into_owned()
-                        .into(),
-                    harness: self.route_harness.clone(),
-                    session: format!("aft-semantic-{}", std::process::id()),
-                },
+                BindIdentity::new(
+                    self.route_project_root.to_string_lossy().into_owned(),
+                    self.route_harness.clone(),
+                    format!("aft-semantic-{}", std::process::id()),
+                ),
                 CallOptions::default(),
             )
             .await

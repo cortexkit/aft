@@ -1348,11 +1348,13 @@ fn probe_governance(
             };
 
             *stage_handle.lock().unwrap() = ProbeStage::OpenRoute;
-            let identity = BindIdentity {
-                project_root: project_root.to_string_lossy().into_owned().into(),
-                harness: "aft-gh-shim".to_string(),
-                session: gh_session_id(&agent_id),
-            };
+            // `BindIdentity::new` sends no registered project id; the shim
+            // never resolved one before the field existed.
+            let identity = BindIdentity::new(
+                project_root.to_string_lossy().into_owned(),
+                "aft-gh-shim",
+                gh_session_id(&agent_id),
+            );
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface {
@@ -3829,11 +3831,11 @@ fn route_governed(
                     RouteTarget::ManagementSurface {
                         module_id: module_id.clone(),
                     },
-                    BindIdentity {
-                        project_root: project_root.to_string_lossy().into_owned().into(),
-                        harness: "aft-gh-shim".to_string(),
-                        session: gh_session_id(&agent_binding.agent_id),
-                    },
+                    BindIdentity::new(
+                        project_root.to_string_lossy().into_owned(),
+                        "aft-gh-shim",
+                        gh_session_id(&agent_binding.agent_id),
+                    ),
                     CallOptions::default(),
                 )
                 .await

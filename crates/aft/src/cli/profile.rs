@@ -268,11 +268,11 @@ fn fetch_management_census(
                 RouteTarget::ManagementSurface {
                     module_id: "aft".to_string(),
                 },
-                BindIdentity {
+                BindIdentity::new(
                     project_root,
-                    harness: "aft-profile".to_string(),
-                    session: format!("aft-profile-{}", std::process::id()),
-                },
+                    "aft-profile",
+                    format!("aft-profile-{}", std::process::id()),
+                ),
                 CallOptions::default(),
             )
             .await

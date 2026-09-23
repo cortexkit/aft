@@ -435,11 +435,13 @@ async fn run_connected_status_dial<C: StatusConsumer>(
             match consumer.catalog_list().await {
                 Ok(catalog) if catalog_advertises_status_line(&catalog.modules) => {
                     if route.is_none() {
-                        let identity = BindIdentity {
-                            project_root: route_identity.project_root.clone().into(),
-                            harness: route_identity.harness.clone(),
-                            session: route_identity.session.clone(),
-                        };
+                        // `BindIdentity::new` leaves the registered project id
+                        // unset: the dial has no resolved id to send.
+                        let identity = BindIdentity::new(
+                            route_identity.project_root.clone(),
+                            route_identity.harness.clone(),
+                            route_identity.session.clone(),
+                        );
                         match consumer
                             .open_route(
                                 RouteTarget::ManagementSurface {
@@ -671,17 +673,22 @@ mod tests {
     fn status_catalog_entry(module_id: &str, operation: &str) -> subc_client_rs::CatalogEntry {
         subc_client_rs::CatalogEntry {
             module_id: module_id.to_string(),
+            ready: true,
             module_version: None,
             roles: vec![ProviderRole::ManagementSurface {
                 operations: vec![ManagementOperation {
                     name: operation.to_string(),
                     kind: ManagementOperationKind::Query,
+                    description: None,
                 }],
                 config_schema: Value::Null,
                 observability: Vec::new(),
                 identity_scope: Vec::new(),
+                concurrency: Default::default(),
             }],
             control_ops: Vec::new(),
+            capabilities: None,
+            self_signals: None,
         }
     }
 

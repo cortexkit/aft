@@ -2366,11 +2366,11 @@ fn send_bind_epoch(
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root.to_path_buf(),
-            harness: "opencode".to_string(),
-            session: session.to_string(),
-        },
+        identity: BindIdentity::new(
+            root.to_path_buf(),
+            "opencode".to_string(),
+            session.to_string(),
+        ),
         consumer_capabilities: None,
         principal: Some(Principal::Direct),
         admission_facts: Default::default(),
@@ -2400,11 +2400,11 @@ async fn write_measure_bind(
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root.to_path_buf(),
-            harness: "opencode".to_string(),
-            session: session.to_string(),
-        },
+        identity: BindIdentity::new(
+            root.to_path_buf(),
+            "opencode".to_string(),
+            session.to_string(),
+        ),
         consumer_capabilities: None,
         principal: Some(Principal::Direct),
         admission_facts: Default::default(),

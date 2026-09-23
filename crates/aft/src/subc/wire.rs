@@ -793,11 +793,7 @@ pub(super) fn build_error_frame(
     code: &str,
     message: &str,
 ) -> Result<Frame, SubcError> {
-    let body = serde_json::to_vec(&ErrorBody {
-        code: code.to_string(),
-        message: message.to_string(),
-    })
-    .map_err(SubcError::Json)?;
+    let body = serde_json::to_vec(&ErrorBody::new(code, message)).map_err(SubcError::Json)?;
     Frame::build_with_version(ver, FrameType::Error, flags, channel, epoch, corr, body)
         .map_err(SubcError::FrameBuild)
 }

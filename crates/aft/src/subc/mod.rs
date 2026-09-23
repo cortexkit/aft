@@ -7372,11 +7372,11 @@ mod tests {
                 target: RouteTarget::ToolProvider {
                     module_id: "aft".to_string(),
                 },
-                identity: subc_protocol::BindIdentity {
-                    project_root: root.as_path().to_path_buf(),
-                    harness: "opencode".to_string(),
-                    session: "bind-health-work-count".to_string(),
-                },
+                identity: subc_protocol::BindIdentity::new(
+                    root.as_path(),
+                    "opencode",
+                    "bind-health-work-count",
+                ),
                 principal: Some(subc_protocol::Principal::Direct),
                 consumer_capabilities: None,
                 admission_facts: Default::default(),

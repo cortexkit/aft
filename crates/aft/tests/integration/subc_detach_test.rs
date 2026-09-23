@@ -351,11 +351,11 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
-        identity: BindIdentity {
-            project_root: root.to_path_buf(),
-            harness: "opencode".to_string(),
-            session: SESSION_ID.to_string(),
-        },
+        identity: BindIdentity::new(
+            root.to_path_buf(),
+            "opencode".to_string(),
+            SESSION_ID.to_string(),
+        ),
         principal: Some(Principal::Direct),
         consumer_capabilities: None,
         admission_facts: Default::default(),
