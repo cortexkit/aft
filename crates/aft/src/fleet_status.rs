@@ -859,9 +859,8 @@ mod tests {
                 accepted_revision: 7
             }
         );
-        let null_read = StatusPublishAck::parse(
-            br#"{"epoch":3,"accepted_revision":7,"last_read_at_ms":null}"#,
-        );
+        let null_read =
+            StatusPublishAck::parse(br#"{"epoch":3,"accepted_revision":7,"last_read_at_ms":null}"#);
         assert!(null_read.is_some(), "a null last_read_at_ms still parses");
     }
 

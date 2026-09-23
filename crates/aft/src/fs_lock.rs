@@ -1569,9 +1569,9 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
         match outcome {
             Err(AcquireError::Timeout) => {}
-            Err(AcquireError::Io(error)) => panic!(
-                "contended metadata read propagated instead of retrying: {error:?}"
-            ),
+            Err(AcquireError::Io(error)) => {
+                panic!("contended metadata read propagated instead of retrying: {error:?}")
+            }
             Ok(_) => panic!("acquired a lock whose metadata could not be read"),
         }
     }
