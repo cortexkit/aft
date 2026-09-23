@@ -777,25 +777,6 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
     allocator_memory_snapshot_impl()
 }
 
-pub(crate) fn issue330_memory_checkpoint(label: &str) {
-    if std::env::var_os("AFT_ISSUE330_MEASURE").is_none() {
-        return;
-    }
-    let allocator = allocator_memory_snapshot_impl();
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    eprintln!(
-        "issue330_memory checkpoint={label} timestamp_ms={timestamp_ms} rss_bytes={} phys_footprint_bytes={} allocator_in_use_bytes={} allocator_allocated_bytes={} allocator_slack_bytes={}",
-        process_rss_bytes().unwrap_or(0),
-        process_phys_footprint_bytes().unwrap_or(0),
-        allocator.bytes_in_use.unwrap_or(0),
-        allocator.size_allocated.unwrap_or(0),
-        allocator.retained_slack_bytes.unwrap_or(0),
-    );
-}
-
 fn allocator_observation(source: AllocatorSource) -> (AllocatorMemorySnapshot, Option<u64>) {
     match source {
         AllocatorSource::Cached => cached_allocator_observation()
