@@ -34,9 +34,28 @@ fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seam
     assert!(!context.contains("todos: tier2.todos.unwrap_or(0)"));
     assert!(!context.contains("match (tier2.dead_code, tier2.unused_exports, tier2.duplicates)"));
 
+    // The agent-visible AFT bar renders the truthful values (a category with no
+    // value shows `?`, never 0), and it does so in exactly one place: the
+    // finalizer's `status_bar_line`. Formatting, transport dispatch and the
+    // inspect payload must not bypass it.
+    assert_eq!(
+        response_finalize.matches("status_bar_count_values").count(),
+        1,
+        "response finalization reads the truthful counts at a single site"
+    );
+    let bar_line = response_finalize
+        .find("fn status_bar_line")
+        .expect("status_bar_line exists");
+    let values_read = response_finalize
+        .find("status_bar_count_values")
+        .expect("status_bar_line reads the truthful counts");
+    let next_fn = response_finalize[bar_line + 1..]
+        .find("\nfn ")
+        .map(|offset| bar_line + 1 + offset)
+        .unwrap_or(response_finalize.len());
     assert!(
-        !response_finalize.contains("status_bar_count_values"),
-        "response finalization may consume only the temporary legacy projection"
+        (bar_line..next_fn).contains(&values_read),
+        "only status_bar_line may read the truthful counts"
     );
     assert!(
         !subc_format.contains("status_bar_count_values"),
@@ -85,9 +104,17 @@ fn inspect_outcomes_continue_to_feed_the_fleet_segment_without_freezing_text() {
         refresh_at < gate_at,
         "counts must refresh before the freshness gate can refuse the payload"
     );
+    let publish = response_finalize
+        .find("fn publish_fleet_status")
+        .expect("fleet publisher exists");
+    let publish_end = response_finalize[publish + 1..]
+        .find("\nfn ")
+        .map(|offset| publish + 1 + offset)
+        .unwrap_or(response_finalize.len());
+    let publish_body = &response_finalize[publish..publish_end];
     assert!(
-        response_finalize.contains("let local_counts = ctx.status_bar_counts();")
-            && response_finalize.contains(".map(aft_status_segment)"),
+        publish_body.contains(".status_bar_counts()")
+            && publish_body.contains(".map(aft_status_segment)"),
         "the fleet segment must still receive the values projection"
     );
 }
