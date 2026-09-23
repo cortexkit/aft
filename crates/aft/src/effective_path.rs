@@ -13,7 +13,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -726,7 +726,36 @@ fn spawn_cached_path_refresh() {
             Ok(())
         });
     }
-    let _ = command.spawn();
+    spawn_reaped(&mut command);
+}
+
+/// Spawn `command` and hand the child to a short-lived thread that waits on
+/// it, returning the child pid so callers can observe the reap.
+///
+/// `setsid()` only detaches the helper from the session; the spawning process
+/// remains its parent and is the only one that can reap it. Without a
+/// `wait()` the finished helper stays a zombie for the life of this process.
+#[cfg(unix)]
+fn spawn_reaped(command: &mut Command) -> Option<u32> {
+    let Ok(child) = command.spawn() else {
+        return None;
+    };
+    let pid = child.id();
+    reap_child_in_background(child);
+    Some(pid)
+}
+
+/// Reap `child` from a named background thread so the caller never blocks.
+#[cfg(unix)]
+fn reap_child_in_background(mut child: Child) {
+    // When the thread cannot be spawned, the error drops the moved closure
+    // and its child with it: the child goes unreaped, matching the behavior
+    // callers had before the reaper existed, instead of blocking on wait().
+    let _ = std::thread::Builder::new()
+        .name("aft-path-refresh-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 #[cfg(test)]
@@ -1004,5 +1033,40 @@ eval "$2"
             enriched,
             OsString::from("/home/alice/.bun/bin:/usr/bin:/bin:/opt/homebrew/bin")
         );
+    }
+
+    #[test]
+    fn reaper_thread_reaps_spawned_child() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let pid = spawn_reaped(&mut command).expect("helper spawn failed");
+
+        // A finished child that nobody waited on stays in the process table
+        // as a zombie and still answers kill(pid, 0); only a reaped child
+        // disappears. Poll with a bounded deadline until the pid is gone,
+        // which proves the reaper thread called wait().
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if status == -1 {
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::ESRCH),
+                    "kill(pid, 0) failed with an unexpected error: {error}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child {pid} was still in the process table after the reap deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
