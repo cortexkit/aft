@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "existing-route-reload-wait",
+    "drain-census-detaching"
+  ],
+  "note": "Requests on an already-bound route wait out a module reload within the route.open reload budget instead of falling back to the host at once, and the drain census reports self-detaching bash waits apart from held requests. Transport and drain logging only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
