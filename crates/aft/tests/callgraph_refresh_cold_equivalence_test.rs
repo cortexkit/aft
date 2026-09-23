@@ -400,3 +400,27 @@ fn reexport_search_order_is_source_order() {
     );
 }
 
+/// Several names in one `export { ... }` list. Their refs used to be numbered
+/// in hash-map order, so two extractions of the same file gave different ref
+/// ids and a different surface fingerprint.
+#[test]
+fn export_alias_rows_are_deterministic() {
+    assert_refresh_matches_cold(
+        "export alias list",
+        &[
+            (
+                "lib.ts",
+                "function a() {}\nfunction b() {}\nfunction c() {}\nfunction d() {}\nfunction e() {}\nfunction f() {}\nexport { a as one, b as two, c as three, d as four, e as five, f as six };\n",
+            ),
+            (
+                "main.ts",
+                "import { one } from \"./lib\";\nexport function main() { one(); }\n",
+            ),
+        ],
+        &[&[(
+            "main.ts",
+            Some("import { one } from \"./lib\";\nexport function main() { one(); one(); }\n"),
+        )]],
+    );
+}
+

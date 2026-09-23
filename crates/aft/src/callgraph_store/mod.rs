@@ -10363,6 +10363,11 @@ fn collect_source_less_export_alias_refs(rel_path: &str, source: &str) -> Source
         if aliases.is_empty() {
             continue;
         }
+        // Number the aliases in a fixed order: the ordinal is part of each ref
+        // id and the parts feed the surface fingerprint, and hash-map order
+        // differs between two extractions of the same file.
+        let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+        aliases.sort();
         let line = source[..start]
             .bytes()
             .filter(|byte| *byte == b'\n')
