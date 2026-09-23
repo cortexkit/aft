@@ -8,6 +8,9 @@
  * The virtual clock only advances through the injected retry sleeps, so the
  * "5 s reload" costs no real time and the outcome depends only on how long each
  * layer is willing to keep retrying, not on machine speed.
+ *
+ * The later tests start the reload after a route is already bound, so the
+ * request on that route is refused by the daemon's data plane instead.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -27,6 +30,7 @@ import {
   SERVER_PROOF_DOMAIN,
   SubcClient,
 } from "@cortexkit/subc-client";
+import { classifyBashHostFallbackError } from "../error-contract.js";
 import { SubcTransportPool } from "../subc-transport.js";
 import { TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
@@ -40,7 +44,23 @@ interface FakeDaemon {
   accepted: number;
   /** Data-plane requests answered on an accepted route. */
   requests: number;
+  /** Data-plane requests refused because their route's module was reloading. */
+  refusedRequests: number;
+  /** Data-plane requests the daemon answered by GOODBYE-ing their route. */
+  goodbyes: number;
   close(): Promise<void>;
+}
+
+/**
+ * A reload that starts after routes are already bound. While it lasts, route
+ * opens are refused and requests on a route bound before it started get the
+ * daemon's data-plane reload refusal (or, with `onBoundRequest: "goodbye"`, a
+ * route GOODBYE after the request was accepted, whose outcome is unknown).
+ * Once it ends, those old routes are gone (`unknown_channel`).
+ */
+interface LateReload {
+  startMs: number;
+  onBoundRequest?: "refuse" | "goodbye";
 }
 
 /**
@@ -52,12 +72,17 @@ async function startFakeDaemon(
   now: () => number,
   reply: () => unknown,
   reloadWindowMs: number = RELOAD_WINDOW_MS,
+  lateReload?: LateReload,
 ): Promise<FakeDaemon> {
   const key = new Uint8Array(32).fill(7);
   const daemonId = new Uint8Array(16).fill(9);
   const sockets = new Set<Socket>();
-  const state = { refusals: 0, accepted: 0, requests: 0 };
+  const state = { refusals: 0, accepted: 0, requests: 0, refusedRequests: 0, goodbyes: 0 };
   let nextChannel = 1;
+  const reloadStartMs = lateReload?.startMs ?? 0;
+  const reloading = (): boolean => now() >= reloadStartMs && now() < reloadWindowMs;
+  /** Virtual time each route channel was bound at. */
+  const boundAt = new Map<number, number>();
 
   const server: Server = createServer((socket) => {
     sockets.add(socket);
@@ -146,7 +171,7 @@ async function startFakeDaemon(
             });
             continue;
           }
-          if (now() < reloadWindowMs) {
+          if (reloading()) {
             state.refusals += 1;
             send(FrameType.Error, 0, 0, header.corr, {
               code: "module_reloading",
@@ -155,10 +180,38 @@ async function startFakeDaemon(
             continue;
           }
           state.accepted += 1;
+          boundAt.set(nextChannel, now());
           send(FrameType.Response, 0, 0, header.corr, {
             op: "route.open",
             route_channel: nextChannel++,
             route_epoch: 1,
+          });
+          continue;
+        }
+
+        const boundBeforeReload =
+          lateReload !== undefined && (boundAt.get(header.channel) ?? 0) < reloadStartMs;
+        if (boundBeforeReload && reloading()) {
+          if (lateReload.onBoundRequest === "goodbye") {
+            // The request was accepted and may have run; only its route ends.
+            state.requests += 1;
+            state.goodbyes += 1;
+            send(FrameType.Goodbye, header.channel, header.epoch, 0n, null);
+            continue;
+          }
+          // The daemon router's refusal when the route's module endpoint is
+          // draining: sent on the route's own channel, before forwarding.
+          state.refusedRequests += 1;
+          send(FrameType.Error, header.channel, header.epoch, header.corr, {
+            code: "module_reloading",
+            message: `module endpoint for route channel ${header.channel} is reloading`,
+          });
+          continue;
+        }
+        if (boundBeforeReload && now() >= reloadWindowMs) {
+          send(FrameType.Error, header.channel, header.epoch, header.corr, {
+            code: "unknown_channel",
+            message: `unknown channel ${header.channel}`,
           });
           continue;
         }
@@ -200,6 +253,12 @@ async function startFakeDaemon(
     },
     get requests() {
       return state.requests;
+    },
+    get refusedRequests() {
+      return state.refusedRequests;
+    },
+    get goodbyes() {
+      return state.goodbyes;
     },
     async close() {
       for (const socket of sockets) socket.destroy();
@@ -394,5 +453,105 @@ describe("route.open across a 5s module reload window (real SubcClient, fake dae
     expect(clock.now).toBeGreaterThan(15_000);
     expect(clock.now).toBeLessThan(30_000);
     expect(daemon.accepted).toBe(0);
+  });
+
+  // A reload that begins while a session's route is already bound: the first
+  // call binds the route at virtual 0 ms, the module starts draining at 1 s, and
+  // the refusal window lasts until 6 s (a 5 s reload).
+  const LATE_RELOAD_START_MS = 1_000;
+  const LATE_RELOAD_END_MS = LATE_RELOAD_START_MS + RELOAD_WINDOW_MS;
+  const LIVE_REPLY = {
+    content: [{ type: "text", text: "live" }],
+    isError: false,
+    structuredContent: { id: "r", success: true, text: "live" },
+  };
+
+  async function boundRoutePool(
+    reloadEndMs: number,
+    onBoundRequest: LateReload["onBoundRequest"] = "refuse",
+  ): Promise<{ pool: SubcTransportPool; daemon: FakeDaemon; clock: { now: number } }> {
+    const clock = { now: 0 };
+    const daemon = await startFakeDaemon(
+      () => clock.now,
+      () => LIVE_REPLY,
+      reloadEndMs,
+      {
+        startMs: LATE_RELOAD_START_MS,
+        onBoundRequest,
+      },
+    );
+    cleanups.push(() => daemon.close());
+    const pool = new SubcTransportPool({
+      connectionFile: daemon.connectionFile,
+      harness: "opencode",
+      consumerIdentity: null,
+      handshakeTimeoutMs: 2_000,
+      routeRetrySleep: async (ms) => {
+        clock.now += ms;
+      },
+    });
+    cleanups.push(() => pool.shutdown());
+
+    // Bind the session's route before the reload starts.
+    const first = await pool.getBridge(TEST_PROJECT_ROOT).toolCall("bound", "bash", {});
+    expect(JSON.stringify(first)).toContain("live");
+    expect(daemon.accepted).toBe(1);
+    clock.now = LATE_RELOAD_START_MS;
+    return { pool, daemon, clock };
+  }
+
+  test("a request on an already-bound route waits out a 5s reload and succeeds", async () => {
+    const { pool, daemon, clock } = await boundRoutePool(LATE_RELOAD_END_MS);
+
+    // A bash-sized timeout: the call must wait for the module, not surface the
+    // refusal that would send bash to its host fallback.
+    const reply = await pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .toolCall("bound", "bash", {}, { timeoutMs: 60_000 });
+    expect(JSON.stringify(reply)).toContain("live");
+    expect(daemon.refusedRequests).toBe(1);
+    expect(clock.now).toBeGreaterThanOrEqual(LATE_RELOAD_END_MS);
+    expect(daemon.accepted).toBe(2);
+    expect(daemon.requests).toBe(2);
+  });
+
+  test("a request on a bound route whose module never returns falls back at the 45s ceiling", async () => {
+    const { pool, daemon, clock } = await boundRoutePool(Number.POSITIVE_INFINITY);
+
+    let surfaced: unknown;
+    try {
+      await pool
+        .getBridge(TEST_PROJECT_ROOT)
+        .toolCall("bound", "bash", {}, { timeoutMs: 10 * 60_000 });
+    } catch (error) {
+      surfaced = error;
+    }
+    expect((surfaced as { code?: string }).code).toBe("module_reloading");
+    expect((surfaced as Error).message).toContain("within the 45s reload-wait ceiling");
+    // Proven never dispatched, so bash may take its host fallback now.
+    expect(classifyBashHostFallbackError(surfaced)).toBe("module down");
+    const waitedMs = clock.now - LATE_RELOAD_START_MS;
+    expect(waitedMs).toBeGreaterThan(40_000);
+    expect(waitedMs).toBeLessThan(45_000);
+    expect(daemon.accepted).toBe(1);
+    expect(daemon.requests).toBe(1);
+  });
+
+  test("a request whose route is closed after it was sent neither retries nor falls back", async () => {
+    const { pool, daemon } = await boundRoutePool(LATE_RELOAD_END_MS, "goodbye");
+
+    let surfaced: unknown;
+    try {
+      await pool.getBridge(TEST_PROJECT_ROOT).toolCall("bound", "bash", {}, { timeoutMs: 60_000 });
+    } catch (error) {
+      surfaced = error;
+    }
+    expect((surfaced as { code?: string }).code).toBe("route_closed");
+    expect((surfaced as Error).message).toContain("route closed by subc");
+    // The module may have run it: no host fallback and no resend.
+    expect(classifyBashHostFallbackError(surfaced)).toBeUndefined();
+    expect(daemon.goodbyes).toBe(1);
+    expect(daemon.requests).toBe(2);
+    expect(daemon.accepted).toBe(1);
   });
 });

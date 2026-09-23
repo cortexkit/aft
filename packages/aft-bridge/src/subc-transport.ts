@@ -35,7 +35,7 @@ import {
 
 import { log } from "./active-logger.js";
 import type { StatusSnapshot } from "./bridge.js";
-import { isRouteOpenReloadWindowError } from "./error-contract.js";
+import { isRouteOpenReloadWindowError, isRouteRequestReloadRefusal } from "./error-contract.js";
 import {
   asCanonicalRootPath,
   asRootGeneration,
@@ -1669,30 +1669,47 @@ export class SubcTransportPool implements AftTransportPool {
       };
 
       let routeAndEntry = await openRouteAfterReloadWindow();
-      try {
-        return await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
-      } catch (error) {
-        if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
-        if (
-          isRouteProvenAbsentError(error) &&
-          this.isCurrentSession(key, record) &&
-          this.client === client
-        ) {
-          clearRouteEntry(routeAndEntry.entry);
-          await this.waitForRouteReopenBackoff().wait;
-          routeAndEntry = await openRouteAfterReloadWindow();
-          try {
-            const reply = await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
-            this.resetRouteReopenBackoff();
-            return reply;
-          } catch (retryError) {
-            if (this.isReapInduced(record)) throw this.annotateReapError(retryError, record);
-            handleRequestFailure(retryError, routeAndEntry.entry);
-            throw retryError;
+      let reopened = false;
+      let retriedAbsentRoute = false;
+      while (true) {
+        try {
+          const reply = await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
+          if (reopened) this.resetRouteReopenBackoff();
+          return reply;
+        } catch (error) {
+          if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
+          const ownsRoute = this.isCurrentSession(key, record) && this.client === client;
+          // A route that was bound before a module reload started gets its
+          // requests refused by the daemon for as long as the drain lasts. The
+          // refusal happens before the request is forwarded, so it is handled
+          // like a refused route.open: drop the stale route, then reopen and
+          // resend within the same reload-wait budget. Only once that budget is
+          // spent does the refusal surface (and let bash fall back to the host).
+          // A healthy connection answered, so it does not count as a transport
+          // failure.
+          if (ownsRoute && isRouteRequestReloadRefusal(error)) {
+            clearRouteEntry(routeAndEntry.entry);
+            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
+              throw reloadWindowExhaustedError(error, callDeadlineMs);
+            }
+            const { delayMs, wait } = this.waitForRouteReopenBackoff();
+            reloadWaitedMs += delayMs;
+            await wait;
+            routeAndEntry = await openRouteAfterReloadWindow();
+            reopened = true;
+            continue;
           }
+          if (ownsRoute && !retriedAbsentRoute && isRouteProvenAbsentError(error)) {
+            retriedAbsentRoute = true;
+            clearRouteEntry(routeAndEntry.entry);
+            await this.waitForRouteReopenBackoff().wait;
+            routeAndEntry = await openRouteAfterReloadWindow();
+            reopened = true;
+            continue;
+          }
+          handleRequestFailure(error, routeAndEntry.entry);
+          throw error;
         }
-        handleRequestFailure(error, routeAndEntry.entry);
-        throw error;
       }
     } catch (error) {
       if (this.isReapInduced(record)) throw this.annotateReapError(error, record);

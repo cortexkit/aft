@@ -124,6 +124,31 @@ export function isRouteOpenReloadWindowError(error: unknown): boolean {
   return code === "module_reloading" || code === "module_warming" || code === "target_unavailable";
 }
 
+/**
+ * True for the daemon's refusal of a data-plane request on an ALREADY-BOUND
+ * route while the module behind it drains for a reload.
+ *
+ * Wire shape: an ERROR frame on the route's own channel with code
+ * `module_reloading` and message `module endpoint for route channel <N> is
+ * reloading`; the raw `SubcClient.request` path rejects it as a plain
+ * `SubcError(message, "module_reloading")`. The daemon's router emits it when
+ * the route's request-credit acquisition fails because the module endpoint is
+ * draining, i.e. BEFORE the frame is spliced to the module, so the request
+ * provably never reached AFT and resending it on a fresh route cannot execute
+ * it twice.
+ *
+ * Deliberately limited to `module_reloading`: the other route.open reload codes
+ * are never emitted on the data plane, and anything outcome-unknown (a GOODBYE
+ * or a socket drop after the request was written) carries different codes or a
+ * `SubcCallError` kind other than `not_sent`.
+ */
+export function isRouteRequestReloadRefusal(error: unknown): boolean {
+  if (error instanceof SubcCallError) {
+    return error.kind === "not_sent" && error.code === "module_reloading";
+  }
+  return error instanceof SubcError && error.code === "module_reloading";
+}
+
 function hasEngineResponse(error: Error): boolean {
   const response = (error as Error & { response?: unknown }).response;
   if (response !== null && typeof response === "object") return true;
