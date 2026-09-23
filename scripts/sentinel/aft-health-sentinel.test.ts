@@ -20,6 +20,7 @@ import {
   updateLimiterWindow,
   detectScheduledCi,
   freshestScheduledListing,
+  resolveWorkflowListings,
   gateInstrumentFindings,
   INSTRUMENT_FAILURE_STREAK,
   instrumentErrorText,
@@ -788,6 +789,92 @@ describe("scheduled listing freshness", () => {
     expect(listing).toBe(stale);
     const findings = detectScheduledCi(sample({ now_ms: now, ci_runs: listing }));
     expect(findings.every((finding) => finding.rule === "instrument")).toBe(true);
+  });
+});
+
+describe("per-workflow scheduled listings", () => {
+  // The 2026-09-23 08:40Z false alarm: the combined listing's newest row came
+  // from another workflow while the cost gate's two newest successes (09-22
+  // and 09-23) were missing from it, so the rule judged the cost gate on 17
+  // stale failures and reported a streak that had ended the day before.
+  const now = Date.parse("2026-09-23T08:40:00Z");
+  const COST_GATE = "Nightly OSS cost gate";
+  const run = (workflow: string, day: number, conclusion: string): ScheduledRun => ({
+    workflow,
+    branch: "main",
+    event: "schedule",
+    status: "completed",
+    conclusion,
+    created_at: `2026-09-${String(day).padStart(2, "0")}T07:44:40Z`,
+  });
+  const freshOther = run("Nightly flake sweep", 23, "success");
+  // Newest first, 09-21 back to 09-05: the stale rows the combined listing
+  // carried for the cost gate.
+  const oldFailures = Array.from({ length: 17 }, (_, index) => run(COST_GATE, 21 - index, "failure"));
+
+  test("a workflow is judged on its own targeted listing, not the combined listing's rows", () => {
+    const combined = [freshOther, ...oldFailures];
+    const fetched: string[] = [];
+    const resolved = resolveWorkflowListings(combined, (workflow) => {
+      fetched.push(workflow);
+      return workflow === COST_GATE
+        ? [run(COST_GATE, 23, "success"), run(COST_GATE, 22, "success"), ...oldFailures]
+        : [freshOther];
+    }, now);
+    // The extra queries are bounded: one targeted fetch per workflow present
+    // in the combined listing, and none for workflows absent from it.
+    expect(fetched.sort()).toEqual([COST_GATE, "Nightly flake sweep"].sort());
+    expect(resolved.fallback).toEqual([]);
+    const findings = detectScheduledCi(sample({ now_ms: now, ci_runs: resolved.runs, ci_fallback: resolved.fallback }));
+    // No verdict and no instrument finding may name the cost gate: judged on
+    // its own listing, its newest runs are the two successes.
+    expect(findings.filter((value) => value.text.includes(COST_GATE))).toEqual([]);
+    expect(findings.some((value) => value.rule === "ci.scheduled_failing")).toBe(false);
+  });
+
+  test("a workflow whose own targeted listing is stale yields an instrument finding, not a streak", () => {
+    const combined = [freshOther, run(COST_GATE, 20, "failure"), run(COST_GATE, 19, "failure"), run(COST_GATE, 18, "failure")];
+    const resolved = resolveWorkflowListings(combined, (workflow) =>
+      // The targeted query itself answers stale: the cost gate's newest row is
+      // three days old, past the listing staleness bound.
+      workflow === COST_GATE ? combined.filter((row) => row.workflow === COST_GATE) : [freshOther], now);
+    const findings = detectScheduledCi(sample({ now_ms: now, ci_runs: resolved.runs, ci_fallback: resolved.fallback }));
+    expect(findings.some((value) => value.rule === "ci.scheduled_failing")).toBe(false);
+    const blind = findings.filter((value) => value.rule === "instrument");
+    expect(blind).toHaveLength(1);
+    expect(blind[0].fingerprint).toBe(`instrument:scheduled-ci:${COST_GATE}`);
+    expect(blind[0].text).toContain(COST_GATE);
+    expect(blind[0].text).toContain("days old");
+  });
+
+  test("a genuine streak on fresh targeted rows still reports", () => {
+    const streak = [run(COST_GATE, 23, "failure"), run(COST_GATE, 22, "failure"), run(COST_GATE, 21, "failure"), run(COST_GATE, 20, "success")];
+    const resolved = resolveWorkflowListings([freshOther, ...streak], (workflow) =>
+      workflow === COST_GATE ? streak : [freshOther], now);
+    const findings = detectScheduledCi(sample({ now_ms: now, ci_runs: resolved.runs, ci_fallback: resolved.fallback }));
+    const failing = findings.filter((value) => value.rule === "ci.scheduled_failing");
+    expect(failing).toHaveLength(1);
+    expect(failing[0].fingerprint).toBe(`ci:${COST_GATE}`);
+    expect(failing[0].text).toContain("3 consecutive runs");
+    expect(failing[0].text).toContain("since 2026-09-21");
+  });
+
+  test("a failed targeted fetch falls back to the combined rows and refuses a verdict", () => {
+    const streak = [run(COST_GATE, 23, "failure"), run(COST_GATE, 22, "failure"), run(COST_GATE, 21, "failure")];
+    const combined = [freshOther, ...streak];
+    const resolved = resolveWorkflowListings(combined, (workflow) => {
+      if (workflow === COST_GATE) throw new Error("gh: connection reset");
+      return [freshOther];
+    }, now);
+    // The cost gate keeps its combined rows and is marked, so the detector
+    // knows they are exactly the input shape that produced the false alarm.
+    expect(resolved.fallback).toEqual([COST_GATE]);
+    const findings = detectScheduledCi(sample({ now_ms: now, ci_runs: resolved.runs, ci_fallback: resolved.fallback }));
+    expect(findings.some((value) => value.rule === "ci.scheduled_failing")).toBe(false);
+    const blind = findings.filter((value) => value.rule === "instrument");
+    expect(blind).toHaveLength(1);
+    expect(blind[0].fingerprint).toBe(`instrument:scheduled-ci:${COST_GATE}`);
+    expect(blind[0].text).toContain(COST_GATE);
   });
 });
 
