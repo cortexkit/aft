@@ -111,6 +111,19 @@ export function getLogFilePath(): string {
 }
 
 /**
+ * Write buffered log lines now instead of on the next flush tick. For lines
+ * logged while the host may be about to exit, which would drop anything still
+ * buffered.
+ */
+export function flushLog(): void {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  flush();
+}
+
+/**
  * Adapter that exposes this logger as a {@link import("@cortexkit/aft-bridge").Logger}
  * for the shared bridge package. The bridge package never knows about this log
  * file or the `[aft-plugin]` tag — it just calls `log/warn/error` and we map

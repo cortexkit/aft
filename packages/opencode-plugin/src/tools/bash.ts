@@ -13,7 +13,7 @@ import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
 import { resolveBashConfig, toolEnabled } from "../config.js";
-import { sessionLog } from "../logger.js";
+import { flushLog, sessionLog } from "../logger.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
@@ -57,6 +57,8 @@ function orchestratedTransportTimeoutMs(
   return waitBudget + BASH_TRANSPORT_MARGIN_MS;
 }
 
+type ForegroundAbortOutcome = "killed" | "call_settled" | "timed_out";
+
 async function abortForegroundWhenRegistered(
   ctx: PluginContext,
   runtime: ToolContext,
@@ -64,11 +66,20 @@ async function abortForegroundWhenRegistered(
 ): Promise<void> {
   const startedAt = Date.now();
   const deadline = startedAt + ABORT_REGISTRATION_WAIT_MS;
+  // One entry per bash_abort_inflight attempt, in order: `killed=<n>` for an
+  // answer and `error=<message>` for a failed send. Only the first few are
+  // kept so a five-second registration wait cannot flood the log.
+  const results: string[] = [];
   let attempts = 0;
   let lastResponse: Record<string, unknown> | undefined;
   let lastError: string | undefined;
+  let outcome: ForegroundAbortOutcome = "timed_out";
 
-  while (!disposed() && Date.now() < deadline) {
+  while (Date.now() < deadline) {
+    if (disposed()) {
+      outcome = "call_settled";
+      break;
+    }
     attempts += 1;
     try {
       lastResponse = await callBashBridge(
@@ -84,24 +95,44 @@ async function abortForegroundWhenRegistered(
         },
       );
       lastError = undefined;
-      if (typeof lastResponse.killed === "number" && lastResponse.killed > 0) return;
+      recordAbortAttempt(results, `killed=${String(lastResponse.killed)}`);
+      if (typeof lastResponse.killed === "number" && lastResponse.killed > 0) {
+        outcome = "killed";
+        break;
+      }
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
+      recordAbortAttempt(results, `error=${lastError}`);
     }
 
-    if (disposed()) return;
+    if (disposed()) {
+      outcome = "call_settled";
+      break;
+    }
     if (Date.now() >= deadline) break;
     await sleep(Math.min(ABORT_REGISTRATION_POLL_MS, deadline - Date.now()));
   }
 
-  if (!disposed()) {
-    sessionLog(runtime.sessionID, "[bash] abort timed out waiting for foreground registration", {
-      attempts,
-      elapsed_ms: Date.now() - startedAt,
-      last_response: lastResponse,
-      last_error: lastError,
-    });
-  }
+  // Every outcome is logged, not only the timeout. An interrupted call whose
+  // task row later lacks `call_aborted` can then be read back as "the abort
+  // never ran", "it ran and Rust found nothing to kill", or "the call ended on
+  // its own first". The line is flushed at once because a host often shuts
+  // down right after an interruption, before a buffered line would be written.
+  sessionLog(runtime.sessionID, `[bash] foreground abort ${outcome}`, {
+    attempts,
+    elapsed_ms: Date.now() - startedAt,
+    results,
+    ...(results.length < attempts ? { results_omitted: attempts - results.length } : {}),
+    last_response: lastResponse,
+    last_error: lastError,
+  });
+  flushLog();
+}
+
+const ABORT_ATTEMPT_RESULTS_KEPT = 20;
+
+function recordAbortAttempt(results: string[], result: string): void {
+  if (results.length < ABORT_ATTEMPT_RESULTS_KEPT) results.push(result);
 }
 
 function listenForForegroundAbort(

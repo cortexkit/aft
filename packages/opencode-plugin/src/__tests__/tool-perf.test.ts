@@ -14,6 +14,7 @@ mock.module("../logger.js", () => ({
   sessionWarn: () => {},
   sessionError: () => {},
   getLogFilePath: () => "",
+  flushLog: () => {},
   bridgeLogger: { log: () => {}, warn: () => {}, error: () => {} },
 }));
 

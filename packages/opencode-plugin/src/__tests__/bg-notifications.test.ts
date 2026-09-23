@@ -32,6 +32,7 @@ mock.module("../logger.js", () => ({
     getLogFilePath: () => "",
   },
   getLogFilePath: () => "",
+  flushLog: () => {},
 }));
 
 afterAll(() => {

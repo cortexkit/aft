@@ -1,5 +1,5 @@
 /// <reference path="../bun-test.d.ts" />
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -16,6 +16,7 @@ import {
   sessionBgStates,
   trackBgTask,
 } from "../bg-notifications.js";
+import * as logger from "../logger.js";
 import { _resetSubagentCacheForTest } from "../shared/subagent-detect.js";
 import { __resetSyncWatchAbortForTests, signalSyncWatchAbort } from "../sync-watch-abort.js";
 import {
@@ -48,6 +49,23 @@ type SendCall = {
   options?: BridgeRequestOptions;
 };
 type ProgressHandler = (frame: { text: string }) => void;
+
+/**
+ * The abort retry runs detached from the tool call, so its outcome line can be
+ * written after `execute` has already returned. Wait a bounded time for it.
+ */
+async function abortOutcomeLog(
+  spy: ReturnType<typeof spyOn<typeof logger, "sessionLog">>,
+): Promise<{ message: string; data: unknown }> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const call = spy.mock.calls.find(([, message]) =>
+      message.startsWith("[bash] foreground abort "),
+    );
+    if (call) return { message: call[1], data: call[2] };
+    await Bun.sleep(5);
+  }
+  throw new Error("foreground abort outcome was never logged");
+}
 
 async function addArtifactBytes(
   command: string,
@@ -791,6 +809,83 @@ describe("OpenCode bash adapter", () => {
     expect(abortAttempts).toBe(3);
     expect(calls.filter((call) => call.command === "bash")).toHaveLength(1);
     expect(calls.filter((call) => call.command === "bash_abort_inflight")).toHaveLength(3);
+  });
+
+  test("foreground abort logs every attempt's answer when it kills the task", async () => {
+    const logSpy = spyOn(logger, "sessionLog");
+    try {
+      let abortAttempts = 0;
+      let settleBash: ((response: BridgeResponse) => void) | undefined;
+      const bashResponse = new Promise<BridgeResponse>((resolvePromise) => {
+        settleBash = resolvePromise;
+      });
+      const { tool: bash } = createHarness((command) => {
+        if (command === "bash") return bashResponse;
+        abortAttempts += 1;
+        if (abortAttempts < 3) return { success: true, killed: 0 };
+        settleBash?.({ success: true, status: "killed", task_id: "t", output: "" });
+        return { success: true, killed: 1 };
+      });
+      const controller = new AbortController();
+      const result = bash.execute(
+        { command: "sleep 30" },
+        createMockSdkContext({ abort: controller.signal }),
+      );
+      controller.abort();
+      await result;
+
+      const outcome = await abortOutcomeLog(logSpy);
+      expect(outcome.message).toBe("[bash] foreground abort killed");
+      expect(outcome.data).toMatchObject({
+        attempts: 3,
+        results: ["killed=0", "killed=0", "killed=1"],
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  test("foreground abort that finds nothing to kill still leaves a trace", async () => {
+    const logSpy = spyOn(logger, "sessionLog");
+    try {
+      let abortAttempts = 0;
+      let settleBash: ((response: BridgeResponse) => void) | undefined;
+      const bashResponse = new Promise<BridgeResponse>((resolvePromise) => {
+        settleBash = resolvePromise;
+      });
+      const { tool: bash } = createHarness((command) => {
+        if (command === "bash") return bashResponse;
+        abortAttempts += 1;
+        // The call ends by itself while Rust still reports nothing to kill.
+        if (abortAttempts === 2) {
+          settleBash?.({
+            success: true,
+            status: "completed",
+            task_id: "t",
+            exit_code: 0,
+            output: "",
+          });
+        }
+        return { success: true, killed: 0 };
+      });
+      const controller = new AbortController();
+      const result = bash.execute(
+        { command: "sleep 30" },
+        createMockSdkContext({ abort: controller.signal }),
+      );
+      controller.abort();
+      await result;
+
+      const outcome = await abortOutcomeLog(logSpy);
+      expect(outcome.message).toBe("[bash] foreground abort call_settled");
+      expect(outcome.data).toMatchObject({
+        attempts: 2,
+        results: ["killed=0", "killed=0"],
+        last_response: { killed: 0 },
+      });
+    } finally {
+      logSpy.mockRestore();
+    }
   });
 
   test("normal foreground completion does not fire the abort cleanup call", async () => {
