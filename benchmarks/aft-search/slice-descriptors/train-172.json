@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "drain-release-held-requests",
+    "oc2-abort-harness-settlement"
+  ],
+  "note": "On module.draining aft releases every held request (bash waits detach to background tasks, permission asks and deferred calls get terminals) and logs a census of what it held; the OpenCode 2 harness waits for the product to settle an interrupted task before teardown, and the plugin logs every abort outcome. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
