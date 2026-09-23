@@ -242,6 +242,14 @@ impl PendingResponses {
         self.entries.is_empty()
     }
 
+    /// True while a response for `request_id` is still registered (not yet
+    /// resolved by `poll_ready` or drained at shutdown).
+    pub fn contains(&self, request_id: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.request_id == request_id)
+    }
+
     pub fn drain_on_shutdown(&mut self) {
         for pending in self.entries.drain(..) {
             if let Some(cancellation) = &pending.cancellation {

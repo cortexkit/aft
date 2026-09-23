@@ -546,6 +546,47 @@ impl WriteResult {
     }
 }
 
+thread_local! {
+    static FULL_VALIDATION_START_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with a one-shot hook that fires on this thread when
+/// [`write_format_validate`] has finished writing, formatting and
+/// syntax-checking a file and is about to run the project type checker.
+///
+/// The standalone request loop runs edits on a worker thread under this hook
+/// and waits for either the hook or the finished response. Everything before
+/// the hook therefore keeps its inline ordering relative to other requests;
+/// only the external checker wait (and the response assembly after it) runs
+/// while the loop answers cheap requests such as `status`. The hook is
+/// cleared when `f` returns, even by unwinding.
+pub fn with_full_validation_start_hook<R>(hook: Box<dyn FnOnce()>, f: impl FnOnce() -> R) -> R {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            let _ = FULL_VALIDATION_START_HOOK.try_with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    FULL_VALIDATION_START_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+    let _clear = ClearHook;
+    f()
+}
+
+/// Fire the hook installed by [`with_full_validation_start_hook`], if any.
+/// Only the first checker run of a request fires it; later runs (multi-file
+/// commands) find the slot empty.
+fn notify_full_validation_start() {
+    let hook = FULL_VALIDATION_START_HOOK
+        .try_with(|slot| slot.borrow_mut().take())
+        .ok()
+        .flatten();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Write content to disk, auto-format, then validate syntax.
 ///
 /// This is the shared tail for all mutation commands. The pipeline order is:
@@ -614,6 +655,7 @@ pub fn write_format_validate(
     let validate_mode = param_validate.or(config_validate).unwrap_or("off");
     let validate_requested = validate_mode == "full";
     let (validation_errors, validate_skipped_reason) = if validate_requested {
+        notify_full_validation_start();
         format::validate_full(path, config)
     } else {
         (Vec::new(), None)

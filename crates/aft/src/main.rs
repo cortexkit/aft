@@ -276,6 +276,16 @@ fn main() {
     let mut queued_lines = VecDeque::new();
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
     let mut graceful_stdin_shutdown = false;
+    // While an edit waits on its type checker (see
+    // `dispatch_with_offloaded_validation`), `validation_gate` holds that
+    // edit's request id. Only `is_served_during_pending_validation` commands
+    // are answered meanwhile; everything else is parked in `held_lines`, in
+    // arrival order, and replayed ahead of newer input once the edit's response
+    // has been written. This keeps file mutations strictly serialized: a second
+    // edit of the same file cannot start until the first one has finished.
+    let mut validation_gate: Option<String> = None;
+    let mut held_lines: VecDeque<io::Result<String>> = VecDeque::new();
+    const VALIDATION_GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
     thread::spawn(move || {
         let stdin = io::stdin();
         let reader = stdin.lock();
@@ -291,8 +301,21 @@ fn main() {
             break;
         }
 
+        if validation_gate
+            .as_deref()
+            .is_some_and(|request_id| !pending.contains(request_id))
+        {
+            validation_gate = None;
+            while let Some(line) = held_lines.pop_back() {
+                queued_lines.push_front(line);
+            }
+        }
+        let gated = validation_gate.is_some();
+
         let configure_pending = configure_maintenance.has_pending(registry.current());
-        let recv_timeout = if configure_pending {
+        let recv_timeout = if gated {
+            VALIDATION_GATE_POLL_INTERVAL
+        } else if configure_pending {
             Duration::from_millis(100)
         } else if pending.is_empty() {
             DRAIN_INTERVAL
@@ -304,6 +327,26 @@ fn main() {
         } else {
             match line_rx.recv_timeout(recv_timeout) {
                 Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) if gated => {
+                    // Runtime drains stay paused while the edit finishes,
+                    // exactly as they were while an edit ran inline; only the
+                    // edit's own deferred response is polled.
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) if gated => {
+                    // Stdin closed with requests still held behind the edit:
+                    // finish the edit and replay them before shutting down.
+                    thread::sleep(VALIDATION_GATE_POLL_INTERVAL);
+                    if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Periodic drain so push frames flow even without requests.
                     // The request-critical configure prefix runs before a cooperative
@@ -354,18 +397,26 @@ fn main() {
         let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
-                // The first request after each configure waits for the request-critical
-                // prefix. The remaining project-runtime and indexing work stays
-                // cooperative, so even ping runs before another suffix unit.
-                configure_maintenance.drain_prefix(registry.current());
-                if configure_maintenance.has_pending(registry.current()) {
-                    aft::runtime_drain::note_configure_maintenance_yield(queued_lines.len() + 1);
+                if gated && !is_served_during_pending_validation(&req.command) {
+                    held_lines.push_back(Ok(line.clone()));
+                    continue;
                 }
-                // Install any completed search index before applying watcher changes.
-                // These bounded, non-blocking drains let each request use the freshest
-                // available index without waiting for configure maintenance.
-                aft::logging::note_drain_slice();
-                drain_non_configure_runtime_events(&registry);
+                if !gated {
+                    // The first request after each configure waits for the request-critical
+                    // prefix. The remaining project-runtime and indexing work stays
+                    // cooperative, so even ping runs before another suffix unit.
+                    configure_maintenance.drain_prefix(registry.current());
+                    if configure_maintenance.has_pending(registry.current()) {
+                        aft::runtime_drain::note_configure_maintenance_yield(
+                            queued_lines.len() + 1,
+                        );
+                    }
+                    // Install any completed search index before applying watcher changes.
+                    // These bounded, non-blocking drains let each request use the freshest
+                    // available index without waiting for configure maintenance.
+                    aft::logging::note_drain_slice();
+                    drain_non_configure_runtime_events(&registry);
+                }
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
@@ -376,6 +427,7 @@ fn main() {
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
                 runtime.note_request();
+                let gates_on_validation = offloads_full_validation(&req, runtime);
                 let dispatch_result = if req.command == "cancel_request" {
                     Ok(DispatchOutcome::Immediate(handle_cancel_request(
                         &req,
@@ -397,6 +449,9 @@ fn main() {
                         Some(response)
                     }
                     Ok(DispatchOutcome::Deferred(pending_response)) => {
+                        if gates_on_validation {
+                            validation_gate = Some(request_id.clone());
+                        }
                         pending.register(pending_response);
                         None
                     }
@@ -426,13 +481,20 @@ fn main() {
                 break;
             }
         }
-        drain_configure_warning_events_for_registry(&registry);
+        let gated = validation_gate.is_some();
+        if !gated {
+            drain_configure_warning_events_for_registry(&registry);
+        }
         if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
             aft::slog_error!("stdout write error: {}", e);
             break;
         }
         if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
             break;
+        }
+        if gated {
+            // Background work resumes once the edit's response is written.
+            continue;
         }
 
         // One suffix unit per served request, whether or not more requests are
@@ -1180,7 +1242,208 @@ fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     if req.command == "read" {
         return aft::commands::read::build_read_outcome(req, ctx);
     }
+    if offloads_full_validation(&req, ctx) {
+        return dispatch_with_offloaded_validation(req, Arc::clone(ctx));
+    }
     DispatchOutcome::Immediate(dispatch(req, ctx))
+}
+
+/// Direct protocol commands that write through `edit::write_format_validate`
+/// and can therefore run the project type checker.
+fn is_validating_mutation_command(command: &str) -> bool {
+    matches!(
+        command,
+        "write"
+            | "edit_match"
+            | "edit_symbol"
+            | "batch"
+            | "apply_patch"
+            | "add_import"
+            | "remove_import"
+            | "organize_imports"
+            | "inline_symbol"
+            | "extract_function"
+            | "move_symbol"
+    )
+}
+
+/// Agent tool names (with or without the `aft_` prefix) that reach the
+/// commands above through `tool_call`.
+fn is_validating_mutation_tool(name: &str) -> bool {
+    let bare_name = name.strip_prefix("aft_").unwrap_or(name);
+    matches!(
+        bare_name,
+        "write" | "edit" | "apply_patch" | "import" | "refactor"
+    )
+}
+
+fn params_request_full_validation(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            (key == "validate" && value.as_str() == Some("full"))
+                || params_request_full_validation(value)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(params_request_full_validation),
+        _ => false,
+    }
+}
+
+/// True when a request is a file mutation that may block on the project type
+/// checker: `validate_on_edit: "full"` in config, or `validate: "full"`
+/// anywhere in its params (direct commands carry it at the top level,
+/// `tool_call` nests it under `arguments`).
+fn offloads_full_validation(req: &RawRequest, ctx: &AppContext) -> bool {
+    let mutation = if req.command == "tool_call" {
+        tool_call_name(req).is_some_and(is_validating_mutation_tool)
+    } else {
+        is_validating_mutation_command(&req.command)
+    };
+    mutation
+        && (ctx.config().validate_on_edit.as_deref() == Some("full")
+            || params_request_full_validation(&req.params))
+}
+
+/// Commands the standalone loop still answers while an offloaded edit waits on
+/// its type checker. They are cheap and never touch project files, so answering
+/// them before the edit's response cannot change what the edit wrote or
+/// reports. Every other request is held until the edit's response is written.
+fn is_served_during_pending_validation(command: &str) -> bool {
+    matches!(
+        command,
+        "status"
+            | "ping"
+            | "version"
+            | "cancel_request"
+            | "bash_drain_completions"
+            | "bash_ack_completions"
+    )
+}
+
+enum OffloadedEditEvent {
+    ValidationStarted,
+    Finished(thread::Result<Response>),
+}
+
+/// Run a file mutation on a worker thread, but keep the request loop blocked
+/// on it until its write, format and syntax check are done. Once the edit
+/// reaches the external type checker, return a deferred response so the loop
+/// can answer `status` and bash completion polls while the checker runs.
+///
+/// A mutation that never reaches the checker step (preview, request error,
+/// or `validate: "off"` overriding the config) completes before this function returns and
+/// is answered immediately, exactly like the inline path. A panic before the
+/// checker is re-raised on the loop thread so the existing dispatch-panic
+/// shutdown applies unchanged.
+fn dispatch_with_offloaded_validation(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+    let request_id = req.id.clone();
+    let session_id = req.session().to_string();
+    let attach_command = attach_command_for_request(&req);
+    let worker_session_id = req.session_id.clone();
+    let (tx, rx) = mpsc::channel::<OffloadedEditEvent>();
+    let started_tx = tx.clone();
+    thread::spawn(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            aft::edit::with_full_validation_start_hook(
+                Box::new(move || {
+                    let _ = started_tx.send(OffloadedEditEvent::ValidationStarted);
+                }),
+                || log_ctx::with_session(worker_session_id, || dispatch(req, &ctx)),
+            )
+        }));
+        let _ = tx.send(OffloadedEditEvent::Finished(result));
+    });
+
+    match rx.recv() {
+        Ok(OffloadedEditEvent::Finished(Ok(response))) => DispatchOutcome::Immediate(response),
+        Ok(OffloadedEditEvent::Finished(Err(payload))) => std::panic::resume_unwind(payload),
+        Ok(OffloadedEditEvent::ValidationStarted) => {
+            offloaded_validation_pending(request_id, session_id, attach_command, rx)
+        }
+        Err(mpsc::RecvError) => {
+            DispatchOutcome::Immediate(offloaded_edit_disconnected(&request_id))
+        }
+    }
+}
+
+fn offloaded_edit_disconnected(request_id: &str) -> Response {
+    Response::error(
+        request_id,
+        "internal_error",
+        "edit worker disconnected before producing a response",
+    )
+}
+
+fn offloaded_edit_response(
+    request_id: &str,
+    command: &str,
+    event: Result<OffloadedEditEvent, mpsc::RecvError>,
+) -> Option<Response> {
+    match event {
+        Ok(OffloadedEditEvent::Finished(Ok(response))) => Some(response),
+        Ok(OffloadedEditEvent::Finished(Err(payload))) => {
+            let message = panic_payload_message(payload.as_ref());
+            aft::slog_error!(
+                "command '{}' panicked during validation: {}",
+                command,
+                message
+            );
+            Some(Response::error(
+                request_id,
+                "internal_error",
+                format!("command '{command}' panicked: {message}"),
+            ))
+        }
+        // The start hook is one-shot, so a second start event cannot arrive.
+        Ok(OffloadedEditEvent::ValidationStarted) => None,
+        Err(mpsc::RecvError) => Some(offloaded_edit_disconnected(request_id)),
+    }
+}
+
+fn offloaded_validation_pending(
+    request_id: String,
+    session_id: String,
+    attach_command: String,
+    rx: mpsc::Receiver<OffloadedEditEvent>,
+) -> DispatchOutcome {
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+    let poll_rx = Arc::clone(&rx);
+    let poll_request_id = request_id.clone();
+    let poll_command = attach_command.clone();
+    let shutdown_request_id = request_id.clone();
+    let shutdown_command = attach_command.clone();
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id,
+        session_id,
+        attach_command,
+        poll: Box::new(move |_| {
+            let rx = poll_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match rx.try_recv() {
+                Ok(event) => offloaded_edit_response(&poll_request_id, &poll_command, Ok(event)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    offloaded_edit_response(&poll_request_id, &poll_command, Err(mpsc::RecvError))
+                }
+            }
+        }),
+        // The file is already written; cancelling the checker would only hide
+        // its result, so the edit is not cancellable once deferred.
+        cancellation: None,
+        // At shutdown, wait for the checker (bounded by
+        // `type_checker_timeout_secs`) so the client still receives the real
+        // edit result instead of a cancellation for a write that happened.
+        on_shutdown: Some(Box::new(move |_| {
+            let rx = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if let Some(response) =
+                    offloaded_edit_response(&shutdown_request_id, &shutdown_command, rx.recv())
+                {
+                    return response;
+                }
+            }
+        })),
+    })
 }
 
 fn handle_echo(req: &RawRequest) -> Response {
@@ -2315,6 +2578,155 @@ mod deferred_semantic_search_tests {
         }
 
         assert_eq!(deferred_bytes, inline_bytes);
+    }
+
+    /// Install a fast `tsc` stub that reports one TS2322 error for `target`.
+    #[cfg(unix)]
+    fn install_fast_tsc_stub(root: &Path, target: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin_dir = root.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).expect("create stub bin dir");
+        let stub = bin_dir.join("tsc");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\nprintf '%s(1,7): error TS2322: Type string is not assignable to type number.\\n' '{}'\nexit 2\n",
+                target.display()
+            ),
+        )
+        .expect("write tsc stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod tsc stub");
+        // Pay first-exec cost (macOS assessment) outside the checker timeout.
+        let _ = std::process::Command::new(&stub)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .status();
+    }
+
+    /// An edit whose type checker runs off the request thread must produce the
+    /// same response bytes as the inline edit it replaces.
+    #[cfg(unix)]
+    #[test]
+    fn offloaded_validation_preserves_inline_edit_response_bytes() {
+        let root = tempfile::tempdir().expect("create validation project");
+        std::fs::write(root.path().join("tsconfig.json"), "{}\n").expect("write tsconfig");
+        let target = root.path().join("parity.ts");
+        install_fast_tsc_stub(root.path(), &target);
+        let make_ctx = || {
+            let mut config = Config {
+                project_root: Some(root.path().to_path_buf()),
+                validate_on_edit: Some("full".to_string()),
+                ..Config::default()
+            };
+            config
+                .checker
+                .insert("typescript".to_string(), "tsc".to_string());
+            Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config))
+        };
+        let make_request = || {
+            request(
+                "parity-write",
+                "write",
+                serde_json::json!({
+                    "file": target.display().to_string(),
+                    "content": "const x: number = \"oops\";\n",
+                }),
+            )
+        };
+
+        let inline_ctx = make_ctx();
+        let inline_request = make_request();
+        let inline_attach = attach_command_for_request(&inline_request);
+        let mut inline_response = dispatch(inline_request, &inline_ctx);
+        finalize_response(
+            &mut inline_response,
+            &inline_ctx,
+            "standalone-search-test",
+            &inline_attach,
+        );
+        assert_eq!(
+            inline_response.data["validation_errors"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "inline control must run the checker: {inline_response:?}"
+        );
+        let mut inline_bytes = Vec::new();
+        super::write_response_to_writer(&mut inline_bytes, &inline_response)
+            .expect("serialize inline response");
+
+        std::fs::remove_file(&target).expect("reset parity target");
+        let deferred_ctx = make_ctx();
+        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut deferred_bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if write_ready_pending_to_writer(&deferred_ctx, &mut pending, &mut deferred_bytes)
+                .expect("serialize deferred response")
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for offloaded edit response"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            String::from_utf8_lossy(&deferred_bytes),
+            String::from_utf8_lossy(&inline_bytes)
+        );
+    }
+
+    #[test]
+    fn only_validating_mutations_offload_the_checker() {
+        let full = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                validate_on_edit: Some("full".to_string()),
+                ..Config::default()
+            },
+        ));
+        let off = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
+        let edit_tool = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "edit", "arguments": {}}),
+        );
+        let prefixed_tool = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "aft_import", "arguments": {}}),
+        );
+        let outline_tool = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "outline", "arguments": {}}),
+        );
+        let param_full = request(
+            "t",
+            "tool_call",
+            serde_json::json!({"name": "write", "arguments": {"validate": "full"}}),
+        );
+        assert!(super::offloads_full_validation(&edit_tool, &full));
+        assert!(super::offloads_full_validation(&prefixed_tool, &full));
+        assert!(super::offloads_full_validation(
+            &request("t", "edit_match", serde_json::json!({})),
+            &full
+        ));
+        assert!(!super::offloads_full_validation(&outline_tool, &full));
+        assert!(!super::offloads_full_validation(
+            &request("t", "status", serde_json::json!({})),
+            &full
+        ));
+        assert!(!super::offloads_full_validation(&edit_tool, &off));
+        assert!(super::offloads_full_validation(&param_full, &off));
     }
 }
 

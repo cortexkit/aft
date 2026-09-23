@@ -1064,6 +1064,185 @@ fn validate_on_edit_off_from_config_skips_checker() {
     assert!(status.success());
 }
 
+/// Creates the release file on drop so a failing assertion never leaves the
+/// blocking checker stub (and the aft child waiting on it) running.
+#[cfg(unix)]
+struct ReleaseOnDrop(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "release");
+    }
+}
+
+/// Read stdout lines until the response with `id` arrives or `budget` runs out.
+/// Returns the response plus the ids of every other response seen first.
+#[cfg(unix)]
+fn read_response_within(
+    aft: &mut AftProcess,
+    id: &str,
+    budget: std::time::Duration,
+) -> (Option<serde_json::Value>, Vec<String>) {
+    let deadline = std::time::Instant::now() + budget;
+    let mut earlier_ids = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return (None, earlier_ids);
+        }
+        let Some(value) = aft.try_read_next_timeout(remaining) else {
+            continue;
+        };
+        match value.get("id").and_then(serde_json::Value::as_str) {
+            Some(seen) if seen == id => return (Some(value), earlier_ids),
+            Some(seen) => earlier_ids.push(seen.to_string()),
+            None => {}
+        }
+    }
+}
+
+/// Issue #334: with `validate_on_edit: "full"`, a standalone bridge ran the
+/// type checker on its only request thread, so `status` (5s passive budget)
+/// and `bash_drain_completions` (15s) queued behind every edit and timed out.
+/// The checker stub here blocks until the test releases it; `status` and the
+/// drain poll must be answered while it is blocked, the edit response must
+/// still carry the checker's result, and a second write to the same file must
+/// wait for the first edit instead of racing its checker.
+#[cfg(unix)]
+#[test]
+fn validate_on_edit_full_keeps_status_responsive_while_checker_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let dir = format_test_dir("validate_full_status_responsive");
+    let target = dir.join("validate_full_status_responsive.ts");
+    let started = dir.join("checker-started");
+    let release = dir.join("checker-release");
+    let seen = dir.join("checker-seen");
+    for path in [&target, &started, &release, &seen] {
+        let _ = fs::remove_file(path);
+    }
+    fs::write(dir.join("tsconfig.json"), "{}\n").unwrap();
+
+    // The stub marks that it started, waits for the release file, then records
+    // the file content it checked and reports one TS2322 error for it.
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("tsc");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'Version 5.0.0'; exit 0; fi\n: > '{started}'\ni=0\nwhile [ ! -f '{release}' ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done\ncat '{target}' >> '{seen}'\nprintf '%s(1,7): error TS2322: Type string is not assignable to type number.\\n' '{target}'\nexit 2\n",
+            started = started.display(),
+            release = release.display(),
+            target = target.display(),
+            seen = seen.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    warm_executable(&stub, &["--version"]);
+    let _release_guard = ReleaseOnDrop(release.clone());
+
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.send(
+        &json!({
+            "id": "cfg-val-responsive",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir,
+            "config": user_config(serde_json::json!({
+                "validate_on_edit": "full",
+                "checker": { "typescript": "tsc" }
+            }))
+        })
+        .to_string(),
+    );
+    assert_eq!(cfg["success"], true, "configure should succeed: {cfg:?}");
+
+    let first = "const x: number = \"one\";\n";
+    let second = "const x: number = \"two\";\n";
+    aft.send_silent(
+        &json!({ "id": "slow-edit", "command": "write", "file": target, "content": first })
+            .to_string(),
+    );
+    let wait_started = Instant::now();
+    while !started.exists() {
+        assert!(
+            wait_started.elapsed() < Duration::from_secs(30),
+            "checker stub never started"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Queue a second write to the same file behind the blocked edit, then poll.
+    aft.send_silent(
+        &json!({ "id": "second-edit", "command": "write", "file": target, "content": second })
+            .to_string(),
+    );
+    let status_sent = Instant::now();
+    aft.send_silent(&json!({ "id": "status-during-check", "command": "status" }).to_string());
+    let (status, before_status) =
+        read_response_within(&mut aft, "status-during-check", Duration::from_secs(5));
+    let status_latency = status_sent.elapsed();
+    let status = status.unwrap_or_else(|| {
+        panic!("status was not answered within its 5s budget while the checker ran")
+    });
+    assert_eq!(status["success"], true, "status should succeed: {status:?}");
+    assert!(
+        before_status.is_empty(),
+        "no edit may answer before the checker is released: {before_status:?}"
+    );
+    aft.send_silent(
+        &json!({ "id": "drain-during-check", "command": "bash_drain_completions" }).to_string(),
+    );
+    let (drain, before_drain) =
+        read_response_within(&mut aft, "drain-during-check", Duration::from_secs(15));
+    assert!(
+        drain.is_some(),
+        "bash_drain_completions was not answered within its 15s budget"
+    );
+    assert!(before_drain.is_empty(), "{before_drain:?}");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        first,
+        "the held second write must not touch the file while the first edit is validating"
+    );
+    eprintln!(
+        "status answered in {}ms while the checker was blocked",
+        status_latency.as_millis()
+    );
+
+    fs::write(&release, "release").unwrap();
+    let (edit, before_edit) = read_response_within(&mut aft, "slow-edit", Duration::from_secs(30));
+    let edit = edit.expect("edit response should arrive after the checker finishes");
+    assert!(before_edit.is_empty(), "{before_edit:?}");
+    assert_eq!(edit["success"], true, "write should succeed: {edit:?}");
+    let errors = edit["validation_errors"]
+        .as_array()
+        .expect("the deferred edit response must carry validation_errors");
+    assert_eq!(errors.len(), 1, "{edit:?}");
+    assert!(
+        errors[0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("TS2322"),
+        "{edit:?}"
+    );
+
+    let (second_edit, _) = read_response_within(&mut aft, "second-edit", Duration::from_secs(30));
+    let second_edit = second_edit.expect("held second write should run after the first");
+    assert_eq!(second_edit["success"], true, "{second_edit:?}");
+    assert_eq!(
+        fs::read_to_string(&seen).unwrap(),
+        format!("{first}{second}"),
+        "each checker run must see its own write"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
 /// Send write with validate:"full" on a .rs file with valid code → if cargo available,
 /// response includes validation_errors: [] (empty).
 #[test]
