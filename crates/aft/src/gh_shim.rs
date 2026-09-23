@@ -3274,7 +3274,7 @@ fn canonicalize_governed_from<R: Read>(
         let Some(reason) = close_reason else {
             return Err(CanonicalizeError::typed(
                 RefusalCode::MissingReason,
-                "issue close requires --reason completed|not_planned because those are distinct public statements",
+                "issue close requires --reason completed|\"not planned\" because those are distinct public statements",
             ));
         };
         body.insert("reason".to_string(), Value::String(reason));
@@ -3691,9 +3691,18 @@ fn declared_reason_value(
             "--reason is only valid for issue close",
         ));
     }
+    // Upstream gh documents the value as "not planned", with a space, while the
+    // GitHub API's state_reason and the holder contract use "not_planned". Accept
+    // both spellings and carry the API form, so a command copied from gh's own
+    // help is not refused.
+    let supplied = if supplied == "not planned" {
+        "not_planned".to_string()
+    } else {
+        supplied
+    };
     if !ISSUE_CLOSE_REASONS.contains(&supplied.as_str()) {
         return Err(CanonicalizeError::unclassified(
-            "--reason must be completed or not_planned",
+            "--reason must be completed or \"not planned\"",
         ));
     }
     Ok(Some(supplied))
@@ -5569,6 +5578,29 @@ mod tests {
         assert!(close_wire.get("body").is_none());
         assert!(close_wire.get("delete-branch").is_none());
         assert!(close_wire.get("delete_branch").is_none());
+
+        // Upstream gh's documented spelling "not planned" (with a space) must
+        // govern like "not_planned", and the wire must carry the API form.
+        for reason_args in [
+            vec!["--reason", "not planned"],
+            vec!["--reason=not planned"],
+            vec!["--reason", "not_planned"],
+        ] {
+            let mut args = vec!["issue", "close", "42"];
+            args.extend(reason_args.iter().copied());
+            args.extend(["--repo", "cortexkit/aft"]);
+            let args = os_args(&args);
+            let Classification::Governed { tuple, canonical } = classify(&args, &v12, "macos")
+            else {
+                panic!("v12 issue close {reason_args:?} must be governed");
+            };
+            let request = canonicalize_governed(&args, &tuple, &canonical, v12.manifest_version)
+                .unwrap_or_else(|error| {
+                    panic!("issue close {reason_args:?} must canonicalize: {error:?}")
+                });
+            let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
+            assert_eq!(wire["reason"], "not_planned", "{reason_args:?}");
+        }
 
         let reopen_args = os_args(&["pr", "reopen", "7", "--repo", "cortexkit/aft"]);
         let Classification::Governed {
