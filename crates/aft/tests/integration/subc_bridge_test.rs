@@ -27,10 +27,13 @@ use aft::subc::{
 use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 use subc_protocol::manifest::ModuleManifest;
-use subc_protocol::session::{HealthReport, ModuleControlRequest, ModuleControlResponse};
+use subc_protocol::session::{
+    HealthReport, ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
+    ModuleControlResponseToModule, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+};
 use subc_protocol::{
-    BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
-    Priority, RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody,
+    Principal, Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 use subc_transport::{authenticate_server, read_frame as read_subc_frame, write_frame};
@@ -3176,6 +3179,240 @@ async fn drive_s1_rejection_daemon(
     // A bare socket drop is a connection loss and exits non-zero on purpose.
     send_connection_goodbye(&mut stream).await;
     drop(stream);
+}
+
+/// The module registers not-ready and flips itself ready over its own
+/// connection. The fake daemon behaves like the one deployed today: it knows
+/// `catalog.update` but refuses `supervisor.live_roots`, and its first
+/// `catalog.update` fails, so the flip must be retried. Routes still bind
+/// normally afterwards.
+#[test]
+fn subc_registers_not_ready_and_flips_ready_when_live_roots_is_refused() {
+    let root = tempfile::tempdir().expect("root tempdir");
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn_dir = tempfile::tempdir().expect("connection tempdir");
+    let conn_path = conn_dir.path().join("subc-connection.json");
+
+    let std_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    std_listener
+        .set_nonblocking(true)
+        .expect("set fake daemon nonblocking");
+    let port = std_listener.local_addr().expect("fake daemon addr").port();
+    let key = vec![0x42; subc_transport::KEY_LEN];
+    let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+    let conn = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: Some(PROTOCOL_VERSION),
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".to_string(),
+            port,
+        }],
+        key: key.clone(),
+        daemon_id,
+        pid: std::process::id(),
+        daemon_ver: "subc-test".to_string(),
+    };
+    connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
+
+    let root_path = root.path().to_path_buf();
+    let daemon = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fake daemon runtime");
+        runtime.block_on(async move {
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                drive_readiness_daemon(std_listener, key, daemon_id, root_path),
+            )
+            .await
+            .expect("readiness daemon watchdog");
+        });
+    });
+
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        },
+    ));
+    let executor = Arc::new(Executor::with_config(ExecutorConfig {
+        pool_size: 2,
+        read_cap: 2,
+        actor_cap: 2,
+        heavy_permits: 1,
+        drr_quantum: 1,
+    }));
+    let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
+
+    run_subc_mode(
+        &conn_path,
+        ctx,
+        executor,
+        malformed_fed_bind_production_dispatch,
+        Some(user_config_path),
+    )
+    .expect("subc mode exits cleanly");
+    daemon.join().expect("readiness daemon joins");
+
+    drop(root);
+    drop(storage);
+}
+
+async fn drive_readiness_daemon(
+    std_listener: StdTcpListener,
+    key: Vec<u8>,
+    daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
+    root: std::path::PathBuf,
+) {
+    let listener = TcpListener::from_std(std_listener).expect("tokio listener");
+    let (mut stream, _) = listener.accept().await.expect("accept aft client");
+    authenticate_server(
+        &mut stream,
+        &key,
+        &daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate aft client");
+
+    let hello = read_any_frame_timeout(&mut stream, "ModuleHello").await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    let hello_body: ModuleHelloBody = serde_json::from_slice(&hello.body).expect("hello body");
+    assert_eq!(
+        hello_body.manifest.ready,
+        Some(false),
+        "the module must register not-ready"
+    );
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: vec![
+                    MODULE_TO_SUBC_OP_CATALOG_UPDATE.to_string(),
+                    "supervisor.live_roots".to_string(),
+                ],
+                subc_capabilities: Vec::new(),
+                storage: None,
+            })
+            .expect("hello ack body"),
+        )
+        .expect("hello ack frame"),
+    )
+    .await;
+
+    // The live-root query arrives first; refuse it as an unknown op.
+    let query = read_any_frame_timeout(&mut stream, "live_roots request").await;
+    assert_eq!(query.header.ty, FrameType::Request);
+    assert_eq!(query.header.channel, 0);
+    let query_body: ModuleControlRequestFromModule =
+        serde_json::from_slice(&query.body).expect("live_roots body");
+    assert_eq!(query_body, ModuleControlRequestFromModule::LiveRoots {});
+    send_channel_zero_error(&mut stream, query.header.corr, "unknown_op").await;
+
+    // The flip follows at once. Fail the first attempt; the retry must come.
+    let mut flip_corrs = Vec::new();
+    for attempt in 0..2 {
+        let flip = read_any_frame_timeout(&mut stream, "catalog.update request").await;
+        assert_eq!(flip.header.ty, FrameType::Request);
+        assert_eq!(flip.header.channel, 0);
+        let flip_body: ModuleControlRequestFromModule =
+            serde_json::from_slice(&flip.body).expect("catalog.update body");
+        match flip_body {
+            ModuleControlRequestFromModule::CatalogUpdate {
+                provides,
+                capabilities,
+                ready,
+            } => {
+                assert_eq!(ready, Some(true));
+                assert_eq!(capabilities, None);
+                assert_eq!(
+                    provides, hello_body.manifest.provides,
+                    "the flip must keep the registered roles"
+                );
+            }
+            other => panic!("expected catalog.update, got {other:?}"),
+        }
+        flip_corrs.push(flip.header.corr);
+        if attempt == 0 {
+            send_channel_zero_error(&mut stream, flip.header.corr, "catalog_busy").await;
+        } else {
+            send_frame(
+                &mut stream,
+                Frame::build(
+                    FrameType::Response,
+                    control_flags(),
+                    0,
+                    0,
+                    flip.header.corr,
+                    serde_json::to_vec(&ModuleControlResponseToModule::CatalogUpdate {})
+                        .expect("catalog.update reply"),
+                )
+                .expect("catalog.update reply frame"),
+            )
+            .await;
+        }
+    }
+    assert_ne!(flip_corrs[0], flip_corrs[1], "each retry is a new request");
+
+    // Sessions bind as before.
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 1,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "aft".to_string(),
+        },
+        identity: BindIdentity::new(
+            root.clone(),
+            "mcp:generic".to_string(),
+            "readiness-session".to_string(),
+        ),
+        principal: Some(Principal::Direct),
+        consumer_capabilities: None,
+        admission_facts: Default::default(),
+    };
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&bind).expect("route bind body"),
+        )
+        .expect("route bind frame"),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 1).await;
+
+    send_connection_goodbye(&mut stream).await;
+    drop(stream);
+}
+
+async fn send_channel_zero_error(stream: &mut tokio::net::TcpStream, corr: u64, code: &str) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Error,
+            control_flags(),
+            0,
+            0,
+            corr,
+            serde_json::to_vec(&ErrorBody::new(code, "refused by the test daemon"))
+                .expect("error body"),
+        )
+        .expect("error frame"),
+    )
+    .await;
 }
 
 pub(super) async fn open_fake_daemon_session_with_hello(

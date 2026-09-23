@@ -51,8 +51,8 @@ use subc_protocol::session::{
     MODULE_CONTROL_OP_HEALTH_CHECK,
 };
 use subc_protocol::{
-    ErrorBody, Flags, Frame, FrameType, ModuleHelloBody, Principal, Priority, RouteTarget,
-    MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
+    ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal, Priority,
+    RouteTarget, MAX_FRAME_BODY_LEN, PROTOCOL_VERSION,
 };
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -149,6 +149,7 @@ mod bash;
 mod health;
 mod manifest;
 mod push;
+mod readiness;
 mod standing;
 mod wire;
 
@@ -2548,6 +2549,45 @@ fn run_subc_mode_inner(
     }
 }
 
+/// Starts the readiness sequence (query live roots, warm, flip ready) beside
+/// the module loop, which must keep running to deliver the daemon's replies.
+/// Returns `None` when the daemon predates readiness: it does not advertise
+/// `catalog.update`, so it ignores `ready: false` and there is nothing to flip.
+fn spawn_readiness(
+    hello_ack: Option<ModuleHelloAckBody>,
+    writer_tx: &WriterSender,
+    metrics: &Arc<DispatchPathMetrics>,
+    provides: Vec<ProviderRole>,
+    control_replies: readiness::PendingControlReplies,
+    spawn_role: readiness::SpawnRole,
+    hello_at: tokio::time::Instant,
+) -> Option<JoinHandle<()>> {
+    let (negotiated_ver, advertised_ops) = match hello_ack {
+        Some(ack) => (ack.negotiated_ver, ack.subc_ops),
+        None => (PROTOCOL_VERSION, Vec::new()),
+    };
+    if !readiness::daemon_supports_ready_flip(&advertised_ops) {
+        log::info!(
+            "readiness: daemon does not advertise catalog.update, so it ignores ready: false; no flip is sent"
+        );
+        return None;
+    }
+    let control = readiness::DaemonControl::new(
+        writer_tx.clone(),
+        Arc::clone(metrics),
+        negotiated_ver,
+        advertised_ops,
+        provides,
+        control_replies,
+        HELLO_CORR + 1,
+    );
+    Some(tokio::spawn(async move {
+        let report =
+            readiness::run_readiness(&control, &readiness::NoWarmer, spawn_role, hello_at).await;
+        log::info!("{report}");
+    }))
+}
+
 /// Maps how the module loop ended onto the process outcome the supervisor
 /// reads. Only a daemon-requested stop may exit 0: the supervisor never
 /// respawns a clean exit, so every other ending must surface as an error.
@@ -2970,8 +3010,13 @@ where
     // the separate channel-0 control operations.
     // Echo the one-time launch nonce the daemon injected via SUBC_LAUNCH_NONCE so a
     // reserved module_id's HELLO is accepted; absent for non-reserved/self-connect.
+    // Read once, before HELLO: it selects the warm-up budget and nothing else.
+    let spawn_role = readiness::SpawnRole::from_process_env();
+    let manifest = build_manifest();
+    let manifest_provides = manifest.provides.clone();
+    let hello_at = tokio::time::Instant::now();
     let hello = ModuleHelloBody {
-        manifest: build_manifest(),
+        manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: control_ops(),
         launch_nonce: std::env::var("SUBC_LAUNCH_NONCE").ok(),
@@ -2990,11 +3035,14 @@ where
         .map_err(SubcError::FrameIo)?;
 
     // Expect HelloAck (registered) or a channel-0 Error (manifest/version reject).
-    match read_frame(&mut read).await.map_err(SubcError::FrameIo)? {
+    let hello_ack = match read_frame(&mut read).await.map_err(SubcError::FrameIo)? {
         None => return Err(SubcError::ClosedBeforeHelloAck),
         Some(frame) => match frame.header.ty {
             FrameType::HelloAck => {
                 log::info!("subc attach: registered (HelloAck received)");
+                // The advertised ops decide which readiness requests the daemon
+                // can serve. An unreadable body advertises nothing.
+                serde_json::from_slice::<ModuleHelloAckBody>(&frame.body).ok()
             }
             FrameType::Error => {
                 let body = serde_json::from_slice::<ErrorBody>(&frame.body).ok();
@@ -3002,11 +3050,21 @@ where
             }
             other => return Err(SubcError::UnexpectedFrame { ty: other }),
         },
-    }
+    };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
+    let control_replies = readiness::PendingControlReplies::default();
+    let readiness_task = spawn_readiness(
+        hello_ack,
+        &writer_tx,
+        &dispatch_path_metrics,
+        manifest_provides,
+        control_replies.clone(),
+        spawn_role,
+        hello_at,
+    );
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
     // the `select!` below: a drain-interval tick (or shutdown) firing while a
     // frame is mid-transit would drop the partially-consumed bytes and desync the
@@ -3360,6 +3418,16 @@ where
                         .await
                         {
                             break Err(error);
+                        }
+                    }
+                    FrameType::Response | FrameType::Error if frame.header.channel == 0 => {
+                        // Replies to AFT's own channel-0 requests (readiness).
+                        let corr = frame.header.corr;
+                        let ty = frame.header.ty;
+                        if !control_replies.resolve(frame) {
+                            log::debug!(
+                                "subc attach: dropping unmatched channel-0 {ty:?} for corr {corr}"
+                            );
                         }
                     }
                     FrameType::Request if frame.header.channel == 0 => {
@@ -3755,6 +3823,11 @@ where
 
     shared_app.set_open_route_count(0);
     health_rollup_worker.shutdown();
+    // The flip retries until accepted; the connection ending is what stops it.
+    if let Some(task) = readiness_task {
+        task.abort();
+        let _ = task.await;
+    }
 
     connection_cancel.cancel();
     cancel_all_active_tool_calls(&active_tool_calls, executor.as_ref(), "connection teardown");
