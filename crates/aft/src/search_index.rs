@@ -181,6 +181,26 @@ pub(crate) enum BorrowedIndexLoad {
     Invalid,
 }
 
+/// What reconciling a borrowed snapshot against this checkout's files found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BorrowedReconcileSummary {
+    /// Files the ignore-aware walk found on disk.
+    pub(crate) walked: usize,
+    /// Snapshot records whose bytes still match disk (kept on shared postings).
+    pub(crate) unchanged: usize,
+    /// The subset of `unchanged` that needed a content hash to prove it.
+    pub(crate) hashed_unchanged: usize,
+    /// Snapshot records whose content differs and were re-indexed in RAM.
+    pub(crate) reindexed: usize,
+    /// Files on disk that the snapshot does not contain.
+    pub(crate) added: usize,
+    /// Snapshot records with no file on disk any more.
+    pub(crate) removed: usize,
+    pub(crate) walk: Duration,
+    pub(crate) verify: Duration,
+    pub(crate) apply: Duration,
+}
+
 struct BorrowedIndexLoadBudget {
     started_at: Instant,
     duration: Duration,
@@ -1965,6 +1985,142 @@ impl SearchIndex {
         let changed = verify_file_mtimes(self, verify_strategy);
         self.ready = true;
         changed
+    }
+
+    /// Bring a borrowed (read-only) snapshot in line with the files that are
+    /// actually on disk under this index's root, entirely in RAM.
+    ///
+    /// A linked worktree reads the home checkout's shared `cache.bin`, which
+    /// describes the home checkout, not this worktree. Branch commits, new
+    /// files, uncommitted edits and untracked files that already existed when
+    /// the snapshot was opened never produce a watcher event, so without this
+    /// pass they stay invisible to search while the index reports ready.
+    ///
+    /// The pass walks the root and compares each snapshot record's size and
+    /// mtime with disk. A record whose size and mtime both match is trusted.
+    /// A same-size record with a different mtime (every file of a fresh
+    /// checkout) is content-hashed against the snapshot's stored hash, in a
+    /// bounded parallel pool, and only a real content difference re-indexes
+    /// it. Differing, added and removed files go into the RAM delta; the
+    /// shared file on disk is never written.
+    ///
+    /// `keep_going` is polled between phases and while applying changes.
+    /// Returning false abandons the pass and yields `None`; the caller must
+    /// then discard the index, because it is only partially reconciled.
+    pub(crate) fn reconcile_borrowed_snapshot_with_disk(
+        &mut self,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<BorrowedReconcileSummary> {
+        const APPLY_CHECKPOINT_INTERVAL: usize = 256;
+        let mut summary = BorrowedReconcileSummary::default();
+
+        let walk_started = Instant::now();
+        let current_files = walk_project_files(&self.project_root, &PathFilters::default());
+        let current_file_set: HashSet<&PathBuf> = current_files.iter().collect();
+        summary.walked = current_files.len();
+        summary.walk = walk_started.elapsed();
+        if !keep_going() {
+            return None;
+        }
+
+        let verify_started = Instant::now();
+        let mut removed_paths = Vec::new();
+        let mut to_verify = Vec::new();
+        for (file_id, entry) in self.files.iter().enumerate() {
+            if entry.path.as_os_str().is_empty() {
+                continue; // tombstoned entry
+            }
+            if !current_file_set.contains(&entry.path) {
+                removed_paths.push(entry.path.clone());
+                continue;
+            }
+            to_verify.push((
+                file_id,
+                entry.path.clone(),
+                FileFreshness {
+                    mtime: entry.modified,
+                    size: entry.size,
+                    content_hash: entry.content_hash,
+                },
+            ));
+        }
+        let verdicts = cache_freshness::verify_files_bounded(
+            to_verify,
+            cache_freshness::VerifyStrategy::StatFirst,
+        );
+        summary.verify = verify_started.elapsed();
+        if !keep_going() {
+            return None;
+        }
+
+        let apply_started = Instant::now();
+        let mut stale_paths = Vec::new();
+        {
+            let files = Arc::make_mut(&mut self.files);
+            for (file_id, path, verdict) in verdicts {
+                match verdict {
+                    FreshnessVerdict::HotFresh => summary.unchanged += 1,
+                    FreshnessVerdict::ContentFresh {
+                        new_mtime,
+                        new_size,
+                    } => {
+                        // Same bytes as the snapshot: keep serving the shared
+                        // postings and remember the local stat so a later
+                        // watcher event compares against this checkout.
+                        if let Some(entry) = files.get_mut(file_id) {
+                            entry.modified = new_mtime;
+                            entry.size = new_size;
+                        }
+                        summary.unchanged += 1;
+                        summary.hashed_unchanged += 1;
+                    }
+                    FreshnessVerdict::Stale | FreshnessVerdict::Deleted => stale_paths.push(path),
+                }
+            }
+        }
+
+        let mut canonical_parents = ParentCanonicalizationMemo::default();
+        let mut applied = 0usize;
+        let mut checkpoint = || {
+            applied += 1;
+            applied % APPLY_CHECKPOINT_INTERVAL != 0 || keep_going()
+        };
+        for path in &removed_paths {
+            if !checkpoint() {
+                return None;
+            }
+            self.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
+            summary.removed += 1;
+        }
+        for path in &stale_paths {
+            if !checkpoint() {
+                return None;
+            }
+            // `update_file` drops the file when it vanished after the walk.
+            self.update_file_with_canonicalization_memo(path, &mut canonical_parents);
+            summary.reindexed += 1;
+        }
+        for path in &current_files {
+            if self.path_to_id.contains_key(path) {
+                continue;
+            }
+            if !checkpoint() {
+                return None;
+            }
+            self.update_file_with_canonicalization_memo(path, &mut canonical_parents);
+            summary.added += 1;
+        }
+        summary.apply = apply_started.elapsed();
+        Some(summary)
+    }
+
+    /// True when `path` is answered from the shared snapshot's postings rather
+    /// than from the in-RAM delta.
+    #[cfg(test)]
+    pub(crate) fn serves_path_from_shared_base_for_test(&self, path: &Path) -> bool {
+        self.path_to_id.get(path).is_some_and(|file_id| {
+            *file_id < self.base_file_count && !self.delta.superseded.contains(file_id)
+        })
     }
 
     #[cfg(debug_assertions)]

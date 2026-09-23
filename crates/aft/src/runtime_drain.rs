@@ -2227,11 +2227,17 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
         if ctx.shared_artifacts_read_only() {
             // Read-only roots reconcile by re-opening the shared artifacts:
             // drop the resident snapshots so the evicted-reload path fires on
-            // the next query.
+            // the next query. With the RAM overlay on, that reload rebuilds
+            // the overlay from disk. A load already in flight may have read
+            // the disk before the lost events, so it is retired and the next
+            // query starts a fresh one.
             ctx.search_index()
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
+            if ctx.ram_overlay_active() {
+                ctx.retire_search_index_rx();
+            }
             if config.semantic_search {
                 ctx.semantic_index()
                     .write()
@@ -2515,8 +2521,12 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     started,
                     WATCHER_DRAIN_SLICE_BUDGET,
                     |path| {
+                        // A root that applies watcher events to its RAM
+                        // index (writers, and borrowed roots with the RAM
+                        // overlay) queues them while a load is in flight so
+                        // they are replayed onto the index it delivers.
                         if heavy_root_work_allowed
-                            && !shared_artifacts_read_only
+                            && apply_ram_search_updates
                             && search_build_in_progress
                         {
                             let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
@@ -6219,6 +6229,83 @@ mod watcher_slice_tests {
         assert!(
             refreshing.is_empty(),
             "a context without a semantic refresh worker must not report refresh work"
+        );
+    }
+
+    #[test]
+    fn ram_overlay_queues_watcher_edits_while_borrowed_load_is_in_flight() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        let file = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("overlay.rs");
+        std::fs::write(&file, "old overlay token\n").expect("write source");
+        let (canonical, cache_dir) = install_search_index(
+            &ctx,
+            root.path(),
+            storage.path(),
+            &file,
+            b"old overlay token\n",
+        );
+        mark_borrow_only(&ctx, &canonical, &cache_dir);
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
+
+        // A borrowed load (for example the reload after an eviction) is in
+        // flight: no index is resident and its receiver is pending. The index
+        // it will deliver was read before the edit below.
+        let loading = ctx
+            .search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("resident search index");
+        let (load_tx, load_rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(load_rx, ctx.configure_generation());
+
+        std::fs::write(&file, "new overlay token\n").expect("edit source");
+        tx.send(WatcherDispatchEvent::Paths(vec![file.clone()]))
+            .unwrap();
+        drain_watcher_events(&ctx);
+
+        load_tx.send(loading).unwrap();
+        drain_search_index_events(&ctx);
+        assert_eq!(
+            grep_count(&ctx, "new overlay token", &canonical),
+            1,
+            "an edit seen while the borrowed load was in flight must be replayed onto it"
+        );
+        assert_eq!(grep_count(&ctx, "old overlay token", &canonical), 0);
+    }
+
+    #[test]
+    fn ram_overlay_rescan_retires_in_flight_borrowed_load() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, _tx) = context_with_watcher(root.path());
+        let file = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("overlay.rs");
+        std::fs::write(&file, "overlay token\n").expect("write source");
+        let (canonical, cache_dir) =
+            install_search_index(&ctx, root.path(), storage.path(), &file, b"overlay token\n");
+        mark_borrow_only(&ctx, &canonical, &cache_dir);
+        ctx.update_config(|config| config.worktree.ram_overlay = true);
+        let (_load_tx, load_rx) = crossbeam_channel::unbounded();
+        ctx.install_search_index_rx(load_rx, ctx.configure_generation());
+
+        refresh_project_after_watcher_rescan(&ctx);
+
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a rescan drops the resident borrowed index"
+        );
+        assert!(
+            ctx.search_index_rx().read().unwrap().is_none(),
+            "a load that may have read the disk before the lost events must not be installed"
         );
     }
 

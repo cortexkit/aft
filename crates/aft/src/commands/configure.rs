@@ -3758,11 +3758,11 @@ fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
 /// current request through the bounded fallback walk. Read-only roots reopen the
 /// shared snapshot without acquiring a writer lease.
 ///
-/// The reloaded index starts with an empty RAM delta containing only the
-/// borrowed base. Subsequent watcher events repopulate the overlay when
-/// `worktree.ram_overlay` is enabled. Until the next watcher apply, eviction
-/// may temporarily hide in-flight local edits from search; that is the
-/// intended initial behavior.
+/// With `worktree.ram_overlay` enabled, the reopened snapshot is reconciled
+/// with this checkout's files before it is installed, so edits the previous
+/// overlay held (and any the watcher lost) are rebuilt from disk rather than
+/// dropped. Without the overlay, a read-only root serves the shared snapshot
+/// as-is.
 pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
     if ctx.canonical_cache_root_opt().is_none() || !ctx.search_index_query_reload_allowed() {
         return false;
@@ -3945,6 +3945,22 @@ pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool
     .unwrap_or(false)
 }
 
+fn log_borrowed_reconcile(root: &Path, summary: &crate::search_index::BorrowedReconcileSummary) {
+    slog_info!(
+        "search index: reconciled borrowed snapshot with {}: walked={} unchanged={} hashed_unchanged={} reindexed={} added={} removed={} walk_ms={} verify_ms={} apply_ms={}",
+        root.display(),
+        summary.walked,
+        summary.unchanged,
+        summary.hashed_unchanged,
+        summary.reindexed,
+        summary.added,
+        summary.removed,
+        summary.walk.as_millis(),
+        summary.verify.as_millis(),
+        summary.apply.as_millis(),
+    );
+}
+
 fn schedule_artifact_loads(
     ctx: &AppContext,
     load_search: bool,
@@ -3997,6 +4013,12 @@ fn schedule_artifact_loads(
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let search_loads_shared_artifacts_read_only =
             is_worktree_bridge_for_search || ctx.shared_artifacts_read_only();
+        // A borrowed snapshot that this root keeps current from its own
+        // watcher events (the same gate the watcher drain uses) must first be
+        // reconciled with this checkout's files. The worker thread cannot
+        // reach the context, so the gate is captured here.
+        let reconcile_borrowed_overlay =
+            !ctx.shared_artifacts_read_only() || ctx.ram_overlay_active();
         let session_id_for_bg = log_ctx::current_session();
         let search_cold_build_limiter = ctx.cold_build_limiter();
         let search_generation = configure_generation;
@@ -4032,65 +4054,76 @@ fn schedule_artifact_loads(
                 // must stay independent of the limiter that protects paths able
                 // to fall through to `rebuild_or_refresh_with_strategy` below.
                 if search_loads_shared_artifacts_read_only {
-                    match crate::readonly_artifacts::open_search_index_read_only(
+                    let opened = match crate::readonly_artifacts::open_search_index_read_only(
                         &root_for_search,
                         symbol_storage.as_deref(),
                     ) {
-                        crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => {
-                            let symbol_files = search_index_symbol_files(&index);
-                            let _ = search_lifecycle.run_if_current(
-                                search_generation_flag.as_ref(),
-                                search_generation,
-                                || {
-                                    let _ = tx.send(index);
-                                    spawn_symbol_cache_prewarm(
-                                        root_for_search,
-                                        symbol_cache,
-                                        symbol_storage,
-                                        symbol_project_key,
-                                        symbol_cache_generation,
-                                        symbol_files,
-                                        true,
-                                        log_ctx::current_session(),
-                                    );
-                                },
-                            );
-                        }
+                        crate::readonly_artifacts::ReadOnlyArtifact::Fresh(index) => Some(index),
                         crate::readonly_artifacts::ReadOnlyArtifact::Stale(stale) => {
-                            let symbol_files = search_index_symbol_files(&stale.index);
-                            let _ = search_lifecycle.run_if_current(
-                                search_generation_flag.as_ref(),
-                                search_generation,
-                                || {
-                                    let _ = tx.send(stale.index);
-                                    spawn_symbol_cache_prewarm(
-                                        root_for_search,
-                                        symbol_cache,
-                                        symbol_storage,
-                                        symbol_project_key,
-                                        symbol_cache_generation,
-                                        symbol_files,
-                                        true,
-                                        log_ctx::current_session(),
-                                    );
-                                },
-                            );
+                            Some(stale.index)
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Degraded(degradation) => {
                             slog_warn!(
                                 "search index is read-only but loading stopped at the interactive budget ({})",
                                 degradation.reason
                             );
+                            None
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Cancelled => {
                             slog_debug!("read-only search index load was cancelled");
+                            None
                         }
                         crate::readonly_artifacts::ReadOnlyArtifact::Absent => {
                             slog_warn!(
                                 "search index is read-only but no shared artifact snapshot exists"
                             );
+                            None
+                        }
+                    };
+                    let Some(mut index) = opened else {
+                        return;
+                    };
+                    // The shared snapshot describes the checkout that built
+                    // it. With the RAM overlay on, this root must first fold
+                    // its own differences into the overlay: an index that
+                    // reports ready while missing them answers "0 matches"
+                    // for code that exists. Until the reconciled index is
+                    // delivered, the receiver stays pending and grep answers
+                    // through the fallback walk with status Building.
+                    if reconcile_borrowed_overlay {
+                        let keep_going = || {
+                            search_lifecycle
+                                .is_current(search_generation_flag.as_ref(), search_generation)
+                        };
+                        match index.reconcile_borrowed_snapshot_with_disk(&keep_going) {
+                            Some(summary) => log_borrowed_reconcile(&root_for_search, &summary),
+                            None => {
+                                slog_debug!(
+                                    "borrowed search snapshot reconciliation abandoned for stale generation {}",
+                                    search_generation
+                                );
+                                return;
+                            }
                         }
                     }
+                    let symbol_files = search_index_symbol_files(&index);
+                    let _ = search_lifecycle.run_if_current(
+                        search_generation_flag.as_ref(),
+                        search_generation,
+                        || {
+                            let _ = tx.send(index);
+                            spawn_symbol_cache_prewarm(
+                                root_for_search,
+                                symbol_cache,
+                                symbol_storage,
+                                symbol_project_key,
+                                symbol_cache_generation,
+                                symbol_files,
+                                true,
+                                log_ctx::current_session(),
+                            );
+                        },
+                    );
                     return;
                 }
 
@@ -9317,6 +9350,249 @@ mod tests {
             owner_before.map(|status| status.mode),
             "read-only fallback must not acquire an owner lease"
         );
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+    }
+
+    fn git_commit_all(root: &Path, message: &str) {
+        assert!(git_command(root)
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(root)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn configure_ram_overlay_worktree(root: &Path, storage: &Path) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "search_index": true,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "worktree": { "ram_overlay": true }
+            }))]
+        }))
+    }
+
+    fn grep_matches_and_status(ctx: &AppContext, pattern: &str) -> (u64, String) {
+        let response = crate::commands::grep::handle_grep(&grep_request(pattern), ctx);
+        assert!(
+            response.success,
+            "grep {pattern} failed: {:?}",
+            response.data
+        );
+        (
+            response.data["total_matches"].as_u64().unwrap_or_default(),
+            response.data["index_status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+
+    /// Publishes a shared search snapshot from a home checkout, then creates
+    /// a linked worktree that differs from it before any AFT process starts
+    /// there: a line added in a branch commit (`a.ts`), a new file in a branch
+    /// commit (`b.ts`), an uncommitted edit (`u.ts`) and an untracked file
+    /// (`d.ts`); `keep.ts` stays identical. Returns the worktree root and the
+    /// storage directory holding the home checkout's shared snapshot.
+    fn linked_worktree_with_pre_existing_drift(temp: &Path) -> (PathBuf, PathBuf) {
+        let storage = temp.join("storage");
+        let home = temp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("a.ts"), "export const HOME_BASE_TOKEN = 1;\n").unwrap();
+        std::fs::write(home.join("u.ts"), "export const UNCHANGED = 1;\n").unwrap();
+        std::fs::write(
+            home.join("keep.ts"),
+            "export const SHARED_SNAPSHOT_TOKEN = 0;\n",
+        )
+        .unwrap();
+        init_git_fixture(&home);
+
+        let owner = test_context();
+        let response = handle_configure_for_test(&configure_with_storage(&home, &storage), &owner);
+        assert!(
+            response.success,
+            "owner configure failed: {:?}",
+            response.data
+        );
+        wait_for_search_index_ready(&owner, Duration::from_secs(10));
+        owner.flush_search_index_on_graceful_shutdown();
+        owner.mark_subc_unbound();
+        owner.cancel_unbound_artifact_work();
+        drop(owner);
+
+        let worktree = temp.join("wt");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&home))
+                .args(["worktree", "add", "--quiet", "-b", "feat"])
+                .arg(&worktree)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut edited = std::fs::read_to_string(worktree.join("a.ts")).unwrap();
+        edited.push_str("export const BRANCH_EDITED_TOKEN = 2;\n");
+        std::fs::write(worktree.join("a.ts"), edited).unwrap();
+        std::fs::write(
+            worktree.join("b.ts"),
+            "export const BRANCH_NEW_FILE_TOKEN = 3;\n",
+        )
+        .unwrap();
+        git_commit_all(&worktree, "branch work");
+        std::fs::write(
+            worktree.join("u.ts"),
+            "export const UNCOMMITTED_EDIT_TOKEN = 5;\n",
+        )
+        .unwrap();
+        std::fs::write(worktree.join("d.ts"), "export const UNTRACKED_TOKEN = 6;\n").unwrap();
+        (worktree, storage)
+    }
+
+    fn configure_borrowing_worktree(worktree: &Path, storage: &Path) -> TestContext {
+        let ctx = test_context();
+        let response =
+            handle_configure_for_test(&configure_ram_overlay_worktree(worktree, storage), &ctx);
+        assert!(
+            response.success,
+            "worktree configure failed: {:?}",
+            response.data
+        );
+        assert!(
+            ctx.ram_overlay_active(),
+            "fixture must exercise a borrow-only root with the RAM overlay on"
+        );
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        ctx
+    }
+
+    const PRE_EXISTING_DRIFT_TOKENS: [&str; 4] = [
+        "BRANCH_EDITED_TOKEN",
+        "BRANCH_NEW_FILE_TOKEN",
+        "UNCOMMITTED_EDIT_TOKEN",
+        "UNTRACKED_TOKEN",
+    ];
+
+    #[test]
+    fn ram_overlay_worktree_indexes_changes_that_predate_the_process() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let (worktree, storage) = linked_worktree_with_pre_existing_drift(temp.path());
+        let cache_bin = crate::search_index::resolve_cache_dir_with_key(
+            &crate::search_index::artifact_cache_key(&std::fs::canonicalize(&worktree).unwrap()),
+            Some(&storage),
+        )
+        .join("cache.bin");
+        let shared_before = std::fs::read(&cache_bin).expect("home checkout published cache.bin");
+
+        let ctx = configure_borrowing_worktree(&worktree, &storage);
+
+        for token in PRE_EXISTING_DRIFT_TOKENS {
+            assert_eq!(
+                grep_matches_and_status(&ctx, token),
+                (1, "Ready".to_string()),
+                "{token} existed in the worktree before AFT started and must be searchable once search reports Ready"
+            );
+        }
+        assert_eq!(
+            grep_matches_and_status(&ctx, "HOME_BASE_TOKEN"),
+            (1, "Ready".to_string())
+        );
+        assert_eq!(
+            grep_matches_and_status(&ctx, "UNCHANGED = 1"),
+            (0, "Ready".to_string()),
+            "the uncommitted edit replaced the snapshot's content for u.ts"
+        );
+        assert_eq!(
+            grep_matches_and_status(&ctx, "SHARED_SNAPSHOT_TOKEN"),
+            (1, "Ready".to_string())
+        );
+        let keep = std::fs::canonicalize(worktree.join("keep.ts")).unwrap();
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|index| index.serves_path_from_shared_base_for_test(&keep)),
+            "a file identical to the snapshot must keep using the shared postings, not the RAM overlay"
+        );
+        assert_eq!(
+            std::fs::read(&cache_bin).unwrap(),
+            shared_before,
+            "reconciliation must never write the shared cache.bin"
+        );
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+    }
+
+    #[test]
+    fn ram_overlay_worktree_rescan_rebuilds_overlay_instead_of_dropping_it() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let (worktree, storage) = linked_worktree_with_pre_existing_drift(temp.path());
+        let ctx = configure_borrowing_worktree(&worktree, &storage);
+
+        // Apply a session edit to the overlay with `SearchIndex::update_file`,
+        // the call the watcher drain makes for a changed path.
+        let edited = std::fs::canonicalize(&worktree)
+            .unwrap()
+            .join("edited-this-session.ts");
+        std::fs::write(&edited, "export const EDITED_THIS_SESSION_TOKEN = 7;\n").unwrap();
+        ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .expect("resident borrowed index")
+            .update_file(&edited);
+        assert_eq!(
+            grep_matches_and_status(&ctx, "EDITED_THIS_SESSION_TOKEN"),
+            (1, "Ready".to_string())
+        );
+
+        crate::runtime_drain::refresh_project_after_watcher_rescan(&ctx);
+        let (matches, status) = grep_matches_and_status(&ctx, "EDITED_THIS_SESSION_TOKEN");
+        assert_eq!(
+            matches, 1,
+            "the fallback walk answers while the snapshot reloads"
+        );
+        assert_ne!(status, "Ready", "no reconciled index is resident yet");
+
+        wait_for_search_index_ready(&ctx, Duration::from_secs(10));
+        assert_eq!(
+            grep_matches_and_status(&ctx, "EDITED_THIS_SESSION_TOKEN"),
+            (1, "Ready".to_string()),
+            "the reloaded snapshot must rebuild the overlay from disk, not start empty"
+        );
+        for token in PRE_EXISTING_DRIFT_TOKENS {
+            assert_eq!(
+                grep_matches_and_status(&ctx, token),
+                (1, "Ready".to_string()),
+                "{token} must survive the rescan reload"
+            );
+        }
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
     }
