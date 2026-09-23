@@ -5,6 +5,7 @@ pub mod ast_scope;
 pub mod ast_search;
 pub mod bash;
 pub mod bash_abort_inflight;
+pub mod bash_artifact_owned;
 pub mod bash_drain_completions;
 pub mod bash_kill;
 pub mod bash_notify;

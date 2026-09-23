@@ -73,6 +73,10 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 /// - `bash_regex_match`: pure regex compilation and matching for the plugins'
 ///   `bash_watch` validation and output scan; its parameters are only a regex
 ///   pattern and text, with no session or configuration privileges.
+/// - `bash_artifact_owned`: read-only yes/no answer to "is this path one of
+///   the requesting session's own background-bash output files?", which the
+///   plugins ask before raising an external-directory prompt for a read. It
+///   reads no file and grants nothing; the answer is scoped to the session.
 /// - `inspect_tier2_run`: the plugins' background Tier-2 refresh trigger for
 ///   the bound root; scan work runs on the maintenance class either way.
 /// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
@@ -93,6 +97,7 @@ pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
             | "bash_unnotify"
             | "bash_wait_detach"
             | "bash_regex_match"
+            | "bash_artifact_owned"
             | "inspect_tier2_run"
             | "hashline_preflight"
     )
@@ -105,6 +110,7 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "echo"
         | "bash_drain_completions"
         | "bash_regex_match"
+        | "bash_artifact_owned"
         | "bash_wait_detach"
         | "db_get_state"
         | "db_get_host_state"

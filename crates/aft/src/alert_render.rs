@@ -20,6 +20,7 @@ pub const EXCLUDED_FINALIZATION_COMMANDS: &[&str] = &[
     "bash_promote",
     "bash_wait_detach",
     "bash_regex_match",
+    "bash_artifact_owned",
     "bash_drain_completions",
     "bash_notify",
     "bash_unnotify",

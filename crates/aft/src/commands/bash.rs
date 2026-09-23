@@ -266,7 +266,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let permission_asks = if params.shell.is_powershell() {
         conservative_powershell_permission_asks(&params.command)
     } else if native_report_only || params.permissions_requested || ctx.config().bash_permissions {
-        crate::bash_permissions::scan::scan_with_cwd(&params.command, ctx, &workdir)
+        crate::bash_permissions::scan::scan_with_cwd_for_session(
+            &params.command,
+            ctx,
+            &workdir,
+            req.session(),
+        )
     } else {
         Vec::new()
     };

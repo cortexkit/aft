@@ -597,3 +597,219 @@ fn malformed_bash_requires_full_permission_prompt() {
 
     assert!(aft.shutdown().success());
 }
+
+/// Background-bash output files live under the AFT storage root, outside
+/// every project. The scanner lets a session read ITS OWN task artifacts with
+/// no external-directory ask, and only its own: the decision is the exact
+/// registry check, never a `bash-tasks` prefix, and only for reads.
+#[cfg(unix)]
+mod session_owned_artifacts {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    const OWNER: &str = "artifact-owner-session";
+    const OTHER: &str = "artifact-other-session";
+
+    fn configure_with_storage(aft: &mut AftProcess, project: &Path, storage: &Path) {
+        let response = aft.send(
+            &serde_json::to_string(&json!({
+                "id": "cfg-artifacts",
+                "command": "configure",
+                "harness": "opencode",
+                "project_root": project,
+                "storage_dir": storage,
+                "config": super::super::helpers::user_config(json!({
+                    "experimental": { "bash": { "background": true } }
+                })),
+            }))
+            .unwrap(),
+        );
+        assert_eq!(response["success"], true, "configure failed: {response:?}");
+    }
+
+    /// Run a background task for `session` and return its canonical stdout path.
+    fn completed_task_stdout(aft: &mut AftProcess, session: &str, text: &str) -> PathBuf {
+        let spawned = aft.send(
+            &serde_json::to_string(&json!({
+                "id": format!("spawn-{session}"),
+                "session_id": session,
+                "command": "bash",
+                "params": { "command": format!("echo {text}"), "background": true },
+            }))
+            .unwrap(),
+        );
+        assert_eq!(spawned["success"], true, "spawn failed: {spawned:?}");
+        let task_id = spawned["task_id"].as_str().unwrap().to_string();
+
+        let started = Instant::now();
+        loop {
+            let status = aft.send(
+                &serde_json::to_string(&json!({
+                    "id": format!("status-{task_id}"),
+                    "session_id": session,
+                    "command": "bash_status",
+                    "params": { "task_id": task_id },
+                }))
+                .unwrap(),
+            );
+            assert_eq!(status["success"], true, "status failed: {status:?}");
+            if status["status"] == "completed" {
+                let path = status["output_path"]
+                    .as_str()
+                    .expect("stdout artifact path");
+                return std::fs::canonicalize(path).expect("stdout artifact exists");
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "task did not complete: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn scan_as(aft: &mut AftProcess, session: &str, command: &str) -> serde_json::Value {
+        let response = aft.send(
+            &serde_json::to_string(&json!({
+                "id": "scan",
+                "session_id": session,
+                "method": "bash",
+                "params": { "command": command, "permissions_requested": true },
+            }))
+            .unwrap(),
+        );
+        // Every command here also needs a plain bash ask, so a
+        // permission_required reply proves the scanner actually ran.
+        assert_eq!(
+            response["code"], "permission_required",
+            "{command}: {response:?}"
+        );
+        response
+    }
+
+    fn owned(aft: &mut AftProcess, session: &str, path: &Path) -> bool {
+        let response = aft.send(
+            &serde_json::to_string(&json!({
+                "id": "owned",
+                "session_id": session,
+                "command": "bash_artifact_owned",
+                "params": { "path": path },
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            response["success"], true,
+            "owned check failed: {response:?}"
+        );
+        response["owned"].as_bool().expect("owned flag")
+    }
+
+    struct Fixture {
+        aft: AftProcess,
+        project: TempDir,
+        _storage: TempDir,
+        own: PathBuf,
+        foreign: PathBuf,
+        lookalike: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        // Neither directory may sit under the system temp dir: temp paths
+        // never ask, which would make every assertion below vacuous.
+        let project = non_system_temp_dir("artifact-project-");
+        let storage = non_system_temp_dir("artifact-storage-");
+        let mut aft = AftProcess::spawn();
+        configure_with_storage(&mut aft, project.path(), storage.path());
+        let own = completed_task_stdout(&mut aft, OWNER, "owner-output");
+        let foreign = completed_task_stdout(&mut aft, OTHER, "other-output");
+        assert!(!own.starts_with(project.path()));
+        let lookalike = own.parent().unwrap().join("unregistered-output");
+        std::fs::write(&lookalike, "not a registered artifact\n").unwrap();
+        Fixture {
+            aft,
+            project,
+            _storage: storage,
+            own,
+            foreign,
+            lookalike,
+        }
+    }
+
+    #[test]
+    fn own_artifact_reads_do_not_ask_for_external_directory() {
+        let mut f = fixture();
+        let own = f.own.display().to_string();
+        for command in [
+            format!("cat {own}"),
+            format!("cat '{own}'"),
+            format!("wc -l < {own}"),
+            format!("cat {own} | tail -n 5"),
+        ] {
+            let response = scan_as(&mut f.aft, OWNER, &command);
+            assert!(
+                !has_external_directory_ask(&response),
+                "{command} asked for its own artifact: {response:?}"
+            );
+        }
+        assert!(owned(&mut f.aft, OWNER, &f.own));
+        assert!(f.aft.shutdown().success());
+    }
+
+    #[test]
+    fn foreign_and_lookalike_artifact_reads_still_ask() {
+        let mut f = fixture();
+        let link = f.project.path().join("task-dir-link");
+        create_dir_symlink(f.own.parent().unwrap(), &link).unwrap();
+        for (label, path) in [
+            ("other session's artifact", f.foreign.clone()),
+            ("unregistered file beside an artifact", f.lookalike.clone()),
+            ("symlinked lookalike", link.join("unregistered-output")),
+        ] {
+            let command = format!("cat {}", path.display());
+            let response = scan_as(&mut f.aft, OWNER, &command);
+            assert!(
+                has_external_directory_ask(&response),
+                "{label} did not ask: {response:?}"
+            );
+            let redirected = format!("wc -l < {}", path.display());
+            let response = scan_as(&mut f.aft, OWNER, &redirected);
+            assert!(
+                has_external_directory_ask(&response),
+                "{label} via input redirect did not ask: {response:?}"
+            );
+            assert!(
+                !owned(&mut f.aft, OWNER, &path),
+                "{label} reported as owned"
+            );
+        }
+        // The owner's artifact is not the other session's either.
+        let response = scan_as(&mut f.aft, OTHER, &format!("cat {}", f.own.display()));
+        assert!(has_external_directory_ask(&response), "{response:?}");
+        assert!(!owned(&mut f.aft, OTHER, &f.own));
+        assert!(f.aft.shutdown().success());
+    }
+
+    #[test]
+    fn writes_deletes_and_extra_external_paths_around_own_artifact_still_ask() {
+        let mut f = fixture();
+        let own = f.own.display().to_string();
+        let task_dir = f.own.parent().unwrap().display().to_string();
+        let outside = f._storage.path().join("copy.txt").display().to_string();
+        for command in [
+            format!("cat {own} > {outside}"),
+            format!("cat {own} > {task_dir}/copy.txt"),
+            format!("cat {own} >> {own}"),
+            format!("echo overwrite > {own}"),
+            format!("rm {own}"),
+            format!("cp {own} {task_dir}/copy.txt"),
+            format!("cat {own} {}", f.lookalike.display()),
+        ] {
+            let response = scan_as(&mut f.aft, OWNER, &command);
+            assert!(
+                has_external_directory_ask(&response),
+                "{command} did not ask: {response:?}"
+            );
+        }
+        assert!(f.aft.shutdown().success());
+    }
+}

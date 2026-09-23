@@ -11,6 +11,18 @@ const FILE_COMMANDS: &[&str] = &[
     "rm", "cp", "mv", "mkdir", "touch", "chmod", "chown", "cat", "cd", "source", ".",
 ];
 const CWD_COMMANDS: &[&str] = &["cd", "pushd", "popd"];
+/// File commands whose path arguments are only read. Only these (and `<`
+/// input redirects) may use a read exemption; a command that can modify,
+/// move or delete its arguments always gets the normal external-directory ask.
+const READ_ONLY_FILE_COMMANDS: &[&str] = &["cat"];
+
+/// Decides whether reading one resolved out-of-root path needs no
+/// external-directory ask. The hoisted bash tool passes the background-task
+/// registry's exact, session-scoped artifact check here, so a session can read
+/// its own task output files (which live under the AFT storage root, outside
+/// every project) without a prompt whose "always allow" could never match the
+/// next task's freshly named directory.
+type ReadExemption<'a> = &'a dyn Fn(&Path) -> bool;
 
 #[derive(Debug, Clone)]
 struct Part {
@@ -46,10 +58,45 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
     scan_with_project_root(command, &project_root, cwd)
 }
 
+/// Scan like [`scan_with_cwd`], but let `session_id` read the stdout, stderr,
+/// exit and pty files of its own background bash tasks without an
+/// external-directory ask.
+///
+/// Ownership is decided by
+/// [`crate::bash_background::BgTaskRegistry::is_session_owned_artifact_path`],
+/// the same exact check `AppContext::validate_read_path` uses: the canonical
+/// path must equal a registered artifact of a task owned by this session.
+/// There is no `bash-tasks` prefix rule, so other sessions' artifacts and
+/// unregistered files next to an artifact still ask. The exemption covers
+/// only read-only uses (`cat` arguments and `<` input redirects); every other
+/// out-of-root path in the command still produces its own ask.
+pub fn scan_with_cwd_for_session(
+    command: &str,
+    ctx: &AppContext,
+    cwd: &Path,
+    session_id: &str,
+) -> Vec<PermissionAsk> {
+    let Some(project_root) = ctx.config().project_root.clone() else {
+        return Vec::new();
+    };
+    let registry = ctx.bash_background();
+    let owned_artifact = |path: &Path| registry.is_session_owned_artifact_path(session_id, path);
+    scan_with_read_exemption(command, &project_root, cwd, Some(&owned_artifact))
+}
+
 pub fn scan_with_project_root(
     command: &str,
     project_root: &Path,
     cwd: &Path,
+) -> Vec<PermissionAsk> {
+    scan_with_read_exemption(command, project_root, cwd, None)
+}
+
+fn scan_with_read_exemption(
+    command: &str,
+    project_root: &Path,
+    cwd: &Path,
+    read_exemption: Option<ReadExemption<'_>>,
 ) -> Vec<PermissionAsk> {
     let project_root = resolve_existing(&project_root);
     let cwd = resolve_existing(cwd);
@@ -112,8 +159,9 @@ pub fn scan_with_project_root(
 
         if head == "cd" {
             collect_redirection_targets(command, node, &scan_cwd, |target| match target {
-                RedirectTarget::Path(path) => {
-                    push_external_path(&mut asks, &mut seen, &project_root, &path);
+                RedirectTarget::Path { path, input_only } => {
+                    let exemption = if input_only { read_exemption } else { None };
+                    push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
                 }
                 RedirectTarget::Dynamic => {}
             });
@@ -126,10 +174,15 @@ pub fn scan_with_project_root(
         }
 
         if FILE_COMMANDS.contains(&head) {
+            let exemption = if READ_ONLY_FILE_COMMANDS.contains(&head) {
+                read_exemption
+            } else {
+                None
+            };
             for arg in path_args(&parts) {
                 match path_arg_target(arg, &scan_cwd) {
                     PathArgTarget::Path(path) => {
-                        push_external_path(&mut asks, &mut seen, &project_root, &path);
+                        push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
                     }
                     // A dynamic target (e.g. `rm "$DEST/file"`) can't be
                     // resolved to a concrete directory. Matching native
@@ -145,8 +198,11 @@ pub fn scan_with_project_root(
         }
 
         collect_redirection_targets(command, node, &scan_cwd, |target| match target {
-            RedirectTarget::Path(path) => {
-                push_external_path(&mut asks, &mut seen, &project_root, &path);
+            RedirectTarget::Path { path, input_only } => {
+                // Only a plain `<` input redirect reads its target; `>`, `>>`,
+                // `&>`, `<>` and friends can create or truncate it.
+                let exemption = if input_only { read_exemption } else { None };
+                push_external_path(&mut asks, &mut seen, &project_root, &path, exemption);
             }
             // Dynamic redirect target (e.g. `echo hi > "$FOO/bar"`): no
             // external_directory ask, same rationale as dynamic path args
@@ -241,7 +297,12 @@ fn node_text<'source>(source: &'source str, node: Node<'_>) -> &'source str {
 }
 
 enum RedirectTarget {
-    Path(PathBuf),
+    /// A resolved redirect target. `input_only` is true only for a plain `<`
+    /// redirect, which reads the file and never writes it.
+    Path {
+        path: PathBuf,
+        input_only: bool,
+    },
     Dynamic,
 }
 
@@ -292,6 +353,13 @@ fn collect_redirection_targets_from_node(
         node.kind(),
         "file_redirect" | "heredoc_redirect" | "herestring_redirect" | "redirection"
     ) {
+        let input_only = node.kind() == "file_redirect" && {
+            let mut cursor = node.walk();
+            let is_plain_input = node
+                .children(&mut cursor)
+                .any(|child| !child.is_named() && child.kind() == "<");
+            is_plain_input
+        };
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if is_dynamic_node(child) {
@@ -304,7 +372,9 @@ fn collect_redirection_targets_from_node(
             ) {
                 let text = node_text(source, child);
                 match path_arg_target(text, cwd) {
-                    PathArgTarget::Path(path) => on_target(RedirectTarget::Path(path)),
+                    PathArgTarget::Path(path) => {
+                        on_target(RedirectTarget::Path { path, input_only })
+                    }
                     PathArgTarget::Dynamic => on_target(RedirectTarget::Dynamic),
                     PathArgTarget::None => {}
                 }
@@ -494,8 +564,12 @@ fn push_external_path(
     seen: &mut HashSet<String>,
     project_root: &Path,
     path: &Path,
+    read_exemption: Option<ReadExemption<'_>>,
 ) {
     if path.starts_with(project_root) || super::is_system_temp_path(path) {
+        return;
+    }
+    if read_exemption.is_some_and(|is_exempt| is_exempt(path)) {
         return;
     }
     let dir = permission_dir(path);
