@@ -89,6 +89,24 @@ if [ "$log_failed" -eq 1 ]; then
   exit 0
 fi
 
+# Job log (`run view --job <id> --log`): the fixture's log_tail file stands in
+# for the failing job's whole log; the script judges only its last lines.
+job_id=""
+for arg in "$@"; do
+  [ "$prev" = "--job" ] && job_id="$arg"
+  prev="$arg"
+done
+if [ -n "$job_id" ]; then
+  cat "$STATE/log_tail" 2>/dev/null || true
+  exit 0
+fi
+
+# The jobs API the skew check reads step names from.
+if [ "${1:-}" = "api" ]; then
+  cat "$STATE/job_steps" 2>/dev/null || true
+  exit 0
+fi
+
 case "$json" in
   defaultBranchRef) cat "$STATE/default_branch" ;;
   databaseId,headSha|databaseId,headSha,workflowName)
@@ -570,6 +588,60 @@ expect_no_out "rebased onto" "lock-skew red never rebases"
 expect_no_out "(round 2 of 3)" "lock-skew red never starts a second round"
 [ "$(git -C "$dir/work" rev-parse HEAD)" = "$skew_sha" ] ||
   fail "lock-skew red moved HEAD, so something rebased"
+
+# --- red that is skew by STEP name: named, on single-job CI ------------------
+# A seat whose CI is one job per platform names the job after the platform, so
+# the job-name arm can never match; the lock check is a step inside it.
+dir="$(new_fixture skew-step)"
+add_train_commit "$dir/work" "skew-step"
+echo "Build and test (macOS)|9003" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nCargo.lock drift check\n' > "$dir/ci-state/job_steps"
+run_train "$dir" skew-step
+expect_rc 1 "a step-named skew red exits 1"
+expect_out "red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry" \
+  "a failing step name matching the skew pattern is classed as skew"
+expect_out "Build and test (macOS)" "step-skew red still names the job"
+
+# --- red that is skew by LOG TAIL: a lock check that is one phase in a step --
+dir="$(new_fixture skew-log)"
+add_train_commit "$dir/work" "skew-log"
+echo "Build and test (macOS)|9004" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+printf 'compile ok\nunit tests ok\nerror: Cargo.lock has drifted from the committed manifests; run cargo update -w\n' > "$dir/ci-state/log_tail"
+run_train "$dir" skew-log
+expect_rc 1 "a log-tail skew red exits 1"
+expect_out "red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry" \
+  "a lockfile drift line in the failing log's tail is classed as skew"
+
+# --- red that is a plain test failure: never classed as skew ----------------
+dir="$(new_fixture skew-not)"
+add_train_commit "$dir/work" "skew-not"
+echo "Unit (ubuntu-latest)|9005" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+printf 'test write_ledger::tests::census ... FAILED\nerror: test failed, to rerun pass `-p agent-file-tools --lib`\n' > "$dir/ci-state/log_tail"
+run_train "$dir" skew-not
+expect_rc 1 "a plain test-failure red exits 1"
+expect_no_out "version/lock skew" "a plain test failure is never classed as skew"
+expect_out "Unit (ubuntu-latest)" "test-failure red still names the job"
+# An early Cargo.lock mention in the log (a build line) must not class a later
+# test failure as skew either: only the tail is judged.
+dir="$(new_fixture skew-early)"
+add_train_commit "$dir/work" "skew-early"
+echo "Unit (ubuntu-latest)|9006" > "$dir/ci-state/failed_job"
+echo "failure" > "$dir/ci-state/conclusion"
+printf 'Build\nTest\n' > "$dir/ci-state/job_steps"
+{
+  printf 'checking Cargo.lock against manifests\n'
+  i=0
+  while [ "$i" -lt 60 ]; do printf 'Compiling crate%d v1.0.0\n' "$i"; i=$((i + 1)); done
+  printf 'test integration::watcher ... FAILED\n'
+} > "$dir/ci-state/log_tail"
+run_train "$dir" skew-early
+expect_rc 1 "an early lock mention with a failing tail exits 1"
+expect_no_out "version/lock skew" "a lockfile line scrolled out of the tail is not skew"
 
 # --- refusal: dirty tree ---------------------------------------------------
 dir="$(new_fixture dirty)"

@@ -141,13 +141,55 @@ repo_slug="$repo_slug_override"
 # real budget.
 probe_attempts="${TRAIN_PUSH_PROBE_ATTEMPTS:-12}"
 probe_sleep="${TRAIN_PUSH_PROBE_SLEEP:-10}"
-# Failing job names that mean the red is dependency skew rather than a broken
-# change: in this repo those are the Cargo.lock and manifest checks. Extend it
-# when a repo names such a job something else.
+# Failing job or step names that mean the red is dependency skew rather than
+# a broken change: in this repo those are the Cargo.lock and manifest checks.
+# Steps are matched too because a seat with single-job CI names its jobs after
+# the platform, and the lock check is a step inside it. Extend the pattern
+# when a repo names such a job or step something else.
 skew_pattern="${TRAIN_PUSH_SKEW_PATTERN:-}"
 if [ -z "$skew_pattern" ]; then
   skew_pattern='lock|version|pin|sibling'
 fi
+
+# A lockfile name next to a drift word in the TAIL of a failing job's log.
+# A lock check that is one phase inside a larger step ends in such a line
+# ("Cargo.lock drifted", "bun.lock is out of date"), and the tail is the only
+# part of a failing log that can still name skew once the step name is
+# generic. Only the tail is judged, so a Cargo.lock mention in an early build
+# line cannot call a later test failure skew; and unlike the name arms this
+# one stays narrower than skew_pattern on purpose, because matching real
+# output is easier to keep conservative than matching prose.
+skew_log_tail() {
+  tail -40 | grep -Ei 'Cargo\.lock|bun\.lock' | grep -Eqi 'drift|stale|out of date|out-of-date|changed|would change|differs|mismatch'
+}
+
+# The whole skew verdict, from the failing jobs' name|job-id lines as the
+# stubbed or real gh reports them. Job names are judged first (cheap, no extra
+# queries); step names come from the jobs API and cover single-job CI, whose
+# job names say only the platform. Advisory jobs are already excluded from the
+# watch log the pairs are parsed from, the same exclusion watch-ci.sh applies,
+# so a lock-flavoured step in a non-gating job cannot call a real red skew.
+red_is_skew() {
+  local run_id="$1"
+  local failing_pairs="$2"
+  local line job_id job_steps
+  if printf '%s\n' "$failing_pairs" | grep -Eqi "$skew_pattern"; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    job_id="${line##*|}"
+    job_steps="$("$OPERATOR_GH" api "repos/$repo_slug/actions/jobs/$job_id" \
+      --jq '.steps[] | select(.conclusion=="failure") | .name' 2>/dev/null || true)"
+    if printf '%s\n' "$job_steps" | grep -Eqi "$skew_pattern"; then
+      return 0
+    fi
+    if "$OPERATOR_GH" run view --repo "$repo_slug" --job "$job_id" --log 2>/dev/null | skew_log_tail; then
+      return 0
+    fi
+  done <<< "$failing_pairs"
+  return 1
+}
 
 say() { printf 'train-push: %s\n' "$1"; }
 refuse() {
@@ -773,7 +815,7 @@ fi
 # has never been exercised is a claim, so once per repository push a throwaway
 # commit to a probe branch and wait for a run to START on it. If the two
 # disagree, it is always the platform that is right.
-probe_marker="$git_dir/train-push-proven"
+probe_marker="$git_common_dir/train-push-proven"
 
 run_trigger_probe() {
   local probe_ref="train/trigger-probe"
@@ -994,8 +1036,17 @@ while true; do
     if [ "$watch_rc" -eq 1 ]; then
       # Report the jobs by name: with three platforms in parallel, "CI failed"
       # is not enough to know whether this needs a local reproduction or a
-      # platform-specific fix.
-      failing="$(grep -o "job='[^']*'" "$watch_log" 2>/dev/null | sed "s/job='//; s/'$//" | sort -u || true)"
+      # platform-specific fix. The watch's early-fail line carries only the
+      # name, so the job id is read back from the run's jobs listing: the skew
+      # check needs it for the failing step names and the log tail.
+      run_id="$(grep -o 'run=[0-9]\+' "$watch_log" 2>/dev/null | head -1 | sed 's/^run=//' || true)"
+      [ -n "$run_id" ] || run_id="$(resolve_ci_run "$head_sha")"
+      failing_pairs=""
+      if [ -n "$run_id" ]; then
+        failing_pairs="$("$OPERATOR_GH" run view "$run_id" --repo "$repo_slug" --json jobs \
+          --jq '[.jobs[] | select(.conclusion=="failure") | .name + "|" + (.databaseId|tostring)] | .[]' 2>/dev/null || true)"
+      fi
+      failing="$(printf '%s\n' "$failing_pairs" | sed 's/|.*//' | sed '/^$/d' || true)"
       if [ -n "$failing" ]; then
         printf 'train-push: CI red — failing job(s):\n' >&2
         # One name per line, not word-split: job names contain spaces.
@@ -1010,7 +1061,7 @@ while true; do
       # because it looks like a flake from the outside: the commit did not
       # change, CI resolved sibling repositories to different versions, and no
       # amount of retrying moves a lockfile - the fix is a bump commit.
-      if [ -n "$failing" ] && printf '%s\n' "$failing" | grep -Eqi "$skew_pattern"; then
+      if red_is_skew "$run_id" "$failing_pairs"; then
         printf 'red is a version/lock skew, not contention: this terminates in a lockfile bump commit, not a retry\n' >&2
       fi
       printf 'train-push: run %s\n' "$run_url" >&2
