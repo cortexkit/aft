@@ -1,5 +1,5 @@
 import { chmod, mkdir, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 export interface TransportDeadStub {
   /** The path handed to the plugin as `AFT_BINARY_PATH` for the whole run. */
@@ -8,10 +8,12 @@ export interface TransportDeadStub {
   live: string;
   /** The stand-in it points at while the transport is dead. */
   dead: string;
+  /** The script the stand-in's interpreter runs; its path never changes. */
+  deadBody: string;
 }
 
 /**
- * The stand-in binary a transport-dead window installs.
+ * What the stand-in a transport-dead window installs actually does.
  *
  * It reads the request the bridge writes to it and only then exits, without
  * answering. That order is the whole point: the request has provably been
@@ -20,11 +22,43 @@ export interface TransportDeadStub {
  * The exit status is an arbitrary non-zero one, chosen so the line it leaves
  * in the plugin log is recognisably this stand-in rather than a real crash.
  */
-export const DEAD_TRANSPORT_STUB_SOURCE = `#!/bin/sh
-# Accept the request the AFT bridge writes, then die without answering it.
+export const DEAD_TRANSPORT_STUB_BODY = `# Accept the request the AFT bridge writes, then die without answering it.
 read -r _request
 exit 7
 `;
+
+/**
+ * The file the swapped `aft` symlink points at while the transport is dead.
+ *
+ * It is only a `#!` line that names the body by its own fixed path. It must
+ * not carry the body itself. When the kernel runs a `#!` script it reads the
+ * `#!` line once, then starts the interpreter with the path it was ASKED to
+ * run, and the interpreter opens that path again to read the script. Here
+ * that path is the symlink the harness swaps. A bridge that respawned the
+ * stand-in just before the window closed had its `/bin/sh` reopen the symlink
+ * after it already pointed back at the real `aft`, and the shell ran the
+ * native binary as a script in the project directory. The ELF header's first
+ * "line" contains a `>` byte (the x86-64 machine id), so the shell redirected
+ * into a new file named after the header bytes that follow it, and the
+ * scenario's disk sweep then failed on that non-UTF-8 name. Whether the
+ * header parses as a command line at all depends on the bytes of each build,
+ * which is why one rebuilt binary failed every run and its predecessor did
+ * not.
+ *
+ * Passing the body as the interpreter's own argument means the shell reads
+ * the body from a path nothing ever swaps. The swapped path arrives only as
+ * `$1`, which the body never reads. The whole `#!` line is one argument, so it
+ * means the same on Linux, which passes the rest of the line as a single
+ * argument, and on macOS, which splits it on whitespace.
+ */
+export function deadTransportStubSource(bodyPath: string): string {
+  if (!isAbsolute(bodyPath) || /\s/.test(bodyPath)) {
+    throw new Error(
+      `the transport-dead stand-in body must be an absolute path without whitespace to fit in a #! line: ${JSON.stringify(bodyPath)}`,
+    );
+  }
+  return `#!/bin/sh ${bodyPath}\n`;
+}
 
 /**
  * Build the switchable `aft` the transport-dead window points the plugin at.
@@ -65,15 +99,18 @@ export async function makeTransportDeadStub(
   isolationRoot: string,
   nativeExecutable: string,
 ): Promise<TransportDeadStub> {
-  const stateRoot = join(isolationRoot, ".harness-state");
+  const stateRoot = resolve(isolationRoot, ".harness-state");
   await mkdir(stateRoot, { recursive: true });
   const stub: TransportDeadStub = {
     executable: join(stateRoot, "aft"),
     live: nativeExecutable,
     dead: join(stateRoot, "aft-dead"),
+    deadBody: join(stateRoot, "aft-dead-body.sh"),
   };
+  await rm(stub.deadBody, { force: true });
+  await writeFile(stub.deadBody, DEAD_TRANSPORT_STUB_BODY);
   await rm(stub.dead, { force: true });
-  await writeFile(stub.dead, DEAD_TRANSPORT_STUB_SOURCE);
+  await writeFile(stub.dead, deadTransportStubSource(stub.deadBody));
   await chmod(stub.dead, 0o755);
   await pointTransportDeadStub(stub, false);
   return stub;

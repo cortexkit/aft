@@ -64,6 +64,11 @@ import {
   materializeParityScenarios,
 } from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
+import {
+  deadTransportStubSource,
+  makeTransportDeadStub,
+  pointTransportDeadStub,
+} from "./transport-stub.js";
 import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
 import type { ScenarioDefinition, ScenarioResult, ScriptedTurn, ToolCallPlan } from "./types.js";
 import {
@@ -680,6 +685,75 @@ describe("shared-server controls", () => {
     expect(
       fallback.turns.map((turn) => transportDeadAtTurn(fallback, window!, turn.label)),
     ).toEqual([false, true, false]);
+  });
+});
+
+describe("the transport-dead stand-in", () => {
+  // A stand-in for the real `aft`: a file that, if a shell ever reads it as a
+  // script, leaves a marker in its working directory. The real binary's ELF
+  // header did the same thing by accident, through a `>` byte in its first
+  // "line".
+  async function interpretableLiveBinary(directory: string): Promise<string> {
+    const live = join(directory, "aft-live");
+    await writeFile(live, "printf interpreted > interpreted-live-binary\n");
+    await chmod(live, 0o755);
+    return live;
+  }
+
+  test("accepts one request through the swapped path, then dies without answering", async () => {
+    const base = await root();
+    const stub = await makeTransportDeadStub(base, await interpretableLiveBinary(base));
+    await pointTransportDeadStub(stub, true);
+    const child = Bun.spawn([stub.executable], {
+      cwd: base,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    child.stdin.write('{"id":"1","command":"configure"}\n');
+    await child.stdin.end();
+    expect(await child.exited).toBe(7);
+    expect(await new Response(child.stdout).text()).toBe("");
+    expect(await new Response(child.stderr).text()).toBe("");
+  });
+
+  test("never reads the real binary as a script when the window closes mid-spawn", async () => {
+    const base = await root();
+    const project = join(base, "project");
+    await mkdir(project);
+    const stub = await makeTransportDeadStub(base, await interpretableLiveBinary(base));
+    await pointTransportDeadStub(stub, true);
+
+    // This replays, step by step, what the kernel does when the bridge spawns
+    // the stand-in. First it reads the `#!` line of whatever the swapped path
+    // names at that instant, to learn which interpreter to start...
+    const shebang = (await readFile(stub.executable, "utf8")).split("\n")[0]!;
+    expect(shebang.startsWith("#!")).toBe(true);
+    const line = shebang.slice(2).trim();
+    const split = line.search(/\s/);
+    const interpreter = split === -1 ? line : line.slice(0, split);
+    const argument = split === -1 ? undefined : line.slice(split).trim();
+
+    // ...the window closes before the interpreter opens anything...
+    await pointTransportDeadStub(stub, false);
+
+    // ...and the interpreter starts with the swapped path as its last
+    // argument, exactly as Linux passes it.
+    const child = Bun.spawn(
+      [interpreter, ...(argument ? [argument] : []), stub.executable],
+      { cwd: project, stdin: "pipe", stdout: "pipe", stderr: "pipe" },
+    );
+    child.stdin.write('{"id":"1","command":"configure"}\n');
+    await child.stdin.end();
+    const exitCode = await child.exited;
+
+    expect(await readdir(project)).toEqual([]);
+    expect(exitCode).toBe(7);
+  });
+
+  test("refuses a body path that cannot sit in a #! line as one argument", () => {
+    expect(() => deadTransportStubSource("relative/body.sh")).toThrow("absolute path");
+    expect(() => deadTransportStubSource("/with space/body.sh")).toThrow("without whitespace");
   });
 });
 
