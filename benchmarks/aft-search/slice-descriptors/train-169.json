@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "subc-module-readiness"
+  ],
+  "note": "The aft subc module registers not-ready, queries live roots, and flips ready within a fixed budget (warmer seam with a no-op warmer); subc crates move to protocol 0.23. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
