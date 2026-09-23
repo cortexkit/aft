@@ -85,6 +85,10 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
 const DISK_FILE_INDEX_MEMO_CAPACITY: usize = 4_096;
+// Refreshes recompute method-dispatch edges this many caller files at a time
+// (the cold build's default chunk size), so a change to a widely called method
+// name never holds every caller's source in one dispatch pass.
+const DISPATCH_REFRESH_CHUNK_FILES: usize = 100;
 const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
 const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
@@ -4707,6 +4711,23 @@ impl CallGraphStore {
             )?;
         }
 
+        // Method-dispatch edges are chosen among every same-named method in
+        // the store, so a method that appears, disappears or moves (a node id
+        // encodes its position) can change the edge of a caller in any file.
+        let mut dispatch_names = BTreeSet::new();
+        for rel_path in touched_callers.iter().chain(deleted.iter()) {
+            let new_nodes = if deleted.contains(rel_path) {
+                None
+            } else {
+                caller_extracts
+                    .get(rel_path)
+                    .map(|extract| extract.nodes.as_slice())
+            };
+            dispatch_names.extend(changed_dispatch_candidate_names(
+                &conn, rel_path, new_nodes,
+            )?);
+        }
+
         let tx = conn.transaction()?;
         for (rel_path, freshness) in fresh_metadata {
             update_file_fresh_metadata(
@@ -4735,6 +4756,16 @@ impl CallGraphStore {
         // the retained snapshot on this path.
         if caller_extracts.is_empty() {
             if !deleted.is_empty() {
+                let started = Instant::now();
+                let dispatch_callers = dispatch_callers_to_recompute(
+                    &tx,
+                    &BTreeSet::new(),
+                    &deleted,
+                    &dispatch_names,
+                )?;
+                refresh_method_dispatch_edges(&tx, &self.project_root, &dispatch_callers)?;
+                projection_callers.extend(dispatch_callers);
+                profile.method_dispatch += started.elapsed();
                 dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
             }
             clear_path_identity_mismatch_if_consistent(&tx, &self.project_root)?;
@@ -4851,13 +4882,26 @@ impl CallGraphStore {
         }
 
         let started = Instant::now();
-        let expected_dispatch_edges =
-            insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
-        delete_stale_method_dispatch_edges_for_callers(
+        // Rewritten files, callers whose refs were re-resolved (a call can move
+        // between a direct and a dispatch edge), and callers whose candidate
+        // methods changed all get their dispatch edges recomputed.
+        let mut dispatch_roots = own_refresh.clone();
+        dispatch_roots.extend(
+            touched_callers
+                .iter()
+                .filter(|rel_path| !deleted.contains(*rel_path))
+                .cloned(),
+        );
+        let mut changed_node_files = own_refresh.clone();
+        changed_node_files.extend(deleted.iter().cloned());
+        let dispatch_callers = dispatch_callers_to_recompute(
             &tx,
-            &own_refresh,
-            &expected_dispatch_edges,
+            &dispatch_roots,
+            &changed_node_files,
+            &dispatch_names,
         )?;
+        refresh_method_dispatch_edges(&tx, &self.project_root, &dispatch_callers)?;
+        projection_callers.extend(dispatch_callers);
         profile.method_dispatch += started.elapsed();
 
         // Freshness metadata is not an input to the projection. Only changed
@@ -12567,6 +12611,92 @@ fn insert_method_dispatch_edge(
         ],
     )?;
     Ok(edge_id)
+}
+
+/// Names of callable nodes in `rel_path` whose id set differs between the
+/// stored rows and `new_nodes` (None when the file is being deleted).
+fn changed_dispatch_candidate_names(
+    conn: &Connection,
+    rel_path: &str,
+    new_nodes: Option<&[NodeRecord]>,
+) -> Result<BTreeSet<String>> {
+    let mut statement = conn.prepare(
+        "SELECT id, name FROM nodes
+         WHERE file_path = ?1 AND kind IN ('method', 'function', 'kernel')",
+    )?;
+    let stored = statement
+        .query_map(params![rel_path], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    let current = new_nodes
+        .unwrap_or_default()
+        .iter()
+        .filter(|node| matches!(node.kind.as_str(), "method" | "function" | "kernel"))
+        .map(|node| (node.id.clone(), node.name.clone()))
+        .collect::<BTreeSet<_>>();
+    Ok(stored
+        .symmetric_difference(&current)
+        .map(|(_, name)| name.clone())
+        .collect())
+}
+
+/// Caller files whose method-dispatch edges a refresh must recompute: `roots`,
+/// callers holding a dispatch edge into a file whose nodes changed, and
+/// callers with an unresolved call named after a changed candidate method.
+fn dispatch_callers_to_recompute(
+    tx: &Transaction<'_>,
+    roots: &BTreeSet<String>,
+    changed_node_files: &BTreeSet<String>,
+    changed_names: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut callers = roots.clone();
+    let mut by_target = tx.prepare(
+        "SELECT DISTINCT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+         WHERE e.target_file = ?1 AND e.provenance IN (?2, ?3)",
+    )?;
+    for file in changed_node_files {
+        for row in by_target.query_map(
+            params![file, PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH],
+            |row| row.get::<_, String>(0),
+        )? {
+            callers.insert(row?);
+        }
+    }
+    let mut by_name = tx.prepare(
+        "SELECT DISTINCT caller_file FROM refs
+         WHERE short_name = ?1 AND kind = 'call' AND status = 'unresolved'",
+    )?;
+    for name in changed_names {
+        for row in by_name.query_map(params![name], |row| row.get::<_, String>(0))? {
+            callers.insert(row?);
+        }
+    }
+    // A deleted caller's refs and edges are already gone.
+    let mut exists = tx.prepare("SELECT 1 FROM files WHERE path = ?1")?;
+    let mut present = BTreeSet::new();
+    for caller in callers {
+        if exists.exists(params![caller])? {
+            present.insert(caller);
+        }
+    }
+    Ok(present)
+}
+
+/// Recomputes the method-dispatch edges of `caller_files`, in the same bounded
+/// chunks the cold build uses, so the source cache stays small.
+fn refresh_method_dispatch_edges(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+    caller_files: &BTreeSet<String>,
+) -> Result<()> {
+    let files = caller_files.iter().cloned().collect::<Vec<_>>();
+    for chunk in files.chunks(DISPATCH_REFRESH_CHUNK_FILES) {
+        let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
+        let expected = insert_method_dispatch_edges(tx, project_root, Some(&chunk))?;
+        delete_stale_method_dispatch_edges_for_callers(tx, &chunk, &expected)?;
+    }
+    Ok(())
 }
 
 fn delete_stale_method_dispatch_edges_for_callers(

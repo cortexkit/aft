@@ -424,6 +424,64 @@ fn export_alias_rows_are_deterministic() {
     );
 }
 
+/// A method-dispatch edge records the target method's node id. Moving the
+/// method inside its file changes that id, and callers in untouched files must
+/// follow it.
+#[test]
+fn dispatch_edges_follow_moved_target_methods() {
+    let cold = assert_refresh_matches_cold(
+        "dispatch target moved",
+        &[
+            ("store.ts", "export class Store {\n  save() {}\n}\n"),
+            ("main.ts", "export function main(s: any) { s.save(); }\n"),
+        ],
+        &[&[(
+            "store.ts",
+            Some("// moved down\nexport class Store {\n  save() {}\n}\n"),
+        )]],
+    );
+    assert!(
+        !edges_to(&cold, "Store::save").is_empty() || !edges_to(&cold, "Store.save").is_empty(),
+        "{:#?}",
+        cold.edges
+    );
+}
+
+/// A new method with the same name changes which candidate name matching
+/// picks (or makes the call ambiguous) for callers in untouched files.
+#[test]
+fn dispatch_edges_follow_new_candidate_methods() {
+    assert_refresh_matches_cold(
+        "dispatch candidate added",
+        &[
+            ("a/store.ts", "export class Store {\n  save() {}\n}\n"),
+            ("b/main.ts", "export function main(s: any) { s.save(); }\n"),
+        ],
+        &[&[("b/cache.ts", Some("export class Cache {\n  save() {}\n}\n"))]],
+    );
+}
+
+/// A call re-resolved in an untouched caller can switch between a direct
+/// edge and a method-dispatch edge; both kinds must be recomputed.
+#[test]
+fn dispatch_edges_follow_dependent_status_changes() {
+    assert_refresh_matches_cold(
+        "dependent call becomes a dispatch call",
+        &[
+            ("lib.ts", "export function save() {}\n"),
+            ("other.ts", "export class Keeper {\n  save() {}\n}\n"),
+            (
+                "main.ts",
+                "import * as ns from \"./lib\";\nexport function main() { ns.save(); }\n",
+            ),
+        ],
+        &[
+            &[("lib.ts", Some("export function keep() {}\n"))],
+            &[("lib.ts", Some("export function save() {}\n"))],
+        ],
+    );
+}
+
 /// A Rust value reference (a function passed as a value) resolves only when
 /// its target is callable. It must be re-resolved when the target changes.
 #[test]
