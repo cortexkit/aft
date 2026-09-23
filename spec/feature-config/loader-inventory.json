@@ -1,0 +1,49 @@
+{
+  "source": [
+    "packages/aft-bridge/src/paths.ts:18-85",
+    "packages/aft-bridge/src/config-tiers.ts:10-43",
+    "packages/opencode-plugin/src/config.ts:1853-1916",
+    "packages/pi-plugin/src/config.ts:1848-1903",
+    "packages/pi-plugin/src/index.ts:408-423",
+    "packages/opencode-plugin/src/config.ts:1881-1886",
+    "packages/pi-plugin/src/harness.ts:5-82",
+    "packages/aft-cli/src/adapters/omp.ts:36-65"
+  ],
+  "accepted_setup_harness_ids": [
+    "opencode-v1",
+    "opencode-v2",
+    "pi",
+    "omp"
+  ],
+  "adapter_to_runtime_harness": {
+    "opencode-v1": "opencode",
+    "opencode-v2": "opencode",
+    "pi": "pi",
+    "omp": "pi"
+  },
+  "note": "The selector IDs are adapter identities; the current Rust resolver accepts opencode/pi/runner/mcp:/fed: and has no distinct OpenCode generation or OMP enum. OMP uses the Pi extension with API-based detection. Do not forward selector strings opencode-v1/opencode-v2/omp to Harness::from_str unchanged.",
+  "consumed_config": [
+    "${XDG_CONFIG_HOME if absolute else HOME/.config}/cortexkit/aft.jsonc",
+    "<selected project root>/.cortexkit/aft.jsonc"
+  ],
+  "project_boundary": {
+    "pi_omp": "Pi extension initializes at process.cwd() and passes that directory to loadAftConfig; no ancestor traversal in readConfigTiers.",
+    "opencode": "registration root is worktree when present and not filesystem-root sentinel, otherwise directory; project config at that root/.cortexkit/aft.jsonc; no ancestor traversal in readConfigTiers.",
+    "standalone_cli": "cwd supplies project discovery origin; do not use diagnostic adapter config path as project root."
+  },
+  "legacy_location_migration_sources_not_ordinary_tiers": {
+    "user": [
+      "${OPENCODE_CONFIG_DIR or configHome/opencode}/aft.jsonc",
+      "${OPENCODE_CONFIG_DIR or configHome/opencode}/aft.json",
+      "${HOME}/.pi/agent/aft.jsonc",
+      "${HOME}/.pi/agent/aft.json"
+    ],
+    "project": [
+      "<project>/.opencode/aft.jsonc",
+      "<project>/.opencode/aft.json",
+      "<project>/.pi/aft.jsonc",
+      "<project>/.pi/aft.json"
+    ]
+  },
+  "fix_scope": "Ordinary tier loader consumes only the two shared CortexKit paths. Legacy sources are read by one-time location migration if target absent, not additional active tiers. Inactive/unconsumed legacy files are not doctor --fix targets; name them in release notes. All embedded harness blocks in an eligible shared file are in scope."
+}

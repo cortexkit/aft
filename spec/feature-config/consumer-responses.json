@@ -1,0 +1,689 @@
+{
+  "version": 1,
+  "status_values": [
+    "off",
+    "building",
+    "ready",
+    "unavailable"
+  ],
+  "source": [
+    "spec constraints lines 59-72, 141-158",
+    "crates/aft/src/commands/grep.rs:125-183",
+    "crates/aft/src/commands/zoom.rs:22-72",
+    "crates/aft/src/search_index.rs:931-954"
+  ],
+  "contract_note": "These are reviewed target-policy payload projections, NOT claims that pre-change Rust emits these keys. The implementing slice must wire these shared fixtures to exact runtime and adapter serialization tests. Omitted fields are explicitly represented as null only where a consumer contract requires a nullable unavailable finding; absence is not an all-clear. Index failure causes are in index.reason; analysis codes remain separate. All normal result rows survive unavailable ancillary analysis.",
+  "fixture_rows": [
+    {
+      "id": "grep/off",
+      "consumer": "grep",
+      "scenario": "off",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts:1: needle\n\nFound 1 match across 1 file",
+        "complete": true,
+        "matches": [
+          {
+            "file": "src/example.ts",
+            "line": 1,
+            "column": 1,
+            "line_text": "needle",
+            "match_text": "needle"
+          }
+        ],
+        "files": null,
+        "index": {
+          "trigram": {
+            "status": "off",
+            "reason": null
+          }
+        },
+        "fallback": "filesystem"
+      }
+    },
+    {
+      "id": "glob/off",
+      "consumer": "glob",
+      "scenario": "off",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts",
+        "complete": true,
+        "matches": null,
+        "files": [
+          "src/example.ts"
+        ],
+        "index": {
+          "trigram": {
+            "status": "off",
+            "reason": null
+          }
+        },
+        "fallback": "filesystem"
+      }
+    },
+    {
+      "id": "aft_search/off",
+      "consumer": "aft_search",
+      "scenario": "off",
+      "expected": {
+        "success": false,
+        "code": "no_search_lanes_enabled",
+        "results": [],
+        "lanes": {
+          "trigram": {
+            "status": "off",
+            "reason": null
+          },
+          "semantic": {
+            "status": "off",
+            "reason": null
+          }
+        },
+        "omitted_lanes": [
+          "trigram",
+          "semantic"
+        ]
+      }
+    },
+    {
+      "id": "aft_callgraph/off",
+      "consumer": "aft_callgraph",
+      "scenario": "off",
+      "expected": {
+        "success": false,
+        "code": "callgraph_off",
+        "index": {
+          "callgraph": {
+            "status": "off",
+            "reason": null
+          }
+        },
+        "results": null
+      }
+    },
+    {
+      "id": "aft_inspect.dead_code/off",
+      "consumer": "aft_inspect.dead_code",
+      "scenario": "off",
+      "expected": {
+        "success": true,
+        "analyses": {
+          "dead_code": {
+            "status": "unavailable",
+            "code": "callgraph_off",
+            "index": {
+              "status": "off",
+              "reason": null
+            },
+            "findings": null
+          },
+          "todos": {
+            "status": "ready",
+            "findings": [
+              {
+                "path": "src/example.ts",
+                "line": 1,
+                "text": "TODO"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "aft_zoom.callgraph/off",
+      "consumer": "aft_zoom.callgraph",
+      "scenario": "off",
+      "expected": {
+        "success": true,
+        "name": "example",
+        "content": "function example() {}",
+        "annotations": {
+          "status": "unavailable",
+          "code": "callgraph_off",
+          "index": {
+            "status": "off",
+            "reason": null
+          },
+          "calls_out": null,
+          "called_by": null
+        }
+      }
+    },
+    {
+      "id": "aft_search.callgraph_enrichment/off",
+      "consumer": "aft_search.callgraph_enrichment",
+      "scenario": "off",
+      "expected": {
+        "success": false,
+        "results": [],
+        "enrichment": {
+          "status": "omitted",
+          "code": "callgraph_off",
+          "index": {
+            "status": "off",
+            "reason": null
+          },
+          "edges": null
+        },
+        "lanes": {
+          "trigram": {
+            "status": "off",
+            "reason": null
+          },
+          "semantic": {
+            "status": "off",
+            "reason": null
+          }
+        }
+      }
+    },
+    {
+      "id": "grep/building",
+      "consumer": "grep",
+      "scenario": "building",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts:1: needle\n\nFound 1 match across 1 file",
+        "complete": true,
+        "matches": [
+          {
+            "file": "src/example.ts",
+            "line": 1,
+            "column": 1,
+            "line_text": "needle",
+            "match_text": "needle"
+          }
+        ],
+        "files": null,
+        "index": {
+          "trigram": {
+            "status": "building",
+            "reason": null
+          }
+        },
+        "fallback": "filesystem"
+      }
+    },
+    {
+      "id": "glob/building",
+      "consumer": "glob",
+      "scenario": "building",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts",
+        "complete": true,
+        "matches": null,
+        "files": [
+          "src/example.ts"
+        ],
+        "index": {
+          "trigram": {
+            "status": "building",
+            "reason": null
+          }
+        },
+        "fallback": "filesystem"
+      }
+    },
+    {
+      "id": "aft_search/building",
+      "consumer": "aft_search",
+      "scenario": "building",
+      "expected": {
+        "success": false,
+        "code": "search_lanes_unavailable",
+        "results": [],
+        "lanes": {
+          "trigram": {
+            "status": "building",
+            "reason": null
+          },
+          "semantic": {
+            "status": "building",
+            "reason": null
+          }
+        },
+        "omitted_lanes": [
+          "trigram",
+          "semantic"
+        ]
+      }
+    },
+    {
+      "id": "aft_callgraph/building",
+      "consumer": "aft_callgraph",
+      "scenario": "building",
+      "expected": {
+        "success": false,
+        "code": "callgraph_building",
+        "index": {
+          "callgraph": {
+            "status": "building",
+            "reason": null
+          }
+        },
+        "results": null
+      }
+    },
+    {
+      "id": "aft_inspect.dead_code/building",
+      "consumer": "aft_inspect.dead_code",
+      "scenario": "building",
+      "expected": {
+        "success": true,
+        "analyses": {
+          "dead_code": {
+            "status": "unavailable",
+            "code": "callgraph_building",
+            "index": {
+              "status": "building",
+              "reason": null
+            },
+            "findings": null
+          },
+          "todos": {
+            "status": "ready",
+            "findings": [
+              {
+                "path": "src/example.ts",
+                "line": 1,
+                "text": "TODO"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "aft_zoom.callgraph/building",
+      "consumer": "aft_zoom.callgraph",
+      "scenario": "building",
+      "expected": {
+        "success": true,
+        "name": "example",
+        "content": "function example() {}",
+        "annotations": {
+          "status": "unavailable",
+          "code": "callgraph_building",
+          "index": {
+            "status": "building",
+            "reason": null
+          },
+          "calls_out": null,
+          "called_by": null
+        }
+      }
+    },
+    {
+      "id": "aft_search.callgraph_enrichment/building",
+      "consumer": "aft_search.callgraph_enrichment",
+      "scenario": "building",
+      "expected": {
+        "success": false,
+        "results": [],
+        "enrichment": {
+          "status": "omitted",
+          "code": "callgraph_building",
+          "index": {
+            "status": "building",
+            "reason": null
+          },
+          "edges": null
+        },
+        "lanes": {
+          "trigram": {
+            "status": "building",
+            "reason": null
+          },
+          "semantic": {
+            "status": "building",
+            "reason": null
+          }
+        }
+      }
+    },
+    {
+      "id": "grep/unavailable",
+      "consumer": "grep",
+      "scenario": "unavailable",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts:1: needle\n\nFound 1 match across 1 file",
+        "complete": true,
+        "matches": [
+          {
+            "file": "src/example.ts",
+            "line": 1,
+            "column": 1,
+            "line_text": "needle",
+            "match_text": "needle"
+          }
+        ],
+        "files": null,
+        "index": {
+          "trigram": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          }
+        },
+        "fallback": "filesystem"
+      }
+    },
+    {
+      "id": "glob/unavailable",
+      "consumer": "glob",
+      "scenario": "unavailable",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts",
+        "complete": true,
+        "matches": null,
+        "files": [
+          "src/example.ts"
+        ],
+        "index": {
+          "trigram": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          }
+        },
+        "fallback": "filesystem"
+      }
+    },
+    {
+      "id": "aft_search/unavailable",
+      "consumer": "aft_search",
+      "scenario": "unavailable",
+      "expected": {
+        "success": false,
+        "code": "search_lanes_unavailable",
+        "results": [],
+        "lanes": {
+          "trigram": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          },
+          "semantic": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          }
+        },
+        "omitted_lanes": [
+          "trigram",
+          "semantic"
+        ]
+      }
+    },
+    {
+      "id": "aft_callgraph/unavailable",
+      "consumer": "aft_callgraph",
+      "scenario": "unavailable",
+      "expected": {
+        "success": false,
+        "code": "callgraph_unavailable",
+        "index": {
+          "callgraph": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          }
+        },
+        "results": null
+      }
+    },
+    {
+      "id": "aft_inspect.dead_code/unavailable",
+      "consumer": "aft_inspect.dead_code",
+      "scenario": "unavailable",
+      "expected": {
+        "success": true,
+        "analyses": {
+          "dead_code": {
+            "status": "unavailable",
+            "code": "callgraph_unavailable",
+            "index": {
+              "status": "unavailable",
+              "reason": "runtime_not_observed"
+            },
+            "findings": null
+          },
+          "todos": {
+            "status": "ready",
+            "findings": [
+              {
+                "path": "src/example.ts",
+                "line": 1,
+                "text": "TODO"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "aft_zoom.callgraph/unavailable",
+      "consumer": "aft_zoom.callgraph",
+      "scenario": "unavailable",
+      "expected": {
+        "success": true,
+        "name": "example",
+        "content": "function example() {}",
+        "annotations": {
+          "status": "unavailable",
+          "code": "callgraph_unavailable",
+          "index": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          },
+          "calls_out": null,
+          "called_by": null
+        }
+      }
+    },
+    {
+      "id": "aft_search.callgraph_enrichment/unavailable",
+      "consumer": "aft_search.callgraph_enrichment",
+      "scenario": "unavailable",
+      "expected": {
+        "success": false,
+        "results": [],
+        "enrichment": {
+          "status": "omitted",
+          "code": "callgraph_unavailable",
+          "index": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          },
+          "edges": null
+        },
+        "lanes": {
+          "trigram": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          },
+          "semantic": {
+            "status": "unavailable",
+            "reason": "runtime_not_observed"
+          }
+        }
+      }
+    },
+    {
+      "id": "grep/partially_ready",
+      "consumer": "grep",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts:1: needle\n\nFound 1 match across 1 file",
+        "complete": true,
+        "matches": [
+          {
+            "file": "src/example.ts",
+            "line": 1,
+            "column": 1,
+            "line_text": "needle",
+            "match_text": "needle"
+          }
+        ],
+        "files": null,
+        "index": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          }
+        },
+        "fallback": null
+      }
+    },
+    {
+      "id": "glob/partially_ready",
+      "consumer": "glob",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": true,
+        "text": "src/example.ts",
+        "complete": true,
+        "matches": null,
+        "files": [
+          "src/example.ts"
+        ],
+        "index": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          }
+        },
+        "fallback": null
+      }
+    },
+    {
+      "id": "aft_search/partially_ready",
+      "consumer": "aft_search",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": true,
+        "code": null,
+        "results": [
+          {
+            "path": "src/example.ts",
+            "line": 1,
+            "text": "needle"
+          }
+        ],
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "unavailable",
+            "reason": "semantic_backend_unavailable"
+          }
+        },
+        "omitted_lanes": [
+          "semantic"
+        ]
+      }
+    },
+    {
+      "id": "aft_callgraph/partially_ready",
+      "consumer": "aft_callgraph",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": false,
+        "code": "callgraph_building",
+        "index": {
+          "callgraph": {
+            "status": "building",
+            "reason": null
+          }
+        },
+        "results": null
+      }
+    },
+    {
+      "id": "aft_inspect.dead_code/partially_ready",
+      "consumer": "aft_inspect.dead_code",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": true,
+        "analyses": {
+          "dead_code": {
+            "status": "unavailable",
+            "code": "callgraph_building",
+            "index": {
+              "status": "building",
+              "reason": null
+            },
+            "findings": null
+          },
+          "todos": {
+            "status": "ready",
+            "findings": [
+              {
+                "path": "src/example.ts",
+                "line": 1,
+                "text": "TODO"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "aft_zoom.callgraph/partially_ready",
+      "consumer": "aft_zoom.callgraph",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": true,
+        "name": "example",
+        "content": "function example() {}",
+        "annotations": {
+          "status": "unavailable",
+          "code": "callgraph_building",
+          "index": {
+            "status": "building",
+            "reason": null
+          },
+          "calls_out": null,
+          "called_by": null
+        }
+      }
+    },
+    {
+      "id": "aft_search.callgraph_enrichment/partially_ready",
+      "consumer": "aft_search.callgraph_enrichment",
+      "scenario": "partially_ready",
+      "expected": {
+        "success": true,
+        "results": [
+          {
+            "path": "src/example.ts",
+            "line": 1,
+            "text": "needle"
+          }
+        ],
+        "enrichment": {
+          "status": "omitted",
+          "code": "callgraph_building",
+          "index": {
+            "status": "building",
+            "reason": null
+          },
+          "edges": null
+        },
+        "lanes": {
+          "trigram": {
+            "status": "ready",
+            "reason": null
+          },
+          "semantic": {
+            "status": "unavailable",
+            "reason": "semantic_backend_unavailable"
+          }
+        }
+      }
+    }
+  ]
+}

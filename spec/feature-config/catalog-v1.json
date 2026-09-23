@@ -1,0 +1,365 @@
+{
+  "plan_version": 1,
+  "source": "spec constraints lines 141-173 and registration-inventory.json canonical_tools",
+  "ordered_tuples": [
+    {
+      "id": "aft_search",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 1,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_search"
+      },
+      "prerequisites": [
+        "indexes.trigram",
+        "indexes.semantic"
+      ]
+    },
+    {
+      "id": "grep",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 2,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "grep"
+      },
+      "prerequisites": [
+        "indexes.trigram"
+      ]
+    },
+    {
+      "id": "glob",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 3,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "glob"
+      },
+      "prerequisites": [
+        "indexes.trigram"
+      ]
+    },
+    {
+      "id": "aft_outline",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 4,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_outline"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "aft_zoom",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 5,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_zoom"
+      },
+      "prerequisites": [
+        "indexes.callgraph"
+      ]
+    },
+    {
+      "id": "aft_callgraph",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 6,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_callgraph"
+      },
+      "prerequisites": [
+        "indexes.callgraph"
+      ]
+    },
+    {
+      "id": "aft_inspect",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 7,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_inspect"
+      },
+      "prerequisites": [
+        "indexes.callgraph"
+      ]
+    },
+    {
+      "id": "aft_conflicts",
+      "kind": "tool",
+      "group": "Search/navigation",
+      "order": 8,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_conflicts"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "read",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 9,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "read"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "write",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 10,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "write"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "edit",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 11,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "edit"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "apply_patch",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 12,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "apply_patch"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "aft_import",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 13,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_import"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "aft_move",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 14,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_move"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "aft_delete",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 15,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_delete"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "aft_safety",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 16,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "aft_safety"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "ast_grep_search",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 17,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "ast_grep_search"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "ast_grep_replace",
+      "kind": "tool",
+      "group": "Editing",
+      "order": 18,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "ast_grep_replace"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "bash",
+      "kind": "tool",
+      "group": "Shell",
+      "order": 19,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "bash"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "bash_status",
+      "kind": "tool",
+      "group": "Shell",
+      "order": 20,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "bash_status"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "bash_write",
+      "kind": "tool",
+      "group": "Shell",
+      "order": 21,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "bash_write"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "bash_watch",
+      "kind": "tool",
+      "group": "Shell",
+      "order": 22,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "bash_watch"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "bash_kill",
+      "kind": "tool",
+      "group": "Shell",
+      "order": 23,
+      "binding": {
+        "path": "disabled_tools",
+        "tool_name": "bash_kill"
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "indexes.trigram",
+      "kind": "index",
+      "group": "Indexes",
+      "order": 24,
+      "binding": {
+        "path": "indexes.trigram",
+        "tool_name": null
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "indexes.semantic",
+      "kind": "index",
+      "group": "Indexes",
+      "order": 25,
+      "binding": {
+        "path": "indexes.semantic",
+        "tool_name": null
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "indexes.callgraph",
+      "kind": "index",
+      "group": "Indexes",
+      "order": 26,
+      "binding": {
+        "path": "indexes.callgraph",
+        "tool_name": null
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "github.read",
+      "kind": "capability",
+      "group": "GitHub",
+      "order": 27,
+      "binding": {
+        "path": "github.read",
+        "tool_name": null
+      },
+      "prerequisites": []
+    },
+    {
+      "id": "github.write",
+      "kind": "capability",
+      "group": "GitHub",
+      "order": 28,
+      "binding": {
+        "path": "github.write",
+        "tool_name": null
+      },
+      "prerequisites": [
+        "github.read"
+      ]
+    }
+  ],
+  "exclusions": [
+    "github.shim",
+    "gh_shim.binary_path",
+    "git.co_author",
+    "sandbox",
+    "bash.rewrite",
+    "bash.compress",
+    "bash.background",
+    "bash.host_fallback",
+    "bash.subagent_background",
+    "configure_warnings_delivery",
+    "url_fetch_allow_private",
+    "semantic backend details",
+    "lsp/formatter settings",
+    "tool_surface",
+    "hoist_builtin_tools",
+    "aft_read",
+    "aft_write",
+    "aft_edit",
+    "aft_apply_patch",
+    "aft_grep",
+    "aft_glob",
+    "aft_bash",
+    "powershell",
+    "aft_powershell"
+  ],
+  "runtime_prerequisites_not_catalog_rows": {
+    "aft_safety": "backup.enabled",
+    "aft_inspect": "inspect.enabled for call; indexes.callgraph for dead-code analysis only",
+    "bash": "bash.enabled",
+    "bash_status/bash_write/bash_watch/bash_kill": "bash.enabled and background runtime support",
+    "aft_move/aft_delete": "backup.enabled if action requires backup",
+    "aft_search": "ready search lane (trigram or semantic); semantic backend only for semantic lane",
+    "grep/glob": "indexed acceleration optional, filesystem fallback must work",
+    "github.read/github.write": "GitHub credentials/authorization; write implies read"
+  }
+}

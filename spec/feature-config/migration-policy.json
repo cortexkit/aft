@@ -1,0 +1,42 @@
+{
+  "id": "feature-config-v1",
+  "source_metadata": {
+    "rust": "crates/aft/Cargo.toml [package].version = 0.57.2",
+    "npm": [
+      "packages/aft-cli/package.json = 0.57.2",
+      "packages/aft-bridge/package.json = 0.57.2",
+      "packages/opencode-plugin/package.json = 0.57.2",
+      "packages/pi-plugin/package.json = 0.57.2"
+    ]
+  },
+  "introduced_minor": "0.58",
+  "reject_from_minor": "0.59",
+  "comparison": "major/minor only; patch ignored",
+  "paths": {
+    "tool_surface": "disabled_tools",
+    "hoist_builtin_tools": "disabled_tools",
+    "enabled": "disabled_tools",
+    "search_index": "indexes.trigram",
+    "experimental_search_index": "indexes.trigram",
+    "semantic_search": "indexes.semantic",
+    "experimental_semantic_search": "indexes.semantic",
+    "callgraph_store": "indexes.callgraph",
+    "github.enabled": "github.read,github.write,github.shim"
+  },
+  "disabled_list_names": {
+    "aft_read": "read",
+    "aft_write": "write",
+    "aft_edit": "edit",
+    "aft_apply_patch": "apply_patch",
+    "aft_grep": "grep",
+    "aft_glob": "glob",
+    "aft_bash": "bash"
+  },
+  "gh_alias_ruling": "gh_read.enabled and gh_shim.enabled were already retired in v0.57.0; they are NOT covered by this new-policy artifact. They reject immediately under their existing policy. Retain gh_shim.binary_path.",
+  "retained_runtime_gates": [
+    "backup.enabled",
+    "inspect.enabled",
+    "bash",
+    "bash.enabled"
+  ]
+}
