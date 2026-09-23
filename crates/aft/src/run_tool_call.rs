@@ -7,7 +7,9 @@ use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 pub type DispatchFn<'a> = dyn Fn(RawRequest, &AppContext) -> Response + 'a;
-pub type FinalizeFn<'a> = dyn Fn(&mut Response) + 'a;
+/// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can
+/// append trailing lines (the AFT status bar) that every transport then delivers unchanged.
+pub type FinalizeFn<'a> = dyn Fn(&mut Response, &mut String) + 'a;
 
 /// Monotonic timestamps for one subc tool call. The recorder stays on the
 /// request path and only takes an `Instant::now()` at each phase boundary.
@@ -398,7 +400,7 @@ pub(crate) fn finish_tool_call_response(
         trace.mark_format_done();
     }
     if let Some(finalizer) = finalizer {
-        finalizer(&mut response);
+        finalizer(&mut response, &mut text);
     }
     if let Some(trace) = phase_trace.as_mut() {
         trace.mark_finalize_done();
@@ -417,6 +419,8 @@ pub fn run_tool_call(
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
     let semantic_key = crate::response_finalize::repeat_breaker::semantic_key(bare_name, &args);
+    // Only a dispatched call is finalized; a translation or request-shape refusal never was.
+    let mut finalize_after_breaker = false;
     let mut result = match prepare_tool_call(
         bare_name,
         args,
@@ -458,13 +462,14 @@ pub fn run_tool_call(
             if let Some(trace) = phase_trace.as_mut() {
                 trace.mark_execute_done();
             }
+            finalize_after_breaker = true;
             finish_tool_call_response(
                 bare_name,
                 format_context,
                 response,
                 prepared.surface_downgraded,
-                finalizer,
-                phase_trace,
+                None,
+                phase_trace.as_deref_mut(),
             )
         }
     };
@@ -495,6 +500,15 @@ pub fn run_tool_call(
             session_id,
             &intervention,
         );
+    }
+    // Finalize after hashing: the status bar the finalizer may append carries moving counts.
+    if finalize_after_breaker {
+        if let Some(finalizer) = finalizer {
+            finalizer(&mut result.response, &mut result.text);
+            if let Some(trace) = phase_trace.as_mut() {
+                trace.mark_finalize_done();
+            }
+        }
     }
 
     ToolCallOutcome::Unary(result)

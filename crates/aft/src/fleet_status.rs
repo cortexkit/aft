@@ -1,14 +1,16 @@
 //! Publisher for AFT's segment on the fleet status-holder plane.
 //!
 //! The holder owns retention and composed rendering. While its route is live,
-//! AFT publishes its project-scoped segment and leaves status-bar attachment to
-//! the holder's host plugin.
+//! AFT publishes its project-scoped segment. A live route only proves that a
+//! publisher exists: AFT leaves the agent-facing bar to the holder's host plugin
+//! only while the holder's publish acks show that something is actually reading
+//! the project's scope (see [`FleetStatusClient::reader_present`]).
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,6 +24,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 const STATUS_CADENCE: Duration = Duration::from_millis(2_500);
+/// How recent the holder's last `status.line` read of a scope must be for AFT
+/// to count it as a live reader. Prefrontal's status stamper polls every 3 s, so
+/// a few of its cadences separate a live renderer from a stale or one-off
+/// diagnostic read.
+const READER_FRESH_WINDOW_MS: u64 = 10_000;
 const DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(5);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
@@ -61,6 +68,12 @@ impl StatusLineSnapshot {
 pub(crate) struct StatusPublishAck {
     pub(crate) epoch: u64,
     pub(crate) accepted_revision: u64,
+    /// Holder wall clock (ms since the Unix epoch) at the last `status.line`
+    /// read that named the published scope. Null when nothing has read the
+    /// scope in the holder process; absent from holders that predate the field.
+    /// Both of those mean "no evidence of a reader".
+    #[serde(default)]
+    pub(crate) last_read_at_ms: Option<u64>,
 }
 
 impl StatusPublishAck {
@@ -90,6 +103,35 @@ impl PublishFence {
 struct ClientState {
     last_publish_at: HashMap<String, Instant>,
     publish_fence: PublishFence,
+    /// Per scope: whether the holder's most recent publish ack reported a read
+    /// of that scope within [`READER_FRESH_WINDOW_MS`] of the ack's arrival.
+    reader_fresh_by_scope: HashMap<String, bool>,
+}
+
+impl ClientState {
+    fn forget_route(&mut self) {
+        self.last_publish_at.clear();
+        self.reader_fresh_by_scope.clear();
+    }
+}
+
+fn status_scope(project_root: &Path) -> String {
+    format!("project:{}", project_root.to_string_lossy())
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Whether an ack received at `ack_at_ms` (AFT's clock) proves a live reader.
+/// A read stamped later than the ack (holder clock ahead of AFT's) counts as
+/// age zero rather than as stale.
+fn read_is_fresh(last_read_at_ms: Option<u64>, ack_at_ms: u64) -> bool {
+    last_read_at_ms
+        .is_some_and(|read_at| ack_at_ms.saturating_sub(read_at) <= READER_FRESH_WINDOW_MS)
 }
 
 struct FleetStatusInner {
@@ -146,13 +188,38 @@ impl FleetStatusClient {
     pub(crate) fn set_route_live(&self, route_live: bool) {
         self.inner.route_live.store(route_live, Ordering::Release);
         if !route_live {
-            self.inner.state.lock().last_publish_at.clear();
+            self.inner.state.lock().forget_route();
         }
     }
 
-    /// Publish AFT's segment when the holder route is live. The return value is
-    /// ownership, not delivery: `true` means the holder's host plugin owns the
-    /// response bar even when cadence, contention, or backpressure skips a send.
+    /// Whether something is reading this project's fleet status line, so the
+    /// holder's composed line (not AFT's own bar) is what the agent sees.
+    ///
+    /// Evidence is the holder's most recent publish ack for the scope: it must
+    /// report a `status.line` read within [`READER_FRESH_WINDOW_MS`] of when AFT
+    /// received that ack. Freshness is judged at ack arrival, not at render
+    /// time, because acks only arrive after publishes and publishes only happen
+    /// on tool results: after any pause of more than the window between two
+    /// tool calls, a render-time age would call a steadily polling reader stale
+    /// and show a duplicate bar. The ack for this call's own publish arrives
+    /// after the decision, so a reader that stops is noticed one result late.
+    pub(crate) fn reader_present(&self, project_root: &Path) -> bool {
+        if !self.inner.route_live.load(Ordering::Acquire) {
+            return false;
+        }
+        let scope = status_scope(project_root);
+        self.inner
+            .state
+            .lock()
+            .reader_fresh_by_scope
+            .get(&scope)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Publish AFT's segment when the holder route is live. The return value
+    /// reports route liveness only; it says nothing about whether anything
+    /// reads the published scope (use [`Self::reader_present`] for that).
     pub(crate) fn publish(
         &self,
         project_root: &Path,
@@ -164,7 +231,7 @@ impl FleetStatusClient {
             return false;
         };
         let route_live = self.inner.route_live.load(Ordering::Acquire);
-        let scope = format!("project:{}", project_root.to_string_lossy());
+        let scope = status_scope(project_root);
         let now = Instant::now();
         let revision = {
             let Some(mut state) = self.inner.state.try_lock() else {
@@ -274,14 +341,21 @@ impl StatusWireRequest {
         let Some(client) = self.client.upgrade() else {
             return true;
         };
-        client.state.lock().publish_fence.observe(ack);
+        let reader_fresh = read_is_fresh(ack.last_read_at_ms, unix_now_ms());
+        let mut state = client.state.lock();
+        state.publish_fence.observe(ack);
+        if let Some(scope) = self.body["scope"].as_str() {
+            state
+                .reader_fresh_by_scope
+                .insert(scope.to_owned(), reader_fresh);
+        }
         true
     }
 
     pub(crate) fn complete_unavailable(self) {
         if let Some(client) = self.client.upgrade() {
             client.route_live.store(false, Ordering::Release);
-            client.state.lock().last_publish_at.clear();
+            client.state.lock().forget_route();
         }
     }
 }
@@ -856,12 +930,18 @@ mod tests {
             ack,
             StatusPublishAck {
                 epoch: 3,
-                accepted_revision: 7
+                accepted_revision: 7,
+                last_read_at_ms: Some(1790115735811),
             }
         );
         let null_read =
             StatusPublishAck::parse(br#"{"epoch":3,"accepted_revision":7,"last_read_at_ms":null}"#);
-        assert!(null_read.is_some(), "a null last_read_at_ms still parses");
+        assert_eq!(
+            null_read
+                .expect("a null last_read_at_ms still parses")
+                .last_read_at_ms,
+            None
+        );
     }
 
     #[test]
@@ -946,6 +1026,7 @@ mod tests {
         fence.observe(StatusPublishAck {
             epoch: 3,
             accepted_revision: 2,
+            last_read_at_ms: None,
         });
         assert_eq!(
             fence,
@@ -1055,6 +1136,93 @@ mod tests {
                 epoch: 3,
                 accepted_revision: 1
             }
+        );
+    }
+
+    fn ack_with_read(revision: u64, last_read_at_ms: Option<u64>) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "epoch": 1,
+            "accepted_revision": revision,
+            "last_read_at_ms": last_read_at_ms,
+        }))
+        .expect("ack bytes")
+    }
+
+    #[test]
+    fn read_freshness_is_bounded_by_the_window_and_tolerates_a_holder_clock_ahead() {
+        let ack_at = 1_000_000;
+        assert!(read_is_fresh(Some(ack_at - READER_FRESH_WINDOW_MS), ack_at));
+        assert!(!read_is_fresh(
+            Some(ack_at - READER_FRESH_WINDOW_MS - 1),
+            ack_at
+        ));
+        assert!(read_is_fresh(Some(ack_at + 5_000), ack_at));
+        assert!(!read_is_fresh(None, ack_at));
+    }
+
+    #[test]
+    fn reader_presence_is_per_scope_and_follows_the_latest_ack() {
+        let (client, mut wire_rx) = FleetStatusClient::channel(4);
+        let read = Path::new("/tmp/read");
+        let unread = Path::new("/tmp/unread");
+        assert!(!client.reader_present(read), "no ack yet is no evidence");
+
+        assert!(client.publish(read, "opencode", "session", "text"));
+        assert!(wire_rx
+            .try_recv()
+            .unwrap()
+            .complete_response(&ack_with_read(1, Some(unix_now_ms() - 2_000))));
+        assert!(client.publish(unread, "opencode", "session", "text"));
+        assert!(wire_rx
+            .try_recv()
+            .unwrap()
+            .complete_response(&ack_with_read(2, None)));
+        assert!(client.reader_present(read));
+        assert!(!client.reader_present(unread));
+
+        // The reader stops: the next ack reports a read older than the window.
+        client.inner.state.lock().last_publish_at.clear();
+        assert!(client.publish(read, "opencode", "session", "text"));
+        assert!(wire_rx
+            .try_recv()
+            .unwrap()
+            .complete_response(&ack_with_read(
+                3,
+                Some(unix_now_ms() - READER_FRESH_WINDOW_MS - 5_000)
+            )));
+        assert!(!client.reader_present(read));
+    }
+
+    #[test]
+    fn holder_without_read_field_or_dropped_route_is_no_reader() {
+        let (client, mut wire_rx) = FleetStatusClient::channel(4);
+        let root = Path::new("/tmp/project");
+        assert!(client.publish(root, "opencode", "session", "text"));
+        assert!(wire_rx
+            .try_recv()
+            .unwrap()
+            .complete_response(br#"{"epoch":1,"accepted_revision":1}"#));
+        assert!(
+            !client.reader_present(root),
+            "an older holder proves no reader"
+        );
+
+        client.inner.state.lock().last_publish_at.clear();
+        assert!(client.publish(root, "opencode", "session", "text"));
+        assert!(wire_rx
+            .try_recv()
+            .unwrap()
+            .complete_response(&ack_with_read(2, Some(unix_now_ms()))));
+        assert!(client.reader_present(root));
+        client.set_route_live(false);
+        assert!(
+            !client.reader_present(root),
+            "a dropped route has no reader"
+        );
+        client.set_route_live(true);
+        assert!(
+            !client.reader_present(root),
+            "evidence from the dropped route does not survive a rebind"
         );
     }
 }

@@ -1608,8 +1608,7 @@ mod pending_response_tests {
     use aft::parser::TreeSitterProvider;
     use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
     use aft::response_finalize::{
-        attach_bg_completions, attach_status_bar, finalize_response, PendingResponse,
-        PendingResponses,
+        attach_bg_completions, finalize_response, PendingResponse, PendingResponses,
     };
     use aft::runtime_registry::RuntimeRegistry;
     use std::path::Path;
@@ -1732,7 +1731,6 @@ mod pending_response_tests {
             fixture_with_completion_and_status(session_id, "bash-0000000000000501");
         let mut inline = Response::success("req-finalize", serde_json::json!({"value": true}));
         attach_bg_completions(&mut inline, &inline_fixture.ctx, session_id, "read");
-        attach_status_bar(&mut inline, &inline_fixture.ctx, session_id, "read");
 
         let helper_fixture =
             fixture_with_completion_and_status(session_id, "bash-0000000000000501");
@@ -3092,7 +3090,7 @@ mod watcher_filter_tests {
     use aft::lsp::roots::ServerKey;
     use aft::parser::TreeSitterProvider;
     use aft::protocol::{ConfigureWarningsFrame, PushFrame, RawRequest, Response};
-    use aft::response_finalize::attach_status_bar;
+    use aft::response_finalize::finalize_response;
     use aft::runtime_drain::{
         drain_semantic_refresh_events, drain_watcher_events,
         record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
@@ -3621,7 +3619,7 @@ mod watcher_filter_tests {
     }
 
     #[test]
-    fn status_bar_attach_skips_unchanged_fingerprint() {
+    fn status_bar_line_skips_unchanged_fingerprint() {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let ctx = make_ctx_with_root(&root);
@@ -3636,21 +3634,21 @@ mod watcher_filter_tests {
                 .publish(key, root.join("known.ts"), vec![]);
         }
 
-        let mut first = Response::success("one", serde_json::json!({}));
-        attach_status_bar(&mut first, &ctx, "session-status", "read");
-        assert_eq!(first.data["status_bar"]["dead_code"], 1);
-        assert_eq!(first.data["status_bar"]["unused_exports"], 2);
-        assert_eq!(first.data["status_bar"]["duplicates"], 3);
-        assert_eq!(first.data["status_bar"]["todos"], 4);
+        // The bar rides in the agent-visible text, never as a `status_bar` field.
+        let with_text = |id: &str| Response::success(id, serde_json::json!({ "text": "body" }));
+        let mut first = with_text("one");
+        finalize_response(&mut first, &ctx, "session-status", "read");
+        assert_eq!(first.data["text"], "body\n\n[AFT E0 W0 | D1 U2 C3 | T4]");
+        assert!(first.data.get("status_bar").is_none());
 
-        let mut unchanged = Response::success("two", serde_json::json!({}));
-        attach_status_bar(&mut unchanged, &ctx, "session-status", "read");
-        assert!(unchanged.data.get("status_bar").is_none());
+        let mut unchanged = with_text("two");
+        finalize_response(&mut unchanged, &ctx, "session-status", "read");
+        assert_eq!(unchanged.data["text"], "body");
 
         ctx.update_status_bar_tier2(Some(5), Some(2), Some(3), Some(4), false);
-        let mut changed = Response::success("three", serde_json::json!({}));
-        attach_status_bar(&mut changed, &ctx, "session-status", "read");
-        assert_eq!(changed.data["status_bar"]["dead_code"], 5);
+        let mut changed = with_text("three");
+        finalize_response(&mut changed, &ctx, "session-status", "read");
+        assert_eq!(changed.data["text"], "body\n\n[AFT E0 W0 | D5 U2 C3 | T4]");
     }
 
     #[test]

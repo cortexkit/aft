@@ -2367,6 +2367,46 @@ fn subc_bridge_without_discovered_status_line_surface_emits_no_status_requests()
     );
 }
 
+fn fleet_consumer_env() -> Vec<EnvVarGuard> {
+    vec![
+        set_test_env("SUBC_MODULE_ID", "aft"),
+        set_test_env("SUBC_LAUNCH_NONCE", "test-launch-nonce"),
+    ]
+}
+
+#[test]
+fn subc_bridge_status_bar_shows_in_text_with_live_holder_but_no_reader() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_status_bar_shows_in_text_with_live_holder_but_no_reader",
+        Duration::from_secs(30),
+        fleet_consumer_env,
+        drive_live_holder_without_reader_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_status_bar_hidden_while_a_reader_recently_read_the_scope() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_status_bar_hidden_while_a_reader_recently_read_the_scope",
+        Duration::from_secs(30),
+        fleet_consumer_env,
+        drive_recent_reader_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_status_bar_returns_when_the_reader_goes_stale() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_status_bar_returns_when_the_reader_goes_stale",
+        Duration::from_secs(30),
+        fleet_consumer_env,
+        drive_reader_goes_stale_daemon,
+        |_, _, _| {},
+    );
+}
+
 #[test]
 fn subc_bridge_session_scoped_bg_completion_and_push_isolation() {
     run_subc_bridge_test(
@@ -6434,7 +6474,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         if completed {
             assert!(
                 tool_response_json(&frame)["status_bar"].is_null(),
-                "opencode-harness solo bar must be suppressed while the fleet plane is live"
+                "the status bar never rides as a structured status_bar field"
             );
         }
         module_inventory.push(frame);
@@ -6512,6 +6552,286 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         }),
         "supervision connection carried fleet consumer traffic: {labels:?}"
     );
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// A fleet status holder (`prefrontal-core`) played by the test. It answers the
+/// module's consumer connection: catalog discovery, the status route bind, and
+/// each `status.publish` with an ack whose `last_read_at_ms` says how recently
+/// something read this project's fleet line.
+struct FakeStatusHolder {
+    consumer_stream: tokio::net::TcpStream,
+    revision: u64,
+}
+
+impl FakeStatusHolder {
+    async fn accept(
+        listener: &TcpListener,
+        key: &[u8],
+        daemon_id: &[u8; subc_transport::DAEMON_ID_LEN],
+        root: &std::path::Path,
+    ) -> Self {
+        let (mut consumer_stream, _) =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("fleet consumer connection timeout")
+                .expect("accept fleet consumer");
+        authenticate_server(
+            &mut consumer_stream,
+            key,
+            daemon_id,
+            "subc-test",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("authenticate fleet consumer");
+        let catalog = read_raw_inventory_frame(&mut consumer_stream, "catalog.list").await;
+        assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
+        reply_to(&mut consumer_stream, &catalog, holder_catalog()).await;
+        let route_open = read_raw_inventory_frame(&mut consumer_stream, "route.open").await;
+        let route_open_body: Value =
+            serde_json::from_slice(&route_open.body).expect("route.open request body");
+        assert_eq!(route_open_body["identity"]["project_root"], json!(root));
+        assert_eq!(route_open_body["identity"]["harness"], "opencode");
+        reply_to(
+            &mut consumer_stream,
+            &route_open,
+            json!({ "op": "route.open", "route_channel": 42, "route_epoch": 7 }),
+        )
+        .await;
+        Self {
+            consumer_stream,
+            revision: 0,
+        }
+    }
+
+    /// Acknowledge the module's next publish. `read_ago_ms` is how long before
+    /// now the holder last served a `status.line` read of the scope; `None` is
+    /// a scope nothing has read.
+    async fn ack_next_publish(&mut self, read_ago_ms: Option<u64>) {
+        // The module re-reads the catalog on its cadence while the route is up;
+        // keep advertising the holder until the publish arrives.
+        let publish = loop {
+            let frame = read_raw_inventory_frame(&mut self.consumer_stream, "status.publish").await;
+            if frame_operation(&frame).as_deref() == Some("catalog.list") {
+                reply_to(&mut self.consumer_stream, &frame, holder_catalog()).await;
+                continue;
+            }
+            break frame;
+        };
+        let publish_body: Value =
+            serde_json::from_slice(&publish.body).expect("status.publish request body");
+        assert_eq!(publish_body["method"], "status.publish");
+        self.revision += 1;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        let last_read_at_ms = read_ago_ms.map(|ago| now_ms - ago);
+        reply_to(
+            &mut self.consumer_stream,
+            &publish,
+            json!({ "result": {
+                "epoch": 7,
+                "accepted_revision": self.revision,
+                "last_read_at_ms": last_read_at_ms,
+            } }),
+        )
+        .await;
+        // Let the module record the ack before the next tool call reads it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn holder_catalog() -> Value {
+    json!({
+        "op": "catalog.list",
+        "generation": 7,
+        "modules": [{
+            "module_id": "prefrontal-core",
+            "roles": [{
+                "role": "management_surface",
+                "operations": [{ "name": "status.line", "kind": "query" }],
+                "config_schema": { "type": "object" },
+                "observability": [],
+                "identity_scope": ["project"],
+            }],
+            "control_ops": [],
+        }],
+        "subc_ops": ["catalog.list", "route.open"],
+    })
+}
+
+async fn reply_to(stream: &mut tokio::net::TcpStream, request: &Frame, body: Value) {
+    send_frame(
+        stream,
+        Frame::build_with_version(
+            request.header.ver,
+            FrameType::Response,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&body).expect("reply body"),
+        )
+        .expect("reply frame"),
+    )
+    .await;
+}
+
+/// Hello plus one bound OpenCode route on `root1`, as a supervised module sees it.
+async fn open_status_bar_module(input: &FakeDaemonInput) -> tokio::net::TcpStream {
+    let (mut stream, _) = input.listener.accept().await.expect("accept aft client");
+    authenticate_server(
+        &mut stream,
+        &input.key,
+        &input.daemon_id,
+        "subc-test",
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("authenticate aft client");
+    let hello = read_raw_inventory_frame(&mut stream, "ModuleHello").await;
+    assert_eq!(hello.header.ty, FrameType::Hello);
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: Vec::new(),
+                subc_capabilities: Vec::new(),
+                storage: None,
+            })
+            .expect("hello ack body"),
+        )
+        .expect("hello ack frame"),
+    )
+    .await;
+    send_route_bind(&mut stream, 1, 10, &input.root1).await;
+    loop {
+        let frame = read_raw_inventory_frame(&mut stream, "RouteBindAck").await;
+        if frame.header.ty == FrameType::Response
+            && frame.header.channel == 0
+            && frame.header.corr == 10
+        {
+            break;
+        }
+    }
+    stream
+}
+
+/// Run one tool call that sets Tier-2 dead-code to `dead_code` and return the
+/// text the agent receives. The first-party plugin reads `structuredContent.text`
+/// and a generic MCP host reads `content[0].text`; both must be the same text.
+async fn agent_text_after_counts(
+    stream: &mut tokio::net::TcpStream,
+    corr: u64,
+    dead_code: u64,
+) -> String {
+    send_tool_call(
+        stream,
+        1,
+        corr,
+        "echo",
+        json!({ "case": "status_bar", "dead_code": dead_code }),
+    )
+    .await;
+    loop {
+        let frame = read_raw_inventory_frame(stream, "tool response").await;
+        if frame.header.ty == FrameType::Response
+            && frame.header.channel == 1
+            && frame.header.corr == corr
+        {
+            let plugin_text = tool_response_json(&frame)["text"]
+                .as_str()
+                .expect("structured text")
+                .to_string();
+            assert_eq!(plugin_text, tool_result_text(&frame));
+            return plugin_text;
+        }
+    }
+}
+
+/// Tier-2 values the `echo` status case sets; diagnostics never reported, so E/W are unknown.
+fn status_bar_for_dead_code(dead_code: u64) -> String {
+    format!("[AFT E? W? | D{dead_code} U12 C13 | T14]")
+}
+
+fn assert_bar(text: &str, dead_code: u64, context: &str) {
+    let expected = status_bar_for_dead_code(dead_code);
+    assert!(
+        text.ends_with(&format!("\n\n{expected}")),
+        "{context}: agent text must end with {expected}: {text:?}"
+    );
+}
+
+fn assert_no_bar(text: &str, context: &str) {
+    assert!(
+        !text.contains("[AFT "),
+        "{context}: agent text must not carry the AFT bar: {text:?}"
+    );
+}
+
+/// The holder's publish cadence is 2.5 s per scope; a later publish (and so a
+/// fresh ack) only happens once that has passed since the previous one.
+const PAST_PUBLISH_CADENCE: Duration = Duration::from_millis(2_700);
+
+async fn drive_live_holder_without_reader_daemon(input: FakeDaemonInput) {
+    let mut stream = open_status_bar_module(&input).await;
+    let text = agent_text_after_counts(&mut stream, 80, 21).await;
+    assert_bar(&text, 21, "before any holder route");
+
+    let mut holder =
+        FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
+    holder.ack_next_publish(None).await;
+
+    // The route to the holder is live, but nothing reads the scope.
+    let text = agent_text_after_counts(&mut stream, 81, 22).await;
+    assert_bar(&text, 22, "live holder route without a reader");
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_recent_reader_daemon(input: FakeDaemonInput) {
+    let mut stream = open_status_bar_module(&input).await;
+    let text = agent_text_after_counts(&mut stream, 80, 21).await;
+    assert_bar(&text, 21, "before any holder route");
+
+    let mut holder =
+        FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
+    holder.ack_next_publish(Some(1_000)).await;
+
+    let text = agent_text_after_counts(&mut stream, 81, 22).await;
+    assert_no_bar(&text, "a reader read the scope 1 s before the ack");
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_reader_goes_stale_daemon(input: FakeDaemonInput) {
+    let mut stream = open_status_bar_module(&input).await;
+    let started = Instant::now();
+    let text = agent_text_after_counts(&mut stream, 80, 21).await;
+    assert_bar(&text, 21, "before any holder route");
+
+    let mut holder =
+        FakeStatusHolder::accept(&input.listener, &input.key, &input.daemon_id, &input.root1).await;
+    holder.ack_next_publish(Some(1_000)).await;
+    let text = agent_text_after_counts(&mut stream, 81, 22).await;
+    assert_no_bar(&text, "fresh reader");
+
+    // The reader stops. The next publish's ack reports the last read as older
+    // than the 10 s window; that call itself was decided on the previous ack.
+    tokio::time::sleep(PAST_PUBLISH_CADENCE.saturating_sub(started.elapsed())).await;
+    let text = agent_text_after_counts(&mut stream, 82, 22).await;
+    assert_no_bar(&text, "decided on the last fresh ack");
+    holder.ack_next_publish(Some(15_000)).await;
+
+    // Counts are unchanged since the hidden bar, yet the agent never saw D22.
+    let text = agent_text_after_counts(&mut stream, 83, 22).await;
+    assert_bar(&text, 22, "reader stale past the window");
     send_connection_goodbye(&mut stream).await;
 }
 

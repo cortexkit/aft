@@ -331,14 +331,14 @@ struct StatusBarCache {
     counts: Option<StatusBarCountValues>,
 }
 
-/// Deduplicates emissions of the legacy numeric status-bar projection. It only
-/// sees the projection derived from truthful values, so missing categories are
-/// not converted to zero in the underlying state.
+/// Deduplicates the agent-facing status bar so it appears in tool-result text
+/// only when a value changes. It compares the omission-preserving values, so a
+/// category arriving (`?` becoming a number) counts as a change.
 #[derive(Debug, Default)]
-struct LegacyStatusBarEmission(RwLock<Option<StatusBarCounts>>);
+struct StatusBarEmission(RwLock<Option<StatusBarCountValues>>);
 
-impl LegacyStatusBarEmission {
-    fn should_emit(&self, counts: &StatusBarCounts) -> bool {
+impl StatusBarEmission {
+    fn should_emit(&self, counts: &StatusBarCountValues) -> bool {
         let mut last = self
             .0
             .write()
@@ -2413,7 +2413,7 @@ pub struct AppContext {
     fleet_status_client: RwLock<Option<crate::fleet_status::FleetStatusClient>>,
     /// Temporary state used to avoid repeatedly emitting the legacy status-bar
     /// response fields. It is no longer needed once those fields are removed.
-    status_bar_last_emitted: LegacyStatusBarEmission,
+    status_bar_last_emitted: StatusBarEmission,
     /// The omission-preserving source of truth. Legacy projections never enter
     /// this cache, so a cache hit cannot recreate an absent category as zero.
     status_bar_cached: RwLock<StatusBarCache>,
@@ -2865,7 +2865,7 @@ impl AppContext {
             progress_sender: Arc::clone(&progress_sender),
             status_emitter,
             fleet_status_client: RwLock::new(None),
-            status_bar_last_emitted: LegacyStatusBarEmission::default(),
+            status_bar_last_emitted: StatusBarEmission::default(),
             status_bar_cached: RwLock::new(StatusBarCache::default()),
             alert_state: parking_lot::Mutex::new(AlertDeltaState::default()),
             repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
@@ -3234,9 +3234,11 @@ impl AppContext {
         self.try_health_summary().into_snapshot(project_root)
     }
 
-    /// Deduplicates emissions of the legacy status-bar response section. This
-    /// compatibility method is no longer needed when responses omit that section.
-    pub fn should_emit_status_bar(&self, counts: &StatusBarCounts) -> bool {
+    /// Records `counts` as the last bar shown to the agent and reports whether
+    /// it differs from the previous one. Call only when the bar is about to be
+    /// rendered into agent-visible text: a call that does not render would
+    /// swallow the change.
+    pub fn should_emit_status_bar(&self, counts: &StatusBarCountValues) -> bool {
         self.status_bar_last_emitted.should_emit(counts)
     }
 

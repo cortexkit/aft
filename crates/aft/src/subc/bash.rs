@@ -144,14 +144,19 @@ fn finalized_bash_result(
     format_context: &crate::subc_format::FormatContext,
     allow_bg_completions: bool,
 ) -> ToolCallResult {
-    crate::response_finalize::finalize_response_with_bg_completions(
+    // The bash formatter never renders `bg_completions`, so formatting before finalization
+    // yields the same text and lets the finalizer append the status bar to it.
+    let mut text =
+        crate::subc_format::format_response_with_context("bash", &response, format_context);
+    crate::response_finalize::finalize_tool_response(
         &mut response,
+        &mut text,
         ctx,
         session_id,
         "bash",
         allow_bg_completions,
     );
-    bash_result_from_response(response, format_context)
+    ToolCallResult { text, response }
 }
 
 fn bash_result_from_response(

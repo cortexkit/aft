@@ -5,6 +5,8 @@ pub mod repeat_breaker;
 
 use std::path::Path;
 
+use serde_json::Value;
+
 use crate::context::AppContext;
 use crate::protocol::Response;
 
@@ -76,8 +78,9 @@ pub fn finalize_response(
     finalize_response_with_bg_completions(response, ctx, session_id, attach_command, true);
 }
 
-/// Compatibility finalization for direct protocol responses without explicit dispatch-root
-/// provenance. Agent-visible responses use [`finalize_response_for_dispatch_root`].
+/// Finalization for direct protocol responses (the standalone NDJSON path). A standalone
+/// `tool_call` response carries its agent-visible text in `data.text`, so the status bar is
+/// appended there; a response without text has nothing the agent reads and gets no bar.
 pub fn finalize_response_with_bg_completions(
     response: &mut Response,
     ctx: &AppContext,
@@ -88,16 +91,43 @@ pub fn finalize_response_with_bg_completions(
     if allow_bg_completions {
         attach_bg_completions(response, ctx, session_id, attach_command);
     }
-    let plane_live = publish_fleet_status(response, ctx, session_id);
-
-    // The pre-tool-call protocol has no dispatch-root provenance or agent-visible text. Keep its
-    // legacy envelope seam isolated from terminal agent responses while older direct fixtures
-    // migrate to explicit-root finalization.
-    if response.data.get("text").is_none()
-        && !alert_render::is_excluded_finalization_command(attach_command)
-    {
-        attach_status_bar_after_publish(response, ctx, plane_live);
+    let publish = publish_fleet_status(response, ctx, session_id);
+    if !response.data.get("text").is_some_and(Value::is_string) {
+        return;
     }
+    let Some(line) = status_bar_line(ctx, publish, attach_command) else {
+        return;
+    };
+    if let Some(Value::String(text)) = response.data.get_mut("text") {
+        append_trailing_line(text, &line);
+    }
+}
+
+/// Finalization for a tool result whose agent-visible text is held apart from the response
+/// (the subc daemon path). Appends the status bar to `text`, the same line the standalone
+/// path appends to `data.text`.
+pub fn finalize_tool_response(
+    response: &mut Response,
+    text: &mut String,
+    ctx: &AppContext,
+    session_id: &str,
+    attach_command: &str,
+    allow_bg_completions: bool,
+) {
+    if allow_bg_completions {
+        attach_bg_completions(response, ctx, session_id, attach_command);
+    }
+    let publish = publish_fleet_status(response, ctx, session_id);
+    if let Some(line) = status_bar_line(ctx, publish, attach_command) {
+        append_trailing_line(text, &line);
+    }
+}
+
+fn append_trailing_line(text: &mut String, line: &str) {
+    if !text.is_empty() {
+        text.push_str(if text.ends_with('\n') { "\n" } else { "\n\n" });
+    }
+    text.push_str(line);
 }
 
 /// Finalize an agent-visible response using the root selected by dispatch. The finalizer owns
@@ -341,98 +371,129 @@ fn aft_status_segment(counts: &crate::context::StatusBarCounts) -> String {
     )
 }
 
-fn holder_owns_status_bar(plane_live: bool, harness: Option<&crate::harness::Harness>) -> bool {
-    plane_live && matches!(harness, Some(crate::harness::Harness::Opencode))
+/// Renders the agent-facing bar from the omission-preserving values. A category with no
+/// trustworthy value yet shows `?` (as the OpenCode footer does) rather than a clean `0`.
+fn agent_status_bar(values: &crate::context::StatusBarCountValues) -> String {
+    fn count(value: Option<usize>) -> String {
+        value.map_or_else(|| "?".to_string(), |value| value.to_string())
+    }
+    let stale_mark = if values.tier2_stale { "~" } else { "" };
+    format!(
+        "[AFT E{} W{} | {}D{} U{} C{} | T{}]",
+        count(values.errors),
+        count(values.warnings),
+        stale_mark,
+        count(values.dead_code),
+        count(values.unused_exports),
+        count(values.duplicates),
+        count(values.todos)
+    )
 }
 
-/// Publish the retained fleet status segment. Agent-facing status-bar envelope insertion is
-/// intentionally absent: reminder rendering below is the only agent response finalizer.
+/// Outcome of offering this response's status to the fleet holder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FleetStatusPublish {
+    /// The response opted out of status (cross-root indexed search), so no bar either.
+    Suppressed,
+    /// `reader_renders` is true only when a host plugin is actually reading this project's
+    /// fleet line for this session's harness, so the composed line replaces AFT's own bar.
+    Offered { reader_renders: bool },
+}
+
+/// Whether the holder's composed line reaches this session's agent. The only renderer of
+/// that line is Prefrontal's status stamper, an OpenCode plugin; a Pi, runner, or MCP
+/// session never sees it even when an OpenCode session reads the same project scope.
+fn fleet_reader_renders_bar(
+    harness: Option<&crate::harness::Harness>,
+    reader_present: bool,
+) -> bool {
+    matches!(harness, Some(crate::harness::Harness::Opencode)) && reader_present
+}
+
+/// Publish the fleet status segment and report whether a fleet reader replaces AFT's bar.
 fn publish_fleet_status(
     response: &mut Response,
     ctx: &AppContext,
     session_id: &str,
-) -> Option<bool> {
-    // Cross-root indexed searches currently suppress fleet status. Remove the private marker
-    // before publishing the response so it cannot appear in a response envelope.
+) -> FleetStatusPublish {
+    // Cross-root indexed searches suppress status. Remove the private marker so it cannot
+    // appear in a response envelope.
     if response
         .data
         .as_object_mut()
         .and_then(|data| data.remove("_aft_suppress_status_bar"))
         .is_some()
     {
+        return FleetStatusPublish::Suppressed;
+    }
+
+    let Some(client) = ctx.fleet_status_client() else {
+        return FleetStatusPublish::Offered {
+            reader_renders: false,
+        };
+    };
+    let config = ctx.config();
+    let Some(project_root) = config.project_root.as_deref() else {
+        return FleetStatusPublish::Offered {
+            reader_renders: false,
+        };
+    };
+    let harness = ctx.harness_opt();
+    let harness_label = harness
+        .as_ref()
+        .map(crate::harness::Harness::wire_label)
+        .unwrap_or_else(|| "unknown".to_string());
+    // The holder composes complete segments only: a partial set is published as quiet text.
+    let aft_text = ctx
+        .status_bar_counts()
+        .as_ref()
+        .map(aft_status_segment)
+        .unwrap_or_default();
+    client.publish(project_root, &harness_label, session_id, &aft_text);
+    FleetStatusPublish::Offered {
+        reader_renders: fleet_reader_renders_bar(
+            harness.as_ref(),
+            client.reader_present(project_root),
+        ),
+    }
+}
+
+/// The status-bar line to append to agent-visible text, if any. Emitted only when the values
+/// changed since the last bar the agent was shown, so an unchanged bar costs no tokens and
+/// keeps prompt caches stable. While a fleet reader renders the bar the change gate is left
+/// untouched, so the bar reappears as soon as that reader goes away.
+fn status_bar_line(
+    ctx: &AppContext,
+    publish: FleetStatusPublish,
+    attach_command: &str,
+) -> Option<String> {
+    if alert_render::is_excluded_finalization_command(attach_command) {
         return None;
     }
-
-    let local_counts = ctx.status_bar_counts();
-    let harness = ctx.harness_opt();
-    let plane_live = ctx.fleet_status_client().is_some_and(|client| {
-        let config = ctx.config();
-        let Some(project_root) = config.project_root.as_deref() else {
-            return false;
-        };
-        let harness_label = harness
-            .as_ref()
-            .map(crate::harness::Harness::wire_label)
-            .unwrap_or_else(|| "unknown".to_string());
-        let aft_text = local_counts
-            .as_ref()
-            .map(aft_status_segment)
-            .unwrap_or_default();
-        client.publish(project_root, &harness_label, session_id, &aft_text)
-    });
-    Some(plane_live)
-}
-
-/// Retired envelope helper retained for direct legacy test fixtures. Production finalization
-/// calls `publish_fleet_status` and cannot emit this field.
-pub fn attach_status_bar(
-    response: &mut Response,
-    ctx: &AppContext,
-    session_id: &str,
-    command: &str,
-) {
-    if alert_render::is_excluded_finalization_command(command) {
-        return;
+    match publish {
+        FleetStatusPublish::Suppressed
+        | FleetStatusPublish::Offered {
+            reader_renders: true,
+        } => return None,
+        FleetStatusPublish::Offered {
+            reader_renders: false,
+        } => {}
     }
-    let plane_live = publish_fleet_status(response, ctx, session_id);
-    attach_status_bar_after_publish(response, ctx, plane_live);
-}
-
-fn attach_status_bar_after_publish(
-    response: &mut Response,
-    ctx: &AppContext,
-    plane_live: Option<bool>,
-) {
-    let Some(plane_live) = plane_live else {
-        return;
-    };
-    let harness = ctx.harness_opt();
-    if holder_owns_status_bar(plane_live, harness.as_ref()) {
-        return;
+    let values = ctx.status_bar_count_values();
+    let nothing_known = [
+        values.errors,
+        values.warnings,
+        values.dead_code,
+        values.unused_exports,
+        values.duplicates,
+        values.todos,
+    ]
+    .iter()
+    .all(Option::is_none);
+    if nothing_known || !ctx.should_emit_status_bar(&values) {
+        return None;
     }
-    let Some(counts) = ctx.status_bar_counts() else {
-        return;
-    };
-    if !ctx.should_emit_status_bar(&counts) {
-        return;
-    }
-    let value = serde_json::json!({
-        "errors": counts.errors,
-        "warnings": counts.warnings,
-        "dead_code": counts.dead_code,
-        "unused_exports": counts.unused_exports,
-        "duplicates": counts.duplicates,
-        "todos": counts.todos,
-        "tier2_stale": counts.tier2_stale,
-    });
-    match response.data.as_object_mut() {
-        Some(data) => {
-            data.insert("status_bar".to_string(), value);
-        }
-        None => {
-            response.data = serde_json::json!({ "status_bar": value });
-        }
-    }
+    Some(agent_status_bar(&values))
 }
 
 #[cfg(test)]
@@ -440,27 +501,105 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        aft_status_segment, finalize_response_with_bg_completions, holder_owns_status_bar,
-        PendingResponse, PendingResponses,
+        aft_status_segment, agent_status_bar, finalize_response_with_bg_completions,
+        finalize_tool_response, fleet_reader_renders_bar, PendingResponse, PendingResponses,
     };
     use crate::config::Config;
-    use crate::context::{AppContext, StatusBarCounts};
+    use crate::context::{AppContext, StatusBarCountValues, StatusBarCounts};
     use crate::fleet_status::FleetStatusClient;
     use crate::harness::Harness;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::Response;
 
     #[test]
-    fn live_holder_retires_only_opencode_response_bars() {
-        assert_eq!(
-            (
-                holder_owns_status_bar(true, Some(&Harness::Opencode)),
-                holder_owns_status_bar(true, Some(&Harness::Runner)),
-            ),
-            (true, false)
+    fn only_an_opencode_session_can_have_its_bar_rendered_by_a_fleet_reader() {
+        assert!(fleet_reader_renders_bar(Some(&Harness::Opencode), true));
+        assert!(!fleet_reader_renders_bar(Some(&Harness::Opencode), false));
+        for harness in [Harness::Pi, Harness::Runner] {
+            assert!(!fleet_reader_renders_bar(Some(&harness), true));
+        }
+        assert!(!fleet_reader_renders_bar(None, true));
+    }
+
+    #[test]
+    fn agent_bar_marks_missing_categories_instead_of_zeroing_them() {
+        let values = StatusBarCountValues {
+            errors: None,
+            warnings: None,
+            dead_code: Some(21),
+            unused_exports: Some(0),
+            duplicates: Some(13),
+            todos: None,
+            tier2_stale: true,
+        };
+        assert_eq!(agent_status_bar(&values), "[AFT E? W? | ~D21 U0 C13 | T?]");
+    }
+
+    fn standalone_ctx() -> AppContext {
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(PathBuf::from("/tmp/project")),
+                ..Config::default()
+            },
         );
-        assert!(!holder_owns_status_bar(true, Some(&Harness::Pi)));
-        assert!(!holder_owns_status_bar(false, Some(&Harness::Opencode)));
+        ctx.set_harness(Harness::Opencode);
+        ctx
+    }
+
+    #[test]
+    fn bar_is_appended_to_text_only_on_change_and_never_to_textless_responses() {
+        let ctx = standalone_ctx();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+
+        let mut textless = Response::success("plumbing", serde_json::json!({}));
+        finalize_response_with_bg_completions(&mut textless, &ctx, "s", "read", false);
+        assert_eq!(
+            textless.data,
+            serde_json::json!({}),
+            "no text, no bar, no sidecar"
+        );
+
+        let mut first = String::from("file contents");
+        let mut response = Response::success("first", serde_json::json!({}));
+        finalize_tool_response(&mut response, &mut first, &ctx, "s", "read", false);
+        assert_eq!(first, "file contents\n\n[AFT E? W? | D1 U2 C3 | T4]");
+
+        let mut unchanged = String::from("file contents");
+        finalize_tool_response(&mut response, &mut unchanged, &ctx, "s", "read", false);
+        assert_eq!(unchanged, "file contents");
+
+        let mut excluded = String::from("drained");
+        ctx.update_status_bar_tier2(Some(9), Some(2), Some(3), Some(4), false);
+        finalize_tool_response(
+            &mut response,
+            &mut excluded,
+            &ctx,
+            "s",
+            "bash_drain_completions",
+            false,
+        );
+        assert_eq!(excluded, "drained", "plumbing never consumes the change");
+
+        let mut standalone =
+            Response::success("standalone", serde_json::json!({ "text": "listing\n" }));
+        finalize_response_with_bg_completions(&mut standalone, &ctx, "s", "glob", false);
+        assert_eq!(
+            standalone.data["text"],
+            "listing\n\n[AFT E? W? | D9 U2 C3 | T4]"
+        );
+    }
+
+    #[test]
+    fn cross_root_marker_suppresses_the_bar_and_is_stripped() {
+        let ctx = standalone_ctx();
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        let mut response = Response::success(
+            "search",
+            serde_json::json!({ "text": "hits", "_aft_suppress_status_bar": true }),
+        );
+        finalize_response_with_bg_completions(&mut response, &ctx, "s", "aft_search", false);
+        assert_eq!(response.data, serde_json::json!({ "text": "hits" }));
     }
 
     #[test]

@@ -129,6 +129,7 @@ mod semantic_disk_test;
 mod staging_cleanup_test;
 mod standalone_search_deferred_test;
 mod state_commands_test;
+mod status_bar_text_test;
 mod status_compression_test;
 mod status_disk_scope_test;
 mod status_memory_test;

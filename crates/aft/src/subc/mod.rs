@@ -6145,9 +6145,10 @@ async fn handle_tool_call(
                             }
                             DispatchOutcome::Immediate(response) => {
                                 phase_trace.mark_execute_done();
-                                let finalizer = |response: &mut Response| {
-                                    crate::response_finalize::finalize_response_with_bg_completions(
+                                let finalizer = |response: &mut Response, text: &mut String| {
+                                    crate::response_finalize::finalize_tool_response(
                                         response,
+                                        text,
                                         ctx,
                                         &identity_for_run.session,
                                         &bare_name_for_run,
@@ -6337,9 +6338,10 @@ async fn handle_tool_call(
         phase_trace.mark_job_admitted();
         log_ctx::with_session(Some(identity_for_run.session.clone()), || {
             let run = || {
-                let finalizer = |response: &mut Response| {
-                    crate::response_finalize::finalize_response_with_bg_completions(
+                let finalizer = |response: &mut Response, text: &mut String| {
+                    crate::response_finalize::finalize_tool_response(
                         response,
+                        text,
                         ctx,
                         &identity_for_run.session,
                         &bare_name,
@@ -6625,9 +6627,10 @@ async fn deliver_resolved_subc_response(
         return Ok(());
     };
     entry.phase_trace.mark_execute_done();
-    let finalizer = |response: &mut Response| {
-        crate::response_finalize::finalize_response_with_bg_completions(
+    let finalizer = |response: &mut Response, text: &mut String| {
+        crate::response_finalize::finalize_tool_response(
             response,
+            text,
             &ctx,
             &entry.session_id,
             &entry.bare_name,
