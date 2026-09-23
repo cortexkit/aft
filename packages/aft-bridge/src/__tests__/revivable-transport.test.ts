@@ -107,6 +107,39 @@ describe("RevivableTransportPool", () => {
     expect(revivedClient.closed).toBe(1);
   });
 
+  test("reconfigure during or after shutdown records overrides without reviving the pool", async () => {
+    let created = 0;
+    const revivedOverrides: Array<[string, unknown]> = [];
+    const owner = new RevivableTransportPool(makeSubcPool(new FakeClient()), async () => {
+      created += 1;
+      const pool = makeSubcPool(new FakeClient());
+      const setOverride = pool.setConfigureOverride.bind(pool);
+      pool.setConfigureOverride = (key: string, value: unknown) => {
+        revivedOverrides.push([key, value]);
+        setOverride(key, value);
+      };
+      return pool;
+    });
+    const transport = owner.getBridge(TEST_PROJECT_ROOT);
+
+    // A reconfigure issued while the host's shutdown is still settling (the
+    // shape of an aborted background install finishing mid-shutdown) must not
+    // install a live replacement pool behind the completed shutdown.
+    const shuttingDown = owner.shutdown("host quit");
+    await owner.reconfigure(TEST_PROJECT_ROOT, { lsp_paths_extra: ["/cache/a"] });
+    await shuttingDown;
+    await owner.reconfigure(TEST_PROJECT_ROOT, { lsp_paths_extra: ["/cache/b"] });
+
+    expect(created).toBe(0);
+    expect(owner.isShutdown()).toBe(true);
+
+    // Real demand still revives, and the replacement carries the latest paths.
+    await transport.toolCall("after-shutdown", "read", {});
+    expect(created).toBe(1);
+    expect(revivedOverrides).toContainEqual(["lsp_paths_extra", ["/cache/b"]]);
+    await owner.shutdown();
+  });
+
   test("captures edit-slot registration once for subc-backed plugin pools", () => {
     const initialPool = makeSubcPool(new FakeClient());
     const owner = new RevivableTransportPool(initialPool, async () =>

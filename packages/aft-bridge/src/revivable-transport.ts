@@ -99,6 +99,18 @@ export class RevivableTransportPool implements AftTransportPool {
   }
 
   async reconfigure(projectRoot: string, overrides: Record<string, unknown>): Promise<void> {
+    if (this.activePool.isShutdown() && !this.revival) {
+      // Reconfigure only updates live bridges, and a shut-down pool has none.
+      // Reviving here would leave a live pool behind after the host's shutdown
+      // hook finished: background work that settles during shutdown (an LSP
+      // install aborted by that hook, for example) then keeps an unowned pool
+      // around and a headless host never exits. Record the overrides instead;
+      // a later revival applies them to the replacement pool.
+      for (const [key, value] of Object.entries(overrides)) {
+        this.setConfigureOverride(key, value);
+      }
+      return;
+    }
     const pool = await this.ensureActivePool();
     const runtimeOverrides: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(overrides)) {
