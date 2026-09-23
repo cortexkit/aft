@@ -227,13 +227,20 @@ pub(super) fn build_manifest() -> ModuleManifest {
     // produce observable file writes. Unfenceable stays unused here because AFT
     // schedules bash internally and releases the Mutating worker after spawn.
     //
-    // The builder leaves `ready`, `capabilities`, `self_signals` and
-    // `provenance` unset, so none of them reaches the wire. The empty
+    // AFT registers not-ready: the daemon answers new route opens with
+    // `module_warming` until `subc::readiness` flips it with a
+    // `catalog.update { ready: true }`, which it always does within a fixed
+    // budget. A daemon that predates the field ignores it and treats the
+    // module as ready, which is the behaviour before readiness existed.
+    //
+    // The builder leaves `capabilities`, `self_signals` and `provenance`
+    // unset, so none of them reaches the wire. The empty
     // `consumes` list is omitted by the protocol crate, which a subc daemon
     // older than 0.17.20 rejects; that daemon version is the floor.
     ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
+        .ready(false)
         .provides(vec![
             ProviderRole::ToolProvider {
                 tools: vec![
@@ -651,6 +658,10 @@ mod tests {
             management.insert("concurrency".to_string(), json!("module_managed")),
             None
         );
+        // AFT registers not-ready and flips itself ready after warm-up (see
+        // `subc::readiness`); this is the only field readiness adds.
+        let top = expected.as_object_mut().expect("manifest object");
+        assert_eq!(top.insert("ready".to_string(), json!(false)), None);
         assert_eq!(actual, expected);
     }
 
