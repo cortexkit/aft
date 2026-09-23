@@ -750,7 +750,7 @@ fn prepare_file_sink(
     logs_dir: &Path,
     file_path: &Path,
 ) -> io::Result<(RotatingFile, SweepSummary)> {
-    fs::create_dir_all(logs_dir)?;
+    create_private_log_dir(logs_dir)?;
     let summary = sweep_logs(
         logs_dir,
         SystemTime::now(),
@@ -877,7 +877,16 @@ impl RotatingFile {
         generations: usize,
         check_every: u64,
     ) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_private_log_file(&path, false)?;
+        #[cfg(unix)]
+        {
+            // Files from before logs were private keep their old mode across
+            // opens and renames, so tighten the live file and its backups.
+            tighten_if_owned(&path, LOG_FILE_MODE);
+            for generation in 1..=generations {
+                tighten_if_owned(&rotated_path(&path, generation), LOG_FILE_MODE);
+            }
+        }
         let size = file.metadata()?.len();
         let mut sink = Self {
             path,
@@ -940,11 +949,7 @@ impl RotatingFile {
         } else {
             remove_file_if_present(&self.path)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
+        let file = open_private_log_file(&self.path, true)?;
         self.writer = Some(BufWriter::new(file));
         self.size = 0;
         self.writes_since_check = 0;
@@ -956,6 +961,73 @@ fn rotated_path(base: &Path, generation: usize) -> PathBuf {
     let mut path = base.as_os_str().to_os_string();
     path.push(format!(".{generation}"));
     PathBuf::from(path)
+}
+
+/// Log lines can quote paths, commands and server output, so on Unix the log
+/// directory is owner-only. Windows keeps its inherited ACLs; AFT has no ACL
+/// helper to tighten them with.
+#[cfg(unix)]
+const LOG_DIR_MODE: u32 = 0o700;
+/// Owner read/write only for every log file AFT creates.
+#[cfg(unix)]
+const LOG_FILE_MODE: u32 = 0o600;
+
+/// Create the log directory owner-only, and tighten one left over from before
+/// logs were private. Parent directories keep their default mode.
+fn create_private_log_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if let Some(parent) = dir.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::DirBuilder::new().mode(LOG_DIR_MODE).create(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+        tighten_if_owned(dir, LOG_DIR_MODE);
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+/// Open a log file for appending (or truncate it, for a fresh generation after
+/// rotation). A newly created file is owner read/write only on Unix.
+fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true);
+    if truncate {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(LOG_FILE_MODE);
+    }
+    options.open(path)
+}
+
+/// Drop group/other permission bits from `path` when the current user owns it.
+/// Best effort: a path owned by someone else (a shared storage root) or one
+/// that cannot be changed is left as it is rather than failing log setup.
+#[cfg(unix)]
+fn tighten_if_owned(path: &Path, mode: u32) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if metadata.uid() != euid || metadata.mode() & 0o777 & !mode == 0 {
+        return;
+    }
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
 }
 
 fn remove_file_if_present(path: &Path) -> io::Result<()> {
@@ -1704,6 +1776,51 @@ mod tests {
         );
         assert!(!on_disk.contains(token));
         assert!(!on_disk.contains("pw123"));
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_log_dir_and_file_are_owner_only() {
+        let temp = TempDir::new().unwrap();
+        let logs_dir = temp.path().join("storage").join("logs");
+        let path = logs_dir.join("aft-4242.log");
+        let (mut sink, _) = prepare_file_sink(&logs_dir, &path).unwrap();
+        sink.write_batch(&line("hello")).unwrap();
+
+        assert_eq!(mode_of(&logs_dir), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
+        // A rotated-in generation is created owner-only too.
+        sink.rotate().unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&rotated_path(&path, 1)), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_world_readable_log_dir_and_files_are_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let logs_dir = temp.path().join("logs");
+        fs::create_dir(&logs_dir).unwrap();
+        fs::set_permissions(&logs_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = logs_dir.join("aft-4242.log");
+        for file in [path.clone(), rotated_path(&path, 1)] {
+            fs::write(&file, "old\n").unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let _ = prepare_file_sink(&logs_dir, &path).unwrap();
+
+        assert_eq!(mode_of(&logs_dir), 0o700);
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(mode_of(&rotated_path(&path, 1)), 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old\n");
     }
 
     #[test]
