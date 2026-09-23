@@ -1317,6 +1317,15 @@ fn quiesce_unbound_root(
     // re-verification plus a full callgraph rebuild on every restart. The
     // expensive teardown (watcher stop + gap invalidation) belongs to the
     // idle-TTL reaper and the root-deleted path.
+    //
+    // In-flight cold builds are also left running here. The long ones (the
+    // semantic embed loop and callgraph extraction) poll
+    // `SubcLifecycleAdmission::unbound_past_grace` and stop at their next
+    // batch or slice once the root has stayed unbound past
+    // `UNBOUND_BUILD_ABANDON_GRACE`, so a quick rebind cancels nothing. The
+    // search-index post-configure load is deliberately excluded: it is bounded
+    // local work (about a minute on a very large repository), has no
+    // cancellation hook, and is allowed to finish and persist.
     let discarded = ctx
         .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
         .unwrap_or(0);
