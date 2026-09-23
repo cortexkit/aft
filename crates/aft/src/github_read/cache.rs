@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
-use crate::config::GhReadConfig;
+use crate::config::GithubConfig;
 use crate::db::github_read_cache::{
     invalidate_github_read_cache_resource, lookup_github_read_cache_entry,
     upsert_github_read_cache_entry, GithubReadCacheEntry, GithubReadCacheKey,
@@ -291,7 +291,7 @@ impl GithubReadEngine {
     /// Begin a resource-string read with strict parser validation.
     pub fn start_resource(
         &self,
-        gh_read: &GhReadConfig,
+        github: &GithubConfig,
         resource: &str,
         working_directory: impl Into<PathBuf>,
         effective_authentication_identity: impl Into<String>,
@@ -299,7 +299,7 @@ impl GithubReadEngine {
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
         self.start_resource_with_view(
-            gh_read,
+            github,
             resource,
             working_directory,
             effective_authentication_identity,
@@ -313,7 +313,7 @@ impl GithubReadEngine {
     /// and durable fallback behavior as `read`.
     pub fn start_resource_with_view(
         &self,
-        gh_read: &GhReadConfig,
+        github: &GithubConfig,
         resource: &str,
         working_directory: impl Into<PathBuf>,
         effective_authentication_identity: impl Into<String>,
@@ -321,7 +321,7 @@ impl GithubReadEngine {
         selector: GithubReadSelector,
         view: GithubReadView,
     ) -> Result<GithubReadStart, GithubReadError> {
-        self.require_enabled(gh_read)?;
+        self.require_enabled(github)?;
         let request = GithubReadRequest::parse(
             resource,
             working_directory,
@@ -329,27 +329,27 @@ impl GithubReadEngine {
             vision_capability,
         )
         .map_err(|error| GithubReadError::invalid_resource(error.to_string()))?;
-        self.start_with_view(gh_read, request, selector, view)
+        self.start_with_view(github, request, selector, view)
     }
 
     /// Start a read without blocking on GitHub or an image host.
     pub fn start(
         &self,
-        gh_read: &GhReadConfig,
+        github: &GithubConfig,
         request: GithubReadRequest,
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
-        self.start_with_view(gh_read, request, selector, GithubReadView::Document)
+        self.start_with_view(github, request, selector, GithubReadView::Document)
     }
 
     pub fn start_with_view(
         &self,
-        gh_read: &GhReadConfig,
+        github: &GithubConfig,
         request: GithubReadRequest,
         selector: GithubReadSelector,
         view: GithubReadView,
     ) -> Result<GithubReadStart, GithubReadError> {
-        self.require_enabled(gh_read)?;
+        self.require_enabled(github)?;
         let fallback = self.cache_fallback_for_request(&request);
         Ok(self.defer_fetch(request, selector, view, fallback))
     }
@@ -373,8 +373,8 @@ impl GithubReadEngine {
             .map_err(cache_failure)
     }
 
-    fn require_enabled(&self, gh_read: &GhReadConfig) -> Result<(), GithubReadError> {
-        if gh_read.enabled {
+    fn require_enabled(&self, github: &GithubConfig) -> Result<(), GithubReadError> {
+        if github.read {
             Ok(())
         } else {
             Err(GithubReadError::GithubReadDisabled)
@@ -888,8 +888,11 @@ mod tests {
         }
     }
 
-    fn enabled_gh_read() -> GhReadConfig {
-        GhReadConfig { enabled: true }
+    fn enabled_gh_read() -> GithubConfig {
+        GithubConfig {
+            read: true,
+            ..GithubConfig::default()
+        }
     }
 
     fn request(vision_capability: Option<bool>) -> GithubReadRequest {
@@ -917,7 +920,7 @@ mod tests {
         );
 
         let error = match engine.start_resource(
-            &GhReadConfig::default(),
+            &GithubConfig::default(),
             "issue://1",
             "/fixture",
             "identity",
@@ -931,7 +934,7 @@ mod tests {
         assert_eq!(error.code(), "gh_read_disabled");
         assert_eq!(
             error.to_string(),
-            "GitHub reads are disabled; set gh_read.enabled: true in aft.jsonc"
+            "GitHub reads are disabled; set github.read: true in aft.jsonc"
         );
         assert_eq!(fetcher.0.load(Ordering::SeqCst), 0);
     }

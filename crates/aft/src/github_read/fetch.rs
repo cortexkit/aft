@@ -57,7 +57,7 @@ impl fmt::Display for GithubReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GithubReadDisabled => formatter
-                .write_str("GitHub reads are disabled; set gh_read.enabled: true in aft.jsonc"),
+                .write_str("GitHub reads are disabled; set github.read: true in aft.jsonc"),
             Self::InvalidResource(message)
             | Self::InvalidCommentSelector(message)
             | Self::FetchFailed(message)

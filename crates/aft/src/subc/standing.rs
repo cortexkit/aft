@@ -358,9 +358,9 @@ impl StandingActor {
         // This context is subc-owned rather than session-bound. A later
         // RouteBind restores `harness` and replaces this observed snapshot.
         config.harness = None;
-        config.search_index = entry.indexes.contains(&IndexKind::Search);
-        config.semantic_search = entry.indexes.contains(&IndexKind::Semantic);
-        config.callgraph_store = entry.indexes.contains(&IndexKind::Callgraph);
+        config.indexes.trigram = entry.indexes.contains(&IndexKind::Search);
+        config.indexes.semantic = entry.indexes.contains(&IndexKind::Semantic);
+        config.indexes.callgraph = entry.indexes.contains(&IndexKind::Callgraph);
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&self.app), config));
         ctx.set_canonical_cache_root(entry.resolved_target.clone());
         ctx.set_standing_artifact_exempt(true);

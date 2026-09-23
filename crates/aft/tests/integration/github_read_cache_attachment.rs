@@ -17,8 +17,11 @@ use aft::github_read::{
 use parking_lot::Mutex;
 use url::Url;
 
-fn enabled_gh_read() -> aft::config::GhReadConfig {
-    aft::config::GhReadConfig { enabled: true }
+fn enabled_gh_read() -> aft::config::GithubConfig {
+    aft::config::GithubConfig {
+        read: true,
+        ..aft::config::GithubConfig::default()
+    }
 }
 
 const FIXTURE_DIRECTORY: &str = "tests/fixtures/github_read_cache_attachment";

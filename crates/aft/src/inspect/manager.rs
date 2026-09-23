@@ -878,7 +878,7 @@ impl InspectManager {
     /// a store that opens but still has `backend_file_state='stale'` rows is
     /// not ready, because `project_dead_code_snapshot` refuses those rows.
     pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
-        if !snapshot.config.callgraph_store {
+        if !snapshot.config.indexes.callgraph {
             return false;
         }
         if snapshot.config.views.enabled {
@@ -3896,7 +3896,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
     projection_cache: Option<&InspectManager>,
 ) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
     let started = Instant::now();
-    if !job.config.callgraph_store {
+    if !job.config.indexes.callgraph {
         crate::slog_info!(
             "tier2 dead_code: callgraph store disabled; reporting callgraph_unavailable"
         );
@@ -5950,7 +5950,11 @@ mod guard_tests {
             inspect_dir: inspect_dir.to_path_buf(),
             config: Arc::new(Config {
                 project_root: Some(root.to_path_buf()),
-                callgraph_store,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: callgraph_store,
+                },
                 ..Config::default()
             }),
             symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
@@ -6043,7 +6047,11 @@ mod guard_tests {
             inspect_dir,
             Arc::new(Config {
                 project_root: Some(root.clone()),
-                callgraph_store: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
                 ..Config::default()
             }),
             Arc::new(RwLock::new(SymbolCache::new())),
@@ -6154,7 +6162,11 @@ mod guard_tests {
             inspect_dir,
             Arc::new(Config {
                 project_root: Some(root.clone()),
-                callgraph_store: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
                 ..Config::default()
             }),
             Arc::new(RwLock::new(SymbolCache::new())),
@@ -7301,7 +7313,11 @@ export function bannerUnused() {}
 
         let config = Arc::new(crate::config::Config {
             project_root: Some(root.clone()),
-            callgraph_store: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..crate::config::Config::default()
         });
         let symbol_cache = Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new()));
@@ -7651,7 +7667,11 @@ mod dead_code_projection_tests {
 
         let config = Arc::new(Config {
             project_root: Some(root.clone()),
-            callgraph_store: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         });
         let symbol_cache = Arc::new(RwLock::new(SymbolCache::new()));

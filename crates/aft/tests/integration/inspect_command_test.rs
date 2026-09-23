@@ -783,7 +783,11 @@ fn tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectSnapshot {
 fn dead_code_tier2_snapshot(project_root: &Path, inspect_dir: &Path) -> InspectSnapshot {
     let config = Config {
         project_root: Some(project_root.to_path_buf()),
-        callgraph_store: true,
+        indexes: aft::config::IndexesConfig {
+            trigram: false,
+            semantic: false,
+            callgraph: true,
+        },
         ..Config::default()
     };
     InspectSnapshot::new(

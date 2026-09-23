@@ -1930,7 +1930,7 @@ fn auto_child_hook_commits_the_cached_bound_identity_exactly_once_on_amend() {
     let binary = aft_binary();
     test_helpers::warm_executable(&binary, &["--version"]);
     let mut config = Config::default();
-    config.gh_shim.enabled = false;
+    config.github.shim = false;
     config.gh_shim.binary_path = Some(binary);
     config.git.co_author = "auto".to_string();
     let inherited_path = std::env::var_os("PATH").expect("test PATH");

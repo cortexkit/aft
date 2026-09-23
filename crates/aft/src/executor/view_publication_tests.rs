@@ -105,9 +105,11 @@ impl Fixture {
         let mut config = Config {
             project_root: Some(root_path.clone()),
             storage_dir: Some(storage.path().to_owned()),
-            semantic_search: false,
-            search_index: false,
-            callgraph_store: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         };
         config.views.enabled = true;

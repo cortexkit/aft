@@ -97,7 +97,7 @@ impl AppContext {
                 }
                 Some(_) => serde_json::json!({ "status": "building" }),
                 None => {
-                    let status = if config.search_index {
+                    let status = if config.indexes.trigram {
                         "loading"
                     } else {
                         "disabled"
@@ -401,9 +401,9 @@ impl AppContext {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),
                 "restrict_to_project_root": config.restrict_to_project_root,
-                "search_index": config.search_index,
-                "semantic_search": config.semantic_search,
-                "callgraph_store": config.callgraph_store,
+                "search_index": config.indexes.trigram,
+                "semantic_search": config.indexes.semantic,
+                "callgraph_store": config.indexes.callgraph,
                 "backup": backups_enabled,
             },
             "search_index": search_index_info,

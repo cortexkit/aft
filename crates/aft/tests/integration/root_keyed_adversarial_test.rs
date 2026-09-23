@@ -516,7 +516,11 @@ fn root_keyed_context(root: &Path, storage: &Path) -> AppContext {
         Config {
             project_root: Some(root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );

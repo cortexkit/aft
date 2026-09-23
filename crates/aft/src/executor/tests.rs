@@ -1776,7 +1776,11 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
         Config {
             project_root: Some(root_dir.path().to_path_buf()),
             storage_dir: Some(storage),
-            callgraph_store: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     ));

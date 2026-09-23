@@ -335,34 +335,20 @@ impl Default for BackupConfig {
     }
 }
 
-/// `gh` routing shim operator hard-off.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Binary configuration for the managed `gh` shim. Whether the shim is
+/// interposed at all is `github.shim`; this block carries no enable state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct GhShimConfig {
-    /// When false, the `gh` routing shim passes bytes through before any
-    /// daemon or catalog probe, so a disabled shim produces no subc traffic.
-    /// Default true. This is an operator hard-off for fleet rollout safety.
-    pub enabled: bool,
     /// Optional deployed or development AFT image used by managed shim entries.
     /// The running executable is used when this user-tier field is absent.
     pub binary_path: Option<PathBuf>,
-}
-
-impl Default for GhShimConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            binary_path: None,
-        }
-    }
 }
 
 /// GitHub integration gates resolved from the user-only `github` block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GithubConfig {
-    /// Master switch. When false, every GitHub integration is disabled.
-    pub enabled: bool,
     /// Whether AFT interposes the governed `gh` shim in agent child PATHs.
     pub shim: bool,
     /// Whether structured `issue://` and `pr://` reads are enabled.
@@ -374,7 +360,6 @@ pub struct GithubConfig {
 impl Default for GithubConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             shim: true,
             read: false,
             write: false,
@@ -382,16 +367,26 @@ impl Default for GithubConfig {
     }
 }
 
-/// Effective structured GitHub read gate retained for the read engine API.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Which background indexes are switched on. Each defaults on and builds
+/// independently of which tools are registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct GhReadConfig {
-    pub enabled: bool,
+pub struct IndexesConfig {
+    /// Trigram index used by indexed grep/glob and the lexical search lane.
+    pub trigram: bool,
+    /// Semantic (embedding) index used by the semantic search lane.
+    pub semantic: bool,
+    /// Persisted call-graph store used by callgraph queries and enrichment.
+    pub callgraph: bool,
 }
 
-impl Default for GhReadConfig {
+impl Default for IndexesConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            trigram: true,
+            semantic: true,
+            callgraph: true,
+        }
     }
 }
 
@@ -487,6 +482,11 @@ pub struct SandboxConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BashConfig {
+    /// Runtime gate for every bash-execution operation, including the
+    /// background companions. When false those operations report
+    /// `bash_disabled`; registration is decided by `disabled_tools` alone.
+    #[serde(default = "default_bash_enabled")]
+    pub enabled: bool,
     /// Permit plugin-side break-glass execution when its AFT transport is unavailable.
     /// Rust accepts this for cross-language config parity but never acts on it.
     pub host_fallback: bool,
@@ -508,6 +508,7 @@ pub struct BashConfig {
 impl Default for BashConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
@@ -551,22 +552,17 @@ pub struct Config {
     /// Whether to restrict file operations to within `project_root` (default: false).
     /// When true, write-capable commands reject paths outside the project root.
     pub restrict_to_project_root: bool,
-    /// Enable the trigram search index (default: false).
-    pub search_index: bool,
+    /// Background index switches (all default on).
+    pub indexes: IndexesConfig,
     /// User-tier standing roots. Empty by default, so normal session indexing is unchanged.
     pub index: IndexConfig,
-    /// Enable semantic search (default: false).
-    pub semantic_search: bool,
     /// Content-addressed index view assembly. Disabled by default.
     pub views: ViewsConfig,
-    /// Whether the plugin registered the `aft_search` tool for this surface
-    /// (default: false). Forwarded by the plugin's resolved registration
-    /// predicate (semantic on + not minimal + not disabled). Used only to pick
-    /// the grep-rewrite footer: when true the footer steers to `aft_search`,
-    /// otherwise to the `grep` tool. Not a capability gate.
+    /// Whether `aft_search` is registered, which is exactly "`aft_search` is not
+    /// in `disabled_tools`". It is derived from the resolved disabled list and
+    /// says nothing about index state or backend presence. Used only to pick
+    /// the grep-rewrite footer. Not a capability gate.
     pub aft_search_registered: bool,
-    /// Enable the persisted callgraph store substrate (default: true).
-    pub callgraph_store: bool,
     /// Number of files to parse in a single batch during callgraph store cold build (default: 100).
     /// Lower values reduce peak memory during cold build.
     /// Set to 0 to disable chunking and parse all files at once.
@@ -601,10 +597,8 @@ pub struct Config {
     pub worktree: WorktreeConfig,
     /// Resolved GitHub integration gates. User configuration only.
     pub github: GithubConfig,
-    /// Effective `gh` shim gate plus its legacy binary override.
+    /// Binary configuration for the managed `gh` shim (no enable state).
     pub gh_shim: GhShimConfig,
-    /// Effective structured GitHub read gate retained for the read engine API.
-    pub gh_read: GhReadConfig,
     /// Git attribution for AFT-spawned agent children. Default off.
     pub git: GitConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
@@ -643,16 +637,9 @@ pub struct Config {
     /// Allow URL-fetch commands to access private network hosts.
     /// Default false; hosting plugins only forward this from user-level config.
     pub url_fetch_allow_private: bool,
-    /// Resolved host-tool registration preference. The Rust core retains this
-    /// value for cross-harness config parity; the hosting plugin owns registration.
-    pub hoist_builtin_tools: bool,
-    /// Resolved tool-surface tier ("minimal", "recommended", or "all"). The
-    /// hosting plugin owns registration; the core keeps the value so it can
-    /// reach the same conclusion about which built-in slots survive.
-    pub tool_surface: String,
-    /// Agent-visible tool names the user switched off. Kept for the same reason
-    /// as `tool_surface`: slot-survival questions must be answered identically
-    /// on both sides of the plugin boundary.
+    /// Resolved agent-visible tool names that are not registered, sorted. A
+    /// tool is registered exactly when its canonical name is absent from this
+    /// list; the resolver always produces it explicitly (even when empty).
     pub disabled_tools: Vec<String>,
     /// Hosting harness identity supplied by configure.
     #[serde(default)]
@@ -687,12 +674,10 @@ impl Default for Config {
             // Default to false to match OpenCode's existing permission-based model.
             // The plugin opts into root restriction explicitly when desired.
             restrict_to_project_root: false,
-            search_index: false,
+            indexes: IndexesConfig::default(),
             index: IndexConfig::default(),
-            semantic_search: false,
             views: ViewsConfig::default(),
-            aft_search_registered: false,
-            callgraph_store: true,
+            aft_search_registered: true,
             callgraph_chunk_size: 100,
             experimental_bash_rewrite: false,
             experimental_bash_compress: false,
@@ -711,7 +696,6 @@ impl Default for Config {
             worktree: WorktreeConfig::default(),
             github: GithubConfig::default(),
             gh_shim: GhShimConfig::default(),
-            gh_read: GhReadConfig::default(),
             git: GitConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),
@@ -722,9 +706,10 @@ impl Default for Config {
             lsp_inflight_installs: HashSet::new(),
             storage_dir: None,
             url_fetch_allow_private: false,
-            hoist_builtin_tools: true,
-            tool_surface: "recommended".to_string(),
-            disabled_tools: Vec::new(),
+            disabled_tools: crate::feature_config::DEFAULT_DISABLED_TOOLS
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             harness: None,
             diagnostic_cache_size: 5000,
             idle: IdleConfig::default(),
@@ -733,8 +718,8 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Whether the host's tagged `read` slot survives surface, hoisting, and
-    /// disable filters.
+    /// Whether the host's tagged `read` slot is registered, i.e. `read` is not
+    /// in the resolved disabled list.
     ///
     /// Only a tagged read mints the `[path#TAG]` snapshots a hashline patch can
     /// address, so a session that lost the read slot must not be offered the
@@ -742,10 +727,17 @@ impl Config {
     /// the plugins' registration check so both sides of the boundary classify a
     /// given config identically.
     pub fn read_slot_survives(&self) -> bool {
-        self.tool_surface != "minimal"
-            && self.hoist_builtin_tools
-            && !self.disabled_tools.iter().any(|name| name == "read")
+        !self.disabled_tools.iter().any(|name| name == "read")
     }
+
+    /// Whether a canonical tool name is registered under the resolved list.
+    pub fn tool_registered(&self, name: &str) -> bool {
+        !self.disabled_tools.iter().any(|disabled| disabled == name)
+    }
+}
+
+const fn default_bash_enabled() -> bool {
+    true
 }
 
 fn default_foreground_wait_window_ms() -> u64 {
@@ -773,18 +765,6 @@ mod tests {
             ..Config::default()
         };
         assert!(unrelated.read_slot_survives());
-
-        let minimal = Config {
-            tool_surface: "minimal".to_string(),
-            ..Config::default()
-        };
-        assert!(!minimal.read_slot_survives());
-
-        let unhoisted = Config {
-            hoist_builtin_tools: false,
-            ..Config::default()
-        };
-        assert!(!unhoisted.read_slot_survives());
     }
 
     #[test]

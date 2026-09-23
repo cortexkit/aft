@@ -2235,9 +2235,9 @@ mod tests {
         let (_dir, root) = test_root("health-tier2-first-scan");
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.as_path().to_path_buf());
-        config.search_index = false;
-        config.semantic_search = false;
-        config.callgraph_store = false;
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.indexes.callgraph = false;
         config.inspect.enabled = true;
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -2290,7 +2290,7 @@ mod tests {
         let executor = Executor::new();
         let (_dir, root) = test_root("health-callgraph-disabled-lingering-rx");
         let mut config = crate::config::Config::default();
-        config.callgraph_store = false;
+        config.indexes.callgraph = false;
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
@@ -2917,9 +2917,9 @@ mod tests {
         let (_dir, root) = test_root("tier2-pass-health-transition");
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.as_path().to_path_buf());
-        config.search_index = false;
-        config.semantic_search = false;
-        config.callgraph_store = false;
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
+        config.indexes.callgraph = false;
         config.inspect.enabled = true;
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),

@@ -785,7 +785,7 @@ fn start_github_read_with_view(
     let (selector, start_line) = github_read_selector(req);
     let vision_capability = req.params.get("vision_capability").and_then(Value::as_bool);
     let authentication_identity = format!("session:{}", req.session());
-    let gh_read = ctx.config().gh_read.clone();
+    let gh_read = ctx.config().github.clone();
     github_read_engine(ctx)
         .start_resource_with_view(
             &gh_read,

@@ -2082,13 +2082,13 @@ pub fn refresh_project_corpus(
             }
         }
 
-        if config.search_index && !ctx.shared_artifacts_read_only() {
+        if config.indexes.trigram && !ctx.shared_artifacts_read_only() {
             spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
             status_changed = true;
             aft::slog_info!("{}", search_refresh_started_log(reason));
         }
 
-        if config.semantic_search && !ctx.shared_artifacts_read_only() {
+        if config.indexes.semantic && !ctx.shared_artifacts_read_only() {
             if let Some(sender) = ctx.semantic_refresh_sender() {
                 *ctx.semantic_index_status()
                     .write()
@@ -2216,7 +2216,7 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     let hardened = ctx.run_if_subc_bound_generation(generation, || {
         let config = ctx.config();
         if ctx.callgraph_writer()
-            && config.callgraph_store
+            && config.indexes.callgraph
             && ctx.pending_callgraph_store_force_token().is_none()
         {
             // The corpus refresh above forces a rebuild only when a store was
@@ -2238,14 +2238,14 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
             if ctx.ram_overlay_active() {
                 ctx.retire_search_index_rx();
             }
-            if config.semantic_search {
+            if config.indexes.semantic {
                 ctx.semantic_index()
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
                 ctx.clear_semantic_refresh_worker();
             }
-        } else if config.semantic_search
+        } else if config.indexes.semantic
             && ctx.semantic_refresh_sender().is_none()
             && ctx.semantic_index_rx().lock().is_none()
         {
@@ -3703,7 +3703,7 @@ mod tests {
         let ignore_path = nested.join(".gitignore");
         std::fs::write(&ignore_path, b"").unwrap();
         let (ctx, tx) = watcher_context(&root);
-        ctx.update_config(|config| config.search_index = true);
+        ctx.update_config(|config| config.indexes.trigram = true);
         ctx.rebuild_gitignore();
         *ctx.search_index()
             .write()
@@ -3748,7 +3748,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (ctx, tx) = watcher_context(&root);
-        ctx.update_config(|config| config.search_index = true);
+        ctx.update_config(|config| config.indexes.trigram = true);
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -4071,7 +4071,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let config = Config {
             project_root: Some(root.path().to_path_buf()),
-            semantic_search: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: false,
+                semantic: true,
+                callgraph: true,
+            },
             ..Config::default()
         };
         let ctx = AppContext::new(default_language_provider_factory(), config);
@@ -4776,9 +4780,11 @@ mod tests {
             Config {
                 project_root: Some(root.clone()),
                 storage_dir: Some(storage),
-                search_index: true,
-                semantic_search: false,
-                callgraph_store: false,
+                indexes: crate::config::IndexesConfig {
+                    trigram: true,
+                    semantic: false,
+                    callgraph: false,
+                },
                 ..Config::default()
             },
         );
@@ -4907,7 +4913,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));
@@ -4948,7 +4958,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));
@@ -4998,7 +5012,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));
@@ -5069,7 +5087,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -5139,7 +5161,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -5204,7 +5230,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));
@@ -5275,7 +5305,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));
@@ -5340,7 +5374,11 @@ mod tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -5478,7 +5516,7 @@ mod watcher_slice_tests {
         let storage = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(root.path());
         ctx.update_config(|config| {
-            config.callgraph_store = true;
+            config.indexes.callgraph = true;
             config.views.enabled = true;
         });
         ctx.set_cache_writer_capabilities(false, false);
@@ -5692,7 +5730,7 @@ mod watcher_slice_tests {
     fn watcher_callgraph_refresh_defers_when_ready_store_is_unavailable() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _) = context_with_watcher(temp.path());
-        ctx.update_config(|config| config.callgraph_store = true);
+        ctx.update_config(|config| config.indexes.callgraph = true);
         ctx.set_cache_role(false, None);
         let source = temp.path().join("pending.rs");
         let generated = temp.path().join("compiled.ts");
@@ -5719,7 +5757,7 @@ mod watcher_slice_tests {
     fn watcher_callgraph_refresh_keeps_worktree_paths_pending() {
         let temp = tempfile::tempdir().unwrap();
         let (ctx, _) = context_with_watcher(temp.path());
-        ctx.update_config(|config| config.callgraph_store = true);
+        ctx.update_config(|config| config.indexes.callgraph = true);
         ctx.set_cache_role(true, None);
         let source = temp.path().join("worktree.rs");
 
@@ -6015,7 +6053,7 @@ mod watcher_slice_tests {
         let canonical = std::fs::canonicalize(root).expect("canonical root");
         ctx.update_config(|config| {
             config.storage_dir = Some(storage.to_path_buf());
-            config.search_index = true;
+            config.indexes.trigram = true;
         });
         ctx.set_canonical_cache_root(canonical.clone());
         let cache_dir = crate::search_index::resolve_cache_dir(&canonical, Some(storage));

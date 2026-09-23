@@ -1425,7 +1425,7 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
     if !ctx.watcher_runtime_active() {
         return false;
     }
-    let search_ready = !config.search_index
+    let search_ready = !config.indexes.trigram
         || ctx
             .search_index()
             .read()
@@ -1436,14 +1436,14 @@ fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-    let semantic_ready = !config.semantic_search
+    let semantic_ready = !config.indexes.semantic
         || ctx
             .semantic_index()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
         || ctx.semantic_index_rx().lock().is_some();
-    let callgraph_ready = !config.callgraph_store
+    let callgraph_ready = !config.indexes.callgraph
         || ctx
             .callgraph_store()
             .read()
@@ -2384,12 +2384,12 @@ fn configure_warm_key(
         home_match,
         is_worktree_bridge,
         shared_artifacts_read_only,
-        config.search_index,
+        config.indexes.trigram,
         config.search_index_max_file_size,
-        config.semantic_search,
+        config.indexes.semantic,
         config.semantic,
         config.views.enabled,
-        config.callgraph_store,
+        config.indexes.callgraph,
         config.callgraph_chunk_size,
         config.inspect.enabled,
         workspace_manifests.unwrap_or_default(),
@@ -2411,7 +2411,7 @@ fn configure_callgraph_build_key(
         home_match,
         is_worktree_bridge,
         shared_artifacts_read_only,
-        config.callgraph_store,
+        config.indexes.callgraph,
         workspace_manifests.unwrap_or_default(),
     )
 }
@@ -2641,6 +2641,18 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &mut next_config,
         );
     let config_dropped_keys = config_diagnostics.dropped;
+    if !config_diagnostics.errors.is_empty() {
+        // The whole candidate is rejected before anything is published or any
+        // index work starts; the context keeps its last-good configuration.
+        return Response::error(
+            &req.id,
+            "config_rejected",
+            format!(
+                "configure: configuration rejected: {}. Run `aft doctor --fix` to migrate removed keys.",
+                config_diagnostics.errors.join(", ")
+            ),
+        );
+    }
     let mut configure_warnings = config_diagnostics
         .warnings
         .into_iter()
@@ -2671,12 +2683,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // AppContext is mutated only after this phase succeeds, so an invalid late
     // field cannot leave the bridge half-configured. Core AftConfig fields are
     // resolved exclusively from `config: [{tier, source, doc}]` above.
-    if let Some(v) = params
-        .get("aft_search_registered")
-        .and_then(|v| v.as_bool())
-    {
-        next_config.aft_search_registered = v;
-    }
+    // `aft_search_registered` is derived by the resolver from the resolved
+    // disabled list (registration only). The plugin-sent flag of the same name
+    // is still accepted for older plugins but no longer trusted.
+    let _legacy_aft_search_registered = params.get("aft_search_registered");
     let edit_slot_survives = match params.get("edit_slot_survives") {
         Some(Value::Bool(value)) => Some(*value),
         Some(_) => {
@@ -2837,7 +2847,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ctx.begin_configure_ack_phase("ack_ready");
             log_slow_configure_prefix(ctx, prefix_started_at);
             let artifact_owner_status = ctx.artifact_owner_status();
-            let search_index_cache_reused = next_config.search_index
+            let search_index_cache_reused = next_config.indexes.trigram
                 && ctx
                     .search_index()
                     .read()
@@ -2884,7 +2894,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 path_count
             );
             let artifact_owner_status = ctx.artifact_owner_status();
-            let search_index_cache_reused = next_config.search_index
+            let search_index_cache_reused = next_config.indexes.trigram
                 && ctx
                     .search_index()
                     .read()
@@ -2966,17 +2976,17 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // HOME is a user container, never a project root; keep project-wide index
     // options from causing a persistent configuration to scan the entire home directory.
-    let search_disabled_for_home = home_match && next_config.search_index;
-    let semantic_disabled_for_home = home_match && next_config.semantic_search;
-    let callgraph_disabled_for_home = home_match && next_config.callgraph_store;
+    let search_disabled_for_home = home_match && next_config.indexes.trigram;
+    let semantic_disabled_for_home = home_match && next_config.indexes.semantic;
+    let callgraph_disabled_for_home = home_match && next_config.indexes.callgraph;
     if search_disabled_for_home {
-        next_config.search_index = false;
+        next_config.indexes.trigram = false;
     }
     if semantic_disabled_for_home {
-        next_config.semantic_search = false;
+        next_config.indexes.semantic = false;
     }
     if callgraph_disabled_for_home {
-        next_config.callgraph_store = false;
+        next_config.indexes.callgraph = false;
     }
 
     let requested_fingerprint =
@@ -2998,7 +3008,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // fingerprint once when that lane is enabled; disabled roots should not stat
     // every package on every equivalent bind.
     let workspace_manifests = next_config
-        .callgraph_store
+        .indexes
+        .callgraph
         .then(|| workspace_manifest_fingerprint(&canonical_cache_root));
     let preflight_warm_key = configure_warm_key(
         &canonical_cache_root,
@@ -3095,7 +3106,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.begin_configure_ack_phase("ack_ready");
         log_slow_configure_prefix(ctx, prefix_started_at);
         let artifact_owner_status = ctx.artifact_owner_status();
-        let search_index_cache_reused = next_config.search_index
+        let search_index_cache_reused = next_config.indexes.trigram
             && ctx
                 .search_index()
                 .read()
@@ -3148,7 +3159,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let storage_root = crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     let artifact_key_needed = !home_match
-        && (next_config.search_index || next_config.semantic_search || next_config.callgraph_store);
+        && (next_config.indexes.trigram
+            || next_config.indexes.semantic
+            || next_config.indexes.callgraph);
     ctx.begin_configure_ack_phase("cache_key_resolve");
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
@@ -3329,7 +3342,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         workspace_manifests.as_deref(),
     );
     let semantic_build_inputs_changed = project_root_changed
-        || previous_config.semantic_search != next_config.semantic_search
+        || previous_config.indexes.semantic != next_config.indexes.semantic
         || semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic)
         || previous_config.semantic.max_files != next_config.semantic.max_files;
     let (configure_generation, equivalent_warm_config) =
@@ -3358,7 +3371,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         ctx.reset_tier2_refresh_scheduler();
         if !semantic_build_adopted {
             ctx.reset_semantic_cold_seed_gate_for_configure();
-            if next_config.semantic_search && !ctx.shared_artifacts_read_only() && !home_match {
+            if next_config.indexes.semantic && !ctx.shared_artifacts_read_only() && !home_match {
                 ctx.schedule_semantic_cold_seed_gate_for_configure();
             }
         }
@@ -3375,8 +3388,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             &canonical_cache_root,
         ));
     ctx.begin_configure_ack_phase("index_loading_state");
-    let search_index = ctx.config().search_index;
-    let semantic_search = ctx.config().semantic_search;
+    let search_index = ctx.config().indexes.trigram;
+    let semantic_search = ctx.config().indexes.semantic;
     let mut search_index_cache_reused = false;
 
     // Reconfigure is still the signal that this root's workspace package
@@ -3552,7 +3565,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         sync_bash_compress_flag,
         reset_filter_registry: !equivalent_warm_config,
         clear_failed_spawns,
-        warm_callgraph_store: next_config.callgraph_store
+        warm_callgraph_store: next_config.indexes.callgraph
             && !home_match
             && !equivalent_warm_config
             && (!equivalent_callgraph_build || !callgraph_build_in_progress),
@@ -3700,8 +3713,8 @@ fn release_callgraph_start_waiters_for_generation_change(
 
 fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
     let config = ctx.config();
-    let search_enabled = config.search_index;
-    let semantic_enabled = config.semantic_search;
+    let search_enabled = config.indexes.trigram;
+    let semantic_enabled = config.indexes.semantic;
     drop(config);
 
     let search_index_missing = ctx
@@ -3808,7 +3821,7 @@ pub(crate) fn restart_search_index_after_load_disconnect(ctx: &AppContext) -> bo
         let _reload_guard = ctx.artifact_reload_guard();
         // A replacement (or a completed build) may have raced ahead of the drain;
         // only reschedule when the index is still genuinely missing and idle.
-        // `missing_artifact_loads` also enforces `config.search_index`.
+        // `missing_artifact_loads` also enforces `config.indexes.trigram`.
         if !missing_artifact_loads(ctx).search {
             return false;
         }
@@ -3880,7 +3893,7 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
             }
         }
         let config = ctx.config();
-        let semantic_enabled = config.semantic_search;
+        let semantic_enabled = config.indexes.semantic;
         drop(config);
         if !semantic_enabled
             || !heavy_root_work_allowed
@@ -6856,7 +6869,7 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        ctx.update_config(|config| config.callgraph_store = true);
+        ctx.update_config(|config| config.indexes.callgraph = true);
         let semantic_fingerprint = ctx
             .semantic_index()
             .read()
@@ -7692,7 +7705,7 @@ mod tests {
         assert!(response.success, "configure failed: {:?}", response.data);
 
         // Core-resolved field applied: user search_index=true survived.
-        assert!(ctx.config().search_index);
+        assert!(ctx.config().indexes.trigram);
         // Trust boundary: project tried restrict=false over user restrict=true →
         // user value wins.
         assert!(ctx.config().restrict_to_project_root);
@@ -9785,7 +9798,7 @@ mod tests {
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());
             config.storage_dir = Some(storage.path().to_path_buf());
-            config.search_index = true;
+            config.indexes.trigram = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         ctx.set_cache_role(true, None);
@@ -9825,7 +9838,7 @@ mod tests {
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());
             config.storage_dir = Some(storage.path().to_path_buf());
-            config.search_index = true;
+            config.indexes.trigram = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         ctx.set_cache_role(false, None);
@@ -9876,7 +9889,7 @@ mod tests {
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());
             config.storage_dir = Some(storage.path().to_path_buf());
-            config.search_index = true;
+            config.indexes.trigram = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         ctx.set_cache_writer_capabilities(false, true);
@@ -9936,7 +9949,7 @@ mod tests {
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());
             config.storage_dir = Some(storage.path().to_path_buf());
-            config.search_index = true;
+            config.indexes.trigram = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         ctx.set_cache_writer_capabilities(false, true);
@@ -9983,7 +9996,7 @@ mod tests {
         ctx.update_config(|config| {
             config.project_root = Some(root.path().to_path_buf());
             config.storage_dir = Some(storage.path().to_path_buf());
-            config.semantic_search = true;
+            config.indexes.semantic = true;
         });
         ctx.set_canonical_cache_root(root.path().to_path_buf());
         set_configure_artifact_post_gate_delay_for_test(500);
@@ -11193,7 +11206,10 @@ mod tests {
         assert!(response.success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert_eq!(ctx.configure_generation(), generation_after_first + 1);
-        assert!(ctx.config().search_index, "changed config must apply fully");
+        assert!(
+            ctx.config().indexes.trigram,
+            "changed config must apply fully"
+        );
         assert_eq!(
             ctx.tsconfig_membership_clear_generation_for_test(),
             tsconfig_clear_generation_after_first + 1
@@ -11532,11 +11548,11 @@ mod tests {
         );
         // Heavy subsystems must have been force-disabled regardless of user config.
         assert!(
-            !ctx.config().search_index,
+            !ctx.config().indexes.trigram,
             "search_index must be auto-disabled at HOME root"
         );
         assert!(
-            !ctx.config().semantic_search,
+            !ctx.config().indexes.semantic,
             "semantic_search must be auto-disabled at HOME root"
         );
     }
@@ -11604,7 +11620,7 @@ mod tests {
             ctx.degraded_reasons()
         );
         // User config preserved.
-        assert!(ctx.config().search_index);
+        assert!(ctx.config().indexes.trigram);
     }
 
     #[cfg(unix)]

@@ -535,7 +535,7 @@ fn print_transition(name: &str, current: &str, previous: &mut String) {
 }
 
 fn search_index_state(ctx: &AppContext) -> SubsystemState {
-    if !ctx.config().search_index {
+    if !ctx.config().indexes.trigram {
         return SubsystemState::Disabled;
     }
     let index_ready = {
@@ -563,7 +563,7 @@ fn search_index_state(ctx: &AppContext) -> SubsystemState {
 }
 
 fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
-    if !ctx.config().semantic_search {
+    if !ctx.config().indexes.semantic {
         return SubsystemState::Disabled;
     }
     match ctx
@@ -613,7 +613,7 @@ fn symbol_cache_state(search_index: &SubsystemState) -> SubsystemState {
 fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
     // A disabled subsystem is terminal. In particular, HOME is never a project
     // root, so its disabled callgraph configuration must not be represented as a retryable miss.
-    if !ctx.config().callgraph_store {
+    if !ctx.config().indexes.callgraph {
         return Some(SubsystemState::Disabled);
     }
     match ctx.callgraph_store_for_ops() {
@@ -750,7 +750,7 @@ fn callgraph_store_state(
     ctx: &AppContext,
     override_state: &Option<SubsystemState>,
 ) -> SubsystemState {
-    if !ctx.config().callgraph_store {
+    if !ctx.config().indexes.callgraph {
         return SubsystemState::Disabled;
     }
     if let Some(state) = override_state {
@@ -994,7 +994,11 @@ mod tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_store: false,
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: false,
+                },
                 ..Config::default()
             },
         );

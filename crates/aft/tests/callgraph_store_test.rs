@@ -889,7 +889,11 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1193,7 +1197,11 @@ fn root_keyed_migration_disk_floor_skips_to_legacy_fallback_without_cold_build()
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1263,7 +1271,11 @@ fn root_keyed_migration_backup_budget_failure_serves_legacy_without_cold_build()
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1352,7 +1364,11 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1437,7 +1453,11 @@ fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() 
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1492,7 +1512,11 @@ fn app_context_revalidates_to_newer_published_generation() {
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1558,7 +1582,11 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
         Config {
             project_root: Some(dir.path().to_path_buf()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1604,7 +1632,11 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
         Config {
             project_root: Some(dir.path().to_path_buf()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -1624,7 +1656,11 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
         Config {
             project_root: Some(unavailable_dir.path().to_path_buf()),
             storage_dir: Some(unavailable_dir.path().join("storage")),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -2125,7 +2161,11 @@ fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppCo
         Config {
             project_root: Some(root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );
@@ -2799,7 +2839,11 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
         Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
-            callgraph_store: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: false,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     );

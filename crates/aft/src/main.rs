@@ -1490,7 +1490,7 @@ fn handle_echo(req: &RawRequest) -> Response {
 /// Params: `file` (string, required) — path to snapshot.
 /// Returns: `{ backup_id }`.
 fn wait_for_semantic_index_before_search(req: &RawRequest, ctx: &AppContext) -> Option<Response> {
-    if std::env::var_os("AFT_WAIT_FOR_SEMANTIC_READY").is_none() || !ctx.config().semantic_search {
+    if std::env::var_os("AFT_WAIT_FOR_SEMANTIC_READY").is_none() || !ctx.config().indexes.semantic {
         return None;
     }
 
@@ -2228,7 +2228,11 @@ mod deferred_semantic_search_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.to_path_buf()),
-                semantic_search: true,
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 semantic: SemanticBackendConfig {
                     backend: SemanticBackend::OpenAiCompatible,
                     model: "test-embedding".to_string(),
@@ -2407,7 +2411,11 @@ mod deferred_semantic_search_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));
@@ -3363,7 +3371,11 @@ mod watcher_filter_tests {
             Config {
                 project_root: Some(root.to_path_buf()),
                 storage_dir: Some(root.join("storage")),
-                callgraph_store: true,
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -3850,7 +3862,11 @@ mod watcher_filter_tests {
             Config {
                 project_root: Some(root.clone()),
                 storage_dir: Some(tmp.path().join("storage")),
-                callgraph_store: true,
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -3936,9 +3952,11 @@ mod watcher_filter_tests {
             Config {
                 project_root: Some(root.clone()),
                 storage_dir: Some(tmp.path().join("storage")),
-                callgraph_store: true,
-                search_index: true,
-                semantic_search: true,
+                indexes: aft::config::IndexesConfig {
+                    trigram: true,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -4192,7 +4210,11 @@ mod watcher_filter_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.clone()),
-                semantic_search: true,
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );

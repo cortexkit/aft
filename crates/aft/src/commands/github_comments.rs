@@ -467,7 +467,7 @@ pub(crate) fn reread_resource(
     spelling: &str,
     working_directory: PathBuf,
 ) -> Result<crate::github_read::GithubReadCompletion, Response> {
-    let gh_read = ctx.config().gh_read.clone();
+    let gh_read = ctx.config().github.clone();
     let start = super::read::github_read_engine(ctx)
         .start_resource(
             &gh_read,

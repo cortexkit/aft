@@ -155,7 +155,7 @@ fn managed_git_hook_contents(hook_name: &str) -> String {
 /// before a child spawn.
 pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
     let shims_dir = storage_root.join(SHIMS_DIR_NAME);
-    if config.gh_shim.enabled {
+    if config.github.shim {
         let binary = shim_binary(config)?;
         match reject_self_referential_pin(&binary, &shims_dir)
             .and_then(|()| probe_gh_shim_binary(&binary))
@@ -290,7 +290,7 @@ pub fn inject(
     // process retains the credentials it needs.
     environment.retain(|key, _| !is_subc_credential_env_key(key));
 
-    let gh_enabled = config.gh_shim.enabled;
+    let gh_enabled = config.github.shim;
     let co_author_enabled = config.git.co_author != "off";
 
     // The inherited environment may already carry governance markers injected
@@ -905,7 +905,7 @@ mod tests {
     #[test]
     fn disabled_features_leave_the_requested_environment_byte_identical() {
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git = GitConfig::default();
         let before = HashMap::from([
             ("PATH".to_string(), "/one:/two".to_string()),
@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn child_environment_strips_the_complete_subc_credential_family_before_config_gates() {
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git = GitConfig::default();
         let mut environment = HashMap::from([
             ("SUBC_MODULE_ID".to_string(), "aft".to_string()),
@@ -1057,7 +1057,7 @@ mod tests {
             config.gh_shim.binary_path.as_deref().unwrap()
         );
 
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         maintain(&config, temp.path()).unwrap();
         assert!(fs::symlink_metadata(entry).is_err());
     }
@@ -1216,7 +1216,7 @@ mod tests {
     #[cfg(unix)]
     fn co_author_environment(storage: &Path) -> HashMap<String, String> {
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git.co_author = TEST_CO_AUTHOR.to_string();
         let mut environment = HashMap::new();
         inject(&config, storage, &mut environment).unwrap();
@@ -1431,7 +1431,7 @@ mod tests {
         );
 
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.gh_shim.binary_path = Some(shim);
         config.git.co_author = "auto".to_string();
         let mut environment = HashMap::new();
@@ -1461,7 +1461,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("storage");
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git.co_author = TEST_CO_AUTHOR.to_string();
 
         maintain(&config, &storage).unwrap();
@@ -1500,7 +1500,7 @@ mod tests {
         let storage = temp.path().join("storage");
         let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git.co_author = TEST_CO_AUTHOR.to_string();
         maintain(&config, &storage).unwrap();
         fs::write(
@@ -1566,7 +1566,7 @@ mod tests {
         let storage = temp.path().join("storage");
         let hooks_dir = storage.join(GIT_HOOKS_DIR_NAME);
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git.co_author = TEST_CO_AUTHOR.to_string();
         maintain(&config, &storage).unwrap();
         assert!(!hooks_dir.join(GIT_HOOKS_QUARANTINE_DIR_NAME).exists());
@@ -1822,7 +1822,7 @@ mod tests {
         );
 
         let mut config = Config::default();
-        config.gh_shim.enabled = false;
+        config.github.shim = false;
         config.git.co_author = "Pair Agent <pair@example.test>".to_string();
         let mut environment = HashMap::new();
         inject(&config, &storage, &mut environment).unwrap();

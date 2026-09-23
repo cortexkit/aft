@@ -99,7 +99,11 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
         Config {
             project_root: Some(canonical_root.clone()),
             storage_dir: Some(storage.path().to_path_buf()),
-            search_index: true,
+            indexes: aft::config::IndexesConfig {
+                trigram: true,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         },
     ));

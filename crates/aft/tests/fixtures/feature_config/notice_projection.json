@@ -1,0 +1,112 @@
+{
+  "projection": "notice_projection_v1",
+  "description": "Shared Rust/TypeScript migration-notice projection digests. Both implementations must reproduce every digest.",
+  "cases": [
+    {
+      "name": "file_absent",
+      "note": "no user file",
+      "digest": "6a623760b3583f93014a2223064c777dc99084e104f69e6db694c552d13efe8c"
+    },
+    {
+      "name": "empty",
+      "note": "empty object",
+      "doc": {},
+      "digest": "c054971de22786daa58f1ec0613359a8eaaddc4cdc95a417f77af9a187548763"
+    },
+    {
+      "name": "unrelated_setting",
+      "note": "unrelated keys are not projected, so this matches the empty case",
+      "doc": {
+        "format_on_edit": true
+      },
+      "digest": "c054971de22786daa58f1ec0613359a8eaaddc4cdc95a417f77af9a187548763"
+    },
+    {
+      "name": "search_index_true",
+      "note": "immediate legacy index key",
+      "doc": {
+        "search_index": true
+      },
+      "digest": "2c7e6e56b0ea8580f198a67768329a0166bd04cdd9d08bce0d6cdd589d87ab31"
+    },
+    {
+      "name": "search_index_true_reordered_with_unrelated",
+      "note": "same digest as search_index_true",
+      "doc": {
+        "format_on_edit": false,
+        "search_index": true
+      },
+      "digest": "2c7e6e56b0ea8580f198a67768329a0166bd04cdd9d08bce0d6cdd589d87ab31"
+    },
+    {
+      "name": "experimental_search_index_true",
+      "note": "equivalent canonical outcome, different legacy name, different digest",
+      "doc": {
+        "experimental_search_index": true
+      },
+      "digest": "f92975073bbfcc68cc384e75d824a650caa3283b5fa91520eb00d9a4661b3be1"
+    },
+    {
+      "name": "tool_surface_all",
+      "note": "surface",
+      "doc": {
+        "tool_surface": "all"
+      },
+      "digest": "cde31723a4debcb257c9b0d2e5e1b7a1e30fddc17adc3ab9eda368879e64b180"
+    },
+    {
+      "name": "disabled_aliases",
+      "note": "order and duplicates are normalized",
+      "doc": {
+        "disabled_tools": [
+          "aft_grep",
+          "aft_glob",
+          "aft_grep"
+        ]
+      },
+      "digest": "754f0fcd1f1fa84ee354cddd308772e9807906b427bcd34d8568340cc54e0265"
+    },
+    {
+      "name": "disabled_aliases_reordered",
+      "note": "same digest as disabled_aliases",
+      "doc": {
+        "disabled_tools": [
+          "aft_glob",
+          "aft_grep"
+        ]
+      },
+      "digest": "754f0fcd1f1fa84ee354cddd308772e9807906b427bcd34d8568340cc54e0265"
+    },
+    {
+      "name": "runtime_gates",
+      "note": "retained registration gates",
+      "doc": {
+        "backup": {
+          "enabled": false
+        },
+        "bash": false,
+        "inspect": {
+          "enabled": false,
+          "diagnostics_timeout_ms": 20000
+        }
+      },
+      "digest": "2ee5ed22cedfdb31dd19dd728af47d3e964b7f556cc91b46ea3275e89fac0cf2"
+    },
+    {
+      "name": "harness_block",
+      "note": "harness block and github master",
+      "doc": {
+        "harnesses": {
+          "pi": {
+            "hoist_builtin_tools": false
+          }
+        },
+        "github": {
+          "enabled": false,
+          "read": true
+        }
+      },
+      "digest": "0f151a39937744ac521ababd68ca6083cf24d34ac1d727d24c73f5018f7749a8"
+    }
+  ]
+}

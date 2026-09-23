@@ -3107,10 +3107,10 @@ impl AppContext {
         let search_index_status = if search_index
             .as_ref()
             .is_some_and(|index| index.ready || index.build_denied)
-            || (borrows_shared_artifacts && config.search_index)
+            || (borrows_shared_artifacts && config.indexes.trigram)
         {
             "ready"
-        } else if config.search_index
+        } else if config.indexes.trigram
             || search_index.as_ref().is_some()
             || search_index_rx.as_ref().is_some()
         {
@@ -3188,11 +3188,11 @@ impl AppContext {
             "disabled"
         } else if callgraph_store.as_ref().is_some() {
             "ready"
-        } else if !callgraph_writer && config.callgraph_store {
+        } else if !callgraph_writer && config.indexes.callgraph {
             // Read-only roots never cold-build; they query the shared store
             // via ReadonlyCallGraphStore on demand.
             "ready"
-        } else if config.callgraph_store {
+        } else if config.indexes.callgraph {
             // Either a build receiver is installed or the build has not been
             // admitted yet; both resolve to ready under this configuration.
             "building"
@@ -4897,7 +4897,7 @@ impl AppContext {
         let head_metadata =
             crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
                 .map_err(|error| error.to_string())?;
-        let semantic_search = self.config().semantic_search;
+        let semantic_search = self.config().indexes.semantic;
         let semantic_keys = if semantic_search && allow_blob_put {
             let index = self
                 .semantic_index
@@ -5097,7 +5097,7 @@ impl AppContext {
         &self,
         respect_config_flag: bool,
     ) -> Result<Option<Arc<ReadonlyCallGraphStore>>, CallGraphStoreError> {
-        if respect_config_flag && !self.config().callgraph_store {
+        if respect_config_flag && !self.config().indexes.callgraph {
             return Ok(None);
         }
         if !self.heavy_root_work_allowed() {
@@ -5270,7 +5270,7 @@ impl AppContext {
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
         }
-        if self.config().views.enabled && self.config().callgraph_store {
+        if self.config().views.enabled && self.config().indexes.callgraph {
             if let Some(view) = self.pinned_view_runtime() {
                 if view.manifest.is_some() {
                     let Some(project_root) = self.callgraph_project_root() else {
@@ -5912,7 +5912,7 @@ impl AppContext {
         }
         // A disabled or degraded root must not create a refresh worker merely
         // to discover later that it cannot write the callgraph store.
-        if !self.config().callgraph_store || !self.heavy_root_work_allowed() {
+        if !self.config().indexes.callgraph || !self.heavy_root_work_allowed() {
             return true;
         }
         self.run_if_subc_bound_generation(generation, || {
@@ -6327,7 +6327,8 @@ impl AppContext {
         *self
             .semantic_index_status
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().semantic_search {
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().indexes.semantic
+        {
             SemanticIndexStatus::ready()
         } else {
             SemanticIndexStatus::Disabled
@@ -6712,7 +6713,7 @@ impl AppContext {
     }
 
     fn automatic_tier2_refresh_categories(snapshot: &InspectSnapshot) -> Vec<InspectCategory> {
-        let callgraph_store_enabled = snapshot.config.callgraph_store;
+        let callgraph_store_enabled = snapshot.config.indexes.callgraph;
         InspectCategory::active()
             .iter()
             .copied()
@@ -8655,7 +8656,11 @@ mod subc_lifecycle_admission_tests {
             default_language_provider_factory(),
             Config {
                 project_root: Some(temp.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -9177,7 +9182,7 @@ mod callgraph_store_for_ops_tests {
                 "HOME root configure must close the heavy-root-work gate"
             );
             assert!(
-                !ctx.config().callgraph_store,
+                !ctx.config().indexes.callgraph,
                 "HOME root configure must force-disable the callgraph store"
             );
             assert!(ctx.is_home_root());
@@ -9876,7 +9881,11 @@ mod callgraph_store_for_ops_tests {
                 Config {
                     project_root: Some(root.clone()),
                     storage_dir: Some(storage.path().to_path_buf()),
-                    callgraph_store: true,
+                    indexes: crate::config::IndexesConfig {
+                        trigram: false,
+                        semantic: false,
+                        callgraph: true,
+                    },
                     callgraph_chunk_size: 1,
                     views: crate::config::ViewsConfig { enabled: true },
                     ..Config::default()
@@ -10156,7 +10165,11 @@ mod callgraph_store_for_ops_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(project.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -10626,7 +10639,11 @@ mod callgraph_store_for_ops_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -10685,7 +10702,11 @@ mod callgraph_store_for_ops_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.path().to_path_buf()),
-                semantic_search: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: true,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         );
@@ -10964,7 +10985,11 @@ mod health_warming_honesty_tests {
         // build-denied and stays not-ready (so grep keeps the fallback walk).
         // Health must treat it as settled, not "building" forever.
         let config = Config {
-            search_index: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: true,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         };
         let ctx = ctx_with_config(config);
@@ -10987,7 +11012,11 @@ mod health_warming_honesty_tests {
         // flight) must still report building — the build-denied carve-out must
         // not leak into ordinary in-progress builds.
         let config = Config {
-            search_index: true,
+            indexes: crate::config::IndexesConfig {
+                trigram: true,
+                semantic: false,
+                callgraph: true,
+            },
             ..Config::default()
         };
         let ctx = ctx_with_config(config);

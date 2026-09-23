@@ -21,8 +21,11 @@ use url::Url;
 
 use super::helpers::AftProcess;
 
-fn enabled_gh_read() -> aft::config::GhReadConfig {
-    aft::config::GhReadConfig { enabled: true }
+fn enabled_gh_read() -> aft::config::GithubConfig {
+    aft::config::GithubConfig {
+        read: true,
+        ..aft::config::GithubConfig::default()
+    }
 }
 
 const FIXTURE_DIRECTORY: &str = "tests/fixtures/github_read_render_transport";

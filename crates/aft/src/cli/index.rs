@@ -146,10 +146,17 @@ fn run_with_paths(
         mut config,
         dropped,
         warnings,
+        errors,
     } = resolve_config(&aft::subc_config::read_local_cortexkit_config_tiers(
         paths.user_config_path.as_deref(),
         &paths.current_dir,
     ));
+    if !errors.is_empty() {
+        return Err(IndexError::validation(format!(
+            "configuration rejected: {}; run `aft doctor --fix`",
+            errors.join(", ")
+        )));
+    }
     reject_index_refusals(&dropped, &warnings)?;
 
     if config.index.roots.is_empty() {

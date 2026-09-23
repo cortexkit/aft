@@ -1115,7 +1115,10 @@ mod tests {
         // The mid-build sample is what a census window during the build sees:
         // before the connection closes, these bytes must already be attributed.
         let credited = staging.sample_write_pages();
-        assert!(credited > 0, "the fixture's writes must be measured before close");
+        assert!(
+            credited > 0,
+            "the fixture's writes must be measured before close"
+        );
 
         let minute = now_ms() / MINUTE_MS * MINUTE_MS;
         let before = Bytes::capture().unwrap_or_default();
@@ -1131,8 +1134,9 @@ mod tests {
         )
         .unwrap();
 
-        let report = census_with_sample(&ledger_conn, minute, Some(&root), minute + MINUTE_MS, None)
-            .unwrap();
+        let report =
+            census_with_sample(&ledger_conn, minute, Some(&root), minute + MINUTE_MS, None)
+                .unwrap();
         let row = report
             .writers
             .iter()

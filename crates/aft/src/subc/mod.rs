@@ -8608,8 +8608,11 @@ mod tests {
             Config {
                 project_root: Some(canonical_root.clone()),
                 storage_dir: Some(storage.path().to_path_buf()),
-                callgraph_store: true,
-                search_index: true,
+                indexes: crate::config::IndexesConfig {
+                    trigram: true,
+                    semantic: false,
+                    callgraph: true,
+                },
                 ..Config::default()
             },
         ));

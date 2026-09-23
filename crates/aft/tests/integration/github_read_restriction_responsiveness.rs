@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use aft::commands::outline::handle_outline;
 use aft::commands::read::handle_read;
 use aft::commands::zoom::handle_zoom;
-use aft::config::{Config, GhReadConfig};
+use aft::config::{Config, GithubConfig};
 use aft::context::{default_language_provider_factory, AppContext};
 use aft::github_read::{
     sqlite_cache_store, DownloadedGithubImage, GithubDocument, GithubDocumentKind,
@@ -36,8 +36,11 @@ const RESTRICTION_PROBE_PROJECT: &str = "AFT_GITHUB_RESTRICTION_PROBE_PROJECT";
 const RESTRICTION_PROBE_DONE: &str = "AFT_GITHUB_RESTRICTION_PROBE_DONE";
 const RESTRICTION_GH_LOG: &str = "AFT_GITHUB_RESTRICTION_GH_LOG";
 
-fn enabled_gh_read() -> GhReadConfig {
-    GhReadConfig { enabled: true }
+fn enabled_gh_read() -> GithubConfig {
+    GithubConfig {
+        read: true,
+        ..GithubConfig::default()
+    }
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -209,7 +212,7 @@ fn isolated_restriction_probe() {
         default_language_provider_factory(),
         Config {
             project_root: Some(project),
-            gh_read: enabled_gh_read(),
+            github: enabled_gh_read(),
             ..Config::default()
         },
     );

@@ -6317,7 +6317,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("create storage dir");
         let ctx = test_context(project.path());
         ctx.update_config(|config| {
-            config.semantic_search = true;
+            config.indexes.semantic = true;
             config.storage_dir = Some(storage.path().to_path_buf());
         });
         ctx.set_canonical_cache_root(project.path().to_path_buf());
@@ -6353,7 +6353,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("create storage dir");
         let ctx = test_context(project.path());
         ctx.update_config(|config| {
-            config.semantic_search = true;
+            config.indexes.semantic = true;
             config.storage_dir = Some(storage.path().to_path_buf());
         });
         ctx.set_canonical_cache_root(project.path().to_path_buf());

@@ -723,9 +723,9 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.update_config(|config| {
         config.project_root = Some(root.clone());
         config.harness = Some(Harness::Opencode);
-        config.callgraph_store = false;
-        config.search_index = false;
-        config.semantic_search = false;
+        config.indexes.callgraph = false;
+        config.indexes.trigram = false;
+        config.indexes.semantic = false;
         config.experimental_bash_background = true;
     });
     ctx.set_harness(Harness::Opencode);
@@ -1340,7 +1340,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             enqueue_semantic_refresh_event_for_test(&req, ctx, &state)
         }
         "enable_callgraph_store_for_test" => {
-            ctx.update_config(|config| config.callgraph_store = true);
+            ctx.update_config(|config| config.indexes.callgraph = true);
             Response::success(req.id, json!({ "callgraph_store": true }))
         }
         "callers" => aft::commands::callers::handle_callers(&req, ctx),

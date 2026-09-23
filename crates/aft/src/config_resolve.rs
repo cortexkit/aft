@@ -14,14 +14,16 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, InspectConfig,
-    SandboxConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
-    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
-    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
-    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
-    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
-    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
+    InspectConfig, SandboxConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
+    WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES,
+    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
+    MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
+use crate::feature_config::{self, PolicyPhase};
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 
@@ -38,6 +40,8 @@ const USER_ONLY_REASON: &str =
     "security: this setting only honors user-level config and project values are ignored";
 const SEMANTIC_SECRET_REASON: &str =
     "security: semantic backend credentials and endpoints must come from user-level config";
+const PROTECTED_TOOL_REASON: &str =
+    "security: a project config cannot disable aft_safety or a host tool slot (read, write, edit, apply_patch, grep, glob, bash)";
 const LSP_USER_ONLY_REASON: &str =
     "security: LSP executable-origin and diagnostic-suppression settings must come from user-level config";
 
@@ -75,6 +79,9 @@ pub struct ConfigWarning {
 pub struct ResolveDiagnostics {
     pub dropped: Vec<DroppedKey>,
     pub warnings: Vec<ConfigWarning>,
+    /// Rejection diagnostics. When non-empty the candidate was rejected as a
+    /// whole and the base config was left untouched.
+    pub errors: Vec<String>,
 }
 
 /// Fully resolved core config plus trust-boundary diagnostics.
@@ -83,6 +90,10 @@ pub struct ResolveResult {
     pub config: Config,
     pub dropped: Vec<DroppedKey>,
     pub warnings: Vec<ConfigWarning>,
+    /// Rejection diagnostics (for example `removed_config_key:<old>:use:<new>`).
+    /// When non-empty `config` must not be used: the whole candidate load is
+    /// rejected rather than continuing with defaults.
+    pub errors: Vec<String>,
 }
 
 /// Strict raw shape for aft.jsonc. This mirrors the TypeScript Zod schema, not
@@ -93,11 +104,6 @@ pub struct ResolveResult {
 pub struct RawAftConfig {
     #[serde(rename = "$schema")]
     pub schema: Option<String>,
-    /// Master switch read by the TypeScript plugins before they start AFT.
-    /// The resolver accepts and merges it for validation, but does not copy it
-    /// into `Config`; when this is false the plugin returns before launching the
-    /// Rust process.
-    pub enabled: Option<bool>,
     pub edit_mode: Option<RawEditMode>,
     pub format_on_edit: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_timeout_secs")]
@@ -108,15 +114,13 @@ pub struct RawAftConfig {
     pub formatter: Option<HashMap<String, RawFormatter>>,
     pub checker: Option<HashMap<String, RawChecker>>,
     pub configure_warnings_delivery: Option<RawConfigureWarningsDelivery>,
-    pub hoist_builtin_tools: Option<bool>,
-    pub tool_surface: Option<RawToolSurface>,
+    /// Raw presence is preserved: `None` (absent) and `Some([])` (explicit
+    /// empty choice) mean different things until user-base resolution.
     pub disabled_tools: Option<Vec<String>>,
     pub restrict_to_project_root: Option<bool>,
-    pub search_index: Option<bool>,
+    pub indexes: Option<RawIndexes>,
     pub index: Option<RawIndex>,
-    pub semantic_search: Option<bool>,
     pub views: Option<RawViews>,
-    pub callgraph_store: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
@@ -125,7 +129,6 @@ pub struct RawAftConfig {
     pub worktree: Option<RawWorktree>,
     pub github: Option<RawGithub>,
     pub gh_shim: Option<RawGhShim>,
-    pub gh_read: Option<RawGhRead>,
     pub git: Option<RawGit>,
     pub pi: Option<RawPi>,
     pub sandbox: Option<RawSandbox>,
@@ -249,22 +252,13 @@ pub enum RawConfigureWarningsDelivery {
     Chat,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RawToolSurface {
-    Minimal,
-    Recommended,
-    All,
-}
-
-impl RawToolSurface {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Minimal => "minimal",
-            Self::Recommended => "recommended",
-            Self::All => "all",
-        }
-    }
+/// Raw `indexes` block; each switch keeps its presence until resolution.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawIndexes {
+    pub trigram: Option<bool>,
+    pub semantic: Option<bool>,
+    pub callgraph: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -374,6 +368,8 @@ pub enum RawBash {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RawBashFeatures {
+    /// Runtime gate for bash execution. Absent means on.
+    pub enabled: Option<bool>,
     pub rewrite: Option<bool>,
     pub compress: Option<bool>,
     pub background: Option<bool>,
@@ -526,7 +522,6 @@ impl RawWorktree {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawGithub {
-    pub enabled: Option<bool>,
     pub shim: Option<bool>,
     pub read: Option<bool>,
     pub write: Option<bool>,
@@ -535,15 +530,8 @@ pub struct RawGithub {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawGhShim {
-    pub enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
     pub binary_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct RawGhRead {
-    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -637,16 +625,71 @@ pub fn resolve_config_for_harness(
     tiers: &[ConfigTier],
     harness: Option<&Harness>,
 ) -> ResolveResult {
+    resolve_config_for_harness_with_phase(tiers, harness, feature_config::current_policy_phase())
+}
+
+/// [`resolve_config_for_harness`] with an explicit migration-policy phase, so
+/// tests can exercise both the translation window and post-window rejection.
+pub fn resolve_config_for_harness_with_phase(
+    tiers: &[ConfigTier],
+    harness: Option<&Harness>,
+    phase: PolicyPhase,
+) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut dropped = Vec::new();
     let mut warnings = Vec::new();
+    let mut errors = Vec::new();
 
+    let mut parsed = Vec::with_capacity(tiers.len());
     for tier in tiers {
-        let Some(mut raw) = parse_tier(tier) else {
+        let Some(outcome) = parse_tier(tier, phase) else {
             continue;
         };
-        apply_harness_override(&mut raw, harness, tier, &mut warnings);
-        apply_github_aliases(&mut raw, tier, &mut warnings);
+        let (raw, translation) = outcome;
+        errors.extend(translation.errors);
+        for warning in translation.warnings {
+            // Migration notices are delivered once per identity by the host
+            // plugin or CLI; the engine only records them in its log so the
+            // same notice is not re-delivered on every configure.
+            crate::slog_info!(
+                "config {} [{}]: {} ({})",
+                tier.tier,
+                warning.key,
+                warning.message,
+                warning.code
+            );
+        }
+        parsed.push((tier, raw));
+    }
+    if !errors.is_empty() {
+        errors.sort();
+        errors.dedup();
+        return ResolveResult {
+            config: Config::default(),
+            dropped,
+            warnings,
+            errors,
+        };
+    }
+
+    // The absent-base default applies exactly once, to the user base, before
+    // any harness override or tier merge. No user file behaves like `{}`.
+    let default_disabled = || {
+        feature_config::DEFAULT_DISABLED_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>()
+    };
+    if !parsed.iter().any(|(tier, _)| tier.tier == "user") {
+        merged.disabled_tools = Some(default_disabled());
+    }
+
+    for (tier, mut raw) in parsed {
+        let is_user = tier.tier == "user";
+        if is_user && raw.disabled_tools.is_none() {
+            raw.disabled_tools = Some(default_disabled());
+        }
+        apply_harness_override(&mut raw, harness, tier, is_user, &mut warnings);
         if let Some(RawEditMode::Unknown(value)) = raw.edit_mode.as_ref() {
             warnings.push(ConfigWarning {
                 code: "invalid_edit_mode",
@@ -657,7 +700,7 @@ pub fn resolve_config_for_harness(
             });
         }
 
-        if tier.tier == "user" {
+        if is_user {
             merge_trusted_config(&mut merged, raw);
         } else {
             record_project_drops(&raw, &tier.tier, &mut dropped);
@@ -666,13 +709,30 @@ pub fn resolve_config_for_harness(
     }
 
     let mut config = Config::default();
-    apply_resolved_config(&merged, &mut config, &mut warnings);
+    if let Err(missing) = apply_resolved_config(&merged, &mut config, &mut warnings) {
+        return ResolveResult {
+            config: Config::default(),
+            dropped,
+            warnings,
+            errors: missing,
+        };
+    }
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
     config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
+    let resolved = serde_json::to_value(&config).unwrap_or(Value::Null);
+    if let Err(invalid) = feature_config::validate_resolved_config(&resolved) {
+        return ResolveResult {
+            config: Config::default(),
+            dropped,
+            warnings,
+            errors: invalid,
+        };
+    }
     ResolveResult {
         config,
         dropped,
         warnings,
+        errors,
     }
 }
 
@@ -737,10 +797,24 @@ pub fn resolve_config_onto_with_diagnostics_for_harness(
         mut config,
         dropped,
         warnings,
+        errors,
     } = resolve_config_for_harness(tiers, harness);
+    if !errors.is_empty() {
+        // A rejected candidate never publishes: the caller keeps its last-good
+        // configuration.
+        return ResolveDiagnostics {
+            dropped,
+            warnings,
+            errors,
+        };
+    }
     carry_process_state(base, &mut config);
     *base = config;
-    ResolveDiagnostics { dropped, warnings }
+    ResolveDiagnostics {
+        dropped,
+        warnings,
+        errors,
+    }
 }
 
 /// Carry the process-state (non-`RawAftConfig`) fields from `base` onto a
@@ -755,7 +829,6 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.checkpoint_ttl_hours = base.checkpoint_ttl_hours;
     resolved.max_symbol_depth = base.max_symbol_depth;
     resolved.diagnostic_cache_size = base.diagnostic_cache_size;
-    resolved.aft_search_registered = base.aft_search_registered;
     resolved.max_background_bash_tasks = base.max_background_bash_tasks;
     resolved.bash_permissions = base.bash_permissions;
     resolved.search_index_max_file_size = base.search_index_max_file_size;
@@ -765,17 +838,24 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
 }
 
-fn parse_tier(tier: &ConfigTier) -> Option<RawAftConfig> {
+fn parse_tier(
+    tier: &ConfigTier,
+    phase: PolicyPhase,
+) -> Option<(RawAftConfig, feature_config::DocumentTranslation)> {
     let stripped = strip_jsonc(&tier.doc);
     let value = serde_json::from_str::<Value>(&stripped).ok()?;
-    let Value::Object(map) = value else {
+    let Value::Object(mut map) = value else {
         return None;
     };
+    // Retired keys are translated (or rejected) on the raw document, before
+    // the strict schema sees it, so they never reach `RawAftConfig`.
+    let translation = feature_config::translate_document(&mut map, phase);
 
-    match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
-        Ok(config) => Some(config),
-        Err(_) => Some(parse_config_partially(map)),
-    }
+    let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
+        Ok(config) => config,
+        Err(_) => parse_config_partially(map),
+    };
+    Some((raw, translation))
 }
 
 fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
@@ -792,56 +872,11 @@ fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
     partial
 }
 
-fn apply_github_aliases(
-    raw: &mut RawAftConfig,
-    tier: &ConfigTier,
-    warnings: &mut Vec<ConfigWarning>,
-) {
-    let legacy_shim = raw.gh_shim.as_ref().and_then(|legacy| legacy.enabled);
-    if let Some(value) = legacy_shim {
-        warnings.push(ConfigWarning {
-            code: "deprecated_config_key",
-            key: "gh_shim.enabled",
-            tier: tier.tier.clone(),
-            value: value.to_string(),
-            message: "gh_shim.enabled is deprecated; use github.shim instead (the alias is removed in v0.57.0)".to_string(),
-        });
-        let github = raw.github.get_or_insert_with(RawGithub::default);
-        if github.shim.is_none() {
-            github.shim = Some(value);
-        }
-        if let Some(legacy) = raw.gh_shim.as_mut() {
-            legacy.enabled = None;
-        }
-        if raw
-            .gh_shim
-            .as_ref()
-            .is_some_and(|legacy| legacy.binary_path.is_none())
-        {
-            raw.gh_shim = None;
-        }
-    }
-
-    if let Some(value) = raw.gh_read.as_ref().and_then(|legacy| legacy.enabled) {
-        warnings.push(ConfigWarning {
-            code: "deprecated_config_key",
-            key: "gh_read.enabled",
-            tier: tier.tier.clone(),
-            value: value.to_string(),
-            message: "gh_read.enabled is deprecated; use github.read instead (the alias is removed in v0.57.0)".to_string(),
-        });
-        let github = raw.github.get_or_insert_with(RawGithub::default);
-        if github.read.is_none() {
-            github.read = Some(value);
-        }
-        raw.gh_read = None;
-    }
-}
-
 fn apply_harness_override(
     raw: &mut RawAftConfig,
     harness: Option<&Harness>,
     tier: &ConfigTier,
+    trusted: bool,
     warnings: &mut Vec<ConfigWarning>,
 ) {
     let Some(overrides) = raw.harnesses.take() else {
@@ -879,7 +914,13 @@ fn apply_harness_override(
     }
 
     match serde_json::from_value::<RawAftConfig>(Value::Object(override_map)) {
-        Ok(override_config) => merge_trusted_config(raw, override_config),
+        Ok(mut override_config) => {
+            // A project harness block, like the project base, may only turn an
+            // index off; a user harness block overrides the user base.
+            let override_indexes = override_config.indexes.take();
+            merge_trusted_config(raw, override_config);
+            raw.indexes = merge_indexes(raw.indexes, override_indexes, !trusted);
+        }
         Err(_) => warnings.push(ConfigWarning {
             code: "invalid_harness_override",
             key: "harnesses",
@@ -897,9 +938,6 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.schema.is_some() {
         base.schema = override_config.schema;
-    }
-    if override_config.enabled.is_some() {
-        base.enabled = override_config.enabled;
     }
     if override_config.edit_mode.is_some() {
         base.edit_mode = override_config.edit_mode;
@@ -925,32 +963,18 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.configure_warnings_delivery.is_some() {
         base.configure_warnings_delivery = override_config.configure_warnings_delivery;
     }
-    if override_config.hoist_builtin_tools.is_some() {
-        base.hoist_builtin_tools = override_config.hoist_builtin_tools;
-    }
-    if override_config.tool_surface.is_some() {
-        base.tool_surface = override_config.tool_surface;
-    }
-    if override_config.disabled_tools.is_some() {
-        base.disabled_tools = override_config.disabled_tools;
-    }
+    // Disables only accumulate: a harness block adds to its base list and can
+    // never re-enable a base disable.
+    union_disabled_tools(&mut base.disabled_tools, override_config.disabled_tools);
     if override_config.restrict_to_project_root.is_some() {
         base.restrict_to_project_root = override_config.restrict_to_project_root;
     }
-    if override_config.search_index.is_some() {
-        base.search_index = override_config.search_index;
-    }
+    base.indexes = merge_indexes(base.indexes, override_config.indexes, false);
     if override_config.index.is_some() {
         base.index = override_config.index;
     }
-    if override_config.semantic_search.is_some() {
-        base.semantic_search = override_config.semantic_search;
-    }
     if override_config.views.is_some() {
         base.views = override_config.views;
-    }
-    if override_config.callgraph_store.is_some() {
-        base.callgraph_store = override_config.callgraph_store;
     }
     if override_config.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = override_config.callgraph_chunk_size;
@@ -972,9 +996,6 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.gh_shim.is_some() {
         base.gh_shim = override_config.gh_shim;
-    }
-    if override_config.gh_read.is_some() {
-        base.gh_read = override_config.gh_read;
     }
     if override_config.git.is_some() {
         base.git = override_config.git;
@@ -1013,9 +1034,6 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
 
 fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     // Project-safe shallow top-level fields.
-    if project.enabled.is_some() {
-        base.enabled = project.enabled;
-    }
     if project.edit_mode.is_some() {
         base.edit_mode = project.edit_mode;
     }
@@ -1028,23 +1046,10 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     if project.configure_warnings_delivery.is_some() {
         base.configure_warnings_delivery = project.configure_warnings_delivery;
     }
-    if project.hoist_builtin_tools.is_some() {
-        base.hoist_builtin_tools = project.hoist_builtin_tools;
-    }
-    if project.tool_surface.is_some() {
-        base.tool_surface = project.tool_surface;
-    }
-    if project.search_index.is_some() {
-        base.search_index = project.search_index;
-    }
-    if project.semantic_search.is_some() {
-        base.semantic_search = project.semantic_search;
-    }
+    // A project may switch an index off but never back on.
+    base.indexes = merge_indexes(base.indexes, project.indexes, true);
     if project.views.is_some() {
         base.views = project.views;
-    }
-    if project.callgraph_store.is_some() {
-        base.callgraph_store = project.callgraph_store;
     }
     if project.callgraph_chunk_size.is_some() {
         base.callgraph_chunk_size = project.callgraph_chunk_size;
@@ -1135,27 +1140,50 @@ fn merge_checker_map(
 }
 
 fn merge_disabled_tools(base: &mut Option<Vec<String>>, override_tools: Option<Vec<String>>) {
+    // Project disables of protected slots (aft_safety and the seven host tool
+    // names) are ignored; `record_project_drops` reports them.
+    union_disabled_tools(
+        base,
+        override_tools.map(|tools| {
+            tools
+                .into_iter()
+                .filter(|tool| !feature_config::is_project_protected_tool(tool))
+                .collect()
+        }),
+    );
+}
+
+/// Union two raw disabled lists, preserving presence: an explicit empty list
+/// on either side yields an explicit (possibly empty) result.
+fn union_disabled_tools(base: &mut Option<Vec<String>>, override_tools: Option<Vec<String>>) {
     let Some(override_tools) = override_tools else {
         return;
     };
-    let mut merged = Vec::new();
-    let mut seen = HashSet::new();
-    for tool in base.iter().flatten() {
-        if seen.insert(tool.clone()) {
-            merged.push(tool.clone());
-        }
-    }
-    for tool in override_tools.iter().filter(|tool| {
-        !matches!(
-            tool.as_str(),
-            "aft_safety" | "read" | "write" | "edit" | "apply_patch" | "grep" | "glob" | "bash"
-        )
-    }) {
-        if seen.insert(tool.clone()) {
-            merged.push(tool.clone());
-        }
-    }
-    *base = Some(merged);
+    let mut merged = base.take().unwrap_or_default();
+    merged.extend(override_tools);
+    *base = Some(feature_config::normalize_tool_list(merged));
+}
+
+/// Merge index switches. Trusted overrides replace each supplied leaf;
+/// restricted (project) overrides can only turn a leaf off.
+fn merge_indexes(
+    base: Option<RawIndexes>,
+    override_indexes: Option<RawIndexes>,
+    restricted: bool,
+) -> Option<RawIndexes> {
+    let Some(override_indexes) = override_indexes else {
+        return base;
+    };
+    let mut merged = base.unwrap_or_default();
+    let apply = |slot: &mut Option<bool>, value: Option<bool>| match value {
+        Some(false) => *slot = Some(false),
+        Some(true) if !restricted => *slot = Some(true),
+        _ => {}
+    };
+    apply(&mut merged.trigram, override_indexes.trigram);
+    apply(&mut merged.semantic, override_indexes.semantic);
+    apply(&mut merged.callgraph, override_indexes.callgraph);
+    Some(merged)
 }
 
 fn merge_semantic_config(
@@ -1277,6 +1305,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
             let base = expand_bash_for_merge(&base);
             let override_features = expand_bash_for_merge(&override_bash);
             Some(RawBash::Features(RawBashFeatures {
+                enabled: override_features.enabled.or(base.enabled),
                 rewrite: override_features.rewrite.or(base.rewrite),
                 compress: override_features.compress.or(base.compress),
                 background: override_features.background.or(base.background),
@@ -1308,7 +1337,10 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
 
 fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
     match value {
+        // A boolean expands to its sub-features only. The runtime gate is left
+        // unset so a later object tier decides it, matching the TypeScript merge.
         RawBash::Bool(enabled) => RawBashFeatures {
+            enabled: None,
             rewrite: Some(*enabled),
             compress: Some(*enabled),
             background: Some(*enabled),
@@ -1453,9 +1485,6 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.gh_shim.is_some() {
         push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
     }
-    if raw.gh_read.is_some() {
-        push_drop(dropped, "gh_read", tier, USER_ONLY_REASON);
-    }
     if raw
         .index
         .as_ref()
@@ -1479,12 +1508,19 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     ) {
         push_drop(dropped, "bash.linux_scope", tier, USER_ONLY_REASON);
     }
-    if raw
-        .disabled_tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|tool| tool == "aft_safety"))
-    {
-        push_drop(dropped, "disabled_tools.aft_safety", tier, USER_ONLY_REASON);
+    for tool in feature_config::normalize_tool_list(
+        raw.disabled_tools
+            .iter()
+            .flatten()
+            .filter(|tool| feature_config::is_project_protected_tool(tool))
+            .cloned(),
+    ) {
+        push_drop(
+            dropped,
+            &format!("disabled_tools.{tool}"),
+            tier,
+            PROTECTED_TOOL_REASON,
+        );
     }
 
     if let Some(semantic) = &raw.semantic {
@@ -1542,17 +1578,24 @@ fn apply_resolved_config(
     raw: &RawAftConfig,
     config: &mut Config,
     warnings: &mut Vec<ConfigWarning>,
-) {
+) -> Result<(), Vec<String>> {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
-    if let Some(value) = raw.hoist_builtin_tools {
-        config.hoist_builtin_tools = value;
-    }
-    if let Some(value) = raw.tool_surface {
-        config.tool_surface = value.as_str().to_string();
-    }
-    if let Some(value) = &raw.disabled_tools {
-        config.disabled_tools = value.clone();
-    }
+    // The user-base default has already been applied; an absent list here is
+    // a resolver bug and must not silently become an empty (all-enabled) list.
+    let Some(disabled_tools) = &raw.disabled_tools else {
+        return Err(vec![
+            "invalid_resolved_config:missing:disabled_tools".to_string()
+        ]);
+    };
+    config.disabled_tools = feature_config::normalize_tool_list(disabled_tools.iter().cloned());
+    config.aft_search_registered = config.tool_registered("aft_search");
+    let indexes = raw.indexes.unwrap_or_default();
+    let defaults = IndexesConfig::default();
+    config.indexes = IndexesConfig {
+        trigram: indexes.trigram.unwrap_or(defaults.trigram),
+        semantic: indexes.semantic.unwrap_or(defaults.semantic),
+        callgraph: indexes.callgraph.unwrap_or(defaults.callgraph),
+    };
     if let Some(value) = raw.format_on_edit {
         config.format_on_edit = value;
     }
@@ -1580,17 +1623,8 @@ fn apply_resolved_config(
     if let Some(value) = raw.restrict_to_project_root {
         config.restrict_to_project_root = value;
     }
-    if let Some(value) = raw.search_index {
-        config.search_index = value;
-    }
-    if let Some(value) = raw.semantic_search {
-        config.semantic_search = value;
-    }
     if let Some(value) = raw.views.as_ref().and_then(|views| views.enabled) {
         config.views.enabled = value;
-    }
-    if let Some(value) = raw.callgraph_store {
-        config.callgraph_store = value;
     }
     if let Some(value) = raw.callgraph_chunk_size {
         config.callgraph_chunk_size = value;
@@ -1604,12 +1638,11 @@ fn apply_resolved_config(
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
     config.github = resolve_github_config(raw.github.as_ref(), warnings);
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
-    config.gh_shim.enabled = config.github.shim;
-    config.gh_read.enabled = config.github.read;
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config, warnings);
+    Ok(())
 }
 
 fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning>) -> IndexConfig {
@@ -1905,9 +1938,6 @@ fn resolve_github_config(
     warnings: &mut Vec<ConfigWarning>,
 ) -> GithubConfig {
     let mut github = GithubConfig::default();
-    if let Some(value) = raw.and_then(|raw| raw.enabled) {
-        github.enabled = value;
-    }
     if let Some(value) = raw.and_then(|raw| raw.shim) {
         github.shim = value;
     }
@@ -1918,11 +1948,9 @@ fn resolve_github_config(
         github.write = value;
     }
 
-    if !github.enabled {
-        github.shim = false;
-        github.read = false;
-        github.write = false;
-    } else if github.write && !github.read {
+    // Write implies read; the legacy `github.enabled` master was translated
+    // into explicit leaves before this point.
+    if github.write && !github.read {
         github.read = true;
         warnings.push(ConfigWarning {
             code: "github_write_requires_read",
@@ -1939,9 +1967,6 @@ fn resolve_github_config(
 
 fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
     let mut gh_shim = GhShimConfig::default();
-    if let Some(value) = raw.and_then(|raw| raw.enabled) {
-        gh_shim.enabled = value;
-    }
     gh_shim.binary_path = raw
         .and_then(|raw| raw.binary_path.as_ref())
         .map(PathBuf::from);
@@ -2049,10 +2074,10 @@ struct ResolvedBashConfig {
 
 fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
     let bash = resolve_bash_config(raw, warnings);
-    // The plugins use `enabled` and `subagent_background` when registering bash
-    // capabilities. Rust resolves them only to accept and merge the same config;
-    // they do not control engine behavior.
-    let _registration_only = (bash.enabled, bash.subagent_background);
+    // `subagent_background` is plugin-owned; Rust resolves it only to accept
+    // and merge the same config.
+    let _plugin_only = bash.subagent_background;
+    config.bash.enabled = bash.enabled;
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
@@ -2079,8 +2104,6 @@ fn resolve_bash_config(
         .experimental
         .as_ref()
         .and_then(|experimental| experimental.bash.as_ref());
-    let surface = raw.tool_surface.unwrap_or(RawToolSurface::Recommended);
-    let surface_default_enabled = surface != RawToolSurface::Minimal;
 
     let top_features = match top {
         Some(RawBash::Features(features)) => Some(features),
@@ -2140,7 +2163,7 @@ fn resolve_bash_config(
             ..base
         },
         Some(RawBash::Features(features)) => ResolvedBashConfig {
-            enabled: true,
+            enabled: features.enabled.unwrap_or(true),
             rewrite: features.rewrite.unwrap_or(true),
             compress: features.compress.unwrap_or(true),
             background: features.background.unwrap_or(true),
@@ -2156,8 +2179,10 @@ fn resolve_bash_config(
                 let rewrite = legacy.rewrite == Some(true);
                 let compress = legacy.compress == Some(true);
                 let background = legacy.background == Some(true);
+                // The runtime gate stays on: only `bash: false` or
+                // `bash.enabled: false` switch it off.
                 return ResolvedBashConfig {
-                    enabled: rewrite || compress || background,
+                    enabled: true,
                     rewrite,
                     compress,
                     background,
@@ -2166,10 +2191,10 @@ fn resolve_bash_config(
             }
 
             ResolvedBashConfig {
-                enabled: surface_default_enabled,
-                rewrite: surface_default_enabled,
-                compress: surface_default_enabled,
-                background: surface_default_enabled,
+                enabled: true,
+                rewrite: true,
+                compress: true,
+                background: true,
                 ..base
             }
         }
@@ -2458,7 +2483,7 @@ mod tests {
             ),
         ]);
         // The valid project key (search_index) still applies via partial-parse...
-        assert!(!smuggle.config.search_index);
+        assert!(!smuggle.config.indexes.trigram);
         // ...but the smuggled process-state fields never reach Config.
         assert!(smuggle.config.storage_dir.is_none());
         assert!(!smuggle.config.bash_permissions);
@@ -2476,11 +2501,8 @@ mod tests {
         assert!(result.dropped.is_empty());
         // Non-bash fields stay at runtime default.
         assert_eq!(result.config.format_on_edit, default_config.format_on_edit);
-        assert_eq!(result.config.search_index, default_config.search_index);
-        assert_eq!(
-            result.config.semantic_search,
-            default_config.semantic_search
-        );
+        assert_eq!(result.config.indexes, default_config.indexes);
+        assert_eq!(result.config.disabled_tools, ["aft_delete", "aft_move"]);
         assert_eq!(result.config.semantic, default_config.semantic);
         assert_eq!(
             result.config.inspect.enabled,
@@ -2584,9 +2606,9 @@ mod tests {
             Some("tsc")
         );
         assert!(result.config.restrict_to_project_root);
-        assert!(result.config.search_index);
-        assert!(result.config.semantic_search);
-        assert!(!result.config.callgraph_store);
+        assert!(result.config.indexes.trigram);
+        assert!(result.config.indexes.semantic);
+        assert!(!result.config.indexes.callgraph);
         assert_eq!(result.config.callgraph_chunk_size, 17);
         assert!(result.config.url_fetch_allow_private);
         assert_eq!(
@@ -2672,8 +2694,41 @@ mod tests {
         let opencode = resolve_config_for_harness(&tiers, Some(&Harness::Opencode));
         let pi = resolve_config_for_harness(&tiers, Some(&Harness::Pi));
 
-        assert!(opencode.config.hoist_builtin_tools);
-        assert!(!pi.config.hoist_builtin_tools);
+        // The legacy hoist choice now translates into disabled host names. The
+        // user base (hoist false) already disables them; a harness block can
+        // only add disables, so the OpenCode `true` cannot re-enable them.
+        // The project's hoist false is ignored: host slots are protected from
+        // project disables.
+        let hosts_and_default = [
+            "aft_delete",
+            "aft_move",
+            "apply_patch",
+            "bash",
+            "edit",
+            "glob",
+            "grep",
+            "read",
+            "write",
+        ];
+        assert_eq!(opencode.config.disabled_tools, hosts_and_default);
+        assert_eq!(pi.config.disabled_tools, hosts_and_default);
+
+        let harness_only = [tier(
+            "user",
+            r#"{ "harnesses": { "pi": { "hoist_builtin_tools": false } } }"#,
+        )];
+        assert_eq!(
+            resolve_config_for_harness(&harness_only, Some(&Harness::Opencode))
+                .config
+                .disabled_tools,
+            ["aft_delete", "aft_move"]
+        );
+        assert_eq!(
+            resolve_config_for_harness(&harness_only, Some(&Harness::Pi))
+                .config
+                .disabled_tools,
+            hosts_and_default
+        );
     }
 
     #[test]
@@ -2745,43 +2800,50 @@ mod tests {
         let remains_disabled = resolve_config(&[
             tier(
                 "user",
-                r#"{"github":{"enabled":true,"shim":false,"read":false,"write":false}}"#,
+                r#"{"github":{"shim":false,"read":false,"write":false}}"#,
             ),
             tier(
                 "project",
-                r#"{"github":{"enabled":true,"shim":true,"read":true,"write":true}}"#,
+                r#"{"github":{"shim":true,"read":true,"write":true}}"#,
             ),
         ]);
-        assert!(remains_disabled.config.github.enabled);
         assert!(!remains_disabled.config.github.shim);
         assert!(!remains_disabled.config.github.read);
         assert!(!remains_disabled.config.github.write);
-        assert!(!remains_disabled.config.gh_shim.enabled);
-        assert!(!remains_disabled.config.gh_read.enabled);
         assert_eq!(drop_keys(&remains_disabled), vec!["github"]);
         assert_eq!(remains_disabled.dropped[0].tier, "project");
         assert_eq!(remains_disabled.dropped[0].reason, USER_ONLY_REASON);
     }
 
     #[test]
-    fn github_master_off_overrides_every_subfeature() {
-        let result = resolve_config(&[tier(
+    fn github_master_off_fills_absent_leaves_and_explicit_leaves_win() {
+        // The legacy master switch no longer vetoes explicit leaves: it only
+        // generates `false` for leaves the block leaves out.
+        let explicit = resolve_config(&[tier(
             "user",
             r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
         )]);
-
+        assert!(explicit.errors.is_empty());
         assert_eq!(
-            result.config.github,
+            explicit.config.github,
             GithubConfig {
-                enabled: false,
+                shim: true,
+                read: true,
+                write: true,
+            }
+        );
+
+        let master_only = resolve_config(&[tier("user", r#"{"github":{"enabled":false}}"#)]);
+        assert_eq!(
+            master_only.config.github,
+            GithubConfig {
                 shim: false,
                 read: false,
                 write: false,
             }
         );
-        assert!(!result.config.gh_shim.enabled);
-        assert!(!result.config.gh_read.enabled);
-        assert!(result.warnings.is_empty());
+        let master_true = resolve_config(&[tier("user", r#"{"github":{"enabled":true}}"#)]);
+        assert_eq!(master_true.config.github, GithubConfig::default());
     }
 
     #[test]
@@ -2801,54 +2863,47 @@ mod tests {
     }
 
     #[test]
-    fn github_legacy_aliases_apply_warn_and_lose_to_new_keys() {
-        let aliases = resolve_config(&[tier(
-            "user",
-            r#"{"gh_shim":{"enabled":false},"gh_read":{"enabled":true}}"#,
-        )]);
-        assert!(!aliases.config.github.shim);
-        assert!(aliases.config.github.read);
+    fn retired_github_aliases_reject_the_whole_load_even_beside_canonical_leaves() {
+        for doc in [
+            r#"{"gh_read":{"enabled":true}}"#,
+            r#"{"github":{"read":false},"gh_read":{"enabled":true}}"#,
+        ] {
+            let result = resolve_config(&[tier("user", doc)]);
+            assert_eq!(
+                result.errors,
+                vec!["removed_config_key:gh_read:use:github.read"]
+            );
+        }
+        let shim = resolve_config(&[tier("user", r#"{"gh_shim":{"enabled":false}}"#)]);
         assert_eq!(
-            aliases
-                .warnings
-                .iter()
-                .filter(|warning| warning.code == "deprecated_config_key")
-                .count(),
-            2
+            shim.errors,
+            vec!["removed_config_key:gh_shim:use:github.shim"]
         );
-        assert!(aliases.warnings.iter().any(|warning| {
-            warning.key == "gh_shim.enabled" && warning.message.contains("github.shim")
-        }));
-        assert!(aliases.warnings.iter().any(|warning| {
-            warning.key == "gh_read.enabled" && warning.message.contains("github.read")
-        }));
+        for phase in [PolicyPhase::Window, PolicyPhase::Rejecting] {
+            let project = resolve_config_for_harness_with_phase(
+                &[
+                    tier("user", r#"{"github":{"read":false}}"#),
+                    tier("project", r#"{"gh_read":{"enabled":true}}"#),
+                ],
+                None,
+                phase,
+            );
+            assert_eq!(
+                project.errors,
+                vec!["removed_config_key:gh_read:use:github.read"]
+            );
+        }
 
-        let new_keys_win = resolve_config(&[tier(
+        // The supported binary override alone is not a retired alias.
+        let binary = resolve_config(&[tier(
             "user",
-            r#"{
-              "github":{"shim":true,"read":false},
-              "gh_shim":{"enabled":false},
-              "gh_read":{"enabled":true}
-            }"#,
+            r#"{"gh_shim":{"binary_path":"/opt/aft/bin/aft"}}"#,
         )]);
-        assert!(new_keys_win.config.github.shim);
-        assert!(!new_keys_win.config.github.read);
-    }
-
-    #[test]
-    fn github_legacy_alias_at_project_tier_is_warned_and_ignored() {
-        let result = resolve_config(&[
-            tier("user", r#"{"github":{"read":false}}"#),
-            tier("project", r#"{"gh_read":{"enabled":true}}"#),
-        ]);
-
-        assert!(!result.config.github.read);
-        assert_eq!(drop_keys(&result), vec!["github"]);
-        assert!(result.warnings.iter().any(|warning| {
-            warning.key == "gh_read.enabled"
-                && warning.tier == "project"
-                && warning.message.contains("github.read")
-        }));
+        assert!(binary.errors.is_empty());
+        assert_eq!(
+            binary.config.gh_shim.binary_path,
+            Some(PathBuf::from("/opt/aft/bin/aft"))
+        );
     }
 
     #[test]
@@ -2871,7 +2926,7 @@ mod tests {
             r#"{"git":{"co_author":"not-an-identity"},"search_index":true}"#,
         )]);
         assert_eq!(invalid.config.git.co_author, "off");
-        assert!(invalid.config.search_index);
+        assert!(invalid.config.indexes.trigram);
     }
 
     #[test]
@@ -3097,14 +3152,48 @@ mod tests {
     }
 
     #[test]
-    fn config_resolve_project_allowed_search_index_wins() {
+    fn project_indexes_can_only_turn_an_index_off() {
+        // A project may switch an index off but never back on: its values AND
+        // with the user resolution (legacy keys translate first).
         let result = resolve_config(&[
             tier("user", r#"{ "search_index": false }"#),
             tier("project", r#"{ "search_index": true }"#),
         ]);
-
-        assert!(result.config.search_index);
+        assert!(!result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
+
+        let project_off = resolve_config(&[
+            tier("user", r#"{}"#),
+            tier(
+                "project",
+                r#"{ "indexes": { "semantic": false }, "harnesses": { "opencode": { "indexes": { "callgraph": false, "semantic": true } } } }"#,
+            ),
+        ]);
+        assert!(project_off.config.indexes.trigram);
+        let opencode = resolve_config_for_harness(
+            &[
+                tier("user", r#"{}"#),
+                tier(
+                    "project",
+                    r#"{ "indexes": { "semantic": false }, "harnesses": { "opencode": { "indexes": { "callgraph": false, "semantic": true } } } }"#,
+                ),
+            ],
+            Some(&Harness::Opencode),
+        );
+        assert!(!opencode.config.indexes.semantic);
+        assert!(!opencode.config.indexes.callgraph);
+        assert!(!project_off.config.indexes.semantic);
+        assert!(project_off.config.indexes.callgraph);
+
+        // A user harness block overrides the user base in either direction.
+        let user_harness = resolve_config_for_harness(
+            &[tier(
+                "user",
+                r#"{ "indexes": { "trigram": false }, "harnesses": { "pi": { "indexes": { "trigram": true } } } }"#,
+            )],
+            Some(&Harness::Pi),
+        );
+        assert!(user_harness.config.indexes.trigram);
     }
 
     #[test]
@@ -3335,8 +3424,31 @@ mod tests {
         ]);
         assert!(result.config.disabled_tools.is_empty());
 
+        // The absent-base default applies to the user base only (no user file
+        // behaves like `{}`); an empty project list adds nothing to it.
         let project_only = resolve_config(&[tier("project", r#"{ "disabled_tools": [] }"#)]);
-        assert!(project_only.config.disabled_tools.is_empty());
+        assert_eq!(
+            project_only.config.disabled_tools,
+            ["aft_delete", "aft_move"]
+        );
+
+        let user_empty_project_zoom = resolve_config(&[
+            tier("user", r#"{ "disabled_tools": [] }"#),
+            tier("project", r#"{ "disabled_tools": ["aft_zoom"] }"#),
+        ]);
+        assert_eq!(user_empty_project_zoom.config.disabled_tools, ["aft_zoom"]);
+
+        for doc in [None, Some("{}")] {
+            let tiers: Vec<ConfigTier> = doc.map(|doc| tier("user", doc)).into_iter().collect();
+            assert_eq!(
+                resolve_config(&tiers).config.disabled_tools,
+                ["aft_delete", "aft_move"]
+            );
+        }
+        let search_only =
+            resolve_config(&[tier("user", r#"{ "disabled_tools": ["aft_search"] }"#)]);
+        assert_eq!(search_only.config.disabled_tools, ["aft_search"]);
+        assert!(!search_only.config.aft_search_registered);
     }
 
     #[test]
@@ -3348,7 +3460,15 @@ mod tests {
                 r#"{ "disabled_tools": ["read", "bash", "aft_safety", "aft_zoom"] }"#,
             ),
         ]);
-        assert_eq!(result.config.disabled_tools, ["write", "aft_zoom"]);
+        assert_eq!(result.config.disabled_tools, ["aft_zoom", "write"]);
+        let dropped = drop_keys(&result);
+        for key in [
+            "disabled_tools.aft_safety",
+            "disabled_tools.bash",
+            "disabled_tools.read",
+        ] {
+            assert!(dropped.contains(&key.to_string()), "{key}");
+        }
     }
 
     #[test]
@@ -3399,11 +3519,24 @@ mod tests {
         assert!(surface_default_result.config.experimental_bash_compress);
         assert!(surface_default_result.config.experimental_bash_background);
 
+        // The legacy minimal surface no longer switches the bash runtime off; it
+        // unregisters bash and its companions through disabled_tools instead.
         let minimal_surface_result =
             resolve_config(&[tier("user", r#"{ "tool_surface": "minimal" }"#)]);
-        assert!(!minimal_surface_result.config.experimental_bash_rewrite);
-        assert!(!minimal_surface_result.config.experimental_bash_compress);
-        assert!(!minimal_surface_result.config.experimental_bash_background);
+        assert!(minimal_surface_result.config.bash.enabled);
+        assert!(minimal_surface_result.config.experimental_bash_rewrite);
+        assert!(minimal_surface_result
+            .config
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "bash"));
+
+        assert!(!false_result.config.bash.enabled);
+        assert!(true_result.config.bash.enabled);
+        assert!(object_default_result.config.bash.enabled);
+        let explicit_off = resolve_config(&[tier("user", r#"{ "bash": { "enabled": false } }"#)]);
+        assert!(!explicit_off.config.bash.enabled);
+        assert!(explicit_off.config.experimental_bash_rewrite);
 
         let merged_result = resolve_config(&[
             tier("user", r#"{ "bash": true }"#),
@@ -3424,10 +3557,13 @@ mod tests {
 
     #[test]
     fn config_resolve_bash_foreground_wait_clamps_to_floor() {
-        let Some(raw) = parse_tier(&tier(
-            "user",
-            r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
-        )) else {
+        let Some((raw, _)) = parse_tier(
+            &tier(
+                "user",
+                r#"{ "bash": { "foreground_wait_window_ms": 1, "subagent_background": true } }"#,
+            ),
+            PolicyPhase::Window,
+        ) else {
             panic!("test tier should parse");
         };
         let mut warnings = Vec::new();
@@ -3471,7 +3607,7 @@ mod tests {
             }"#,
         )]);
 
-        assert!(result.config.search_index);
+        assert!(result.config.indexes.trigram);
         assert!(!result.config.format_on_edit);
         assert_eq!(result.config.semantic, SemanticBackendConfig::default());
         assert!(result.dropped.is_empty());
@@ -3484,7 +3620,7 @@ mod tests {
             r#"{ "not_a_real_key": true, "search_index": true }"#,
         )]);
 
-        assert!(result.config.search_index);
+        assert!(result.config.indexes.trigram);
         assert!(result.dropped.is_empty());
     }
 
@@ -3530,7 +3666,10 @@ mod tests {
             config.lsp_servers.is_empty(),
             "lsp_servers must reset to default, not inherit prior bind's custom server"
         );
-        assert!(config.search_index, "this bind's own field still applies");
+        assert!(
+            config.indexes.trigram,
+            "this bind's own field still applies"
+        );
     }
 
     #[test]
@@ -3580,7 +3719,7 @@ mod tests {
             config.project_root,
             Some(std::path::PathBuf::from("/tmp/proj"))
         );
-        assert!(config.search_index);
+        assert!(config.indexes.trigram);
     }
 
     #[test]
@@ -3670,7 +3809,7 @@ mod tests {
             }"#,
         )]);
 
-        assert!(result.config.search_index);
+        assert!(result.config.indexes.trigram);
         assert_eq!(
             result.config.formatter.get("rust").map(String::as_str),
             Some("rustfmt")
