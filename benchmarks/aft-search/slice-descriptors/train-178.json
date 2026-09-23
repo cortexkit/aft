@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "standalone-validate-off-loop",
+    "gh-shim-not-planned",
+    "v0.57.2-notes"
+  ],
+  "note": "The standalone loop runs the edit type-checker wait off the request thread so status stays responsive, the gh shim accepts the \"not planned\" close reason spelling, and the v0.57.2 release notes. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
