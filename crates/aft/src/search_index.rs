@@ -6096,20 +6096,32 @@ pub fn ignore_rules_fingerprint(project_root: &Path) -> String {
             files.push(global_ignore);
         }
     }
+    // Each entry pairs the name the file is hashed under with where it is
+    // read from. The two differ only for the repository's `info/exclude`.
+    let mut files: Vec<(PathBuf, PathBuf)> =
+        files.into_iter().map(|path| (path.clone(), path)).collect();
     let info_exclude = git_info_exclude_path(&root);
     if info_exclude.is_file() {
-        files.push(info_exclude);
+        // `info/exclude` lives in the git directory shared by the home
+        // checkout and all of its linked worktrees: inside the home checkout's
+        // root but outside every worktree's. Hashing its real location would
+        // make identical rules fingerprint differently per checkout, so it is
+        // always hashed as `<root>/.git/info/exclude`. That is exactly the
+        // name the home checkout's top level has always used, which keeps
+        // fingerprints of existing top-level artifacts unchanged. Its content
+        // is still read from the real file and still drives the fingerprint.
+        files.push((root.join(".git").join("info").join("exclude"), info_exclude));
     }
     files.sort();
     files.dedup();
 
     let mut hasher = Sha256::new();
     hasher.update(b"aft-ignore-rules-v1\0");
-    for path in files {
-        if let Some(relative) = cache_relative_path(&root, &path) {
+    for (identity, path) in files {
+        if let Some(relative) = cache_relative_path(&root, &identity) {
             hasher.update(relative.to_string_lossy().as_bytes());
         } else {
-            hasher.update(path.to_string_lossy().as_bytes());
+            hasher.update(identity.to_string_lossy().as_bytes());
         }
         hasher.update(b"\0");
         match fs::read(&path) {

@@ -894,6 +894,69 @@ mod tests {
         assert!(SearchIndex::read_from_disk(&cache_dir, &root).is_none());
     }
 
+    fn linked_worktree(root: &Path) -> (TempDir, PathBuf) {
+        let temp = tempfile::tempdir().expect("create worktree dir");
+        let worktree = temp.path().join("wt");
+        let status = git_command(root)
+            .args(["worktree", "add", "-q", "--detach"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .expect("git worktree add");
+        assert!(status.success(), "git worktree add failed");
+        let worktree = fs::canonicalize(worktree).expect("canonical worktree root");
+        (temp, worktree)
+    }
+
+    fn write_info_exclude(root: &Path, contents: &str) {
+        let exclude = root.join(".git/info/exclude");
+        fs::create_dir_all(exclude.parent().expect("info dir")).expect("create info dir");
+        fs::write(exclude, contents).expect("write info/exclude");
+    }
+
+    /// `.git/info/exclude` is shared by the home checkout and its worktrees but
+    /// sits inside only the home checkout's root. Its location alone must not
+    /// make a worktree's borrow look like an ignore-rule difference.
+    #[test]
+    fn linked_worktree_borrow_is_fresh_when_ignore_rules_match() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        write_info_exclude(&root, "*.local\n");
+        let storage = tempfile::tempdir().expect("storage");
+        build_search_artifact(&root, storage.path());
+        let (_wt_dir, worktree) = linked_worktree(&root);
+
+        match open_search_index_read_only(&worktree, Some(storage.path())) {
+            ReadOnlyArtifact::Fresh(index) => {
+                assert!(index.path_to_id.contains_key(&worktree.join("src/lib.rs")));
+            }
+            other => panic!("expected a fresh borrowed artifact, got {other:?}"),
+        }
+        assert_eq!(
+            crate::search_index::ignore_rules_fingerprint(&root),
+            crate::search_index::ignore_rules_fingerprint(&worktree)
+        );
+    }
+
+    /// The shared `info/exclude` content still drives the fingerprint: edited
+    /// rules must be reported to a borrower and refused by the owner.
+    #[test]
+    fn info_exclude_content_change_is_still_an_ignore_rule_difference() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, root) = fixture_project();
+        write_info_exclude(&root, "*.local\n");
+        let storage = tempfile::tempdir().expect("storage");
+        let cache_dir = build_search_artifact(&root, storage.path());
+        let (_wt_dir, worktree) = linked_worktree(&root);
+        write_info_exclude(&root, "*.local\n*.generated\n");
+
+        match open_search_index_read_only(&worktree, Some(storage.path())) {
+            ReadOnlyArtifact::Stale(stale) => assert!(stale.ignore_rules_differ),
+            other => panic!("expected a stale borrowed artifact, got {other:?}"),
+        }
+        assert!(SearchIndex::read_from_disk(&cache_dir, &root).is_none());
+    }
+
     #[test]
     fn read_only_openers_never_modify_artifact_directory() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
