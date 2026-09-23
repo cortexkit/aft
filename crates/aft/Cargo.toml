@@ -134,9 +134,9 @@ htmd = "0.5.4"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-subc-protocol = "=0.22.0"
-subc-transport = "=0.7.1"
-subc-client-rs = "=0.15.4"
+subc-protocol = "=0.23.0"
+subc-transport = "=0.7.2"
+subc-client-rs = "=0.15.6"
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 vt100 = "0.16"
 
