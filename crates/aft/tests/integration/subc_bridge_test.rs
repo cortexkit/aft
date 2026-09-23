@@ -1813,6 +1813,12 @@ where
 }
 
 async fn accept_client_hello_then_close(listener: &TcpListener) {
+    drop(accept_client_hello(listener).await);
+}
+
+/// Accept one attach attempt and read its ClientHello, returning the still-open
+/// stream so the caller decides when the client sees the close.
+async fn accept_client_hello(listener: &TcpListener) -> tokio::net::TcpStream {
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
     let mut len_bytes = [0_u8; 4];
     stream
@@ -1830,7 +1836,7 @@ async fn accept_client_hello_then_close(listener: &TcpListener) {
         .await
         .expect("read ClientHello body");
     serde_json::from_slice::<subc_transport::ClientHello>(&body).expect("decode ClientHello");
-    drop(stream);
+    stream
 }
 
 async fn complete_initial_attach(
@@ -1959,7 +1965,11 @@ fn subc_initial_attach_rereads_rewritten_connection_file() {
         "subc_initial_attach_rereads_rewritten_connection_file",
         Duration::from_secs(10),
         |mut input| async move {
-            accept_client_hello_then_close(&input.listener).await;
+            // Hold the first attempt open until the connection file names the
+            // replacement. Closing it first let the client's retry race the
+            // rewrite: on a slow runner it re-read the old endpoint, connected to
+            // the unattended old listener and burned a second retry.
+            let first_attempt = accept_client_hello(&input.listener).await;
 
             let replacement =
                 StdTcpListener::bind("127.0.0.1:0").expect("bind replacement fake daemon");
@@ -1987,6 +1997,7 @@ fn subc_initial_attach_rereads_rewritten_connection_file() {
                 },
             )
             .expect("rewrite connection file");
+            drop(first_attempt);
 
             // Keep the old endpoint open but unattended. Success on the replacement
             // proves the retry read the newly published endpoint instead of reusing it.
