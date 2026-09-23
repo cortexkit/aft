@@ -90,6 +90,90 @@ const TERMINAL_TASK_STATES = new Set([
   "timed_out",
 ]);
 
+/** How long an interrupted call's task has to be settled by the product itself. */
+export const INTERRUPTION_BUDGET_MS = 5_000;
+
+export interface AbortSettlementEvidence {
+  task_id: string;
+  /** Whether the task row reached a terminal state before the harness stopped anything. */
+  settled: boolean;
+  elapsed_ms: number;
+  task?: TaskState;
+  observed: TaskState[];
+  probe_errors: number;
+  last_probe_error?: string;
+}
+
+/**
+ * Wait, up to `deadlineAt`, for the task an interruption targeted to be ended
+ * by the product itself.
+ *
+ * Interrupting a session only stops the host's tool fiber: the host answers the
+ * interrupt and lets its client exit without waiting for the plugin, which
+ * sends its own `bash_abort_inflight` afterwards and keeps retrying it until
+ * Rust reports the task killed. Stopping the host and the task's process group
+ * as soon as the client exits kills the task before that request lands, and
+ * the row then records the harness's kill instead of the product's. The wait
+ * ends as soon as the row is terminal; a row that is still running at the
+ * deadline is left for the normal cleanup, and the scenario's own assertion
+ * reports it.
+ */
+export async function waitForAbortSettlement(
+  probe: TaskProbe,
+  taskId: string,
+  deadlineAt: number,
+): Promise<AbortSettlementEvidence> {
+  const startedAt = Date.now();
+  let observed: TaskState[] = [];
+  let probeErrors = 0;
+  let lastProbeError: string | undefined;
+
+  for (;;) {
+    try {
+      observed = await probe.states();
+    } catch (error) {
+      probeErrors += 1;
+      lastProbeError = error instanceof Error ? error.message : String(error);
+    }
+    const task = observed.find((candidate) => candidate.id === taskId);
+    const settled = task !== undefined && TERMINAL_TASK_STATES.has(task.status);
+    if (settled || Date.now() >= deadlineAt) {
+      return {
+        task_id: taskId,
+        settled,
+        elapsed_ms: Date.now() - startedAt,
+        task,
+        observed,
+        probe_errors: probeErrors,
+        last_probe_error: lastProbeError,
+      };
+    }
+    await Bun.sleep(Math.max(0, Math.min(25, deadlineAt - Date.now())));
+  }
+}
+
+/**
+ * The failure for an interrupted scenario whose task rows do not show the
+ * product's abort, or `undefined` when one of them does. A scenario that
+ * started no task has nothing to show.
+ */
+export function callAbortedFailure(
+  scenarioId: string,
+  termination: QuiescenceEvidence,
+  settlement?: AbortSettlementEvidence,
+): Error | undefined {
+  if (termination.tasks.length === 0) return undefined;
+  if (termination.tasks.some((task) => task.status_reason === "call_aborted")) return undefined;
+  const settledNote = settlement
+    ? settlement.settled
+      ? `; task ${settlement.task_id} ended as ${settlement.task?.status ?? "unknown"} without it`
+      : `; task ${settlement.task_id} was still ${settlement.task?.status ?? "absent"} ${settlement.elapsed_ms}ms into the interruption budget, so the harness stopped it`
+    : "";
+  return new Error(
+    `${scenarioId}: Rust task row did not record status_reason call_aborted${settledNote}`,
+  );
+}
+
 /**
  * Whether any member of a process group is still a process that can run.
  *

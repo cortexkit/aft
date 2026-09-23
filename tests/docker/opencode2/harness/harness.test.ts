@@ -47,9 +47,12 @@ import {
   sessionPermissionRules,
 } from "./permission-plan.js";
 import {
+  callAbortedFailure,
   ProcessObserver,
   processGroupRunning,
   type TaskProbe,
+  type TaskState,
+  waitForAbortSettlement,
   waitForTaskStatus,
 } from "./process-observer.js";
 import { readPinnedV1HostVersion } from "./pin.js";
@@ -2062,5 +2065,96 @@ describe("the run reports a verdict for every row", () => {
     expect(parentDisposition("expected_fail:https://example.invalid/1", [unparsedOutput])).toBe(
       "expected_fail",
     );
+  });
+});
+
+/**
+ * Stands in for the task registry while an interrupted foreground call is
+ * being aborted. The interrupt has already been answered and the host's client
+ * has exited; the plugin's own abort reaches Rust `abortLandsAfterMs` later and
+ * records `call_aborted`. If the harness stops the task first (the probe's
+ * `cancel`, which signals the task's process group), the task dies of that
+ * signal instead and its row carries no abort reason, which is what the
+ * failing CI rows recorded.
+ */
+class InterruptedForegroundTask implements TaskProbe {
+  readonly id = "bash-interrupted";
+  readonly abortLandsAt: number;
+  harnessKilledFirst = false;
+
+  constructor(abortLandsAfterMs: number) {
+    this.abortLandsAt = Date.now() + abortLandsAfterMs;
+  }
+
+  async states(): Promise<TaskState[]> {
+    if (this.harnessKilledFirst) return [{ id: this.id, status: "killed" }];
+    if (Date.now() >= this.abortLandsAt) {
+      return [{ id: this.id, status: "killed", status_reason: "call_aborted" }];
+    }
+    return [{ id: this.id, status: "running" }];
+  }
+
+  async cancel(id: string): Promise<void> {
+    const [task] = await this.states();
+    if (id === this.id && task?.status === "running") this.harnessKilledFirst = true;
+  }
+}
+
+/** The driver's teardown after an interrupted row's host has exited. */
+async function tearDownInterruptedRow(probe: InterruptedForegroundTask, deadlineAt: number) {
+  const settlement = await waitForAbortSettlement(probe, probe.id, deadlineAt);
+  const termination = await new ProcessObserver("bash/T4/abort", probe).cleanupAndConfirm(1_000);
+  const failure = callAbortedFailure("bash/T4/abort", termination, settlement);
+  return { settlement, termination, failure };
+}
+
+describe("interrupted foreground task teardown", () => {
+  // Each delay is how long after the host's client exits the plugin's abort
+  // lands. Zero is the ordering a quiet machine produces; the others are the
+  // ordering a loaded runner produced, injected here instead of hoped for.
+  for (const abortLandsAfterMs of [0, 30, 150, 600, 1_500]) {
+    test(`an abort landing ${abortLandsAfterMs}ms after the host exits is what the row records`, async () => {
+      const probe = new InterruptedForegroundTask(abortLandsAfterMs);
+      const { settlement, termination, failure } = await tearDownInterruptedRow(
+        probe,
+        Date.now() + 5_000,
+      );
+
+      expect(probe.harnessKilledFirst).toBe(false);
+      expect(settlement.settled).toBe(true);
+      expect(termination.tasks).toEqual([
+        { id: probe.id, status: "killed", status_reason: "call_aborted" },
+      ]);
+      expect(failure).toBeUndefined();
+    });
+  }
+
+  test("an abort that never lands still fails the row once the budget is spent", async () => {
+    const probe = new InterruptedForegroundTask(60_000);
+    const startedAt = Date.now();
+    const { settlement, termination, failure } = await tearDownInterruptedRow(
+      probe,
+      startedAt + 200,
+    );
+
+    expect(settlement.settled).toBe(false);
+    expect(settlement.task?.status).toBe("running");
+    // The harness still stops the task itself once the budget is gone.
+    expect(probe.harnessKilledFirst).toBe(true);
+    expect(termination.stopped).toBe(true);
+    expect(failure?.message).toContain("did not record status_reason call_aborted");
+    expect(failure?.message).toContain("so the harness stopped it");
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+  });
+
+  test("a row with no task has nothing to prove", () => {
+    const termination = {
+      started_at: "",
+      completed_at: "",
+      tasks: [],
+      processes: [],
+      stopped: true,
+    };
+    expect(callAbortedFailure("bash/T4/abort", termination)).toBeUndefined();
   });
 });

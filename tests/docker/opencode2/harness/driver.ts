@@ -42,7 +42,14 @@ import {
   sessionPermissionRules,
 } from "./permission-plan.js";
 import { readPinnedHostVersion, readPinnedV1HostVersion } from "./pin.js";
-import { ProcessObserver, waitForTaskStatus } from "./process-observer.js";
+import {
+  type AbortSettlementEvidence,
+  callAbortedFailure,
+  INTERRUPTION_BUDGET_MS,
+  ProcessObserver,
+  waitForAbortSettlement,
+  waitForTaskStatus,
+} from "./process-observer.js";
 import { reportTable } from "./report.js";
 import { AftTaskProbe } from "./task-probe.js";
 import { assertComparison, assertT6Trailer, projectText } from "./projection.js";
@@ -513,6 +520,9 @@ async function runOneScenario(options: {
   const observedTexts: Record<string, string> = {};
   let restoreCalls: ToolCallPlan[] = [];
   let abortIssuedAt: number | undefined;
+  // The task an abort control was gated on, so teardown can let the product
+  // end that task before the harness stops anything.
+  let abortTargetTaskId: string | undefined;
   let hostCompletedAt: number | undefined;
   const controlPathValues: Record<string, string> = {};
   const permissionRules = sessionPermissionRules(scenario);
@@ -710,6 +720,7 @@ async function runOneScenario(options: {
                 control.wait_for_task.timeout_ms,
               );
               controlPathValues.task_id = readiness.task.id;
+              if (control.purpose === "abort") abortTargetTaskId = readiness.task.id;
               await forensics.writeJson(`control-${control.id}-task-readiness.json`, readiness);
             }
             await discoverActiveSessionId(control, controlPathValues, apiOptions);
@@ -922,10 +933,10 @@ async function runOneScenario(options: {
     await Promise.all(controlPromises);
     if (
       scenario.trajectory === "T4" &&
-      (abortIssuedAt === undefined || hostCompletedAt - abortIssuedAt > 5_000)
+      (abortIssuedAt === undefined || hostCompletedAt - abortIssuedAt > INTERRUPTION_BUDGET_MS)
     ) {
       throw new Error(
-        `${scenario.id}: interruption exceeded 5s (${String(
+        `${scenario.id}: interruption exceeded ${INTERRUPTION_BUDGET_MS / 1_000}s (${String(
           abortIssuedAt === undefined ? "abort not issued" : hostCompletedAt - abortIssuedAt,
         )})`,
       );
@@ -983,6 +994,29 @@ async function runOneScenario(options: {
   } finally {
     if (transportDeadStub) await pointTransportDeadStub(transportDeadStub, false);
     await Promise.allSettled(controlPromises);
+    // The host's client exits as soon as the interrupt is answered, while the
+    // plugin's abort of the foreground task is still on its way to Rust. The
+    // task and the host stay up until that abort has had the interruption
+    // budget to land; stopping them any earlier is the harness killing the task
+    // and then reading its own kill back as the product's.
+    let abortSettlement: AbortSettlementEvidence | undefined;
+    if (
+      scenario.trajectory === "T4" &&
+      taskProbe &&
+      abortTargetTaskId !== undefined &&
+      abortIssuedAt !== undefined
+    ) {
+      try {
+        abortSettlement = await waitForAbortSettlement(
+          taskProbe,
+          abortTargetTaskId,
+          abortIssuedAt + INTERRUPTION_BUDGET_MS,
+        );
+        await forensics.writeJson("abort-settlement.json", abortSettlement);
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
     if (mock) {
       try {
         await forensics.writeExchanges(mock.exchanges);
@@ -1041,14 +1075,9 @@ async function runOneScenario(options: {
           recordFailure(error);
         }
       }
-      if (
-        scenario.trajectory === "T4" &&
-        termination.tasks.length > 0 &&
-        !termination.tasks.some((task) => task.status_reason === "call_aborted")
-      ) {
-        recordFailure(
-          new Error(`${scenario.id}: Rust task row did not record status_reason call_aborted`),
-        );
+      if (scenario.trajectory === "T4") {
+        const failure = callAbortedFailure(scenario.id, termination, abortSettlement);
+        if (failure) recordFailure(failure);
       }
       if (disk) {
         // A rejected permission ends the run at the gated call, so no later
