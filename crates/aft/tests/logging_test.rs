@@ -103,7 +103,13 @@ fn malformed_request_body_leaves_no_trace_in_the_log() {
     assert!(parse_line.contains(&expected_bytes), "{parse_line}");
     assert!(parse_line.contains("sha256="), "{parse_line}");
     for marker in ["CMD_MARKER_5150", content_marker, "internal.example"] {
-        assert!(!contents.contains(marker), "log file leaked {marker}:\n{contents}");
-        assert!(!stderr.contains(marker), "stderr leaked {marker}:\n{stderr}");
+        assert!(
+            !contents.contains(marker),
+            "log file leaked {marker}:\n{contents}"
+        );
+        assert!(
+            !stderr.contains(marker),
+            "stderr leaked {marker}:\n{stderr}"
+        );
     }
 }

@@ -64,15 +64,18 @@ static CREDENTIAL_QUERY: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 /// `key=` is too generic to mask on its name alone; see [`looks_like_secret`].
-static KEY_QUERY: LazyLock<Regex> =
-    LazyLock::new(|| compile(r#"(?i)([?&]key=)([^&\s#"'<>]+)"#));
+static KEY_QUERY: LazyLock<Regex> = LazyLock::new(|| compile(r#"(?i)([?&]key=)([^&\s#"'<>]+)"#));
 
 /// Mask credentials in `text`. Returns the input unchanged (borrowed) when it
 /// contains nothing to mask, so the common case allocates nothing.
 pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     let mut out = Cow::Borrowed(text);
     if contains_ignore_ascii_case(text, "authorization") {
-        out = replace_in(out, &AUTHORIZATION_HEADER, format!("${{1}}{SECRET_PLACEHOLDER}"));
+        out = replace_in(
+            out,
+            &AUTHORIZATION_HEADER,
+            format!("${{1}}{SECRET_PLACEHOLDER}"),
+        );
     }
     if text.contains("github_pat_") {
         out = replace_in(out, &GITHUB_PAT, SECRET_PLACEHOLDER);
@@ -86,7 +89,10 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
     if text.contains("eyJ") {
         out = replace_in(out, &JWT, SECRET_PLACEHOLDER);
     }
-    if text.contains('A') {
+    if ["AKIA", "ASIA", "AGPA", "AIDA", "AROA"]
+        .iter()
+        .any(|prefix| text.contains(prefix))
+    {
         out = replace_in(out, &AWS_ACCESS_KEY_ID, SECRET_PLACEHOLDER);
     }
     if text.contains("://") {
@@ -97,7 +103,11 @@ pub fn aft_redactor(text: &str) -> Cow<'_, str> {
         );
     }
     if text.contains('=') && (text.contains('?') || text.contains('&')) {
-        out = replace_in(out, &CREDENTIAL_QUERY, format!("${{1}}{SECRET_PLACEHOLDER}"));
+        out = replace_in(
+            out,
+            &CREDENTIAL_QUERY,
+            format!("${{1}}{SECRET_PLACEHOLDER}"),
+        );
         out = replace_in(out, &KEY_QUERY, |caps: &Captures<'_>| {
             if looks_like_secret(&caps[2]) {
                 format!("{}{SECRET_PLACEHOLDER}", &caps[1])
@@ -133,11 +143,7 @@ pub fn truncate_for_log(text: &str, max_bytes: usize) -> Cow<'_, str> {
     while !text.is_char_boundary(cut) {
         cut -= 1;
     }
-    Cow::Owned(format!(
-        "{}…(+{} bytes)",
-        &text[..cut],
-        text.len() - cut
-    ))
+    Cow::Owned(format!("{}…(+{} bytes)", &text[..cut], text.len() - cut))
 }
 
 /// Describe a request line that must not itself be logged: its byte length and
@@ -145,7 +151,10 @@ pub fn truncate_for_log(text: &str, max_bytes: usize) -> Cow<'_, str> {
 pub fn unlogged_input_summary(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(input.as_bytes());
-    let short: String = digest[..6].iter().map(|byte| format!("{byte:02x}")).collect();
+    let short: String = digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     format!("bytes={} sha256={short}", input.len())
 }
 
@@ -211,7 +220,12 @@ mod tests {
         let fixture = fixture();
         assert!(!fixture.masked.is_empty());
         for case in fixture.masked {
-            assert_eq!(aft_redactor(&case.input), case.expected, "input: {}", case.input);
+            assert_eq!(
+                aft_redactor(&case.input),
+                case.expected,
+                "input: {}",
+                case.input
+            );
         }
     }
 
@@ -230,7 +244,11 @@ mod tests {
         let body = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         for prefix in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
             let line = format!("token {prefix}{body} end");
-            assert_eq!(aft_redactor(&line), "token <REDACTED_SECRET> end", "{prefix}");
+            assert_eq!(
+                aft_redactor(&line),
+                "token <REDACTED_SECRET> end",
+                "{prefix}"
+            );
         }
         assert_eq!(
             aft_redactor("x github_pat_11AB_cd34 y"),
@@ -272,8 +290,14 @@ mod tests {
             aft_redactor("jwt eyJhbGciOi.eyJzdWIiOi.c2lnbmF0dXJl end"),
             "jwt <REDACTED_SECRET> end"
         );
-        assert_eq!(aft_redactor("key sk-live-abcdefgh123"), "key <REDACTED_SECRET>");
-        assert_eq!(aft_redactor("id AKIAABCDEFGHIJKLMNOP"), "id <REDACTED_SECRET>");
+        assert_eq!(
+            aft_redactor("key sk-live-abcdefgh123"),
+            "key <REDACTED_SECRET>"
+        );
+        assert_eq!(
+            aft_redactor("id AKIAABCDEFGHIJKLMNOP"),
+            "id <REDACTED_SECRET>"
+        );
     }
 
     #[test]

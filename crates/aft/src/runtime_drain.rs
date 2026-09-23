@@ -3419,8 +3419,14 @@ mod tests {
     fn lsp_params_debug_rendering_is_bounded() {
         let file_text = "x".repeat(10_000);
         let rendered = lsp_params_for_log(Some(serde_json::json!({ "text": file_text })));
-        let full_len = serde_json::json!({ "text": "x".repeat(10_000) }).to_string().len();
-        assert!(rendered.len() < LSP_PARAMS_LOG_BYTES + 32, "{}", rendered.len());
+        let full_len = serde_json::json!({ "text": "x".repeat(10_000) })
+            .to_string()
+            .len();
+        assert!(
+            rendered.len() < LSP_PARAMS_LOG_BYTES + 32,
+            "{}",
+            rendered.len()
+        );
         assert!(
             rendered.ends_with(&format!("…(+{} bytes)", full_len - LSP_PARAMS_LOG_BYTES)),
             "{rendered}"
