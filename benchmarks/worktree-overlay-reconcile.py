@@ -17,7 +17,11 @@ many files, and resuming it. The overflow is not guaranteed on every attempt,
 so the harness retries and reports whether a rescan was observed in the log.
 
 Usage:
-    python3 benchmarks/worktree-overlay-reconcile.py --binary target/debug/aft
+    python3 benchmarks/worktree-overlay-reconcile.py --binary target/debug/aft --rescan
+
+    # Reconciliation cost on a clone of a real repository:
+    python3 benchmarks/worktree-overlay-reconcile.py --binary target/stage/aft \
+        --source-repo . --worktree-ref HEAD~200
 """
 
 from __future__ import annotations
@@ -267,6 +271,59 @@ def rescan_phase(args: argparse.Namespace, client: AftClient, worktree: Path) ->
     return rows
 
 
+def cost_phase(args: argparse.Namespace, base: Path, env: dict[str, str]) -> list[JsonObject]:
+    """Time reconciliation on a real repository instead of the tiny fixture.
+
+    The source repository is cloned as the home checkout, which publishes the
+    shared snapshot. A linked worktree is then added at `--worktree-ref`; a
+    fresh checkout gives every file a new mtime, so this is the case where
+    every same-size file must be content-hashed.
+    """
+    home = base / "home-checkout"
+    worktree = base / "wt"
+    storage = base / "storage"
+    subprocess.run(
+        ["git", "clone", "-q", str(args.source_repo), str(home)], check=True, env=env
+    )
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "--detach", str(worktree), args.worktree_ref],
+        cwd=home,
+        check=True,
+        env=env,
+    )
+    rows: list[JsonObject] = []
+    owner = AftClient(args.binary, env, base / "owner.log")
+    try:
+        configure(owner, home, storage, ram_overlay=False)
+        rows.append({"owner_ready_s": round(wait_ready(owner, "fn main", timeout=900), 3)})
+        time.sleep(2.0)
+    finally:
+        owner.close()
+    for run_index in range(args.repeats):
+        borrower = AftClient(args.binary, env, base / f"worktree-{run_index}.log")
+        try:
+            configure(borrower, worktree, storage, ram_overlay=True)
+            ready = wait_ready(borrower, "fn main", timeout=900)
+            line = next(
+                (
+                    entry
+                    for entry in borrower.log_text().splitlines()
+                    if "reconciled borrowed snapshot" in entry
+                ),
+                "",
+            )
+            rows.append(
+                {
+                    "run": run_index,
+                    "worktree_ready_s": round(ready, 3),
+                    "reconcile": line.split(": ", 2)[-1] if line else None,
+                }
+            )
+        finally:
+            borrower.close()
+    return rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
@@ -275,13 +332,21 @@ def main() -> int:
     parser.add_argument("--rescan", action="store_true", help="also run the watcher-rescan phase")
     parser.add_argument("--touch-count", type=int, default=4000)
     parser.add_argument("--rescan-attempts", type=int, default=5)
+    parser.add_argument(
+        "--source-repo",
+        type=Path,
+        help="measure reconciliation cost on a clone of this repository instead",
+    )
+    parser.add_argument("--worktree-ref", default="HEAD")
+    parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     args.binary = args.binary.resolve()
 
     base = Path(tempfile.mkdtemp(prefix="aft-overlay-", dir=args.work_dir))
     base = base.resolve()
     env = isolated_env(base)
-    for row in startup_phase(args, base, env):
+    phase = cost_phase if args.source_repo else startup_phase
+    for row in phase(args, base, env):
         print(json.dumps(row), flush=True)
     print(json.dumps({"work_dir": str(base)}), flush=True)
     return 0
