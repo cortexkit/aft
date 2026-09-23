@@ -2777,6 +2777,10 @@ mod tests {
         let config = Config {
             project_root: Some(dir.path().to_path_buf()),
             format_on_edit: true,
+            // This checks the happy path, not the timeout: a loaded Windows
+            // runner has taken more than the 10 s default to start rustfmt
+            // through the rustup shim.
+            formatter_timeout_secs: 120,
             ..Config::default()
         };
         let (formatted, reason) = auto_format(&path, &config);
