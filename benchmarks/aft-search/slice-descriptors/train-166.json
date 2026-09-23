@@ -1,0 +1,17 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "subc-protocol-022-migration",
+    "issue-331-bind-backoff",
+    "fleet-status-ack-tolerance",
+    "readiness-query-correction"
+  ],
+  "note": "Moves AFT to subc-protocol 0.22 / subc-transport 0.7.1 / subc-client-rs 0.15.4 with a byte-level HELLO manifest guard, backs off repeated status-holder bind rejections, and pins publish-ack tolerance of new holder fields. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
