@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{canonicalize_like_product, user_config, AftProcess};
 
 const TOKENS: [&str; 3] = ["TOKEN_TOP", "TOKEN_ONE", "TOKEN_TWO"];
 
@@ -46,7 +46,9 @@ fn git(dir: &Path, args: &[&str]) {
 
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().expect("fixture dir");
-    let base = fs::canonicalize(dir.path()).expect("canonical fixture dir");
+    // Git refuses Windows verbatim (`\\?\`) paths, which bare
+    // `fs::canonicalize` returns there, so use the product's normalized form.
+    let base = canonicalize_like_product(dir.path());
     let home = base.join("home");
     for (path, token) in [
         ("top.ts", "TOKEN_TOP"),
