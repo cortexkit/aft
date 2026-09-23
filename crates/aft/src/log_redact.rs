@@ -311,9 +311,11 @@ mod tests {
 
     #[test]
     fn unlogged_input_summary_carries_length_and_hash_only() {
-        let summary = unlogged_input_summary("{\"command\":\"secret\"");
-        assert!(summary.starts_with("bytes=20 sha256="), "{summary}");
-        assert_eq!(summary.len(), "bytes=20 sha256=".len() + 12);
+        let input = "{\"command\":\"secret\"";
+        let summary = unlogged_input_summary(input);
+        let prefix = format!("bytes={} sha256=", input.len());
+        assert!(summary.starts_with(&prefix), "{summary}");
+        assert_eq!(summary.len(), prefix.len() + 12);
         assert!(!summary.contains("secret"));
     }
 

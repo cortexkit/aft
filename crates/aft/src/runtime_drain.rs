@@ -3286,6 +3286,15 @@ pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Insta
     crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
 }
 
+/// Bytes of LSP `params` kept in a debug line. Diagnostics can quote source and
+/// `workspace/applyEdit` carries whole file text, so the rest is dropped.
+const LSP_PARAMS_LOG_BYTES: usize = 512;
+
+fn lsp_params_for_log(params: Option<serde_json::Value>) -> String {
+    let rendered = params.unwrap_or(serde_json::Value::Null).to_string();
+    crate::log_redact::truncate_for_log(&rendered, LSP_PARAMS_LOG_BYTES).into_owned()
+}
+
 pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
     let drained = {
         let mut lsp = ctx.lsp();
@@ -3309,7 +3318,7 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
                     server_kind,
                     root.display(),
                     method,
-                    params.unwrap_or(serde_json::Value::Null)
+                    lsp_params_for_log(params)
                 );
             }
             LspEvent::ServerRequest {
@@ -3325,7 +3334,7 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
                     root.display(),
                     id,
                     method,
-                    params.unwrap_or(serde_json::Value::Null)
+                    lsp_params_for_log(params)
                 );
             }
             LspEvent::ServerExited {
@@ -3405,6 +3414,19 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
+
+    #[test]
+    fn lsp_params_debug_rendering_is_bounded() {
+        let file_text = "x".repeat(10_000);
+        let rendered = lsp_params_for_log(Some(serde_json::json!({ "text": file_text })));
+        let full_len = serde_json::json!({ "text": "x".repeat(10_000) }).to_string().len();
+        assert!(rendered.len() < LSP_PARAMS_LOG_BYTES + 32, "{}", rendered.len());
+        assert!(
+            rendered.ends_with(&format!("…(+{} bytes)", full_len - LSP_PARAMS_LOG_BYTES)),
+            "{rendered}"
+        );
+        assert_eq!(lsp_params_for_log(None), "null");
+    }
 
     #[test]
     fn semantic_ready_publication_is_skipped_unless_paths_are_pending() {
