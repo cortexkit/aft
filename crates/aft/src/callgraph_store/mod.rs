@@ -20552,10 +20552,7 @@ mod bounded_build_breaker_tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(
-            staged_hash,
-            hash_to_hex(new_extract.freshness.content_hash)
-        );
+        assert_eq!(staged_hash, hash_to_hex(new_extract.freshness.content_hash));
         let names = |sql: &str| -> BTreeSet<String> {
             let mut statement = conn.prepare(sql).unwrap();
             statement
@@ -20564,8 +20561,11 @@ mod bounded_build_breaker_tests {
                 .collect::<std::result::Result<_, _>>()
                 .unwrap()
         };
-        let expected_nodes: BTreeSet<String> =
-            new_extract.nodes.iter().map(|node| node.id.clone()).collect();
+        let expected_nodes: BTreeSet<String> = new_extract
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
         assert_eq!(
             names("SELECT id FROM nodes WHERE file_path = 'first.ts'"),
             expected_nodes,
