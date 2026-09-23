@@ -3,7 +3,6 @@
 // This file makes it explicit and enables post-edit formatting/checking.
 {
   "$schema": "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json",
-  "hoist_builtin_tools": true,
 
   // Post-edit auto-format stays off: reformatting right after a patch makes
   // the on-disk file drift from what the agent last read, so its next
