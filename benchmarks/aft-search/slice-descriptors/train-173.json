@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "sentinel-scheduled-ci-per-workflow"
+  ],
+  "note": "The health sentinel judges each scheduled workflow on its own targeted run listing, refusing a verdict when that listing is stale or unavailable. Sentinel script only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
