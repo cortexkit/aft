@@ -21,7 +21,8 @@
  *   HARNESS_PLUGIN      absolute path of the plugin entry (src/index.ts)
  *   HARNESS_MODE        "sigterm": skip session_shutdown, add a second SIGTERM
  *                       listener that never exits, and wait for the parent to
- *                       send SIGTERM
+ *                       send SIGTERM; "subagent": expect MAGIC_CONTEXT_PI_SUBAGENT=1,
+ *                       watch startup stay quiet, then call aft_outline
  *
  * Stdout protocol, one line each: `EVENT <name> <detail>`.
  */
@@ -42,22 +43,27 @@ function makeFakeInnerPool() {
   const poolId = poolsCreated;
   let shutDown = false;
   const liveBridges = new Map<string, ReturnType<typeof setInterval>>();
+  // Bridges spawn lazily on first use, like the real pool's.
+  const spawnIfNeeded = (root: string, reason: string) => {
+    if (liveBridges.has(root)) return;
+    bridgesSpawned += 1;
+    emit("bridge-spawn", `pool=${poolId} ${reason}`);
+    // Stands in for the bridge child's stdio pipes: ref'd until shutdown.
+    liveBridges.set(
+      root,
+      setInterval(() => undefined, 1_000),
+    );
+  };
   const bridgeFor = (root: string) => ({
     cwd: root,
     async send(command: string) {
-      if (!liveBridges.has(root)) {
-        bridgesSpawned += 1;
-        emit("bridge-spawn", `pool=${poolId} command=${command}`);
-        // Stands in for the bridge child's stdio pipes: ref'd until shutdown.
-        liveBridges.set(
-          root,
-          setInterval(() => undefined, 1_000),
-        );
-      }
+      spawnIfNeeded(root, `command=${command}`);
       return { success: true };
     },
-    async toolCall() {
-      return { text: "", success: true };
+    async toolCall(_sessionId: string | undefined, name: string) {
+      spawnIfNeeded(root, `tool=${name}`);
+      emit("bridge-tool-call", name);
+      return { text: "outline ok", success: true };
     },
     cacheStatusSnapshot() {},
     getCachedStatus() {
@@ -107,7 +113,10 @@ Bun.plugin({
         ensureStorageMigrated: async () => undefined,
         // Resolves only after shutdown, so the eager warmup is still waiting
         // on it when the host tears the session down.
-        ensureOnnxRuntime: () => onnxReady,
+        ensureOnnxRuntime: () => {
+          emit("onnx-prepare");
+          return onnxReady;
+        },
         createAftTransportPool: async () =>
           new realBridge.RevivableTransportPool(makeFakeInnerPool() as never, async () => {
             emit("pool-revived");
@@ -123,8 +132,11 @@ const npmMarker = process.env.HARNESS_NPM_MARKER;
 if (!pluginPath || !npmMarker) throw new Error("harness env missing");
 
 const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
+const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
 const pi = {
-  registerTool() {},
+  registerTool(tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) {
+    tools.set(tool.name, tool);
+  },
   registerCommand() {},
   on(event: string, handler: (...args: unknown[]) => unknown) {
     const list = handlers.get(event) ?? [];
@@ -137,27 +149,48 @@ const plugin = (await import(pluginPath)).default as (api: unknown) => Promise<v
 await plugin(pi);
 emit("plugin-ready");
 
-// Shut down only once the LSP install has really spawned its npm child.
-const deadline = Date.now() + 15_000;
-while (!existsSync(npmMarker) && Date.now() < deadline) {
-  await new Promise((resolve) => setTimeout(resolve, 25));
-}
-emit(existsSync(npmMarker) ? "npm-started" : "npm-never-started");
-
-if (process.env.HARNESS_MODE === "sigterm") {
-  // Stand in for a host that also listens for SIGTERM but never exits from it
-  // (Pi's signal-exit listener stands aside while another listener exists),
-  // and that keeps running on its own, like an interactive host would.
-  process.on("SIGTERM", function hostListenerThatNeverExits() {
-    emit("host-listener-called");
-  });
-  setInterval(() => undefined, 1_000);
-  emit("awaiting-signal");
-} else {
+if (process.env.HARNESS_MODE === "subagent") {
+  // Give any eager startup work time to show itself: an npm spawn, an ONNX
+  // Runtime preparation, or a warmup bridge would all land well within this.
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+  emit(existsSync(npmMarker) ? "npm-started" : "npm-never-started");
+  emit("startup-quiet", `bridges=${bridgesSpawned}`);
+  const outline = tools.get("aft_outline");
+  if (!outline) throw new Error("aft_outline was not registered");
+  const extCtx = {
+    cwd: process.cwd(),
+    hasUI: false,
+    sessionManager: { getSessionId: () => "subagent-session" },
+  };
+  const result = await outline.execute("call-1", { target: "a.ts" }, undefined, undefined, extCtx);
+  emit("tool-result", JSON.stringify(result).slice(0, 200));
   for (const handler of handlers.get("session_shutdown") ?? []) {
     await handler({}, {});
   }
-  // The ONNX Runtime becomes ready only now, after the pool is gone.
-  resolveOnnx("/fake/onnxruntime");
   emit("shutdown-done", `pools=${poolsCreated} bridges=${bridgesSpawned}`);
+} else {
+  // Shut down only once the LSP install has really spawned its npm child.
+  const deadline = Date.now() + 15_000;
+  while (!existsSync(npmMarker) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  emit(existsSync(npmMarker) ? "npm-started" : "npm-never-started");
+
+  if (process.env.HARNESS_MODE === "sigterm") {
+    // Stand in for a host that also listens for SIGTERM but never exits from it
+    // (Pi's signal-exit listener stands aside while another listener exists),
+    // and that keeps running on its own, like an interactive host would.
+    process.on("SIGTERM", function hostListenerThatNeverExits() {
+      emit("host-listener-called");
+    });
+    setInterval(() => undefined, 1_000);
+    emit("awaiting-signal");
+  } else {
+    for (const handler of handlers.get("session_shutdown") ?? []) {
+      await handler({}, {});
+    }
+    // The ONNX Runtime becomes ready only now, after the pool is gone.
+    resolveOnnx("/fake/onnxruntime");
+    emit("shutdown-done", `pools=${poolsCreated} bridges=${bridgesSpawned}`);
+  }
 }

@@ -44,7 +44,7 @@ const tempDirs: string[] = [];
 let runPromise: Promise<HarnessRun> | undefined;
 
 /** Build a throwaway HOME/XDG/project sandbox and start the harness in it. */
-function spawnHarness(mode: "session-shutdown" | "sigterm") {
+function spawnHarness(mode: "session-shutdown" | "sigterm" | "subagent") {
   const tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
   tempDirs.push(tempDir);
   const binDir = join(tempDir, "bin");
@@ -83,6 +83,8 @@ function spawnHarness(mode: "session-shutdown" | "sigterm") {
     HARNESS_PLUGIN: resolve(import.meta.dir, "../index.ts"),
     HARNESS_MODE: mode,
   });
+  if (mode === "subagent") env.MAGIC_CONTEXT_PI_SUBAGENT = "1";
+  else delete env.MAGIC_CONTEXT_PI_SUBAGENT;
 
   const child = spawn(
     process.execPath,
@@ -289,3 +291,96 @@ describe.skipIf(process.platform === "win32")("SIGTERM ends a Pi host running th
     expect(isAlive(run.npmPid ?? -1)).toBe(false);
   }, 70_000);
 });
+
+interface SubagentRun {
+  events: Array<{ name: string; detail: string }>;
+  exitCode: number | null;
+  killedAsHung: boolean;
+  npmPid: number | null;
+  stderr: string;
+}
+
+function runSubagentHarness(): Promise<SubagentRun> {
+  return new Promise<SubagentRun>((resolveRun, rejectRun) => {
+    const { child, npmMarker } = spawnHarness("subagent");
+    const run: SubagentRun = {
+      events: [],
+      exitCode: null,
+      killedAsHung: false,
+      npmPid: null,
+      stderr: "",
+    };
+    let stdoutBuf = "";
+    child.stdout.on("data", (chunk) => {
+      stdoutBuf += String(chunk);
+      let newline = stdoutBuf.indexOf("\n");
+      while (newline >= 0) {
+        const line = stdoutBuf.slice(0, newline);
+        stdoutBuf = stdoutBuf.slice(newline + 1);
+        newline = stdoutBuf.indexOf("\n");
+        const match = /^EVENT (\S+) ?(.*)$/.exec(line);
+        if (match) run.events.push({ name: match[1] ?? "", detail: match[2] ?? "" });
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      run.stderr = (run.stderr + String(chunk)).slice(-4_000);
+    });
+    const overallTimer = setTimeout(() => {
+      run.killedAsHung = true;
+      child.kill("SIGKILL");
+    }, 45_000);
+    child.on("error", rejectRun);
+    child.on("exit", (code) => {
+      clearTimeout(overallTimer);
+      run.exitCode = code;
+      run.npmPid = readNpmPid(npmMarker);
+      sigtermNpmPid ??= run.npmPid;
+      resolveRun(run);
+    });
+  });
+}
+
+let subagentRunPromise: Promise<SubagentRun> | undefined;
+const subagentRun = () => {
+  subagentRunPromise ??= runSubagentHarness();
+  return subagentRunPromise;
+};
+const eventsBefore = (run: SubagentRun, marker: string) => {
+  const index = run.events.findIndex((event) => event.name === marker);
+  return index < 0 ? run.events : run.events.slice(0, index);
+};
+
+describe.skipIf(process.platform === "win32")(
+  "pi-magic-context subagent (MAGIC_CONTEXT_PI_SUBAGENT=1)",
+  () => {
+    test("startup runs no warmup, no ONNX Runtime preparation and no LSP install", async () => {
+      const run = await subagentRun();
+      if (run.killedAsHung || run.exitCode !== 0) console.error(`harness stderr:\n${run.stderr}`);
+      expect(run.events.map((event) => event.name)).toContain("startup-quiet");
+      const startup = eventsBefore(run, "startup-quiet").map((event) => event.name);
+      expect(startup).not.toContain("bridge-spawn");
+      expect(startup).not.toContain("onnx-prepare");
+      expect(startup).toContain("npm-never-started");
+      expect(run.npmPid).toBeNull();
+    }, 60_000);
+
+    test("an AFT tool call still reaches a lazily spawned bridge", async () => {
+      const run = await subagentRun();
+      const afterStartup = run.events.slice(
+        run.events.findIndex((event) => event.name === "startup-quiet") + 1,
+      );
+      expect(afterStartup.map((event) => [event.name, event.detail.split(" ")[1] ?? ""])).toEqual(
+        expect.arrayContaining([
+          ["bridge-spawn", "tool=outline"],
+          ["bridge-tool-call", ""],
+        ]),
+      );
+      expect(run.events.find((event) => event.name === "bridge-tool-call")?.detail).toBe("outline");
+      expect(run.events.find((event) => event.name === "tool-result")?.detail).toContain(
+        "outline ok",
+      );
+      expect(run.killedAsHung).toBe(false);
+      expect(run.exitCode).toBe(0);
+    }, 60_000);
+  },
+);

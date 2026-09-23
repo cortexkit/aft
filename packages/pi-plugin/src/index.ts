@@ -289,6 +289,20 @@ function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string 
 const ONNX_WARMUP_WAIT_CAP_MS = 60_000;
 
 /**
+ * pi-magic-context runs its historian and dreamer as child `pi --print`
+ * processes that load every installed extension, aft-pi included, and it
+ * guarantees this variable is set to "1" in each of them. Those children are
+ * short-lived and mostly never call an AFT tool, so aft-pi skips its eager
+ * startup work there (warmup bridge, ONNX Runtime preparation, LSP
+ * auto-install) and keeps only tool registration with a lazily spawned bridge.
+ */
+const MAGIC_CONTEXT_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
+
+function isMagicContextSubagent(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[MAGIC_CONTEXT_SUBAGENT_ENV] === "1";
+}
+
+/**
  * Wait for `promise`, but give up after `capMs`. The cap timer is cleared as
  * soon as the promise settles and is unref'd while pending: it only bounds the
  * wait and must never be the thing that keeps the host process alive. A plain
@@ -462,7 +476,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // settles. Bridges spawned AFTER the download finishes pick it up
   // automatically. `ensureOnnxRuntime` returns null on unsupported platforms.
   let onnxRuntimePromise: Promise<string | null> | null = null;
-  if (shouldPrepareOnnxRuntime(config)) {
+  const skipEagerStartup = isMagicContextSubagent();
+  if (skipEagerStartup) {
+    log(
+      `${MAGIC_CONTEXT_SUBAGENT_ENV}=1: running as a pi-magic-context subagent, so skipping eager warmup, ONNX Runtime preparation and LSP auto-install; the bridge starts on the first AFT tool call`,
+    );
+  }
+  if (!skipEagerStartup && shouldPrepareOnnxRuntime(config)) {
     onnxRuntimePromise = ensureOnnxRuntime(storageDir).catch((err) => {
       warn(`Failed to prepare ONNX Runtime: ${err instanceof Error ? err.message : String(err)}`);
       return null;
@@ -494,7 +514,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // malicious versions. Best-effort — failures never block plugin startup.
   let lspAutoInstallPassLease: AutoInstallPassLease | null = null;
   try {
-    const lspAutoInstall = config.lsp?.auto_install ?? true;
+    const lspAutoInstall = !skipEagerStartup && (config.lsp?.auto_install ?? true);
     const lspGraceDays = config.lsp?.grace_days ?? 7;
     const lspVersions = config.lsp?.versions ?? {};
     const lspDisabled = new Set(config.lsp?.disabled ?? []);
@@ -519,7 +539,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       versions: lspVersions,
       disabled: lspDisabled,
     });
-    const relevantGithub = discoverRelevantGithubServers(projectRoot);
+    // The relevance scan only feeds install decisions, so skip the walk when
+    // no install can start.
+    const relevantGithub = runSharedAutoInstall
+      ? discoverRelevantGithubServers(projectRoot)
+      : new Set<string>();
     const ghResult = runGithubAutoInstall(relevantGithub, {
       autoInstall: runSharedAutoInstall,
       graceDays: lspGraceDays,
@@ -780,8 +804,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // startup) does not apply here, so eager warmup is the correct trade for Pi:
   // it removes first-tool-call latency without the bridge-storm downside.
   // The $HOME guard below is the only case we skip. See the home-dir note.
+  // (pi-magic-context subagents also skip it; see isMagicContextSubagent.)
   void (async () => {
     try {
+      if (skipEagerStartup) return;
       // Note #65: skip eager configure when Pi was launched from the user's
       // home directory. Configuring on `$HOME` walks the entire user home
       // tree (100k–10M files), times out the 30s configure budget, gets
