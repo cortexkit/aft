@@ -42,6 +42,8 @@ Caveats, so the number is not over-read: the log has one-second resolution and n
 
 **Swap.** The incumbent stays routable until cutover, so nobody sees `module_warming` and the budget does not delay callers. It can cover the full live set. Proposed budget: **90 s**, twice the measured burst, as a ceiling against a warm-up that hangs.
 
+**AFT does not swap (decided 2026-09-23).** AFT stays `overlap: exclusive`: two processes on one root would both run a watcher and contend for the per-root writer lease, and a candidate that found the lease held would drop to read-only and warm in a mode it never serves in. The daemon refuses `--swap` for an exclusive module before anything spawns, so the swap budget never applies to AFT. Every AFT restart is a plain start: the old process exits, the new one refuses new route opens with the retryable `module_warming` while it warms (up to 10 s), then flips. So for AFT, warm-up is only worth it when the refusal window plus an adopted first call beats an immediate flip with a lazy first call; that has to be measured, not assumed.
+
 Both are named constants in the module, not daemon config.
 
 ## Failure behaviour
