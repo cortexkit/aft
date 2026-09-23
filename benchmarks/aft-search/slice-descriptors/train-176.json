@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-334-path-identity-gap",
+    "issue-334-v2-footer"
+  ],
+  "note": "A refresh path that resolves outside the project root is skipped per refresh instead of permanently disabling dead-code, a stale path-identity record clears once the store matches disk, and the status payload adds per-category status_bar_values so the OpenCode 2 footer stops claiming startup. Callgraph store, status and TUI only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
