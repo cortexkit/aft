@@ -56,22 +56,29 @@ async function runCleanups(reason: string): Promise<void> {
 /** Conventional exit codes for fatal signals (128 + signal number). */
 export const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 } as const;
 
-/** Cap on cleanup time once WE own process termination for a signal. */
-const SIGNAL_CLEANUP_TIMEOUT_MS = 5_000;
-
 /**
- * Registering ANY listener for SIGINT/SIGTERM/SIGHUP disables Node/Bun's
- * default terminate-on-signal behavior. If AFT's listener is the only one,
- * the default was suppressed solely by us, so we must exit or the host hangs
- * forever. If the host or another extension also listens, terminating is
- * their call. Mirror of the OpenCode plugin's shutdown-hooks contract.
+ * Longest a signalled process stays alive for cleanup, AFT's and any other
+ * listener's, before AFT exits it with the conventional code.
  */
-export function shouldForceExit(otherListenerCount: number): boolean {
-  return otherListenerCount === 0;
-}
+export const SIGNAL_EXIT_BOUND_MS = 5_000;
 
 let signalShutdownStarted = false;
 
+/**
+ * Registering ANY listener for SIGINT/SIGTERM/SIGHUP disables Node/Bun's
+ * default terminate-on-signal behaviour, so after a signal this handler must
+ * make sure the process really ends; a plugin must never leave its host
+ * unkillable. Other listeners cannot be trusted to do the exit: Pi's own
+ * listener (the signal-exit package) only re-raises when it is the sole
+ * listener, so with AFT's handler present it stood aside while AFT deferred to
+ * it and SIGTERM did nothing at all.
+ *
+ * - AFT's listener is the only one: run cleanup, then exit (at most the bound).
+ * - Other listeners exist: run cleanup alongside them and give them until the
+ *   bound to finish and exit on their own terms. The bound timer is unref'd so
+ *   it never keeps an otherwise finished process alive; if the process is
+ *   still running when it fires, exit with 128 + signal.
+ */
 function installProcessHandlers(): void {
   const state = getState();
   if (state.installed) return;
@@ -80,37 +87,44 @@ function installProcessHandlers(): void {
   const signals = ["SIGTERM", "SIGINT", "SIGHUP"] as const;
   for (const sig of signals) {
     const handler = () => {
+      const code = SIGNAL_EXIT_CODES[sig];
       const others = process.listenerCount(sig) - 1;
-      if (!shouldForceExit(others)) {
-        // Named deferral: a shutdown hang is then attributable to the OTHER
-        // listener from the log alone.
-        const names = process
-          .listeners(sig)
-          .filter((fn) => fn !== handler)
-          .map((fn) => fn.name || fn.toString().slice(0, 80).replace(/\s+/g, " "))
-          .join(" | ");
-        log(
-          `${sig}: deferring termination to ${others} other listener(s); cleanup only. Others: ${names}`,
-        );
-        void runCleanups(sig);
+      if (signalShutdownStarted) {
+        // A repeated signal while only AFT is cleaning up means "now". With
+        // other listeners, the already-armed bound still ends the process.
+        if (others === 0) process.exit(code);
         return;
       }
-      if (signalShutdownStarted) {
-        process.exit(SIGNAL_EXIT_CODES[sig]);
-      }
       signalShutdownStarted = true;
-      // Record the intended code immediately so even an unexpected early exit
-      // (event loop drains mid-cleanup) reports the signal, not 0.
-      process.exitCode = SIGNAL_EXIT_CODES[sig];
-      // Deliberately ref'd: we own termination here, so keeping the process
-      // alive for at most the cap is the point — an unref'd timer would let
-      // the loop drain and exit before the race settles.
-      const timeout = new Promise<void>((resolve) => {
-        setTimeout(resolve, SIGNAL_CLEANUP_TIMEOUT_MS);
-      });
-      void Promise.race([runCleanups(sig), timeout]).finally(() => {
-        process.exit(SIGNAL_EXIT_CODES[sig]);
-      });
+      // Record the conventional code now so a process that simply drains
+      // after cleanup still reports the signal rather than 0. A host that
+      // exits with its own code overrides this.
+      process.exitCode = code;
+      const exit = () => process.exit(code);
+      if (others === 0) {
+        // Deliberately ref'd: we own termination, so staying alive for at
+        // most the bound while cleanup runs is the point.
+        const bound = setTimeout(exit, SIGNAL_EXIT_BOUND_MS);
+        void runCleanups(sig).finally(() => {
+          clearTimeout(bound);
+          exit();
+        });
+        return;
+      }
+      const names = process
+        .listeners(sig)
+        .filter((fn) => fn !== handler)
+        .map((fn) => fn.name || fn.toString().slice(0, 80).replace(/\s+/g, " "))
+        .join(" | ");
+      log(
+        `${sig}: running cleanup; ${others} other listener(s) have ${SIGNAL_EXIT_BOUND_MS}ms to exit before AFT exits with ${code}. Others: ${names}`,
+      );
+      void runCleanups(sig);
+      const bound = setTimeout(() => {
+        log(`${sig}: process still running ${SIGNAL_EXIT_BOUND_MS}ms after the signal; exiting`);
+        exit();
+      }, SIGNAL_EXIT_BOUND_MS);
+      (bound as { unref?: () => void }).unref?.();
     };
     process.on(sig, handler);
   }

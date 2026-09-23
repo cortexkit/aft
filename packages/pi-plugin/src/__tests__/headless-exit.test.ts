@@ -8,6 +8,8 @@
  * second extension installed). These tests run the real extension in a child
  * process (see fixtures/headless-exit-harness.ts), shut the session down while
  * an LSP auto-install is still running, and watch what the process does next.
+ * A second suite sends SIGTERM to a host that has another SIGTERM listener
+ * which never exits, and checks the plugin still ends the process.
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
@@ -38,56 +40,69 @@ function isAlive(pid: number): boolean {
   }
 }
 
-let tempDir: string | undefined;
+const tempDirs: string[] = [];
 let runPromise: Promise<HarnessRun> | undefined;
+
+/** Build a throwaway HOME/XDG/project sandbox and start the harness in it. */
+function spawnHarness(mode: "session-shutdown" | "sigterm") {
+  const tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
+  tempDirs.push(tempDir);
+  const binDir = join(tempDir, "bin");
+  const projectDir = join(tempDir, "project");
+  const configDir = join(tempDir, "config");
+  const npmMarker = join(tempDir, "npm.pid");
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(projectDir, { recursive: true });
+  mkdirSync(join(configDir, "cortexkit"), { recursive: true });
+  // A stand-in for npm that records its pid and then just sits there, so the
+  // LSP install is guaranteed to still be running when the session ends.
+  writeFileSync(join(binDir, "npm"), '#!/bin/sh\necho $$ > "$HARNESS_NPM_MARKER"\nexec sleep 60\n');
+  chmodSync(join(binDir, "npm"), 0o755);
+  // A TypeScript project makes typescript-language-server relevant; pinning
+  // its version skips the registry probe so no network is needed.
+  writeFileSync(join(projectDir, "a.ts"), "export const a = 1;\n");
+  writeFileSync(join(projectDir, "package.json"), '{ "name": "headless-exit" }\n');
+  writeFileSync(
+    join(configDir, "cortexkit", "aft.jsonc"),
+    '{ "semantic_search": true, "lsp": { "versions": { "typescript-language-server": "4.3.3" } } }\n',
+  );
+
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) env[key] = value;
+  }
+  delete env.AFT_CACHE_DIR;
+  Object.assign(env, {
+    HOME: join(tempDir, "home"),
+    XDG_CONFIG_HOME: configDir,
+    XDG_CACHE_HOME: join(tempDir, "cache"),
+    XDG_DATA_HOME: join(tempDir, "data"),
+    XDG_STATE_HOME: join(tempDir, "state"),
+    PATH: `${binDir}:/usr/bin:/bin`,
+    HARNESS_NPM_MARKER: npmMarker,
+    HARNESS_PLUGIN: resolve(import.meta.dir, "../index.ts"),
+    HARNESS_MODE: mode,
+  });
+
+  const child = spawn(
+    process.execPath,
+    ["run", resolve(import.meta.dir, "fixtures/headless-exit-harness.ts")],
+    { cwd: projectDir, env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  return { child, npmMarker };
+}
+
+function readNpmPid(npmMarker: string): number | null {
+  try {
+    return Number.parseInt(readFileSync(npmMarker, "utf8").trim(), 10);
+  } catch {
+    return null;
+  }
+}
 
 function runHarness(): Promise<HarnessRun> {
   runPromise ??= new Promise<HarnessRun>((resolveRun, rejectRun) => {
-    tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
-    const binDir = join(tempDir, "bin");
-    const projectDir = join(tempDir, "project");
-    const configDir = join(tempDir, "config");
-    const npmMarker = join(tempDir, "npm.pid");
-    mkdirSync(binDir, { recursive: true });
-    mkdirSync(projectDir, { recursive: true });
-    mkdirSync(join(configDir, "cortexkit"), { recursive: true });
-    // A stand-in for npm that records its pid and then just sits there, so the
-    // LSP install is guaranteed to still be running when the session ends.
-    writeFileSync(
-      join(binDir, "npm"),
-      '#!/bin/sh\necho $$ > "$HARNESS_NPM_MARKER"\nexec sleep 60\n',
-    );
-    chmodSync(join(binDir, "npm"), 0o755);
-    // A TypeScript project makes typescript-language-server relevant; pinning
-    // its version skips the registry probe so no network is needed.
-    writeFileSync(join(projectDir, "a.ts"), "export const a = 1;\n");
-    writeFileSync(join(projectDir, "package.json"), '{ "name": "headless-exit" }\n');
-    writeFileSync(
-      join(configDir, "cortexkit", "aft.jsonc"),
-      '{ "semantic_search": true, "lsp": { "versions": { "typescript-language-server": "4.3.3" } } }\n',
-    );
-
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (value !== undefined) env[key] = value;
-    }
-    delete env.AFT_CACHE_DIR;
-    Object.assign(env, {
-      HOME: join(tempDir, "home"),
-      XDG_CONFIG_HOME: configDir,
-      XDG_CACHE_HOME: join(tempDir, "cache"),
-      XDG_DATA_HOME: join(tempDir, "data"),
-      XDG_STATE_HOME: join(tempDir, "state"),
-      PATH: `${binDir}:/usr/bin:/bin`,
-      HARNESS_NPM_MARKER: npmMarker,
-      HARNESS_PLUGIN: resolve(import.meta.dir, "../index.ts"),
-    });
-
-    const child = spawn(
-      process.execPath,
-      ["run", resolve(import.meta.dir, "fixtures/headless-exit-harness.ts")],
-      { cwd: projectDir, env, stdio: ["ignore", "pipe", "pipe"] },
-    );
+    const { child, npmMarker } = spawnHarness("session-shutdown");
     const run: HarnessRun = {
       events: [],
       exitedAfterShutdownMs: null,
@@ -133,23 +148,95 @@ function runHarness(): Promise<HarnessRun> {
       if (shutdownAt !== null && !run.killedAsHung) {
         run.exitedAfterShutdownMs = Date.now() - shutdownAt;
       }
-      try {
-        run.npmPid = Number.parseInt(readFileSync(npmMarker, "utf8").trim(), 10);
-      } catch {
-        run.npmPid = null;
-      }
+      run.npmPid = readNpmPid(npmMarker);
       resolveRun(run);
     });
   });
   return runPromise;
 }
 
+interface SigtermRun {
+  events: string[];
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  exitedAfterSignalMs: number | null;
+  killedAsHung: boolean;
+  npmPid: number | null;
+  stderr: string;
+}
+
+/** Longest the process may live after SIGTERM: the plugin's bound plus slack. */
+const SIGTERM_EXIT_BOUND_MS = 8_000;
+let sigtermNpmPid: number | null = null;
+
+function runSigtermHarness(): Promise<SigtermRun> {
+  return new Promise<SigtermRun>((resolveRun, rejectRun) => {
+    const { child, npmMarker } = spawnHarness("sigterm");
+    const run: SigtermRun = {
+      events: [],
+      exitCode: null,
+      exitSignal: null,
+      exitedAfterSignalMs: null,
+      killedAsHung: false,
+      npmPid: null,
+      stderr: "",
+    };
+    let signalledAt: number | null = null;
+    let hangTimer: ReturnType<typeof setTimeout> | undefined;
+    let stdoutBuf = "";
+    child.stdout.on("data", (chunk) => {
+      stdoutBuf += String(chunk);
+      let newline = stdoutBuf.indexOf("\n");
+      while (newline >= 0) {
+        const line = stdoutBuf.slice(0, newline);
+        stdoutBuf = stdoutBuf.slice(newline + 1);
+        newline = stdoutBuf.indexOf("\n");
+        const match = /^EVENT (\S+)/.exec(line);
+        if (!match) continue;
+        run.events.push(match[1] ?? "");
+        if (match[1] === "awaiting-signal") {
+          signalledAt = Date.now();
+          child.kill("SIGTERM");
+          hangTimer = setTimeout(() => {
+            run.killedAsHung = true;
+            child.kill("SIGKILL");
+          }, HANG_KILL_MS);
+        }
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      run.stderr = (run.stderr + String(chunk)).slice(-4_000);
+    });
+    const overallTimer = setTimeout(() => {
+      run.killedAsHung = true;
+      child.kill("SIGKILL");
+    }, 60_000);
+    child.on("error", rejectRun);
+    child.on("exit", (code, signal) => {
+      clearTimeout(overallTimer);
+      clearTimeout(hangTimer);
+      run.exitCode = code;
+      run.exitSignal = signal;
+      if (signalledAt !== null && !run.killedAsHung) {
+        run.exitedAfterSignalMs = Date.now() - signalledAt;
+      }
+      run.npmPid = readNpmPid(npmMarker);
+      sigtermNpmPid = run.npmPid;
+      resolveRun(run);
+    });
+  });
+}
+
+// Removing the sandboxes can be slow on a loaded machine (the full workspace
+// suite runs packages in parallel), so allow more than the default hook time.
 afterAll(async () => {
   const run = await runPromise?.catch(() => undefined);
   // Never leave the stand-in npm behind if a regression orphaned it.
-  if (run?.npmPid && isAlive(run.npmPid)) process.kill(run.npmPid, "SIGKILL");
-  if (tempDir) rmSync(tempDir, { recursive: true, force: true });
-});
+  for (const pid of [run?.npmPid, sigtermNpmPid]) {
+    if (pid && isAlive(pid)) process.kill(pid, "SIGKILL");
+  }
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+}, 30_000);
 
 const eventsAfterShutdown = (run: HarnessRun) => {
   const index = run.events.findIndex((event) => event.name === "shutdown-done");
@@ -185,3 +272,20 @@ describe.skipIf(process.platform === "win32")(
     }, 70_000);
   },
 );
+
+describe.skipIf(process.platform === "win32")("SIGTERM ends a Pi host running the plugin", () => {
+  // Pi's signal-exit listener only re-raises when it is the only listener, so
+  // with AFT's handler present nobody else exits the process: AFT must.
+  test("exits with 143 within the bound even when another SIGTERM listener never exits", async () => {
+    const run = await runSigtermHarness();
+    expect(run.events).toContain("awaiting-signal");
+    expect(run.events).toContain("host-listener-called");
+    if (run.killedAsHung) console.error(`harness stderr tail:\n${run.stderr}`);
+    expect(run.killedAsHung).toBe(false);
+    expect({ code: run.exitCode, signal: run.exitSignal }).toEqual({ code: 143, signal: null });
+    expect(run.exitedAfterSignalMs ?? Number.POSITIVE_INFINITY).toBeLessThan(SIGTERM_EXIT_BOUND_MS);
+    // The plugin's own cleanup still ran: the in-flight npm install is gone.
+    expect(run.npmPid).not.toBeNull();
+    expect(isAlive(run.npmPid ?? -1)).toBe(false);
+  }, 70_000);
+});

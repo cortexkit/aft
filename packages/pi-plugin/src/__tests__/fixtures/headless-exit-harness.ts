@@ -19,6 +19,9 @@
  * Environment (set by the parent test):
  *   HARNESS_NPM_MARKER  file the fake `npm` writes its pid to once it starts
  *   HARNESS_PLUGIN      absolute path of the plugin entry (src/index.ts)
+ *   HARNESS_MODE        "sigterm": skip session_shutdown, add a second SIGTERM
+ *                       listener that never exits, and wait for the parent to
+ *                       send SIGTERM
  *
  * Stdout protocol, one line each: `EVENT <name> <detail>`.
  */
@@ -141,9 +144,20 @@ while (!existsSync(npmMarker) && Date.now() < deadline) {
 }
 emit(existsSync(npmMarker) ? "npm-started" : "npm-never-started");
 
-for (const handler of handlers.get("session_shutdown") ?? []) {
-  await handler({}, {});
+if (process.env.HARNESS_MODE === "sigterm") {
+  // Stand in for a host that also listens for SIGTERM but never exits from it
+  // (Pi's signal-exit listener stands aside while another listener exists),
+  // and that keeps running on its own, like an interactive host would.
+  process.on("SIGTERM", function hostListenerThatNeverExits() {
+    emit("host-listener-called");
+  });
+  setInterval(() => undefined, 1_000);
+  emit("awaiting-signal");
+} else {
+  for (const handler of handlers.get("session_shutdown") ?? []) {
+    await handler({}, {});
+  }
+  // The ONNX Runtime becomes ready only now, after the pool is gone.
+  resolveOnnx("/fake/onnxruntime");
+  emit("shutdown-done", `pools=${poolsCreated} bridges=${bridgesSpawned}`);
 }
-// The ONNX Runtime becomes ready only now, after the pool is gone.
-resolveOnnx("/fake/onnxruntime");
-emit("shutdown-done", `pools=${poolsCreated} bridges=${bridgesSpawned}`);
