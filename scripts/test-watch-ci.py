@@ -188,17 +188,20 @@ class WatchCiLiveTests(unittest.TestCase):
         self.assertFalse(git_log.exists(), "numeric run IDs must not invoke git")
         self.assertTrue(all(call[:2] == ["run", "view"] for call in self.calls()))
 
-    def test_cancelled_advisory_job_does_not_red_a_run_whose_gating_jobs_passed(self) -> None:
+    def test_opencode2_job_gates_the_run_now_that_it_is_required(self) -> None:
         # Live fixture: cortexkit/aft run 35346888604 (train 114 round 2)
-        # completed with conclusion 'cancelled' because the advisory
-        # 'OpenCode 2 (Linux Docker)' job hit its time cap, while every gating
-        # job passed and main's required checks were all green on the sha. The
-        # verdict must come from the non-advisory jobs, not the run summary.
+        # completed with conclusion 'cancelled' because 'OpenCode 2 (Linux
+        # Docker)' hit its time cap while every other job passed. That job was
+        # advisory then and read as landable (advisory_only=1). It has been a
+        # required check on main since 2026-09-22, so the same run must now red
+        # the train: train 181 read 'CI green' here and was then refused at
+        # landing because the required check had failed.
         if self.env["REPO"] != "cortexkit/aft":
             self.skipTest("fixture run belongs to cortexkit/aft")
         result = self.watch("35346888604")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("conclusion=cancelled advisory_only=1", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("gating_failed='E2E / OpenCode 2 (Linux Docker)'", result.stdout)
+        self.assertNotIn("advisory_only=1", result.stdout)
 
     def test_sha_resolution_asks_for_the_push_run_only(self) -> None:
         # A sha is not unique across triggers: a scheduled or dispatched re-run

@@ -168,11 +168,13 @@ while true; do
   STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
   # Advisory (continue-on-error) jobs read 'failure' at the job level but do
   # not gate the run: 'Bash permission e2e (Windows)' in PR mode
-  # (_unit-suite.yml strict=false) and 'OpenCode 2 (Linux Docker)' until its
-  # matrix is green and the check is required. Fail-fast must not fire on
-  # them; the run-level conclusion check below remains authoritative.
+  # (_unit-suite.yml strict=false). 'OpenCode 2 (Linux Docker)' is NOT
+  # advisory: it has been a required check on main since 2026-09-22, so a
+  # red there must fail the train here rather than surface as a refused
+  # landing. Fail-fast must not fire on advisory jobs; the run-level
+  # conclusion check below remains authoritative.
   FAILED_JOB=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
+    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
@@ -196,12 +198,12 @@ while true; do
       exit 0
     fi
     # An advisory job cancelled at its own time cap makes the RUN read
-    # 'cancelled' while every gating job passed (train 114 round 2: only
-    # 'OpenCode 2 (Linux Docker)' was cancelled and main's 25 required checks
-    # were all green). The sha is landable then, so the verdict is the set of
-    # non-advisory jobs, not the run's summary conclusion.
+    # 'cancelled' while every gating job passed. The sha is landable then, so
+    # the verdict is the set of non-advisory jobs, not the run's summary
+    # conclusion. (Train 114 round 2 hit this with 'OpenCode 2 (Linux
+    # Docker)', which was advisory then and is required now.)
     GATING_BAD=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not) | .name] | join("; ")')
+      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission") | not) | .name] | join("; ")')
     if [ -z "$GATING_BAD" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC advisory_only=1"
       exit 0
