@@ -767,6 +767,31 @@ mod tests {
     }
 
     #[test]
+    fn root_labelled_permits_name_the_root_without_sharing_a_slot() {
+        let limiter = test_limiter(4);
+        let root = std::path::Path::new("/work/labelled-root");
+        let first = acquire_blocking_while_for_root_with_limiter(&limiter, "first", root, || true)
+            .expect("first labelled permit");
+        let second =
+            acquire_blocking_while_for_root_with_limiter(&limiter, "second", root, || true)
+                .expect("second labelled permit");
+
+        let census = limiter.census();
+        assert_eq!(census.holders.len(), 2, "{census:?}");
+        assert!(census
+            .holders
+            .iter()
+            .all(|holder| holder.root == root.display().to_string() && holder.sharers == 1));
+        assert_eq!(
+            limiter.available.load(Ordering::Acquire),
+            2,
+            "a root label must not merge two builds into one shared slot"
+        );
+        drop((first, second));
+        assert_eq!(limiter.available.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
     fn permits_release_on_drop() {
         let _serial = serial();
         let before = GLOBAL_COLD_BUILD_LIMITER.available.load(Ordering::Acquire);

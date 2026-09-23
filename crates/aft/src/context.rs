@@ -201,7 +201,7 @@ impl Default for SubcLifecycleAdmission {
             unbound: Arc::default(),
             unbound_since: Arc::default(),
             abandon_grace_ms: Arc::new(AtomicU64::new(
-                UNBOUND_BUILD_ABANDON_GRACE.as_millis() as u64,
+                UNBOUND_BUILD_ABANDON_GRACE.as_millis() as u64
             )),
         }
     }
@@ -5676,45 +5676,43 @@ impl AppContext {
                 // fence once the root has stayed unbound past the grace
                 // window. The persist-epoch rule above is unchanged: a
                 // transient unbind still lets the build finish and persist.
-                let built = crate::callgraph_store::with_unbound_abandonment_check(
-                    lifecycle,
-                    || {
+                let built =
+                    crate::callgraph_store::with_unbound_abandonment_check(lifecycle, || {
                         crate::callgraph_store::with_publish_epoch(
                             persist_epoch_flag.clone(),
                             persist_epoch,
                             || match work {
-                        CallgraphBackgroundWork::LegacyMigration => {
-                            CallGraphStore::migrate_legacy_with_lease(
-                                callgraph_dir.clone(),
-                                project_root.clone(),
-                            )
-                        }
-                        CallgraphBackgroundWork::ForceRebuild(_) => {
-                            let files = crate::callgraph::walk_project_files(&project_root)
-                                .collect::<Vec<_>>();
-                            CallGraphStore::force_cold_build_with_lease_chunked(
-                                callgraph_dir.clone(),
-                                project_root.clone(),
-                                &files,
-                                chunk_size,
-                            )
-                            .map(|(store, _)| Some(store))
-                        }
-                        CallgraphBackgroundWork::Ensure => {
-                            let files = crate::callgraph::walk_project_files(&project_root)
-                                .collect::<Vec<_>>();
-                            CallGraphStore::ensure_built_with_lease_chunked(
-                                callgraph_dir.clone(),
-                                project_root.clone(),
-                                &files,
-                                chunk_size,
-                            )
-                            .map(|(store, _)| Some(store))
-                        }
-                    },
+                                CallgraphBackgroundWork::LegacyMigration => {
+                                    CallGraphStore::migrate_legacy_with_lease(
+                                        callgraph_dir.clone(),
+                                        project_root.clone(),
+                                    )
+                                }
+                                CallgraphBackgroundWork::ForceRebuild(_) => {
+                                    let files = crate::callgraph::walk_project_files(&project_root)
+                                        .collect::<Vec<_>>();
+                                    CallGraphStore::force_cold_build_with_lease_chunked(
+                                        callgraph_dir.clone(),
+                                        project_root.clone(),
+                                        &files,
+                                        chunk_size,
+                                    )
+                                    .map(|(store, _)| Some(store))
+                                }
+                                CallgraphBackgroundWork::Ensure => {
+                                    let files = crate::callgraph::walk_project_files(&project_root)
+                                        .collect::<Vec<_>>();
+                                    CallGraphStore::ensure_built_with_lease_chunked(
+                                        callgraph_dir.clone(),
+                                        project_root.clone(),
+                                        &files,
+                                        chunk_size,
+                                    )
+                                    .map(|(store, _)| Some(store))
+                                }
+                            },
                         )
-                    },
-                );
+                    });
                 match built {
                     Ok(Some(store)) => {
                         if store.is_legacy_migration() {
@@ -9617,6 +9615,114 @@ mod callgraph_store_for_ops_tests {
             CallgraphStoreAccess::Ready(_)
         ));
         query.join().expect("callgraph query thread");
+    }
+
+    /// Schedules a callgraph cold build held at its start gate, with the
+    /// given abandon grace, and returns the context, project root, the gate
+    /// release, and a clone of the build's event receiver.
+    fn gated_callgraph_cold_build(
+        grace: Duration,
+    ) -> (
+        Arc<AppContext>,
+        TempDir,
+        TempDir,
+        PathBuf,
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<CallGraphStoreBuildEvent>,
+    ) {
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(
+                project.path().join(format!("{name}.rs")),
+                format!("pub fn {name}_marker() {{}}\n"),
+            )
+            .expect("source file");
+        }
+        let project_root = std::fs::canonicalize(project.path()).expect("canonical project root");
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                callgraph_chunk_size: 1,
+                ..Config::default()
+            },
+        ));
+        ctx.isolate_cold_build_limiter_for_test(2);
+        ctx.set_unbound_build_abandon_grace_for_test(grace);
+        let (reached, release) = install_callgraph_build_start_gate(project_root.clone());
+        assert!(matches!(
+            ctx.schedule_callgraph_store_warm(),
+            CallgraphStoreAccess::Building
+        ));
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("scheduled callgraph worker did not reach start barrier");
+        let events = ctx
+            .callgraph_store_rx()
+            .lock()
+            .clone()
+            .expect("callgraph build receiver");
+        (ctx, project, storage, project_root, release, events)
+    }
+
+    fn wait_for_no_cold_build_holders(ctx: &AppContext) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ctx.cold_build_limiter().census().holders.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "cold-build permit was not released: {:?}",
+                ctx.cold_build_limiter().census().holders
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn callgraph_cold_build_stops_at_next_fence_when_root_is_abandoned_past_grace() {
+        let _env_guard = callgraph_build_wait_ms(10_000);
+        let (ctx, _project, _storage, project_root, release, events) =
+            gated_callgraph_cold_build(Duration::ZERO);
+        let census = ctx.cold_build_limiter().census();
+        assert_eq!(census.holders.len(), 1, "{census:?}");
+        assert_eq!(
+            census.holders[0].root,
+            project_root.display().to_string(),
+            "the callgraph holder must name its root"
+        );
+
+        ctx.mark_subc_unbound();
+        release.send(()).expect("release callgraph worker");
+        let event = events
+            .recv_timeout(Duration::from_secs(30))
+            .expect("callgraph worker did not settle");
+        assert!(
+            matches!(event, CallGraphStoreBuildEvent::Settled),
+            "an abandoned root's callgraph build must stop without publishing a store"
+        );
+        wait_for_no_cold_build_holders(&ctx);
+    }
+
+    #[test]
+    fn callgraph_cold_build_continues_through_unbind_inside_grace() {
+        let _env_guard = callgraph_build_wait_ms(10_000);
+        let (ctx, _project, _storage, _project_root, release, events) =
+            gated_callgraph_cold_build(Duration::from_secs(600));
+
+        // A transient unbind (host restart) must leave the build running.
+        ctx.mark_subc_unbound();
+        release.send(()).expect("release callgraph worker");
+        let event = events
+            .recv_timeout(Duration::from_secs(30))
+            .expect("callgraph worker did not settle");
+        assert!(
+            matches!(event, CallGraphStoreBuildEvent::Ready { .. }),
+            "a root unbound for less than the grace window must finish its callgraph build"
+        );
+        wait_for_no_cold_build_holders(&ctx);
     }
 
     #[test]

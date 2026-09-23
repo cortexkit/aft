@@ -4157,15 +4157,17 @@ fn schedule_artifact_loads(
                 // Only writable roots reach this permit. Even a cache hit can
                 // discover stale inputs and rebuild, so the writable load stays
                 // cold-build limited before reading or refreshing the artifact.
-                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-                    &search_cold_build_limiter,
-                    "search index post-configure load",
-                    &root_for_search,
-                    || {
-                        search_lifecycle
-                            .is_current(search_generation_flag.as_ref(), search_generation)
-                    },
-                ) else {
+                let Some(_permit) =
+                    crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+                        &search_cold_build_limiter,
+                        "search index post-configure load",
+                        &root_for_search,
+                        || {
+                            search_lifecycle
+                                .is_current(search_generation_flag.as_ref(), search_generation)
+                        },
+                    )
+                else {
                     return;
                 };
                 if search_persist_epoch_flag.current() != search_persist_epoch {
@@ -4619,10 +4621,7 @@ fn schedule_artifact_loads(
                             let mut embed_batches = 0usize;
                             let mut embed = |texts: Vec<String>| {
                                 if semantic_lifecycle.unbound_past_grace() {
-                                    log_semantic_build_abandoned(
-                                        &root_clone,
-                                        &progress_for_embed,
-                                    );
+                                    log_semantic_build_abandoned(&root_clone, &progress_for_embed);
                                     return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
                                 }
                                 if semantic_build_epoch_flag.load(Ordering::SeqCst)
@@ -9024,6 +9023,137 @@ mod tests {
             ),
             "an unbound worker must not publish a refresh event after its slot wait"
         );
+    }
+
+    /// Starts a semantic cold build over nine small files at one chunk per
+    /// embed batch and returns once the first batch is parked in the embedding
+    /// server, so the build holds its cold-build permit mid-loop.
+    fn semantic_cold_build_parked_on_first_batch(
+        grace: Duration,
+    ) -> (
+        TestContext,
+        CountingEmbeddingServer,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+    ) {
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let storage = temp.path().join("storage");
+        std::fs::create_dir_all(&project).unwrap();
+        for index in 0..8 {
+            std::fs::write(
+                project.join(format!("batch_{index}.rs")),
+                format!("pub fn abandoned_batch_symbol_{index}() -> usize {{ {index} }}\n"),
+            )
+            .unwrap();
+        }
+        init_git_fixture(&project);
+        let request =
+            configure_semantic_with_options(&project, &storage, &server.base_url, true, 1, false);
+        let ctx = test_context();
+        ctx.isolate_cold_build_limiter_for_test(4);
+        ctx.set_unbound_build_abandon_grace_for_test(grace);
+
+        let response = handle_configure_for_test(&request, &ctx);
+        assert!(response.success, "configure failed: {:?}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(10)),
+            "semantic cold build did not reach the embedding server"
+        );
+        (ctx, server, temp, project, storage)
+    }
+
+    fn semantic_cold_build_holders(
+        ctx: &AppContext,
+    ) -> Vec<crate::cold_build_limiter::ColdBuildCensusEntry> {
+        ctx.cold_build_limiter()
+            .census()
+            .holders
+            .into_iter()
+            .filter(|holder| holder.kind == super::SEMANTIC_COLD_BUILD_LIMITER_KIND)
+            .collect()
+    }
+
+    #[test]
+    fn semantic_cold_build_stops_within_one_batch_when_root_is_abandoned_past_grace() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (ctx, server, _temp, project, storage) =
+            semantic_cold_build_parked_on_first_batch(Duration::ZERO);
+
+        let holders = semantic_cold_build_holders(&ctx);
+        assert_eq!(holders.len(), 1, "{holders:?}");
+        assert_eq!(
+            Path::new(&holders[0].root).file_name(),
+            Some(std::ffi::OsStr::new("project")),
+            "the semantic holder must name its root, not `unknown`"
+        );
+
+        // Quiesce exactly as the subc loop does for a root with no routes.
+        ctx.mark_subc_unbound();
+        super::cancel_deferred_configure_maintenance(&ctx);
+        server.release_responses();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !semantic_cold_build_holders(&ctx).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned semantic build kept its cold-build permit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Give a build that ignored the stop time to send more batches.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            server.non_probe_request_count(),
+            1,
+            "the build must stop at the batch boundary after the in-flight batch"
+        );
+        assert!(
+            !semantic_cache_file(&storage, &project).exists(),
+            "a cancelled cold build must not persist a partial index"
+        );
+    }
+
+    #[test]
+    fn semantic_cold_build_continues_through_unbind_inside_grace() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_lock = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (ctx, server, _temp, project, storage) =
+            semantic_cold_build_parked_on_first_batch(Duration::from_secs(600));
+
+        // A transient unbind: the next batch boundary is crossed while the
+        // root is still unbound, but inside the grace window.
+        ctx.mark_subc_unbound();
+        super::cancel_deferred_configure_maintenance(&ctx);
+        server.release_response();
+        assert!(
+            server.wait_for_non_probe_request_count(2, Duration::from_secs(10)),
+            "an unbind inside the grace window must not stop the build"
+        );
+        ctx.mark_subc_bound();
+        server.release_responses();
+        assert!(
+            server.wait_for_non_probe_request_count(8, Duration::from_secs(10)),
+            "the build must embed every batch after a transient unbind"
+        );
+
+        let cache = semantic_cache_file(&storage, &project);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.exists() || !semantic_cold_build_holders(&ctx).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the build must persist and release its permit after a transient unbind"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
