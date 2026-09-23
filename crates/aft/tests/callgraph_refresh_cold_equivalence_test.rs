@@ -424,3 +424,24 @@ fn export_alias_rows_are_deterministic() {
     );
 }
 
+/// A Rust value reference (a function passed as a value) resolves only when
+/// its target is callable. It must be re-resolved when the target changes.
+#[test]
+fn rust_value_refs_are_refreshed_with_their_target() {
+    assert_refresh_matches_cold(
+        "rust value ref target becomes callable",
+        &[
+            ("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n"),
+            ("src/lib.rs", "mod app;\nmod util;\n"),
+            ("src/util.rs", "pub const HELPER: u32 = 1;\n"),
+            (
+                "src/app.rs",
+                "use crate::util::HELPER;\npub fn run() -> Vec<u32> {\n    vec![1u32].into_iter().map(HELPER).collect()\n}\n",
+            ),
+        ],
+        &[&[(
+            "src/util.rs",
+            Some("#[allow(non_snake_case)]\npub fn HELPER(x: u32) -> u32 {\n    x\n}\n"),
+        )]],
+    );
+}

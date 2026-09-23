@@ -15139,7 +15139,10 @@ fn ref_dependency_row_depends_on(
     }
 
     match row.kind.as_str() {
-        "call" => true,
+        // A call or value reference in a file that imports `rel_path` can bind
+        // to it even when its stored state points elsewhere or nowhere (a value
+        // reference only resolves once its target is callable).
+        "call" | "value_ref" => true,
         "import" | "reexport" => row
             .module_path
             .as_deref()
