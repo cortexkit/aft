@@ -58,6 +58,10 @@ fn malformed_request_body_leaves_no_trace_in_the_log() {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
     let mut child = Command::new(binary)
         .env("AFT_CACHE_DIR", temp.path())
+        // Slow the log writer so the lines logged just before exit are still
+        // queued when the process ends: the test then fails unless every exit
+        // path waits for the writer to drain.
+        .env("AFT_TEST_LOG_WRITER_DELAY_MS", "300")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -86,14 +90,9 @@ fn malformed_request_body_leaves_no_trace_in_the_log() {
         .join("aft")
         .join("logs")
         .join(format!("aft-{pid}.log"));
-    let mut contents = String::new();
-    for _ in 0..40 {
-        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-        if contents.contains("parse error") {
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
+    // No polling: the process has exited, so everything it logged must
+    // already be on disk.
+    let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
     // The parse-error line must exist, or the absence checks prove nothing.
     let parse_line = contents
         .lines()

@@ -61,6 +61,17 @@ fn parse_subc_arg(
     None
 }
 
+/// Upper bound on how long an exit waits for the durable log to catch up.
+const DURABLE_LOG_EXIT_FLUSH: Duration = Duration::from_secs(2);
+
+/// Flush the durable log before `process::exit`, which skips every destructor
+/// and would otherwise drop the lines still queued for the log writer: the
+/// ones that explain the exit.
+fn exit_after_log_flush(code: i32) -> i32 {
+    aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+    code
+}
+
 fn main() {
     // `gh` is a compatibility entry point for the upstream GitHub CLI. Handle
     // it before scanning AFT's global arguments; otherwise `gh --version` would
@@ -205,7 +216,10 @@ fn main() {
         let user_config_path = aft::subc_config::cortexkit_user_config_path();
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
-            Ok(()) => return,
+            Ok(()) => {
+                aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+                return;
+            }
             // A lost connection is a restart request, not a failure to attach:
             // the supervisor respawns any non-zero exit, and a distinct code keeps
             // it separate from attach/auth failures in the supervisor's ledger.
@@ -213,17 +227,17 @@ fn main() {
                 aft::slog_error!(
                     "subc connection lost after attach; exiting for supervisor restart"
                 );
-                std::process::exit(SUBC_CONNECTION_LOST_EXIT_CODE);
+                std::process::exit(exit_after_log_flush(SUBC_CONNECTION_LOST_EXIT_CODE));
             }
             Err(aft::subc::SubcError::ActorFatal) => {
                 aft::slog_error!(
                     "executor actor went fatal after attach; exiting for supervisor restart"
                 );
-                std::process::exit(SUBC_ACTOR_FATAL_EXIT_CODE);
+                std::process::exit(exit_after_log_flush(SUBC_ACTOR_FATAL_EXIT_CODE));
             }
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");
-                std::process::exit(1);
+                std::process::exit(exit_after_log_flush(1));
             }
         }
     }
@@ -564,6 +578,7 @@ fn main() {
         "shutdown phase=complete elapsed_ms={}",
         shutdown_started.elapsed().as_millis()
     );
+    aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
 }
 
 #[cfg(test)]
@@ -811,7 +826,7 @@ fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspC
             if killed > 0 {
                 aft::slog_info!("signal {}: killed {} LSP child process(es)", signal, killed);
             }
-            std::process::exit(128 + signal);
+            std::process::exit(exit_after_log_flush(128 + signal));
         }
     });
 }
@@ -856,7 +871,7 @@ fn install_subc_signal_handler(
                     killed
                 );
             }
-            std::process::exit(128 + signal);
+            std::process::exit(exit_after_log_flush(128 + signal));
         }
     });
 }

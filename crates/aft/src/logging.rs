@@ -770,6 +770,8 @@ fn prepare_file_sink(
 enum LogMessage {
     Write(Vec<u8>),
     Reconfigure(PathBuf),
+    /// Write everything queued before this message, then signal the sender.
+    Flush(SyncSender<()>),
 }
 
 #[derive(Default)]
@@ -810,9 +812,21 @@ impl Write for TeeWriter {
 }
 
 fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
+    // Test-only: hold each batch so a test can prove exit paths wait for the
+    // writer instead of racing it. Debug builds only; release ignores it.
+    #[cfg(debug_assertions)]
+    let test_delay = std::env::var("AFT_TEST_LOG_WRITER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis);
     while let Ok(message) = rx.recv() {
+        #[cfg(debug_assertions)]
+        if let Some(delay) = test_delay {
+            thread::sleep(delay);
+        }
         let mut lines = Vec::new();
         let mut reconfigure = None;
+        let mut flushed = None;
         match message {
             LogMessage::Write(line) => {
                 lines.push(line);
@@ -823,11 +837,16 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
                             reconfigure = Some(storage_root);
                             break;
                         }
+                        Ok(LogMessage::Flush(done)) => {
+                            flushed = Some(done);
+                            break;
+                        }
                         Err(_) => break,
                     }
                 }
             }
             LogMessage::Reconfigure(storage_root) => reconfigure = Some(storage_root),
+            LogMessage::Flush(done) => flushed = Some(done),
         }
         if !lines.is_empty() {
             if let Err(error) = sink.write_batch(&lines) {
@@ -837,6 +856,11 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
                 ));
                 break;
             }
+        }
+        // The channel is FIFO, so every line queued before the flush request
+        // has been written by now.
+        if let Some(done) = flushed {
+            let _ = done.try_send(());
         }
         if let Some(storage_root) = reconfigure {
             let logs_dir = storage_root.join("logs");
@@ -857,6 +881,32 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
 
 fn write_stderr_once(message: &str) {
     let _ = io::stderr().write_all(message.as_bytes());
+}
+
+/// Wait, at most `timeout`, until the durable log writer has written every line
+/// logged before this call.
+///
+/// The file sink is a background thread fed by a channel, so a process that
+/// exits right after logging loses whatever is still queued: the lines closest
+/// to an exit, which are the ones forensics needs. Every exit path calls this
+/// first. Returns false when the writer did not confirm in time (or the durable
+/// log is disabled), so an exit is never held longer than `timeout`.
+pub fn flush_durable_log(timeout: std::time::Duration) -> bool {
+    let tx = match FILE_CONTROL.lock() {
+        Ok(control) => control.tx.clone(),
+        Err(_) => None,
+    };
+    let Some(tx) = tx else {
+        return false;
+    };
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    // A blocking send: a full queue is exactly when there is the most to lose.
+    // The writer drains continuously, so this waits for space rather than
+    // dropping the request.
+    if tx.send(LogMessage::Flush(done_tx)).is_err() {
+        return false;
+    }
+    done_rx.recv_timeout(timeout).is_ok()
 }
 
 struct RotatingFile {
