@@ -8018,6 +8018,26 @@ fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -
 }
 
 fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
+    // Staging drops the per-file secondary indexes (refs.caller_file,
+    // dispatch_hints.file, ...) so bulk inserts skip index maintenance, which
+    // turns every per-file delete below into a full table scan. Scanning once
+    // per staged file makes a cold build quadratic in the file count.
+    //
+    // A file's `files` row is written in the same extraction-batch transaction
+    // as all of its other staged rows, and staging clears every table when it
+    // starts, so a path with no `files` row has nothing to delete. That is
+    // every file of a fresh staging run. Only a file committed before a crash
+    // (resumed with different content) or pruned from the inventory has a
+    // `files` row, and only those pay for the scans. The lookup is on the
+    // `files` primary key, which is never dropped.
+    let previously_staged: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+        params![rel_path],
+        |row| row.get(0),
+    )?;
+    if !previously_staged {
+        return Ok(());
+    }
     tx.execute(
         "DELETE FROM staging_ref_context
          WHERE ref_id IN (SELECT ref_id FROM refs WHERE caller_file = ?1)",
@@ -20440,6 +20460,132 @@ mod bounded_build_breaker_tests {
             "the already committed batch and its credit survive adoption; only the new batch increments credit"
         );
         assert_eq!(staged_build_phase(&conn).unwrap().as_deref(), Some("ready"));
+    }
+
+    /// A file committed by an interrupted extraction pass whose content no
+    /// longer matches must lose every old row when the resumed pass re-extracts
+    /// it, even though fresh files skip the per-file delete entirely.
+    #[test]
+    fn resumed_stage_replaces_changed_file_rows() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let first = root.join("first.ts");
+        let second = root.join("second.ts");
+        std::fs::write(
+            &first,
+            "function oldHelper() {}\nexport function first() { oldHelper(); }\n",
+        )
+        .unwrap();
+        std::fs::write(&second, "export function second() {}\n").unwrap();
+        let old_extract = build_file_extract(&root, &first).unwrap();
+        assert!(
+            old_extract
+                .raw_refs
+                .iter()
+                .any(|raw| raw.short_name.as_deref() == Some("oldHelper")),
+            "the old content stages a reference that must disappear on resume"
+        );
+        // The file changes after its batch was committed; the resumed pass sees
+        // a staged content hash that no longer matches and re-extracts it.
+        std::fs::write(
+            &first,
+            "function newHelper() {}\nexport function first() { newHelper(); }\n",
+        )
+        .unwrap();
+
+        let staging = temp.path().join("stage.sqlite");
+        let writer_lease = acquire_writer_lease(temp.path(), "test-key", &root)
+            .unwrap()
+            .expect("test root may write its private staging database");
+        let store = CallGraphStore::open_at_path(
+            root.clone(),
+            "test-key".to_string(),
+            staging,
+            None,
+            true,
+            Some(writer_lease),
+            None,
+        )
+        .unwrap()
+        .store;
+        let corpus_fingerprint = store
+            .stage_cold_build_file_inventory(&[first.clone(), second.clone()])
+            .unwrap();
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            clear_tables(&tx).unwrap();
+            tx.execute("DELETE FROM staging_ref_context", []).unwrap();
+            insert_meta(&tx).unwrap();
+            drop_cold_build_secondary_indexes(&tx).unwrap();
+            set_meta_ready(&tx, false).unwrap();
+            set_staged_build_phase(&tx, "extracting").unwrap();
+            set_staged_string(&tx, STAGED_CORPUS_FINGERPRINT, &corpus_fingerprint).unwrap();
+            set_staged_u64(&tx, STAGED_COMMITTED_EXTRACTED_BYTES, 0).unwrap();
+            {
+                let mut inserts = ColdBuildInsertStatements::new(&tx).unwrap();
+                insert_file_extract_prepared(
+                    &mut inserts,
+                    &root.display().to_string(),
+                    &old_extract,
+                )
+                .unwrap();
+                for raw in &old_extract.raw_refs {
+                    insert_staged_ref_prepared(&mut inserts, raw).unwrap();
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        store
+            .cold_build_chunked(&[first.clone(), second.clone()], 1)
+            .expect("resumed build re-extracts the changed file");
+
+        let new_extract = build_file_extract(&root, &first).unwrap();
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(staged_build_phase(&conn).unwrap().as_deref(), Some("ready"));
+        let staged_hash: String = conn
+            .query_row(
+                "SELECT content_hash FROM files WHERE path = 'first.ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            staged_hash,
+            hash_to_hex(new_extract.freshness.content_hash)
+        );
+        let names = |sql: &str| -> BTreeSet<String> {
+            let mut statement = conn.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        let expected_nodes: BTreeSet<String> =
+            new_extract.nodes.iter().map(|node| node.id.clone()).collect();
+        assert_eq!(
+            names("SELECT id FROM nodes WHERE file_path = 'first.ts'"),
+            expected_nodes,
+            "only the re-extracted content's nodes remain"
+        );
+        let expected_refs: BTreeSet<String> = new_extract
+            .raw_refs
+            .iter()
+            .map(|raw| raw.ref_id.clone())
+            .collect();
+        assert_eq!(
+            names("SELECT ref_id FROM refs WHERE caller_file = 'first.ts'"),
+            expected_refs,
+            "only the re-extracted content's refs remain"
+        );
+        let short_names = names(
+            "SELECT short_name FROM refs WHERE caller_file = 'first.ts' AND short_name IS NOT NULL",
+        );
+        assert!(!short_names.contains("oldHelper"), "{short_names:?}");
+        assert!(short_names.contains("newHelper"), "{short_names:?}");
     }
 
     const SPECIMEN_CHILD_TEST: &str =
