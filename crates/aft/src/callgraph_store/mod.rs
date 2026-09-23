@@ -4779,7 +4779,7 @@ impl CallGraphStore {
         // Method-dispatch edges are chosen among every same-named method in
         // the store, so a method that appears, disappears or moves (a node id
         // encodes its position) can change the edge of a caller in any file.
-        let mut dispatch_names = BTreeSet::new();
+        let mut dispatch_names = DispatchNames::default();
         for rel_path in touched_callers.iter().chain(deleted.iter()) {
             let new_nodes = if deleted.contains(rel_path) {
                 None
@@ -4788,9 +4788,10 @@ impl CallGraphStore {
                     .get(rel_path)
                     .map(|extract| extract.nodes.as_slice())
             };
-            dispatch_names.extend(changed_dispatch_candidate_names(
-                &conn, rel_path, new_nodes,
-            )?);
+            dispatch_names.extend(
+                rel_path,
+                changed_dispatch_candidate_names(&conn, rel_path, new_nodes)?,
+            );
         }
 
         let tx = conn.transaction()?;
@@ -12703,6 +12704,28 @@ fn insert_method_dispatch_edge(
     Ok(edge_id)
 }
 
+/// Method names whose dispatch candidates changed in a refresh. `path_form`
+/// holds the ones that came from non-JS/TS files, whose callers can store a
+/// whole path as a call's short name.
+#[derive(Debug, Default)]
+struct DispatchNames {
+    all: BTreeSet<String>,
+    path_form: BTreeSet<String>,
+}
+
+impl DispatchNames {
+    fn extend(&mut self, rel_path: &str, names: BTreeSet<String>) {
+        let js_family = Path::new(rel_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| JS_TS_EXTENSIONS.contains(&ext));
+        if !js_family {
+            self.path_form.extend(names.iter().cloned());
+        }
+        self.all.extend(names);
+    }
+}
+
 /// Names under which `rel_path` offers a different set of method-dispatch
 /// candidates in `new_nodes` (None when the file is being deleted) than in its
 /// stored rows. Name matching chooses by candidate file, scoped name and kind
@@ -12782,7 +12805,7 @@ fn dispatch_callers_to_recompute(
     tx: &Transaction<'_>,
     roots: &BTreeSet<String>,
     changed_node_files: &BTreeSet<String>,
-    changed_names: &BTreeSet<String>,
+    changed_names: &DispatchNames,
 ) -> Result<BTreeSet<String>> {
     let mut callers = roots.clone();
     let mut by_target = tx.prepare(
@@ -12797,19 +12820,36 @@ fn dispatch_callers_to_recompute(
             callers.insert(row?);
         }
     }
-    if !changed_names.is_empty() {
-        // A call's short name can be a whole path (`Type::method`), so match
-        // on its last segment, as name matching does.
+    let mut by_name = tx.prepare(
+        "SELECT DISTINCT caller_file FROM refs
+         WHERE short_name = ?1 AND +kind = 'call' AND status = 'unresolved'",
+    )?;
+    // `+kind` keeps SQLite on the short-name index; on the kind index this
+    // lookup walks every call row.
+    for name in &changed_names.all {
+        for row in by_name.query_map(params![name], |row| row.get::<_, String>(0))? {
+            callers.insert(row?);
+        }
+    }
+    if !changed_names.path_form.is_empty() {
+        // Rust (and other non-JS) calls can store a whole path as their short
+        // name (`Type::method`); match those on the last segment, as name
+        // matching does. JS/TS short names are the bare member name, so a
+        // change in a JS/TS file never needs this scan.
         let mut unresolved = tx.prepare(
             "SELECT caller_file, short_name FROM refs
-             WHERE kind = 'call' AND status = 'unresolved' AND short_name IS NOT NULL",
+             WHERE kind = 'call' AND status = 'unresolved'
+               AND (short_name GLOB '*::*' OR short_name GLOB '*.*' OR short_name GLOB '*->*')",
         )?;
         let rows = unresolved.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         for row in rows {
             let (caller_file, short_name) = row?;
-            if changed_names.contains(callee_last_segment(&short_name)) {
+            if changed_names
+                .path_form
+                .contains(callee_last_segment(&short_name))
+            {
                 callers.insert(caller_file);
             }
         }
@@ -15571,10 +15611,10 @@ fn reexport_consumer_refs(
 }
 
 /// The name a call's short name ends in: `clone` for `crate::git::clone`,
-/// `save` for `store.save`.
+/// `save` for `store.save` or `store->save`.
 fn callee_last_segment(short_name: &str) -> &str {
     short_name
-        .rsplit(|character| matches!(character, ':' | '.'))
+        .rsplit(|character| matches!(character, ':' | '.' | '>'))
         .next()
         .unwrap_or(short_name)
 }

@@ -751,3 +751,36 @@ fn created_file_without_importers() {
     );
 }
 
+/// Rust stores a path call's whole path as its short name (`Widget::build`),
+/// so a method added in another file must still reach that caller's dispatch
+/// edge.
+#[test]
+fn dispatch_edges_follow_new_rust_path_candidates() {
+    let cold = assert_refresh_matches_cold(
+        "rust method added for a path call",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "mod app;\nmod shapes;\n"),
+            (
+                "src/shapes.rs",
+                "pub struct Widget;\nimpl Widget {\n    pub fn other() {}\n}\n",
+            ),
+            (
+                "src/app.rs",
+                "pub fn run() {\n    Widget::build();\n}\n",
+            ),
+        ],
+        &[&[(
+            "src/shapes.rs",
+            Some("pub struct Widget;\nimpl Widget {\n    pub fn other() {}\n    pub fn build() {}\n}\n"),
+        )]],
+    );
+    assert!(
+        !edges_to(&cold, "Widget::build").is_empty(),
+        "{:#?}",
+        cold.edges
+    );
+}
