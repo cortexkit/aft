@@ -2427,6 +2427,8 @@ pub struct StalePathCensus {
 pub struct RefreshFilesProfile {
     pub parse: Duration,
     pub dependency_selection: Duration,
+    /// Part of `dependency_selection`: finding importers of created files.
+    pub created_file_scan: Duration,
     pub row_deletes: Duration,
     pub row_inserts: Duration,
     pub dependent_parse: Duration,
@@ -2441,9 +2443,10 @@ pub struct RefreshFilesProfile {
 impl RefreshFilesProfile {
     pub fn report(&self) -> String {
         format!(
-            "parse={}ms dependency_selection={}ms row_deletes={}ms row_inserts={}ms dependent_parse={}ms index_load={}ms ref_resolution={}ms method_dispatch={}ms commit={}ms total={}ms",
+            "parse={}ms dependency_selection={}ms created_file_scan={}ms row_deletes={}ms row_inserts={}ms dependent_parse={}ms index_load={}ms ref_resolution={}ms method_dispatch={}ms commit={}ms total={}ms",
             self.parse.as_millis(),
             self.dependency_selection.as_millis(),
+            self.created_file_scan.as_millis(),
             self.row_deletes.as_millis(),
             self.row_inserts.as_millis(),
             self.dependent_parse.as_millis(),
@@ -4715,6 +4718,7 @@ impl CallGraphStore {
         let started = Instant::now();
         let (created_importers, created_reexporters) =
             importers_of_created_files(&conn, &self.project_root, &created)?;
+        profile.created_file_scan = started.elapsed();
         for (file, importers) in &created_importers {
             for importer in importers {
                 record_dependent_refs(
@@ -15605,12 +15609,14 @@ fn import_names_bound_to(
     bound
 }
 
-/// Import and re-export rows whose module can now name one of `created`.
-/// Before a file exists a bare or path-alias specifier (`@/late`, a workspace
-/// package) and a `.js` specifier for a `.ts` file resolve to nothing, so the
-/// importer's dependency set cannot name the file and `ref_ids_depending_on`
-/// does not find it. Returns the importing files per created file and the
-/// re-export rows among them.
+/// Import, re-export and `mod` rows whose module can now name one of
+/// `created`. Before a file exists a bare or path-alias specifier (`@/late`, a
+/// workspace package), a `.js` specifier for a `.ts` file and a directory
+/// import resolve to nothing, so the importer's dependency set cannot name the
+/// file and `ref_ids_depending_on` does not find it. Only rows whose specifier
+/// matches one of the forms that can reach a created path
+/// (`created_file_specifier_patterns`) are resolved again. Returns the
+/// importing files per created file and the re-export rows among them.
 fn importers_of_created_files(
     conn: &Connection,
     project_root: &Path,
@@ -15630,33 +15636,52 @@ fn importers_of_created_files(
         root: project_root,
         facts: &disk,
     };
-    let mut statement = conn.prepare(
-        "SELECT caller_file, kind, module_path, full_ref, wildcard FROM refs
-         WHERE kind IN ('import', 'reexport') AND module_path IS NOT NULL
-         ORDER BY caller_file, byte_start, ref_id",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, i64>(4)? != 0,
-        ))
-    })?;
-    for row in rows {
-        let (caller_file, kind, module_path, full_ref, wildcard) = row?;
-        if created.contains(&caller_file) {
-            continue;
-        }
-        let dependencies = module_dependencies_with_memo(
-            project_root,
-            &project_root.join(&caller_file),
-            &module_path,
-            &memo,
-            &facts,
-        );
-        for file in dependencies.intersection(created) {
+    let tsconfig_dirs = tsconfig_dirs(conn, project_root, created)?;
+    for file in created {
+        let patterns = created_file_specifier_patterns(project_root, file, &tsconfig_dirs, &facts);
+        let (sql, values) = patterns.query();
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)? != 0,
+            ))
+        })?;
+        for row in rows {
+            let (caller_file, kind, module_path, full_ref, wildcard) = row?;
+            if created.contains(&caller_file) {
+                continue;
+            }
+            let names_file = if kind == "module" {
+                rust_declared_module_target(project_root, &caller_file, &module_path, &memo, &facts)
+                    .as_deref()
+                    == Some(file.as_str())
+            } else {
+                module_dependencies_with_memo(
+                    project_root,
+                    &project_root.join(&caller_file),
+                    &module_path,
+                    &memo,
+                    &facts,
+                )
+                .contains(file)
+                    || (caller_file.ends_with(".rs")
+                        && rust_declared_module_path_target(
+                            project_root,
+                            &caller_file,
+                            &module_path,
+                            &memo,
+                            &facts,
+                        )
+                        .as_deref()
+                            == Some(file.as_str()))
+            };
+            if !names_file {
+                continue;
+            }
             importers
                 .entry(file.clone())
                 .or_default()
@@ -15666,14 +15691,370 @@ fn importers_of_created_files(
                     .entry(file.clone())
                     .or_default()
                     .push(ReexportRow {
-                        caller_file: caller_file.clone(),
-                        full_ref: full_ref.clone(),
+                        caller_file,
+                        full_ref,
                         wildcard,
                     });
             }
         }
     }
     Ok((importers, reexporters))
+}
+
+/// Directories holding a `tsconfig.json` the resolver can consult: every
+/// indexed one plus the ancestors of the created files, which covers stores
+/// that do not index JSON.
+fn tsconfig_dirs(
+    conn: &Connection,
+    project_root: &Path,
+    created: &BTreeSet<String>,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut dirs = BTreeSet::new();
+    let mut statement = conn.prepare(
+        "SELECT path FROM files WHERE path = 'tsconfig.json' OR path GLOB '*/tsconfig.json'",
+    )?;
+    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+        if let Some(dir) = project_root.join(row?).parent() {
+            dirs.insert(dir.to_path_buf());
+        }
+    }
+    for file in created {
+        for dir in project_root.join(file).ancestors().skip(1) {
+            if !dir.starts_with(project_root) {
+                break;
+            }
+            if dir.join("tsconfig.json").is_file() {
+                dirs.insert(dir.to_path_buf());
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+/// SQLite GLOB patterns for the `module_path` of rows that may name one
+/// created file, split by the caller's language because JS/TS specifiers and
+/// Rust `use`/`mod` paths name files differently.
+#[derive(Debug, Default)]
+struct CreatedFilePatterns {
+    js: BTreeSet<String>,
+    rust: BTreeSet<String>,
+    /// For a created crate root (`lib.rs`/`main.rs`): every Rust caller under
+    /// this directory, since any `use` path can fall back to the crate root.
+    rust_crate_dir: Option<String>,
+}
+
+impl CreatedFilePatterns {
+    fn query(&self) -> (String, Vec<String>) {
+        let mut values = Vec::new();
+        let any_of = |patterns: &BTreeSet<String>, values: &mut Vec<String>| {
+            let clauses = patterns
+                .iter()
+                .map(|pattern| {
+                    values.push(pattern.clone());
+                    format!("module_path GLOB ?{}", values.len())
+                })
+                .collect::<Vec<_>>();
+            if clauses.is_empty() {
+                "0".to_string()
+            } else {
+                clauses.join(" OR ")
+            }
+        };
+        let js = any_of(&self.js, &mut values);
+        let mut rust = any_of(&self.rust, &mut values);
+        if let Some(dir) = &self.rust_crate_dir {
+            values.push(format!("{}/*", glob_escape(dir)));
+            rust = format!("{rust} OR caller_file GLOB ?{}", values.len());
+        }
+        (
+            format!(
+                "SELECT caller_file, kind, module_path, full_ref, wildcard FROM refs
+                 WHERE kind IN ('import', 'reexport', 'module') AND module_path IS NOT NULL
+                   AND ((caller_file NOT GLOB '*.rs' AND ({js}))
+                        OR (caller_file GLOB '*.rs' AND ({rust})))
+                 ORDER BY caller_file, byte_start, ref_id"
+            ),
+            values,
+        )
+    }
+}
+
+/// Escapes GLOB metacharacters so a file or package name matches literally.
+fn glob_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '*' => escaped.push_str("[*]"),
+            '?' => escaped.push_str("[?]"),
+            '[' => escaped.push_str("[[]"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+/// Every specifier form through which the module resolver can reach `file`
+/// (a project-relative path), as GLOB patterns over `module_path`:
+///
+/// - relative and path-alias specifiers whose last component is the file name
+///   or its stem (`./keys`, `@/keys`, `../keys.js`: the resolver tries the exact
+///   path and then swaps the extension), or the directory name for an
+///   `index.*` file (`./widgets`, `.`, `..`);
+/// - the name of an enclosing package when the file is that package's entry,
+///   or an `exports` subpath that maps onto it (`package_entry_targets`);
+/// - aliases from `compilerOptions.paths` whose target maps onto the file,
+///   derived by matching the file against each target pattern (this covers
+///   exact aliases and targets whose wildcard is not the last component);
+/// - for Rust callers, `use`/`mod` paths that contain the module name the file
+///   defines (`b` for `b.rs` or `b/mod.rs`), and every caller in the crate when
+///   the file is `lib.rs`/`main.rs`.
+fn created_file_specifier_patterns(
+    project_root: &Path,
+    file: &str,
+    tsconfig_dirs: &BTreeSet<PathBuf>,
+    facts: &FactPaths<'_>,
+) -> CreatedFilePatterns {
+    let mut patterns = CreatedFilePatterns::default();
+    let path = Path::new(file);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    let parent_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str());
+
+    for last in [name, stem] {
+        let last = glob_escape(last);
+        patterns.js.insert(last.clone());
+        patterns.js.insert(format!("*/{last}"));
+    }
+    let stem_escaped = glob_escape(stem);
+    patterns.js.insert(format!("{stem_escaped}.*"));
+    patterns.js.insert(format!("*/{stem_escaped}.*"));
+    if stem == "index" {
+        for relative in [".", "..", "./", "../"] {
+            patterns.js.insert(relative.to_string());
+            patterns.js.insert(format!("*/{relative}"));
+        }
+        if let Some(parent) = parent_name {
+            let parent = glob_escape(parent);
+            for form in [
+                parent.clone(),
+                format!("*/{parent}"),
+                format!("{parent}/"),
+                format!("*/{parent}/"),
+            ] {
+                patterns.js.insert(form);
+            }
+        }
+    }
+
+    let absolute = project_root.join(file);
+    // The forms `resolve_file_like_path` accepts for this file: the exact path,
+    // the path with any JS/TS extension swapped in, and the directory of an
+    // index file.
+    let without_extension = absolute.with_extension("");
+    let mut targets = vec![absolute.clone(), without_extension.clone()];
+    for ext in JS_TS_EXTENSIONS {
+        targets.push(without_extension.with_extension(ext));
+    }
+    if stem == "index" {
+        if let Some(parent) = absolute.parent() {
+            targets.push(parent.to_path_buf());
+        }
+    }
+    let targets = targets
+        .iter()
+        .map(|target| normalize_lexically(target).to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    for dir in absolute.ancestors().skip(1) {
+        if !dir.starts_with(project_root) {
+            break;
+        }
+        let Some(package_json) = std::fs::read(dir.join("package.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        let Some(package_name) = package_json.get("name").and_then(|name| name.as_str()) else {
+            continue;
+        };
+        for (specifier, package_target) in package_entry_targets(package_name, &package_json) {
+            let mut candidates = vec![package_target.clone()];
+            // The resolver prefers `src/` sources over a `dist/` build.
+            if let Some(rest) = package_target.strip_prefix("dist/") {
+                candidates.push(format!("src/{rest}"));
+            }
+            for candidate in candidates {
+                let pattern = normalize_lexically(&dir.join(candidate))
+                    .to_string_lossy()
+                    .into_owned();
+                for target in &targets {
+                    if let Some(glob) = alias_specifier_for(&specifier, &pattern, target) {
+                        patterns.js.insert(glob);
+                    }
+                }
+            }
+        }
+    }
+
+    for dir in tsconfig_dirs {
+        let Some((base_dir, aliases)) = callgraph::tsconfig_path_aliases(dir, facts) else {
+            continue;
+        };
+        for (alias, alias_targets) in aliases {
+            for alias_target in alias_targets {
+                let pattern = normalize_lexically(&base_dir.join(&alias_target))
+                    .to_string_lossy()
+                    .into_owned();
+                for target in &targets {
+                    if let Some(specifier) = alias_specifier_for(&alias, &pattern, target) {
+                        patterns.js.insert(specifier);
+                    }
+                }
+            }
+        }
+    }
+
+    if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+        let module = if name == "mod.rs" {
+            parent_name
+        } else {
+            Some(stem)
+        };
+        if matches!(name, "lib.rs" | "main.rs") {
+            patterns.rust_crate_dir = path
+                .parent()
+                .and_then(Path::parent)
+                .map(|crate_dir| crate_dir.to_string_lossy().into_owned())
+                .filter(|crate_dir| !crate_dir.is_empty());
+            if patterns.rust_crate_dir.is_none() {
+                patterns.rust.insert("*".to_string());
+            }
+        } else if let Some(module) = module {
+            patterns.rust.insert(format!("*{}*", glob_escape(module)));
+        }
+    }
+    patterns
+}
+
+/// `(specifier, target)` pairs through which a package's own name can reach a
+/// file, as `resolve_package_entry` resolves them: `exports` entries (a
+/// wildcard key maps a wildcard target), the `module`/`main` fields and the
+/// `src/index`/`index` fallback for the bare name. Targets are relative to the
+/// package directory. Subpaths that fall back to a file of the same name are
+/// matched by the last-component patterns instead.
+fn package_entry_targets(
+    package_name: &str,
+    package_json: &serde_json::Value,
+) -> Vec<(String, String)> {
+    fn condition_target(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(target) => Some(target.clone()),
+            serde_json::Value::Object(map) => ["source", "import", "module", "default", "types"]
+                .into_iter()
+                .find_map(|field| map.get(field).and_then(condition_target)),
+            _ => None,
+        }
+    }
+    let strip = |target: String| {
+        target
+            .strip_prefix("./")
+            .map(ToOwned::to_owned)
+            .unwrap_or(target)
+    };
+    let mut entries = Vec::new();
+    match package_json.get("exports") {
+        Some(serde_json::Value::Object(map))
+            if map.keys().any(|key| key == "." || key.starts_with("./")) =>
+        {
+            for (key, value) in map {
+                let Some(target) = condition_target(value) else {
+                    continue;
+                };
+                let specifier = match key.as_str() {
+                    "." => package_name.to_string(),
+                    key => match key.strip_prefix("./") {
+                        Some(subpath) => format!("{package_name}/{subpath}"),
+                        None => continue,
+                    },
+                };
+                entries.push((specifier, strip(target)));
+            }
+        }
+        Some(exports) => {
+            if let Some(target) = condition_target(exports) {
+                entries.push((package_name.to_string(), strip(target)));
+            }
+        }
+        None => {}
+    }
+    for field in ["module", "main"] {
+        if let Some(target) = package_json.get(field).and_then(|value| value.as_str()) {
+            entries.push((package_name.to_string(), strip(target.to_string())));
+        }
+    }
+    entries.push((package_name.to_string(), "src/index".to_string()));
+    entries.push((package_name.to_string(), "index".to_string()));
+    entries
+}
+
+/// The GLOB pattern of the specifiers that `alias` (a `paths` key) maps onto
+/// `target` through `alias_target` (the key's target, already absolute), or
+/// None when that target cannot produce `target`.
+fn alias_specifier_for(alias: &str, alias_target: &str, target: &str) -> Option<String> {
+    let capture = match alias_target.split_once('*') {
+        Some((prefix, suffix)) => {
+            if target.len() < prefix.len() + suffix.len()
+                || !target.starts_with(prefix)
+                || !target.ends_with(suffix)
+            {
+                return None;
+            }
+            Some(&target[prefix.len()..target.len() - suffix.len()])
+        }
+        None => {
+            if alias_target != target {
+                return None;
+            }
+            None
+        }
+    };
+    Some(match (alias.split_once('*'), capture) {
+        (Some((prefix, suffix)), Some(capture)) => format!(
+            "{}{}{}",
+            glob_escape(prefix),
+            glob_escape(capture),
+            glob_escape(suffix)
+        ),
+        // A wildcard alias with a fixed target maps every matching specifier.
+        (Some((prefix, suffix)), None) => {
+            format!("{}*{}", glob_escape(prefix), glob_escape(suffix))
+        }
+        (None, _) => glob_escape(alias),
+    })
+}
+
+/// Resolves `.` and `..` components without touching the filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// The refs of `caller_file` that depend on `rel_path`, judged as if the

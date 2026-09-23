@@ -644,3 +644,110 @@ fn rust_pub_use_of_declared_module_is_refreshed() {
     );
     assert!(!edges_to(&cold, "clone").is_empty(), "{:#?}", cold.edges);
 }
+
+/// A created `index.ts` answers an existing import of its directory.
+#[test]
+fn created_file_satisfies_directory_index_import() {
+    let cold = assert_refresh_matches_cold(
+        "index file created for a directory import",
+        &[
+            (
+                "src/main.ts",
+                "import { widget } from \"./widgets\";\nexport function main() { widget(); }\n",
+            ),
+            ("src/widgets/button.ts", "export function button() {}\n"),
+        ],
+        &[&[(
+            "src/widgets/index.ts",
+            Some("export function widget() {}\n"),
+        )]],
+    );
+    assert_eq!(edges_to(&cold, "widget").len(), 1);
+}
+
+/// An exact `paths` alias (no wildcard) names a fixed file, so nothing in the
+/// specifier resembles the created file's name.
+#[test]
+fn created_file_satisfies_exact_path_alias() {
+    let cold = assert_refresh_matches_cold(
+        "exact path alias target created",
+        &[
+            (
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@settings\":[\"src/config/values.ts\"]}}}\n",
+            ),
+            (
+                "src/main.ts",
+                "import { load } from \"@settings\";\nexport function main() { load(); }\n",
+            ),
+        ],
+        &[&[("src/config/values.ts", Some("export function load() {}\n"))]],
+    );
+    assert_eq!(edges_to(&cold, "load").len(), 1);
+}
+
+/// A workspace package whose entry file is created after its importers.
+#[test]
+fn created_file_satisfies_workspace_package_entry() {
+    let cold = assert_refresh_matches_cold(
+        "workspace package entry created",
+        &[
+            (
+                "package.json",
+                "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n",
+            ),
+            (
+                "packages/core/package.json",
+                "{\"name\":\"@s/core\",\"main\":\"lib/entry.ts\"}\n",
+            ),
+            ("packages/core/lib/other.ts", "export function other() {}\n"),
+            (
+                "packages/app/src/main.ts",
+                "import { run } from \"@s/core\";\nexport function main() { run(); }\n",
+            ),
+        ],
+        &[&[(
+            "packages/core/lib/entry.ts",
+            Some("export function run() {}\n"),
+        )]],
+    );
+    assert_eq!(edges_to(&cold, "run").len(), 1);
+}
+
+/// A created Rust file answers an existing `mod` declaration; the declaring
+/// file's dependency rows must name it, as a cold build's do.
+#[test]
+fn created_file_satisfies_rust_mod_declaration() {
+    assert_refresh_matches_cold(
+        "rust module file created",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod util;\npub fn run() {\n    util::helper();\n}\n",
+            ),
+        ],
+        &[&[("src/util.rs", Some("pub fn helper() {}\n"))]],
+    );
+}
+
+/// A created file nothing refers to: the refresh must still match the cold
+/// build (and should not need to re-resolve anything else).
+#[test]
+fn created_file_without_importers() {
+    assert_refresh_matches_cold(
+        "unreferenced file created",
+        &[
+            (
+                "src/main.ts",
+                "import { helper } from \"./helper\";\nexport function main() { helper(); }\n",
+            ),
+            ("src/helper.ts", "export function helper() {}\n"),
+        ],
+        &[&[("src/fresh.ts", Some("export function fresh() {}\n"))]],
+    );
+}
+

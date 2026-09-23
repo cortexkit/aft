@@ -2660,6 +2660,40 @@ fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> 
     None
 }
 
+/// The `compilerOptions.paths` of `tsconfig_dir/tsconfig.json` as
+/// `resolve_tsconfig_path` reads them: the directory targets are relative to
+/// (`baseUrl`, default the tsconfig's directory) and each alias with its
+/// targets. None when the file is missing, unparsable or has no `paths`.
+pub(crate) fn tsconfig_path_aliases(
+    tsconfig_dir: &Path,
+    facts: &FactPaths<'_>,
+) -> Option<(PathBuf, Vec<(String, Vec<String>)>)> {
+    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), None, facts)?;
+    let compiler_options = tsconfig.get("compilerOptions")?;
+    let paths = compiler_options.get("paths")?.as_object()?;
+    let base_url = compiler_options
+        .get("baseUrl")
+        .and_then(Value::as_str)
+        .unwrap_or(".");
+    let aliases = paths
+        .iter()
+        .map(|(alias, targets)| {
+            let targets = targets
+                .as_array()
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (alias.clone(), targets)
+        })
+        .collect();
+    Some((tsconfig_dir.join(base_url), aliases))
+}
+
 fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
     if let Some(star_index) = alias.find('*') {
         let (prefix, suffix_with_star) = alias.split_at(star_index);
