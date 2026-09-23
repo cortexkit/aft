@@ -745,9 +745,10 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
       ));
       continue;
     }
-    // Rows inherited from the combined listing because the workflow's own
-    // targeted fetch failed are exactly the input that produced the false
-    // alarm; a streak counted from them is not a verdict.
+    // Rows kept from the combined listing after the workflow's own targeted
+    // fetch failed may be missing that workflow's newest runs (the combined
+    // listing has served fresh aggregate rows over stale per-workflow rows),
+    // so a failure streak counted from them could be an incorrect verdict.
     if (sample.ci_fallback?.includes(workflow)) {
       out.push(instrument(
         `scheduled-ci:${workflow}`,
