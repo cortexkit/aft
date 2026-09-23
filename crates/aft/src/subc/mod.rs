@@ -290,6 +290,16 @@ enum RouteDetachPolicy {
     CancelOnDetach,
 }
 
+/// The version and flags of a route request, which the module echoes on the
+/// terminal frame that answers it. Kept with each tracked request so the module
+/// can still answer it when the request ends somewhere other than its own
+/// response path (a client Cancel, or reclaiming the request's project root).
+#[derive(Clone, Copy, Debug)]
+struct RequestFrameMeta {
+    ver: u8,
+    flags: Flags,
+}
+
 #[derive(Clone)]
 struct ActiveToolCall {
     root_id: ProjectRootId,
@@ -298,6 +308,12 @@ struct ActiveToolCall {
     /// Tool name and submission time, reported by the drain census.
     tool: String,
     started_at: Instant,
+    request: RequestFrameMeta,
+    /// Set once the call's own response task has claimed the right to answer
+    /// it. The entry stays in the map until that response has been handed to
+    /// the writer, so the drain census keeps counting the call until then;
+    /// a Cancel that arrives in between leaves the answer to that task.
+    answering: bool,
 }
 
 type ActiveToolCalls = Arc<StdMutex<HashMap<(RouteChannel, u64), ActiveToolCall>>>;
@@ -540,6 +556,7 @@ fn submit_active_tool_call(
     request_id: String,
     detach_policy: RouteDetachPolicy,
     tool: &str,
+    request: RequestFrameMeta,
     job: crate::executor::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let (rx, cancellation) =
@@ -555,9 +572,28 @@ fn submit_active_tool_call(
                 detach_policy,
                 tool: tool.to_string(),
                 started_at: Instant::now(),
+                request,
+                answering: false,
             },
         );
     rx
+}
+
+/// Claims the right to answer a tracked call from its response task. Returns
+/// false when the call is no longer tracked (a Cancel or route teardown already
+/// ended it) or another path already claimed it. The entry stays in the map
+/// until [`finish_active_tool_call`] runs after the response frame is queued.
+fn claim_active_tool_call(active: &ActiveToolCalls, route: RouteChannel, corr: u64) -> bool {
+    let mut calls = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match calls.get_mut(&(route, corr)) {
+        Some(call) if !call.answering => {
+            call.answering = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn finish_active_tool_call(active: &ActiveToolCalls, route: RouteChannel, corr: u64) -> bool {
@@ -579,25 +615,67 @@ fn active_tool_call_is_registered(
         .contains_key(&(route, corr))
 }
 
+/// Stops tracking a call and cancels its job. Returns the request's frame
+/// metadata when the caller now owns the call's terminal frame: the call's own
+/// response task will find it gone and send nothing. Returns `None` when the
+/// call is not tracked, or when its response task has already claimed it and
+/// will answer it itself.
 fn cancel_active_tool_call(
     active: &ActiveToolCalls,
     executor: &Executor,
     route: RouteChannel,
     corr: u64,
     reason: &str,
-) -> bool {
-    let call = active
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&(route, corr));
-    let Some(call) = call else {
-        return false;
+) -> Option<RequestFrameMeta> {
+    let call = {
+        let mut calls = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if calls.get(&(route, corr)).is_none_or(|call| call.answering) {
+            return None;
+        }
+        calls.remove(&(route, corr))?
     };
     let outcome = executor.cancel_job(&call.root_id, &call.cancellation);
     log::debug!(
         "subc attach: cancelled active tool call route={route} corr={corr} reason={reason} outcome={outcome:?}"
     );
-    true
+    Some(call.request)
+}
+
+/// Stops tracking every call on a route whose project root is being reclaimed,
+/// cancels their jobs, and returns the corr and frame metadata of each call
+/// whose terminal frame the caller now owes. Calls whose response task already
+/// claimed them are dropped from tracking but answered by that task.
+fn abandon_route_tool_calls_for_reclaim(
+    active: &ActiveToolCalls,
+    executor: &Executor,
+    route: RouteChannel,
+) -> Vec<(u64, RequestFrameMeta)> {
+    let removed = {
+        let mut calls = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys = calls
+            .keys()
+            .filter(|(call_route, _)| *call_route == route)
+            .copied()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| calls.remove(&key).map(|call| (key.1, call)))
+            .collect::<Vec<_>>()
+    };
+    let mut owed = Vec::new();
+    for (corr, call) in removed {
+        let outcome = executor.cancel_job(&call.root_id, &call.cancellation);
+        log::debug!(
+            "subc attach: cancelled active tool call route={route} corr={corr} reason=root reclaim outcome={outcome:?}"
+        );
+        if !call.answering {
+            owed.push((corr, call.request));
+        }
+    }
+    owed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1537,7 +1615,16 @@ fn reap_idle_lsp_servers(
     }
 }
 
+/// Forgets a project root whose directory is gone, together with every route
+/// bound to it. The daemon still has those routes bound (nothing here tells it
+/// otherwise) and still counts every request open on them until it sees a
+/// terminal frame for the request's corr. The returned frames are those
+/// terminals, one per request this call stops tracking: a StreamEnd for each
+/// held bg_events stream and a `route_not_bound` error for each tool call or
+/// permission ask. The caller must queue them; dropping them leaves requests
+/// the daemon waits on forever, which pins its restart drain at the ceiling.
 #[allow(clippy::too_many_arguments)]
+#[must_use = "the returned terminal frames must be queued, or the daemon keeps those requests open"]
 fn purge_deleted_root_residents(
     root_id: &ProjectRootId,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
@@ -1556,7 +1643,13 @@ fn purge_deleted_root_residents(
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
-) {
+) -> Vec<Frame> {
+    const RECLAIMED_MESSAGE: &str = "project root was removed; the route is no longer bound";
+    let mut terminals = Vec::new();
+    let mut push_terminal = |built: Result<Frame, SubcError>| match built {
+        Ok(frame) => terminals.push(frame),
+        Err(error) => log::warn!("subc attach: failed to build root-reclaim terminal: {error}"),
+    };
     let mut stale_routes = root_channels.get(root_id).cloned().unwrap_or_default();
     stale_routes.extend(
         routes
@@ -1582,16 +1675,23 @@ fn purge_deleted_root_residents(
         if let Some(cancel) = route_bash_cancels.remove(&route) {
             cancel.token.cancel();
         }
-        apply_route_work_disposition(
-            active_tool_calls,
-            executor,
-            route,
-            RouteWorkDisposition::Abandon,
-            "root reclaim",
-        );
+        for (corr, request) in
+            abandon_route_tool_calls_for_reclaim(active_tool_calls, executor, route)
+        {
+            push_terminal(build_error_frame(
+                request.ver,
+                route.channel,
+                route.epoch,
+                corr,
+                request.flags,
+                "route_not_bound",
+                RECLAIMED_MESSAGE,
+            ));
+        }
         retry_buffer.remove(&route);
         if let Some(sub) = bg_subs.remove(&route) {
             metrics.record_bg_subscription_ended(&sub.root, &sub.session, route, "root-reclaim");
+            push_terminal(push::build_bg_stream_end(route, &sub));
         }
         bg_wake_pending.remove(&route);
     }
@@ -1599,14 +1699,30 @@ fn purge_deleted_root_residents(
     session_identity.retain(|(root, _), _| root != root_id);
     push_buffer.retain(|key, _| &key.root != root_id);
     bg_wake_epoch.retain(|(root, _), _| root != root_id);
-    pending_bash_asks.retain(|_, ask| &ask.root != root_id);
+    pending_bash_asks.retain(|_, ask| {
+        if &ask.root != root_id {
+            return true;
+        }
+        push_terminal(build_error_frame(
+            ask.tool_ver,
+            ask.route.channel,
+            ask.route.epoch,
+            ask.tool_corr,
+            ask.tool_flags,
+            "route_not_bound",
+            RECLAIMED_MESSAGE,
+        ));
+        false
+    });
     bg_sub_by_session.retain(|(root, _), _| root != root_id);
     sync_bg_live_delivery_sessions(executor, routes, Some(root_id));
 
     log::info!(
-        "subc attach: fully forgot deleted root {}; cause=absence_reclaim",
-        root_id.as_path().display()
+        "subc attach: fully forgot deleted root {}; cause=absence_reclaim; ended {} held request(s)",
+        root_id.as_path().display(),
+        terminals.len()
     );
+    terminals
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3715,14 +3831,48 @@ where
                     }
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
-                        cancel_active_tool_call(
+                        let corr = frame.header.corr;
+                        // The daemon frees a request's credit only on the
+                        // module's terminal frame, never on the client's Cancel.
+                        // A call this Cancel stops tracking will never answer
+                        // on its own, so it is answered here.
+                        let cancelled_call = cancel_active_tool_call(
                             &active_tool_calls,
                             executor.as_ref(),
                             channel,
-                            frame.header.corr,
+                            corr,
                             "Cancel frame",
                         );
-                        pending_responses.cancel_request(channel, frame.header.corr);
+                        let cancelled_deferred = pending_responses.cancel_request(channel, corr);
+                        if cancelled_call.is_some() || cancelled_deferred {
+                            let request = cancelled_call.unwrap_or(RequestFrameMeta {
+                                ver: frame.header.ver,
+                                flags: frame.header.flags,
+                            });
+                            let sent = match build_error_frame(
+                                request.ver,
+                                channel.channel,
+                                channel.epoch,
+                                corr,
+                                request.flags,
+                                "cancelled",
+                                "request cancelled",
+                            ) {
+                                Ok(error_frame) => {
+                                    send_reliable_writer_frame(
+                                        &writer_tx,
+                                        &dispatch_path_metrics,
+                                        error_frame,
+                                        "cancelled tool call error",
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = sent {
+                                break Err(error);
+                            }
+                        }
                         if bg_subs.contains_key(&channel) {
                             if let Err(error) = end_bg_subscription(
                                 &writer_tx,
@@ -4073,7 +4223,7 @@ where
                 );
                 for root_id in &reap.forgotten_deleted_roots {
                     bg_unacked_keys_by_root.remove(root_id);
-                    purge_deleted_root_residents(
+                    let terminals = purge_deleted_root_residents(
                         root_id,
                         &mut routes,
                         &mut root_channels,
@@ -4092,6 +4242,18 @@ where
                         &mut pending_bash_asks,
                         &dispatch_path_metrics,
                     );
+                    for terminal in terminals {
+                        if let Err(error) = send_reliable_writer_frame(
+                            &writer_tx,
+                            &dispatch_path_metrics,
+                            terminal,
+                            "root-reclaim terminal",
+                        )
+                        .await
+                        {
+                            break 'module_loop Err(error);
+                        }
+                    }
                 }
                 if reap.evicted > 0 {
                     log::debug!("subc attach: reaped {} idle root(s)", reap.evicted);
@@ -6192,6 +6354,10 @@ async fn handle_tool_call(
             request_id.clone(),
             RouteDetachPolicy::CancelOnDetach,
             &bare_name,
+            RequestFrameMeta {
+                ver: frame.header.ver,
+                flags: frame.header.flags,
+            },
             job,
         );
 
@@ -6239,7 +6405,7 @@ async fn handle_tool_call(
                     }
                 }
                 Ok(DeferredSetupOutcome::Immediate { text, phase_trace }) => {
-                    if !finish_active_tool_call(&active_tool_calls, route, corr) {
+                    if !claim_active_tool_call(&active_tool_calls, route, corr) {
                         return;
                     }
                     let result = ToolCallResult { text, response };
@@ -6281,6 +6447,7 @@ async fn handle_tool_call(
                             );
                         }
                     }
+                    finish_active_tool_call(&active_tool_calls, route, corr);
                     if fatal {
                         signal_fatal_teardown(
                             &completion_tx,
@@ -6294,7 +6461,7 @@ async fn handle_tool_call(
                     }
                 }
                 Err(_) => {
-                    if !finish_active_tool_call(&active_tool_calls, route, corr) {
+                    if !claim_active_tool_call(&active_tool_calls, route, corr) {
                         return;
                     }
                     let text = crate::subc_format::format_response_with_context(
@@ -6320,6 +6487,7 @@ async fn handle_tool_call(
                         )
                         .await;
                     }
+                    finish_active_tool_call(&active_tool_calls, route, corr);
                 }
             }
         });
@@ -6385,6 +6553,10 @@ async fn handle_tool_call(
         request_id.clone(),
         RouteDetachPolicy::RetainForReplay,
         &bare_name_for_frame,
+        RequestFrameMeta {
+            ver: frame.header.ver,
+            flags: frame.header.flags,
+        },
         job,
     );
     let completion_tx = tx.clone();
@@ -6409,7 +6581,9 @@ async fn handle_tool_call(
                 None,
             ),
         };
-        if !finish_active_tool_call(&active_tool_calls, route, corr) {
+        // Claim, not finish: the call stays tracked (and counted by the drain
+        // census) until its response is in the writer queue.
+        if !claim_active_tool_call(&active_tool_calls, route, corr) {
             return;
         }
         let result = ToolCallResult { text, response };
@@ -6457,6 +6631,7 @@ async fn handle_tool_call(
                 log::error!("subc attach: failed to build tool response frame: {error}");
             }
         }
+        finish_active_tool_call(&active_tool_calls, route, corr);
         if fatal {
             signal_fatal_teardown(
                 &completion_tx,
@@ -6745,6 +6920,14 @@ pub(crate) mod test_support {
         ProgressFrame, StatusChangedFrame,
     };
     use serde_json::json;
+
+    /// Frame metadata for a tracked request in tests that never write its frame.
+    pub(super) fn test_request_meta() -> RequestFrameMeta {
+        RequestFrameMeta {
+            ver: PROTOCOL_VERSION,
+            flags: Flags::new(false, Priority::Interactive, false),
+        }
+    }
 
     pub(super) fn test_root(name: &str) -> (tempfile::TempDir, ProjectRootId) {
         let dir = tempfile::Builder::new()
@@ -7174,6 +7357,8 @@ pub(crate) mod test_support {
                 detach_policy: RouteDetachPolicy::CancelOnDetach,
                 tool: "inspect".to_string(),
                 started_at: Instant::now(),
+                request: test_request_meta(),
+                answering: false,
             },
         );
         started_rx
@@ -7187,7 +7372,8 @@ pub(crate) mod test_support {
             route,
             41,
             "test route abandonment"
-        ));
+        )
+        .is_some());
         let terminal = wait_for_inspect_terminal(&mut pending, &ctx);
         assert_eq!(terminal.data["inspect_terminal"], "interrupted");
         assert_eq!(
@@ -7295,6 +7481,7 @@ pub(crate) mod test_support {
             "tracked-search".to_string(),
             RouteDetachPolicy::RetainForReplay,
             "search",
+            test_request_meta(),
             Box::new(move |_| {
                 tracked_started_tx.send(()).expect("signal tracked search");
                 let deadline = Instant::now() + Duration::from_secs(5);
@@ -7331,6 +7518,7 @@ pub(crate) mod test_support {
             "teardown-terminal".to_string(),
             RouteDetachPolicy::CancelOnDetach,
             "inspect",
+            test_request_meta(),
             Box::new(move |_| {
                 terminal_started_tx
                     .send(())
@@ -7450,6 +7638,8 @@ pub(crate) mod test_support {
                 detach_policy: RouteDetachPolicy::CancelOnDetach,
                 tool: "inspect".to_string(),
                 started_at: Instant::now(),
+                request: test_request_meta(),
+                answering: false,
             },
         )])));
 
@@ -7558,6 +7748,8 @@ pub(crate) mod test_support {
             detach_policy: RouteDetachPolicy::CancelOnDetach,
             tool: tool.to_string(),
             started_at: Instant::now(),
+            request: test_request_meta(),
+            answering: false,
         };
         let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::from([
             (
@@ -8746,8 +8938,24 @@ mod tests {
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
         let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        // One call nothing has answered yet, and one whose response task has
+        // already claimed it: only the first is owed a terminal by the purge.
+        for (corr, answering) in [(78, false), (79, true)] {
+            active_tool_calls.lock().expect("active calls").insert(
+                (route, corr),
+                ActiveToolCall {
+                    root_id: root.clone(),
+                    cancellation: JobCancellation::new(),
+                    detach_policy: RouteDetachPolicy::RetainForReplay,
+                    tool: "grep".to_string(),
+                    started_at: Instant::now(),
+                    request: super::test_support::test_request_meta(),
+                    answering,
+                },
+            );
+        }
         health::take_bg_observability_logs_for_test();
-        purge_deleted_root_residents(
+        let terminals = purge_deleted_root_residents(
             &root,
             &mut routes,
             &mut root_channels,
@@ -8773,6 +8981,30 @@ mod tests {
         assert!(route_bash_cancels.is_empty());
         assert!(reclaimed_routes.contains(route));
         assert!(cancel_signal.is_cancelled());
+        // The daemon still has the route bound, so every request the purge
+        // stops tracking is answered on its own corr and route.
+        let mut ended = terminals
+            .iter()
+            .map(|frame| {
+                assert_eq!(
+                    (frame.header.channel, frame.header.epoch),
+                    (route.channel, route.epoch)
+                );
+                (frame.header.ty, frame.header.corr)
+            })
+            .collect::<Vec<_>>();
+        ended.sort_by_key(|(_, corr)| *corr);
+        assert_eq!(
+            ended,
+            vec![(FrameType::StreamEnd, 77), (FrameType::Error, 78)]
+        );
+        let error_frame = terminals
+            .iter()
+            .find(|frame| frame.header.ty == FrameType::Error)
+            .expect("error terminal");
+        let error: Value = serde_json::from_slice(&error_frame.body).expect("error body");
+        assert_eq!(error["code"], "route_not_bound");
+        assert!(active_tool_calls.lock().expect("active calls").is_empty());
         assert_eq!(
             health::take_bg_observability_logs_for_test(),
             vec![format!(
@@ -8780,6 +9012,62 @@ mod tests {
                 root.as_path().display()
             )]
         );
+    }
+
+    /// A tool call's response task claims the call before it queues the
+    /// response and stops tracking it only afterwards, so the drain census
+    /// cannot report quiescence while a response is still on its way to the
+    /// writer. A Cancel that arrives in that window must leave the answer to
+    /// the response task; otherwise the corr would get two terminals.
+    #[test]
+    fn claimed_tool_call_stays_counted_until_its_response_is_queued() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("claimed-tool-call");
+        let route = route_key(4, 2);
+        let active: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
+        for corr in [5, 6] {
+            active.lock().expect("active calls").insert(
+                (route, corr),
+                ActiveToolCall {
+                    root_id: root.clone(),
+                    cancellation: JobCancellation::new(),
+                    detach_policy: RouteDetachPolicy::RetainForReplay,
+                    tool: "grep".to_string(),
+                    started_at: Instant::now(),
+                    request: super::test_support::test_request_meta(),
+                    answering: false,
+                },
+            );
+        }
+        let metrics = DispatchPathMetrics::new();
+        let census = |active: &ActiveToolCalls| {
+            drain::held_request_census(
+                active,
+                &PendingSubcResponses::default(),
+                &metrics,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                0,
+            )
+            .total()
+        };
+
+        assert!(claim_active_tool_call(&active, route, 5));
+        assert!(!claim_active_tool_call(&active, route, 5), "one claimant");
+        assert_eq!(census(&active), 2, "a claimed call is still held");
+        assert!(
+            cancel_active_tool_call(&active, &executor, route, 5, "test").is_none(),
+            "a Cancel after the claim leaves the answer to the response task"
+        );
+        assert!(finish_active_tool_call(&active, route, 5));
+        assert_eq!(census(&active), 1);
+
+        // An unclaimed call is the Cancel's to answer, and its response task
+        // then finds nothing to claim.
+        assert!(cancel_active_tool_call(&active, &executor, route, 6, "test").is_some());
+        assert!(!claim_active_tool_call(&active, route, 6));
+        assert_eq!(census(&active), 0);
     }
 
     /// The control for the deleted-root reclamation above: a root whose
@@ -9261,7 +9549,8 @@ mod tests {
         let mut retry_buffer = HashMap::new();
         let mut reclaimed_routes = ReclaimedRoutes::default();
         for forgotten in &outcome.forgotten_deleted_roots {
-            purge_deleted_root_residents(
+            // Nothing was open on the abandoned route, so nothing is owed.
+            let terminals = purge_deleted_root_residents(
                 forgotten,
                 &mut routes,
                 &mut root_channels,
@@ -9280,6 +9569,7 @@ mod tests {
                 &mut pending_bash_asks,
                 &metrics,
             );
+            assert!(terminals.is_empty());
         }
 
         assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);

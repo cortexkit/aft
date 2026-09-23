@@ -25,12 +25,18 @@
 //!   `module_reloading` error when it has none. Both are read-only, so the
 //!   caller retries on the restarted module.
 //! - `tool:<name>`: an ordinary executor tool call. Left to finish: these
-//!   complete well inside the drain deadline.
+//!   complete well inside the drain deadline. A call stays counted until its
+//!   response frame is in the writer queue, not merely until it has run.
 //! - `route_bind`: a RouteBind awaiting its configure job. Left to finish; it
 //!   is already bounded by the route-bind deadline.
 //!
 //! `control_requests` (the module's own channel-0 requests to the daemon) are
 //! reported alongside but are not route-held requests.
+//!
+//! The census only sees requests the module still tracks. Every path that stops
+//! tracking a request other than by answering it (a client Cancel, reclaiming a
+//! deleted project root) must itself send the request's terminal frame, or the
+//! daemon keeps counting a request this census no longer shows.
 
 use std::collections::BTreeMap;
 

@@ -415,13 +415,9 @@ fn try_send_bg_stream_data(
     )
 }
 
-pub(super) async fn send_reliable_bg_stream_end(
-    writer_tx: &WriterSender,
-    metrics: &DispatchPathMetrics,
-    channel: RouteChannel,
-    sub: &BgSub,
-) -> Result<(), SubcError> {
-    let frame = Frame::build_with_version(
+/// The StreamEnd that closes a held bg_events stream on the corr it was opened with.
+pub(super) fn build_bg_stream_end(channel: RouteChannel, sub: &BgSub) -> Result<Frame, SubcError> {
+    Frame::build_with_version(
         sub.ver,
         FrameType::StreamEnd,
         sub.flags,
@@ -430,7 +426,16 @@ pub(super) async fn send_reliable_bg_stream_end(
         sub.corr,
         Vec::new(),
     )
-    .map_err(SubcError::FrameBuild)?;
+    .map_err(SubcError::FrameBuild)
+}
+
+pub(super) async fn send_reliable_bg_stream_end(
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    channel: RouteChannel,
+    sub: &BgSub,
+) -> Result<(), SubcError> {
+    let frame = build_bg_stream_end(channel, sub)?;
     send_reliable_writer_frame(writer_tx, metrics, frame, "bg_events StreamEnd").await
 }
 
