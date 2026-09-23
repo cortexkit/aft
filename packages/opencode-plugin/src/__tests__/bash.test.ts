@@ -56,10 +56,15 @@ type ProgressHandler = (frame: { text: string }) => void;
  */
 async function abortOutcomeLog(
   spy: ReturnType<typeof spyOn<typeof logger, "sessionLog">>,
+  sessionID: string,
 ): Promise<{ message: string; data: unknown }> {
+  // Filter on the test's own session: an earlier test's abort loop keeps
+  // running after its call settles and can log its outcome while this test's
+  // spy is installed, and every other test shares one session id.
   for (let attempt = 0; attempt < 200; attempt++) {
-    const call = spy.mock.calls.find(([, message]) =>
-      message.startsWith("[bash] foreground abort "),
+    const call = spy.mock.calls.find(
+      ([session, message]) =>
+        session === sessionID && message.startsWith("[bash] foreground abort "),
     );
     if (call) return { message: call[1], data: call[2] };
     await Bun.sleep(5);
@@ -827,14 +832,20 @@ describe("OpenCode bash adapter", () => {
         return { success: true, killed: 1 };
       });
       const controller = new AbortController();
+      // A leftover line from another session, exactly the shape an earlier
+      // test's still-running abort loop writes. The helper must skip it.
+      logger.sessionLog("test-session", "[bash] foreground abort killed", {
+        attempts: 1,
+        results: ["killed=1"],
+      });
       const result = bash.execute(
         { command: "sleep 30" },
-        createMockSdkContext({ abort: controller.signal }),
+        createMockSdkContext({ abort: controller.signal, sessionID: "abort-log-killed" }),
       );
       controller.abort();
       await result;
 
-      const outcome = await abortOutcomeLog(logSpy);
+      const outcome = await abortOutcomeLog(logSpy, "abort-log-killed");
       expect(outcome.message).toBe("[bash] foreground abort killed");
       expect(outcome.data).toMatchObject({
         attempts: 3,
@@ -871,12 +882,12 @@ describe("OpenCode bash adapter", () => {
       const controller = new AbortController();
       const result = bash.execute(
         { command: "sleep 30" },
-        createMockSdkContext({ abort: controller.signal }),
+        createMockSdkContext({ abort: controller.signal, sessionID: "abort-log-settled" }),
       );
       controller.abort();
       await result;
 
-      const outcome = await abortOutcomeLog(logSpy);
+      const outcome = await abortOutcomeLog(logSpy, "abort-log-settled");
       expect(outcome.message).toBe("[bash] foreground abort call_settled");
       expect(outcome.data).toMatchObject({
         attempts: 2,
