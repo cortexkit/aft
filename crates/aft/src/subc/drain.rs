@@ -98,6 +98,15 @@ pub(super) enum BashHoldPhase {
 }
 
 impl BashHoldPhase {
+    /// True for the phases that sit in the bash wait loop, which detaches the
+    /// call into a background task on its own next poll once the drain window
+    /// opens. A call in one of these phases will answer shortly after the
+    /// release step without anything else acting on it. A call still spawning
+    /// has not reached that loop yet, so it is not counted as detaching.
+    fn detaches_on_drain(self) -> bool {
+        matches!(self, Self::Foreground | Self::Block | Self::Wait)
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Spawning => "bash:spawning",
@@ -158,6 +167,9 @@ impl HeldBashCalls {
 struct HeldKind {
     count: usize,
     oldest: Option<Duration>,
+    /// Requests of this kind release themselves asynchronously once the drain
+    /// window is open (see [`BashHoldPhase::detaches_on_drain`]).
+    detaching: bool,
 }
 
 /// Count of held requests by kind, with the oldest age per kind where the
@@ -170,8 +182,13 @@ pub(super) struct HeldRequestCensus {
 
 impl HeldRequestCensus {
     fn add(&mut self, kind: impl Into<String>, age: Option<Duration>) {
+        self.add_kind(kind, age, false);
+    }
+
+    fn add_kind(&mut self, kind: impl Into<String>, age: Option<Duration>, detaching: bool) {
         let entry = self.kinds.entry(kind.into()).or_default();
         entry.count += 1;
+        entry.detaching = detaching;
         entry.oldest = match (entry.oldest, age) {
             (Some(current), Some(age)) => Some(current.max(age)),
             (current, age) => current.or(age),
@@ -195,8 +212,32 @@ impl HeldRequestCensus {
         self.kinds.values().filter_map(|kind| kind.oldest).max()
     }
 
+    /// Route-held requests that will release themselves without further action
+    /// now that the drain window is open.
+    pub(super) fn detaching(&self) -> usize {
+        self.kinds
+            .values()
+            .filter(|kind| kind.detaching)
+            .map(|kind| kind.count)
+            .sum()
+    }
+
+    /// The `held` figure the line for `phase` reports. On the `released` line
+    /// the self-releasing requests are reported as `detaching` instead, so
+    /// `held` there counts only requests nothing is about to answer. The other
+    /// phases report every route-held request: before the release step nothing
+    /// is detaching yet, and a bash wait still held at the deadline is stuck.
+    pub(super) fn held(&self, phase: &str) -> usize {
+        if phase == DRAIN_PHASE_RELEASED {
+            self.total() - self.detaching()
+        } else {
+            self.total()
+        }
+    }
+
     /// The single log line for this census, e.g.
     /// `subc attach: drain census phase=start held=3 oldest=12.3s kinds=[bash:wait=1 (12.3s), bg_events=2] control_requests=0`.
+    /// The `released` line adds `detaching=<n>` after `held` (see [`Self::held`]).
     pub(super) fn line(&self, phase: &str) -> String {
         let kinds = self
             .kinds
@@ -211,9 +252,14 @@ impl HeldRequestCensus {
             .oldest()
             .map(format_age)
             .unwrap_or_else(|| "-".to_string());
+        let detaching = if phase == DRAIN_PHASE_RELEASED {
+            format!(" detaching={}", self.detaching())
+        } else {
+            String::new()
+        };
         format!(
-            "subc attach: drain census phase={phase} held={} oldest={oldest} kinds=[{kinds}] control_requests={}",
-            self.total(),
+            "subc attach: drain census phase={phase} held={}{detaching} oldest={oldest} kinds=[{kinds}] control_requests={}",
+            self.held(phase),
             self.control_requests
         )
     }
@@ -262,7 +308,11 @@ pub(super) fn held_request_census(
         }
     }
     for call in metrics.held_bash_calls.snapshot() {
-        census.add(call.phase.label(), age(call.since));
+        census.add_kind(
+            call.phase.label(),
+            age(call.since),
+            call.phase.detaches_on_drain(),
+        );
     }
     for ask in pending_bash_asks.values() {
         census.add("permission_ask", age(ask.asked_at));
@@ -282,7 +332,35 @@ pub(super) fn report_drain_census(
     census: &HeldRequestCensus,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
-    let line = census.line(phase);
+    emit_drain_census(phase, census, census.line(phase), lifecycle_probe);
+}
+
+/// Logs the `connection-end` census. `quiesced_before_close` says whether a
+/// drain tick saw nothing held before the connection ended; without it a
+/// `held=0` here cannot tell a drain that quiesced from requests that were
+/// still open when the daemon closed the connection and were dropped with it.
+pub(super) fn report_connection_end_census(
+    census: &HeldRequestCensus,
+    quiesced_before_close: bool,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+) {
+    let line = connection_end_line(census, quiesced_before_close);
+    emit_drain_census(DRAIN_PHASE_CONNECTION_END, census, line, lifecycle_probe);
+}
+
+fn connection_end_line(census: &HeldRequestCensus, quiesced_before_close: bool) -> String {
+    format!(
+        "{} quiesced_before_close={quiesced_before_close}",
+        census.line(DRAIN_PHASE_CONNECTION_END)
+    )
+}
+
+fn emit_drain_census(
+    phase: &str,
+    census: &HeldRequestCensus,
+    line: String,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+) {
     if phase == DRAIN_PHASE_DEADLINE && census.total() > 0 {
         log::warn!("{line}");
     } else {
@@ -296,13 +374,16 @@ pub(super) fn report_drain_census(
 /// Census phases, in the order they can appear for one drain.
 /// `start`: on the `module.draining` notice, before anything is released.
 pub(super) const DRAIN_PHASE_START: &str = "start";
-/// `released`: right after the notice's release actions ran.
+/// `released`: right after the notice's release actions ran. Bash waits are
+/// still held at that instant but detach on their own next poll; the line
+/// reports them as `detaching` rather than `held`.
 pub(super) const DRAIN_PHASE_RELEASED: &str = "released";
 /// `quiesced`: the first drain tick that finds nothing held.
 pub(super) const DRAIN_PHASE_QUIESCED: &str = "quiesced";
 /// `deadline`: the drain deadline passed with the connection still up.
 pub(super) const DRAIN_PHASE_DEADLINE: &str = "deadline";
-/// `connection-end`: the daemon connection ended during or after a drain.
+/// `connection-end`: the daemon connection ended during or after a drain. The
+/// line says whether `quiesced` was observed before the close.
 pub(super) const DRAIN_PHASE_CONNECTION_END: &str = "connection-end";
 
 /// Which one-time census lines one drain has already written.
@@ -351,6 +432,48 @@ mod tests {
             census.line("start"),
             "subc attach: drain census phase=start held=4 oldest=12.3s kinds=[bash:wait=2 (12.3s), bg_events=1, tool:grep=1 (0.1s)] control_requests=1"
         );
+    }
+
+    #[test]
+    fn released_line_reports_self_detaching_bash_waits_apart_from_held() {
+        let mut census = HeldRequestCensus::default();
+        census.add_kind(
+            BashHoldPhase::Foreground.label(),
+            Some(Duration::from_millis(1_500)),
+            BashHoldPhase::Foreground.detaches_on_drain(),
+        );
+        census.add_kind(
+            BashHoldPhase::Wait.label(),
+            Some(Duration::from_millis(45_200)),
+            BashHoldPhase::Wait.detaches_on_drain(),
+        );
+        census.add_kind(
+            BashHoldPhase::Spawning.label(),
+            Some(Duration::from_millis(200)),
+            BashHoldPhase::Spawning.detaches_on_drain(),
+        );
+        census.add("tool:grep", Some(Duration::from_millis(100)));
+
+        assert_eq!(census.total(), 4);
+        assert_eq!(census.detaching(), 2);
+        assert_eq!(census.held(DRAIN_PHASE_RELEASED), 2);
+        assert_eq!(
+            census.line(DRAIN_PHASE_RELEASED),
+            "subc attach: drain census phase=released held=2 detaching=2 oldest=45.2s kinds=[bash:foreground=1 (1.5s), bash:spawning=1 (0.2s), bash:wait=1 (45.2s), tool:grep=1 (0.1s)] control_requests=0"
+        );
+        // Before the release step and at the deadline every held request counts.
+        assert_eq!(census.held(DRAIN_PHASE_START), 4);
+        assert!(!census.line(DRAIN_PHASE_DEADLINE).contains("detaching="));
+    }
+
+    #[test]
+    fn connection_end_line_states_whether_quiescence_was_seen() {
+        let census = HeldRequestCensus::default();
+        assert_eq!(
+            connection_end_line(&census, true),
+            "subc attach: drain census phase=connection-end held=0 oldest=- kinds=[] control_requests=0 quiesced_before_close=true"
+        );
+        assert!(connection_end_line(&census, false).ends_with(" quiesced_before_close=false"));
     }
 
     #[test]

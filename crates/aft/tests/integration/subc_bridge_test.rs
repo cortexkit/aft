@@ -7314,6 +7314,28 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
         );
     }
 
+    // The census taken right after the release step still sees both bash
+    // waits (each detaches on its own next poll) and the heavy call, but
+    // reports the bash waits as detaching so `held` names only the request
+    // nothing is about to answer.
+    let (held, counts, line) =
+        next_drain_census(&mut lifecycle_events, "released", Duration::from_secs(1)).await;
+    eprintln!("{line}");
+    assert_eq!(
+        counts,
+        vec![
+            ("bash:block".to_string(), 1),
+            ("bash:wait".to_string(), 1),
+            ("tool:semantic_search".to_string(), 1),
+        ],
+        "released census: {line}"
+    );
+    assert_eq!(held, 1, "released census: {line}");
+    assert!(
+        line.contains("held=1 detaching=2 "),
+        "released census line: {line}"
+    );
+
     // Both bash waits were detached, not killed: the caller got the task id.
     let mut task_ids = Vec::new();
     for corr in [WAIT_CORR, BLOCK_CORR] {
@@ -7399,6 +7421,18 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
     )
     .await;
     send_connection_goodbye(&mut stream).await;
+
+    // The drain quiesced before the daemon closed the connection.
+    let (_, _, line) = next_drain_census(
+        &mut lifecycle_events,
+        "connection-end",
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        line.ends_with(" quiesced_before_close=true"),
+        "connection-end census line: {line}"
+    );
 }
 
 /// Ending a subscription on drain must not lose a completion that was queued

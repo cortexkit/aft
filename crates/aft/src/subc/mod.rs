@@ -192,8 +192,9 @@ pub enum SubcLifecycleEvent {
         task_id: String,
         session_id: String,
     },
-    /// One drain census, exactly as logged: `held` route-held requests broken
-    /// down by kind in `counts`.
+    /// One drain census, exactly as logged: `held` is the line's `held` figure
+    /// (on the `released` line it excludes the self-detaching bash waits),
+    /// and `counts` breaks every route-held request down by kind.
     DrainCensus {
         phase: String,
         held: usize,
@@ -233,7 +234,7 @@ impl SubcTestLifecycleProbe {
     fn drain_census(&self, phase: &str, census: &drain::HeldRequestCensus, line: &str) {
         let _ = self.events_tx.send(SubcLifecycleEvent::DrainCensus {
             phase: phase.to_string(),
-            held: census.total(),
+            held: census.held(phase),
             counts: census.counts(),
             line: line.to_string(),
         });
@@ -4133,7 +4134,7 @@ where
     };
 
     shared_app.set_open_route_count(0);
-    if drain_progress.is_some() {
+    if let Some(progress) = drain_progress.as_ref() {
         let census = drain::held_request_census(
             &active_tool_calls,
             &pending_responses,
@@ -4143,9 +4144,9 @@ where
             &pending_binds,
             control_replies.len(),
         );
-        drain::report_drain_census(
-            drain::DRAIN_PHASE_CONNECTION_END,
+        drain::report_connection_end_census(
             &census,
+            progress.quiesced_reported,
             lifecycle_probe.as_ref(),
         );
     }
