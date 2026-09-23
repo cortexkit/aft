@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RotatingLogSink, resolveAftLogPath, resolveAftStorageRoot } from "../durable-log.js";
@@ -73,5 +81,44 @@ describe("durable plugin logging", () => {
     expect(readFileSync(path, "utf8")).toBe("eeee\n");
     expect(readFileSync(`${path}.1`, "utf8")).toBe("cccc\ndddd\n");
     expect(() => readFileSync(`${path}.2`, "utf8")).toThrow();
+  });
+
+  const posixOnly = process.platform === "win32" ? test.skip : test;
+  const modeOf = (path: string): number => statSync(path).mode & 0o777;
+
+  posixOnly("creates an owner-only log directory and log files", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const path = join(root, "storage", "logs", "aft-plugin.log");
+    const sink = new RotatingLogSink(path, { maxBytes: 10 });
+
+    for (const value of ["aaaa\n", "bbbb\n", "cccc\n"]) sink.append(value);
+    await sink.drain();
+
+    expect(modeOf(join(root, "storage", "logs"))).toBe(0o700);
+    expect(modeOf(path)).toBe(0o600);
+    expect(modeOf(`${path}.1`)).toBe(0o600);
+  });
+
+  posixOnly("tightens an existing world-readable log directory and files", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const dir = join(root, "logs");
+    const path = join(dir, "aft-plugin.log");
+    mkdirSync(dir, { mode: 0o755 });
+    chmodSync(dir, 0o755);
+    for (const file of [path, `${path}.1`]) {
+      writeFileSync(file, "old\n");
+      chmodSync(file, 0o644);
+    }
+
+    const sink = new RotatingLogSink(path);
+    sink.append("new\n");
+    await sink.drain();
+
+    expect(modeOf(dir)).toBe(0o700);
+    expect(modeOf(path)).toBe(0o600);
+    expect(modeOf(`${path}.1`)).toBe(0o600);
+    expect(readFileSync(path, "utf8")).toBe("old\nnew\n");
   });
 });
