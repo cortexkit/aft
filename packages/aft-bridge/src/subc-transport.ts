@@ -128,7 +128,22 @@ const RECONNECT_RETRY_CAP_MS = 2_000;
  */
 const SUBC_DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * Longest a call waits out route.open refusals while the AFT module reloads,
+ * however long the call's own timeout is. A restart drains the old module for at
+ * most the daemon's 30 s drain ceiling (reported as `drain_timeout_ms` by
+ * `ck module status aft`), then starts the new module (normally well under a
+ * second or two); 45 s covers that worst case with margin. The ceiling exists
+ * because a module that is genuinely down must reach the caller's fallback (for
+ * example bash host fallback) promptly instead of after a long transport timeout.
+ */
+const ROUTE_OPEN_RELOAD_WAIT_CEILING_MS = 45_000;
+
 function reloadWaitExhaustedSuffix(callDeadlineMs: number): string {
+  if (callDeadlineMs > ROUTE_OPEN_RELOAD_WAIT_CEILING_MS) {
+    const ceilingSeconds = ROUTE_OPEN_RELOAD_WAIT_CEILING_MS / 1000;
+    return ` The AFT daemon module did not return within the ${ceilingSeconds}s reload-wait ceiling.`;
+  }
   const seconds = Math.round(callDeadlineMs / 100) / 10;
   return ` The AFT daemon module did not return within this call's ${seconds}s deadline.`;
 }
@@ -1559,11 +1574,13 @@ export class SubcTransportPool implements AftTransportPool {
       };
 
       // A module reload (drain, restart, warm-up) refuses route.open for as long
-      // as it lasts, which can exceed 30 s. The call waits it out for as long as
-      // its own deadline allows and only then surfaces the refusal (which lets a
-      // caller such as bash fall back). Time spent waiting comes out of the
-      // request's budget, so the call never outlives the deadline it was given.
+      // as it lasts. The call waits it out for as long as its own deadline allows,
+      // but never longer than ROUTE_OPEN_RELOAD_WAIT_CEILING_MS, and then surfaces
+      // the refusal (which lets a caller such as bash fall back). Time spent
+      // waiting comes out of the request's budget, so the call never outlives the
+      // deadline it was given.
       const callDeadlineMs = timeoutMs ?? SUBC_DEFAULT_REQUEST_TIMEOUT_MS;
+      const reloadWaitBudgetMs = Math.min(callDeadlineMs, ROUTE_OPEN_RELOAD_WAIT_CEILING_MS);
       let reloadWaitedMs = 0;
       const openRouteAfterReloadWindow = async (): Promise<{
         route: RouteHandle;
@@ -1576,7 +1593,7 @@ export class SubcTransportPool implements AftTransportPool {
             if (!isRouteOpenReloadWindowError(error)) throw error;
             // Check the budget before starting (or joining) the shared retry
             // timer, so a call that gives up leaves no orphan timer behind.
-            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= callDeadlineMs) {
+            if (reloadWaitedMs + this.nextRouteReopenDelayMs() >= reloadWaitBudgetMs) {
               throw reloadWindowExhaustedError(error, callDeadlineMs);
             }
             const { delayMs, wait } = this.waitForRouteReopenBackoff();

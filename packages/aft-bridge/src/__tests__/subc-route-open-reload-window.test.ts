@@ -344,6 +344,42 @@ describe("route.open across a 5s module reload window (real SubcClient, fake dae
     expect(daemon.requests).toBe(0);
   });
 
+  test("a module that never returns makes a long-timeout call give up at the 45s ceiling", async () => {
+    // A module that is genuinely down must reach the caller's fallback promptly,
+    // not after a bash-sized transport timeout.
+    const clock = { now: 0 };
+    const daemon = await startFakeDaemon(
+      () => clock.now,
+      () => ({ content: [], isError: false }),
+      Number.POSITIVE_INFINITY,
+    );
+    cleanups.push(() => daemon.close());
+    const pool = new SubcTransportPool({
+      connectionFile: daemon.connectionFile,
+      harness: "opencode",
+      consumerIdentity: null,
+      handshakeTimeoutMs: 2_000,
+      routeRetrySleep: async (ms) => {
+        clock.now += ms;
+      },
+    });
+    cleanups.push(() => pool.shutdown());
+
+    let surfaced: unknown;
+    try {
+      await pool
+        .getBridge(TEST_PROJECT_ROOT)
+        .toolCall("module-down", "read", {}, { timeoutMs: 10 * 60_000 });
+    } catch (error) {
+      surfaced = error;
+    }
+    expect((surfaced as { code?: string }).code).toBe("module_reloading");
+    expect((surfaced as Error).message).toContain("within the 45s reload-wait ceiling");
+    expect(clock.now).toBeGreaterThan(40_000);
+    expect(clock.now).toBeLessThan(45_000);
+    expect(daemon.accepted).toBe(0);
+  });
+
   test("a call without its own timeout waits out the reload for the client's 30s default", async () => {
     const { pool, daemon, clock } = await longReloadPool();
 
