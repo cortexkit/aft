@@ -248,3 +248,162 @@ avoid the known full-store shutdown rewrite. After the kill, the source store
 still reported exactly 73,319 files, 7,204,989 nodes, 5,922,357 refs, 1,075,852
 persisted edges, and 6,591 exports; the measurements did not assume the store
 remained unchanged.
+
+## Reporter-scale before/after (dispatch-name fix)
+
+This section measures the fix that stopped dead-code reachability from copying
+each language's dispatched method-name set into every file of that language
+(each file now borrows the shared per-language set; only Go keeps a per-file
+method set). The measurement was taken on 2026-09-23 at the same 37,358-file
+point as the tables above, with both harnesses reading the same store.
+
+### Harnesses
+
+| harness | source | binary built from |
+| --- | --- | --- |
+| BEFORE | `2773cc917aa391b6870ed7ffb0a7e22af35cda35` (dispatch-root semantics tests added, per-file fanout still in place) with the three scaffolding commits of tag `keep/330-measure-harness` (`56ff9b0ed`, `88d818c6f`, `53d3bc055`) cherry-picked on top, plus one local commit adding the dispatch-root and aggregate digest lines | detached local commit `816749c9c42023aaa3c1d1749830de4a486ca784` (not pushed to any ref) |
+| AFTER | tag `keep/330-after-harness` | `905381d6bc639cc1f774be825a68554af8671a83` |
+
+The measure-harness tag did not print the dispatch-root digest or the aggregate
+digest, so the BEFORE build added exactly the lines the AFTER tag already has
+for them: an `issue330_dispatch_roots count=… digest=…` line after the
+`dispatch_roots` set is collected (a `DefaultHasher` over the `BTreeSet`), and
+an `aggregate_json_bytes=… aggregate_digest=…` line in the example (a
+`DefaultHasher` over the aggregate's `serde_json` text). Nothing else differs
+from the tagged scaffolding. The AFTER tag's projected-name counter sums the
+language set length for each non-Go file and the per-file method count for Go
+files, so it reports the same logical number of `(file, method-name)` entries
+the BEFORE code allocated. Its separate `materialized_names` counter counts
+only the names actually copied per file.
+
+Both were `cargo build --release -p agent-file-tools --example
+issue330_projection_harness` under `nice -n 10`, with a shared target
+directory, and each binary was copied aside before the other was built.
+
+### Corpus and store
+
+`~/Work/OSS/linux` at `89a312991dc6e638a36adc43ccb91dbc25504c04` was indexed
+once by `aft index` (built from the AFTER tree) with an isolated
+`AFT_STORAGE_DIR`, an isolated `XDG_CONFIG_HOME` holding only a callgraph
+standing root for that path, and `nice -n 10`. The published generation had
+exactly the counters of the earlier full generation: 73,319 files, 7,204,989
+nodes, 5,922,357 refs, 1,075,852 persisted edges, and 6,591 exported or
+default-export nodes.
+
+The 37,358-file store was a copy-on-write clone of that generation, pruned the
+same way as before: keep the first 37,358 `files.path` values in `ORDER BY
+path` order (the last kept path is
+`drivers/net/ethernet/marvell/mvpp2/mvpp2_debugfs.c`), delete `refs` whose
+`caller_file` is outside that set, then delete out-of-set `nodes` and `files`.
+Its counters:
+
+| counter | rows |
+| --- | ---: |
+| files | 37,358 |
+| nodes | 5,733,439 |
+| refs | 2,540,479 |
+| persisted edges table (not pruned) | 1,075,852 |
+| exported/default-export nodes | 996 |
+| outbound calls emitted by the dead-code projection | 2,357,263 |
+
+Nodes, exports, projected calls (2,357,263), the snapshot estimate
+(566,371,678 bytes) and the dispatch counters (3,119 method names across 10
+languages, 62,661,141 projected names) all equal the investigation's
+reporter-scale point, so this is the same subset. The store's SHA-256
+(`b81f53a3…3ef6`) and all five SQL counters were read again after every run and
+never changed.
+
+Each run was a fresh process: `AFT_ISSUE330_MEASURE=1 RAYON_NUM_THREADS=8 nice
+-n 10 /usr/bin/time -l <harness> <store> ~/Work/OSS/linux`. Runs alternated
+BEFORE, AFTER, BEFORE, AFTER. The machine's one-minute load average was 5.6 to
+13.5 at run starts. All four runs exited normally, so none had to be killed.
+
+### Results
+
+Peak RSS is `/usr/bin/time -l` "maximum resident set size"; peak
+`phys_footprint` is its "peak memory footprint". They are separate metrics and
+neither is derived from the other. The dispatch-phase delta is the default-zone
+allocator `size_allocated` difference between the checkpoint after both edge
+maps exist (`rollup_production_edges`) and the checkpoint after the first
+reachability state returns (`rollup_all_reachability`). This is the same
+bracket the phase table above reports as +5,012.2 MB. MB means 10^6 bytes.
+
+| run | peak RSS | peak `phys_footprint` | dispatch-phase `size_allocated` delta | `size_in_use` delta, same bracket | dispatch roots (count / digest) | aggregate digest (JSON bytes) | wall time |
+| --- | ---: | ---: | ---: | ---: | --- | --- | ---: |
+| BEFORE 1 | 7,031,832,576 B (7,031.8 MB) | 6,391,534,992 B (6,391.5 MB) | +4,852,809,728 B (+4,852.8 MB) | +742,960 B | 785 / `421410b100dd37e2` | `b9863b99eece45f3` (8,520) | 73.6 s |
+| BEFORE 2 | 7,030,013,952 B (7,030.0 MB) | 6,440,293,776 B (6,440.3 MB) | +4,861,198,336 B (+4,861.2 MB) | +749,328 B | 785 / `421410b100dd37e2` | `b9863b99eece45f3` (8,520) | 95.7 s |
+| AFTER 1 | 2,491,334,656 B (2,491.3 MB) | 1,963,034,880 B (1,963.0 MB) | +4,194,304 B (+4.2 MB) | +704,816 B | 785 / `421410b100dd37e2` | `b9863b99eece45f3` (8,520) | 57.7 s |
+| AFTER 2 | 2,216,099,840 B (2,216.1 MB) | 1,711,408,808 B (1,711.4 MB) | +4,194,304 B (+4.2 MB) | +769,424 B | 785 / `421410b100dd37e2` | `b9863b99eece45f3` (8,520) | 69.8 s |
+
+In all four runs the second (production) reachability build added 0 bytes of
+`size_allocated`. Both reachability builds reported the same traversal
+counters in every run: 2,393 nodes expanded, 3,140 queue insertions, a
+1,542-node peak queue, 2,393 reachable nodes, and 145,476 and 144,913 edge
+sources. The AFTER counter reported `materialized_names=0`: this corpus has no
+Go files, so no per-file name set was copied at all.
+
+Summary of what the fix changed at this scale:
+
+- Dispatch-phase `size_allocated` rise: +4,853 to +4,861 MB before, +4.2 MB
+  after, in both after runs exactly one 4 MiB allocator region
+  (4,194,304 bytes). It is not zero, but it is about 1/1,160 of the before
+  value. The earlier investigation's single before run had +5,012 MB in the
+  same bracket, so run-to-run variation in this delta is at least 160 MB.
+- Peak RSS: 7,030.0 to 7,031.8 MB before, 2,216.1 to 2,491.3 MB after.
+- Peak `phys_footprint`: 6,391.5 to 6,440.3 MB before, 1,711.4 to 1,963.0 MB
+  after.
+- Dead-code results are unchanged: dispatch-root count and digest, aggregate
+  digest and aggregate JSON length are identical across all four runs.
+- Before the fix, RSS at the checkpoint after the first reachability build was
+  6,871 to 6,872 MB. After the fix it was 2,078 to 2,196 MB. After the fix the
+  largest checkpoint RSS values are at snapshot completion (1,968 to 2,061 MB),
+  at rollup start (up to 2,418 MB in AFTER 1) and at aggregate completion
+  (2,216 to 2,335 MB). The dispatch phase is no longer where the process high
+  water forms. These are checkpoint readings, not an attribution of the
+  `/usr/bin/time` peak instant.
+
+### Measured versus computed
+
+Measured: every peak (from `/usr/bin/time -l`), every checkpoint RSS,
+`phys_footprint` and allocator figure (read in-process at named checkpoints),
+the counters, digests, traversal statistics and wall times, and the store
+counters and hash. Computed: only the deltas, which are the difference of two
+measured checkpoint values from the same run, and the MB figures, which divide
+by 10^6. Nothing was converted between RSS and `phys_footprint`. The
+reporter's own 15.6 GB peak was not reproduced by this corpus before the fix
+either, so this section does not claim a reduction in the reporter's absolute
+number, only in the part of it this corpus reproduces.
+
+### Cold index build: an unrelated finding and the workaround used
+
+The first `aft index` attempt was on pace for many hours even though the
+machine was quiet (one-minute load 7 to 29). After 6,328 s it had staged only
+35,264 of 73,319 files, and the staging rate had fallen from about 1,300 to
+about 110 files per minute. `sample` and `atos` against the build's dSYM put
+the main thread in `delete_staged_file_rows` (`callgraph_store/mod.rs`),
+inside `sqlite3_step`, mostly in `pread`. The cold build drops its secondary
+indexes before extraction (`drop_cold_build_secondary_indexes`). It then calls
+`delete_staged_file_rows` for every extracted file, which runs `DELETE … WHERE
+ref_id IN (SELECT ref_id FROM refs WHERE caller_file = ?1)` and deletes by
+`nodes.file_path` and `dispatch_hints.file`. Without those indexes, `EXPLAIN
+QUERY PLAN` on the staging store shows `SCAN refs` for that subquery. Each
+file therefore scans every row staged so far, and extraction is quadratic in
+corpus size. This may explain part of the earlier "cold index 20× slow"
+episode, which was attributed to machine load. No product code was changed
+for it here.
+
+To finish the corpus, the index process was stopped with `SIGKILL`. The three
+indexes those deletes need were then added to the staging store by hand,
+using the product's own names and definitions (`idx_refs_caller_file`,
+`idx_nodes_file`, `idx_dispatch_hints_file`), which made the plan `SEARCH refs
+USING INDEX idx_refs_caller_file`. The build was then resumed. It resumed at
+the committed staging rows because the corpus fingerprint matched, so it did
+not drop the indexes again. It finished extraction, resolution and
+publication in 1,775 s, with 522,534,912 bytes peak RSS and 464,356,576 bytes
+peak `phys_footprint`. The indexes change only how quickly rows are found, not
+which rows are written: the product's later `CREATE INDEX IF NOT EXISTS` step
+kept them, and the published generation's counters equal the earlier
+investigation's generation exactly.
+
+The raw logs, stores and harness worktrees lived under this worktree's
+ignored `.bg-shell/` directory and were deleted after the measurement.
