@@ -82,7 +82,7 @@ export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
-  previous?: { pid?: number; free_bytes?: number; available_bytes?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  previous?: { pid?: number; free_bytes?: number; available_bytes?: number; sampled_at_ms?: number; bytes_written?: number; unexplained_write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]>; tool_slow_roots?: string[] };
   /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
   ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; fallback?: string[]; error?: string };
   /** Consecutive ticks each instrument fingerprint has failed; see gateInstrumentFindings. */
@@ -236,10 +236,16 @@ export function updateLimiterWindow(prior: LimiterWindow | undefined, lines: str
 
 export function detectDaemon(sample: SentinelSample, state: SentinelState): Finding[] {
   const out: Finding[] = [];
-  const previousMisses = state.previous?.unreachable_runs ?? 0;
   if (!sample.supervisor) out.push(instrument("supervisor", "module status was not read"));
   if (sample.health_error) out.push(instrument("health-check", sample.health_error));
-  if (sample.supervisor?.running === false || (sample.health_error && previousMisses >= 1)) {
+  // daemon.down pages only on the supervisor's own word: it reports aft not
+  // running, or it could not be read at all (the collector sets running=false
+  // only after its confirming read failed too). A failed health probe with a
+  // live supervisor behind it is an instrument failure, which the
+  // consecutive-tick gate handles: on 2026-09-23 at load 255 one timed-out
+  // probe ("Error: exit null") paged CRITICAL here while the supervisor read
+  // running/healthy with zero restarts.
+  if (sample.supervisor?.running === false) {
     out.push(finding("daemon.down", "CRITICAL", "daemon:aft", `AFT daemon is unavailable (${sample.health_error ?? "supervisor reports not running"})`, "health.check is reachable and the supervisor reports aft running"));
   }
   const oldPid = state.previous?.pid;
@@ -608,7 +614,21 @@ export function detectProcess(sample: SentinelSample, state: SentinelState): Fin
   return out;
 }
 
-export function detectSearchAndTools(sample: SentinelSample): Finding[] {
+const SLOW_TOOL_LINE = /slow tool_call .*\btotal=(\d+)ms/;
+const TOOL_SLOW_CALL_MS = 10_000;
+const TOOL_SLOW_BURST = 10;
+/** Roots whose newest log lines hold more slow tool calls than tool.slow tolerates. */
+function slowToolRoots(lines: string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const line of lines) {
+    if (Number(line.match(SLOW_TOOL_LINE)?.[1] ?? 0) <= TOOL_SLOW_CALL_MS) continue;
+    const root = rootFrom(line);
+    counts.set(root, (counts.get(root) ?? 0) + 1);
+  }
+  return [...counts].filter(([, count]) => count > TOOL_SLOW_BURST).map(([root]) => root).sort();
+}
+
+export function detectSearchAndTools(sample: SentinelSample, state?: SentinelState): Finding[] {
   if (sample.log_error) return [instrument("tool-log", sample.log_error)];
   const byRoot = new Map<string, { searches: number; degraded: number; slow: number }>();
   for (const line of sample.log_lines ?? []) {
@@ -618,14 +638,21 @@ export function detectSearchAndTools(sample: SentinelSample): Finding[] {
       entry.searches++;
       if (/fully_degraded|index[:=] building/i.test(line)) entry.degraded++;
     }
-    const ms = Number(line.match(/slow tool_call .*\btotal=(\d+)ms/)?.[1] ?? 0);
-    if (ms > 10_000) entry.slow++;
+    const ms = Number(line.match(SLOW_TOOL_LINE)?.[1] ?? 0);
+    if (ms > TOOL_SLOW_CALL_MS) entry.slow++;
     byRoot.set(root, entry);
   }
   const out: Finding[] = [];
   for (const [root, value] of byRoot) {
     if (value.searches >= 5 && value.degraded / value.searches > 0.2) out.push(finding("search.degraded", "WARNING", `search:${root}`, `${value.degraded}/${value.searches} search calls were degraded on ${root}`, "at most 20% of search calls in the window are degraded"));
-    if (value.slow > 10) out.push(finding("tool.slow", "WARNING", `tool:${root}`, `${value.slow} tool calls exceeded 10 seconds on ${root}`, "at most 10 tool calls exceed 10 seconds in the window"));
+    // The daemon writes "slow tool_call" when a call COMPLETES, so every line
+    // this rule can count is already history: re-raising the finding on each
+    // tick of a slow episode re-reports finished calls. Report the onset once
+    // per episode instead; nextPrevious records the hot roots, and the rule
+    // stays quiet until a tick below the threshold ends the episode.
+    if (value.slow > TOOL_SLOW_BURST && !state?.previous?.tool_slow_roots?.includes(root)) {
+      out.push(finding("tool.slow", "WARNING", `tool:${root}`, `${value.slow} tool calls exceeded 10 seconds on ${root}`, "a tick with at most 10 slow calls ends the episode"));
+    }
   }
   return out;
 }
@@ -776,7 +803,7 @@ export function detectAll(sample: SentinelSample, state: SentinelState): Finding
   return [
     ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample, state), ...detectRetention(sample),
     ...detectIndexes(sample), ...detectTier2Overlong(sample), ...detectExecutor(sample, state), ...detectWakes(sample), ...detectWatcher(sample, state),
-    ...detectStorage(sample, state), ...detectProcess(sample, state), ...detectSearchAndTools(sample), ...detectDeadSessions(sample), ...detectDsym(sample),
+    ...detectStorage(sample, state), ...detectProcess(sample, state), ...detectSearchAndTools(sample, state), ...detectDeadSessions(sample), ...detectDsym(sample),
     ...detectScheduledCi(sample),
   ].filter((value, index, all) => all.findIndex((other) => other.fingerprint === value.fingerprint) === index);
 }
@@ -1095,12 +1122,30 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
   const sample: SentinelSample = { now_ms };
   const cursors: Partial<SentinelState> = {};
   const ck = existsSync(join(HOME, ".local", "bin", "ck")) ? join(HOME, ".local", "bin", "ck") : "ck";
-  try {
+  const readSupervisor = (): void => {
     const status = commandJson(ck, ["--subc", CONNECTION, "module", "status", "aft", "--json"]);
     const module = status.module ?? {};
     sample.supervisor = { running: module.state === "running" && module.live === true, last_exit_code: module.last_exit_code ?? null, placement_recorded: false };
     sample.health = status.health ?? {};
-  } catch (error) { sample.health_error = String(error); sample.supervisor = { running: false }; }
+  };
+  try {
+    readSupervisor();
+  } catch (error) {
+    // One failed read says nothing about the daemon by itself: under load the
+    // spawn times out ("exit null") while the module is running and healthy,
+    // and treating that as "supervisor says not running" paged daemon.down on
+    // a live daemon (2026-09-23, load 255). Confirm with the supervisor before
+    // anyone may call it down: a supervisor that answers makes this a plain
+    // instrument failure, and only a supervisor that is unreachable or reports
+    // not running may page.
+    sample.health_error = String(error);
+    try {
+      readSupervisor();
+    } catch (confirmation) {
+      sample.supervisor = { running: false };
+      sample.health_error = `${String(error)}; supervisor confirmation also failed: ${String(confirmation)}`;
+    }
+  }
   try {
     const current = daemonPidLog();
     sample.supervisor = { ...(sample.supervisor ?? { running: true }), pid: current.pid };
@@ -1230,7 +1275,7 @@ export function nextPrevious(sample: SentinelSample, state: SentinelState): Sent
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const executor = executorHealth(sample);
   const previous = state.previous;
-  return { pid: sample.supervisor?.pid, free_bytes: sample.disk?.free_bytes, available_bytes: sample.disk?.available_bytes, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  return { pid: sample.supervisor?.pid, free_bytes: sample.disk?.free_bytes, available_bytes: sample.disk?.available_bytes, sampled_at_ms: sample.now_ms, unexplained_write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, tool_slow_roots: slowToolRoots(sample.log_lines ?? []), ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {

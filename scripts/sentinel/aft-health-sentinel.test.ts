@@ -107,11 +107,24 @@ describe("health sentinel pure detectors", () => {
     expect(statSync(large).size).toBe(0);
   });
 
-  test("daemon.down requires two unreachable health runs", () => {
-    const first = detectDaemon(sample({ health: undefined, health_error: "timeout" }), cleanState());
-    expect(first.some((value) => value.rule === "daemon.down")).toBe(false);
-    const second = detectDaemon(sample({ health: undefined, health_error: "timeout" }), { findings: {}, previous: { unreachable_runs: 1 } });
-    expect(second.find((value) => value.rule === "daemon.down")?.fingerprint).toBe("daemon:aft");
+  test("daemon.down needs the supervisor's word: a failed probe behind a live supervisor is an instrument finding", () => {
+    // 2026-09-23, load 255: one probe timed out ("Error: exit null") while
+    // `ck module status aft` read running/healthy (pid 8143, restarts 0).
+    // The collector confirms with the supervisor before anyone may call it
+    // down, so this sample shape must never page - on neither the first nor a
+    // later consecutive failure.
+    const probeDown = sample({ health: undefined, health_error: "Error: exit null" });
+    expect(rules(detectDaemon(probeDown, cleanState()))).not.toContain("daemon.down");
+    expect(rules(detectDaemon(probeDown, cleanState()))).toContain("instrument");
+    // The supervisor reporting stopped pages immediately, as before.
+    const stopped = detectDaemon(sample({ health: undefined, health_error: "Error: exit null", supervisor: { running: false } }), cleanState());
+    expect(stopped.find((value) => value.rule === "daemon.down")?.fingerprint).toBe("daemon:aft");
+    // So does a supervisor the confirming read could not reach either.
+    const unreachable = detectDaemon(
+      sample({ health: undefined, health_error: "Error: exit null; supervisor confirmation also failed: Error: exit null", supervisor: { running: false } }),
+      cleanState(),
+    );
+    expect(unreachable.some((value) => value.rule === "daemon.down")).toBe(true);
   });
 
   test("daemon restart, panic, bind stall, and sandbox refusal are surfaced", () => {
@@ -576,6 +589,23 @@ describe("health sentinel pure detectors", () => {
       ...Array.from({ length: 11 }, () => "2026-09-17T14:29:00Z [aft] slow tool_call name=read total=11000ms root=/repo"),
     ];
     expect(rules(detectSearchAndTools(sample({ log_lines: lines })))).toEqual(["search.degraded", "tool.slow"]);
+  });
+
+  test("tool.slow reports a slow episode once at its onset, not on every tick it continues", () => {
+    const lines = Array.from({ length: 11 }, () => "2026-09-17T14:29:00Z [aft] slow tool_call name=read total=11000ms root=/repo");
+    // Onset: the episode is reported.
+    expect(rules(detectSearchAndTools(sample({ log_lines: lines }), cleanState()))).toContain("tool.slow");
+    // nextPrevious carries the hot roots into the next tick's state.
+    const afterOnset = nextPrevious(sample({ log_lines: lines }), cleanState());
+    expect(afterOnset?.tool_slow_roots).toEqual(["/repo"]);
+    // While the episode continues, the already-finished calls behind it are
+    // not re-reported.
+    const during: SentinelState = { findings: {}, previous: afterOnset };
+    expect(rules(detectSearchAndTools(sample({ log_lines: lines }), during))).not.toContain("tool.slow");
+    // A quiet tick ends the episode, so a later burst on the same root reports again.
+    const afterQuiet = nextPrevious(sample({ log_lines: [] }), cleanState());
+    expect(afterQuiet?.tool_slow_roots).toEqual([]);
+    expect(rules(detectSearchAndTools(sample({ log_lines: lines }), { findings: {}, previous: afterQuiet }))).toContain("tool.slow");
   });
 
   test("dead routed sessions compare idle age with root TTL", () => {

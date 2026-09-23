@@ -10,7 +10,7 @@ The collector reads `ck module status aft --json`, which exposes the same Manage
 
 | Rule | Severity and trigger | Clears when |
 |---|---|---|
-| `daemon.down` | CRITICAL when the supervisor says AFT is not running, or `health.check` is unreachable for two consecutive runs | health is reachable and the supervisor reports AFT running |
+| `daemon.down` | CRITICAL when the supervisor reports AFT not running or cannot be read; a failed health probe with a live supervisor behind it is an `instrument:health-check` warning (3 consecutive ticks), never this page | health is reachable and the supervisor reports AFT running |
 | `daemon.restarted` | WARNING when the pid changes without a placement record; the text includes old/new pid and exit code | the next run sees the same pid |
 | `daemon.panic` | CRITICAL on a new `panicked at`, `actor_fatal`, or `fatal executor` line | the next log window has no panic signature |
 | `limiter.saturated` | CRITICAL with at least five cold-build deferrals and no slot acquisition in 15 minutes | a slot turns over or the window has fewer than five deferrals |
@@ -27,7 +27,7 @@ The collector reads `ck module status aft --json`, which exposes the same Manage
 | `process.cpu` | WARNING above 150% CPU averaged over the interval | interval CPU is at most 150% |
 | `process.writes` | WARNING above 1 GiB/hour writes; includes the three largest growing cache-key artifacts, their mapped roots and share of the write delta, and calls out likely in-place/WAL churn when growth explains under half | write rate is at most 1 GiB/hour |
 | `search.degraded` | WARNING per root when more than 20% of at least five search calls disclose `fully_degraded` or `index: building` | degraded share is at most 20% |
-| `tool.slow` | WARNING per root when more than 10 tool calls exceed 10 seconds | at most 10 calls exceed 10 seconds |
+| `tool.slow` | WARNING per root at the onset of a slow episode (more than 10 completed calls over 10 seconds in one tick); quiet while the episode continues, since every counted call has already finished | a tick with at most 10 slow calls ends the episode |
 | `routes.dead_sessions` | WARNING when memory census reports bound routes on a root idle beyond its configured root TTL | routes close or root activity is newer than the TTL |
 | `dsym.missing` | WARNING when the running image's LC_UUID has no artifact under `aft/dsym/<UUID>/` | an artifact is stored at that UUID key |
 | `dsym.stale` | WARNING when an artifact exists at the running UUID key but its own LC_UUID differs; the running and found UUIDs are named | the artifact at the key has the running image's LC_UUID |
