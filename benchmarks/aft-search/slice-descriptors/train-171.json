@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "restart-drain-outage",
+    "subc-client-013-bump",
+    "issue-330-reporter-scale-record"
+  ],
+  "note": "The aft module ends held bg_events streams when subc drains it, so a restart no longer waits out the 30 s drain ceiling; the bridge waits out a reload up to the call deadline, capped at 45 s; @cortexkit/subc-client moves to ^0.13.1; the #330 reporter-scale measurement is recorded. No file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
