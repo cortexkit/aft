@@ -3,7 +3,7 @@
   "artifact_id": "ART-V049-S5-AGENT-SURFACE-MANIFEST-001",
   "artifact_version": "0.49.0",
   "manifest_id": "MAN-V049-S5-AGENT-SURFACE-001",
-  "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+  "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
   "source_inventory": "docs/v0.49-agent-surface-sources.json",
   "hash_rule": "Hash exact UTF-8 file bytes from the source commit; do not normalize newlines, reserialize JSON, or apply test-only normalization.",
   "artifacts": [
@@ -17,7 +17,7 @@
         "REG-V049-OC-REC",
         "REG-V049-OC-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 57679,
       "sha256": "8bfa2b0830d922fbef728cb523f77a8b9925085e8fc0525c73ce4e6acc618b66"
@@ -32,7 +32,7 @@
         "REG-V049-OC-REC",
         "REG-V049-OC-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 19554,
       "sha256": "2373944d2cdde5184430a00b035ee24936bd50b2df728123e1eeae94fdb14838"
@@ -45,7 +45,7 @@
       "profiles": [
         "REG-V049-OC-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 8393,
       "sha256": "854c7a7680d47d1f08ac6e945d537ccea892aef1569ac5dcf6abc225afb93725"
@@ -60,7 +60,7 @@
         "REG-V049-OC-REC",
         "REG-V049-OC-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 8580,
       "sha256": "985749c95a7b1c65d77c38ae2e798f10cdba0b1f281857930276a49225acb026"
@@ -74,7 +74,7 @@
         "REG-V049-OC-REC",
         "REG-V049-OC-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 6092,
       "sha256": "4dc0ba1675a425dcfe9fa08fb49bda9d3fedaa7044a25f9b6ac333ee79c3b46e"
@@ -89,7 +89,7 @@
         "REG-V049-OC-REC",
         "REG-V049-OC-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 14125,
       "sha256": "7911b9a0da13470f425bd3483fcb792e9ff374549b26baf0cb4d40aa9c11ed5a"
@@ -104,7 +104,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 52245,
       "sha256": "0b605d9df1d210d04d10caf62813bf8f9e11da9c371bb3dab56f5f7d55f611b8"
@@ -119,7 +119,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 23603,
       "sha256": "fa82242377f1457ccceba3b1206c4d11e6d560ecf5bcf24e7aa476c7e3099b9c"
@@ -132,7 +132,7 @@
       "profiles": [
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 9529,
       "sha256": "77268cd02bcd4ba668516ec340be31313d743e75a4bc03485a208aa8b134aeb3"
@@ -147,7 +147,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 10449,
       "sha256": "21f1410d20f54c8c20c11c640beba8e6dd6dbc04dd26e8eb3e934468bb9ed5ae"
@@ -161,7 +161,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 8509,
       "sha256": "cada6a75bf97cda30fe144ad68733246b850f9de72d62d71c18d6994f1f3d5c4"
@@ -174,7 +174,7 @@
       "profiles": [
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 10508,
       "sha256": "96c9545632670e11154eb249f3d24fa175866a7230f8c4acc925cc04a34b6d8c"
@@ -189,7 +189,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 13900,
       "sha256": "ef3a07c7f98ada33e3b3531d8c805f93295bea9c272c47b69a51a81c2ed4af45"
@@ -207,7 +207,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 44284,
       "sha256": "08f1a7a6b67ead08ced504a7e4be033befe00454f3545a9c3add488d8ed3e3f3"
@@ -225,7 +225,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 43214,
       "sha256": "d5b841e688fde0b0cb4863c0d3194a197e9dc0803db1f01add6e7cee9db13f87"
@@ -240,7 +240,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 8251,
       "sha256": "c7bb8151ffbf6fa074357f408e6d3b59b69eba74d69136d073493eefef3f7465"
@@ -251,7 +251,7 @@
       "kind": "generated subc manifest schema",
       "owner": "subc-schema-generation",
       "profiles": [],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 47445,
       "sha256": "cb01aa1a579f1df5d032c15bee56b7d7bc2cb4b921cfd961f8573cdc7ad6d54c"
@@ -269,7 +269,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 7057,
       "sha256": "65ba8d1c7c7414eefb30f7109f18da3eb71ad06bd730f3bcee2f91a22b1839b1"
@@ -287,7 +287,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 5328,
       "sha256": "ee3d7bb22093c1e4436feec7f6c9f59425d349dfbcc9407eb0e73e030fae2931"
@@ -305,10 +305,10 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
-      "byte_length": 315387,
-      "sha256": "ab5dfd03cdd933058dbb59700bc01c93dad5c3f307d9259d5be0150855cb61f4"
+      "byte_length": 315391,
+      "sha256": "3c8c1c781bda0effec84d848f8bc7a11e90782df6eee20548b18655d154b0790"
     },
     {
       "id": "ART-V049-S5-AUDIT-IMPLEMENTATION-001",
@@ -323,7 +323,7 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 28239,
       "sha256": "975a7094d1caae41fad572aace4f2417bb3c074541c5f1beba9498233397c9bb"
@@ -341,10 +341,10 @@
         "REG-V049-PI-REC",
         "REG-V049-PI-ALL"
       ],
-      "source_commit": "82ff789252f306e9bee65fdb8776e2529cff738b",
+      "source_commit": "d20719a6bac44cd1062e2805cf892bac1819a398",
       "encoding": "UTF-8",
       "byte_length": 253608,
-      "sha256": "a213987a96829d4e9c8ede5081b4a0aacc1916142c0086a06a23f4e7de778db9"
+      "sha256": "2dc552379158708daee51558118b651f0544f98005f6820ee7262c5193b22acb"
     }
   ]
 }
