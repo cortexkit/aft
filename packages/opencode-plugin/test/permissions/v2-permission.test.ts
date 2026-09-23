@@ -856,3 +856,56 @@ describe("OpenCode V2 projected filesystem tools", () => {
     }
   });
 });
+
+/**
+ * OpenCode 2 runs the shared read definition, so the session-owned bash
+ * artifact skip must hold there too: the external_directory prompt is skipped
+ * only when Rust's `bash_artifact_owned` says this session owns the file.
+ */
+describe("OpenCode V2 reads of bash task artifacts", () => {
+  // Outside the repository and outside every system temp root, so the path
+  // is external and only the ownership answer can suppress the prompt.
+  const ARTIFACT = "/aft-v2-artifact-fixture/opencode/bash-tasks/bgb-0123abcd/stdout";
+
+  function artifactReadTool(owned: boolean, service: PromptService) {
+    const ownershipQueries: Record<string, unknown>[] = [];
+    const bridge = {
+      send: async (command: string, params: Record<string, unknown>) => {
+        if (command !== "bash_artifact_owned") throw new Error(`unexpected ${command}`);
+        ownershipQueries.push(params);
+        return { success: true, owned };
+      },
+      toolCall: async () => ({ success: true, text: "task output" }),
+    };
+    const ctx = {
+      pool: { getBridge: () => bridge } as unknown as BridgePool,
+      client: {},
+      config: { tool_surface: "all", hoist_builtin_tools: true },
+      hashlineEffective: false,
+      storageDir: "/isolated/storage",
+    } as PluginContext;
+    const { host } = permissionHost(OPENCODE_DEFAULT_RULES);
+    const consumers = hoistedV2ToolConsumers(host, service.channel);
+    const read = projectV2Tool("read", hoistedTools(ctx).read, LOCATION, consumers);
+    return { read, ownershipQueries };
+  }
+
+  test("the session's own artifact is read with no prompt", async () => {
+    const service = promptService(["allow"]);
+    const { read, ownershipQueries } = artifactReadTool(true, service);
+
+    await execute(read, { path: ARTIFACT });
+
+    expect(service.creates).toEqual([]);
+    expect(ownershipQueries).toEqual([{ path: ARTIFACT, session_id: "session-v2" }]);
+  });
+
+  test("an artifact this session does not own still raises external_directory", async () => {
+    const service = promptService(["allow"]);
+    const { read } = artifactReadTool(false, service);
+
+    await execute(read, { path: ARTIFACT });
+
+    expect(service.creates.map((create) => create.action)).toEqual(["external_directory"]);
+  });
+});

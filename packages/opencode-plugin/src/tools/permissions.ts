@@ -2,12 +2,11 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { resolveAftStorageRoot } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
 import { sendIgnoredMessage } from "../shared/ignored-message.js";
 import type { PluginContext } from "../types.js";
-import { expandTilde, projectRootFor } from "./_shared.js";
+import { callBridge, expandTilde, projectRootFor } from "./_shared.js";
 
 const UNSUPPORTED_ASK_HOST =
   "AFT requires OpenCode 1.15.5 or newer for permission asks; please upgrade OpenCode";
@@ -265,26 +264,33 @@ function isSystemTempPath(target: string): boolean {
 }
 
 /**
- * Whether a path has the shape of a bash task artifact under the AFT storage
- * root: <storage>/<harness>/bash-tasks/<task-dir>/<artifact-file>.
+ * Whether `target` is one of this session's own background-bash output files
+ * (stdout, stderr, exit or pty), as decided by the Rust task registry.
  *
- * Truncated bash output points agents at these files, and they live outside
- * every project by design. An external-directory prompt here stalls
- * unattended sessions for a read the server validates anyway: Rust's
- * validate_read_path only serves the file when the requesting session OWNS
- * the task (BgTaskRegistry::is_session_owned_artifact_path) and never allows
- * writes. The shape check is deliberately narrow — exactly one path segment
- * per level below bash-tasks — so nothing else under the storage root is
- * exempted.
+ * Truncated bash output points agents at these files. They live under the AFT
+ * storage root, outside every project, and every task gets a freshly named
+ * directory, so an "always allow" answer to an external-directory prompt never
+ * matches the next task and unattended sessions stall on the prompt.
+ *
+ * The plugin cannot decide ownership itself: a `bash-tasks` path shape would
+ * also match another session's output or any file dropped beside an artifact,
+ * and with `restrict_to_project_root` off Rust would then read it with no
+ * check at all. So the answer comes from `bash_artifact_owned`, which applies
+ * `BgTaskRegistry::is_session_owned_artifact_path` (canonical path, exact
+ * artifact name, requesting session). Any failure — an older binary, a closed
+ * bridge, a malformed reply — counts as "not owned" so the prompt still runs.
  */
-function isBashTaskArtifactPath(target: string): boolean {
-  const storageRoot = normalizePath(resolveAftStorageRoot());
-  const normalizedTarget = normalizePath(target);
-  if (!containsPath(storageRoot, normalizedTarget)) return false;
-  const relative = normalizedTarget.slice(storageRoot.length).replace(/^[/\\]+/, "");
-  const segments = relative.split(/[/\\]+/);
-  // <harness>/bash-tasks/<task-dir>/<artifact-file>
-  return segments.length === 4 && segments[1] === "bash-tasks";
+async function isSessionOwnedBashArtifact(
+  ctx: PluginContext,
+  context: ToolContext,
+  target: string,
+): Promise<boolean> {
+  try {
+    const response = await callBridge(ctx, context, "bash_artifact_owned", { path: target });
+    return response.success !== false && response.owned === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -443,11 +449,14 @@ export async function assertExternalDirectoryPermission(
 
   if (isSystemTempPath(absoluteTarget)) return undefined;
 
-  // Bash task artifacts under the AFT storage root: skip the external
-  // prompt for server-validated reads — Rust only serves them to the owning
-  // session, so the prompt protected nothing and stalled unattended runs
-  // whenever a truncation footer pointed the agent at its own task output.
-  if (options?.serverValidatedRead === true && isBashTaskArtifactPath(absoluteTarget)) {
+  // A session's own bash task output: skip the external prompt for reads
+  // only. The check is the Rust registry's exact, session-scoped ownership
+  // test, so another session's output, unregistered files beside an artifact
+  // and every other path under the storage root still prompt.
+  if (
+    options?.serverValidatedRead === true &&
+    (await isSessionOwnedBashArtifact(ctx, context, absoluteTarget))
+  ) {
     return undefined;
   }
 

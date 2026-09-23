@@ -602,7 +602,9 @@ describe("permission audit regressions", () => {
         "permission rules (not a user choice)",
     );
     expect(String(raw)).not.toContain('"action":"deny"');
-    expect(calls).toHaveLength(0);
+    // Only the read-only artifact ownership query reached Rust; the read itself
+    // was never dispatched.
+    expect(calls.map((call) => call.command)).toEqual(["bash_artifact_owned"]);
   });
 
   test("aft_search external path hard-blocks under restrict_to_project_root", async () => {
@@ -1398,5 +1400,94 @@ describe("GitHub resource mutation permissions", () => {
       params: { filePath: "pr://7", content: "approved body" },
     });
     expect(result).toBe("comment published");
+  });
+});
+
+/**
+ * A session's own background-bash output files live outside the project, so a
+ * read of one would normally raise an external_directory prompt. The skip is
+ * decided by Rust's exact, session-scoped `bash_artifact_owned` answer, never
+ * by the path's shape, so everything below uses real `bash-tasks`-shaped paths
+ * and only the bridge answer distinguishes them.
+ */
+describe("session-owned bash artifact reads", () => {
+  async function artifactFixture() {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const taskDir = path.join(external, "opencode", "bash-tasks", "bgb-0123abcd");
+    await mkdir(taskDir, { recursive: true });
+    const artifact = path.join(taskDir, "stdout");
+    await writeFile(artifact, "task output\n");
+    return { project, artifact };
+  }
+
+  function ownershipHarness(ownedPaths: Set<string>, fail = false) {
+    return createHarness(hoistedTools, (command, params) => {
+      if (command === "bash_artifact_owned") {
+        if (fail) throw new Error("bridge closed");
+        return { success: true, owned: ownedPaths.has(String(params.path)) };
+      }
+      return { success: true, text: "task output" };
+    });
+  }
+
+  test("reading the session's own artifact raises no external_directory prompt", async () => {
+    const { project, artifact } = await artifactFixture();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = ownershipHarness(new Set([artifact]));
+
+    await tools.read.execute(
+      { filePath: artifact },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expect(askCalls.filter((call) => call.permission === "external_directory")).toEqual([]);
+    const ownership = calls.find((call) => call.command === "bash_artifact_owned");
+    expect(ownership?.params).toEqual({
+      path: artifact,
+      session_id: "permission-audit-test",
+    });
+    expect(calls.map((call) => call.command)).toContain("read");
+  });
+
+  test("another session's artifact or an unregistered lookalike still prompts", async () => {
+    const { project, artifact } = await artifactFixture();
+    const askCalls: AskCall[] = [];
+    // Rust answers "not owned" for another session's artifact and for any file
+    // that merely sits at an artifact-shaped path.
+    const { tools } = ownershipHarness(new Set());
+
+    await tools.read.execute(
+      { filePath: artifact },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
+  });
+
+  test("an unanswered ownership query fails closed to the prompt", async () => {
+    const { project, artifact } = await artifactFixture();
+    const askCalls: AskCall[] = [];
+    const { tools } = ownershipHarness(new Set([artifact]), true);
+
+    await tools.read.execute(
+      { filePath: artifact },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
+  });
+
+  test("non-read tools never consult ownership and still prompt for an owned artifact", async () => {
+    const { project, artifact } = await artifactFixture();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = ownershipHarness(new Set([artifact]));
+
+    await tools.write.execute(
+      { filePath: artifact, content: "overwrite" },
+      createSdkContext(project, recordingAsk(askCalls)),
+    );
+
+    expectExternalAsk(askCalls.filter((call) => call.permission === "external_directory"));
+    expect(calls.map((call) => call.command)).not.toContain("bash_artifact_owned");
   });
 });
