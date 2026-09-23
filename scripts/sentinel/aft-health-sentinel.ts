@@ -69,6 +69,9 @@ export type SentinelSample = {
   ci_error?: string;
 };
 export type FindingLedger = Record<string, { last_alerted_at: number; last_seen_at: number; severity: Severity; rule: string; text: string; cleared_at?: number }>;
+/** One limiter-relevant log event: a cold-build deferral or a slot acquisition. */
+export type LimiterEvent = { ts_ms: number; kind: "deferred" | "acquired"; line?: string };
+export type LimiterWindow = { pid?: number; events: LimiterEvent[]; truncated?: boolean };
 export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
@@ -78,6 +81,8 @@ export type SentinelState = {
   ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
   /** Consecutive ticks each instrument fingerprint has failed; see gateInstrumentFindings. */
   instrument_failures?: Record<string, number>;
+  /** Rolling 15-minute window of limiter events, maintained across ticks by updateLimiterWindow. */
+  limiter?: LimiterWindow;
 };
 
 const HOME = homedir();
@@ -170,18 +175,57 @@ export function healthBytesWritten(sample: SentinelSample): { available: boolean
 }
 
 function roots(sample: SentinelSample): RootHealth[] { return Array.isArray(metrics(sample).roots) ? metrics(sample).roots : []; }
-function linesSince(lines: string[], now: number, windowMs: number): string[] {
-  return lines.filter((line) => {
-    const match = line.match(/^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)/);
-    if (!match) return true;
-    const ts = Date.parse(match[1]);
-    return !Number.isFinite(ts) || now - ts <= windowMs;
-  });
-}
 function rootFrom(line: string): string {
   return line.match(/\broot=(.+?)(?:\s+(?:key|category|session|kind|outcome|files|ms)=|$)/)?.[1]
     ?? line.match(/route\.bind within[^:]*:\s*(\/[^ ]+)/)?.[1]
     ?? "unknown";
+}
+
+const LOG_LINE_TS = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)/;
+// The daemon logs deferrals as "... deferred by cold build limit ..." and
+// acquisitions in two shapes: "<class> cold-build slot acquired after Nms
+// wait: request=... kind=..." (class is inspect-triggered, maintenance, or
+// standing) and "maintenance build slot acquired after Nms wait: ..." — see
+// acquire_or_wait in crates/aft/src/cold_build_limiter.rs.
+const LIMITER_DEFERRED_LINE = /deferred by cold build limit/i;
+const LIMITER_ACQUIRED_LINE = /cold-build slot acquired|maintenance build slot acquired/i;
+// The state file is rewritten on every tick, so the window is capped: a log
+// that floods deferrals must not grow it without limit. When the cap is hit
+// the oldest entries are dropped and `truncated` is set, meaning the window
+// now covers less than the full 15 minutes rather than the state file
+// growing past this bound.
+export const LIMITER_EVENT_LIMIT = 2000;
+
+/**
+ * Roll the persisted limiter evidence window forward by one tick.
+ *
+ * `lines` carries only what the daemon appended since the previous tick (the
+ * log cursor in the state file), so the 15-minute window detectLimiter
+ * reports on cannot be computed from the sample alone; it has to live in the
+ * state file. Each tick appends the timestamps of the new deferral and
+ * acquisition lines and prunes entries older than the window. A pid change
+ * means a new daemon process, and the old process's events say nothing about
+ * its limiter, so the buffer starts empty. Both pids must be known for that
+ * verdict: a state file from before this buffer existed has no recorded pid,
+ * and that absence is not a change.
+ */
+export function updateLimiterWindow(prior: LimiterWindow | undefined, lines: string[], nowMs: number, pid?: number): LimiterWindow {
+  const restarted = prior?.pid !== undefined && pid !== undefined && prior.pid !== pid;
+  const events: LimiterEvent[] = restarted ? [] : [...(prior?.events ?? [])];
+  for (const line of lines) {
+    const kind = LIMITER_DEFERRED_LINE.test(line) ? "deferred" : LIMITER_ACQUIRED_LINE.test(line) ? "acquired" : undefined;
+    if (!kind) continue;
+    const parsed = Date.parse(line.match(LOG_LINE_TS)?.[1] ?? "");
+    // An undated line still happened on this tick; the tick's own time stands
+    // in for the missing timestamp.
+    const ts_ms = Number.isFinite(parsed) ? parsed : nowMs;
+    // The acquisition text is kept for the holder fallback in detectLimiter;
+    // deferral text carries nothing the count does not.
+    events.push(kind === "acquired" ? { ts_ms, kind, line: line.trim() } : { ts_ms, kind });
+  }
+  const kept = events.filter((event) => nowMs - event.ts_ms <= FIFTEEN_MINUTES);
+  const overflow = kept.length - LIMITER_EVENT_LIMIT;
+  return { pid, events: overflow > 0 ? kept.slice(overflow) : kept, ...(overflow > 0 ? { truncated: true } : {}) };
 }
 
 export function detectDaemon(sample: SentinelSample, state: SentinelState): Finding[] {
@@ -229,17 +273,22 @@ export function detectLogHealth(sample: SentinelSample): Finding[] {
   return out;
 }
 
-export function detectLimiter(sample: SentinelSample): Finding[] {
+export function detectLimiter(sample: SentinelSample, state: SentinelState): Finding[] {
   if (sample.log_error) return [instrument("limiter-log", sample.log_error)];
-  const window = linesSince(sample.log_lines ?? [], sample.now_ms, FIFTEEN_MINUTES);
-  const deferred = window.filter((line) => /deferred by cold build limit/i.test(line));
-  const acquired = window.filter((line) => /cold-build slot acquired/i.test(line));
+  // The window is the persisted buffer updateLimiterWindow maintains across
+  // ticks, not this tick's log lines: sample.log_lines covers only what the
+  // daemon appended since the previous tick, so judging "in 15m" from it
+  // pages on every restart storm that defers right after acquiring.
+  const events = (state.limiter?.events ?? []).filter((event) => sample.now_ms - event.ts_ms <= FIFTEEN_MINUTES);
+  const deferred = events.filter((event) => event.kind === "deferred");
+  const acquired = events.filter((event) => event.kind === "acquired");
   if (deferred.length < 5 || acquired.length > 0) return [];
   const limiter = metrics(sample).cold_build_limiter;
   const holders: LimiterEntry[] = limiter?.holders ?? [];
-  const holderText = holders.length
-    ? holders.map((h) => `${h.kind ?? h.domain ?? "build"}@${h.root ?? "unknown"} age=${h.age_ms ?? "?"}ms`).join(", ")
-    : [...(sample.log_lines ?? [])].reverse().filter((line) => /cold-build slot acquired/i.test(line)).slice(0, 2).map((line) => line.trim()).join(" | ") || "holders unavailable";
+  const holderText =
+    acquired.slice(-2).map((event) => event.line ?? "").filter(Boolean).reverse().join(" | ")
+    || holders.map((h) => `${h.kind ?? h.domain ?? "build"}@${h.root ?? "unknown"} age=${h.age_ms ?? "?"}ms`).join(", ")
+    || "holders unavailable";
   return [finding("limiter.saturated", "CRITICAL", "limiter:cold-build", `${deferred.length} cold-build deferrals with no acquisition in 15m; holders: ${holderText}`, "a slot is acquired or fewer than five deferrals occur in the 15-minute window")];
 }
 
@@ -688,7 +737,7 @@ export function detectScheduledCi(sample: SentinelSample): Finding[] {
 
 export function detectAll(sample: SentinelSample, state: SentinelState): Finding[] {
   return [
-    ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample), ...detectRetention(sample),
+    ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample, state), ...detectRetention(sample),
     ...detectIndexes(sample), ...detectTier2Overlong(sample), ...detectExecutor(sample, state), ...detectWakes(sample), ...detectWatcher(sample, state),
     ...detectStorage(sample, state), ...detectProcess(sample, state), ...detectSearchAndTools(sample), ...detectDeadSessions(sample), ...detectDsym(sample),
     ...detectScheduledCi(sample),
@@ -1106,7 +1155,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     sample.log_lines = readFileSync(join(dir, "log-excerpt.txt"), "utf8").split("\n").filter(Boolean);
     sample.supervisor ??= { running: true, pid: 95277 };
   } else ({ sample, cursors } = collectSample(state));
-  const gated = gateInstrumentFindings(detectAll(sample, state), state.instrument_failures);
+  // The limiter rule judges a 15-minute window, but a sample only carries the
+  // lines appended since the previous tick; updateLimiterWindow folds this
+  // tick's lines into the persisted buffer before any detector runs, and the
+  // updated buffer is both judged now and written back to the state file.
+  const limiter = updateLimiterWindow(state.limiter, sample.log_lines ?? [], sample.now_ms, sample.supervisor?.pid);
+  const detectionState: SentinelState = { ...state, limiter };
+  const gated = gateInstrumentFindings(detectAll(sample, detectionState), state.instrument_failures);
   const findings = gated.findings;
   // The full sample is diagnostic output for a hand-run; a launchd tick
   // prints only what changed so the stdout log stays readable.
@@ -1129,7 +1184,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
   }
   for (const value of reconciled.cleared) appendEvent({ ts: new Date(sample.now_ms).toISOString(), rule: value.prior.rule, state: "cleared", fingerprint: value.fingerprint, text: value.prior.text, severity: value.prior.severity });
-  const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, instrument_failures: gated.streaks, previous: nextPrevious(sample, state) };
+  const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, instrument_failures: gated.streaks, limiter, previous: nextPrevious(sample, state) };
   mkdirSync(dirname(STATE_FILE), { recursive: true });
   writeFileSync(STATE_FILE, JSON.stringify(next, null, 2));
   return 0;

@@ -17,6 +17,7 @@ import {
   detectProcess,
   detectRetention,
   detectSearchAndTools,
+  updateLimiterWindow,
   detectScheduledCi,
   freshestScheduledListing,
   gateInstrumentFindings,
@@ -129,14 +130,89 @@ describe("health sentinel pure detectors", () => {
     expect(broken[0].text).toContain("4096");
   });
 
+  // The rule now reads the persisted window buffer, so every case threads
+  // tick lines through updateLimiterWindow exactly as main does.
+  const limiterState = (lines: string[], now: number, prior?: SentinelState["limiter"], pid = 42): SentinelState =>
+    ({ findings: {}, limiter: updateLimiterWindow(prior, lines, now, pid) });
+
   test("limiter saturation raises without turnover", () => {
     const deferrals = Array.from({ length: 5 }, (_, index) => `2026-09-17T14:2${index}:00Z [aft] tier2 refresh deferred by cold build limit`);
-    expect(detectLimiter(sample({ log_lines: deferrals }))[0].fingerprint).toBe("limiter:cold-build");
+    expect(detectLimiter(sample(), limiterState(deferrals, NOW))[0].fingerprint).toBe("limiter:cold-build");
   });
 
   test("healthy post-restart limiter turnover does not raise", () => {
     const fixture = readFileSync(join(import.meta.dir, "fixtures", "healthy-limiter.log"), "utf8").trim().split("\n");
-    expect(detectLimiter(sample({ log_lines: fixture }))).toEqual([]);
+    expect(detectLimiter(sample(), limiterState(fixture, NOW))).toEqual([]);
+  });
+
+  test("restart storm: acquisitions on one tick, deferrals on the next, no page", () => {
+    // Replays the 2026-09-23 specimen: a restarted daemon logged 41 slot
+    // acquisitions (first three at 05:28:14-17), and the next tick, under a
+    // minute later, saw only the Tier-2 deferrals from 05:28:58-05:29:59.
+    // Judging the second tick alone paged CRITICAL on a healthy limiter.
+    const tick1 = [
+      "2026-09-23T05:28:14Z [aft] inspect-triggered cold-build slot acquired after 12ms wait: request=inspect:/repo/a:1 kind=explicit inspect",
+      "2026-09-23T05:28:16Z [aft] maintenance cold-build slot acquired after 3ms wait: request=maintenance:/repo/a kind=semantic",
+      "2026-09-23T05:28:17Z [aft] maintenance build slot acquired after 1ms wait: callgraph",
+    ];
+    const t1 = Date.parse("2026-09-23T05:28:20Z");
+    const afterTick1 = updateLimiterWindow(undefined, tick1, t1, 42);
+    const t2 = Date.parse("2026-09-23T05:29:05Z");
+    const tick2 = Array.from({ length: 14 }, (_, index) =>
+      `2026-09-23T05:28:${58 + (index % 2)}Z [aft] tier2 refresh deferred by cold build limit: categories=[callgraph] root=/repo/${index}`);
+    const afterTick2 = updateLimiterWindow(afterTick1, tick2, t2, 42);
+    expect(afterTick2.events).toHaveLength(17);
+    expect(detectLimiter(sample({ now_ms: t2, log_lines: tick2 }), { findings: {}, limiter: afterTick2 })).toEqual([]);
+  });
+
+  test("deferrals accumulating across ticks with no acquisition in 15m page with live holders", () => {
+    // No single tick carries five deferrals; the window does.
+    let window = updateLimiterWindow(undefined, [], NOW - 3 * 60_000, 42);
+    for (let tick = 0; tick < 3; tick += 1) {
+      const now = NOW - (2 - tick) * 60_000;
+      const lines = [0, 1].map((index) => `2026-09-17T14:${27 + tick}:0${index}Z [aft] tier2 refresh deferred by cold build limit root=/repo/${tick}-${index}`);
+      window = updateLimiterWindow(window, lines, now, 42);
+    }
+    expect(window.events).toHaveLength(6);
+    const holders = [{ kind: "search", root: "/repo/holder", age_ms: 900_000 }];
+    const found = detectLimiter(sample({ health: { metrics: { cold_build_limiter: { holders } } } }), { findings: {}, limiter: window });
+    expect(found[0].fingerprint).toBe("limiter:cold-build");
+    expect(found[0].text).toContain("6 cold-build deferrals with no acquisition in 15m");
+    expect(found[0].text).toContain("holders: search@/repo/holder age=900000ms");
+    expect(found[0].text).not.toContain("holders unavailable");
+  });
+
+  test("a daemon pid change resets the limiter window", () => {
+    const deferrals = Array.from({ length: 6 }, (_, index) => `2026-09-17T14:2${index}:00Z [aft] tier2 refresh deferred by cold build limit`);
+    const before = updateLimiterWindow(undefined, deferrals, NOW - 60_000, 42);
+    expect(before.events).toHaveLength(6);
+    const after = updateLimiterWindow(before, [], NOW, 43);
+    expect(after.pid).toBe(43);
+    expect(after.events).toEqual([]);
+    // The old process's deferrals must not page against the new process.
+    expect(detectLimiter(sample(), { findings: {}, limiter: after })).toEqual([]);
+    // An unknown prior pid is not a change: a state file from before the
+    // buffer existed keeps what it accumulates.
+    const adopted = updateLimiterWindow({ events: before.events }, [], NOW, 42);
+    expect(adopted.events).toHaveLength(6);
+  });
+
+  test("limiter window prunes entries older than 15 minutes", () => {
+    const old = Array.from({ length: 6 }, (_, index) => `2026-09-17T14:0${index}:00Z [aft] tier2 refresh deferred by cold build limit`);
+    const seeded = updateLimiterWindow(undefined, old, Date.parse("2026-09-17T14:06:00Z"), 42);
+    const pruned = updateLimiterWindow(seeded, [], NOW, 42);
+    expect(pruned.events).toEqual([]);
+    // A recent acquisition keeps pruned old deferrals from paging.
+    const withAcquisition = updateLimiterWindow(seeded, ["2026-09-17T14:29:30Z [aft] maintenance build slot acquired after 2ms wait: search"], NOW, 42);
+    expect(withAcquisition.events.map((event) => event.kind)).toEqual(["acquired"]);
+    expect(detectLimiter(sample(), { findings: {}, limiter: withAcquisition })).toEqual([]);
+  });
+
+  test("the limiter window is bounded and drops the oldest entries", () => {
+    const flood = Array.from({ length: 2100 }, (_, index) => `2026-09-17T14:29:00Z [aft] tier2 refresh deferred by cold build limit n=${index}`);
+    const bounded = updateLimiterWindow(undefined, flood, NOW, 42);
+    expect(bounded.events.length).toBeLessThanOrEqual(2000);
+    expect(bounded.truncated).toBe(true);
   });
 
   test("stuck indexes use stable root and plane fingerprint", () => {
@@ -673,7 +749,7 @@ test("preserved tier2 wedge replay raises the three causal findings", () => {
   const replay: SentinelSample = sample({ now_ms: lastTs, health, log_lines: logLines });
   const limiterLines = logLines.filter((line) => /deferred by cold build limit/.test(line) || (/cold-build slot acquired/.test(line) && Date.parse(line.split(" ", 1)[0]) > lastTs - 15 * 60_000));
   replay.log_lines = [...limiterLines, `2026-09-17T10:42:27Z [aft] inspect-triggered cold-build slot acquired after 1ms wait: request=inspect:${worktree}:1 kind=explicit inspect Tier-2 run`];
-  const found = [...detectLimiter({ ...replay, log_lines: limiterLines }), ...detectIndexes(replay), ...detectTier2Overlong({ ...replay, log_lines: replay.log_lines })];
+  const found = [...detectLimiter(replay, { findings: {}, limiter: updateLimiterWindow(undefined, limiterLines, replay.now_ms, replay.supervisor?.pid) }), ...detectIndexes(replay), ...detectTier2Overlong({ ...replay, log_lines: replay.log_lines })];
   expect(rules(found)).toEqual(expect.arrayContaining(["limiter.saturated", "index.stuck", "tier2.pass_overlong"]));
 });
 
