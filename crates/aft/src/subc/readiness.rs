@@ -1110,6 +1110,17 @@ mod tests {
         Frame::build(ty, control_flags(), 0, 0, corr, body).expect("reply frame")
     }
 
+    #[test]
+    fn live_roots_op_name_is_the_wire_tag_of_the_request() {
+        // The daemon advertises the op under the request's serde tag, and the
+        // query is sent only when that exact name is advertised. A string that
+        // drifts from the crate's tag would make the module skip the query on
+        // every daemon, silently, forever.
+        let body = serde_json::to_value(ModuleControlRequestFromModule::LiveRoots {})
+            .expect("serialize live_roots request");
+        assert_eq!(body["op"], LIVE_ROOTS_OP);
+    }
+
     #[tokio::test]
     async fn live_roots_query_is_not_sent_when_the_daemon_does_not_advertise_it() {
         let (control, mut rx, _pending) = wire_control(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
