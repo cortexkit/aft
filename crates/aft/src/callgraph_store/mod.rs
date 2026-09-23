@@ -806,6 +806,11 @@ mod write_amplification_tests {
         assert!(store.node_for(Path::new("src/lib.ts"), "after").is_ok());
     }
 
+    // A path whose location cannot be resolved (here `..` after a regular
+    // file) might still be a project file under an alias the store cannot see
+    // through, so it keeps failing the refresh and recording a named gap.
+    // Unix-only: Windows folds `..` lexically, which makes this path resolve.
+    #[cfg(unix)]
     #[test]
     fn unresolvable_refresh_path_records_a_path_identity_gap() {
         let temp = tempdir().unwrap();
@@ -813,8 +818,9 @@ mod write_amplification_tests {
         let source = root.join("src/lib.ts");
         fs::create_dir_all(source.parent().unwrap()).unwrap();
         fs::write(&source, "export function live() {}\n").unwrap();
-        let foreign = temp.path().join("foreign.ts");
-        fs::write(&foreign, "export function foreign() {}\n").unwrap();
+        let not_a_dir = temp.path().join("plain-file");
+        fs::write(&not_a_dir, "not a directory\n").unwrap();
+        let foreign = not_a_dir.join("..").join("foreign.ts");
         let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
         store.cold_build(std::slice::from_ref(&source)).unwrap();
 
@@ -832,6 +838,116 @@ mod write_amplification_tests {
                 root.display()
             ))
         );
+    }
+
+    fn dead_code_projection_available(store: &CallGraphStore) -> bool {
+        dead_code_projection::project_dead_code_snapshot_with_revision(store.sqlite_path()).is_ok()
+    }
+
+    // Regression for a project containing a symlink to a file in another tree
+    // (issue #334: `~/.omo/codegraph/projects/<name>/source.json`). The watcher
+    // canonicalizes event paths, so the refresh receives the symlink TARGET,
+    // which lies outside the root. That path must be skipped for this refresh
+    // only; it used to be recorded as a store-wide gap that disabled dead-code
+    // for the project permanently.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_outside_root_is_skipped_without_disabling_dead_code() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        let source = root.join("src/lib.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "export function live() {}\n").unwrap();
+        let outside = temp.path().join("elsewhere/source.json");
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, "{}\n").unwrap();
+        let link = root.join("source.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        assert!(dead_code_projection_available(&store));
+
+        let watcher_path = crate::watcher_filter::canonicalize_watcher_path(link.clone());
+        assert!(
+            !watcher_path.starts_with(std::fs::canonicalize(&root).unwrap()),
+            "the watcher hands the refresh the out-of-root symlink target"
+        );
+        let stats = store
+            .refresh_files(&[watcher_path.clone(), source.clone()])
+            .expect("an out-of-root path must not fail the refresh");
+        assert_eq!(stats.skipped_out_of_root, vec![watcher_path.clone()]);
+        assert_eq!(stats.changed_files, vec!["src/lib.ts"]);
+        store
+            .mark_files_stale(std::slice::from_ref(&watcher_path))
+            .expect("marking an out-of-root path stale is a no-op");
+
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(path_identity_mismatch_reason(&conn).unwrap(), None);
+        drop(conn);
+        assert!(dead_code_projection_available(&store));
+    }
+
+    fn write_legacy_path_identity_gap(store: &CallGraphStore, root: &Path) {
+        let conn = store.conn.lock().unwrap();
+        record_path_identity_mismatch(
+            &conn,
+            &CallGraphStoreError::PathIdentityMismatch {
+                path: PathBuf::from("/elsewhere/source.json"),
+                project_root: root.to_path_buf(),
+            },
+        )
+        .unwrap();
+    }
+
+    // Stores written by earlier releases already carry the gap record on disk.
+    // The next refresh that finds every indexed file matching disk clears it.
+    #[test]
+    fn stale_path_identity_gap_clears_once_store_matches_disk() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        let source = root.join("src/lib.ts");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "export function live() {}\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        write_legacy_path_identity_gap(&store, &root);
+        assert!(!dead_code_projection_available(&store));
+
+        store
+            .refresh_files(std::slice::from_ref(&source))
+            .expect("refresh of an unchanged in-root file");
+
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(path_identity_mismatch_reason(&conn).unwrap(), None);
+        drop(conn);
+        assert!(dead_code_projection_available(&store));
+    }
+
+    // The gap must survive while any indexed file differs from disk: the
+    // store could still be missing the change the record stands for.
+    #[test]
+    fn path_identity_gap_stays_while_an_indexed_file_is_out_of_date() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("project");
+        let first = root.join("src/a.ts");
+        let second = root.join("src/b.ts");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, "export function a() {}\n").unwrap();
+        fs::write(&second, "export function b() {}\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root.clone()).unwrap();
+        store.cold_build(&[first.clone(), second.clone()]).unwrap();
+        write_legacy_path_identity_gap(&store, &root);
+
+        fs::write(&second, "export function b_changed_on_disk() {}\n").unwrap();
+        store.refresh_files(std::slice::from_ref(&first)).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        assert!(path_identity_mismatch_reason(&conn).unwrap().is_some());
+        drop(conn);
+
+        store.refresh_files(std::slice::from_ref(&second)).unwrap();
+        let conn = store.conn.lock().unwrap();
+        assert_eq!(path_identity_mismatch_reason(&conn).unwrap(), None);
     }
 
     #[test]
@@ -2288,6 +2404,10 @@ pub struct IncrementalStats {
     pub dependency_selected_refs: usize,
     pub refreshed_own_files: usize,
     pub unchanged_extract_files: usize,
+    /// Inputs that resolve to a real location outside the project root (for
+    /// example a symlink inside the project pointing elsewhere). They are not
+    /// part of this project's graph, so the refresh ignores them.
+    pub skipped_out_of_root: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4544,10 +4664,15 @@ impl CallGraphStore {
             }
         }
 
+        let mut skipped_out_of_root = Vec::new();
         for input in changed_files {
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
                 Ok(path) => path,
+                Err(_) if refresh_path_resolves_outside_root(&self.project_root, input) => {
+                    skipped_out_of_root.push(input.clone());
+                    continue;
+                }
                 Err(error) => {
                     record_path_identity_mismatch(&conn, &error)?;
                     return Err(error);
@@ -4690,14 +4815,17 @@ impl CallGraphStore {
             profile.row_deletes += started.elapsed();
         }
 
+        log_skipped_out_of_root_refresh_paths(&self.project_root, &skipped_out_of_root);
+
         // Already-fresh inputs have no callers to resolve. Backend freshness
         // writes do not change projection inputs, so only deletions invalidate
         // the retained snapshot on this path.
         if caller_extracts.is_empty() {
-            let wrote_rows = tx.total_changes() != total_changes_before;
             if !deleted.is_empty() {
                 dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
             }
+            clear_path_identity_mismatch_if_consistent(&tx, &self.project_root)?;
+            let wrote_rows = tx.total_changes() != total_changes_before;
             let started = Instant::now();
             commit_incremental_if_current(tx)?;
             if wrote_rows {
@@ -4713,6 +4841,7 @@ impl CallGraphStore {
                     dependency_selected_refs,
                     refreshed_own_files: 0,
                     unchanged_extract_files: 0,
+                    skipped_out_of_root,
                 },
                 profile,
             ));
@@ -4823,6 +4952,7 @@ impl CallGraphStore {
         if !own_refresh.is_empty() || !selected_ref_ids.is_empty() || !deleted.is_empty() {
             dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
         }
+        clear_path_identity_mismatch_if_consistent(&tx, &self.project_root)?;
         let started = Instant::now();
         commit_incremental_if_current(tx)?;
         self.record_commit(total_changes_before, &conn);
@@ -4836,6 +4966,7 @@ impl CallGraphStore {
                 dependency_selected_refs,
                 refreshed_own_files: own_refresh.len(),
                 unchanged_extract_files: unchanged_extracts,
+                skipped_out_of_root,
             },
             profile,
         ))
@@ -4854,6 +4985,9 @@ impl CallGraphStore {
         for path in files {
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, path) {
                 Ok(path) => path,
+                // Same rule as refresh: a file that really lives outside the
+                // root has no row here to mark.
+                Err(_) if refresh_path_resolves_outside_root(&self.project_root, path) => continue,
                 Err(error) => {
                     drop(tx);
                     record_path_identity_mismatch(&conn, &error)?;
@@ -7835,6 +7969,91 @@ fn record_path_identity_mismatch(conn: &Connection, error: &CallGraphStoreError)
         ],
     )?;
     Ok(())
+}
+
+/// Clear a recorded path identity gap once the store is shown to match disk.
+///
+/// The record means "a refresh was asked to apply a path this store could not
+/// place, so the graph may be missing that change". It is safe to drop only
+/// when every indexed file still matches its bytes on disk and no file is
+/// waiting for a refresh: at that point nothing the store holds is out of date,
+/// whatever path triggered the record. Without this, one bad path disabled
+/// dead-code for the project until the store was deleted by hand. The check
+/// stats every indexed file, so it runs only while a record exists.
+fn clear_path_identity_mismatch_if_consistent(
+    tx: &Transaction<'_>,
+    project_root: &Path,
+) -> Result<()> {
+    if path_identity_mismatch_reason(tx)?.is_none() {
+        return Ok(());
+    }
+    if !stale_backend_file_paths(tx, project_root, true)?.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = tx.prepare("SELECT path FROM files")?;
+    let paths = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for rel_path in paths {
+        let Some(row) = load_file_row(tx, &rel_path)? else {
+            continue;
+        };
+        match cache_freshness::verify_file(&project_root.join(&rel_path), &row.freshness) {
+            FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. } => {}
+            FreshnessVerdict::Stale | FreshnessVerdict::Deleted => return Ok(()),
+        }
+    }
+    tx.execute(
+        "DELETE FROM meta WHERE k = ?1",
+        [PATH_IDENTITY_MISMATCH_META_KEY],
+    )?;
+    crate::slog_info!(
+        "callgraph store: cleared path identity gap for {}; every indexed file matches disk",
+        project_root.display()
+    );
+    Ok(())
+}
+
+/// True when a refresh input that failed to map under the root is a real file
+/// (or a deleted file whose directory still exists) outside the root.
+///
+/// Such a path belongs to another tree, typically reached through a symlink
+/// inside the project that the file watcher resolved to its target. It is not
+/// in this project's graph, so skipping it cannot leave the graph out of date.
+/// A path whose location cannot be resolved at all (an unreadable component,
+/// `..` after a regular file) is different: it could still be a project file
+/// under an alias the store cannot see through, so callers keep treating it
+/// as a recorded identity gap.
+fn refresh_path_resolves_outside_root(project_root: &Path, path: &Path) -> bool {
+    let full_path = if path.is_relative() {
+        project_root.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    if std::fs::canonicalize(&full_path).is_ok() {
+        return true;
+    }
+    let missing = matches!(
+        std::fs::symlink_metadata(&full_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    missing
+        && full_path
+            .parent()
+            .is_some_and(|parent| std::fs::canonicalize(parent).is_ok())
+}
+
+fn log_skipped_out_of_root_refresh_paths(project_root: &Path, skipped: &[PathBuf]) {
+    let Some(first) = skipped.first() else {
+        return;
+    };
+    crate::slog_warn!(
+        "callgraph store refresh skipped {} path(s) outside project root {} (first: {}); they resolve to files in another tree, usually through a symlink",
+        skipped.len(),
+        project_root.display(),
+        first.display()
+    );
 }
 
 pub(super) fn path_identity_mismatch_reason(conn: &Connection) -> Result<Option<String>> {

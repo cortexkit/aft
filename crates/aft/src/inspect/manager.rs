@@ -3689,12 +3689,13 @@ fn refresh_writable_dead_code_store(
     match store.refresh_files(refresh_paths) {
         Ok(stats) => {
             crate::slog_info!(
-                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={} root={} {}",
+                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={} skipped_out_of_root={} root={} {}",
                 callgraph_dir.display(),
                 refresh_paths.len(),
                 stats.changed_files.len(),
                 stats.deleted_files.len(),
                 stats.refreshed_own_files,
+                stats.skipped_out_of_root.len(),
                 store.project_root().display(), io.finish()
             );
         }
@@ -6702,6 +6703,9 @@ export function bannerUnused() {}
         assert_eq!(snapshot.exported_symbols.len(), 3);
     }
 
+    // Unix-only: the unresolvable path relies on `..` after a regular file,
+    // which Windows folds lexically into a resolvable path.
+    #[cfg(unix)]
     #[test]
     fn path_identity_mismatch_is_a_named_dead_code_terminal_gap() {
         let dir = write_ts_project(1);
@@ -6711,13 +6715,16 @@ export function bannerUnused() {}
             callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("store dir");
         let source = root.join("mod0.ts");
         let foreign_dir = tempfile::tempdir().expect("foreign tempdir");
-        let foreign = foreign_dir.path().join("foreign.ts");
-        std::fs::write(&foreign, "export function foreign() {}\n").expect("write foreign source");
+        let not_a_dir = foreign_dir.path().join("plain-file");
+        std::fs::write(&not_a_dir, "not a directory\n").expect("write plain file");
+        // A location that cannot be resolved, unlike a real out-of-root file
+        // (those are skipped per refresh and never recorded).
+        let foreign = not_a_dir.join("..").join("foreign.ts");
         let store = CallGraphStore::open(callgraph_dir, root.clone()).expect("open store");
         store.cold_build(&[source]).expect("cold build store");
         let error = store
             .refresh_files(&[foreign.clone()])
-            .expect_err("foreign watcher path cannot be assigned a store-relative key");
+            .expect_err("an unresolvable path cannot be assigned a store-relative key");
         assert!(matches!(
             error,
             CallGraphStoreError::PathIdentityMismatch { .. }
