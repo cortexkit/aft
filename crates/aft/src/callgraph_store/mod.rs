@@ -2975,23 +2975,12 @@ impl DiskProjectIndex<'_> {
             )
             .optional()
             .ok()??;
-        let mut index = DbFileIndex {
-            lang: lang_from_label(&lang),
-            exports: HashSet::new(),
-            default_export: None,
-            export_aliases: HashMap::new(),
-            node_by_scoped: HashMap::new(),
-            node_by_bare: HashMap::new(),
-            node_kind_by_id: HashMap::new(),
-            module_targets: HashMap::new(),
-            declared_module_targets: HashMap::new(),
-            reexports: Vec::new(),
-        };
+        let mut index = DbFileIndex::empty(lang_from_label(&lang));
         let mut nodes = self
             .conn
             .prepare(
                 "SELECT id, name, scoped_name, kind, exported, is_default_export
-                 FROM nodes WHERE file_path = ?1",
+                 FROM nodes WHERE file_path = ?1 ORDER BY scoped_name, id",
             )
             .ok()?;
         let rows = nodes
@@ -3010,16 +2999,7 @@ impl DiskProjectIndex<'_> {
             .ok()?;
         drop(nodes);
         for (id, name, scoped_name, kind, exported, is_default_export) in rows {
-            if exported {
-                index.exports.insert(name.clone());
-                index.exports.insert(scoped_name.clone());
-            }
-            if is_default_export {
-                index.default_export = Some(scoped_name.clone());
-            }
-            index.node_by_scoped.insert(scoped_name, id.clone());
-            index.node_by_bare.entry(name).or_insert(id.clone());
-            index.node_kind_by_id.insert(id, kind);
+            index.note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
         }
 
         let mut refs = self
@@ -3027,13 +3007,15 @@ impl DiskProjectIndex<'_> {
             .prepare(
                 "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
                   FROM refs
-                  WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')",
+                  WHERE caller_file = ?1 AND kind IN ('import', 'module', 'reexport', 'export_alias')
+                  ORDER BY byte_start, byte_end, ref_id",
             )
             .ok()?;
         let rows = refs
             .query_map(params![rel_path], |row| {
-                Ok((
+                Ok(module_index_ref(
                     row.get::<_, String>(0)?,
+                    rel_path.to_string(),
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
@@ -3046,97 +3028,21 @@ impl DiskProjectIndex<'_> {
             .collect::<std::result::Result<Vec<_>, _>>()
             .ok()?;
         drop(refs);
-        for (ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name) in rows {
-            if kind == "export_alias" {
-                if let (Some(exported), Some(source)) = (local_name, requested_name) {
-                    index.export_aliases.insert(exported, source);
-                }
-                continue;
-            }
-            let Some(module_path) = module_path else {
-                continue;
-            };
-            let target_file = if kind == "module" {
-                rust_declared_module_target(
-                    self.project_root,
-                    rel_path,
-                    &module_path,
-                    self.module_resolution_memo,
-                    &FactPaths {
-                        root: self.project_root,
-                        facts: &DiskFacts::new(self.project_root),
-                    },
-                )
-            } else {
-                self.disk_module_target(rel_path, &module_path)
-            }
-            .or_else(|| {
-                self.conn
-                    .query_row(
-                        "SELECT d.dep_file
-                         FROM file_dependencies d
-                         JOIN files f ON f.path = d.dep_file
-                         WHERE d.file_path = ?1
-                         ORDER BY d.dep_file
-                         LIMIT 1",
-                        params![rel_path],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten()
-            });
-            index
-                .module_targets
-                .entry(module_path.clone())
-                .or_insert_with(|| target_file.clone());
-            if kind == "module" {
-                index
-                    .declared_module_targets
-                    .entry(module_path.clone())
-                    .or_insert_with(|| target_file.clone());
-            }
-            if kind == "reexport" {
-                let raw = RawRef {
-                    ref_id,
-                    caller_node: None,
-                    caller_symbol: None,
-                    caller_file: rel_path.to_string(),
-                    kind,
-                    short_name: None,
-                    full_ref,
-                    module_path: Some(module_path),
-                    import_kind: Some("reexport".to_string()),
-                    local_name: None,
-                    requested_name: None,
-                    namespace_alias: None,
-                    wildcard,
-                    line: 0,
-                    byte_start: 0,
-                    byte_end: 0,
-                    dependencies: BTreeSet::new(),
-                };
-                index
-                    .reexports
-                    .push(reexport_index_from_raw(&raw, target_file));
-            }
+        let facts = FactPaths {
+            root: self.project_root,
+            facts: &DiskFacts::new(self.project_root),
+        };
+        for raw in rows {
+            index.note_module_ref(
+                self.project_root,
+                rel_path,
+                &raw,
+                self.module_resolution_memo,
+                &facts,
+                &|file: &str| self.contains_file(file),
+            );
         }
         Some(index)
-    }
-
-    fn disk_module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
-        let caller_dir = self.project_root.join(caller_file).parent()?.to_path_buf();
-        let candidate = callgraph::resolve_module_path_with_memo(
-            &caller_dir,
-            module_path,
-            self.module_resolution_memo,
-            &FactPaths {
-                root: self.project_root,
-                facts: &DiskFacts::new(self.project_root),
-            },
-        )?;
-        let rel_path = relative_path(self.project_root, &candidate);
-        self.contains_file(&rel_path).then_some(rel_path)
     }
 
     fn load_module_parent(&self, target_file: &str) -> Option<(String, String)> {
@@ -11394,22 +11300,35 @@ impl<'a> ProjectIndex<'a> {
             root: project_root,
             facts: &disk,
         };
-        let mut files = load_db_file_indexes(tx, project_root, &module_resolution_memo, &facts)?;
-        let mut caller_data = HashMap::new();
-        for (rel_path, extract) in caller_extracts {
-            files.insert(
-                rel_path.clone(),
-                DbFileIndex::from_extract(
+        // Files created in this refresh have no `files` row yet (their rows are
+        // written after resolution), but a cold build of the same tree indexes
+        // them, so they count as indexed module targets here too.
+        let caller_paths = caller_extracts.keys().cloned().collect::<HashSet<_>>();
+        let mut files = load_db_file_indexes(
+            tx,
+            project_root,
+            &caller_paths,
+            &module_resolution_memo,
+            &facts,
+        )?;
+        let caller_indexes = caller_extracts
+            .iter()
+            .map(|(rel_path, extract)| {
+                let index = DbFileIndex::from_store_extract(
                     project_root,
                     extract,
-                    &FactPaths {
-                        root: project_root,
-                        facts: &DiskFacts::new(project_root),
-                    },
-                ),
-            );
-            caller_data.insert(rel_path.clone(), &extract.data);
-        }
+                    &module_resolution_memo,
+                    &facts,
+                    |file| files.contains_key(file) || caller_paths.contains(file),
+                );
+                (rel_path.clone(), index)
+            })
+            .collect::<Vec<_>>();
+        files.extend(caller_indexes);
+        let caller_data = caller_extracts
+            .iter()
+            .map(|(rel_path, extract)| (rel_path.clone(), &extract.data))
+            .collect();
         Ok(Self::from_parts(
             project_root,
             files,
@@ -11454,6 +11373,21 @@ impl<'a> ProjectIndex<'a> {
 }
 
 impl DbFileIndex {
+    fn empty(lang: Option<LangId>) -> Self {
+        DbFileIndex {
+            lang,
+            exports: HashSet::new(),
+            default_export: None,
+            export_aliases: HashMap::new(),
+            node_by_scoped: HashMap::new(),
+            node_by_bare: HashMap::new(),
+            node_kind_by_id: HashMap::new(),
+            module_targets: HashMap::new(),
+            declared_module_targets: HashMap::new(),
+            reexports: Vec::new(),
+        }
+    }
+
     fn from_extract(project_root: &Path, extract: &FileExtract, facts: &FactPaths<'_>) -> Self {
         let mut node_by_scoped = HashMap::new();
         let mut node_by_bare = HashMap::new();
@@ -11515,11 +11449,151 @@ impl DbFileIndex {
             reexports,
         }
     }
+
+    /// The index a refresh uses for a file it is about to rewrite. It is built
+    /// from exactly the rows the extract will write, and read in the same order,
+    /// as the index a cold build loads for that file from SQLite (see
+    /// `DiskProjectIndex::load_file_index`), so the two resolve alike.
+    fn from_store_extract(
+        project_root: &Path,
+        extract: &FileExtract,
+        memo: &callgraph::ModuleResolutionMemo,
+        facts: &FactPaths<'_>,
+        is_indexed: impl Fn(&str) -> bool,
+    ) -> Self {
+        let mut index = DbFileIndex::empty(Some(extract.lang));
+        let mut nodes = extract.nodes.iter().collect::<Vec<_>>();
+        nodes.sort_by(|left, right| {
+            node_row_order(&left.scoped_name, &left.id, &right.scoped_name, &right.id)
+        });
+        for node in nodes {
+            index.note_node(
+                &node.id,
+                &node.name,
+                &node.scoped_name,
+                &node.kind,
+                node.exported,
+                node.is_default_export,
+            );
+        }
+        let mut refs = extract
+            .raw_refs
+            .iter()
+            .filter(|raw| {
+                matches!(
+                    raw.kind.as_str(),
+                    "import" | "module" | "reexport" | "export_alias"
+                )
+            })
+            .collect::<Vec<_>>();
+        refs.sort_by(|left, right| {
+            (left.byte_start, left.byte_end, &left.ref_id).cmp(&(
+                right.byte_start,
+                right.byte_end,
+                &right.ref_id,
+            ))
+        });
+        for raw in refs {
+            index.note_module_ref(
+                project_root,
+                &extract.rel_path,
+                raw,
+                memo,
+                facts,
+                &is_indexed,
+            );
+        }
+        index
+    }
+
+    /// Records one `nodes` row. Callers feed rows in `node_row_order`, so the
+    /// first-wins bare-name lookup and the last-wins default export do not
+    /// depend on SQLite rowids, which differ between a cold build and a store
+    /// that refreshes rewrote.
+    fn note_node(
+        &mut self,
+        id: &str,
+        name: &str,
+        scoped_name: &str,
+        kind: &str,
+        exported: bool,
+        is_default_export: bool,
+    ) {
+        if exported {
+            self.exports.insert(name.to_string());
+            self.exports.insert(scoped_name.to_string());
+        }
+        if is_default_export {
+            self.default_export = Some(scoped_name.to_string());
+        }
+        self.node_by_scoped
+            .insert(scoped_name.to_string(), id.to_string());
+        self.node_by_bare
+            .entry(name.to_string())
+            .or_insert_with(|| id.to_string());
+        self.node_kind_by_id
+            .insert(id.to_string(), kind.to_string());
+    }
+
+    /// Records one `import`, `module`, `reexport` or `export_alias` ref of this
+    /// file. Callers feed refs in source order (byte range, then ref id), which
+    /// fixes the order `export *` re-exports are searched in.
+    fn note_module_ref(
+        &mut self,
+        project_root: &Path,
+        caller_file: &str,
+        raw: &RawRef,
+        memo: &callgraph::ModuleResolutionMemo,
+        facts: &FactPaths<'_>,
+        is_indexed: &impl Fn(&str) -> bool,
+    ) {
+        if raw.kind == "export_alias" {
+            if let (Some(exported), Some(source)) = (&raw.local_name, &raw.requested_name) {
+                self.export_aliases.insert(exported.clone(), source.clone());
+            }
+            return;
+        }
+        let Some(module_path) = &raw.module_path else {
+            return;
+        };
+        let target_file = module_ref_target(
+            project_root,
+            caller_file,
+            &raw.kind,
+            module_path,
+            memo,
+            facts,
+            is_indexed,
+        );
+        self.module_targets
+            .entry(module_path.clone())
+            .or_insert_with(|| target_file.clone());
+        if raw.kind == "module" {
+            self.declared_module_targets
+                .entry(module_path.clone())
+                .or_insert_with(|| target_file.clone());
+        }
+        if raw.kind == "reexport" {
+            self.reexports
+                .push(reexport_index_from_raw(raw, target_file));
+        }
+    }
+}
+
+/// The order every file-index loader reads `nodes` rows in.
+fn node_row_order(
+    left_scoped: &str,
+    left_id: &str,
+    right_scoped: &str,
+    right_id: &str,
+) -> std::cmp::Ordering {
+    (left_scoped, left_id).cmp(&(right_scoped, right_id))
 }
 
 fn load_db_file_indexes(
     tx: &Transaction<'_>,
     project_root: &Path,
+    extra_indexed_files: &HashSet<String>,
     module_resolution_memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
 ) -> Result<HashMap<String, DbFileIndex>> {
@@ -11530,25 +11604,12 @@ fn load_db_file_indexes(
     })?;
     for row in rows {
         let (rel_path, lang) = row?;
-        files.insert(
-            rel_path.clone(),
-            DbFileIndex {
-                lang: lang_from_label(&lang),
-                exports: HashSet::new(),
-                default_export: None,
-                export_aliases: HashMap::new(),
-                node_by_scoped: HashMap::new(),
-                node_by_bare: HashMap::new(),
-                node_kind_by_id: HashMap::new(),
-                module_targets: HashMap::new(),
-                declared_module_targets: HashMap::new(),
-                reexports: Vec::new(),
-            },
-        );
+        files.insert(rel_path, DbFileIndex::empty(lang_from_label(&lang)));
     }
 
     let mut node_stmt = tx.prepare(
-        "SELECT file_path, id, name, scoped_name, kind, exported, is_default_export FROM nodes",
+        "SELECT file_path, id, name, scoped_name, kind, exported, is_default_export FROM nodes
+         ORDER BY file_path, scoped_name, id",
     )?;
     let nodes = node_stmt.query_map([], |row| {
         Ok((
@@ -11563,209 +11624,84 @@ fn load_db_file_indexes(
     })?;
     for row in nodes {
         let (file_path, id, name, scoped_name, kind, exported, is_default_export) = row?;
-        let file = files
-            .entry(file_path.clone())
-            .or_insert_with(|| DbFileIndex {
-                lang: None,
-                exports: HashSet::new(),
-                default_export: None,
-                export_aliases: HashMap::new(),
-                node_by_scoped: HashMap::new(),
-                node_by_bare: HashMap::new(),
-                node_kind_by_id: HashMap::new(),
-                module_targets: HashMap::new(),
-                declared_module_targets: HashMap::new(),
-                reexports: Vec::new(),
-            });
-        if exported {
-            file.exports.insert(name.clone());
-            file.exports.insert(scoped_name.clone());
-        }
-        if is_default_export {
-            file.default_export = Some(scoped_name.clone());
-        }
-        file.node_by_scoped.insert(scoped_name, id.clone());
-        file.node_by_bare.entry(name).or_insert(id.clone());
-        file.node_kind_by_id.insert(id, kind);
+        files
+            .entry(file_path)
+            .or_insert_with(|| DbFileIndex::empty(None))
+            .note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
     }
     let file_keys: HashSet<String> = files.keys().cloned().collect();
-    // Persisted caller extracts supply import targets. Only reexports from other
-    // files need dependency reconstruction, and their caller dependencies are
-    // loaded once instead of issuing repeated SQLite queries per reference.
-    let dependencies_by_file = load_file_dependencies_index(tx)?;
+    let is_indexed = |file: &str| file_keys.contains(file) || extra_indexed_files.contains(file);
+    // Caller extracts replace their own files' indexes afterwards; these rows
+    // serve every other file a resolution walk can reach through re-exports.
     let mut ref_stmt = tx.prepare(
         "SELECT ref_id, caller_file, kind, module_path, full_ref, wildcard, local_name, requested_name
-             FROM refs WHERE kind IN ('module', 'reexport', 'export_alias')",
+             FROM refs WHERE kind IN ('module', 'reexport', 'export_alias')
+             ORDER BY caller_file, byte_start, byte_end, ref_id",
     )?;
     let ref_rows = ref_stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<String>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, i64>(5)? != 0,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<String>>(7)?,
+            module_index_ref(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)? != 0,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ),
         ))
     })?;
     for row in ref_rows {
-        let (
-            ref_id,
-            caller_file,
-            kind,
-            module_path,
-            full_ref,
-            wildcard,
-            local_name,
-            requested_name,
-        ) = row?;
-        if kind == "export_alias" {
-            if let (Some(exported), Some(source_symbol), Some(file)) =
-                (local_name, requested_name, files.get_mut(&caller_file))
-            {
-                file.export_aliases.insert(exported, source_symbol);
-            }
-            continue;
-        }
-        let Some(module_path) = module_path else {
-            continue;
-        };
-        let file_deps = dependencies_by_file
-            .get(&caller_file)
-            .cloned()
-            .unwrap_or_default();
-        let deps = stored_dependencies_for_module(
-            project_root,
-            &caller_file,
-            &module_path,
-            &file_deps,
-            &file_keys,
-            facts,
-        );
-        let target_file = if kind == "module" {
-            rust_declared_module_target(
+        let (caller_file, raw) = row?;
+        if let Some(file) = files.get_mut(&caller_file) {
+            file.note_module_ref(
                 project_root,
                 &caller_file,
-                &module_path,
+                &raw,
                 module_resolution_memo,
                 facts,
-            )
-        } else {
-            deps.iter().find(|dep| file_keys.contains(*dep)).map(|dep| {
-                relative_path(
-                    project_root,
-                    &facts
-                        .canonical(&project_root.join(dep))
-                        .unwrap_or_else(|| project_root.join(dep)),
-                )
-            })
-        };
-        if let Some(file) = files.get_mut(&caller_file) {
-            file.module_targets
-                .entry(module_path.clone())
-                .or_insert_with(|| target_file.clone());
-            if kind == "module" {
-                file.declared_module_targets
-                    .entry(module_path.clone())
-                    .or_insert_with(|| target_file.clone());
-            }
-            if kind == "reexport" {
-                let raw = RawRef {
-                    ref_id,
-                    caller_node: None,
-                    caller_symbol: None,
-                    caller_file,
-                    kind,
-                    short_name: None,
-                    full_ref,
-                    module_path: Some(module_path),
-                    import_kind: Some("reexport".to_string()),
-                    local_name: None,
-                    requested_name: None,
-                    namespace_alias: None,
-                    wildcard,
-                    line: 0,
-                    byte_start: 0,
-                    byte_end: 0,
-                    dependencies: deps,
-                };
-                file.reexports
-                    .push(reexport_index_from_raw(&raw, target_file));
-            }
+                &is_indexed,
+            );
         }
     }
 
     Ok(files)
 }
 
-fn stored_dependencies_for_module(
-    project_root: &Path,
-    caller_file: &str,
-    module_path: &str,
-    caller_dependencies: &BTreeSet<String>,
-    indexed_files: &HashSet<String>,
-    facts: &FactPaths<'_>,
-) -> BTreeSet<String> {
-    let caller_path = project_root.join(caller_file);
-    let mut candidates = rust_module_dependencies(project_root, &caller_path, module_path, facts);
-    if module_path.starts_with('.') {
-        let caller_dir = caller_path.parent().unwrap_or(project_root);
-        for candidate in relative_module_candidates(&caller_dir.join(module_path)) {
-            let normalized = if facts.is_file(&candidate) {
-                facts.canonical(&candidate).unwrap_or(candidate.clone())
-            } else {
-                candidate
-            };
-            candidates.insert(relative_path(project_root, &normalized));
-        }
+/// A persisted `import`/`module`/`reexport`/`export_alias` row, rebuilt with
+/// just the fields a file index reads.
+#[allow(clippy::too_many_arguments)]
+fn module_index_ref(
+    ref_id: String,
+    caller_file: String,
+    kind: String,
+    module_path: Option<String>,
+    full_ref: Option<String>,
+    wildcard: bool,
+    local_name: Option<String>,
+    requested_name: Option<String>,
+) -> RawRef {
+    RawRef {
+        ref_id,
+        caller_node: None,
+        caller_symbol: None,
+        caller_file,
+        kind,
+        short_name: None,
+        full_ref,
+        module_path,
+        import_kind: None,
+        local_name,
+        requested_name,
+        namespace_alias: None,
+        wildcard,
+        line: 0,
+        byte_start: 0,
+        byte_end: 0,
+        dependencies: BTreeSet::new(),
     }
-    let exact = candidates
-        .intersection(caller_dependencies)
-        .filter(|dependency| indexed_files.contains(*dependency))
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if !exact.is_empty() || module_path.starts_with('.') {
-        return exact;
-    }
-
-    let module_path = rust_module_path_without_alias_or_use_list(module_path)
-        .trim_matches(|character| matches!(character, '\'' | '"'));
-    let package_name = module_path
-        .split('/')
-        .next_back()
-        .unwrap_or(module_path)
-        .replace('_', "-");
-    let matched = caller_dependencies
-        .iter()
-        .filter(|dependency| indexed_files.contains(*dependency))
-        .filter(|dependency| {
-            dependency.as_str() == module_path
-                || dependency.ends_with(&format!("/{module_path}"))
-                || Path::new(dependency).components().any(|component| {
-                    component.as_os_str().to_string_lossy().replace('_', "-") == package_name
-                })
-        })
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    if matched.len() == 1 {
-        matched
-    } else {
-        BTreeSet::new()
-    }
-}
-
-fn load_file_dependencies_index(tx: &Transaction<'_>) -> Result<HashMap<String, BTreeSet<String>>> {
-    let mut by_file: HashMap<String, BTreeSet<String>> = HashMap::new();
-    let mut stmt = tx.prepare("SELECT file_path, dep_file FROM file_dependencies")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (file_path, dependency) = row?;
-        by_file.entry(file_path).or_default().insert(dependency);
-    }
-    Ok(by_file)
 }
 
 // Cold builds insert into empty tables, while incremental refreshes reuse these
@@ -15083,6 +15019,47 @@ fn edge_snapshot_with_conn(conn: &Connection) -> Result<BTreeSet<StoredEdge>> {
     Ok(edges)
 }
 
+/// The indexed file that an `import`, `reexport` or Rust `module` ref names.
+///
+/// Cold builds and incremental refreshes both answer this through this one
+/// function, so a store gives the same answer however it was built. The
+/// answer comes from the module resolver itself, not from the file's
+/// dependency set: that set also holds candidate paths recorded only so that
+/// creating one of them invalidates the importer, and picking the first
+/// existing member can name a file the import never refers to.
+///
+/// Rust `use` paths are not handled by the JS/TS resolver; for Rust callers
+/// the first indexed file among the module's Rust path candidates is used.
+/// No other file is ever substituted: an import the resolver cannot place
+/// (`bun:test`, `node:fs`, an npm package) has no target.
+fn module_ref_target(
+    project_root: &Path,
+    caller_file: &str,
+    kind: &str,
+    module_path: &str,
+    memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
+    is_indexed: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if kind == "module" {
+        return rust_declared_module_target(project_root, caller_file, module_path, memo, facts);
+    }
+    let caller_path = project_root.join(caller_file);
+    if Path::new(caller_file)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        == Some("rs")
+    {
+        return rust_module_candidates(project_root, &caller_path, module_path, facts)
+            .into_iter()
+            .find(|candidate| is_indexed(candidate));
+    }
+    let caller_dir = caller_path.parent()?;
+    let resolved = callgraph::resolve_module_path_with_memo(caller_dir, module_path, memo, facts)?;
+    let rel_path = relative_path(project_root, &resolved);
+    is_indexed(&rel_path).then_some(rel_path)
+}
+
 fn module_target_from_dependencies(
     project_root: &Path,
     dependencies: &BTreeSet<String>,
@@ -15236,7 +15213,21 @@ fn rust_module_dependencies(
     module_path: &str,
     facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
-    let mut deps = BTreeSet::new();
+    rust_module_candidates(project_root, abs_path, module_path, facts)
+        .into_iter()
+        .collect()
+}
+
+/// Existing files a Rust `use` path can name, most specific first: the file for
+/// the full path (`a/b.rs`, `a/b/mod.rs`), then the file for its parent module,
+/// which is where an item such as `a::b::Item` lives.
+fn rust_module_candidates(
+    project_root: &Path,
+    abs_path: &Path,
+    module_path: &str,
+    facts: &FactPaths<'_>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
     let rel_path = relative_path(
         project_root,
         &facts
@@ -15244,12 +15235,12 @@ fn rust_module_dependencies(
             .unwrap_or_else(|| abs_path.to_path_buf()),
     );
     let Some(path_segments) = rust_module_dependency_segments(&rel_path, module_path) else {
-        return deps;
+        return candidates;
     };
     let src_prefix = rust_src_prefix(&rel_path);
     rust_push_module_dependency_candidate(
         project_root,
-        &mut deps,
+        &mut candidates,
         &src_prefix,
         &path_segments,
         facts,
@@ -15257,13 +15248,13 @@ fn rust_module_dependencies(
     if !path_segments.is_empty() {
         rust_push_module_dependency_candidate(
             project_root,
-            &mut deps,
+            &mut candidates,
             &src_prefix,
             &path_segments[..path_segments.len() - 1],
             facts,
         );
     }
-    deps
+    candidates
 }
 
 fn rust_module_dependency_segments(rel_path: &str, module_path: &str) -> Option<Vec<String>> {
@@ -15291,7 +15282,7 @@ fn rust_module_path_without_alias_or_use_list(module_path: &str) -> &str {
 
 fn rust_push_module_dependency_candidate(
     project_root: &Path,
-    deps: &mut BTreeSet<String>,
+    deps: &mut Vec<String>,
     src_prefix: &str,
     segments: &[String],
     facts: &FactPaths<'_>,
@@ -15308,8 +15299,8 @@ fn rust_push_module_dependency_candidate(
         ]
     };
     for candidate in candidates {
-        if facts.is_file(&project_root.join(&candidate)) {
-            deps.insert(candidate);
+        if facts.is_file(&project_root.join(&candidate)) && !deps.contains(&candidate) {
+            deps.push(candidate);
         }
     }
 }
@@ -18622,31 +18613,6 @@ export function leaf() {}
         println!(
             "BENCH_COLD_BUILD chunk={chunk} files={} nodes={} refs={} edges={} ms={ms}",
             stats.files, stats.nodes, stats.refs, stats.edges
-        );
-    }
-
-    #[test]
-    fn persisted_workspace_reexport_selects_its_package_dependency() {
-        let root = tempdir().expect("temp dir");
-        let dependencies = BTreeSet::from([
-            "packages/aft-bridge/src/index.ts".to_string(),
-            "packages/opencode-plugin/src/types.ts".to_string(),
-        ]);
-        let indexed_files = dependencies.iter().cloned().collect::<HashSet<_>>();
-
-        assert_eq!(
-            stored_dependencies_for_module(
-                root.path(),
-                "packages/opencode-plugin/src/shared/bash-hints.ts",
-                "@cortexkit/aft-bridge",
-                &dependencies,
-                &indexed_files,
-                &FactPaths {
-                    root: root.path(),
-                    facts: &DiskFacts::new(root.path())
-                }
-            ),
-            BTreeSet::from(["packages/aft-bridge/src/index.ts".to_string()])
         );
     }
 
