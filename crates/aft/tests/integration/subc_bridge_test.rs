@@ -2377,6 +2377,26 @@ fn subc_bridge_bg_events_idle_completion_wake_lane() {
 }
 
 #[test]
+fn subc_bridge_module_draining_ends_held_bg_streams_while_tool_call_finishes() {
+    run_subc_bridge_test(
+        "subc_bridge_module_draining_ends_held_bg_streams_while_tool_call_finishes",
+        Duration::from_secs(60),
+        drive_module_draining_ends_bg_streams_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe() {
+    run_subc_bridge_test(
+        "subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe",
+        Duration::from_secs(60),
+        drive_completion_survives_drain_resubscribe_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_dropped_completion_nudge_is_rearmed_until_ack() {
     run_subc_bridge_test(
         "subc_bridge_dropped_completion_nudge_is_rearmed_until_ack",
@@ -6914,6 +6934,246 @@ async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
         BG_CHANNEL,
         BG_CORR,
         "pattern dropped-nudge ack",
+    )
+    .await;
+    assert_eq!(ack["success"], true);
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// Sends the daemon's one-way `module.draining` notice (a channel-0 Push).
+async fn send_module_draining(stream: &mut tokio::net::TcpStream, deadline_in: Duration) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis() as u64;
+    let body = json!({
+        "op": "module.draining",
+        "reason": "restart",
+        "deadline_ms": now_ms + deadline_in.as_millis() as u64,
+    });
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Push,
+            control_flags(),
+            0,
+            0,
+            0,
+            serde_json::to_vec(&body).expect("module.draining body"),
+        )
+        .expect("module.draining frame"),
+    )
+    .await;
+}
+
+/// Reads frames for `duration`, ignoring wake nudges on the listed bg_events
+/// streams and pushes; any other frame (a stream end, a response) is a failure.
+async fn settle_bg_streams(
+    stream: &mut tokio::net::TcpStream,
+    channels: &[u16],
+    corr: u64,
+    duration: Duration,
+    label: &str,
+) {
+    let deadline = Instant::now() + duration;
+    while let Some(frame) = read_any_frame_until(stream, deadline, label).await {
+        let is_nudge = frame.header.ty == FrameType::StreamData
+            && frame.header.corr == corr
+            && channels.contains(&frame.header.channel);
+        if is_nudge || frame.header.ty == FrameType::Push {
+            continue;
+        }
+        panic!("unexpected frame while {label}: {:?}", frame.header);
+    }
+}
+
+/// Collects StreamEnd frames for the listed bg_events streams until all have
+/// ended or `bound` elapses, and returns the channels that ended. Wake nudges and
+/// pushes are ignored; any other frame is a failure.
+async fn collect_bg_stream_ends(
+    stream: &mut tokio::net::TcpStream,
+    channels: &[u16],
+    corr: u64,
+    bound: Duration,
+) -> HashSet<u16> {
+    let deadline = Instant::now() + bound;
+    let mut ended = HashSet::new();
+    while ended.len() < channels.len() {
+        let Some(frame) = read_any_frame_until(stream, deadline, "bg_events StreamEnd").await
+        else {
+            break;
+        };
+        let ours = frame.header.corr == corr && channels.contains(&frame.header.channel);
+        match frame.header.ty {
+            FrameType::StreamEnd if ours => {
+                assert!(frame.body.is_empty(), "StreamEnd body should be empty");
+                ended.insert(frame.header.channel);
+            }
+            FrameType::StreamData if ours => {}
+            FrameType::Push => {}
+            _ => panic!(
+                "unexpected frame while waiting for bg_events StreamEnd: {:?}",
+                frame.header
+            ),
+        }
+    }
+    ended
+}
+
+/// The daemon cannot finish draining a module while any request on it is open,
+/// and a held bg_events subscription is an open request that never settles on
+/// its own. On `module.draining` every held stream must end promptly, while a
+/// real tool call already in flight still runs to completion.
+async fn drive_module_draining_ends_bg_streams_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    const BG_CHANNELS: [u16; 3] = [245, 246, 247];
+    const BG_CORR: u64 = 820;
+    // Well under the daemon's 30 s drain ceiling; the ends are expected in ms.
+    const STREAM_END_BOUND: Duration = Duration::from_secs(2);
+    for (index, channel) in BG_CHANNELS.iter().enumerate() {
+        let bind_corr = 810 + index as u64;
+        send_route_bind_with_session(&mut stream, *channel, bind_corr, &root1, "session-1").await;
+        expect_route_bind_ack(&mut stream, bind_corr).await;
+    }
+    for channel in BG_CHANNELS {
+        send_bg_events_subscribe(&mut stream, channel, BG_CORR).await;
+    }
+    settle_bg_streams(
+        &mut stream,
+        &BG_CHANNELS,
+        BG_CORR,
+        Duration::from_millis(800),
+        "seeding bg_events subscriptions",
+    )
+    .await;
+
+    send_tool_call(
+        &mut stream,
+        1,
+        830,
+        "semantic_search",
+        json!({ "case": "heavy" }),
+    )
+    .await;
+    state.wait_until("in-flight heavy call started", |inner| inner.heavy_started);
+
+    let drain_started = Instant::now();
+    send_module_draining(&mut stream, Duration::from_secs(30)).await;
+    let ended = collect_bg_stream_ends(&mut stream, &BG_CHANNELS, BG_CORR, STREAM_END_BOUND).await;
+    let quiesced_after = drain_started.elapsed();
+    assert_eq!(
+        ended,
+        HashSet::from(BG_CHANNELS),
+        "held bg_events streams still open {STREAM_END_BOUND:?} after module.draining"
+    );
+    eprintln!(
+        "module.draining ended {} held bg_events streams in {quiesced_after:?}",
+        BG_CHANNELS.len()
+    );
+
+    // The in-flight call was not cut short by the drain notice.
+    state.release_heavy();
+    let heavy = read_frame_timeout(&mut stream, "in-flight heavy response").await;
+    assert_eq!(heavy.header.ty, FrameType::Response);
+    assert_eq!(heavy.header.corr, 830);
+    assert_eq!(tool_response_json(&heavy)["success"], true);
+
+    // A subscription that slips in while the drain is still running is ended
+    // at once instead of holding the drain open again.
+    send_bg_events_subscribe(&mut stream, 245, 840).await;
+    let late = collect_bg_stream_ends(&mut stream, &[245], 840, STREAM_END_BOUND).await;
+    assert_eq!(late, HashSet::from([245]));
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// Ending a subscription on drain must not lose a completion that was queued
+/// before it: the completion stays in the registry and a fresh subscription's
+/// drain still returns it.
+async fn drive_completion_survives_drain_resubscribe_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    const BG_CHANNEL: u16 = 245;
+    const BG_CORR: u64 = 850;
+    const RESUBSCRIBE_CORR: u64 = 852;
+    send_route_bind_with_session(&mut stream, BG_CHANNEL, 849, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 849).await;
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    settle_bg_streams(
+        &mut stream,
+        &[BG_CHANNEL],
+        BG_CORR,
+        Duration::from_millis(800),
+        "seeding bg_events subscription",
+    )
+    .await;
+
+    send_bash_background(&mut stream, 851, "printf 'queued-before-drain\n'").await;
+    let launch = read_tool_response_allowing_bg_events(
+        &mut stream,
+        851,
+        BG_CHANNEL,
+        BG_CORR,
+        "queued-before-drain launch",
+    )
+    .await;
+    let task_id = launch["task_id"]
+        .as_str()
+        .expect("background task id")
+        .to_string();
+    // The completion wake proves the completion is queued before the drain.
+    let _wake = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(30),
+        "completion wake before drain",
+    )
+    .await;
+
+    // A short drain window, so the same module accepts the resubscribe below
+    // the way a restarted module would.
+    let drain_window = Duration::from_millis(400);
+    send_module_draining(&mut stream, drain_window).await;
+    let ended =
+        collect_bg_stream_ends(&mut stream, &[BG_CHANNEL], BG_CORR, Duration::from_secs(2)).await;
+    assert_eq!(ended, HashSet::from([BG_CHANNEL]));
+    tokio::time::sleep(drain_window + Duration::from_millis(200)).await;
+
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, RESUBSCRIBE_CORR).await;
+    let drained = drain_bg_completions_until(
+        &mut stream,
+        1,
+        860,
+        &[task_id.clone()],
+        BG_CHANNEL,
+        RESUBSCRIBE_CORR,
+    )
+    .await;
+    assert!(drained["bg_completions"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["task_id"] == task_id)));
+    send_tool_call(
+        &mut stream,
+        1,
+        1160,
+        "bash_ack_completions",
+        json!({ "task_ids": [task_id] }),
+    )
+    .await;
+    let ack = read_tool_response_allowing_bg_events(
+        &mut stream,
+        1160,
+        BG_CHANNEL,
+        RESUBSCRIBE_CORR,
+        "queued-before-drain ack",
     )
     .await;
     assert_eq!(ack["success"], true);

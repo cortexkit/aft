@@ -47,7 +47,7 @@ use subc_protocol::manifest::{
     StorageScope, Tool, TrustTier,
 };
 use subc_protocol::session::{
-    HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
+    HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
     MODULE_CONTROL_OP_HEALTH_CHECK,
 };
 use subc_protocol::{
@@ -2207,6 +2207,58 @@ async fn end_bg_subscription(
     Ok(())
 }
 
+/// Upper bound on how long one `module.draining` notice keeps ending new
+/// bg_events subscriptions. The daemon's own drain ceiling is 30 s; the cap only
+/// guards against a nonsensical deadline leaving wakes switched off for good if
+/// the daemon abandons the drain and keeps this module.
+const MODULE_DRAINING_WINDOW_CAP: Duration = Duration::from_secs(120);
+
+/// Converts the daemon's wall-clock drain deadline (Unix milliseconds) into a
+/// local monotonic instant, capped by [`MODULE_DRAINING_WINDOW_CAP`]. A deadline
+/// already in the past yields `now`, which ends no later subscription.
+fn draining_window_end(deadline_ms: u64) -> Instant {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let remaining = Duration::from_millis(deadline_ms.saturating_sub(now_ms));
+    Instant::now() + remaining.min(MODULE_DRAINING_WINDOW_CAP)
+}
+
+/// Ends every held bg_events subscription with a clean StreamEnd when the daemon
+/// starts draining this module.
+///
+/// A held subscription is an open request as far as the daemon is concerned, so
+/// while any is open the drain can never reach request quiescence and always
+/// runs to its forced-teardown ceiling. Tool calls in flight are untouched and
+/// finish normally. The stream carries only wake nudges; completions stay in the
+/// per-session registry until acked, and the bridge's subscription reopens on
+/// StreamEnd and drains that registry, so nothing queued is lost.
+async fn end_bg_subscriptions_for_drain(
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    bg_subs: &mut HashMap<RouteChannel, BgSub>,
+    bg_sub_by_session: &mut BgSubsBySession,
+    bg_wake_pending: &mut BgWakePending,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+) -> Result<usize, SubcError> {
+    let channels: Vec<RouteChannel> = bg_subs.keys().copied().collect();
+    for &channel in &channels {
+        end_bg_subscription(
+            writer_tx,
+            metrics,
+            bg_subs,
+            bg_sub_by_session,
+            bg_wake_pending,
+            channel,
+            routes.get(&channel),
+            "module-draining",
+        )
+        .await?;
+    }
+    Ok(channels.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn teardown_installed_route(
     tx: &WriterSender,
@@ -3118,6 +3170,9 @@ where
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
+    // Set by the daemon's `module.draining` notice; until then (bounded by the
+    // drain deadline) new bg_events subscriptions are ended immediately.
+    let mut module_draining_until: Option<Instant> = None;
     let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
@@ -3507,6 +3562,8 @@ where
                                 &deferred_response_tx,
                                 allow_native_passthrough,
                                 tool_response_body_limit,
+                                module_draining_until
+                                    .is_some_and(|until| Instant::now() < until),
                             )
                             .await
                         };
@@ -3554,6 +3611,34 @@ where
                         .await
                         {
                             break Err(error);
+                        }
+                    }
+                    FrameType::Push if frame.header.channel == 0 => {
+                        match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
+                            Ok(ModuleControlCommand::Draining { reason, deadline_ms }) => {
+                                module_draining_until = Some(draining_window_end(deadline_ms));
+                                let ended = match end_bg_subscriptions_for_drain(
+                                    &writer_tx,
+                                    &dispatch_path_metrics,
+                                    &mut bg_subs,
+                                    &mut bg_sub_by_session,
+                                    &mut bg_wake_pending,
+                                    &routes,
+                                )
+                                .await
+                                {
+                                    Ok(ended) => ended,
+                                    Err(error) => break Err(error),
+                                };
+                                log::info!(
+                                    "subc attach: module draining (reason={reason:?}); ended {ended} held bg_events stream(s) so the drain can quiesce"
+                                );
+                            }
+                            Err(error) => {
+                                log::debug!(
+                                    "subc attach: ignoring unrecognized channel-0 push: {error}"
+                                );
+                            }
                         }
                     }
                     // Incoming push messages are ignored here. Cancel frames are
@@ -5316,6 +5401,7 @@ async fn handle_tool_call(
     deferred_response_tx: &mpsc::UnboundedSender<PendingSubcResponse>,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
+    module_draining: bool,
 ) -> Result<(), SubcError> {
     let route_id = route_key(frame.header.channel, frame.header.epoch);
     if pending_binds.contains_key(&route_id) {
@@ -5391,7 +5477,19 @@ async fn handle_tool_call(
             );
             push::send_reliable_bg_stream_end(tx, metrics, route_id, &old_sub).await?;
         }
-        if !identity.trust.allows_bash_observation() {
+        // A subscription that arrives while the daemon is draining this module
+        // would hold the drain open exactly like the ones ended by the
+        // `module.draining` notice, so it is ended at once as well. Ending it is
+        // not a delivery loss: completions stay in the per-session registry until
+        // acked, and the bridge drains them after it resubscribes.
+        let end_cause = if !identity.trust.allows_bash_observation() {
+            Some("subscribe-denied")
+        } else if module_draining {
+            Some("module-draining")
+        } else {
+            None
+        };
+        if let Some(end_cause) = end_cause {
             bg_subs.remove(&route_id);
             bg_wake_pending.remove(&route_id);
             remove_bg_subscription_index(bg_sub_by_session, route_id, Some(&identity));
@@ -5406,7 +5504,7 @@ async fn handle_tool_call(
                 &identity.root,
                 &identity.session,
                 route_id,
-                "subscribe-denied",
+                end_cause,
             );
             push::send_reliable_bg_stream_end(tx, metrics, route_id, &denied_sub).await?;
             return Ok(());
