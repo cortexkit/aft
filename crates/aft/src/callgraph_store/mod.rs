@@ -1012,6 +1012,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static REFRESH_COMMIT_ADMISSION: std::cell::RefCell<Option<(SubcLifecycleAdmission, Arc<std::sync::atomic::AtomicU64>, u64)>> =
         const { std::cell::RefCell::new(None) };
+    static COLD_BUILD_ABANDONMENT: std::cell::RefCell<Option<SubcLifecycleAdmission>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 mod dead_code_projection;
@@ -1117,8 +1119,64 @@ pub(crate) fn with_publish_epoch<R>(
     run()
 }
 
+struct ColdBuildAbandonmentGuard {
+    previous: Option<SubcLifecycleAdmission>,
+}
+
+impl Drop for ColdBuildAbandonmentGuard {
+    fn drop(&mut self) {
+        COLD_BUILD_ABANDONMENT.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Run a cold build that stops at its next slice fence once `lifecycle`'s
+/// root has stayed unbound past the abandon grace window. The stop returns
+/// `Superseded`; committed staging slices stay on disk so a later bind resumes
+/// from them. This is independent of the publish epoch, which deliberately
+/// does not advance on route teardown.
+pub(crate) fn with_unbound_abandonment_check<R>(
+    lifecycle: SubcLifecycleAdmission,
+    run: impl FnOnce() -> R,
+) -> R {
+    let previous = COLD_BUILD_ABANDONMENT.with(|slot| slot.replace(Some(lifecycle)));
+    let _guard = ColdBuildAbandonmentGuard { previous };
+    run()
+}
+
 fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize) -> Result<()> {
     notify_cold_build_slice_observer(stage, completed, total);
+    let abandoned = COLD_BUILD_ABANDONMENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(SubcLifecycleAdmission::unbound_past_grace)
+    });
+    if abandoned {
+        let scope = crate::logging::current_index_build();
+        crate::slog_info!(
+            "cold build cancelled: plane=callgraph root={} build_id={} progress={}/{} stage={} cause=unbound_past_grace",
+            scope
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |scope| scope.root.display().to_string()),
+            scope.as_ref().map_or("-", |scope| scope.build_id.as_str()),
+            completed,
+            total,
+            stage
+        );
+        if let Some(scope) = scope.as_ref() {
+            crate::logging::log_index_event(
+                crate::logging::IndexEvent::from_scope(
+                    crate::logging::IndexEventKind::BuildSuperseded,
+                    scope,
+                )
+                .field("stage", stage)
+                .field("completed", completed)
+                .field("total", total),
+            );
+        }
+        return Err(CallGraphStoreError::Superseded);
+    }
     let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
     if admission.is_none_or(|(epoch, expected)| epoch.is_current(expected)) {
         if let Some(scope) = crate::logging::current_index_build() {

@@ -430,14 +430,34 @@ fn wait_for_semantic_artifact_start(
 #[derive(Clone)]
 struct SemanticRefreshLimiter(Arc<crate::cold_build_limiter::ColdBuildLimiter>);
 
+/// Record that a semantic build stopped because its root stayed unbound past
+/// the abandon grace window. Called from inside the embed loop, where the
+/// build's index-event scope (and so its build id) is installed on the thread.
+fn log_semantic_build_abandoned(root: &Path, progress: &SemanticBuildProgress) {
+    let snapshot = progress.snapshot();
+    let build_id = crate::logging::current_index_build()
+        .filter(|scope| scope.plane == crate::logging::IndexPlane::Semantic)
+        .map(|scope| scope.build_id)
+        .unwrap_or_else(|| "-".to_string());
+    slog_info!(
+        "cold build cancelled: plane=semantic root={} build_id={} batches_done={}/{} cause=unbound_past_grace",
+        root.display(),
+        build_id,
+        snapshot.current_batch,
+        snapshot.total_batches
+    );
+}
+
 impl SemanticRefreshLimiter {
     fn acquire(
         &self,
+        root: &Path,
         admitted: impl Fn() -> bool,
     ) -> Option<crate::cold_build_limiter::ColdBuildPermit> {
-        crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
             &self.0,
             SEMANTIC_REFRESH_LIMITER_KIND,
+            root,
             admitted,
         )
     }
@@ -863,9 +883,9 @@ fn spawn_semantic_refresh_worker(
                 // queueing behind another root is preferable to bursting a shared backend.
                 // Interactive QueryBudget embeddings do not run on this worker and
                 // therefore never wait on this maintenance limiter.
-                let Some(_refresh_permit) =
-                    limiter.acquire(|| lifecycle.is_current(generation_flag.as_ref(), generation))
-                else {
+                let Some(_refresh_permit) = limiter.acquire(&project_root, || {
+                    lifecycle.is_current(generation_flag.as_ref(), generation)
+                }) else {
                     return;
                 };
 
@@ -4137,9 +4157,10 @@ fn schedule_artifact_loads(
                 // Only writable roots reach this permit. Even a cache hit can
                 // discover stale inputs and rebuild, so the writable load stays
                 // cold-build limited before reading or refreshing the artifact.
-                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
                     &search_cold_build_limiter,
                     "search index post-configure load",
+                    &root_for_search,
                     || {
                         search_lifecycle
                             .is_current(search_generation_flag.as_ref(), search_generation)
@@ -4597,6 +4618,13 @@ fn schedule_artifact_loads(
                             let mut embedded_chunks = 0usize;
                             let mut embed_batches = 0usize;
                             let mut embed = |texts: Vec<String>| {
+                                if semantic_lifecycle.unbound_past_grace() {
+                                    log_semantic_build_abandoned(
+                                        &root_clone,
+                                        &progress_for_embed,
+                                    );
+                                    return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
+                                }
                                 if semantic_build_epoch_flag.load(Ordering::SeqCst)
                                     != semantic_build_epoch
                                 {
@@ -4639,9 +4667,10 @@ fn schedule_artifact_loads(
                             // acknowledgement path, and waits only while this root
                             // remains bound so an unbound root cannot take a slot.
                             let Some(_refresh_permit) =
-                                crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                                crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
                                     &semantic_cold_build_limiter,
                                     SEMANTIC_REFRESH_LIMITER_KIND,
+                                    &root_clone,
                                     || {
                                         semantic_lifecycle.is_current(
                                             semantic_generation_flag.as_ref(),
@@ -4767,9 +4796,10 @@ fn schedule_artifact_loads(
                     }
 
                     let Some(_cold_build_permit) =
-                        crate::cold_build_limiter::acquire_blocking_while_with_limiter(
+                        crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
                             &semantic_cold_build_limiter,
                             SEMANTIC_COLD_BUILD_LIMITER_KIND,
+                            &root_clone,
                             || {
                                 semantic_lifecycle.is_current(
                                     semantic_generation_flag.as_ref(),
@@ -4837,8 +4867,16 @@ fn schedule_artifact_loads(
                             entries_total: Some(total),
                         });
                     };
-                    let mut build_is_current =
-                        || semantic_build_epoch_flag.load(Ordering::SeqCst) == semantic_build_epoch;
+                    let mut build_is_current = || {
+                        // Checked before every embed batch. A root abandoned
+                        // past the grace window stops here; returning from
+                        // this closure drops the cold-build permit.
+                        if semantic_lifecycle.unbound_past_grace() {
+                            log_semantic_build_abandoned(&root_clone, &semantic_build_progress);
+                            return false;
+                        }
+                        semantic_build_epoch_flag.load(Ordering::SeqCst) == semantic_build_epoch
+                    };
                     let index = SemanticIndex::build_with_progress_and_cancellation_caps(
                         &root_clone,
                         &files,
@@ -4948,6 +4986,17 @@ fn schedule_artifact_loads(
                         other => break other,
                     }
                 };
+
+                // An abandoned root's cancelled build has nothing to publish:
+                // lifecycle admission already refuses publication while
+                // unbound, and reporting the stop as a failure would be noise.
+                // A build that completed before noticing still takes the normal
+                // path below so its finished artifact can persist.
+                if !matches!(build_result, Ok(Ok(_))) && semantic_lifecycle.unbound_past_grace() {
+                    crate::semantic_index::clear_embedding_backend_retry_status(&root_clone);
+                    clear_cold_seed_active();
+                    return;
+                }
 
                 enum SemanticBuildOutcome {
                     Ready(SemanticBuildReady),

@@ -172,25 +172,76 @@ fn pending_path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
     })
 }
 
+/// How long a root may stay unbound before its long-running cold builds
+/// (semantic embedding, callgraph extraction) are abandoned. A host restart
+/// unbinds every root and rebinds it within seconds; a rebind inside this
+/// window leaves in-flight builds untouched. A root that stays unbound past
+/// the window has really been abandoned, and its builds stop at their next
+/// batch or slice boundary so they release the process-wide cold-build slot
+/// and stop loading the embedding backend.
+pub(crate) const UNBOUND_BUILD_ABANDON_GRACE: Duration = Duration::from_secs(120);
+
 /// Serializes the daemon's bound/unbound transition with admission of deferred
 /// root work. The lock covers only the bounded decision and worker-start commit;
 /// call sites must not wait for worker completion or run a scan while holding it.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct SubcLifecycleAdmission {
     unbound: Arc<parking_lot::Mutex<bool>>,
+    /// When the current unbound period started; `None` while bound. Written
+    /// only while holding `unbound`.
+    unbound_since: Arc<parking_lot::Mutex<Option<Instant>>>,
+    /// Grace window for `unbound_past_grace`, in milliseconds. Per lifecycle
+    /// so a test can shorten it without affecting other contexts.
+    abandon_grace_ms: Arc<AtomicU64>,
+}
+
+impl Default for SubcLifecycleAdmission {
+    fn default() -> Self {
+        Self {
+            unbound: Arc::default(),
+            unbound_since: Arc::default(),
+            abandon_grace_ms: Arc::new(AtomicU64::new(
+                UNBOUND_BUILD_ABANDON_GRACE.as_millis() as u64,
+            )),
+        }
+    }
 }
 
 impl SubcLifecycleAdmission {
     fn mark_bound(&self) {
-        *self.unbound.lock() = false;
+        let mut unbound = self.unbound.lock();
+        *unbound = false;
+        *self.unbound_since.lock() = None;
     }
 
     fn mark_unbound(&self, configure_generation: &AtomicU64) {
         let mut unbound = self.unbound.lock();
         if !*unbound {
             *unbound = true;
+            *self.unbound_since.lock() = Some(Instant::now());
             configure_generation.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// True when the root has had no bound route for longer than the abandon
+    /// grace window. Long cold builds poll this between batches: a transient
+    /// unbind (rebind within the window) never trips it, so those builds keep
+    /// running exactly as they do while bound.
+    pub(crate) fn unbound_past_grace(&self) -> bool {
+        let unbound = self.unbound.lock();
+        if !*unbound {
+            return false;
+        }
+        let grace = Duration::from_millis(self.abandon_grace_ms.load(Ordering::SeqCst));
+        self.unbound_since
+            .lock()
+            .is_some_and(|since| since.elapsed() >= grace)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_abandon_grace_for_test(&self, grace: Duration) {
+        self.abandon_grace_ms
+            .store(grace.as_millis() as u64, Ordering::SeqCst);
     }
 
     pub(crate) fn is_current(&self, generation: &AtomicU64, expected: u64) -> bool {
@@ -3681,6 +3732,11 @@ impl AppContext {
         self.subc_lifecycle.is_unbound()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_unbound_build_abandon_grace_for_test(&self, grace: Duration) {
+        self.subc_lifecycle.set_abandon_grace_for_test(grace);
+    }
+
     pub(crate) fn subc_lifecycle_admission(&self) -> SubcLifecycleAdmission {
         self.subc_lifecycle.clone()
     }
@@ -5575,7 +5631,8 @@ impl AppContext {
         }
 
         let limiter = self.cold_build_limiter();
-        let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::new(
+        let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::labelled_with_root(
+            project_root.display().to_string(),
             "callgraph-background",
             crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
         );
@@ -5601,6 +5658,7 @@ impl AppContext {
         let persist_epoch_flag = self.callgraph_persist_epoch_flag();
 
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.fetch_add(1, Ordering::SeqCst);
+        let lifecycle = self.subc_lifecycle.clone();
 
         std::thread::spawn(move || {
             let _permit = permit;
@@ -5614,10 +5672,17 @@ impl AppContext {
                     );
                     return;
                 }
-                let built = crate::callgraph_store::with_publish_epoch(
-                    persist_epoch_flag.clone(),
-                    persist_epoch,
-                    || match work {
+                // The abandonment check stops extraction at its next slice
+                // fence once the root has stayed unbound past the grace
+                // window. The persist-epoch rule above is unchanged: a
+                // transient unbind still lets the build finish and persist.
+                let built = crate::callgraph_store::with_unbound_abandonment_check(
+                    lifecycle,
+                    || {
+                        crate::callgraph_store::with_publish_epoch(
+                            persist_epoch_flag.clone(),
+                            persist_epoch,
+                            || match work {
                         CallgraphBackgroundWork::LegacyMigration => {
                             CallGraphStore::migrate_legacy_with_lease(
                                 callgraph_dir.clone(),
@@ -5646,6 +5711,8 @@ impl AppContext {
                             )
                             .map(|(store, _)| Some(store))
                         }
+                    },
+                        )
                     },
                 );
                 match built {

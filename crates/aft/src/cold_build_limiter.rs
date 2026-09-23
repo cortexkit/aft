@@ -56,6 +56,24 @@ pub(crate) fn acquire_blocking_while_with_limiter(
     acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, || false)
 }
 
+/// Same admission as [`acquire_blocking_while_with_limiter`], but the holder
+/// and queue census name `root` instead of `unknown`. The root is a label only:
+/// unlike [`ColdBuildAdmissionRequest::for_root`] it does not let other builds
+/// for the same root share this permit, so slot accounting is unchanged.
+pub(crate) fn acquire_blocking_while_for_root_with_limiter(
+    limiter: &Arc<ColdBuildLimiter>,
+    kind: &str,
+    root: &std::path::Path,
+    admitted: impl Fn() -> bool,
+) -> Option<ColdBuildPermit> {
+    let request = ColdBuildAdmissionRequest::labelled_with_root(
+        root.display().to_string(),
+        kind,
+        ColdBuildAdmissionClass::Maintenance,
+    );
+    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, || false)
+}
+
 /// Identify the source of a cold-build request without exposing a limiter knob.
 ///
 /// The classes deliberately have no absolute priority ordering. When a class
@@ -93,7 +111,10 @@ impl ColdBuildAdmissionClass {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColdBuildAdmissionRequest {
     request_id: String,
+    /// Root whose builds share one permit (see `holders_by_root`).
     root: Option<String>,
+    /// Root shown in the census when `root` is unset. Display only.
+    census_root: Option<String>,
     class: ColdBuildAdmissionClass,
 }
 
@@ -106,6 +127,7 @@ impl ColdBuildAdmissionRequest {
         Self {
             request_id,
             root,
+            census_root: None,
             class,
         }
     }
@@ -118,8 +140,28 @@ impl ColdBuildAdmissionRequest {
         Self {
             request_id: request_id.into(),
             root: Some(root.into()),
+            census_root: None,
             class,
         }
+    }
+
+    /// A request whose census entry names `root` without joining that root's
+    /// shared permit.
+    pub(crate) fn labelled_with_root(
+        root: impl Into<String>,
+        request_id: impl Into<String>,
+        class: ColdBuildAdmissionClass,
+    ) -> Self {
+        Self {
+            request_id: request_id.into(),
+            root: None,
+            census_root: Some(root.into()),
+            class,
+        }
+    }
+
+    fn census_label(&self) -> Option<&str> {
+        self.root.as_deref().or(self.census_root.as_deref())
     }
 }
 
@@ -418,7 +460,7 @@ impl ColdBuildLimiter {
             .admission_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some(self.install_permit_locked(&mut state, "unclassified", None, "unclassified"))
+        Some(self.install_permit_locked(&mut state, "unclassified", None, None, "unclassified"))
     }
 
     fn try_acquire_classified(
@@ -470,6 +512,7 @@ impl ColdBuildLimiter {
             &mut state,
             request.class.label(),
             request.root.as_deref(),
+            request.census_label(),
             kind,
         ))
     }
@@ -479,6 +522,7 @@ impl ColdBuildLimiter {
         state: &mut AdmissionState,
         domain: &'static str,
         root: Option<&str>,
+        census_root: Option<&str>,
         kind: &str,
     ) -> ColdBuildPermit {
         let census_id = state.next_census_id;
@@ -493,7 +537,7 @@ impl ColdBuildLimiter {
             census_id,
             CensusRecord {
                 domain,
-                root: root.unwrap_or("unknown").to_string(),
+                root: census_root.unwrap_or("unknown").to_string(),
                 kind: kind.to_string(),
                 permit: Some(Weak::clone(&weak)),
                 started_at_ms: unix_millis_now(),
@@ -610,7 +654,7 @@ impl AdmissionWaiter {
             census_id,
             CensusRecord {
                 domain: request.class.label(),
-                root: request.root.as_deref().unwrap_or("unknown").to_string(),
+                root: request.census_label().unwrap_or("unknown").to_string(),
                 kind: kind.to_string(),
                 permit: None,
                 started_at_ms: unix_millis_now(),
