@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "callgraph-cold-build-linear"
+  ],
+  "note": "The callgraph cold build skips per-file staging deletes for files never staged in the run, removing a quadratic table scan (extraction 20k files 2092 s -> 194 s); the built store is unchanged. Callgraph store only; no file under the ranking fence is touched: no engine, corpus, indexed-content or ranking change."
+}
