@@ -760,7 +760,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     registeredTools,
   );
   ctx.hashlineEffective = hashlineEditRegistered;
-  // One configure-time warning per load; surviving slots keep ordinary behavior.
+  // Warn once per load when hashline editing is requested but `read` or `edit`
+  // is disabled; the tools that are still registered keep their normal behavior.
   const hashlineDowngrade = reportHashlineDowngrade(aftConfig, registeredTools, (message) =>
     deliverConfigMigrationWarnings(registrationRoot, [message]),
   );

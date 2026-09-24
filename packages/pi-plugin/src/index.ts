@@ -763,7 +763,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const hashlineEditRegistered = piHashlineEffective(config, surface);
   const hashlineDowngrade = piHashlineDowngrade(config, surface);
   if (hashlineDowngrade) {
-    // One configure-time warning per load; surviving slots keep ordinary behavior.
+    // Warn once per load when hashline editing is requested but `read` or `edit`
+    // is disabled; the tools that are still registered keep their normal behavior.
     warn(`[hashline] ${hashlineDowngrade.code}: ${hashlineDowngrade.message}`);
     deliverConfigMigrationWarnings([hashlineDowngrade.message]);
   }

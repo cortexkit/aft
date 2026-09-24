@@ -147,7 +147,8 @@ fn status_disk_bytes_zero_when_no_cache_for_project() {
             "harness": "opencode",
         "project_root": project_root.to_str().expect("utf-8"),
         "storage_dir": storage_root.to_str().expect("utf-8"),
-        // Same reason as above: no real index build may write into the slice.
+        // Disable both indexes so real index builds cannot write bytes into
+        // the fake storage slice this test measures.
         "config": [{
             "tier": "user",
             "source": "test",
