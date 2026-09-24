@@ -1,9 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
 /**
- * Resolver version-mismatch test — verifies that `findBinarySync` rejects
- * an npm platform binary whose `--version` does not match the requested
- * `expectedVersion`, and falls through to PATH lookup instead.
+ * Resolver version-mismatch test — verifies that the resolver never accepts a
+ * binary whose version does not match the requested `expectedVersion`, and
+ * that the synchronous resolver establishes identity without running anything.
  *
  * Regression case (caught during v0.23 Pi RPC e2e dogfooding): a workspace
  * upgraded to plugin v0.22.x can still have a bun-hoisted older
@@ -18,10 +18,23 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { findBinarySync, readBinaryVersion, __test__ as resolverTest } from "../resolver.js";
+import { delimiter, join } from "node:path";
+import {
+  __waitForIdentityWritesForTests,
+  identitySidecarPath,
+  readBinaryIdentity,
+  writeBinaryIdentitySidecar,
+} from "../binary-identity.js";
+import {
+  __setEnsureBinaryForTests,
+  findBinary,
+  findBinarySync,
+  readBinaryVersion,
+  __test__ as resolverTest,
+} from "../resolver.js";
 import { writeAftFixture, writeAftVersionFixture } from "./test-utils/aft-executable-fixture.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
@@ -102,6 +115,7 @@ describe("findBinarySync versioned cache validation", () => {
   });
 
   afterEach(() => {
+    __setEnsureBinaryForTests(null);
     releaseEnv?.();
     releaseEnv = undefined;
     rmSync(tmpDir, { recursive: true, force: true });
@@ -118,20 +132,30 @@ describe("findBinarySync versioned cache validation", () => {
     return writeAftVersionFixture(binaryPath, reportedVersion);
   }
 
-  test("returns exact-version cached binary after probing --version", () => {
+  test("returns a cached binary vouched for by its identity sidecar", () => {
     const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
-
-    // Precondition: the cached binary actually exists at the expected path.
-    expect(existsSync(binaryPath)).toBe(true);
-
-    // Precondition: the fake binary actually reports the expected version.
-    expect(readBinaryVersion(binaryPath)).toBe("1.2.3");
+    writeBinaryIdentitySidecar(binaryPath, "1.2.3", "0".repeat(64));
 
     expect(findBinarySync("1.2.3")).toBe(binaryPath);
   });
 
+  test("does not trust a cached binary without a sidecar", () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+    expect(existsSync(binaryPath)).toBe(true);
+
+    expect(findBinarySync("1.2.3")).toBeNull();
+  });
+
+  test("does not trust a sidecar that records a different version", () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+    writeBinaryIdentitySidecar(binaryPath, "9.9.9", "0".repeat(64));
+
+    expect(findBinarySync("1.2.3")).toBeNull();
+  });
+
   test("logs the successful resolution path and source", () => {
     const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+    writeBinaryIdentitySidecar(binaryPath, "1.2.3", "0".repeat(64));
     const packageRoot = join(import.meta.dir, "..", "..");
     const result = spawnSync(
       process.execPath,
@@ -159,24 +183,76 @@ describe("findBinarySync versioned cache validation", () => {
     );
   });
 
-  test("skips mislabeled newer cached binary instead of accepting directory name", () => {
-    const binaryPath = writeCachedVersion("v1.2.3", "9.9.9");
+  test("findBinary verifies a sidecar-less entry off-thread and records its identity", async () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+    __setEnsureBinaryForTests(async () => {
+      throw new Error("a verified cache entry must not trigger a download");
+    });
 
+    await expect(findBinary("1.2.3")).resolves.toBe(binaryPath);
+    await __waitForIdentityWritesForTests();
+
+    const identity = readBinaryIdentity(binaryPath);
+    expect(identity?.version).toBe("1.2.3");
+    expect(identity?.sha256).toBe(
+      createHash("sha256").update(readFileSync(binaryPath)).digest("hex"),
+    );
+    // The next lookup is stat-only.
+    expect(findBinarySync("1.2.3")).toBe(binaryPath);
+  });
+
+  test("skips mislabeled newer cached binary instead of accepting directory name", async () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "9.9.9");
     expect(existsSync(binaryPath)).toBe(true);
+    const downloads: Array<string | undefined> = [];
+    __setEnsureBinaryForTests(async (version) => {
+      downloads.push(version);
+      return "/downloaded/aft";
+    });
 
     expect(findBinarySync("1.2.3")).toBeNull();
+    await expect(findBinary("1.2.3")).resolves.toBe("/downloaded/aft");
+    expect(downloads).toEqual(["1.2.3"]);
+    expect(existsSync(identitySidecarPath(binaryPath))).toBe(false);
+  });
+
+  test("a binary replaced under its sidecar is re-verified and a wrong version is not used", async () => {
+    const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
+    writeBinaryIdentitySidecar(binaryPath, "1.2.3", "0".repeat(64));
+    // Another writer swaps different bytes in: the sidecar no longer matches.
+    rmSync(binaryPath);
+    writeCachedVersion("v1.2.3", "9.9.9");
+    __setEnsureBinaryForTests(async () => "/downloaded/aft");
+
+    expect(findBinarySync("1.2.3")).toBeNull();
+    await expect(findBinary("1.2.3")).resolves.toBe("/downloaded/aft");
   });
 });
 
-describe("findBinarySync PATH lookup parsing", () => {
-  test("splits CRLF-separated Windows where output into individual candidates", () => {
-    expect(
-      resolverTest.parsePathLookupOutput("C:\\tools\\aft.exe\r\nC:\\other\\aft.exe\r\n"),
-    ).toEqual(["C:\\tools\\aft.exe", "C:\\other\\aft.exe"]);
+describe("PATH candidate scan", () => {
+  test("lists existing aft executables in PATH order and ignores relative entries", () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-path-scan-"));
+    try {
+      const ext = process.platform === "win32" ? ".exe" : "";
+      const first = join(root, "first");
+      const second = join(root, "second");
+      const empty = join(root, "empty");
+      mkdirSync(empty, { recursive: true });
+      writeAftVersionFixture(join(first, `aft${ext}`), "1.0.0");
+      writeAftVersionFixture(join(second, `aft${ext}`), "1.0.0");
+      const PATH = ["relative/bin", empty, first, second, first].join(delimiter);
+
+      expect(resolverTest.pathCandidates({ PATH }, ext)).toEqual([
+        join(first, `aft${ext}`),
+        join(second, `aft${ext}`),
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
-describe.skipIf(skipPosixPathLookup)("findBinarySync PATH/cargo validation", () => {
+describe.skipIf(skipPosixPathLookup)("findBinary PATH/cargo validation", () => {
   let tmpDir: string;
   let releaseEnv: (() => void) | undefined;
 
@@ -194,28 +270,26 @@ describe.skipIf(skipPosixPathLookup)("findBinarySync PATH/cargo validation", () 
   });
 
   afterEach(() => {
+    __setEnsureBinaryForTests(null);
     releaseEnv?.();
     releaseEnv = undefined;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  function writeFakeAft(path: string, reportedVersion: string): void {
-    writeAftVersionFixture(path, reportedVersion);
-  }
-
-  test("skips mismatched PATH candidate and falls through to matching cargo binary", () => {
+  test("skips mismatched PATH candidate and falls through to matching cargo binary", async () => {
     const pathBinary = join(tmpDir, "path-bin", "aft");
     const cargoBinary = join(tmpDir, "home", ".cargo", "bin", "aft");
-    writeFakeAft(pathBinary, "9.9.9");
-    writeFakeAft(cargoBinary, "1.2.3");
+    writeAftVersionFixture(pathBinary, "9.9.9");
+    writeAftVersionFixture(cargoBinary, "1.2.3");
+    __setEnsureBinaryForTests(async () => null);
 
-    expect(readBinaryVersion(pathBinary)).toBe("9.9.9");
-    expect(readBinaryVersion(cargoBinary)).toBe("1.2.3");
-    expect(findBinarySync("1.2.3")).toBe(cargoBinary);
+    // Neither is considered synchronously: their versions are unknown until they run.
+    expect(findBinarySync("1.2.3")).toBeNull();
+    await expect(findBinary("1.2.3")).resolves.toBe(cargoBinary);
   });
 });
 
-describe("findBinarySync AFT_BINARY_PATH override", () => {
+describe("AFT_BINARY_PATH override", () => {
   let tmpDir: string;
   let releaseEnv: (() => void) | undefined;
 
@@ -229,8 +303,7 @@ describe("findBinarySync AFT_BINARY_PATH override", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test("uses the explicit hermetic binary before caches and PATH", async () => {
-    const binaryPath = writeAftVersionFixture(join(tmpDir, "aft-explicit"), "1.2.3");
+  async function useExplicit(binaryPath: string): Promise<void> {
     releaseEnv = await acquireEnv({
       AFT_BINARY_PATH: binaryPath,
       AFT_CACHE_DIR: undefined,
@@ -238,20 +311,27 @@ describe("findBinarySync AFT_BINARY_PATH override", () => {
       HOME: tmpDir,
       PATH: "",
     });
+  }
+
+  test("uses the explicit hermetic binary before caches and PATH", async () => {
+    const binaryPath = writeAftVersionFixture(join(tmpDir, "aft-explicit"), "1.2.3");
+    await useExplicit(binaryPath);
 
     expect(findBinarySync("1.2.3")).toBe(binaryPath);
+    await expect(findBinary("1.2.3")).resolves.toBe(binaryPath);
+  });
+
+  test("findBinary rejects an explicit binary that reports another version", async () => {
+    const binaryPath = writeAftVersionFixture(join(tmpDir, "aft-explicit"), "9.9.9");
+    await useExplicit(binaryPath);
+
+    await expect(findBinary("1.2.3")).rejects.toThrow(/AFT_BINARY_PATH is incompatible/);
   });
 
   test("fails closed instead of touching operator resolution sources", async () => {
-    const missing = join(tmpDir, "missing-aft");
-    releaseEnv = await acquireEnv({
-      AFT_BINARY_PATH: missing,
-      AFT_CACHE_DIR: undefined,
-      XDG_CACHE_HOME: tmpDir,
-      HOME: tmpDir,
-      PATH: "",
-    });
+    await useExplicit(join(tmpDir, "missing-aft"));
 
     expect(() => findBinarySync("1.2.3")).toThrow(/AFT_BINARY_PATH.*native executable/);
+    await expect(findBinary("1.2.3")).rejects.toThrow(/AFT_BINARY_PATH.*native executable/);
   });
 });
