@@ -9,6 +9,9 @@ import {
   noticeDigest,
   noticeProjection,
   policyPhaseForVersion,
+  SEMANTIC_COST_NOTICE,
+  semanticCostNotice,
+  suppliesSemanticIndexInput,
   translateConfigDocument,
   validateResolvedConfig,
 } from "../feature-config.js";
@@ -163,5 +166,52 @@ describe("migration notice delivery", () => {
     });
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).toContain("may repeat");
+  });
+});
+
+describe("semantic cost notice", () => {
+  test("uses the exact spec text", () => {
+    expect(SEMANTIC_COST_NOTICE).toBe(
+      "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run aft setup to change indexes.semantic; if legacy configuration is rejected, run aft doctor --fix first.",
+    );
+  });
+
+  test("detects supplied semantic inputs in the base and active harness blocks only", () => {
+    expect(suppliesSemanticIndexInput(undefined, "pi")).toBe(false);
+    expect(suppliesSemanticIndexInput({ indexes: { trigram: false } }, "pi")).toBe(false);
+    expect(suppliesSemanticIndexInput({ indexes: { semantic: false } }, "pi")).toBe(true);
+    expect(suppliesSemanticIndexInput({ semantic_search: true }, "pi")).toBe(true);
+    expect(suppliesSemanticIndexInput({ experimental_semantic_search: true }, "pi")).toBe(true);
+    const harnessOnly = { harnesses: { opencode: { indexes: { semantic: true } } } };
+    expect(suppliesSemanticIndexInput(harnessOnly, "opencode")).toBe(true);
+    expect(suppliesSemanticIndexInput(harnessOnly, "pi")).toBe(false);
+  });
+
+  test("applies only to an effectively-on default local backend and is delivered once", () => {
+    const base = {
+      userConfigPath: "/cfg/aft.jsonc",
+      semanticEffective: true,
+      semanticInputSupplied: false,
+      semanticBackend: undefined,
+    };
+    expect(semanticCostNotice({ ...base, semanticEffective: false })).toBeNull();
+    expect(semanticCostNotice({ ...base, semanticInputSupplied: true })).toBeNull();
+    expect(semanticCostNotice({ ...base, semanticBackend: "ollama" })).toBeNull();
+    const notice = semanticCostNotice({ ...base, semanticBackend: "fastembed" });
+    expect(notice?.message).toBe(SEMANTIC_COST_NOTICE);
+
+    const root = mkdtempSync(join(tmpdir(), "aft-cost-notice-"));
+    roots.push(root);
+    const storePath = join(root, "state", "migration-notices.json");
+    const delivered: string[] = [];
+    const deliver = (message: string) => delivered.push(message);
+    const fresh = semanticCostNotice(base);
+    if (fresh === null) throw new Error("expected a cost notice");
+    expect(deliverMigrationNoticeOnce({ ...fresh, deliver, storePath })).toBe(true);
+    // A later load (a restart) yields the same identity and is suppressed.
+    const again = semanticCostNotice(base);
+    if (again === null) throw new Error("expected a cost notice");
+    expect(deliverMigrationNoticeOnce({ ...again, deliver, storePath })).toBe(false);
+    expect(delivered).toEqual([SEMANTIC_COST_NOTICE]);
   });
 });

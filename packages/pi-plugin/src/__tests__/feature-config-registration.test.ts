@@ -14,11 +14,16 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ADAPTER_UNIMPLEMENTED_TOOLS, CANONICAL_TOOLS } from "@cortexkit/aft-bridge";
+import {
+  ADAPTER_UNIMPLEMENTED_TOOLS,
+  CANONICAL_TOOLS,
+  SEMANTIC_COST_NOTICE,
+} from "@cortexkit/aft-bridge";
 
 import {
   type AftConfig,
   ConfigRejectedError,
+  getConfigLoadNotices,
   loadAftConfig,
   setFeatureConfigPolicyVersionForTests,
 } from "../config.js";
@@ -134,5 +139,32 @@ describe("Pi/OMP feature-config registration", () => {
     expect((rejected as ConfigRejectedError).errors).toEqual([
       "removed_config_key:aft_glob:use:glob",
     ]);
+  });
+});
+
+describe("semantic default-on cost notice", () => {
+  const costNotices = () =>
+    getConfigLoadNotices().filter((notice) => notice.message === SEMANTIC_COST_NOTICE);
+
+  test("is queued when semantic is on only by default", () => {
+    for (const user of [undefined, {}, { indexes: { trigram: false } }]) {
+      loadWithUserConfig(user);
+      expect(costNotices()).toHaveLength(1);
+      expect(costNotices()[0]?.configPath).toBe(join(root, "xdg", "cortexkit", "aft.jsonc"));
+    }
+  });
+
+  test("is not queued when the user configured semantic or chose another backend", () => {
+    for (const user of [
+      { indexes: { semantic: true } },
+      { indexes: { semantic: false } },
+      { semantic_search: true },
+      { experimental_semantic_search: true },
+      { harnesses: { pi: { indexes: { semantic: true } } } },
+      { semantic: { backend: "openai_compatible", base_url: "http://localhost:1" } },
+    ]) {
+      loadWithUserConfig(user);
+      expect(costNotices()).toHaveLength(0);
+    }
   });
 });

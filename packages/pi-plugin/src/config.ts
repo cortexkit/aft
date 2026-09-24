@@ -23,9 +23,11 @@ import {
   resolveCortexKitConfigPaths,
   resolveIndexes,
   resolveLegacyAftConfigSources,
+  semanticCostNotice,
   sortedUnique,
   stripHarnessSpecificConfigKeys,
   stripJsoncSymbols,
+  suppliesSemanticIndexInput,
   translateConfigDocument,
   unionDisabledTools,
   validateResolvedConfig,
@@ -1425,6 +1427,9 @@ export interface ConfigLoadNotice {
 
 let configLoadNotices: ConfigLoadNotice[] = [];
 
+/** Whether any tier of the current load supplied a semantic index input. */
+let semanticInputSupplied = false;
+
 /** Migration notices from the most recent {@link loadAftConfig} call. */
 export function getConfigLoadNotices(): readonly ConfigLoadNotice[] {
   return configLoadNotices;
@@ -1464,6 +1469,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   // Retired keys are translated (inside the migration window) or rejected on
   // the raw document, before schema validation, so they never reach Zod.
   const projection = noticeProjection(structuredClone(cleanConfig));
+  if (suppliesSemanticIndexInput(cleanConfig, ACTIVE_HARNESS)) semanticInputSupplied = true;
   const translation = translateConfigDocument(cleanConfig, currentPolicyPhase(), tier);
   if (translation.errors.length > 0) {
     throw new ConfigRejectedError(translation.errors, configPath);
@@ -1978,6 +1984,7 @@ export function buildConfigTierConfigureParams(
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
   configLoadNotices = [];
+  semanticInputSupplied = false;
 
   const { userConfigPath, projectConfigPath } = resolveAftConfigPaths(projectDirectory);
 
@@ -2024,5 +2031,14 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   };
   const invalid = validateResolvedConfig(resolved);
   if (invalid.length > 0) throw new ConfigRejectedError(invalid);
+  // Queued with the migration notices, which the adapters deliver before any
+  // ONNX Runtime download or index work starts.
+  const costNotice = semanticCostNotice({
+    userConfigPath,
+    semanticEffective: resolved.indexes?.semantic === true,
+    semanticInputSupplied,
+    semanticBackend: resolved.semantic?.backend,
+  });
+  if (costNotice !== null) configLoadNotices.push(costNotice);
   return resolved;
 }

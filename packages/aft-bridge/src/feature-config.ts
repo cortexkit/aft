@@ -578,6 +578,68 @@ export function noticeDigest(projection: unknown): string {
   return createHash("sha256").update(canonicalJson(projection), "utf8").digest("hex");
 }
 
+/**
+ * One-time notice shown when the semantic index is on only because indexes now
+ * default on. The text is fixed by the feature-config spec.
+ */
+export const SEMANTIC_COST_NOTICE =
+  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run aft setup to change indexes.semantic; if legacy configuration is rejected, run aft doctor --fix first.";
+
+/**
+ * Identity of the semantic cost notice. It is a constant rather than a digest
+ * of the config file, so the notice is delivered once per user config path and
+ * unrelated config edits never bring it back.
+ */
+export const SEMANTIC_COST_NOTICE_DIGEST = noticeDigest({ notice: "semantic_default_cost_v1" });
+
+/**
+ * True when a raw config document supplies any semantic index input (the
+ * canonical `indexes.semantic` leaf or a legacy/experimental alias) in its base
+ * block or in the block of `activeHarness`. A supplied value, true or false,
+ * means the user chose the setting, so the default-on cost notice does not
+ * apply.
+ */
+export function suppliesSemanticIndexInput(
+  raw: JsonRecord | undefined,
+  activeHarness: string,
+): boolean {
+  if (raw === undefined) return false;
+  const [leaf, immediate, experimental] = INDEX_INPUTS.find(([name]) => name === "semantic") ?? [
+    "semantic",
+    "semantic_search",
+    "experimental_semantic_search",
+  ];
+  const blockSupplies = (block: unknown): boolean => {
+    if (!isRecord(block)) return false;
+    if (isRecord(block.indexes) && block.indexes[leaf] !== undefined) return true;
+    if (block[immediate] !== undefined) return true;
+    return experimental !== undefined && block[experimental] !== undefined;
+  };
+  const harnessBlock = isRecord(raw.harnesses) ? raw.harnesses[activeHarness] : undefined;
+  return blockSupplies(raw) || blockSupplies(harnessBlock);
+}
+
+/**
+ * The semantic cost notice for one load, or null when it does not apply. It
+ * applies only when the semantic index is effectively on because of the new
+ * default: no loaded tier supplied a semantic input, and no non-local
+ * embedding backend is configured (a remote backend downloads nothing).
+ */
+export function semanticCostNotice(options: {
+  userConfigPath: string;
+  semanticEffective: boolean;
+  semanticInputSupplied: boolean;
+  semanticBackend: string | undefined;
+}): { configPath: string; digest: string; message: string } | null {
+  if (!options.semanticEffective || options.semanticInputSupplied) return null;
+  if (options.semanticBackend !== undefined && options.semanticBackend !== "fastembed") return null;
+  return {
+    configPath: options.userConfigPath,
+    digest: SEMANTIC_COST_NOTICE_DIGEST,
+    message: SEMANTIC_COST_NOTICE,
+  };
+}
+
 /** Raw `indexes` block as it appears in one config tier. */
 export interface RawIndexesConfig {
   trigram?: boolean;
