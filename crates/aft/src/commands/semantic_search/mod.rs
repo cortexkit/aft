@@ -107,6 +107,9 @@ use crate::commands::symbol_render::{
 };
 use crate::config::IndexKind;
 use crate::context::{AppContext, SemanticIndexStatus};
+use crate::feature_status::{
+    cause as feature_cause, observed_index_status, IndexEffective, IndexObservation, IndexPlane,
+};
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
 use crate::list_envelope::ListEnvelope;
@@ -761,8 +764,141 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     if response.success {
         let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
         attach_search_execution_metadata(&mut response, &plan, embedding_counts);
+        if external_root.is_none() {
+            SearchLaneStatus::observe_current(ctx).attach_labels(&mut response, ctx);
+        }
     }
     response
+}
+
+/// Status of the two index lanes `aft_search` ranks over, taken from the
+/// shared engine observation. Labelling only: nothing here reads or changes
+/// ranking, and observing never starts a build.
+struct SearchLaneStatus {
+    trigram: IndexObservation,
+    semantic: IndexObservation,
+}
+
+impl SearchLaneStatus {
+    /// `trigram_ready` is the readiness this request already waited for, so a
+    /// load that finished inside the request's wait budget counts as ready.
+    fn observe(ctx: &AppContext, trigram_ready: bool) -> Self {
+        let trigram = if trigram_ready {
+            IndexObservation::ready()
+        } else {
+            match observed_index_status(ctx, IndexPlane::Trigram) {
+                // Not resident but usable a moment ago: a query is the signal
+                // that recovers an idle-evicted index, as grep and glob do.
+                observation
+                    if observation.unavailable_reason.as_deref()
+                        == Some(feature_cause::RUNTIME_NOT_OBSERVED)
+                        && super::configure::trigger_search_index_reload_if_evicted(ctx) =>
+                {
+                    IndexObservation::building()
+                }
+                observation => observation,
+            }
+        };
+        Self {
+            trigram,
+            semantic: observed_index_status(ctx, IndexPlane::Semantic),
+        }
+    }
+
+    fn observe_current(ctx: &AppContext) -> Self {
+        Self {
+            trigram: observed_index_status(ctx, IndexPlane::Trigram),
+            semantic: observed_index_status(ctx, IndexPlane::Semantic),
+        }
+    }
+
+    fn lanes_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "trigram": self.trigram.consumer_json(),
+            "semantic": self.semantic.consumer_json(),
+        })
+    }
+
+    fn omitted_lanes(&self) -> Vec<&'static str> {
+        [("trigram", &self.trigram), ("semantic", &self.semantic)]
+            .into_iter()
+            .filter(|(_, lane)| !lane.is_ready())
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The refusal when no lane is ready: `no_search_lanes_enabled` when both
+    /// indexes are configured off, otherwise `search_lanes_unavailable`.
+    fn refusal(&self, req_id: &str, ctx: &AppContext) -> Option<Response> {
+        if self.trigram.is_ready() || self.semantic.is_ready() {
+            return None;
+        }
+        let both_off = self.trigram.effective == IndexEffective::Off
+            && self.semantic.effective == IndexEffective::Off;
+        let (code, message) = if both_off {
+            (
+                "no_search_lanes_enabled",
+                "aft_search has no index lane enabled: indexes.trigram and indexes.semantic are both off. Enable one with aft setup, or use grep.",
+            )
+        } else {
+            (
+                "search_lanes_unavailable",
+                "aft_search has no ready index lane yet (see lanes for each lane's status); retry shortly or use grep.",
+            )
+        };
+        Some(Response::error_with_data(
+            req_id,
+            code,
+            message,
+            serde_json::json!({
+                "results": [],
+                "lanes": self.lanes_json(),
+                "omitted_lanes": self.omitted_lanes(),
+                "enrichment": callgraph_enrichment_json(ctx),
+            }),
+        ))
+    }
+
+    fn attach_labels(&self, response: &mut Response, ctx: &AppContext) {
+        let Some(data) = response.data.as_object_mut() else {
+            return;
+        };
+        data.insert("lanes".to_string(), self.lanes_json());
+        data.insert(
+            "omitted_lanes".to_string(),
+            serde_json::json!(self.omitted_lanes()),
+        );
+        data.insert("enrichment".to_string(), callgraph_enrichment_json(ctx));
+    }
+}
+
+/// Whether search results carry callgraph (blast-radius) enrichment. When the
+/// callgraph cannot serve it, the enrichment is explicitly omitted with the
+/// callgraph index status and the analysis code, never silently absent.
+fn callgraph_enrichment_json(ctx: &AppContext) -> serde_json::Value {
+    if warm_callgraph_store(ctx).is_some() {
+        return serde_json::json!({
+            "status": "applied",
+            "code": serde_json::Value::Null,
+            "index": IndexObservation::ready().consumer_json(),
+        });
+    }
+    let observation = match observed_index_status(ctx, IndexPlane::Callgraph) {
+        // Resident but mid-refresh: enrichment waits for the refresh.
+        observation if observation.is_ready() => IndexObservation::building(),
+        observation => observation,
+    };
+    let code = match observation.effective {
+        IndexEffective::Off => "callgraph_off",
+        IndexEffective::Building => "callgraph_building",
+        IndexEffective::Ready | IndexEffective::Unavailable => "callgraph_unavailable",
+    };
+    serde_json::json!({
+        "status": "omitted",
+        "code": code,
+        "index": observation.consumer_json(),
+        "edges": serde_json::Value::Null,
+    })
 }
 
 fn attach_search_execution_metadata(
@@ -902,6 +1038,12 @@ fn handle_semantic_search_inner(
             );
         }
     };
+    // With neither index lane ready there is nothing to rank: refuse with
+    // each lane's status instead of presenting a filesystem walk as search.
+    let lanes = SearchLaneStatus::observe(ctx, lexical_ready);
+    if let Some(refusal) = lanes.refusal(&req.id, ctx) {
+        return refusal;
+    }
     let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
     if lexical_ready && mode != SearchMode::Regex && !engine_plan.contains(SearchLaneKind::Semantic)
     {

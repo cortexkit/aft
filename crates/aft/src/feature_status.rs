@@ -173,16 +173,19 @@ pub fn unobserved_index_status(enabled: bool) -> IndexObservation {
 /// Current observed status of `plane` in this engine runtime.
 ///
 /// A resolved-off index is `off` regardless of backend support or whether it
-/// was ever observed. An enabled index is `ready` or `building` when the
+/// was ever observed. A HOME root is the one exception: configure turns its
+/// indexes off internally, so it reports `unavailable` with `home_root`. An enabled index is `ready` or `building` when the
 /// runtime holds that state, otherwise `unavailable` with a named cause
 /// (`runtime_not_observed` when nothing has been observed yet).
 pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObservation {
-    let enabled = plane.enabled_in(&ctx.config());
-    if !enabled {
-        return IndexObservation::off();
-    }
+    // Configure forces every index off for a HOME root (degraded mode). That
+    // is not the user's resolved choice, so report it as unavailable with its
+    // cause rather than as configured off.
     if ctx.is_home_root() {
         return IndexObservation::unavailable(cause::HOME_ROOT);
+    }
+    if !plane.enabled_in(&ctx.config()) {
+        return IndexObservation::off();
     }
     match plane {
         IndexPlane::Trigram => observe_trigram(ctx),
@@ -317,3 +320,7 @@ pub fn callgraph_access_observation(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "feature_status/consumer_fixture_tests.rs"]
+mod consumer_fixture_tests;

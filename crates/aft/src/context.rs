@@ -5272,12 +5272,15 @@ impl AppContext {
     }
 
     fn callgraph_store_for_ops_with_wait(&self, wait: Duration) -> CallgraphStoreAccess {
+        // HOME roots and unbound roots do no heavy work at all; configure
+        // also forces the callgraph off there, so check this first to keep
+        // reporting them as unavailable rather than configured off.
+        if !self.heavy_root_work_allowed() {
+            return CallgraphStoreAccess::Unavailable;
+        }
         // A disabled index never starts: refuse before any open or cold build.
         if !self.config().indexes.callgraph {
             return CallgraphStoreAccess::Off;
-        }
-        if !self.heavy_root_work_allowed() {
-            return CallgraphStoreAccess::Unavailable;
         }
         if self.config().views.enabled && self.config().indexes.callgraph {
             if let Some(view) = self.pinned_view_runtime() {

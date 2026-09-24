@@ -2054,6 +2054,24 @@ pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Respo
     if ctx.is_home_root() {
         return home_root_disabled_response(req_id, operation);
     }
+    if !ctx.is_worktree_bridge() && ctx.callgraph_project_root().is_some() {
+        // A configured root whose store this runtime cannot use (for example
+        // a borrowed read-only root, or a root that is being unbound): report
+        // the plane's observed cause rather than "not configured".
+        let observation = match crate::feature_status::observed_index_status(
+            ctx,
+            crate::feature_status::IndexPlane::Callgraph,
+        ) {
+            observation if observation.unavailable_reason.is_some() => observation,
+            _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
+        };
+        return callgraph_index_refusal(
+            req_id,
+            "callgraph_unavailable",
+            format!("{operation}: persisted callgraph store is unavailable in this runtime"),
+            observation,
+        );
+    }
     unavailable_response(req_id, operation, ctx.is_worktree_bridge())
 }
 

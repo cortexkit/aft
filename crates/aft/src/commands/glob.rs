@@ -169,6 +169,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     if walk_truncated {
         body["walk_truncated"] = serde_json::Value::Bool(true);
     }
+    // Disclose the trigram index state and whether any root was answered by a
+    // filesystem walk rather than the index.
+    body["index"] = crate::commands::grep::trigram_index_disclosure(ctx);
+    body["fallback"] = if source == "index" {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String("filesystem".to_string())
+    };
 
     let rendered_count =
         crate::subc_format::report_rendered_row_count("glob", &body).unwrap_or(files.len());

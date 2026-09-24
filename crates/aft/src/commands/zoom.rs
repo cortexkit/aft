@@ -982,7 +982,15 @@ fn zoom_one_symbol(
         vec![]
     };
 
-    let (calls_out, called_by) = if include_callgraph {
+    // The callgraph annotations follow the callgraph index: while it is off,
+    // building or unavailable, zoom returns the symbol with an explicitly
+    // unavailable annotations field instead of call lists.
+    let callgraph_unavailable = if include_callgraph {
+        unavailable_callgraph_annotations(ctx)
+    } else {
+        None
+    };
+    let (calls_out, called_by) = if include_callgraph && callgraph_unavailable.is_none() {
         // Get all symbols in the resolved file for call matching
         let all_symbols = match ctx.provider().list_symbols(resolved_file_path) {
             Ok(s) => s,
@@ -1087,13 +1095,40 @@ fn zoom_one_symbol(
     };
 
     match serde_json::to_value(&resp) {
-        Ok(resp_json) => Response::success(&req.id, resp_json),
+        Ok(mut resp_json) => {
+            if let Some(unavailable) = callgraph_unavailable {
+                resp_json["annotations"] = unavailable;
+            }
+            Response::success(&req.id, resp_json)
+        }
         Err(err) => Response::error(
             &req.id,
             "internal_error",
             format!("zoom: failed to serialize response: {err}"),
         ),
     }
+}
+
+/// The `annotations` value for a `callgraph:true` zoom when the callgraph
+/// index is not ready: the analysis code, the index status and cause, and null
+/// call lists (never empty lists, which would read as "no callers"). None when
+/// the index is ready. Observing the index never starts a build.
+fn unavailable_callgraph_annotations(ctx: &AppContext) -> Option<serde_json::Value> {
+    use crate::feature_status::{observed_index_status, IndexEffective, IndexPlane};
+    let observation = observed_index_status(ctx, IndexPlane::Callgraph);
+    let code = match observation.effective {
+        IndexEffective::Ready => return None,
+        IndexEffective::Off => "callgraph_off",
+        IndexEffective::Building => "callgraph_building",
+        IndexEffective::Unavailable => "callgraph_unavailable",
+    };
+    Some(serde_json::json!({
+        "status": "unavailable",
+        "code": code,
+        "index": observation.consumer_json(),
+        "calls_out": serde_json::Value::Null,
+        "called_by": serde_json::Value::Null,
+    }))
 }
 
 fn empty_annotations() -> serde_json::Value {
@@ -1601,7 +1636,15 @@ fn render_json_zoom(
         vec![]
     };
 
-    let (calls_out, called_by) = if include_callgraph {
+    // The callgraph annotations follow the callgraph index: while it is off,
+    // building or unavailable, zoom returns the symbol with an explicitly
+    // unavailable annotations field instead of call lists.
+    let callgraph_unavailable = if include_callgraph {
+        unavailable_callgraph_annotations(ctx)
+    } else {
+        None
+    };
+    let (calls_out, called_by) = if include_callgraph && callgraph_unavailable.is_none() {
         let all_symbols = match ctx.provider().list_symbols(path) {
             Ok(s) => s,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
@@ -1655,7 +1698,12 @@ fn render_json_zoom(
     };
 
     match serde_json::to_value(&resp) {
-        Ok(resp_json) => Response::success(&req.id, resp_json),
+        Ok(mut resp_json) => {
+            if let Some(unavailable) = callgraph_unavailable {
+                resp_json["annotations"] = unavailable;
+            }
+            Response::success(&req.id, resp_json)
+        }
         Err(err) => Response::error(
             &req.id,
             "internal_error",
@@ -2185,6 +2233,28 @@ mod tests {
         AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
     }
 
+    /// A context whose callgraph index is ready, so `callgraph:true` zooms
+    /// compute call annotations. The store itself can be empty: zoom's call
+    /// lists come from the file's own syntax tree.
+    fn make_ctx_with_ready_callgraph() -> (AppContext, tempfile::TempDir) {
+        let ctx = make_ctx();
+        let root = tempfile::tempdir().expect("callgraph root");
+        let project_root = std::fs::canonicalize(root.path()).expect("canonical root");
+        let store_dir = project_root.join(".callgraph-store-test");
+        let store =
+            crate::callgraph_store::CallGraphStore::open(store_dir.clone(), project_root.clone())
+                .expect("open callgraph store");
+        store.cold_build(&[]).expect("build empty callgraph store");
+        drop(store);
+        let store = crate::callgraph_store::CallGraphStore::open_readonly(store_dir, project_root)
+            .expect("open read-only callgraph store")
+            .expect("ready callgraph store");
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::sync::Arc::new(store));
+        (ctx, root)
+    }
+
     #[test]
     fn parse_zoom_symbol_names_splits_whitespace_for_code() {
         let params = serde_json::json!({ "symbol": "InspectCategory active is_active" });
@@ -2496,7 +2566,7 @@ function helper(value: number): number {
 
     #[test]
     fn zoom_response_has_calls_out_and_called_by() {
-        let ctx = make_ctx();
+        let (ctx, _callgraph_root) = make_ctx_with_ready_callgraph();
         let path = fixture_path("calls.ts");
 
         let req = make_zoom_request_cg("z-1", path.to_str().unwrap(), "compute");
@@ -2534,7 +2604,7 @@ function helper(value: number): number {
 
     #[test]
     fn zoom_callgraph_dedupes_repeated_call_sites_by_name() {
-        let ctx = make_ctx();
+        let (ctx, _callgraph_root) = make_ctx_with_ready_callgraph();
         let path = fixture_path("calls.ts");
 
         let req = make_zoom_request_cg("z-dedupe-out", path.to_str().unwrap(), "repeatedOutgoing");
@@ -2586,7 +2656,7 @@ function helper(value: number): number {
 
     #[test]
     fn zoom_response_empty_annotations_for_unused() {
-        let ctx = make_ctx();
+        let (ctx, _callgraph_root) = make_ctx_with_ready_callgraph();
         let path = fixture_path("calls.ts");
 
         let req = make_zoom_request_cg("z-2", path.to_str().unwrap(), "unused");

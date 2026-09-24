@@ -1821,6 +1821,18 @@ fn build_inspect_payload(
             .get(category)
             .expect("all active categories have a fresh inspect payload");
         let mut category_summary = summary_for(*category, payload);
+        let dead_code_unavailable =
+            *category == InspectCategory::DeadCode && dead_code_callgraph_unavailable(payload);
+        if dead_code_unavailable {
+            annotate_dead_code_unavailable(
+                &mut category_summary,
+                payload,
+                crate::feature_status::observed_index_status(
+                    ctx,
+                    crate::feature_status::IndexPlane::Callgraph,
+                ),
+            );
+        }
         if *category == InspectCategory::Duplicates && no_files_matched_scope {
             category_summary["total_analyzed_lines"] = serde_json::json!(0);
             category_summary["duplicated_percent"] = serde_json::json!(0.0);
@@ -1836,6 +1848,14 @@ fn build_inspect_payload(
             }
         }
         summary.insert(category.as_str().to_string(), category_summary);
+        if dead_code_unavailable {
+            // No analysis ran, so there is no findings list to show; an empty
+            // list would read as "no dead code".
+            if sections.includes(*category) {
+                details.insert(category.as_str().to_string(), Value::Null);
+            }
+            continue;
+        }
         if sections.includes(*category) {
             let detail = details_for(*category, payload, top_k);
             let total_count = payload
@@ -2200,7 +2220,22 @@ fn render_symbol_category(
             .get("callgraph_unavailable_reason")
             .and_then(Value::as_str)
             .unwrap_or("no callgraph");
-        lines.push(format!("Dead code analysis unavailable ({reason})"));
+        match (
+            section.get("code").and_then(Value::as_str),
+            section.pointer("/index/status").and_then(Value::as_str),
+        ) {
+            (Some(code), Some(status)) => {
+                let cause = section
+                    .pointer("/index/reason")
+                    .and_then(Value::as_str)
+                    .map(|cause| format!(": {cause}"))
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "Dead code analysis unavailable ({code}; callgraph index {status}{cause})"
+                ));
+            }
+            _ => lines.push(format!("Dead code analysis unavailable ({reason})")),
+        }
         return;
     }
     if let Some(status) = section.get("status").and_then(Value::as_str) {
@@ -2852,6 +2887,60 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// True when the dead-code aggregate could not run because the callgraph was
+/// not usable.
+fn dead_code_callgraph_unavailable(payload: &Value) -> bool {
+    payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+}
+
+/// Mark an unavailable dead-code summary with the analysis code, the callgraph
+/// index status and cause, and null findings, so it can never read as zero
+/// findings. Other analyses in the same inspect response are unaffected.
+///
+/// `observation` is the callgraph plane's current state. When the plane now
+/// reports ready but this aggregate was computed without a usable graph, the
+/// analysis is still unavailable; its cause comes from the aggregate.
+fn annotate_dead_code_unavailable(
+    summary: &mut Value,
+    payload: &Value,
+    observation: crate::feature_status::IndexObservation,
+) {
+    use crate::feature_status::{cause, IndexEffective, IndexObservation};
+    let observation = if observation.is_ready() {
+        IndexObservation::unavailable(
+            payload
+                .get("callgraph_unavailable_reason")
+                .and_then(Value::as_str)
+                .unwrap_or(cause::RUNTIME_NOT_OBSERVED),
+        )
+    } else {
+        observation
+    };
+    let code = match observation.effective {
+        IndexEffective::Off => "callgraph_off",
+        IndexEffective::Building => "callgraph_building",
+        IndexEffective::Ready | IndexEffective::Unavailable => "callgraph_unavailable",
+    };
+    summary["status"] = serde_json::json!("unavailable");
+    summary["code"] = serde_json::json!(code);
+    summary["index"] = observation.consumer_json();
+    summary["findings"] = Value::Null;
+}
+
+#[cfg(test)]
+pub(crate) fn summary_for_test(category: InspectCategory, payload: &Value) -> Value {
+    summary_for(category, payload)
+}
+
+#[cfg(test)]
+pub(crate) fn annotate_dead_code_unavailable_for_test(
+    summary: &mut Value,
+    payload: &Value,
+    observation: crate::feature_status::IndexObservation,
+) {
+    annotate_dead_code_unavailable(summary, payload, observation);
 }
 
 fn summary_for(category: InspectCategory, payload: &Value) -> Value {

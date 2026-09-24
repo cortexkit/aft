@@ -149,6 +149,16 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
         ));
     }
 
+    // Disclose the trigram index state and whether this answer came from a
+    // filesystem walk instead of the index. A missing or building index never
+    // turns into "no matches": the walk above still searched every file.
+    body["index"] = trigram_index_disclosure(ctx);
+    body["fallback"] = if result.index_status == IndexStatus::Ready {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String("filesystem".to_string())
+    };
+
     if let Some(envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
         body["matches_list_envelope"] = serde_json::to_value(&envelope).unwrap_or_default();
     }
@@ -181,6 +191,18 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     Response::success(&req.id, body)
+}
+
+/// `{"trigram": {status, reason}}` for grep/glob responses, from the shared
+/// engine observation. Reading it never starts a build.
+pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
+    serde_json::json!({
+        "trigram": crate::feature_status::observed_index_status(
+            ctx,
+            crate::feature_status::IndexPlane::Trigram,
+        )
+        .consumer_json(),
+    })
 }
 
 pub(crate) fn format_grep_text(result: &GrepResult, project_root: &Path) -> String {
