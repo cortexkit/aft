@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-wire-goldens",
+    "opencode2-onnx-bootstrap"
+  ],
+  "note": "No ranking-fence file changed. The train adds gh-shim wire captures with a drift test, deletes a stale gh.route fixture, and moves OpenCode plugin startup (ONNX Runtime resolution and configure overrides) into one bootstrap shared by the V1 and V2 entries."
+}
