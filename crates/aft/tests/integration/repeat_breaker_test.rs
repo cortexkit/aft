@@ -527,6 +527,54 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
 }
 
 #[test]
+fn repeat_breaker_counts_a_previewed_mutation_once() {
+    // Hoisted mutations send a preview and then the apply for one model call.
+    // Two genuine identical writes 31 s apart are two occurrences, below the
+    // three the breaker needs. Counting previews made them four, and the
+    // breaker fired on the second write claiming drifting output.
+    let project = tempfile::tempdir().expect("preview repeat project");
+    let target = project.path().join("notes.txt");
+    let mut aft = AftProcess::spawn();
+    aft.configure(project.path());
+    let mut texts = Vec::new();
+
+    for cycle in 0..2 {
+        for preview in [true, false] {
+            let mut request = json!({
+                "id": format!("preview-repeat-{cycle}-{preview}"),
+                "command": "tool_call",
+                "session_id": SESSION,
+                "name": "write",
+                "arguments": { "path": target, "content": "same body\n" },
+            });
+            if preview {
+                request["preview"] = json!(true);
+            }
+            let response = aft.send_with_timeout(
+                &serde_json::to_string(&request).expect("serialize write request"),
+                Duration::from_secs(10),
+            );
+            assert!(
+                response["success"].as_bool().unwrap_or(false),
+                "write must succeed: {response:?}"
+            );
+            texts.push(response["text"].as_str().unwrap_or_default().to_string());
+        }
+        if cycle == 0 {
+            std::thread::sleep(Duration::from_secs(31));
+        }
+    }
+
+    for (index, text) in texts.iter().enumerate() {
+        assert!(
+            !text.contains("<system-reminder>"),
+            "call {index} must not steer after two genuine writes: {text:?}"
+        );
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn repeat_breaker_escalates_from_sixth_call() {
     let breaker = RepeatBreaker::default();
     let start = Instant::now();

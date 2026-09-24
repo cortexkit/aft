@@ -487,7 +487,12 @@ pub fn run_tool_call(
     // decorations carry moving counts, so hashing afterward would make identical results appear
     // different forever and silently prevent the breaker from firing.
     let output_hash = crate::response_finalize::repeat_breaker::output_hash(&result.text);
-    let intervention = if crate::subc::is_subc_native_plumbing_tool(bare_name) {
+    // A preview is the first half of a hoisted mutation (`write`, `edit`,
+    // `apply_patch`): the plugin previews, asks for permission, then applies,
+    // all for one model call. Counting the preview as well would count every
+    // mutation twice, fire on the second genuine repeat, and misread the
+    // preview's different text as drifting output.
+    let intervention = if crate::subc::is_subc_native_plumbing_tool(bare_name) || ctx.preview {
         None
     } else {
         app_ctx
