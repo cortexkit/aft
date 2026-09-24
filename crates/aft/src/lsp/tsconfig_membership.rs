@@ -138,7 +138,7 @@ struct Field<T> {
 
 #[derive(Debug, Clone, Default)]
 struct RawTsConfig {
-    extends: Option<String>,
+    extends: Vec<String>,
     files: Option<Vec<String>>,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
@@ -194,17 +194,28 @@ fn resolve_tsconfig_fields(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    let mut resolved = if let Some(extends) = raw.extends.as_deref() {
+    let mut resolved = ResolvedFields::default();
+    for extends in &raw.extends {
         let parent = resolve_extends_path(&origin_dir, extends).ok_or_else(|| {
             format!(
                 "unsupported or missing tsconfig extends '{extends}' from {}",
                 tsconfig_path.display()
             )
         })?;
-        resolve_tsconfig_fields(&parent, depth + 1, visiting)?
-    } else {
-        ResolvedFields::default()
-    };
+        let fields = resolve_tsconfig_fields(&parent, depth + 1, visiting)?;
+        if fields.files.is_some() {
+            resolved.files = fields.files;
+        }
+        if fields.include.is_some() {
+            resolved.include = fields.include;
+        }
+        if fields.exclude.is_some() {
+            resolved.exclude = fields.exclude;
+        }
+        if fields.out_dir.is_some() {
+            resolved.out_dir = fields.out_dir;
+        }
+    }
 
     if let Some(files) = raw.files {
         resolved.files = Some(Field {
@@ -243,7 +254,15 @@ fn parse_tsconfig(tsconfig_path: &Path) -> Result<RawTsConfig, String> {
         .map_err(|err| format!("parse {}: {err}", tsconfig_path.display()))?;
 
     Ok(RawTsConfig {
-        extends: string_field(&value, "extends"),
+        extends: match value.get("extends") {
+            Some(Value::String(single)) => vec![single.clone()],
+            Some(Value::Array(array)) => array
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        },
         files: string_array_field(&value, "files"),
         include: string_array_field(&value, "include"),
         exclude: string_array_field(&value, "exclude"),
@@ -377,25 +396,98 @@ fn resolve_extends_path(origin_dir: &Path, extends: &str) -> Option<PathBuf> {
     }
 
     let raw_path = Path::new(raw);
-    if !raw_path.is_absolute()
-        && !raw.starts_with("./")
-        && !raw.starts_with("../")
-        && raw != "."
-        && raw != ".."
+    if raw_path.is_absolute()
+        || raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw == "."
+        || raw == ".."
+    {
+        let base = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            origin_dir.join(raw_path)
+        };
+        return find_extends_candidate(&base);
+    }
+
+    // TypeScript resolves package extends with nodeNextJsonConfigResolver:
+    // https://github.com/microsoft/TypeScript/blob/v5.9.3/src/compiler/commandLineParser.ts#L3612-L3644
+    // Reject traversal before joining an untrusted specifier.
+    let normalized = raw.replace('\\', "/");
+    if normalized
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+        || normalized.starts_with('/')
     {
         return None;
     }
+    let mut directory = origin_dir;
+    loop {
+        let node_modules = directory.join("node_modules");
+        // A symlinked node_modules must not turn an ancestor lookup into a
+        // read outside that ancestor's tree.
+        if node_modules.exists()
+            && !canonical_or_normalized(&node_modules)
+                .starts_with(canonical_or_normalized(directory))
+        {
+            directory = directory.parent()?;
+            continue;
+        }
+        let base = node_modules.join(&normalized);
+        if let Some(found) = find_package_extends_candidate(&base, &normalized, &node_modules) {
+            return Some(found);
+        }
+        directory = directory.parent()?;
+    }
+}
 
-    let base = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
-    } else {
-        origin_dir.join(raw_path)
-    };
-
-    extends_candidates(&base)
+fn find_extends_candidate(base: &Path) -> Option<PathBuf> {
+    extends_candidates(base)
         .into_iter()
         .find(|candidate| candidate.is_file())
         .map(|candidate| canonical_or_normalized(&candidate))
+}
+
+fn find_package_extends_candidate(
+    base: &Path,
+    specifier: &str,
+    node_modules: &Path,
+) -> Option<PathBuf> {
+    // TypeScript checks package.json's `tsconfig` field before tsconfig.json:
+    // https://github.com/microsoft/TypeScript/blob/v5.9.3/src/compiler/moduleNameResolver.ts#L2481-L2544
+    // Scoped names have two segments; unscoped names have one.
+    let parts: Vec<_> = specifier.split('/').collect();
+    let package_parts = if parts.first()?.starts_with('@') {
+        2
+    } else {
+        1
+    };
+    if parts.len() == package_parts {
+        let package_dir = parts
+            .iter()
+            .take(package_parts)
+            .fold(node_modules.to_path_buf(), |dir, part| dir.join(part));
+        let package_json = package_dir.join("package.json");
+        if canonical_or_normalized(&package_dir).starts_with(canonical_or_normalized(node_modules))
+            && canonical_or_normalized(&package_json)
+                .starts_with(canonical_or_normalized(node_modules))
+        {
+            if let Ok(source) = fs::read_to_string(package_json) {
+                if let Ok(value) = serde_json::from_str::<Value>(&source) {
+                    if let Some(field) = string_field(&value, "tsconfig") {
+                        let target = package_dir.join(field);
+                        if let Some(found) = find_extends_candidate(&target) {
+                            if found.starts_with(canonical_or_normalized(node_modules)) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    find_extends_candidate(base)
+        .filter(|found| found.starts_with(canonical_or_normalized(node_modules)))
 }
 
 fn extends_candidates(base: &Path) -> Vec<PathBuf> {
@@ -547,6 +639,131 @@ mod tests {
         assert!(!cache.should_skip_diagnostics(&listed));
         // Unlisted file is NOT a member → skipped.
         assert!(cache.should_skip_diagnostics(&unlisted));
+    }
+
+    #[test]
+    fn bare_package_extends_filters_outside_include() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("node_modules/@tsconfig/bun/tsconfig.json"),
+            "{}\n",
+        );
+        write(
+            &root.join("tsconfig.json"),
+            r#"{"extends":"@tsconfig/bun/tsconfig.json","include":["src"]}"#,
+        );
+        let included = root.join("src/a.ts");
+        let excluded = root.join("scripts/b.ts");
+        write(&included, "export const a = 1;\n");
+        write(&excluded, "export const b = 2;\n");
+        let mut cache = TsconfigMembershipCache::new();
+        assert!(!cache.should_skip_diagnostics(&included));
+        assert!(cache.should_skip_diagnostics(&excluded));
+    }
+
+    #[test]
+    fn bare_package_extends_searches_parent_node_modules() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("node_modules/config/tsconfig.json"), "{}\n");
+        write(
+            &root.join("packages/pkg/tsconfig.json"),
+            r#"{"extends":"config","include":["src"]}"#,
+        );
+        let excluded = root.join("packages/pkg/scripts/b.ts");
+        write(&excluded, "export const b = 2;\n");
+        assert!(TsconfigMembershipCache::new().should_skip_diagnostics(&excluded));
+    }
+
+    #[test]
+    fn package_json_tsconfig_field_precedes_default() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("node_modules/config/package.json"),
+            r#"{"tsconfig":"configs/base.json"}"#,
+        );
+        write(
+            &root.join("node_modules/config/configs/base.json"),
+            r#"{"files":["src/a.ts"]}"#,
+        );
+        write(
+            &root.join("node_modules/config/tsconfig.json"),
+            r#"{"include":["scripts"]}"#,
+        );
+        write(&root.join("tsconfig.json"), r#"{"extends":"config"}"#);
+        let included = root.join("node_modules/config/configs/src/a.ts");
+        let excluded = root.join("scripts/b.ts");
+        write(&included, "export const a = 1;\n");
+        write(&excluded, "export const b = 2;\n");
+        let fields =
+            super::resolve_tsconfig_fields(&root.join("tsconfig.json"), 0, &mut Default::default())
+                .unwrap();
+        let project = super::build_resolved_config(root, fields).unwrap();
+        // The inherited files list is relative to its own config, not the child.
+        assert!(project.contains_canonical(&super::canonical_or_normalized(&included)));
+        assert!(!project.contains_canonical(&super::canonical_or_normalized(&excluded)));
+    }
+
+    #[test]
+    fn array_extends_later_parent_overrides_earlier_fields() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("node_modules/first/tsconfig.json"),
+            r#"{"files":["a.ts"]}"#,
+        );
+        write(
+            &root.join("node_modules/second/tsconfig.json"),
+            r#"{"files":["b.ts"]}"#,
+        );
+        write(
+            &root.join("tsconfig.json"),
+            r#"{"extends":["first","second"]}"#,
+        );
+        let a = root.join("node_modules/first/a.ts");
+        let b = root.join("node_modules/second/b.ts");
+        write(&a, "export const a = 1;\n");
+        write(&b, "export const b = 2;\n");
+        let fields =
+            super::resolve_tsconfig_fields(&root.join("tsconfig.json"), 0, &mut Default::default())
+                .unwrap();
+        let project = super::build_resolved_config(root, fields).unwrap();
+        assert!(!project.contains_canonical(&super::canonical_or_normalized(&a)));
+        assert!(project.contains_canonical(&super::canonical_or_normalized(&b)));
+    }
+
+    #[test]
+    fn missing_bare_package_retains_warning_and_fallback() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("tsconfig.json"),
+            r#"{"extends":"not-installed","include":["src"]}"#,
+        );
+        let excluded = root.join("scripts/b.ts");
+        write(&excluded, "export const b = 2;\n");
+        let error =
+            super::resolve_tsconfig_fields(&root.join("tsconfig.json"), 0, &mut Default::default())
+                .unwrap_err();
+        assert!(
+            error.contains("unsupported or missing tsconfig extends 'not-installed'"),
+            "{error}"
+        );
+        assert!(!TsconfigMembershipCache::new().should_skip_diagnostics(&excluded));
+    }
+
+    #[test]
+    fn bare_package_windows_separators_and_traversal() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("node_modules/@tsconfig/bun/tsconfig.json"),
+            "{}\n",
+        );
+        assert!(super::resolve_extends_path(root, "@tsconfig\\bun\\tsconfig.json").is_some());
+        assert!(super::resolve_extends_path(root, "@tsconfig\\..\\outside").is_none());
     }
 
     #[test]

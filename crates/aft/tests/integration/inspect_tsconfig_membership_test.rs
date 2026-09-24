@@ -392,6 +392,33 @@ fn inspect_diagnostics_extends_chain_applies_inherited_exclude() {
 }
 
 #[test]
+fn inspect_diagnostics_bare_package_extends_keeps_membership_filter() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "node_modules/@tsconfig/bun/tsconfig.json", "{}\n");
+    write_file(
+        &root,
+        "pkg/tsconfig.json",
+        r#"{"extends":"@tsconfig/bun/tsconfig.json","include":["src"]}"#,
+    );
+    write_file(&root, "pkg/scripts/b.ts", "export const b = 2;\n");
+    write_file(&root, "pkg/src/a.ts", "export const a = 1;\n");
+    let ctx = configured_context(&root);
+    configure_fake_typescript_lsp(&ctx);
+
+    let excluded = inspect_diagnostics_scope(&ctx, "pkg/scripts/b.ts");
+    assert_eq!(excluded["success"], true, "inspect failed: {excluded:#}");
+    assert!(
+        diagnostics_details(&excluded).is_empty(),
+        "excluded file leaked: {excluded:#}"
+    );
+
+    let included = inspect_diagnostics_scope(&ctx, "pkg/src/a.ts");
+    assert_eq!(included["success"], true, "inspect failed: {included:#}");
+    assert_eq!(included["summary"]["diagnostics"]["errors"], 1);
+    assert_eq!(diagnostics_details(&included)[0]["file"], "pkg/src/a.ts");
+}
+
+#[test]
 fn inspect_diagnostics_no_tsconfig_keeps_current_behavior() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "package.json", "{\"name\":\"no-tsconfig\"}\n");
