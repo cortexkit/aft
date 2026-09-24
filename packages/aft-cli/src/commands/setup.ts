@@ -4,14 +4,20 @@ import { CLI } from "../lib/cli.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
 import { ensureAftSchemaUrl } from "../lib/jsonc.js";
 import { intro, log, note, outro } from "../lib/prompts.js";
+import { type FeatureSetupDeps, featureMode, runFeatureSetup } from "../setup/feature-wizard.js";
 import { formatHostGenerations, type OpenCodeHostDetection } from "../setup/host-generation.js";
 
 export interface SetupOptions {
   resolveAdapters?: typeof resolveAdaptersForCommand;
   detectOpenCodeHost?: () => OpenCodeHostDetection;
+  /** Overrides for the feature step (native runner, prompts). */
+  features?: FeatureSetupDeps;
 }
 
 export async function runSetup(argv: string[], options: SetupOptions = {}): Promise<number> {
+  // `--plan` prints the binary's plan and nothing else, so stdout stays JSON.
+  if (featureMode(argv) === "plan") return runFeatureSetup(argv, options.features);
+
   intro(`${CLI} setup`);
 
   const adapters = await (options.resolveAdapters ?? resolveAdaptersForCommand)(argv, {
@@ -101,6 +107,12 @@ export async function runSetup(argv: string[], options: SetupOptions = {}): Prom
 
     printNextSteps(adapter);
   }
+
+  // Feature choices live in the shared user config, so they are asked once
+  // per run rather than once per harness.
+  log.step("Features");
+  const featureStatus = await runFeatureSetup(argv, options.features);
+  if (featureStatus !== 0) anyFailure = true;
 
   if (anyFailure) {
     outro("Setup finished with warnings — see above.");

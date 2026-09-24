@@ -42,6 +42,13 @@ import {
   renderDiagnosticsMarkdown,
   tailLogFile,
 } from "../lib/diagnostics.js";
+import {
+  explicitHarness,
+  loadFeaturePlan,
+  type NativeRunner,
+  runConfigFix,
+  runNative,
+} from "../lib/feature-plan.js";
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
@@ -62,6 +69,11 @@ import { confirm, intro, log, note, outro, selectMany, selectOne, text } from ".
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
+import {
+  type FeatureSetupDeps,
+  renderFeatureStatus,
+  runFeatureSetup,
+} from "../setup/feature-wizard.js";
 import { formatHostGenerations, type OpenCodeHostDetection } from "../setup/host-generation.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
@@ -96,6 +108,12 @@ export interface DoctorOptions {
   detectOpenCodeHost?: () => OpenCodeHostDetection;
   /** Optional ONNX repair override lets tests exercise --fix without a download. */
   applyOnnxFix?: typeof runOnnxFix;
+  /** `doctor --reconfigure`: rerun the feature wizard. */
+  reconfigure?: boolean;
+  /** Native binary runner for the feature plan and config migration (tests stub it). */
+  runNative?: NativeRunner;
+  /** Overrides for the reconfigure wizard's prompts. */
+  features?: FeatureSetupDeps;
 }
 
 function openCodeAdapter(adapters: HarnessAdapter[]): HarnessAdapter | undefined {
@@ -200,6 +218,13 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   }
   intro(`${CLI} doctor`);
 
+  if (options.reconfigure) {
+    return runFeatureSetup(
+      options.argv.filter((arg) => arg !== "--reconfigure"),
+      { ...options.features, run: options.runNative ?? options.features?.run },
+    );
+  }
+
   if (options.fix) {
     return runFixFlow(
       options.argv,
@@ -207,6 +232,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       options.resolveAdapters,
       options.collectDiagnostics,
       options.applyOnnxFix,
+      options.runNative,
     );
   }
 
@@ -272,6 +298,8 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   );
   logBuildBreakerSuspensions(report);
 
+  const featuresFailed = logFeatureStatus(options.argv, options.runNative);
+
   log.step("If you remove AFT");
   for (const line of renderRemovalSection(removalHealth)) {
     log.info(`  ${line}`);
@@ -285,7 +313,8 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     );
   }
 
-  const hadProblems = hasDoctorProblems(report) || Boolean(opencodeDoctor?.problems.length);
+  const hadProblems =
+    hasDoctorProblems(report) || Boolean(opencodeDoctor?.problems.length) || featuresFailed;
   for (const h of report.harnesses) {
     log.step(`${h.displayName}`);
     if (!h.hostInstalled) {
@@ -1032,6 +1061,7 @@ async function runFixFlow(
   resolveAdapters: typeof resolveAdaptersForCommand = resolveAdaptersForCommand,
   collect: typeof collectDiagnostics = collectDiagnostics,
   applyOnnxFix: typeof runOnnxFix = runOnnxFix,
+  runNativeFn: NativeRunner = runNative,
 ): Promise<number> {
   const adapters = await resolveAdapters(argv, {
     allowMulti: false,
@@ -1138,11 +1168,16 @@ async function runFixFlow(
   // Apply the ONNX Runtime repair when diagnostics found a managed-runtime issue.
   const onnxResult = await applyOnnxFix(adapters, report, { yes: true });
 
+  // Rewrite retired config keys to their canonical replacements. This is the
+  // only path allowed to repair configuration that ordinary loading rejects.
+  const configSummary = applyConfigMigration(runNativeFn);
+
   const applied: string[] = [];
   if (pluginEntrySummary.changed > 0) applied.push("plugin registration");
   if (pluginUpdateSummary.updated > 0) applied.push("plugin package update");
   if (storageSummary.created > 0) applied.push("AFT storage directory");
   if (schemaSummary.changed > 0) applied.push("AFT config $schema");
+  if (configSummary.changed > 0) applied.push("AFT config migration");
   if (binaryDownloaded) applied.push("aft binary download");
   if ((onnxResult?.installed ?? 0) > 0) applied.push("ONNX Runtime install");
 
@@ -1159,6 +1194,8 @@ async function runFixFlow(
     storageSummary.errors === 0 &&
     schemaSummary.changed === 0 &&
     schemaSummary.errors === 0 &&
+    configSummary.changed === 0 &&
+    configSummary.errors === 0 &&
     pluginEntrySummary.changed === 0 &&
     pluginEntrySummary.errors === 0 &&
     pluginUpdateSummary.updated === 0 &&
@@ -1178,6 +1215,7 @@ async function runFixFlow(
     binaryDownloadError !== null ||
     storageSummary.errors > 0 ||
     schemaSummary.errors > 0 ||
+    configSummary.errors > 0 ||
     pluginEntrySummary.errors > 0 ||
     pluginUpdateSummary.errors > 0;
   const afterReport = await collect(adapters);
@@ -1201,6 +1239,51 @@ async function runFixFlow(
 function logDoctorFixSummary(applied: string[], skipped: string[]): void {
   log.info(applied.length > 0 ? `Applied: ${applied.join(", ")}.` : "Applied: no changes.");
   if (skipped.length > 0) log.warn(`Skipped: ${skipped.join("; ")}.`);
+}
+
+/**
+ * Report every catalog feature with the same states `aft setup --plan`
+ * derives (configured/source, effective, derivation reason, unavailable
+ * cause). Returns true when ordinary loading rejects the configuration; a
+ * missing or older binary that cannot produce a plan is only a warning,
+ * because the binary check reports it separately.
+ */
+function logFeatureStatus(argv: string[], run: NativeRunner = runNative): boolean {
+  log.step("Features");
+  const loaded = loadFeaturePlan(explicitHarness(argv), run);
+  if (!loaded.ok) {
+    const message = `  ${loaded.error.split("\n").join("\n  ")}`;
+    if (loaded.configRejected) log.error(message);
+    else log.warn(message);
+    return loaded.configRejected;
+  }
+  if (loaded.warnings) log.warn(`  ${loaded.warnings}`);
+  for (const line of renderFeatureStatus(loaded.plan)) log.info(`  ${line}`);
+  return false;
+}
+
+/** Run the config migration and log each file's outcome. */
+function applyConfigMigration(run: NativeRunner): { changed: number; errors: number } {
+  const result = runConfigFix(run);
+  if (!result.ok) {
+    log.error(`AFT config migration failed: ${result.error}`);
+    return { changed: 0, errors: 1 };
+  }
+  let changed = 0;
+  let errors = 0;
+  for (const file of result.files) {
+    if (file.status === "rewritten") {
+      changed += 1;
+      log.success(`Migrated ${file.tier} config ${file.path}`);
+    } else if (file.status === "failed") {
+      errors += 1;
+      log.error(
+        `Could not migrate ${file.tier} config ${file.path}: ${file.error ?? "unknown error"}`,
+      );
+    }
+    for (const line of file.notes) log.warn(`  ${line}`);
+  }
+  return { changed, errors };
 }
 
 function logDoctorIssues(report: DiagnosticReport): void {

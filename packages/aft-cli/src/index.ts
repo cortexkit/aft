@@ -19,12 +19,18 @@ function printHelp(): void {
   console.log("");
   console.log("  Commands:");
   console.log("    --version        Show CLI, binary, and per-harness plugin versions");
-  console.log("    setup            Interactive setup wizard");
+  console.log("    setup            Interactive setup wizard (plugin registration and features)");
+  console.log("    setup --plan     Print the feature plan as JSON");
+  console.log("    setup --yes      Save proposed feature defaults without prompting");
+  console.log("    setup --answers <file>  Save feature choices from an answers file");
   console.log("    index            Build one configured index snapshot (no scheduler)");
   console.log("    doctor           Check and fix configuration issues");
   console.log("    doctor --profile [seconds]  Profile a running AFT daemon");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
-  console.log("    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch)");
+  console.log(
+    "    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch, retired config keys)",
+  );
+  console.log("    doctor --reconfigure  Rerun the feature wizard");
   console.log("    doctor --clear   Select caches to clear with an interactive prompt");
   console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
   console.log(
@@ -86,7 +92,8 @@ async function main(): Promise<number> {
     const clear = args.includes("--clear");
     const fix = args.includes("--fix");
     const issue = args.includes("--issue");
-    return runDoctor({ clear, fix, force, issue, argv: args });
+    const reconfigure = args.includes("--reconfigure");
+    return runDoctor({ clear, fix, force, issue, reconfigure, argv: args });
   }
   printHelp();
   return command ? 1 : 0;

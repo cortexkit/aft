@@ -741,6 +741,75 @@ describe("OpenCode doctor generation and load path", () => {
     expect(output).not.toContain("required exact pin");
   });
 
+  test("reports every plan feature, and a rejected config as a problem", async () => {
+    const root = tempRoot("aft-cli-doctor-features-");
+    const fixture = doctorFixture(root, `${AFT_OPENCODE_PACKAGE}@latest`, "v1");
+    writeFileSync(fixture.harness.logFile.path, "load path: root-default\n");
+    const plan = {
+      plan_version: 1,
+      features: [
+        {
+          id: "indexes.trigram",
+          kind: "index",
+          group: "Indexes",
+          order: 24,
+          label: "Trigram index",
+          description: "d",
+          binding: { path: "indexes.trigram", tool_name: null },
+          default: true,
+          configured: true,
+          source: "default",
+          proposed: true,
+          effective: "unavailable",
+          reason: "default",
+          available: false,
+          unavailable_reason: "runtime_not_observed",
+          cost_note: null,
+          prerequisites: [],
+        },
+      ],
+    };
+    const base = {
+      clear: false,
+      fix: false,
+      force: false,
+      issue: false,
+      argv: ["--harness", "opencode"],
+      resolveAdapters: async () => [fixture.adapter],
+      collectDiagnostics: async () => fixture.report,
+      collectRemovalHealth: async () => ({ available: false, message: "fixture" }),
+      detectOpenCodeHost: () => detection("v1"),
+    };
+    const calls: string[][] = [];
+    let lines = captureOutput();
+    const code = await runDoctor({
+      ...base,
+      runNative: (args) => {
+        calls.push(args);
+        return { ok: true, stdout: JSON.stringify(plan), stderr: "", status: 0 };
+      },
+    });
+    expect(code).toBe(0);
+    expect(calls).toEqual([["setup", "--plan", "--harness", "opencode"]]);
+    expect(lines.join("\n")).toContain(
+      "indexes.trigram: unavailable — configured on (default); reason: default; unavailable: runtime_not_observed",
+    );
+
+    lines = captureOutput();
+    const rejected = await runDoctor({
+      ...base,
+      runNative: () => ({
+        ok: false,
+        stdout: "",
+        stderr:
+          "removed_config_key:gh_read:use:github.read\nAFT cannot load this configuration. Run `aft doctor --fix` to migrate it, then rerun setup.",
+        status: 1,
+      }),
+    });
+    expect(rejected).toBe(1);
+    expect(lines.join("\n")).toContain("removed_config_key:gh_read:use:github.read");
+  });
+
   test("accepts an explicit semver registration on V1", () => {
     const root = tempRoot("aft-cli-doctor-v1-semver-");
     const fixture = doctorFixture(root, pinnedPluginEntry(getSelfVersion()), "v1");
