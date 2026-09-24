@@ -36,9 +36,7 @@ async function enableZoomSurface(env: PiIsolatedEnv): Promise<void> {
   await writeFile(
     join(env.workdir, ".pi", "aft.jsonc"),
     JSON.stringify({
-      tool_surface: "all",
-      search_index: true,
-      semantic_search: false,
+      indexes: { semantic: false },
       url_fetch_allow_private: true,
     }),
     "utf8",

@@ -14,22 +14,24 @@ import {
   startAimock,
 } from "./helpers";
 
+// This suite exercises every AFT tool, including aft_delete and aft_move,
+// which are disabled by default. An explicit empty disable list in the user
+// config registers all of them. A project config cannot do this: a project
+// may disable tools but never enable one.
+const ALL_TOOLS_USER_CONFIG = { disabled_tools: [] };
+
 async function enableAllToolSurface(env: PiIsolatedEnv): Promise<void> {
   await mkdir(join(env.workdir, ".pi"), { recursive: true });
   await writeFile(
     join(env.workdir, ".pi", "aft.jsonc"),
-    JSON.stringify({ tool_surface: "all", search_index: true, semantic_search: false }),
+    JSON.stringify({ indexes: { semantic: false } }),
     "utf8",
   );
 }
 
 async function enableAllToolSurfaceWithSearch(env: PiIsolatedEnv): Promise<void> {
   await mkdir(join(env.workdir, ".pi"), { recursive: true });
-  await writeFile(
-    join(env.workdir, ".pi", "aft.jsonc"),
-    JSON.stringify({ tool_surface: "all", search_index: true, semantic_search: true }),
-    "utf8",
-  );
+  await writeFile(join(env.workdir, ".pi", "aft.jsonc"), JSON.stringify({}), "utf8");
 }
 
 function resultText(event: Record<string, unknown>): string {
@@ -160,6 +162,7 @@ async function withPiTool(
       aftPluginDir: resolvePiPluginDir(),
       configDir: env.configDir,
       workdir: env.workdir,
+      aftConfigOverrides: ALL_TOOLS_USER_CONFIG,
     });
     client = spawned.client;
     expect(spawned.child.pid).toBeGreaterThan(0);
@@ -350,6 +353,7 @@ describe("AFT Pi tools (real Pi RPC)", () => {
         aftPluginDir: resolvePiPluginDir(),
         configDir: env.configDir,
         workdir: env.workdir,
+        aftConfigOverrides: ALL_TOOLS_USER_CONFIG,
       });
       client = spawned.client;
       const seenToolCallIds = new Set<string>();
@@ -567,6 +571,7 @@ describe("AFT Pi tools (real Pi RPC)", () => {
         aftPluginDir: resolvePiPluginDir(),
         configDir: env.configDir,
         workdir: env.workdir,
+        aftConfigOverrides: ALL_TOOLS_USER_CONFIG,
       });
       client = spawned.client;
       expect(
@@ -653,6 +658,7 @@ describe("AFT Pi tools (real Pi RPC)", () => {
         aftPluginDir: resolvePiPluginDir(),
         configDir: env.configDir,
         workdir: env.workdir,
+        aftConfigOverrides: ALL_TOOLS_USER_CONFIG,
       });
       client = spawned.client;
       expect(
