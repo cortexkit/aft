@@ -7,39 +7,6 @@
   ],
   "entries": [
     {
-      "path": "ARCHITECTURE.md",
-      "line": 48,
-      "column": 90,
-      "token": "filePath",
-      "text": "- Contains: Hoisted tools (edit/write/apply_patch; where read, write, and edit advertise filePath to satisfy OpenCode's host UI header display contract while accepting path), reading tools, import tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, search tools, semantic tools (governed by isolated `aft_search` host permission checks independent from `grep`), inspect tools, permissions helpers, and the `callToolCall` transport wrapper (`packages/opencode-plugin/src/tools/_shared.ts`)",
-      "location": "line 48, column 90",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "ARCHITECTURE.md",
-      "line": 55,
-      "column": 114,
-      "token": "filePath",
-      "text": "- Contains: Hoisted tools (read/write/edit/grep) supporting cross-harness compatibility aliases (e.g. accepting `filePath` for `path` or vice versa), reading tools, import tools, structure tools, navigation tools, refactoring tools, safety tools, bash tools, conflict tools, AST tools, inspect tools, semantic tools, render helpers, diff-format helper, the `callToolCall` transport wrapper (`packages/pi-plugin/src/tools/_shared.ts`), and harness-aware registration funnel (`packages/pi-plugin/src/tool-registration.ts`) supporting `pi.tool_presentation` (\"top_level\" vs \"host_default\") and OMP tool description guidance folding",
-      "location": "line 55, column 114",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "STRUCTURE.md",
-      "line": 137,
-      "column": 53,
-      "token": "filePath",
-      "text": "- Contains: Thin adapters for hoisted (advertising `filePath` on OpenCode for read/write/edit to honor host UI header display contract), reading, import, navigation, refactor, safety, bash, conflict, AST, search, semantic, and inspect tools; permissions and internals helpers",
-      "location": "line 137, column 53",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
       "path": "benchmarks/codegraph-replication/src/drivers.ts",
       "line": 159,
       "column": 40,
