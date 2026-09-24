@@ -146,12 +146,17 @@ fn project(actual: &Value, expected: &Value) -> Value {
     Value::Object(out)
 }
 
+/// Root-relative path with `/` separators, the form the shared fixtures use.
+/// The engine reports native paths, so on Windows this turns `src\example.ts`
+/// into `src/example.ts` for the comparison only.
 fn relative(root: &Path, path: &str) -> String {
     Path::new(path)
         .strip_prefix(root)
         .unwrap_or(Path::new(path))
-        .display()
-        .to_string()
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 const NEEDLE_FILE: (&str, &str) = ("src/example.ts", "needle\n");
