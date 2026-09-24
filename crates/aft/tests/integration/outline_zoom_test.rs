@@ -585,23 +585,15 @@ function unused(): void {
         "content should include outgoing call: {content}"
     );
 
-    let calls_out = resp["annotations"]["calls_out"].as_array().unwrap();
-    assert_eq!(
-        calls_out.len(),
-        1,
-        "compute should have one known outgoing call: {calls_out:?}"
-    );
-    assert_eq!(calls_out[0]["name"], "helper");
-    assert_eq!(calls_out[0]["line"], 6);
-
-    let called_by = resp["annotations"]["called_by"].as_array().unwrap();
-    assert_eq!(
-        called_by.len(),
-        1,
-        "compute should have one known caller: {called_by:?}"
-    );
-    assert_eq!(called_by[0]["name"], "orchestrate");
-    assert_eq!(called_by[0]["line"], 11);
+    // No callgraph index is observed in this bare process, so the ordinary zoom
+    // comes back with an explicitly unavailable callgraph field instead of
+    // call lists (the lists themselves are covered by the zoom unit tests over
+    // a ready callgraph).
+    assert_eq!(resp["annotations"]["status"], "unavailable");
+    assert_eq!(resp["annotations"]["code"], "callgraph_unavailable");
+    assert_eq!(resp["annotations"]["index"]["status"], "unavailable");
+    assert!(resp["annotations"]["calls_out"].is_null());
+    assert!(resp["annotations"]["called_by"].is_null());
 
     let status = aft.shutdown();
     assert!(status.success());

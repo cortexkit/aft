@@ -7198,7 +7198,9 @@ impl AppContext {
         }
     }
 
-    fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot> {
+    pub(crate) fn try_semantic_backend_health_snapshot(
+        &self,
+    ) -> Option<EmbeddingBackendHealthSnapshot> {
         let outage = self
             .semantic_refresh_circuit
             .backend_outage

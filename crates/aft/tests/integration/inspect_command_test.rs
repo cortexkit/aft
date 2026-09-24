@@ -853,7 +853,10 @@ fn inspect_dead_code_fresh_result_has_no_unavailable_status() {
         "src/main.ts",
         "export function live() { return 1; }\n",
     );
-    let ctx = configured_context(&root);
+    // A fresh dead-code result needs a usable callgraph; with the callgraph
+    // index off the analysis is reported unavailable instead.
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
 
     let response = inspect(
         &ctx,

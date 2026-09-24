@@ -351,9 +351,12 @@ fn cli_snapshot_daemonless_query_discloses_stale_snapshot() {
         &search_request(standing_root.path()),
         &session_bound,
     ));
+    // The session-bound context has not loaded any index lane of its own, so
+    // aft_search refuses with each lane's status rather than walking; either
+    // way it must not borrow the CLI snapshot's staleness disclosure.
     assert_eq!(
-        session_response["success"], true,
-        "session-bound query failed: {session_response:?}"
+        session_response["code"], "search_lanes_unavailable",
+        "session-bound query: {session_response:?}"
     );
     assert!(
         !has_stale_snapshot_warning(&session_response),

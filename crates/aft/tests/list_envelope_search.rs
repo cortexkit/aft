@@ -553,6 +553,12 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         aft::context::SemanticIndexStatus::Disabled;
+    // aft_search refuses when no index lane is ready; serve from a ready
+    // trigram lane.
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(aft::search_index::SearchIndex::build(project_root));
 
     // Search with top_k = 3 (less than 6 matches) -> more_available = true
     let req: aft::protocol::RawRequest = serde_json::from_value(json!({
@@ -566,27 +572,21 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
     let resp = aft::commands::semantic_search::handle_semantic_search(&req, &ctx);
     assert!(resp.success);
     assert_eq!(resp.data["more_available"], true);
-    assert_eq!(resp.data["engine_capped"], true);
     assert_eq!(resp.data["result_count"], 3);
 
-    // The degraded walk owns the envelope projection; telemetry flags remain separate.
+    // Served by the ready trigram lane (aft_search refuses when no lane is
+    // ready, so the old no-index degraded walk is no longer reached here):
+    // the envelope still reports the page against the full match count.
     let env_val = resp
         .data
         .get("results_list_envelope")
         .expect("envelope must be attached");
     let env: ListEnvelope = serde_json::from_value(env_val.clone()).unwrap();
     assert_eq!(env.shown, 3);
-    assert_eq!(env.total, Total::AtLeast(4));
-    assert_eq!(env.reason, Some(Reason::Walk));
-    assert_eq!(env.causes, vec![Reason::Walk, Reason::Budget, Reason::Cap]);
+    assert_eq!(env.total, Total::Exact(6));
     assert_eq!(env.unit, Unit::Results);
 
-    // Formatted subc response renders trailer
-    let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &FormatContext::default());
-    assert!(formatted
-        .contains("shown 3 of ≥4 results (walk) · narrow: offset, topK, path, includeTests"));
-
-    // Now search with top_k = 10 (greater than 6 matches) -> more_available = false, complete
+    // top_k = 10 (greater than 6 matches) -> the page is complete.
     let req_complete: aft::protocol::RawRequest = serde_json::from_value(json!({
         "id": "live-search-2",
         "command": "semantic_search",
@@ -598,19 +598,5 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
     let resp_complete = aft::commands::semantic_search::handle_semantic_search(&req_complete, &ctx);
     assert!(resp_complete.success);
     assert_eq!(resp_complete.data["more_available"], false);
-    assert_eq!(resp_complete.data["engine_capped"], false);
-    let complete_envelope: ListEnvelope =
-        serde_json::from_value(resp_complete.data["results_list_envelope"].clone())
-            .expect("degraded walk carries its shared envelope");
-    assert_eq!(complete_envelope.reason, Some(Reason::Walk));
-    assert_eq!(complete_envelope.total, Total::AtLeast(6));
-    let formatted_complete =
-        format_response_with_context(SEARCH_COMMAND, &resp_complete, &FormatContext::default());
-    assert_eq!(
-        formatted_complete
-            .lines()
-            .filter(|line| line.starts_with("shown "))
-            .collect::<Vec<_>>(),
-        ["shown 6 of ≥6 results (walk) · narrow: offset, topK, path, includeTests"]
-    );
+    assert_eq!(resp_complete.data["result_count"], 6);
 }

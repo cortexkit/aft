@@ -99,12 +99,10 @@ fn wait_for_ready_search(aft: &mut AftProcess, query: &str) -> Value {
 }
 
 #[test]
-fn semantic_search_falls_back_to_lexical_when_disabled_without_index() {
-    // When semantic search is disabled, a natural-language query degrades to a
-    // lexical grep fallback (council #5 design) so the agent is not stranded with
-    // zero results. The fallback is honest: it reports semantic_status "disabled"
-    // and interpreted_as "literal" alongside whatever lexical results it finds.
-    // Use an empty project directory so the path is deterministic regardless of cwd.
+fn semantic_search_refuses_before_any_index_lane_is_ready() {
+    // With no ready index lane aft_search refuses with search_lanes_unavailable
+    // and each lane's status instead of a degraded lexical grep. Use an empty
+    // project directory so the path is deterministic regardless of cwd.
     let project = setup_project(&[]);
     let previous_cwd = std::env::current_dir().expect("read cwd");
     std::env::set_current_dir(project.path()).expect("set cwd to empty project");
@@ -116,27 +114,23 @@ fn semantic_search_falls_back_to_lexical_when_disabled_without_index() {
         json!({
             "id": "semantic-disabled-fallback",
             "command": "semantic_search",
-            // Natural-language phrasing routes to the degraded lexical fallback
-            // when semantic is disabled.
             "query": "how does request handling work",
         }),
     );
 
     std::env::set_current_dir(&previous_cwd).expect("restore cwd");
 
-    assert_eq!(
-        response["success"], true,
-        "search should succeed: {response:?}"
-    );
-    assert_eq!(response["semantic_status"], "disabled");
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(response["lexical_only_fallback"], true);
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "search_lanes_unavailable");
+    assert_eq!(response["results"], json!([]));
+    assert!(response["lanes"]["trigram"]["status"].is_string());
+    assert!(response["lanes"]["semantic"]["status"].is_string());
 
     let status = aft.shutdown();
     assert!(status.success());
 }
 #[test]
-fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
+fn semantic_search_with_both_index_lanes_off_refuses_with_no_search_lanes_enabled() {
     let project = setup_project(&[("src/lib.rs", "pub fn handle_request() -> bool { true }\n")]);
     let storage = tempfile::tempdir().expect("create storage dir");
     let mut aft = AftProcess::spawn();
@@ -156,15 +150,11 @@ fn semantic_search_falls_back_to_lexical_when_feature_is_off() {
         }),
     );
 
-    // semantic_search: false -> natural-language query degrades to the honest
-    // lexical-only grep fallback (council #5), not a bare "not enabled" error.
-    assert_eq!(
-        response["success"], true,
-        "search should succeed: {response:?}"
-    );
-    assert_eq!(response["semantic_status"], "disabled");
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(response["lexical_only_fallback"], true);
+    // Registration is unaffected: the tool answers, naming both lanes off.
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "no_search_lanes_enabled");
+    assert_eq!(response["lanes"]["trigram"]["status"], "off");
+    assert_eq!(response["lanes"]["semantic"]["status"], "off");
 
     let status = aft.shutdown();
     assert!(status.success());

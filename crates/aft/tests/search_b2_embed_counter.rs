@@ -146,6 +146,12 @@ fn non_semantic_public_rows_never_reach_the_embedding_boundary() {
             ..Config::default()
         },
     );
+    // aft_search refuses when no index lane is ready; serve these rows from a
+    // ready trigram lane.
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(aft::search_index::SearchIndex::build(project.path()));
 
     for (index, query) in cases().zero_embedding_queries.iter().enumerate() {
         for pass in ["cold", "warm"] {

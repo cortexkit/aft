@@ -9370,15 +9370,13 @@ mod tests {
             &semantic_search_request("how does the query reload semantic state"),
             &ctx,
         );
-        assert!(
-            first.success,
-            "degraded search should succeed: {:?}",
-            first.data
-        );
-        assert!(
-            first.data["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("Semantic index is reloading; retry shortly.")),
+        // Trigram is off in this fixture, so while the semantic index reloads
+        // no lane is ready: the query refuses and labels semantic building.
+        assert!(!first.success, "{:?}", first.data);
+        assert_eq!(first.data["code"], json!("search_lanes_unavailable"));
+        assert_eq!(
+            first.data["lanes"]["semantic"],
+            json!({"status": "building", "reason": null}),
             "first query did not disclose the scheduled reload: {:?}",
             first.data
         );
@@ -9391,9 +9389,10 @@ mod tests {
             &semantic_search_request("how does the query reload semantic state"),
             &ctx,
         );
-        assert!(
-            second.success,
-            "building fallback should succeed: {:?}",
+        assert_eq!(
+            second.data["lanes"]["semantic"]["status"],
+            json!("building"),
+            "second query must join the in-flight reload: {:?}",
             second.data
         );
         wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));

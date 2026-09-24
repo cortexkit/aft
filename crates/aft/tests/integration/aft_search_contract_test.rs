@@ -364,6 +364,47 @@ fn install_lexical_index(ctx: &AppContext, source_file: &Path, source: &str) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
 }
 
+/// With neither index lane ready aft_search refuses with
+/// `search_lanes_unavailable`, empty results and each lane's status. The test
+/// contexts never build a trigram index, so that lane is enabled but not
+/// observed.
+fn assert_no_ready_lane_refusal(response: &Value, trigram_status: &str, semantic_status: &str) {
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(
+        response["code"], "search_lanes_unavailable",
+        "response: {response:?}"
+    );
+    assert_eq!(response["results"], serde_json::json!([]));
+    assert_eq!(response["lanes"]["trigram"]["status"], trigram_status);
+    assert_eq!(response["lanes"]["semantic"]["status"], semantic_status);
+    assert_eq!(
+        response["omitted_lanes"],
+        serde_json::json!(["trigram", "semantic"])
+    );
+}
+
+/// Install a ready trigram index over the whole project, so a test can
+/// exercise aft_search routing over a ready lane.
+fn install_project_lexical_index(ctx: &AppContext, project_root: &Path) {
+    let index = SearchIndex::build(project_root);
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+}
+
+/// Mark the semantic lane ready with an empty resident index. aft_search then
+/// has a ready lane while the trigram lane is not, which is when it takes its
+/// walk-based literal/regex routes.
+fn install_ready_semantic_lane(ctx: &AppContext, project_root: &Path) {
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    *ctx.semantic_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(SemanticIndex::new(project_root.to_path_buf(), 3));
+}
+
 fn project_with_repeated_needle_files(
     file_count: usize,
 ) -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>) {
@@ -608,7 +649,9 @@ fn assert_degraded_grep_fallback(response: &Value, semantic_status: &str) {
 }
 
 #[test]
-fn natural_language_auto_falls_back_to_grep_when_semantic_disabled() {
+fn natural_language_query_refuses_when_no_lane_is_ready_and_semantic_disabled() {
+    // With no ready index lane aft_search refuses with each lane's status;
+    // it no longer answers with a degraded filesystem-walk grep.
     let project = tempfile::tempdir().expect("create project dir");
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -619,83 +662,34 @@ fn natural_language_auto_falls_back_to_grep_when_semantic_disabled() {
     )
     .expect("write source file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
+    ctx.update_config(|config| config.indexes.semantic = false);
     let response = response_value(handle_semantic_search(
         &request("how retry logic works"),
         &ctx,
     ));
 
-    assert_eq!(
-        response["success"], true,
-        "natural-language fallback should succeed: {response:?}"
-    );
-    assert_eq!(response["query_kind"], "NaturalLanguage");
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(response["semantic_status"], "disabled");
-    assert_eq!(response["lexical_only_fallback"], true);
-    assert!(
-        response["results"]
-            .as_array()
-            .expect("results array")
-            .iter()
-            .any(|result| result["kind"] == "GrepLine"
-                && result["line_text"]
-                    .as_str()
-                    .is_some_and(|line| line.contains("how retry logic works"))),
-        "expected literal degraded fallback result: {response:?}"
-    );
+    assert_no_ready_lane_refusal(&response, "unavailable", "off");
 }
 
 #[test]
-fn degraded_grep_reports_file_cap_gap_when_scan_limit_reached() {
+fn no_ready_lane_refuses_instead_of_a_capped_degraded_grep() {
+    // With no ready index lane aft_search refuses with each lane's status;
+    // it no longer answers with a degraded filesystem-walk grep.
     let project = tempfile::tempdir().expect("create project dir");
-    let src_dir = project.path().join("src");
-    std::fs::create_dir_all(&src_dir).expect("create source dir");
-    for index in 0..=1_000 {
-        std::fs::write(
-            src_dir.join(format!("module_{index}.rs")),
-            format!("pub fn unrelated_{index}() {{}}\n"),
-        )
-        .expect("write source file");
-    }
-
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
+    ctx.update_config(|config| config.indexes.semantic = false);
     let response = response_value(handle_semantic_search(
         &request("how slow backend fallback works"),
         &ctx,
     ));
 
-    assert_eq!(
-        response["success"], true,
-        "degraded grep fallback should succeed: {response:?}"
-    );
-    assert_eq!(response["complete"], false);
-    assert_eq!(response["fully_degraded"], true);
-    assert_eq!(response["engine_capped"], true);
-    assert_eq!(response["more_available"], true);
-    assert_eq!(response["result_count"], 0);
-    assert_eq!(response["degraded_grep_walk_truncated"], true);
-    assert_eq!(response["degraded_grep_file_limit"], 1_000);
-    assert_eq!(response["degraded_grep_candidate_files"], 1_000);
-
-    let warnings = response["warnings"].as_array().expect("warnings array");
-    assert!(
-        warnings.iter().any(|warning| warning
-            .as_str()
-            .is_some_and(|text| text.contains("1000-file scan cap"))),
-        "expected degraded grep file cap warning, got {warnings:?}"
-    );
+    assert_no_ready_lane_refusal(&response, "unavailable", "off");
 }
 
 #[test]
-fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
+fn natural_language_query_refuses_while_the_semantic_lane_builds() {
+    // With no ready index lane aft_search refuses with each lane's status;
+    // it no longer answers with a degraded filesystem-walk grep.
     let project = tempfile::tempdir().expect("create project dir");
     let source_file = project.path().join("src/lib.rs");
     std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -714,31 +708,12 @@ fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
         entries_done: Some(0),
         entries_total: Some(1),
     };
-
     let response = response_value(handle_semantic_search(
         &request("how retry logic works"),
         &ctx,
     ));
 
-    assert_eq!(
-        response["success"], true,
-        "natural-language building fallback should succeed: {response:?}"
-    );
-    assert_eq!(response["query_kind"], "NaturalLanguage");
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(response["semantic_status"], "building");
-    assert_eq!(response["lexical_only_fallback"], true);
-    assert!(
-        response["results"]
-            .as_array()
-            .expect("results array")
-            .iter()
-            .any(|result| result["kind"] == "GrepLine"
-                && result["line_text"]
-                    .as_str()
-                    .is_some_and(|line| line.contains("how retry logic works"))),
-        "expected literal degraded fallback result while building: {response:?}"
-    );
+    assert_no_ready_lane_refusal(&response, "unavailable", "building");
 }
 
 #[test]
@@ -1204,16 +1179,15 @@ fn hybrid_failed_semantic_uses_lexical_only_fallback() {
 }
 
 #[test]
-fn auto_mode_falls_back_to_grep_when_trigram_unavailable_and_semantic_disabled() {
+fn auto_mode_refuses_when_trigram_unavailable_and_semantic_disabled() {
+    // With no ready index lane aft_search refuses with each lane's status;
+    // it no longer answers with a degraded filesystem-walk grep.
     let (project, _source_file, _source) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
+    ctx.update_config(|config| config.indexes.semantic = false);
     let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
 
-    assert_degraded_grep_fallback(&response, "disabled");
+    assert_no_ready_lane_refusal(&response, "unavailable", "off");
 }
 
 #[test]
@@ -1281,23 +1255,18 @@ fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
 }
 
 #[test]
-fn legacy_semantic_hint_is_ignored_without_index() {
+fn legacy_semantic_hint_without_any_index_refuses() {
+    // With no ready index lane aft_search refuses with each lane's status;
+    // it no longer answers with a degraded filesystem-walk grep.
     let (project, _source_file, _source) = project_with_needle();
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
+    ctx.update_config(|config| config.indexes.semantic = false);
     let response = response_value(handle_semantic_search(
         &request_with("needle_symbol", Some("semantic")),
         &ctx,
     ));
 
-    assert_eq!(response["success"], true);
-    assert!(response["text"]
-        .as_str()
-        .expect("fallback text")
-        .contains("lexical-only fallback"));
+    assert_no_ready_lane_refusal(&response, "unavailable", "off");
 }
 
 #[test]
@@ -1326,6 +1295,9 @@ fn regex_grep_success_reports_ready_status_not_semantic_backend_status() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
     let response = response_value(handle_semantic_search(
         &request_with("^pub fn exported", Some("regex")),
         &ctx,
@@ -1349,10 +1321,14 @@ fn grep_results_report_regex_or_literal_source() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
-    for (query, hint, expected_source) in [
-        ("^pub fn exported", "regex", "regex"),
-        ("needle_symbol", "literal", "literal"),
-    ] {
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
+
+    // Only the regex route yields grep lines once a trigram lane is ready; a
+    // literal query is then served by the lexical lane (see
+    // literal_query_strips_surrounding_paired_quotes).
+    for (query, hint, expected_source) in [("^pub fn exported", "regex", "regex")] {
         let response = response_value(handle_semantic_search(
             &request_with(query, Some(hint)),
             &ctx,
@@ -1511,6 +1487,9 @@ fn literal_grep_filters_test_support_files_unless_requested() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
     let default_response = response_value(handle_semantic_search(
         &request_with("CREATE TABLE needle_table", Some("literal")),
         &ctx,
@@ -1552,60 +1531,24 @@ fn literal_grep_filters_test_support_files_unless_requested() {
 }
 
 #[test]
-fn degraded_grep_filters_test_support_files_unless_requested() {
+fn no_ready_lane_refuses_instead_of_a_degraded_grep_with_test_files() {
+    // With no ready index lane aft_search refuses with each lane's status;
+    // it no longer answers with a degraded filesystem-walk grep.
     let project = tempfile::tempdir().expect("create project dir");
-    let source_file = project.path().join("src/lib.rs");
-    let fixture_file = project.path().join("fixtures/notes.txt");
-    std::fs::create_dir_all(source_file.parent().expect("source parent"))
-        .expect("create source dir");
-    std::fs::create_dir_all(fixture_file.parent().expect("fixture parent"))
-        .expect("create fixture dir");
-    std::fs::write(&fixture_file, "how retry schema fallback works\n").expect("write fixture file");
+    std::fs::create_dir_all(project.path().join("fixtures")).expect("create fixture dir");
     std::fs::write(
-        &source_file,
-        "pub fn retry() { /* how retry schema fallback works */ }\n",
+        project.path().join("fixtures/notes.txt"),
+        "how retry schema fallback works\n",
     )
-    .expect("write source file");
+    .expect("write fixture file");
     let ctx = test_context(project.path());
-    *ctx.semantic_index_status()
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-
-    let default_response = response_value(handle_semantic_search(
-        &request("how retry schema fallback works"),
-        &ctx,
-    ));
-    assert_eq!(
-        default_response["success"], true,
-        "default fallback should succeed"
-    );
-    let default_results = default_response["results"]
-        .as_array()
-        .expect("results array");
-    assert!(
-        default_results.iter().all(|result| result["file"]
-            .as_str()
-            .is_some_and(|file| !file.replace('\\', "/").contains("/fixtures/"))),
-        "default degraded grep should hide fixtures: {default_response:?}"
-    );
-
-    let include_response = response_value(handle_semantic_search(
+    ctx.update_config(|config| config.indexes.semantic = false);
+    let response = response_value(handle_semantic_search(
         &request_with_include_tests("how retry schema fallback works", None, 5, true),
         &ctx,
     ));
-    assert_eq!(
-        include_response["success"], true,
-        "include_tests fallback should succeed"
-    );
-    let include_results = include_response["results"]
-        .as_array()
-        .expect("results array");
-    assert!(
-        include_results.iter().any(|result| result["file"]
-            .as_str()
-            .is_some_and(|file| file.replace('\\', "/").ends_with("fixtures/notes.txt"))),
-        "include_tests:true should surface degraded fixtures: {include_response:?}"
-    );
+
+    assert_no_ready_lane_refusal(&response, "unavailable", "off");
 }
 
 #[test]
@@ -1974,6 +1917,9 @@ fn auto_bare_quantifier_queries_route_to_regex_grep() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
     for query in ["foo*", "foo+", "colou?r", "foo*bar"] {
         let response = response_value(handle_semantic_search(&request(query), &ctx));
 
@@ -1999,6 +1945,9 @@ fn auto_short_identifier_tokens_use_literal_scan() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; the literal walk route
+    // under test is taken while only the semantic lane is ready.
+    install_ready_semantic_lane(&ctx, project.path());
     for query in ["id", "ab"] {
         let response = response_value(handle_semantic_search(&request(query), &ctx));
 
@@ -2074,6 +2023,10 @@ fn literal_query_strips_surrounding_paired_quotes() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
+
     for (query, label) in [
         ("\"needle_symbol\"", "double-quoted"),
         ("'needle_symbol'", "single-quoted"),
@@ -2087,7 +2040,9 @@ fn literal_query_strips_surrounding_paired_quotes() {
             response["success"], true,
             "{label} literal query should succeed after quote-strip: {response:?}"
         );
-        assert_eq!(response["interpreted_as"], "literal");
+        // With a ready trigram lane the stripped literal runs on the lexical
+        // lane rather than the no-index grep walk.
+        assert_eq!(response["interpreted_as"], "lexical");
         assert_eq!(
             response["query"], "needle_symbol",
             "response query echo should reflect stripped form for {label} input"
@@ -2097,7 +2052,9 @@ fn literal_query_strips_surrounding_paired_quotes() {
                 .as_array()
                 .expect("results array")
                 .iter()
-                .any(|r| r["kind"] == "GrepLine"),
+                .any(|r| r["file"]
+                    .as_str()
+                    .is_some_and(|file| path_ends_with(file, "src/lib.rs"))),
             "stripped {label} query should match needle_symbol in source: {response:?}"
         );
     }
@@ -2118,6 +2075,9 @@ fn literal_query_preserves_unmatched_quotes() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
     let response = response_value(handle_semantic_search(
         &request_with("\"'needle", Some("literal")),
         &ctx,
@@ -2160,6 +2120,9 @@ fn quote_strip_only_removes_one_pair() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    // aft_search refuses when no index lane is ready; route over a ready
+    // trigram lane.
+    install_project_lexical_index(&ctx, project.path());
     let response = response_value(handle_semantic_search(
         &request_with("\"\"needle\"\"", Some("literal")),
         &ctx,

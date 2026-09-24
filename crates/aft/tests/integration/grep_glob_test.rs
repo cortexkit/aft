@@ -920,7 +920,7 @@ fn grep_explicit_file_reports_runtime_fallback_index_status_when_index_disabled(
 }
 
 #[test]
-fn semantic_degraded_grep_fallback_respects_aftignore() {
+fn semantic_search_with_both_lanes_off_refuses_instead_of_walking() {
     let project = setup_project(&[
         (
             "src/lib.rs",
@@ -961,29 +961,11 @@ fn semantic_degraded_grep_fallback_respects_aftignore() {
         }),
     );
 
-    assert_eq!(
-        response["success"], true,
-        "semantic_search should succeed: {response:?}"
-    );
-    assert_eq!(response["semantic_status"], "disabled");
-    assert_eq!(response["interpreted_as"], "literal");
-    assert_eq!(response["lexical_only_fallback"], true);
-    let files = response["results"]
-        .as_array()
-        .expect("results array")
-        .iter()
-        .map(|result| {
-            result["file"]
-                .as_str()
-                .expect("result file")
-                .replace('\\', "/")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        files,
-        vec![canonical_path_string(&project.path().join("src/lib.rs")).replace('\\', "/")],
-        ".aftignored file must be skipped by degraded semantic grep fallback: {response:?}"
-    );
+    // With both index lanes configured off aft_search refuses instead of the
+    // old degraded filesystem walk, so no file (ignored or not) is returned.
+    assert_eq!(response["success"], false, "response: {response:?}");
+    assert_eq!(response["code"], "no_search_lanes_enabled");
+    assert_eq!(response["results"], serde_json::json!([]));
 
     let status = aft.shutdown();
     assert!(status.success());

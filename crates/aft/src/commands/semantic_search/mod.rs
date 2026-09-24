@@ -786,22 +786,37 @@ impl SearchLaneStatus {
         let trigram = if trigram_ready {
             IndexObservation::ready()
         } else {
-            match observed_index_status(ctx, IndexPlane::Trigram) {
-                // Not resident but usable a moment ago: a query is the signal
-                // that recovers an idle-evicted index, as grep and glob do.
-                observation
-                    if observation.unavailable_reason.as_deref()
-                        == Some(feature_cause::RUNTIME_NOT_OBSERVED)
-                        && super::configure::trigger_search_index_reload_if_evicted(ctx) =>
-                {
-                    IndexObservation::building()
-                }
-                observation => observation,
-            }
+            observed_index_status(ctx, IndexPlane::Trigram)
         };
-        Self {
-            trigram,
-            semantic: observed_index_status(ctx, IndexPlane::Semantic),
+        let semantic = match observed_index_status(ctx, IndexPlane::Semantic) {
+            // Enabled but not resident: a query is the signal that recovers an
+            // idle-evicted semantic index, as the semantic branch did before.
+            // A read-only root may also recover a failed shared snapshot; the
+            // reload trigger itself decides what is reloadable, and a missing
+            // ONNX Runtime is never retried.
+            observation
+                if (Self::not_observed(&observation)
+                    || observation.unavailable_reason.as_deref()
+                        == Some(feature_cause::SEMANTIC_BUILD_FAILED))
+                    && super::configure::trigger_semantic_index_reload_if_evicted(ctx) =>
+            {
+                IndexObservation::building()
+            }
+            observation => observation,
+        };
+        Self { trigram, semantic }
+    }
+
+    fn not_observed(observation: &IndexObservation) -> bool {
+        observation.unavailable_reason.as_deref() == Some(feature_cause::RUNTIME_NOT_OBSERVED)
+    }
+
+    /// Start reloading an idle-evicted trigram index before the request waits
+    /// for trigram readiness, so a reload that finishes inside the wait
+    /// budget serves this query (grep and glob recover the same way).
+    fn recover_evicted_trigram(ctx: &AppContext) {
+        if Self::not_observed(&observed_index_status(ctx, IndexPlane::Trigram)) {
+            super::configure::trigger_search_index_reload_if_evicted(ctx);
         }
     }
 
@@ -1022,6 +1037,7 @@ fn handle_semantic_search_inner(
     let semantic_status = semantic_status_label(&semantic_status_snapshot);
     let mut warnings = Vec::new();
 
+    SearchLaneStatus::recover_evicted_trigram(ctx);
     let lexical_ready = match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
     {
         Ok(ready) => ready,
@@ -5612,6 +5628,30 @@ mod tests {
         )
     }
 
+    /// Mark the semantic lane ready with an empty resident index, so a test
+    /// can exercise the walk routes aft_search takes while the trigram lane
+    /// is not ready.
+    fn install_ready_semantic_lane(ctx: &AppContext, project_root: &Path) {
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            crate::semantic_index::SemanticIndex::new(project_root.to_path_buf(), 384),
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Ready {
+            refreshing: Vec::new(),
+            accounting: Default::default(),
+        };
+    }
+
+    fn install_ready_search_index(ctx: &AppContext, project_root: &Path) {
+        let index = SearchIndex::build(project_root);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+    }
+
     fn install_warm_callgraph_store(ctx: &AppContext, project_root: &Path) {
         let root = std::fs::canonicalize(project_root).expect("canonical project root");
         let files = walk_project_files(&root).collect::<Vec<_>>();
@@ -6230,63 +6270,17 @@ mod tests {
     }
 
     #[test]
-    fn building_trigram_index_identifier_uses_bounded_walk() {
+    fn building_indexes_refuse_with_each_lanes_status_instead_of_walking() {
+        // With both lanes still building there is no index to rank over.
+        // aft_search used to answer with a bounded filesystem walk here; the
+        // feature-config contract instead refuses with search_lanes_unavailable
+        // and each lane's status, and leaves the walk to grep.
         let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("needle.ts");
         std::fs::write(
-            &source_file,
+            project.path().join("needle.ts"),
             "export const fresh_root_needle = 'fresh_root_needle';\n",
         )
         .expect("write source file");
-
-        let ctx = test_context(project.path());
-        *ctx.semantic_index_status()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
-            stage: "loading_artifacts".to_string(),
-            files: None,
-            entries_done: None,
-            entries_total: None,
-        };
-        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
-        ctx.install_search_index_rx(rx, ctx.configure_generation());
-
-        let raw_response =
-            with_first_search_index_load_wait_budget_for_test(Duration::from_millis(40), || {
-                handle_semantic_search(&semantic_request("fresh_root_needle", 5), &ctx)
-            });
-        let rendered = crate::subc_format::format_response("search", &raw_response, false);
-        let response = response_value(raw_response);
-
-        assert_eq!(response["success"], true);
-        assert_eq!(response["status"], "partial");
-        assert_eq!(response["complete"], false);
-        assert_eq!(response["semantic_status"], "building");
-        assert_eq!(response["interpreted_as"], "literal");
-        let results = response["results"].as_array().expect("results array");
-        assert!(results.iter().any(|result| {
-            result["file"]
-                .as_str()
-                .is_some_and(|file| file.ends_with("needle.ts"))
-        }));
-        let text = response["text"].as_str().expect("response text");
-        assert!(text.contains(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
-        // The handler never renders the trailer itself; the shared formatter
-        // appends it from the wire envelope exactly once.
-        assert!(!text.contains("(walk)"));
-        assert!(!text.contains("(exhausted)"));
-        assert_eq!(response["results_list_envelope"]["reason"], "walk");
-        assert_eq!(rendered.matches("(walk)").count(), 1, "{rendered}");
-        assert!(!rendered.contains("(exhausted)"));
-        assert_eq!(
-            response["results_list_envelope"]["total"]["kind"],
-            "at_least"
-        );
-    }
-
-    #[test]
-    fn first_search_wait_budget_expires_with_honest_loading_reply() {
-        let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
         *ctx.semantic_index_status()
             .write()
@@ -6301,21 +6295,46 @@ mod tests {
 
         let wait_budget = Duration::from_millis(40);
         let started = Instant::now();
-        let raw_response = with_first_search_index_load_wait_budget_for_test(wait_budget, || {
-            handle_semantic_search(&semantic_request("still_loading", 5), &ctx)
-        });
-        let rendered = crate::subc_format::format_response("search", &raw_response, false);
-        let response = response_value(raw_response);
+        let response = response_value(with_first_search_index_load_wait_budget_for_test(
+            wait_budget,
+            || handle_semantic_search(&semantic_request("fresh_root_needle", 5), &ctx),
+        ));
 
+        // The request still gives an in-flight trigram load its wait budget.
         assert!(started.elapsed() >= wait_budget);
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(response["status"], "partial");
-        let text = response["text"].as_str().expect("response text");
-        assert!(text.contains(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
-        assert!(text.contains("Found 0 match"));
-        // The trailer is the shared formatter's, appended from the wire envelope.
-        assert_eq!(rendered.matches("(walk)").count(), 1, "{rendered}");
-        assert!(!rendered.contains("(exhausted)"));
+        assert_eq!(response["success"], false);
+        assert_eq!(response["code"], "search_lanes_unavailable");
+        assert_eq!(response["results"], serde_json::json!([]));
+        assert_eq!(
+            response["lanes"],
+            serde_json::json!({
+                "trigram": {"status": "building", "reason": null},
+                "semantic": {"status": "building", "reason": null},
+            })
+        );
+        assert_eq!(
+            response["omitted_lanes"],
+            serde_json::json!(["trigram", "semantic"])
+        );
+    }
+
+    #[test]
+    fn both_lanes_configured_off_refuse_with_no_search_lanes_enabled() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = test_context(project.path());
+        ctx.update_config(|config| {
+            config.indexes.trigram = false;
+            config.indexes.semantic = false;
+        });
+        let response = response_value(handle_semantic_search(
+            &semantic_request("anything", 5),
+            &ctx,
+        ));
+        assert_eq!(response["success"], false);
+        assert_eq!(response["code"], "no_search_lanes_enabled");
+        assert_eq!(response["lanes"]["trigram"]["status"], "off");
+        assert_eq!(response["lanes"]["semantic"]["status"], "off");
     }
 
     #[test]
@@ -6469,18 +6488,22 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             SemanticIndexStatus::Failed("shared snapshot absent".to_string());
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("retry snapshot", 5, "semantic"),
             &ctx,
         ));
 
+        // The trigram lane answers; the query also schedules the shared
+        // snapshot reload and labels the semantic lane as building.
         assert_eq!(response["success"], true);
-        assert_eq!(response["status"], "ready");
-        assert_eq!(response["semantic_status"], "building");
-        assert!(response["text"]
-            .as_str()
-            .expect("semantic fallback text")
-            .contains("semantic lane is unavailable"));
+        assert_eq!(
+            response["lanes"]["semantic"],
+            serde_json::json!({"status": "building", "reason": null})
+        );
+        assert_eq!(response["omitted_lanes"], serde_json::json!(["semantic"]));
         assert!(ctx.semantic_index_rx().lock().is_some());
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
@@ -6510,19 +6533,24 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             SemanticIndexStatus::Failed(missing_runtime);
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("retry snapshot", 5, "semantic"),
             &ctx,
         ));
 
+        // The trigram lane answers; the semantic lane is labelled with the
+        // missing-runtime cause rather than a retryable state.
         assert_eq!(response["success"], true);
-        assert_eq!(response["semantic_status"], "unavailable");
-        let text = response["text"].as_str().expect("semantic fallback text");
-        assert!(text.contains("ONNX Runtime not found"), "{text}");
-        assert!(text.contains("npx @cortexkit/aft doctor --fix"), "{text}");
-        assert!(!text.contains("reloading"), "{text}");
-        assert!(!text.contains("retry shortly"), "{text}");
-        assert!(!text.contains("Retry in a few seconds"), "{text}");
+        assert_eq!(response["lanes"]["semantic"]["status"], "unavailable");
+        let expected_cause = if crate::feature_status::local_semantic_platform_supported() {
+            "onnx_runtime_unavailable"
+        } else {
+            "semantic_platform_unsupported"
+        };
+        assert_eq!(response["lanes"]["semantic"]["reason"], expected_cause);
         // The reload was not merely reported differently, it was never started:
         // the receiver a scheduled reload installs is still absent.
         assert!(ctx.semantic_index_rx().lock().is_none());
@@ -6542,6 +6570,9 @@ mod tests {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint(".*exported", 5, "regex"),
             &ctx,
@@ -6573,6 +6604,9 @@ mod tests {
         }))
         .expect("build include-tests request");
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(&request, &ctx));
 
         assert_eq!(response["success"], true);
@@ -6599,6 +6633,9 @@ mod tests {
         .expect("write source file");
         let ctx = test_context(project.path());
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("assert_ne!(.*route_channel", 5, "auto"),
             &ctx,
@@ -6631,6 +6668,9 @@ mod tests {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("assert_ne!(.*route_channel", 5, "regex"),
             &ctx,
@@ -6653,6 +6693,9 @@ mod tests {
         std::fs::write(&source_file, "let route_alpha_channel = 1;\n").expect("write source file");
         let ctx = test_context(project.path());
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises the walk route taken while only the semantic lane is ready.
+        install_ready_semantic_lane(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("route_.*channel", 5, "auto"),
             &ctx,
@@ -6679,6 +6722,9 @@ mod tests {
         std::fs::write(&source_file, "id = 1\n").expect("write source file");
         let ctx = test_context(project.path());
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises the walk route taken while only the semantic lane is ready.
+        install_ready_semantic_lane(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("id", 5, "literal"),
             &ctx,
@@ -6697,6 +6743,9 @@ mod tests {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
 
+        // aft_search refuses when no index lane is ready; this test
+        // exercises query routing over a ready trigram lane.
+        install_ready_search_index(&ctx, project.path());
         let response = response_value(handle_semantic_search(
             &semantic_request_with_hint("(?=foo)", 5, "regex"),
             &ctx,
@@ -6765,6 +6814,8 @@ mod tests {
             .semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+        // aft_search refuses when no index lane is ready.
+        install_ready_search_index(&first_ctx, first_project.path());
         let first_lane_response = response_value(handle_semantic_search(
             &semantic_request_with_hint(".*exported", 5, "regex"),
             &first_ctx,

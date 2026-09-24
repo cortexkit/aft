@@ -194,23 +194,28 @@ pub fn observed_index_status(ctx: &AppContext, plane: IndexPlane) -> IndexObserv
     }
 }
 
+// Observation takes locks with `try_*` only: a caller may already hold an
+// index lock (or a writer may be swapping the index), and reporting must never
+// wait on or deadlock against index work. A lock held for writing means the
+// index is being replaced or updated, which reports as building.
+
 fn observe_trigram(ctx: &AppContext) -> IndexObservation {
-    let resident = {
-        let guard = ctx
-            .search_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.as_ref().map(|index| index.ready)
+    let resident = match ctx.search_index().try_read() {
+        Ok(guard) => guard.as_ref().map(|index| index.ready),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            poisoned.into_inner().as_ref().map(|index| index.ready)
+        }
+        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
     };
     match resident {
         Some(true) => IndexObservation::ready(),
         Some(false) => IndexObservation::building(),
         None => {
-            let loading = ctx
-                .search_index_rx()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some();
+            let loading = match ctx.search_index_rx().try_read() {
+                Ok(guard) => guard.is_some(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
+                Err(std::sync::TryLockError::WouldBlock) => true,
+            };
             if loading {
                 IndexObservation::building()
             } else {
@@ -221,26 +226,35 @@ fn observe_trigram(ctx: &AppContext) -> IndexObservation {
 }
 
 fn observe_semantic(ctx: &AppContext) -> IndexObservation {
-    let status = ctx
-        .semantic_index_status()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let status = match ctx.semantic_index_status().try_read() {
+        Ok(guard) => guard.clone(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
+    };
     if let SemanticIndexStatus::Failed(message) = &status {
         return IndexObservation::unavailable(semantic_failure_cause(ctx, message));
     }
-    if !ctx.semantic_backend_health_snapshot().available {
+    if ctx
+        .try_semantic_backend_health_snapshot()
+        .is_some_and(|health| !health.available)
+    {
         return IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE);
     }
-    let resident = ctx
-        .semantic_index()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some();
+    let resident = match ctx.semantic_index().try_read() {
+        Ok(guard) => guard.is_some(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
+    };
     match status {
         SemanticIndexStatus::Ready { .. } if resident => IndexObservation::ready(),
         SemanticIndexStatus::Building { .. } => IndexObservation::building(),
-        _ if ctx.semantic_index_rx().lock().is_some() => IndexObservation::building(),
+        _ if ctx
+            .semantic_index_rx()
+            .try_lock()
+            .is_none_or(|rx| rx.is_some()) =>
+        {
+            IndexObservation::building()
+        }
         _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
 }
@@ -277,11 +291,11 @@ pub const fn local_semantic_platform_supported() -> bool {
 }
 
 fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
-    let resident = ctx
-        .callgraph_store()
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .is_some();
+    let resident = match ctx.callgraph_store().try_read() {
+        Ok(guard) => guard.is_some(),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
+    };
     if resident && ctx.pending_callgraph_store_force_token().is_none() {
         return IndexObservation::ready();
     }
@@ -291,7 +305,10 @@ fn observe_callgraph(ctx: &AppContext) -> IndexObservation {
     if ctx.callgraph_store_build_denial().is_some() {
         return IndexObservation::unavailable(cause::CALLGRAPH_BUILD_DENIED);
     }
-    if ctx.callgraph_store_rx().lock().is_some()
+    if ctx
+        .callgraph_store_rx()
+        .try_lock()
+        .is_none_or(|rx| rx.is_some())
         || ctx.pending_callgraph_store_force_token().is_some()
     {
         return IndexObservation::building();
