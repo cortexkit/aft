@@ -2,292 +2,62 @@
 //!
 //! `aft setup` and `aft fix-config` rewrite a handful of keys in files people
 //! edit by hand. Re-serializing the parsed value would drop every comment and
-//! reorder keys, so this module instead locates the byte span of the member it
-//! has to change and splices new text into the original document. Everything
-//! it does not touch (comments, formatting, unrelated keys, key order) is
-//! carried over byte for byte.
+//! reorder keys, so edits go through the concrete syntax tree of the
+//! `jsonc-parser` crate (dprint's parser): it keeps every comment, blank line,
+//! trailing comma and line-ending style that an edit does not touch, and fixes
+//! up commas and indentation around inserted and removed members.
 //!
-//! The parser accepts the same dialect the config loader accepts: JSON plus
-//! `//` and `/* */` comments and trailing commas.
+//! The accepted dialect is the one the config loader accepts: JSON plus `//`
+//! and `/* */` comments and trailing commas. The parser's other leniencies
+//! (unquoted keys, single quotes, hex numbers, missing commas) are switched
+//! off, because the loader would reject a file that used them.
 
 use std::io::Write;
 use std::path::Path;
 
+use jsonc_parser::cst::{CstInputValue, CstObject, CstObjectProp, CstRootNode};
+use jsonc_parser::ParseOptions;
 use serde_json::Value;
 
-/// A parsed value and its byte span `[start, end)` in the document.
-#[derive(Debug, Clone)]
-struct Node {
-    start: usize,
-    end: usize,
-    kind: NodeKind,
-}
-
-#[derive(Debug, Clone)]
-enum NodeKind {
-    Object(Vec<Member>),
-    Array,
-    Scalar,
-}
-
-#[derive(Debug, Clone)]
-struct Member {
-    key: String,
-    key_start: usize,
-    value: Node,
-}
-
-struct Parser<'a> {
-    src: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            src: text.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn error(&self, message: &str) -> String {
-        format!("invalid JSONC at byte {}: {message}", self.pos)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.src.get(self.pos).copied()
-    }
-
-    /// Skip whitespace and comments.
-    fn skip_trivia(&mut self) -> Result<(), String> {
-        loop {
-            match self.peek() {
-                Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
-                Some(b'/') if self.src.get(self.pos + 1) == Some(&b'/') => {
-                    while let Some(byte) = self.peek() {
-                        if byte == b'\n' {
-                            break;
-                        }
-                        self.pos += 1;
-                    }
-                }
-                Some(b'/') if self.src.get(self.pos + 1) == Some(&b'*') => {
-                    self.pos += 2;
-                    loop {
-                        match self.peek() {
-                            None => return Err(self.error("unterminated block comment")),
-                            Some(b'*') if self.src.get(self.pos + 1) == Some(&b'/') => {
-                                self.pos += 2;
-                                break;
-                            }
-                            Some(_) => self.pos += 1,
-                        }
-                    }
-                }
-                _ => return Ok(()),
-            }
-        }
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        let start = self.pos;
-        if self.peek() != Some(b'"') {
-            return Err(self.error("expected string"));
-        }
-        self.pos += 1;
-        loop {
-            match self.peek() {
-                None => return Err(self.error("unterminated string")),
-                Some(b'\\') => self.pos += 2,
-                Some(b'"') => {
-                    self.pos += 1;
-                    break;
-                }
-                Some(_) => self.pos += 1,
-            }
-        }
-        let raw = std::str::from_utf8(&self.src[start..self.pos])
-            .map_err(|_| self.error("string is not UTF-8"))?;
-        serde_json::from_str::<String>(raw).map_err(|error| self.error(&error.to_string()))
-    }
-
-    fn parse_value(&mut self) -> Result<Node, String> {
-        self.skip_trivia()?;
-        let start = self.pos;
-        match self.peek() {
-            Some(b'{') => {
-                self.pos += 1;
-                let mut members = Vec::new();
-                loop {
-                    self.skip_trivia()?;
-                    match self.peek() {
-                        Some(b'}') => {
-                            self.pos += 1;
-                            break;
-                        }
-                        Some(b'"') => {
-                            let key_start = self.pos;
-                            let key = self.parse_string()?;
-                            self.skip_trivia()?;
-                            if self.peek() != Some(b':') {
-                                return Err(self.error("expected ':'"));
-                            }
-                            self.pos += 1;
-                            let value = self.parse_value()?;
-                            members.push(Member {
-                                key,
-                                key_start,
-                                value,
-                            });
-                            self.skip_trivia()?;
-                            match self.peek() {
-                                Some(b',') => self.pos += 1,
-                                Some(b'}') => {}
-                                _ => return Err(self.error("expected ',' or '}'")),
-                            }
-                        }
-                        _ => return Err(self.error("expected object key")),
-                    }
-                }
-                Ok(Node {
-                    start,
-                    end: self.pos,
-                    kind: NodeKind::Object(members),
-                })
-            }
-            Some(b'[') => {
-                self.pos += 1;
-                loop {
-                    self.skip_trivia()?;
-                    if self.peek() == Some(b']') {
-                        self.pos += 1;
-                        break;
-                    }
-                    self.parse_value()?;
-                    self.skip_trivia()?;
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => {}
-                        _ => return Err(self.error("expected ',' or ']'")),
-                    }
-                }
-                Ok(Node {
-                    start,
-                    end: self.pos,
-                    kind: NodeKind::Array,
-                })
-            }
-            Some(b'"') => {
-                self.parse_string()?;
-                Ok(Node {
-                    start,
-                    end: self.pos,
-                    kind: NodeKind::Scalar,
-                })
-            }
-            Some(_) => {
-                while let Some(byte) = self.peek() {
-                    if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'+' | b'.') {
-                        self.pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if self.pos == start {
-                    return Err(self.error("unexpected character"));
-                }
-                let token = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or_default();
-                serde_json::from_str::<Value>(token).map_err(|_| self.error("invalid literal"))?;
-                Ok(Node {
-                    start,
-                    end: self.pos,
-                    kind: NodeKind::Scalar,
-                })
-            }
-            None => Err(self.error("unexpected end of document")),
-        }
+fn loader_dialect() -> ParseOptions {
+    ParseOptions {
+        allow_comments: true,
+        allow_trailing_commas: true,
+        allow_loose_object_property_names: false,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
     }
 }
 
-fn parse_root(text: &str) -> Result<Node, String> {
-    let mut parser = Parser::new(text);
-    let root = parser.parse_value()?;
-    parser.skip_trivia()?;
-    if parser.pos != text.len() {
-        return Err(parser.error("unexpected content after the root value"));
-    }
-    if !matches!(root.kind, NodeKind::Object(_)) {
-        return Err("invalid JSONC: the root value must be an object".to_string());
-    }
-    Ok(root)
-}
-
-/// Leading whitespace of the line containing `pos`.
-fn line_indent(text: &str, pos: usize) -> &str {
-    let line_start = text[..pos].rfind('\n').map_or(0, |index| index + 1);
-    let rest = &text[line_start..];
-    let width = rest
-        .bytes()
-        .take_while(|byte| *byte == b' ' || *byte == b'\t')
-        .count();
-    &rest[..width]
-}
-
-/// Whether only spaces/tabs precede `pos` on its line.
-fn starts_line(text: &str, pos: usize) -> bool {
-    let line_start = text[..pos].rfind('\n').map_or(0, |index| index + 1);
-    text[line_start..pos]
-        .bytes()
-        .all(|byte| byte == b' ' || byte == b'\t')
-}
-
-/// Serialize `value` for insertion at a position whose line is indented by
-/// `indent`. Arrays of scalars stay on one line; objects are expanded.
-fn render_value(value: &Value, indent: &str) -> String {
+fn to_input(value: &Value) -> CstInputValue {
     match value {
-        Value::Object(map) if !map.is_empty() => {
-            let inner = format!("{indent}  ");
-            let body = map
-                .iter()
-                .map(|(key, value)| {
-                    format!(
-                        "{inner}{}: {}",
-                        serde_json::to_string(key).unwrap_or_default(),
-                        render_value(value, &inner)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",\n");
-            format!("{{\n{body}\n{indent}}}")
-        }
-        Value::Array(items) if items.iter().any(|item| item.is_object() || item.is_array()) => {
-            let inner = format!("{indent}  ");
-            let body = items
-                .iter()
-                .map(|item| format!("{inner}{}", render_value(item, &inner)))
-                .collect::<Vec<_>>()
-                .join(",\n");
-            format!("[\n{body}\n{indent}]")
-        }
-        Value::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(|item| serde_json::to_string(item).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(", ")
+        Value::Null => CstInputValue::Null,
+        Value::Bool(value) => CstInputValue::Bool(*value),
+        Value::Number(number) => CstInputValue::Number(number.to_string()),
+        Value::String(text) => CstInputValue::String(text.clone()),
+        Value::Array(items) => CstInputValue::Array(items.iter().map(to_input).collect()),
+        Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), to_input(value)))
+                .collect(),
         ),
-        other => serde_json::to_string(other).unwrap_or_default(),
     }
 }
 
-/// Build `{a: {b: value}}` for the remaining path segments.
-fn nest(path: &[&str], value: &Value) -> Value {
-    path.iter().rev().fold(value.clone(), |inner, key| {
-        let mut map = serde_json::Map::new();
-        map.insert((*key).to_string(), inner);
-        Value::Object(map)
-    })
+/// The member named `key`. With duplicate keys the last one wins, as it does
+/// for the loader.
+fn last_prop(object: &CstObject, key: &str) -> Option<CstObjectProp> {
+    object
+        .properties()
+        .into_iter()
+        .rev()
+        .find(|prop| prop.decoded_name().as_deref() == Some(key))
+}
+
+fn child_object(object: &CstObject, key: &str) -> Option<CstObject> {
+    last_prop(object, key)?.object_value()
 }
 
 /// A JSONC document edited in place.
@@ -297,15 +67,22 @@ pub struct JsoncDocument {
 }
 
 impl JsoncDocument {
-    /// Parse `text`. An empty (or whitespace-only) document is an empty object.
+    /// Parse `text`. The root must be an object; an empty (or
+    /// whitespace-only) document stands for an empty object.
     pub fn parse(text: &str) -> Result<Self, String> {
-        let text = if text.trim().is_empty() {
-            "{\n}\n".to_string()
-        } else {
-            text.to_string()
+        let doc = Self {
+            text: text.to_string(),
         };
-        parse_root(&text)?;
-        Ok(Self { text })
+        let root = doc.root()?;
+        if root.value().is_some() && root.object_value().is_none() {
+            return Err("invalid JSONC: the root value must be an object".to_string());
+        }
+        Ok(doc)
+    }
+
+    fn root(&self) -> Result<CstRootNode, String> {
+        CstRootNode::parse(&self.text, &loader_dialect())
+            .map_err(|error| format!("invalid JSONC: {error}"))
     }
 
     /// The current document text.
@@ -313,168 +90,80 @@ impl JsoncDocument {
         &self.text
     }
 
-    /// The plain JSON value of the document (comments and trailing commas removed).
+    /// The plain JSON value of the document (comments and trailing commas
+    /// removed). An empty document is `{}`.
     pub fn value(&self) -> Result<Value, String> {
+        if self.text.trim().is_empty() {
+            return Ok(Value::Object(serde_json::Map::new()));
+        }
         serde_json::from_str(&crate::jsonc::strip_jsonc(&self.text))
             .map_err(|error| format!("invalid JSONC: {error}"))
     }
 
     /// Whether a member exists at `path`.
     pub fn contains(&self, path: &[&str]) -> bool {
-        let Ok(root) = parse_root(&self.text) else {
+        let Some((last, parents)) = path.split_last() else {
+            return true;
+        };
+        let Ok(root) = self.root() else {
             return false;
         };
-        let mut node = &root;
-        for key in path {
-            let NodeKind::Object(members) = &node.kind else {
-                return false;
-            };
-            match members.iter().rev().find(|member| member.key == *key) {
-                Some(member) => node = &member.value,
+        let Some(mut object) = root.object_value() else {
+            return false;
+        };
+        for key in parents {
+            match child_object(&object, key) {
+                Some(child) => object = child,
                 None => return false,
             }
         }
-        true
+        last_prop(&object, last).is_some()
     }
 
     /// Set the member at `path` to `value`, creating missing parent objects.
     /// An existing non-object parent is replaced by an object.
     pub fn set(&mut self, path: &[&str], value: &Value) -> Result<(), String> {
-        if path.is_empty() {
+        let Some((last, parents)) = path.split_last() else {
             return Err("cannot replace the document root".to_string());
-        }
-        let root = parse_root(&self.text)?;
-        let mut node = root;
-        for (depth, key) in path.iter().enumerate() {
-            let NodeKind::Object(members) = node.kind.clone() else {
-                let replacement = nest(&path[depth..], value);
-                let indent = line_indent(&self.text, node.start).to_string();
-                self.splice(node.start, node.end, &render_value(&replacement, &indent));
-                return Ok(());
+        };
+        let root = self.root()?;
+        let mut object = root.object_value_or_set();
+        for key in parents {
+            object = match last_prop(&object, key) {
+                Some(prop) => prop.object_value_or_set(),
+                None => object.object_value_or_set(key),
             };
-            // Duplicate keys resolve to the last occurrence, as in the loader.
-            match members.iter().rev().find(|member| member.key == *key) {
-                Some(member) if depth + 1 == path.len() => {
-                    let indent = line_indent(&self.text, member.key_start).to_string();
-                    self.splice(
-                        member.value.start,
-                        member.value.end,
-                        &render_value(value, &indent),
-                    );
-                    return Ok(());
-                }
-                Some(member) => node = member.value.clone(),
-                None => {
-                    let inserted = nest(&path[depth + 1..], value);
-                    self.insert_member(&node, &members, key, &inserted);
-                    return Ok(());
-                }
-            }
         }
-        Ok(())
-    }
-
-    fn insert_member(&mut self, object: &Node, members: &[Member], key: &str, value: &Value) {
-        let key_text = serde_json::to_string(key).unwrap_or_default();
-        match members.last() {
-            Some(last) => {
-                let first = &members[0];
-                if starts_line(&self.text, first.key_start) {
-                    let indent = line_indent(&self.text, first.key_start).to_string();
-                    let text = format!(",\n{indent}{key_text}: {}", render_value(value, &indent));
-                    self.splice(last.value.end, last.value.end, &text);
-                } else {
-                    let indent = line_indent(&self.text, object.start).to_string();
-                    let text = format!(", {key_text}: {}", render_value(value, &indent));
-                    self.splice(last.value.end, last.value.end, &text);
-                }
-            }
+        match last_prop(&object, last) {
+            Some(prop) => prop.set_value(to_input(value)),
             None => {
-                let close = object.end - 1;
-                let close_indent = if starts_line(&self.text, close) {
-                    line_indent(&self.text, close).to_string()
-                } else {
-                    line_indent(&self.text, object.start).to_string()
-                };
-                let indent = format!("{close_indent}  ");
-                let inner_has_newline = self.text[object.start + 1..close].contains('\n');
-                let mut text = format!("\n{indent}{key_text}: {}", render_value(value, &indent));
-                if !inner_has_newline {
-                    text.push('\n');
-                    text.push_str(&close_indent);
-                }
-                self.splice(object.start + 1, object.start + 1, &text);
+                object.append(last, to_input(value));
             }
         }
+        self.text = root.to_string();
+        Ok(())
     }
 
     /// Remove the member at `path`. Returns whether anything was removed.
     pub fn remove(&mut self, path: &[&str]) -> Result<bool, String> {
-        let Some((last_key, parents)) = path.split_last() else {
+        let Some((last, parents)) = path.split_last() else {
             return Err("cannot remove the document root".to_string());
         };
-        let root = parse_root(&self.text)?;
-        let mut node = root;
+        let root = self.root()?;
+        let Some(mut object) = root.object_value() else {
+            return Ok(false);
+        };
         for key in parents {
-            let NodeKind::Object(members) = &node.kind else {
-                return Ok(false);
-            };
-            match members.iter().rev().find(|member| member.key == *key) {
-                Some(member) => node = member.value.clone(),
+            match child_object(&object, key) {
+                Some(child) => object = child,
                 None => return Ok(false),
             }
         }
-        let NodeKind::Object(members) = &node.kind else {
+        let Some(prop) = last_prop(&object, last) else {
             return Ok(false);
         };
-        let Some(index) = members.iter().rposition(|member| member.key == *last_key) else {
-            return Ok(false);
-        };
-        let member = &members[index];
-        let bytes = self.text.as_bytes();
-
-        let own_line = starts_line(&self.text, member.key_start);
-        let begin = if own_line {
-            self.text[..member.key_start]
-                .rfind('\n')
-                .map_or(0, |index| index + 1)
-        } else {
-            member.key_start
-        };
-        let mut end = member.value.end;
-        let mut probe = end;
-        while matches!(bytes.get(probe), Some(b' ' | b'\t' | b'\r' | b'\n')) {
-            probe += 1;
-        }
-        let had_following_comma = bytes.get(probe) == Some(&b',');
-        if had_following_comma {
-            end = probe + 1;
-        }
-        if own_line {
-            let mut tail = end;
-            while matches!(bytes.get(tail), Some(b' ' | b'\t' | b'\r')) {
-                tail += 1;
-            }
-            if bytes.get(tail) == Some(&b'\n') {
-                end = tail + 1;
-            }
-        }
-
-        // Without a following comma the member was last: drop the comma that
-        // separated it from its predecessor instead.
-        let mut preceding_comma = None;
-        if !had_following_comma && index > 0 {
-            let mut parser = Parser::new(&self.text);
-            parser.pos = members[index - 1].value.end;
-            parser.skip_trivia()?;
-            if parser.peek() == Some(b',') {
-                preceding_comma = Some(parser.pos);
-            }
-        }
-        self.splice(begin, end, "");
-        if let Some(comma) = preceding_comma {
-            self.splice(comma, comma + 1, "");
-        }
+        prop.remove();
+        self.text = root.to_string();
         Ok(true)
     }
 
@@ -484,10 +173,6 @@ impl JsoncDocument {
             Some(Value::Object(map)) if map.is_empty() => self.remove(path),
             _ => Ok(false),
         }
-    }
-
-    fn splice(&mut self, start: usize, end: usize, replacement: &str) {
-        self.text.replace_range(start..end, replacement);
     }
 }
 
@@ -632,5 +317,86 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn a_comment_between_members_stays_put_through_edits() {
+        let text = "{\n  \"a\": 1,\n  // about b\n  \"b\": 2,\n  /* about c */\n  \"c\": 3\n}\n";
+        let mut doc = JsoncDocument::parse(text).unwrap();
+        doc.set(&["b"], &json!(20)).unwrap();
+        doc.remove(&["c"]).unwrap();
+        doc.set(&["d"], &json!(true)).unwrap();
+        let out = doc.text();
+        assert!(out.contains("  // about b\n  \"b\": 20"), "{out}");
+        assert_eq!(doc.value().unwrap(), json!({"a": 1, "b": 20, "d": true}));
+    }
+
+    #[test]
+    fn trailing_commas_are_kept_and_edits_stay_loadable() {
+        let text = "{\n  \"a\": [1, 2,],\n  \"b\": {\"x\": 1,},\n}\n";
+        let mut doc = JsoncDocument::parse(text).unwrap();
+        doc.set(&["c"], &json!(false)).unwrap();
+        doc.set(&["b", "y"], &json!(2)).unwrap();
+        doc.remove(&["a"]).unwrap();
+        assert_eq!(
+            doc.value().unwrap(),
+            json!({"b": {"x": 1, "y": 2}, "c": false})
+        );
+        assert!(doc.text().trim_end().ends_with(",\n}"), "{}", doc.text());
+    }
+
+    #[test]
+    fn inline_nested_objects_accept_edits() {
+        let text = "{\"github\": {\"read\": true}, \"indexes\": {\"semantic\": false}}";
+        let mut doc = JsoncDocument::parse(text).unwrap();
+        doc.set(&["github", "write"], &json!(true)).unwrap();
+        doc.set(&["indexes", "semantic"], &json!(true)).unwrap();
+        doc.remove(&["github", "read"]).unwrap();
+        assert_eq!(
+            doc.value().unwrap(),
+            json!({"github": {"write": true}, "indexes": {"semantic": true}})
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings_are_preserved() {
+        let text = "{\r\n  // note\r\n  \"a\": 1\r\n}\r\n";
+        let mut doc = JsoncDocument::parse(text).unwrap();
+        doc.set(&["b"], &json!(["x"])).unwrap();
+        doc.set(&["c", "d"], &json!(true)).unwrap();
+        let out = doc.text();
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "bare LF in {out:?}"
+        );
+        assert!(out.contains("// note\r\n"));
+        assert_eq!(
+            doc.value().unwrap(),
+            json!({"a": 1, "b": ["x"], "c": {"d": true}})
+        );
+    }
+
+    #[test]
+    fn empty_object_and_empty_file_both_accept_members() {
+        for text in ["{}", "", "  \n", "{}\n"] {
+            let mut doc = JsoncDocument::parse(text).unwrap();
+            assert_eq!(doc.value().unwrap(), json!({}));
+            assert!(!doc.remove(&["x"]).unwrap());
+            doc.set(&["disabled_tools"], &json!([])).unwrap();
+            doc.set(&["github", "write"], &json!(true)).unwrap();
+            assert_eq!(
+                doc.value().unwrap(),
+                json!({"disabled_tools": [], "github": {"write": true}}),
+                "{text:?} -> {}",
+                doc.text()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_edit_the_last_occurrence_like_the_loader() {
+        let mut doc = JsoncDocument::parse("{\"a\": 1, \"a\": 2}").unwrap();
+        doc.set(&["a"], &json!(3)).unwrap();
+        assert_eq!(doc.value().unwrap(), json!({"a": 3}));
     }
 }
