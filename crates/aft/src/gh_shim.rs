@@ -85,6 +85,15 @@ const V14_GOVERNED_TUPLES: &[&str] = &["issue create", "issue edit"];
 // is refused on this path, and without the bypass `issue edit` stays on the
 // governed own-issue route.
 const V14_OPERATOR_LABEL_TUPLES: &[&str] = &["issue edit"];
+// v14 extends the same operator row to two verbs that have no bot-speech route
+// at all, for the design gate every seat runs: maintainers put labels such as
+// `design-approved` on issues and `trivial` on pull requests, and create those
+// labels when a repository lacks them. The manifest declares them in the admin
+// tier, but each runs only in its row's narrow shape: a label-only `pr edit` on
+// any pull request, and a `label create` with a name, color, description and
+// `--force`. Without the bypass both refuse as undeclared, exactly as before
+// v14, and label deletion and editing stay undeclared.
+const V14_OPERATOR_ROW_ADMIN_TUPLES: &[&str] = &["pr edit", "label create"];
 /// The only API endpoint admitted as governed speech: the id-addressed edit of
 /// an issue comment. The shim classifies and forwards; the route holder is what
 /// verifies the comment was written by the calling seat's bot.
@@ -461,6 +470,16 @@ where
     match classification {
         Classification::Mechanical => delegate_to_upstream(args),
         Classification::Admin { tuple } => {
+            if is_reviewed_operator_row_admin_tuple(manifest.manifest_version, &tuple) {
+                return dispatch_operator_row_admin(
+                    args,
+                    &tuple,
+                    manifest.manifest_version,
+                    paths,
+                    now,
+                    delegate_to_upstream,
+                );
+            }
             if operator_bypass_requested() {
                 let repository = explicit_repo(args).or_else(infer_repository_from_git);
                 if let Err(error) = append_bypass_audit(paths, &tuple, repository.as_deref(), now) {
@@ -484,6 +503,7 @@ where
                 return dispatch_operator_label_edit(
                     args,
                     &tuple,
+                    LabelTarget::Issue,
                     paths,
                     now,
                     delegate_to_upstream,
@@ -521,13 +541,55 @@ fn operator_bypass_requested() -> bool {
     std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator"))
 }
 
-/// Run a label-only `gh issue edit` as the operator.
+/// Run an admin-tier operator row (`pr edit`, `label create`).
 ///
-/// The argv must be exactly the label row (see `parse_operator_label_edit`);
-/// anything else refuses by name without touching the audit or upstream. The
-/// audit record is appended and synced before upstream `gh` is spawned, so an
-/// attempt that crashes mid-call is still on record.
-fn dispatch_operator_label_edit<F>(
+/// These verbs have no bot-speech route, so without the bypass they refuse as
+/// undeclared, the same refusal code they had before v14 declared them. With
+/// the bypass each runs only in its row's shape.
+fn dispatch_operator_row_admin<F>(
+    args: &[OsString],
+    tuple: &str,
+    manifest_version: u64,
+    paths: &StatePaths,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    let row_text = match tuple {
+        "pr edit" => LabelTarget::PullRequest.row_text(),
+        _ => OPERATOR_LABEL_CREATE_ROW_TEXT,
+    };
+    if !operator_bypass_requested() {
+        return refuse(
+            RefusalCode::Unclassified,
+            &format!(
+                "verb \"{tuple}\" has no bot-speech route in manifest {manifest_version}; {row_text}"
+            ),
+        );
+    }
+    match tuple {
+        "pr edit" => dispatch_operator_label_edit(
+            args,
+            tuple,
+            LabelTarget::PullRequest,
+            paths,
+            now,
+            delegate_to_upstream,
+        ),
+        _ => dispatch_operator_label_create(args, tuple, paths, now, delegate_to_upstream),
+    }
+}
+
+/// Run a `gh label create` as the operator.
+///
+/// The argv must be exactly the label-create row (see
+/// `parse_operator_label_create`); anything else refuses by name without
+/// touching the audit or upstream. The audit record is appended and synced
+/// before upstream `gh` is spawned, so an attempt that crashes mid-call is
+/// still on record.
+fn dispatch_operator_label_create<F>(
     args: &[OsString],
     tuple: &str,
     paths: &StatePaths,
@@ -537,7 +599,47 @@ fn dispatch_operator_label_edit<F>(
 where
     F: FnOnce(&[OsString]) -> i32,
 {
-    let edit = match parse_operator_label_edit(args) {
+    let create = match parse_operator_label_create(args) {
+        Ok(create) => create,
+        Err(error) => return refuse_governed_canonicalization(&error),
+    };
+    let repository = create.repository.clone().or_else(infer_repository_from_git);
+    if let Err(error) = append_bypass_audit_record(
+        paths,
+        &json!({
+            "as_of_unix_secs": now,
+            "tuple": tuple,
+            "repository": repository,
+            "label": create.label,
+            "color": create.color,
+        }),
+    ) {
+        return refuse(
+            RefusalCode::BypassAuditUnavailable,
+            &format!("operator bypass audit could not be appended: {error}"),
+        );
+    }
+    delegate_to_upstream(args)
+}
+
+/// Run a label-only `gh issue edit` or `gh pr edit` as the operator.
+///
+/// The argv must be exactly the label row (see `parse_operator_label_edit`);
+/// anything else refuses by name without touching the audit or upstream. The
+/// audit record is appended and synced before upstream `gh` is spawned, so an
+/// attempt that crashes mid-call is still on record.
+fn dispatch_operator_label_edit<F>(
+    args: &[OsString],
+    tuple: &str,
+    target: LabelTarget,
+    paths: &StatePaths,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    let edit = match parse_operator_label_edit(args, target) {
         Ok(edit) => edit,
         Err(error) => return refuse_governed_canonicalization(&error),
     };
@@ -2710,6 +2812,13 @@ fn is_reviewed_operator_label_tuple(manifest_version: u64, tuple: &str) -> bool 
     manifest_version >= 14 && V14_OPERATOR_LABEL_TUPLES.contains(&tuple)
 }
 
+/// True for an admin-tier tuple that runs only in its operator row's narrow
+/// shape (`pr edit` with labels only, `label create`), never as a plain
+/// bypass. Only reached for a tuple the manifest already declares admin.
+fn is_reviewed_operator_row_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
+    manifest_version >= 14 && V14_OPERATOR_ROW_ADMIN_TUPLES.contains(&tuple)
+}
+
 /// True for the one API rule that may be governed rather than admin: the v14
 /// own-comment PATCH. Every other governed API rule stays undeclared, so a
 /// signed rule alone cannot widen raw API writes into bot speech.
@@ -2803,7 +2912,10 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     }
     match manifest.tier_for_tuple(&tuple, platform) {
         Some(Tier::Mechanical) => Classification::Mechanical,
-        Some(Tier::Admin) if is_reviewed_admin_tuple(manifest.manifest_version, &tuple) => {
+        Some(Tier::Admin)
+            if is_reviewed_admin_tuple(manifest.manifest_version, &tuple)
+                || is_reviewed_operator_row_admin_tuple(manifest.manifest_version, &tuple) =>
+        {
             Classification::Admin { tuple }
         }
         Some(Tier::Governed) if is_reviewed_governed_tuple(manifest.manifest_version, &tuple) => {
@@ -3815,32 +3927,89 @@ fn infer_repository_from_git() -> Option<String> {
     canonical_repository_key(&origin_remote(&cwd)?)
 }
 
-/// A label-only `gh issue edit` accepted for the operator bypass: what the
-/// audit line records before upstream `gh` runs.
+/// Which kind of thread a label-only edit targets: `gh issue edit` or
+/// `gh pr edit`. Both verbs share one parser; this carries the differences in
+/// what the positional may name and how the audit line records it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LabelTarget {
+    Issue,
+    PullRequest,
+}
+
+impl LabelTarget {
+    fn row_text(self) -> &'static str {
+        match self {
+            Self::Issue => OPERATOR_LABEL_ROW_TEXT,
+            Self::PullRequest => OPERATOR_PR_LABEL_ROW_TEXT,
+        }
+    }
+
+    /// What the positional names, for refusal text.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull request",
+        }
+    }
+
+    /// The path segment of a `https://github.com/<owner>/<repo>/<segment>/<n>`
+    /// URL that names this kind of thread.
+    fn url_segment(self) -> &'static str {
+        match self {
+            Self::Issue => "issues",
+            Self::PullRequest => "pull",
+        }
+    }
+
+    /// The audit field that carries the number. The issue row keeps the
+    /// `issue_number` field it has always written, so existing readers of the
+    /// audit log see the same record shape.
+    fn audit_number_field(self) -> &'static str {
+        match self {
+            Self::Issue => "issue_number",
+            Self::PullRequest => "pr_number",
+        }
+    }
+}
+
+/// A label-only `gh issue edit` or `gh pr edit` accepted for the operator
+/// bypass: what the audit line records before upstream `gh` runs.
 #[derive(Debug, Eq, PartialEq)]
 struct OperatorLabelEdit {
-    /// From an issue URL, else from `--repo`/`-R`; `None` means the caller
-    /// falls back to the git origin, as upstream `gh` does.
+    /// From an issue or pull request URL, else from `--repo`/`-R`; `None`
+    /// means the caller falls back to the git origin, as upstream `gh` does.
     repository: Option<String>,
-    issue_number: u64,
+    target: LabelTarget,
+    number: u64,
     labels_added: Vec<String>,
     labels_removed: Vec<String>,
 }
 
 const OPERATOR_LABEL_ROW_TEXT: &str = "under GH_SHIM_BYPASS=operator `gh issue edit` admits only label changes: --add-label, --remove-label, one issue number or URL, and --repo/-R";
+const OPERATOR_PR_LABEL_ROW_TEXT: &str = "under GH_SHIM_BYPASS=operator `gh pr edit` admits only label changes: --add-label, --remove-label, one pull request number or URL, and --repo/-R";
+const OPERATOR_LABEL_CREATE_ROW_TEXT: &str = "under GH_SHIM_BYPASS=operator `gh label create` admits only one label name, --color/-c, --description/-d, --force/-f, and --repo/-R";
 
 /// Read the argv of the operator label row, refusing everything that is not
-/// part of it.
+/// part of it. `gh issue edit` and `gh pr edit` share this reader; `target`
+/// says which of the two the positional must name.
 ///
 /// Accepted, and nothing else: `--add-label` and `--remove-label` as
 /// `--flag value` or `--flag=value` with comma-separated labels; exactly one
-/// positional, an issue number or issue URL; `--repo`/`-R` as `--repo value`,
+/// positional, a number or a URL naming an issue (`/issues/<n>`) or a pull
+/// request (`/pull/<n>`) to match `target`; `--repo`/`-R` as `--repo value`,
 /// `--repo=value`, `-R value` or `-R=value`, before or after the command. At
 /// least one label flag is required. Any other argument refuses by name even
 /// when a label flag is also present, because upstream `gh` runs the whole
-/// argv: a title or assignee change riding along with a label would run under
-/// the operator's identity without being recorded as such.
-fn parse_operator_label_edit(args: &[OsString]) -> Result<OperatorLabelEdit, CanonicalizeError> {
+/// argv: a title, body, reviewer or assignee change riding along with a label
+/// would run under the operator's identity without being recorded as such. A
+/// pull request branch name is not admitted either: the audit line must record
+/// the number that was changed.
+fn parse_operator_label_edit(
+    args: &[OsString],
+    target_kind: LabelTarget,
+) -> Result<OperatorLabelEdit, CanonicalizeError> {
+    let row_text = target_kind.row_text();
+    let noun = target_kind.noun();
     let (_, _, head_index) = command_head(args)
         .ok_or_else(|| CanonicalizeError::unclassified("missing command head"))?;
     let mut explicit_repository: Option<String> = None;
@@ -3850,7 +4019,8 @@ fn parse_operator_label_edit(args: &[OsString]) -> Result<OperatorLabelEdit, Can
     let mut saw_label_flag = false;
     let mut index = 0;
     while index < args.len() {
-        // The two command words (`issue`, `edit`); command_head found them.
+        // The two command words (`issue edit` or `pr edit`); command_head
+        // found them.
         if index == head_index || index == head_index + 1 {
             index += 1;
             continue;
@@ -3884,30 +4054,19 @@ fn parse_operator_label_edit(args: &[OsString]) -> Result<OperatorLabelEdit, Can
             index += consumed;
             continue;
         }
-        if let Some((supplied, consumed)) = operator_row_flag_value(value, "--repo", next)?
-            .or(operator_row_flag_value(value, "-R", next)?)
-        {
-            if explicit_repository.replace(supplied).is_some() {
-                return Err(CanonicalizeError::typed(
-                    RefusalCode::UnsupportedFlag,
-                    "--repo: given more than once",
-                ));
-            }
+        if let Some(consumed) = operator_row_repo_flag(value, next, &mut explicit_repository)? {
             index += consumed;
             continue;
         }
         if value.starts_with('-') {
-            // Name the flag without any inline value: `--body=...` must not
-            // echo the text it carried.
-            let flag = value.split('=').next().unwrap_or(value);
             return Err(CanonicalizeError::typed(
                 RefusalCode::UnsupportedFlag,
-                format!("{flag}: {OPERATOR_LABEL_ROW_TEXT}"),
+                format!("{}: {row_text}", refused_flag_name(value)),
             ));
         }
         if let Some(first) = target {
             return Err(CanonicalizeError::unclassified(format!(
-                "{value}: a second positional after issue {first}; {OPERATOR_LABEL_ROW_TEXT}"
+                "{value}: a second positional after {noun} {first}; {row_text}"
             )));
         }
         target = Some(value);
@@ -3917,36 +4076,173 @@ fn parse_operator_label_edit(args: &[OsString]) -> Result<OperatorLabelEdit, Can
     if !saw_label_flag {
         return Err(CanonicalizeError::typed(
             RefusalCode::UnsupportedFlag,
-            format!("no --add-label or --remove-label: {OPERATOR_LABEL_ROW_TEXT}"),
+            format!("no --add-label or --remove-label: {row_text}"),
         ));
     }
     let target = target.ok_or_else(|| {
-        CanonicalizeError::unclassified(format!(
-            "no issue number or URL: {OPERATOR_LABEL_ROW_TEXT}"
-        ))
+        CanonicalizeError::unclassified(format!("no {noun} number or URL: {row_text}"))
     })?;
-    let (url_repository, issue_number) = parse_issue_target(target).ok_or_else(|| {
+    let segment = target_kind.url_segment();
+    let (url_repository, number) = parse_thread_target(target, segment).ok_or_else(|| {
         CanonicalizeError::unclassified(format!(
-            "{target}: not an issue number or https://github.com/<owner>/<repo>/issues/<number> URL"
+            "{target}: not a number or https://github.com/<owner>/<repo>/{segment}/<number> URL"
         ))
     })?;
     let explicit_repository = explicit_repository
         .map(|repository| canonical_repository_key(&repository).unwrap_or(repository));
-    // An issue URL names its own repository. If --repo names a different one
-    // the target is ambiguous, and the audit line would record a guess.
+    // A URL names its own repository. If --repo names a different one the
+    // target is ambiguous, and the audit line would record a guess.
     if let (Some(from_url), Some(explicit)) = (&url_repository, &explicit_repository) {
         if from_url != explicit {
             return Err(CanonicalizeError::unclassified(format!(
-                "{target}: the issue URL names {from_url} but --repo names {explicit}"
+                "{target}: the {noun} URL names {from_url} but --repo names {explicit}"
             )));
         }
     }
     Ok(OperatorLabelEdit {
         repository: url_repository.or(explicit_repository),
-        issue_number,
+        target: target_kind,
+        number,
         labels_added,
         labels_removed,
     })
+}
+
+/// A `gh label create` accepted for the operator bypass: what the audit line
+/// records before upstream `gh` runs.
+#[derive(Debug, Eq, PartialEq)]
+struct OperatorLabelCreate {
+    /// From `--repo`/`-R`; `None` means the caller falls back to the git
+    /// origin, as upstream `gh` does.
+    repository: Option<String>,
+    label: String,
+    /// `None` when no color was given: upstream then picks a random one.
+    color: Option<String>,
+}
+
+/// Read the argv of the operator label-create row, refusing everything that
+/// is not part of it.
+///
+/// Accepted, and nothing else (the flags `gh label create --help` lists):
+/// exactly one positional, the label name; `--color`/`-c` and
+/// `--description`/`-d` with a value, as `flag value` or `flag=value`;
+/// `--force`/`-f` without a value; `--repo`/`-R` as for the label edit row.
+/// Every other flag and a second positional refuse by name, because upstream
+/// `gh` runs the whole argv under the operator's identity.
+fn parse_operator_label_create(
+    args: &[OsString],
+) -> Result<OperatorLabelCreate, CanonicalizeError> {
+    let row_text = OPERATOR_LABEL_CREATE_ROW_TEXT;
+    let (_, _, head_index) = command_head(args)
+        .ok_or_else(|| CanonicalizeError::unclassified("missing command head"))?;
+    let mut explicit_repository: Option<String> = None;
+    let mut label: Option<&str> = None;
+    let mut color: Option<String> = None;
+    let mut saw_description = false;
+    let mut saw_force = false;
+    let mut index = 0;
+    while index < args.len() {
+        // The two command words (`label`, `create`); command_head found them.
+        if index == head_index || index == head_index + 1 {
+            index += 1;
+            continue;
+        }
+        let value = args[index].to_str().ok_or_else(|| {
+            CanonicalizeError::unclassified("non-UTF-8 arguments are outside the label row")
+        })?;
+        let next = args.get(index + 1);
+        if let Some((supplied, consumed)) = operator_row_flag_value(value, "--color", next)?
+            .or(operator_row_flag_value(value, "-c", next)?)
+        {
+            if color.replace(supplied).is_some() {
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::UnsupportedFlag,
+                    "--color: given more than once",
+                ));
+            }
+            index += consumed;
+            continue;
+        }
+        if let Some((_, consumed)) = operator_row_flag_value(value, "--description", next)?
+            .or(operator_row_flag_value(value, "-d", next)?)
+        {
+            if std::mem::replace(&mut saw_description, true) {
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::UnsupportedFlag,
+                    "--description: given more than once",
+                ));
+            }
+            index += consumed;
+            continue;
+        }
+        if value == "--force" || value == "-f" {
+            if std::mem::replace(&mut saw_force, true) {
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::UnsupportedFlag,
+                    "--force: given more than once",
+                ));
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(consumed) = operator_row_repo_flag(value, next, &mut explicit_repository)? {
+            index += consumed;
+            continue;
+        }
+        if value.starts_with('-') {
+            return Err(CanonicalizeError::typed(
+                RefusalCode::UnsupportedFlag,
+                format!("{}: {row_text}", refused_flag_name(value)),
+            ));
+        }
+        if let Some(first) = label {
+            return Err(CanonicalizeError::unclassified(format!(
+                "{value}: a second positional after label {first}; {row_text}"
+            )));
+        }
+        label = Some(value);
+        index += 1;
+    }
+    let label = label
+        .ok_or_else(|| CanonicalizeError::unclassified(format!("no label name: {row_text}")))?;
+    Ok(OperatorLabelCreate {
+        repository: explicit_repository
+            .map(|repository| canonical_repository_key(&repository).unwrap_or(repository)),
+        label: label.to_string(),
+        color,
+    })
+}
+
+/// Consume `--repo`/`-R` for an operator row, refusing a second one. Returns
+/// how many arguments the spelling used, or `None` when `value` is a
+/// different argument.
+fn operator_row_repo_flag(
+    value: &str,
+    next: Option<&OsString>,
+    explicit_repository: &mut Option<String>,
+) -> Result<Option<usize>, CanonicalizeError> {
+    let Some((supplied, consumed)) = operator_row_flag_value(value, "--repo", next)?
+        .or(operator_row_flag_value(value, "-R", next)?)
+    else {
+        return Ok(None);
+    };
+    if explicit_repository.replace(supplied).is_some() {
+        return Err(CanonicalizeError::typed(
+            RefusalCode::UnsupportedFlag,
+            "--repo: given more than once",
+        ));
+    }
+    Ok(Some(consumed))
+}
+
+/// The name of a refused flag without any value it carried: `--body=...` and
+/// the attached short spelling `-bTEXT` must not echo the text.
+fn refused_flag_name(value: &str) -> &str {
+    if value.starts_with("--") {
+        value.split('=').next().unwrap_or(value)
+    } else {
+        value.get(..2).unwrap_or(value)
+    }
 }
 
 /// The value of `flag` when `value` is that flag, spelled `flag value` (the
@@ -3980,9 +4276,10 @@ fn operator_row_flag_value(
     }
 }
 
-/// An issue number, or a `https://github.com/<owner>/<repo>/issues/<number>`
-/// URL together with the repository it names.
-fn parse_issue_target(target: &str) -> Option<(Option<String>, u64)> {
+/// A thread number, or a `https://github.com/<owner>/<repo>/<segment>/<number>`
+/// URL together with the repository it names. `segment` is `issues` for an
+/// issue and `pull` for a pull request, so a URL of the other kind refuses.
+fn parse_thread_target(target: &str, segment: &str) -> Option<(Option<String>, u64)> {
     let number = |text: &str| {
         (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
             .then(|| text.parse::<u64>().ok())
@@ -3997,9 +4294,12 @@ fn parse_issue_target(target: &str) -> Option<(Option<String>, u64)> {
         .find_map(|prefix| target.strip_prefix(prefix))?
         .trim_end_matches('/');
     let parts = path.split('/').collect::<Vec<_>>();
-    let [owner, repository, "issues", issue] = parts.as_slice() else {
+    let [owner, repository, kind, issue] = parts.as_slice() else {
         return None;
     };
+    if *kind != segment {
+        return None;
+    }
     let repository = canonical_repository_key(&format!("{owner}/{repository}"))?;
     Some((Some(repository), number(issue)?))
 }
@@ -4594,8 +4894,9 @@ fn append_bypass_audit(
 }
 
 /// The operator label row's audit line: the common bypass fields plus the
-/// issue and the labels added and removed, so `gh --status` shows what the
-/// operator changed and not just that a bypass happened.
+/// issue or pull request number and the labels added and removed, so
+/// `gh --status` shows what the operator changed and not just that a bypass
+/// happened.
 fn append_label_bypass_audit(
     paths: &StatePaths,
     tuple: &str,
@@ -4603,17 +4904,15 @@ fn append_label_bypass_audit(
     edit: &OperatorLabelEdit,
     now: u64,
 ) -> io::Result<()> {
-    append_bypass_audit_record(
-        paths,
-        &json!({
-            "as_of_unix_secs": now,
-            "tuple": tuple,
-            "repository": repository,
-            "issue_number": edit.issue_number,
-            "labels_added": edit.labels_added,
-            "labels_removed": edit.labels_removed,
-        }),
-    )
+    let mut record = json!({
+        "as_of_unix_secs": now,
+        "tuple": tuple,
+        "repository": repository,
+        "labels_added": edit.labels_added,
+        "labels_removed": edit.labels_removed,
+    });
+    record[edit.target.audit_number_field()] = json!(edit.number);
+    append_bypass_audit_record(paths, &record)
 }
 
 fn append_bypass_audit_record(paths: &StatePaths, record: &Value) -> io::Result<()> {
@@ -7880,7 +8179,7 @@ mod tests {
             ),
             "{args:?} must reach the declared issue edit row"
         );
-        parse_operator_label_edit(&args)
+        parse_operator_label_edit(&args, LabelTarget::Issue)
     }
 
     #[test]
@@ -8066,7 +8365,8 @@ mod tests {
                 edit,
                 OperatorLabelEdit {
                     repository: repository.map(str::to_string),
-                    issue_number: *issue_number,
+                    target: LabelTarget::Issue,
+                    number: *issue_number,
                     labels_added: added.iter().map(|label| label.to_string()).collect(),
                     labels_removed: removed.iter().map(|label| label.to_string()).collect(),
                 },
