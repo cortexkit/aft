@@ -193,7 +193,7 @@ mod wire;
 use self::health::{
     build_health_report, warn_slow_pending_binds, warn_slow_running_interactive_jobs,
     DeferredBashWaitGuard, DispatchPathMetrics, HealthRollupCache, HealthRollupWorker,
-    ReapBlockerCensus, ResponseTaskGuard,
+    ReapBlockerCensus, ResponseTaskGuard, UnboundRetention,
 };
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
 use self::manifest::{
@@ -922,6 +922,14 @@ struct RootMeta {
     idle_artifacts_evicted: bool,
     unbound_quiesced: bool,
     consecutive_missing_sweeps: u8,
+    /// When the idle reaper last submitted the unbound-teardown persist for
+    /// this root. Sweeps run every few hundred milliseconds, so a persist that
+    /// could not clear its blocker (cache lock contention, a failed write) is
+    /// retried at most once per [`UNBOUND_TEARDOWN_PERSIST_RETRY`].
+    teardown_persist_submitted_at: Option<Instant>,
+    /// Label of the blocker last logged for a root retained past its idle
+    /// TTL, so each distinct retention reason is logged once.
+    ttl_retention_logged: Option<&'static str>,
     /// A ConfigureTail drain for this root is submitted and has not completed.
     /// Counted across roots against `CONFIGURE_TAIL_CONCURRENCY`.
     configure_tail_in_flight: bool,
@@ -1090,6 +1098,8 @@ impl RootMeta {
             idle_artifacts_evicted: false,
             unbound_quiesced: false,
             consecutive_missing_sweeps: 0,
+            teardown_persist_submitted_at: None,
+            ttl_retention_logged: None,
             configure_tail_in_flight: false,
         }
     }
@@ -1102,6 +1112,8 @@ impl RootMeta {
         self.note_activity();
         self.idle_artifacts_evicted = false;
         self.unbound_quiesced = false;
+        self.teardown_persist_submitted_at = None;
+        self.ttl_retention_logged = None;
     }
 }
 
@@ -1497,6 +1509,56 @@ struct IdleReapOutcome {
     forgotten_deleted_roots: Vec<ProjectRootId>,
 }
 
+/// Minimum gap between unbound-teardown persist attempts for one root.
+const UNBOUND_TEARDOWN_PERSIST_RETRY: Duration = Duration::from_secs(60);
+
+/// Count an unbound root retained past its idle TTL and log the reason once
+/// per distinct blocker.
+fn note_unbound_ttl_retention(
+    root_id: &ProjectRootId,
+    meta: &mut RootMeta,
+    retention: UnboundRetention,
+    census: &mut ReapBlockerCensus,
+) {
+    census.note_unbound_retained(retention);
+    let label = retention.label();
+    if meta.ttl_retention_logged != Some(label) {
+        meta.ttl_retention_logged = Some(label);
+        log::info!(
+            "subc attach: unbound root {} is past its idle TTL but retained; blocker={}",
+            root_id.as_path().display(),
+            label
+        );
+    }
+}
+
+/// Queue the final artifact work for an unbound root past its idle TTL:
+/// persist the search delta the way graceful shutdown does and drop inspect
+/// completions nobody will drain. It runs as a maintenance job on the root's
+/// actor, never on the transport loop, and bails out if the root was rebound
+/// before it started. The reaper decides eviction on a later sweep, on the
+/// transport loop that also owns route binds, so a rebind that lands while
+/// this job runs always wins: the root then has a bound route and is skipped.
+fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId) {
+    let request_id = format!(
+        "subc-unbound-teardown-persist-{}",
+        root_id.as_path().to_string_lossy()
+    );
+    let response_id = request_id.clone();
+    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+        let persisted = ctx.persist_unbound_artifacts_for_teardown();
+        Response::success(response_id, json!({ "persisted": persisted }))
+    });
+    // The response only reports whether a delta was written; the next sweep
+    // re-reads the blocker itself, so the receiver is not awaited.
+    drop(executor.submit_maintenance_async(
+        root_id.clone(),
+        Lane::MaintenanceCommit,
+        request_id,
+        job,
+    ));
+}
+
 fn reap_idle_roots(
     now: Instant,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -1583,12 +1645,28 @@ fn reap_idle_roots(
                 || meta.idle_artifacts_evicted
                 || now.saturating_duration_since(meta.last_touched)
                     < root_idle_ttl(executor, root_id)
-                || meta.active_bash_waits > 0
-                || meta.maintenance_pending
-                || !meta.maintenance_queued_kinds.is_empty()
-                || has_pending_bind
-                || !executor.actor_is_idle(root_id)
             {
+                continue;
+            }
+            // The root is unbound and past its TTL, so anything that stops
+            // eviction from here on is a retention the census must show.
+            let retention = if meta.active_bash_waits > 0 {
+                Some(UnboundRetention::BashWaits)
+            } else if meta.maintenance_pending {
+                Some(UnboundRetention::MaintenancePending)
+            } else if !meta.maintenance_queued_kinds.is_empty() {
+                Some(UnboundRetention::MaintenanceQueued)
+            } else if has_pending_bind {
+                Some(UnboundRetention::PendingBind)
+            } else if !executor.actor_is_idle(root_id) {
+                // Includes the unbound-teardown persist while it is queued or
+                // running, so that job is never submitted twice.
+                Some(UnboundRetention::ActorBusy)
+            } else {
+                None
+            };
+            if let Some(retention) = retention {
+                note_unbound_ttl_retention(root_id, meta, retention, &mut census);
                 continue;
             }
         }
@@ -1620,13 +1698,33 @@ fn reap_idle_roots(
                 .kill_running_tasks_for_root(root_id.as_path());
         }
         let taken_pending = Some(ctx.take_pending_reconciliation_state());
-        if ctx.artifact_eviction_blocked() {
+        if let Some(blocker) = ctx.artifact_eviction_blocker() {
             if let Some(pending) = taken_pending {
                 ctx.restore_pending_reconciliation_state(pending);
             }
             if deleted {
                 census.deleted_retained += 1;
                 census.artifact_eviction_blocked += 1;
+            } else if let Some(meta) = live_roots.get_mut(&root_id) {
+                note_unbound_ttl_retention(
+                    &root_id,
+                    meta,
+                    UnboundRetention::Artifact(blocker),
+                    &mut census,
+                );
+                // Nothing else runs artifact work for an unbound root, so a
+                // blocker only a teardown job can clear (the unpersisted
+                // search delta above all) would otherwise hold the root and
+                // its watcher until rebind or daemon exit. The persist runs
+                // on the root's maintenance lane, off this transport loop;
+                // the next sweep evicts once the blocker is gone.
+                let retry_due = meta.teardown_persist_submitted_at.is_none_or(|submitted| {
+                    now.saturating_duration_since(submitted) >= UNBOUND_TEARDOWN_PERSIST_RETRY
+                });
+                if blocker.clearable_by_unbound_teardown() && retry_due {
+                    meta.teardown_persist_submitted_at = Some(now);
+                    submit_unbound_teardown_persist(executor, &root_id);
+                }
             }
             continue;
         }
@@ -1638,6 +1736,13 @@ fn reap_idle_roots(
             if deleted {
                 census.deleted_retained += 1;
                 census.artifact_eviction_failed += 1;
+            } else if let Some(meta) = live_roots.get_mut(&root_id) {
+                note_unbound_ttl_retention(
+                    &root_id,
+                    meta,
+                    UnboundRetention::ArtifactEvictionFailed,
+                    &mut census,
+                );
             }
             continue;
         }
@@ -1658,6 +1763,8 @@ fn reap_idle_roots(
         } else {
             if let Some(meta) = live_roots.get_mut(&root_id) {
                 meta.idle_artifacts_evicted = true;
+                meta.teardown_persist_submitted_at = None;
+                meta.ttl_retention_logged = None;
             }
             ctx.release_idle_reopenable_resources_in_background();
         }
@@ -1669,9 +1776,11 @@ fn reap_idle_roots(
     let census_changed = metrics.record_reap(census);
     if census_changed {
         log::info!(
-            "subc attach: retained {} deleted root(s) during idle reap; blockers={}",
+            "subc attach: retained {} deleted root(s) during idle reap; blockers={}; retained {} unbound root(s) past idle TTL; unbound_blockers={}",
             census.deleted_retained,
-            census.blocker_histogram()
+            census.blocker_histogram(),
+            census.unbound_retained,
+            census.unbound_histogram()
         );
     }
 
@@ -9106,6 +9215,343 @@ mod tests {
             vec![pending],
             "a blocked eviction must restore the taken pending paths"
         );
+    }
+
+    /// An unbound, quiesced, TTL-aged writer root whose resident search index
+    /// holds a watcher edit that was never written to `cache.bin`.
+    struct DirtyUnboundRoot {
+        _root_dir: tempfile::TempDir,
+        _storage: tempfile::TempDir,
+        root: ProjectRootId,
+        canonical: PathBuf,
+        cache_dir: PathBuf,
+        ctx: Arc<AppContext>,
+        executor: Arc<Executor>,
+        live_roots: HashMap<ProjectRootId, RootMeta>,
+    }
+
+    impl DirtyUnboundRoot {
+        fn new(name: &str) -> Self {
+            let (root_dir, root) = test_root(name);
+            let storage = tempfile::tempdir().expect("storage dir");
+            let canonical = std::fs::canonicalize(root.as_path()).expect("canonical root");
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(canonical.clone()),
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    ..Config::default()
+                },
+            ));
+            ctx.set_canonical_cache_root(canonical.clone());
+            let executor = Arc::new(Executor::new());
+            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+            // Persisted base first, then the watcher edit that only lives in
+            // the resident delta.
+            let cache_dir =
+                crate::search_index::resolve_cache_dir(&canonical, Some(storage.path()));
+            let mut index = crate::search_index::SearchIndex::build(&canonical);
+            assert!(
+                index.write_to_disk(&cache_dir, None),
+                "base cache.bin write"
+            );
+            let edited = canonical.join("edited.rs");
+            std::fs::write(&edited, "fn edited_delta_marker() {}\n").unwrap();
+            index.ready = true;
+            index.update_file(&edited);
+            assert!(index.has_pending_disk_changes());
+            *ctx.search_index().write().unwrap() = Some(index);
+
+            let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+            quiesce_unbound_root(&root, &mut live_roots, &executor);
+            live_roots.get_mut(&root).unwrap().last_touched =
+                Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+            assert_eq!(
+                ctx.artifact_eviction_blocker(),
+                Some(crate::context::ArtifactEvictionBlocker::SearchDeltaUnpersisted)
+            );
+            Self {
+                _root_dir: root_dir,
+                _storage: storage,
+                root,
+                canonical,
+                cache_dir,
+                ctx,
+                executor,
+                live_roots,
+            }
+        }
+
+        fn reap(
+            &mut self,
+            now: Instant,
+            root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
+            metrics: &DispatchPathMetrics,
+        ) -> IdleReapOutcome {
+            reap_idle_roots(
+                now,
+                &mut self.live_roots,
+                &HashMap::new(),
+                root_channels,
+                &self.executor,
+                metrics,
+            )
+        }
+
+        fn wait_for_actor_idle(&self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.executor.actor_is_idle(&self.root) {
+                assert!(Instant::now() < deadline, "teardown persist never finished");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn has_pending_disk_changes(&self) -> bool {
+            self.ctx
+                .search_index()
+                .read()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|index| index.has_pending_disk_changes())
+        }
+
+        fn cache_bin(&self) -> Vec<u8> {
+            std::fs::read(self.cache_dir.join("cache.bin")).expect("read cache.bin")
+        }
+    }
+
+    #[test]
+    fn unbound_root_with_unpersisted_search_delta_is_persisted_then_evicted() {
+        let mut fixture = DirtyUnboundRoot::new("unpersisted-delta");
+        let cache_before = fixture.cache_bin();
+        let metrics = DispatchPathMetrics::new();
+        let start = Instant::now();
+
+        // The first TTL sweep finds the delta as the only blocker and queues
+        // the persist instead of holding the root forever.
+        assert_eq!(fixture.reap(start, &HashMap::new(), &metrics).evicted, 0);
+        fixture.wait_for_actor_idle();
+        assert!(
+            !fixture.has_pending_disk_changes(),
+            "the teardown persist must write the delta before eviction"
+        );
+        assert!(fixture.ctx.search_index().read().unwrap().is_some());
+        assert_ne!(
+            fixture.cache_bin(),
+            cache_before,
+            "cache.bin must be rewritten"
+        );
+        let mut restored = crate::search_index::SearchIndex::read_from_disk(
+            &fixture.cache_dir,
+            &fixture.canonical,
+        )
+        .expect("reload cache.bin");
+        restored.set_ready(true);
+        assert_eq!(
+            restored
+                .grep(
+                    "edited_delta_marker",
+                    true,
+                    &[],
+                    &[],
+                    &fixture.canonical,
+                    10
+                )
+                .matches
+                .len(),
+            1,
+            "the persisted cache.bin must carry the delta"
+        );
+
+        let mut evicted = 0;
+        for hours_later in [1u64, 6, 24] {
+            evicted += fixture
+                .reap(
+                    start + Duration::from_secs(hours_later * 3600),
+                    &HashMap::new(),
+                    &metrics,
+                )
+                .evicted;
+        }
+        assert_eq!(evicted, 1, "the persisted root is evicted exactly once");
+        assert!(fixture.live_roots[&fixture.root].idle_artifacts_evicted);
+        assert!(!fixture.ctx.artifact_eviction_blocked());
+        assert!(fixture.ctx.search_index().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn rebind_during_unbound_teardown_persist_keeps_root_resident() {
+        let mut fixture = DirtyUnboundRoot::new("rebind-mid-persist");
+        let (_gate, reached, release) =
+            crate::context::gate_unbound_teardown_persist_for_test(fixture.canonical.clone());
+        let metrics = DispatchPathMetrics::new();
+        let start = Instant::now();
+
+        assert_eq!(fixture.reap(start, &HashMap::new(), &metrics).evicted, 0);
+        reached
+            .recv_timeout(Duration::from_secs(10))
+            .expect("teardown persist reached its gate");
+
+        // The route rebinds while the persist is in flight: the transport
+        // loop reopens lifecycle admission and records the bound channel.
+        fixture.ctx.mark_subc_bound();
+        fixture
+            .live_roots
+            .get_mut(&fixture.root)
+            .unwrap()
+            .reactivate_bound();
+        let root_channels =
+            HashMap::from([(fixture.root.clone(), HashSet::from([route_key(7, 1)]))]);
+        release.send(()).unwrap();
+        fixture.wait_for_actor_idle();
+
+        for hours_later in [1u64, 24] {
+            assert_eq!(
+                fixture
+                    .reap(
+                        start + Duration::from_secs(hours_later * 3600),
+                        &root_channels,
+                        &metrics,
+                    )
+                    .evicted,
+                0,
+                "a rebound root must not be evicted"
+            );
+        }
+        assert!(!fixture.live_roots[&fixture.root].idle_artifacts_evicted);
+        assert!(
+            fixture.ctx.search_index().read().unwrap().is_some(),
+            "the rebound root keeps its resident index"
+        );
+    }
+
+    #[test]
+    fn unbound_root_held_past_ttl_is_counted_with_its_blocker() {
+        // No canonical cache root, so the teardown persist cannot write and
+        // the delta keeps holding the root.
+        let (_root_dir, root) = test_root("held-root-census");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let edited = root.as_path().join("edited.rs");
+        std::fs::write(&edited, "fn edited() {}\n").unwrap();
+        let mut index = crate::search_index::SearchIndex::new();
+        index.ready = true;
+        index.update_file(&edited);
+        *ctx.search_index().write().unwrap() = Some(index);
+
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        quiesce_unbound_root(&root, &mut live_roots, &executor);
+        live_roots.get_mut(&root).unwrap().last_touched =
+            Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        let metrics = DispatchPathMetrics::new();
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &metrics,
+        );
+        assert_eq!(outcome.evicted, 0);
+        assert_eq!(
+            live_roots[&root].ttl_retention_logged,
+            Some("search_delta_unpersisted")
+        );
+
+        let app = crate::context::App::default_shared();
+        let health_rollup_cache = HealthRollupCache::new();
+        health_rollup_cache.refresh(&executor, &app);
+        let report = build_health_report(
+            &health_rollup_cache,
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+        );
+        let reap = report
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.get("reap"))
+            .expect("reap health metrics");
+        assert_eq!(reap["unbound_retained"].as_u64(), Some(1));
+        assert_eq!(
+            reap["unbound_blockers"]["search_delta_unpersisted"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(reap["unbound_blockers"]["actor_busy"].as_u64(), Some(0));
+        // Deleted-root accounting is unchanged.
+        assert_eq!(reap["deleted_retained"].as_u64(), Some(0));
+        assert_eq!(
+            reap["blockers"]["artifact_eviction_blocked"].as_u64(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn borrow_only_root_ram_delta_does_not_block_ttl_eviction() {
+        let (_root_dir, root) = test_root("borrow-only-delta");
+        let ctx = test_ctx();
+        ctx.set_cache_role(true, None);
+        assert!(ctx.shared_artifacts_read_only());
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let edited = root.as_path().join("edited.rs");
+        std::fs::write(&edited, "fn edited() {}\n").unwrap();
+        let mut index = crate::search_index::SearchIndex::new();
+        index.ready = true;
+        index.update_file(&edited);
+        assert!(index.has_pending_disk_changes());
+        *ctx.search_index().write().unwrap() = Some(index);
+        // A borrow-only root can never write this delta, so it is not work
+        // the eviction would lose.
+        assert!(!ctx.artifact_eviction_blocked());
+
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        quiesce_unbound_root(&root, &mut live_roots, &executor);
+        live_roots.get_mut(&root).unwrap().last_touched =
+            Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &DispatchPathMetrics::new(),
+        );
+        assert_eq!(outcome.evicted, 1);
+        assert!(ctx.search_index().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn control_unbound_root_with_clean_search_index_is_evicted() {
+        let (_root_dir, root) = test_root("clean-index");
+        let ctx = test_ctx();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+        let mut index = crate::search_index::SearchIndex::new();
+        index.ready = true;
+        assert!(!index.has_pending_disk_changes());
+        *ctx.search_index().write().unwrap() = Some(index);
+
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        quiesce_unbound_root(&root, &mut live_roots, &executor);
+        live_roots.get_mut(&root).unwrap().last_touched =
+            Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+
+        let outcome = reap_idle_roots(
+            Instant::now(),
+            &mut live_roots,
+            &HashMap::new(),
+            &HashMap::new(),
+            &executor,
+            &DispatchPathMetrics::new(),
+        );
+        assert_eq!(outcome.evicted, 1);
+        assert!(live_roots[&root].idle_artifacts_evicted);
+        assert!(ctx.search_index().read().unwrap().is_none());
     }
 
     #[test]

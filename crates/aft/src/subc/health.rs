@@ -8,8 +8,63 @@ use super::{
     HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot,
     RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
-use crate::context::{App, AppContext};
+use crate::context::{App, AppContext, ArtifactEvictionBlocker};
 use crate::executor::BindBlockerSnapshot;
+
+/// Why the idle reaper kept an existing, unbound root that is past its idle
+/// TTL. Deleted roots are counted separately in the census's `blockers`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UnboundRetention {
+    BashWaits,
+    MaintenancePending,
+    MaintenanceQueued,
+    PendingBind,
+    ActorBusy,
+    Artifact(ArtifactEvictionBlocker),
+    ArtifactEvictionFailed,
+}
+
+const UNBOUND_RETENTION_KINDS: usize = 13;
+
+const UNBOUND_RETENTION_LABELS: [&str; UNBOUND_RETENTION_KINDS] = [
+    "bash_waits",
+    "maintenance_pending",
+    "maintenance_queued",
+    "pending_binds",
+    "actor_busy",
+    "standing_root",
+    "build_in_flight",
+    "semantic_refresh",
+    "inspect_tier2",
+    "bash_running",
+    "pending_reconciliation",
+    "search_delta_unpersisted",
+    "artifact_eviction_failed",
+];
+
+impl UnboundRetention {
+    fn index(self) -> usize {
+        match self {
+            Self::BashWaits => 0,
+            Self::MaintenancePending => 1,
+            Self::MaintenanceQueued => 2,
+            Self::PendingBind => 3,
+            Self::ActorBusy => 4,
+            Self::Artifact(ArtifactEvictionBlocker::StandingRoot) => 5,
+            Self::Artifact(ArtifactEvictionBlocker::BuildInFlight) => 6,
+            Self::Artifact(ArtifactEvictionBlocker::SemanticRefresh) => 7,
+            Self::Artifact(ArtifactEvictionBlocker::InspectTier2) => 8,
+            Self::Artifact(ArtifactEvictionBlocker::BashRunning) => 9,
+            Self::Artifact(ArtifactEvictionBlocker::PendingReconciliation) => 10,
+            Self::Artifact(ArtifactEvictionBlocker::SearchDeltaUnpersisted) => 11,
+            Self::ArtifactEvictionFailed => 12,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        UNBOUND_RETENTION_LABELS[self.index()]
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct ReapBlockerCensus {
@@ -25,9 +80,27 @@ pub(super) struct ReapBlockerCensus {
     pub(super) actor_state_busy: usize,
     pub(super) artifact_eviction_blocked: usize,
     pub(super) artifact_eviction_failed: usize,
+    /// Existing roots with no bound route that are past their idle TTL but
+    /// were not evicted, counted once each under the reason in
+    /// `unbound_blockers`.
+    pub(super) unbound_retained: usize,
+    pub(super) unbound_blockers: [usize; UNBOUND_RETENTION_KINDS],
 }
 
 impl ReapBlockerCensus {
+    pub(super) fn note_unbound_retained(&mut self, reason: UnboundRetention) {
+        self.unbound_retained += 1;
+        self.unbound_blockers[reason.index()] += 1;
+    }
+
+    pub(super) fn unbound_histogram(&self) -> String {
+        UNBOUND_RETENTION_LABELS
+            .iter()
+            .zip(self.unbound_blockers.iter())
+            .map(|(label, count)| format!("{label}={count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
     pub(super) fn blocker_histogram(&self) -> String {
         format!(
             "absence_unconfirmed={},bound_routes={},unbound_quiesced={},bash_waits={},maintenance_pending={},maintenance_queued={},pending_binds={},actor_busy={},actor_state_busy={},artifact_eviction_blocked={},artifact_eviction_failed={}",
@@ -65,6 +138,8 @@ struct ReapMetrics {
     actor_state_busy: AtomicUsize,
     artifact_eviction_blocked: AtomicUsize,
     artifact_eviction_failed: AtomicUsize,
+    unbound_retained: AtomicUsize,
+    unbound_blockers: [AtomicUsize; UNBOUND_RETENTION_KINDS],
 }
 
 impl ReapMetrics {
@@ -84,6 +159,8 @@ impl ReapMetrics {
             actor_state_busy: AtomicUsize::new(0),
             artifact_eviction_blocked: AtomicUsize::new(0),
             artifact_eviction_failed: AtomicUsize::new(0),
+            unbound_retained: AtomicUsize::new(0),
+            unbound_blockers: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
     }
 
@@ -91,7 +168,13 @@ impl ReapMetrics {
     /// from the previous sweep's.
     fn record(&self, now_ms: u64, census: ReapBlockerCensus) -> bool {
         self.last_sweep_ms.store(now_ms, Ordering::Relaxed);
-        let summary = format!("{};{}", census.deleted_retained, census.blocker_histogram());
+        let summary = format!(
+            "{};{};{};{}",
+            census.deleted_retained,
+            census.blocker_histogram(),
+            census.unbound_retained,
+            census.unbound_histogram()
+        );
         let changed = {
             let mut last = self
                 .last_retained_summary
@@ -123,10 +206,24 @@ impl ReapMetrics {
             .store(census.artifact_eviction_blocked, Ordering::Relaxed);
         self.artifact_eviction_failed
             .store(census.artifact_eviction_failed, Ordering::Relaxed);
+        self.unbound_retained
+            .store(census.unbound_retained, Ordering::Relaxed);
+        for (slot, count) in self
+            .unbound_blockers
+            .iter()
+            .zip(census.unbound_blockers.iter())
+        {
+            slot.store(*count, Ordering::Relaxed);
+        }
         changed
     }
 
     fn snapshot(&self) -> Value {
+        let unbound_blockers = UNBOUND_RETENTION_LABELS
+            .iter()
+            .zip(self.unbound_blockers.iter())
+            .map(|(label, count)| ((*label).to_string(), json!(count.load(Ordering::Relaxed))))
+            .collect::<serde_json::Map<_, _>>();
         json!({
             "deleted_retained": self.deleted_retained.load(Ordering::Relaxed),
             "blockers": {
@@ -142,6 +239,8 @@ impl ReapMetrics {
                 "artifact_eviction_blocked": self.artifact_eviction_blocked.load(Ordering::Relaxed),
                 "artifact_eviction_failed": self.artifact_eviction_failed.load(Ordering::Relaxed),
             },
+            "unbound_retained": self.unbound_retained.load(Ordering::Relaxed),
+            "unbound_blockers": unbound_blockers,
             "last_sweep_ms": self.last_sweep_ms.load(Ordering::Relaxed),
         })
     }

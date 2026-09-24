@@ -1148,6 +1148,104 @@ pub(crate) struct PendingReconciliationState {
     corpus_refresh: bool,
 }
 
+/// Why [`AppContext::artifact_eviction_blocker`] refused eviction. The idle
+/// reaper counts retained unbound roots per kind in its health census.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ArtifactEvictionBlocker {
+    /// A configured standing root keeps its artifacts resident on purpose.
+    StandingRoot,
+    /// A search, callgraph, or semantic build receiver is still installed.
+    BuildInFlight,
+    /// A semantic build or incremental refresh is recorded as running.
+    SemanticRefresh,
+    /// An inspect Tier-2 job is counted as in flight.
+    InspectTier2,
+    /// A background bash task started from this root is still running.
+    BashRunning,
+    /// Watcher-derived paths still await reconciliation into an artifact.
+    PendingReconciliation,
+    /// The resident search index holds edits that were never written to
+    /// `cache.bin`.
+    SearchDeltaUnpersisted,
+}
+
+impl ArtifactEvictionBlocker {
+    /// Whether a teardown job can clear this blocker on an unbound root:
+    /// writing the search delta to disk, or dropping inspect completions that
+    /// nothing drains while the root is unbound. The other blockers are either
+    /// intentional (standing roots, running bash tasks) or clear on their own.
+    pub(crate) fn clearable_by_unbound_teardown(self) -> bool {
+        matches!(self, Self::SearchDeltaUnpersisted | Self::InspectTier2)
+    }
+}
+
+/// Test gate that parks the unbound-teardown persist of one root after its
+/// unbound check, so a test can rebind the root while the persist is running.
+#[cfg(test)]
+struct UnboundTeardownPersistGate {
+    root: PathBuf,
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static UNBOUND_TEARDOWN_PERSIST_GATE: std::sync::OnceLock<
+    parking_lot::Mutex<Option<UnboundTeardownPersistGate>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct UnboundTeardownPersistGateGuard;
+
+#[cfg(test)]
+impl Drop for UnboundTeardownPersistGateGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = UNBOUND_TEARDOWN_PERSIST_GATE.get() {
+            *slot.lock() = None;
+        }
+    }
+}
+
+/// Install the gate for `root`. Returns a guard that removes it, a receiver
+/// that fires when the persist reaches the gate, and a sender that releases it.
+#[cfg(test)]
+pub(crate) fn gate_unbound_teardown_persist_for_test(
+    root: PathBuf,
+) -> (
+    UnboundTeardownPersistGateGuard,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let mut slot = UNBOUND_TEARDOWN_PERSIST_GATE
+        .get_or_init(Default::default)
+        .lock();
+    assert!(
+        slot.is_none(),
+        "unbound teardown persist gate already installed"
+    );
+    *slot = Some(UnboundTeardownPersistGate {
+        root,
+        reached: reached_tx,
+        release: release_rx,
+    });
+    (UnboundTeardownPersistGateGuard, reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_unbound_teardown_persist_gate_for_test(root: Option<&Path>) {
+    let gate = UNBOUND_TEARDOWN_PERSIST_GATE.get().and_then(|slot| {
+        slot.lock()
+            .as_ref()
+            .filter(|gate| Some(gate.root.as_path()) == root)
+            .map(|gate| (gate.reached.clone(), gate.release.clone()))
+    });
+    if let Some((reached, release)) = gate {
+        let _ = reached.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
+    }
+}
+
 impl WatcherDrainSliceState {
     pub(crate) fn new(configure_generation: u64, configure_content_generation: u64) -> Self {
         Self {
@@ -7637,8 +7735,18 @@ impl AppContext {
     /// live handle. Callers use this as the single safety gate before clearing
     /// resident stores and inspect caches.
     pub fn artifact_eviction_blocked(&self) -> bool {
+        self.artifact_eviction_blocker().is_some()
+    }
+
+    /// The first condition that makes artifact eviction unsafe, or `None` when
+    /// eviction may proceed. Conditions are checked in a fixed order and the
+    /// unpersisted search delta is checked last, so a result of
+    /// [`ArtifactEvictionBlocker::SearchDeltaUnpersisted`] means it is the only
+    /// blocker; the idle reaper relies on that to decide when persisting the
+    /// delta is enough to make the root evictable.
+    pub(crate) fn artifact_eviction_blocker(&self) -> Option<ArtifactEvictionBlocker> {
         if self.standing_artifact_exempt.load(Ordering::Acquire) {
-            return true;
+            return Some(ArtifactEvictionBlocker::StandingRoot);
         }
         let semantic_refresh_in_flight = match &*self
             .semantic_index_status
@@ -7649,26 +7757,71 @@ impl AppContext {
             SemanticIndexStatus::Ready { refreshing, .. } => !refreshing.is_empty(),
             SemanticIndexStatus::Disabled | SemanticIndexStatus::Failed(_) => false,
         };
-        if crate::runtime_drain::any_build_in_flight(self)
-            || semantic_refresh_in_flight
-            || self.inspect_manager.tier2_any_in_flight()
-            || !self.bash_background.running_tasks().is_empty()
-            || !self.pending_callgraph_store_paths.lock().is_empty()
+        if crate::runtime_drain::any_build_in_flight(self) {
+            return Some(ArtifactEvictionBlocker::BuildInFlight);
+        }
+        if semantic_refresh_in_flight {
+            return Some(ArtifactEvictionBlocker::SemanticRefresh);
+        }
+        if self.inspect_manager.tier2_any_in_flight() {
+            return Some(ArtifactEvictionBlocker::InspectTier2);
+        }
+        if !self.bash_background.running_tasks().is_empty() {
+            return Some(ArtifactEvictionBlocker::BashRunning);
+        }
+        if !self.pending_callgraph_store_paths.lock().is_empty()
             || !self.pending_search_index_paths.lock().is_empty()
             || !self.pending_tier2_paths.lock().is_empty()
             || !self.pending_semantic_index_paths.lock().is_empty()
             || *self.pending_semantic_corpus_refresh.lock()
         {
-            return true;
+            return Some(ArtifactEvictionBlocker::PendingReconciliation);
         }
 
+        // A borrow-only root (including a `worktree.ram_overlay` root that
+        // applies local edits to its in-RAM delta) never writes the shared
+        // `cache.bin`, so its delta is not pending disk work: no persist path
+        // exists for it and treating it as one would pin the root forever.
+        // Dropping it loses nothing a daemon restart would not also lose; the
+        // next load reconciles the borrowed snapshot with the checkout.
+        if self.shared_artifacts_read_only() {
+            return None;
+        }
         let search_has_pending_disk_changes = self
             .search_index
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(SearchIndex::has_pending_disk_changes);
-        search_has_pending_disk_changes
+        search_has_pending_disk_changes.then_some(ArtifactEvictionBlocker::SearchDeltaUnpersisted)
+    }
+
+    /// Persist the resident search-index delta of an unbound root so the idle
+    /// reaper can evict it, and drop inspect completions that arrived after
+    /// the unbind (nothing drains them while the root is unbound, and each one
+    /// keeps its Tier-2 job counted as in flight).
+    ///
+    /// This is the only artifact work an unbound root runs. It does nothing
+    /// once the root is bound again: the rebind owns the root's artifacts from
+    /// that point, and configure persists the delta itself. A rebind that lands
+    /// after the check below only lets an ordinary delta write finish, which is
+    /// harmless for a bound root. Returns whether a delta was written.
+    pub(crate) fn persist_unbound_artifacts_for_teardown(&self) -> bool {
+        if !self.subc_unbound_quiesced() {
+            return false;
+        }
+        let _ = self.inspect_manager.discard_completions();
+        #[cfg(test)]
+        wait_on_unbound_teardown_persist_gate_for_test(self.canonical_cache_root_opt().as_deref());
+        // Unbind retires the search receiver and the watcher drain is a no-op
+        // while unbound, so the shutdown flush normally does no waiting: one
+        // 25 ms cache-lock attempt plus the delta write. A receiver present
+        // here belongs to a rebind that has already started; leave the index
+        // to it rather than wait up to the shutdown build-settle bound.
+        if self.search_index_build_in_progress() {
+            return false;
+        }
+        self.flush_search_index_on_graceful_shutdown()
     }
 
     /// Drop idle root-scoped artifact handles. Persistent data remains on disk;
