@@ -100,6 +100,47 @@ fn release_wait_registration(
     }
 }
 
+/// What one wake of a deferred bash wait learned about its task.
+struct DeferredWaitObservation {
+    /// The task reached a terminal state, or is no longer in the registry.
+    target_finished: bool,
+    /// A `wait: true` call's session asked to detach the wait.
+    detach_pending: bool,
+}
+
+/// Reads a deferred bash wait's task state on the blocking pool.
+///
+/// The wait loop runs on the subc frame loop's single-threaded runtime. The
+/// registry snapshot takes the task's state mutex, which the bash watchdog can
+/// hold while it persists the task (a file write plus an aft.db upsert), and a
+/// terminal snapshot may render cached output from disk. Doing either inline
+/// stops the frame loop, so no route's frames are read or written until the
+/// lock frees. Here the frame loop only awaits.
+async fn observe_deferred_bash_wait(
+    registry: crate::bash_background::BgTaskRegistry,
+    task_id: String,
+    session_id: String,
+    wait_mode: bool,
+) -> DeferredWaitObservation {
+    tokio::task::spawn_blocking(move || {
+        let target_finished = registry
+            .observed_status(&task_id, &session_id, 0)
+            .is_none_or(|snapshot| snapshot.info.status.is_terminal());
+        let detach_pending = wait_mode && registry.wait_mode_detach_pending(&session_id);
+        DeferredWaitObservation {
+            target_finished,
+            detach_pending,
+        }
+    })
+    .await
+    // A panicked read learned nothing; hand the decision to the executor poll,
+    // which reads the task again and answers the call either way.
+    .unwrap_or(DeferredWaitObservation {
+        target_finished: true,
+        detach_pending: false,
+    })
+}
+
 /// Hands a held call's command to the background the way a drain detach does
 /// (the task keeps running and delivers its completion later), off the
 /// executor and off the module loop's thread: promotion writes task metadata.
@@ -729,12 +770,19 @@ async fn run_deferred_bash_wait(
             }
             _ = cancel.cancelled() => {
                 if claim.claim_for_wait_task() {
-                    release_wait_registration(
-                        &registry,
-                        &session_id,
-                        &task_id,
-                        detach_on_user_message,
-                    );
+                    // Registry locks stay off the frame loop's thread.
+                    let registry = registry.clone();
+                    let session_id = session_id.clone();
+                    let task_id = task_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        release_wait_registration(
+                            &registry,
+                            &session_id,
+                            &task_id,
+                            detach_on_user_message,
+                        );
+                    })
+                    .await;
                 }
                 send_bash_deferred_completion(
                     &completion_tx,
@@ -751,18 +799,20 @@ async fn run_deferred_bash_wait(
                 .await;
                 break;
             }
-            _ = async {
+            observation = async {
                 tokio::select! {
                     _ = registry.terminal_transition_notified() => {}
                     _ = tokio::time::sleep(PENDING_POLL_INTERVAL) => {}
                 }
+                observe_deferred_bash_wait(
+                    registry.clone(),
+                    task_id.clone(),
+                    session_id.clone(),
+                    detach_on_user_message,
+                )
+                .await
             } => {
-                let observed = registry.observed_status(&task_id, &session_id, 0);
-                let target_finished = observed
-                    .as_ref()
-                    .is_none_or(|snapshot| snapshot.info.status.is_terminal());
-                let detach_pending = detach_on_user_message
-                    && registry.wait_mode_detach_pending(&session_id);
+                let DeferredWaitObservation { target_finished, detach_pending } = observation;
                 let promotion_due = !block_to_completion && Instant::now() >= deadline;
                 // While the module drains, every foreground wait (wait:true,
                 // block_to_completion, or a plain wait window) is detached into
@@ -1466,5 +1516,118 @@ mod grant_path_tests {
                 .load(Ordering::Relaxed),
             0
         );
+    }
+
+    /// A deferred bash wait runs on the frame loop's single-threaded runtime.
+    /// While another thread holds its task's state mutex (the bash watchdog
+    /// does, while it persists the task to disk and aft.db), the wait's
+    /// periodic task check must not park that thread: every other route's
+    /// frames are read and written by it. The timer ticks below stand in for
+    /// those routes, because they only run when the runtime thread is free.
+    #[tokio::test]
+    async fn deferred_bash_wait_does_not_block_the_frame_loop_on_task_state_lock() {
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        }));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(4);
+        let (poll_touch_tx, _poll_touch_rx) = mpsc::channel(16);
+        let (_dir, root) = super::super::test_support::test_root("bash-wait-lock");
+        executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+
+        submit_deferred_bash(
+            &executor,
+            &completion_tx,
+            &poll_touch_tx,
+            &metrics,
+            running_bash_stub,
+            root.clone(),
+            root.as_path().to_path_buf(),
+            "session-lock".to_string(),
+            "wait-lock".to_string(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            Flags::new(false, Priority::Passive, false),
+            PROTOCOL_VERSION,
+            json!({
+                "command": "sleep 2",
+                "wait": true,
+                "timeout": 10_000,
+            }),
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+        );
+
+        let started_by = Instant::now() + Duration::from_secs(3);
+        while metrics
+            .deferred_bash_waits_in_flight
+            .load(Ordering::Relaxed)
+            < 1
+        {
+            assert!(Instant::now() < started_by, "deferred bash wait never started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let registry = executor
+            .actor_context(&root)
+            .expect("actor context")
+            .bash_background()
+            .clone();
+        let task_id = registry
+            .list(0)
+            .into_iter()
+            .next()
+            .expect("running bash task")
+            .info
+            .task_id;
+        let task = registry.task_for_test(&task_id).expect("registered task");
+
+        let hold = Duration::from_millis(1_200);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _state = task.state.lock().expect("task state");
+            held_tx.send(()).expect("held signal");
+            std::thread::sleep(hold);
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("holder took the task state lock");
+
+        // Tick the runtime through several of the wait's poll intervals while
+        // the lock is held. An inline snapshot parks the thread for the whole
+        // hold, which shows up as one tick taking ~1.2 s.
+        let ticking_until = Instant::now() + Duration::from_millis(800);
+        let mut longest_tick = Duration::ZERO;
+        while Instant::now() < ticking_until {
+            let tick = Instant::now();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            longest_tick = longest_tick.max(tick.elapsed());
+        }
+        assert!(
+            longest_tick < Duration::from_millis(300),
+            "the frame loop stalled for {longest_tick:?} behind a held task state lock"
+        );
+        holder.join().expect("holder thread");
+
+        // The call still answers normally once the command exits.
+        let completion = tokio::time::timeout(Duration::from_secs(8), completion_rx.recv())
+            .await
+            .expect("deferred completion deadline")
+            .expect("deferred completion");
+        assert!(completion.result.expect("terminal bash result").response.success);
     }
 }

@@ -5449,6 +5449,13 @@ impl BgTaskRegistry {
             .filter(|task| task.session_id == session_id)
     }
 
+    /// Test access to a task's shared state, so a test can hold its state
+    /// mutex the way the watchdog does while it persists the task.
+    #[cfg(test)]
+    pub(crate) fn task_for_test(&self, task_id: &str) -> Option<Arc<BgTask>> {
+        self.task(task_id)
+    }
+
     pub fn try_health_counts(&self) -> Option<BgTaskHealthCounts> {
         let running = self
             .inner
