@@ -1,11 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
+import { binaryContentHash, binaryStampKey, peekBinaryContentHash } from "./binary-identity.js";
 import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { withPathPrepended } from "./path-env.js";
@@ -48,15 +47,26 @@ function bashTaskIdFrom(response: Record<string, unknown>): string | undefined {
 
 type BinaryFingerprintReader = (binaryPath: string) => string | null | undefined;
 
-function hashBinaryOnDisk(binaryPath: string): string | null {
-  try {
-    return createHash("sha256").update(readFileSync(binaryPath)).digest("hex");
-  } catch {
-    return null;
-  }
+/**
+ * The bridge fingerprints its binary's bytes at spawn and compares that with
+ * the file on disk during idle maintenance, so a bridge whose binary was
+ * replaced (an upgrade or a local rebuild) retires and the next call respawns
+ * onto the new binary. Hashing the ~85 MB binary synchronously stalled the
+ * host thread on every spawn and every check, so the default reader never
+ * reads the file itself: it answers from the identity sidecar or an earlier
+ * hash of the same stamp, and otherwise starts a streamed hash and reports
+ * "unknown for now".
+ */
+function peekBinaryFingerprint(binaryPath: string): string | null {
+  return peekBinaryContentHash(binaryPath);
 }
 
-let binaryFingerprintReader: BinaryFingerprintReader = hashBinaryOnDisk;
+let binaryFingerprintReader: BinaryFingerprintReader = peekBinaryFingerprint;
+/** Off-thread fingerprint used when the spawn-time peek had no answer yet. */
+let binaryFingerprintAsyncReader: (
+  binaryPath: string,
+  expectedStampKey: string,
+) => Promise<string | null> = binaryContentHash;
 
 function readBinaryFingerprint(binaryPath: string): string | null {
   try {
@@ -69,7 +79,13 @@ function readBinaryFingerprint(binaryPath: string): string | null {
 
 /** Test seam: replace the on-disk binary fingerprint reader without fs module mocks. */
 export function __setBinaryFingerprintForTests(impl: BinaryFingerprintReader | null): void {
-  binaryFingerprintReader = impl ?? hashBinaryOnDisk;
+  binaryFingerprintReader = impl ?? peekBinaryFingerprint;
+  binaryFingerprintAsyncReader = impl
+    ? async (binaryPath) => {
+        const fingerprint = impl(binaryPath);
+        return typeof fingerprint === "string" && fingerprint.length > 0 ? fingerprint : null;
+      }
+    : binaryContentHash;
 }
 
 // ## Note on TypeScript `as` type assertions
@@ -626,9 +642,37 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   /**
+   * Fingerprint the binary this child was spawned from, without reading it on
+   * the host thread. When the fingerprint is not known yet, it is hashed in the
+   * background and adopted only if the file still has the stamp it had at
+   * spawn and this is still the same child, so the fingerprint always
+   * describes the bytes the running child came from.
+   */
+  private recordSpawnedBinaryFingerprint(): void {
+    this.spawnedBinaryFingerprint = readBinaryFingerprint(this.binaryPath);
+    if (this.spawnedBinaryFingerprint) return;
+    const spawnStampKey = binaryStampKey(this.binaryPath);
+    if (spawnStampKey === null) return;
+    const generation = this.processGeneration;
+    void binaryFingerprintAsyncReader(this.binaryPath, spawnStampKey).then(
+      (fingerprint) => {
+        if (
+          fingerprint &&
+          this.processGeneration === generation &&
+          this.spawnedBinaryFingerprint === null
+        ) {
+          this.spawnedBinaryFingerprint = fingerprint;
+        }
+      },
+      () => {},
+    );
+  }
+
+  /**
    * Idle-window maintenance hook: when the on-disk binary changed since this
    * child spawned, stop routing new work to this bridge so the pool can let it
-   * drain and retire it.
+   * drain and retire it. A fingerprint that is still being computed counts as
+   * unchanged; the next check sees the result.
    */
   maybeScheduleRespawnForUpdatedBinary(checkIntervalMs: number, now = Date.now()): boolean {
     if (this._shuttingDown || this._retiringDueToBinaryChange || !this.isAlive()) return false;
@@ -1453,7 +1497,7 @@ export class BinaryBridge implements AftProjectTransport {
 
     this.process = child;
     this.processGeneration += 1;
-    this.spawnedBinaryFingerprint = readBinaryFingerprint(this.binaryPath);
+    this.recordSpawnedBinaryFingerprint();
     this.lastBinaryFingerprintCheckAt = Date.now();
     this.stdoutBuffer = "";
     this.stdoutReadOffset = 0;

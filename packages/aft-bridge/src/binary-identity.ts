@@ -17,9 +17,10 @@
  * and a tiny read, never an exec and never a hash. Any mismatch (the file was
  * replaced, touched, or copied over) makes the entry untrusted again.
  *
- * The SHA-256 is recorded for audits and doctor output; it is deliberately not
- * checked on the resolve path because hashing 85 MB synchronously would block
- * the host thread just like the exec did.
+ * The SHA-256 is never computed on the resolve path, because hashing 85 MB
+ * synchronously would block the host thread just like the exec did. It is
+ * what a running bridge compares against later to notice that the binary on
+ * disk was replaced (see {@link peekBinaryContentHash}).
  */
 
 import { createHash } from "node:crypto";
@@ -258,4 +259,80 @@ export async function __waitForIdentityWritesForTests(): Promise<void> {
   while (pendingIdentityWrites.size > 0) {
     await Promise.all([...pendingIdentityWrites]);
   }
+}
+
+/**
+ * A key for the file's current size, mtime and inode, or null when the file
+ * cannot be stat-ed. Two equal keys mean the file has not been replaced or
+ * rewritten in between (as far as stat can tell).
+ */
+export function binaryStampKey(binaryPath: string): string | null {
+  try {
+    const stamp = stampOf(binaryPath);
+    return `${stamp.size}:${stamp.mtimeNs}:${stamp.ino ?? "-"}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Content hashes already computed, keyed by path, valid while the stamp key is unchanged. */
+const contentHashCache = new Map<string, { stampKey: string; sha256: string }>();
+/** Content hashes being computed, keyed by path and stamp key. */
+const contentHashInFlight = new Map<string, Promise<string | null>>();
+
+/**
+ * SHA-256 of `binaryPath`'s bytes, computed by streaming the file so the event
+ * loop keeps running. Resolves to null when the file is unreadable, or when it
+ * changes while being hashed. With `expectedStampKey`, also resolves to null
+ * unless the file still has that stamp, so the hash can only describe that
+ * exact file. Results are cached until the file's stamp changes.
+ */
+export function binaryContentHash(
+  binaryPath: string,
+  expectedStampKey?: string,
+): Promise<string | null> {
+  const stampKey = binaryStampKey(binaryPath);
+  if (stampKey === null) return Promise.resolve(null);
+  if (expectedStampKey !== undefined && stampKey !== expectedStampKey) {
+    return Promise.resolve(null);
+  }
+  const cached = contentHashCache.get(binaryPath);
+  if (cached && cached.stampKey === stampKey) return Promise.resolve(cached.sha256);
+  const flightKey = `${binaryPath}\0${stampKey}`;
+  const existing = contentHashInFlight.get(flightKey);
+  if (existing) return existing;
+  const task = (async () => {
+    try {
+      const sha256 = await sha256File(binaryPath);
+      if (binaryStampKey(binaryPath) !== stampKey) return null;
+      contentHashCache.set(binaryPath, { stampKey, sha256 });
+      return sha256;
+    } catch {
+      return null;
+    } finally {
+      contentHashInFlight.delete(flightKey);
+    }
+  })();
+  contentHashInFlight.set(flightKey, task);
+  return task;
+}
+
+/**
+ * The content hash of `binaryPath` if it is known without reading the file,
+ * else null. Known means: a matching identity sidecar (stat check only) or a
+ * hash computed earlier for the file's current stamp. On a miss, a streamed
+ * hash starts in the background so a later call can answer. Never reads or
+ * hashes the file synchronously, so it is safe on a host's main thread.
+ */
+export function peekBinaryContentHash(binaryPath: string): string | null {
+  if (checkBinaryIdentity(binaryPath).status === "trusted") {
+    const sha256 = readBinaryIdentity(binaryPath)?.sha256;
+    if (sha256) return sha256;
+  }
+  const stampKey = binaryStampKey(binaryPath);
+  if (stampKey === null) return null;
+  const cached = contentHashCache.get(binaryPath);
+  if (cached && cached.stampKey === stampKey) return cached.sha256;
+  void binaryContentHash(binaryPath);
+  return null;
 }

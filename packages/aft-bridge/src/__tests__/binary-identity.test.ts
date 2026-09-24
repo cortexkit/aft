@@ -22,9 +22,12 @@ import { join } from "node:path";
 import {
   __waitForIdentityWritesForTests,
   type BinaryIdentity,
+  binaryContentHash,
+  binaryStampKey,
   checkBinaryIdentity,
   identitySidecarPath,
   isTrustedCachedBinary,
+  peekBinaryContentHash,
   readBinaryIdentity,
   recordBinaryIdentity,
   writeBinaryIdentitySidecar,
@@ -150,5 +153,41 @@ describe("sidecar writes", () => {
     await expect(recordBinaryIdentity(binary, "1.2.3")).resolves.toBe(false);
     await __waitForIdentityWritesForTests();
     expect(readdirSync(join(dir, "v1.2.3"))).toEqual([]);
+  });
+});
+
+describe("content hash for bridge hot-swap detection", () => {
+  test("a matching sidecar answers with its recorded sha256 without reading the file", () => {
+    // A sha256 that is not the file's real hash proves the answer came from
+    // the sidecar rather than from hashing the bytes.
+    writeBinaryIdentitySidecar(binary, "1.2.3", "f".repeat(64));
+    expect(peekBinaryContentHash(binary)).toBe("f".repeat(64));
+  });
+
+  test("without a sidecar the first peek is unknown, and the background hash answers later", async () => {
+    const expected = createHash("sha256").update(readFileSync(binary)).digest("hex");
+
+    expect(peekBinaryContentHash(binary)).toBeNull();
+    await expect(binaryContentHash(binary)).resolves.toBe(expected);
+    expect(peekBinaryContentHash(binary)).toBe(expected);
+  });
+
+  test("a changed file invalidates the cached hash", async () => {
+    await binaryContentHash(binary);
+    rmSync(binary);
+    writeFileSync(binary, "different, longer bytes for a rebuilt binary");
+
+    expect(peekBinaryContentHash(binary)).toBeNull();
+    await expect(binaryContentHash(binary)).resolves.toBe(
+      createHash("sha256").update(readFileSync(binary)).digest("hex"),
+    );
+  });
+
+  test("a hash tied to a stamp refuses a file that no longer has it", async () => {
+    const stampAtSpawn = binaryStampKey(binary) as string;
+    rmSync(binary);
+    writeFileSync(binary, "replaced after the spawn");
+
+    await expect(binaryContentHash(binary, stampAtSpawn)).resolves.toBeNull();
   });
 });

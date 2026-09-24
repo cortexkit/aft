@@ -2,11 +2,12 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
-import { writeBinaryIdentitySidecar } from "../binary-identity.js";
+import { binaryContentHash, writeBinaryIdentitySidecar } from "../binary-identity.js";
 import {
   BinaryBridge,
   BridgeTransportUnknownOutcomeError,
@@ -1219,6 +1220,47 @@ process.stdin.on("data", (chunk) => {
       expect(response).toMatchObject({ success: true, source: "compatible", command: "ping" });
     } finally {
       await pool.shutdown();
+    }
+  });
+
+  test("a spawned bridge fingerprints its binary off-thread and still retires when the binary changes", async () => {
+    const echoSource = (label: string) => `#!/usr/bin/env node
+// ${label}
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const req = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [] }) + "\\n");
+  }
+});
+`;
+    const binary = writeExecutable("fingerprinted.js", echoSource("first build"));
+    const bridge = new BinaryBridge(binary, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const internals = bridge as unknown as { spawnedBinaryFingerprint: string | null };
+    try {
+      await bridge.send("ping");
+      // No sidecar: the spawn does not hash synchronously; the fingerprint
+      // arrives from the background hash of the spawned file.
+      const spawnedHash = createHash("sha256").update(readFileSync(binary)).digest("hex");
+      const deadline = Date.now() + 5_000;
+      while (internals.spawnedBinaryFingerprint === null && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(internals.spawnedBinaryFingerprint).toBe(spawnedHash);
+      expect(bridge.maybeScheduleRespawnForUpdatedBinary(0)).toBe(false);
+
+      // A rebuild replaces the bytes in place.
+      writeFileSync(binary, echoSource("second build with different bytes"));
+      // The first check after the change only starts hashing the new bytes.
+      expect(bridge.maybeScheduleRespawnForUpdatedBinary(0)).toBe(false);
+      await binaryContentHash(binary);
+      expect(bridge.maybeScheduleRespawnForUpdatedBinary(0)).toBe(true);
+    } finally {
+      await bridge.shutdown();
     }
   });
 
