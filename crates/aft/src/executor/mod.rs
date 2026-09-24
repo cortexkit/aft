@@ -357,6 +357,61 @@ impl DispatchLivenessAtomics {
     }
 }
 
+/// Progress marker for the scheduler (dispatch) loop, read by the subc stall
+/// watchdog from its own thread. Everything here is an atomic or a channel
+/// length read, so reading it never waits on the scheduler state mutex that a
+/// stalled loop may be blocked on or holding.
+pub struct DispatchLoopLiveness {
+    origin: Instant,
+    /// Milliseconds since `origin` when the loop last received or finished an
+    /// event.
+    last_progress_ms: AtomicU64,
+    /// True from the moment the loop receives an event until it has processed
+    /// it and released the scheduler lock.
+    in_event: AtomicBool,
+    /// Clone of the scheduler's event receiver, used only for `len()`: events
+    /// sent but not yet received are work the loop owes. It never receives.
+    event_rx: Receiver<SchedulerEvent>,
+}
+
+impl DispatchLoopLiveness {
+    fn new(event_rx: Receiver<SchedulerEvent>) -> Self {
+        Self {
+            origin: Instant::now(),
+            last_progress_ms: AtomicU64::new(0),
+            in_event: AtomicBool::new(false),
+            event_rx,
+        }
+    }
+
+    fn now_ms(&self) -> u64 {
+        duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn begin_event(&self) {
+        self.last_progress_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.in_event.store(true, Ordering::Release);
+    }
+
+    fn end_event(&self) {
+        self.last_progress_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.in_event.store(false, Ordering::Release);
+    }
+
+    /// Time since the loop last received or finished an event.
+    pub fn progress_age(&self) -> Duration {
+        let last = self.last_progress_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.now_ms().saturating_sub(last))
+    }
+
+    /// The loop owes work when it is inside an event or events are queued for
+    /// it. An idle scheduler parked in `recv()` with an empty channel owes
+    /// nothing, however long ago it last ran.
+    pub fn has_pending_work(&self) -> bool {
+        self.in_event.load(Ordering::Acquire) || !self.event_rx.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutatingLaneSnapshot {
     pub root_id: ProjectRootId,
@@ -668,8 +723,10 @@ impl Executor {
         let dispatch_liveness = Arc::new(DispatchLivenessAtomics::new());
         let (run_tx, run_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let dispatch_loop_liveness = Arc::new(DispatchLoopLiveness::new(event_rx.clone()));
 
         let scheduler_event_tx = event_tx.clone();
+        let scheduler_loop_liveness = Arc::clone(&dispatch_loop_liveness);
         let scheduler_state = Arc::clone(&state);
         let scheduler_heavy = Arc::clone(&heavy);
         let scheduler_violations = Arc::clone(&nonrunnable_dispatches);
@@ -689,6 +746,7 @@ impl Executor {
                     scheduler_completed_interactive,
                     scheduler_completed_maintenance,
                     scheduler_dispatch_liveness,
+                    scheduler_loop_liveness,
                 );
             })
             .expect("spawn AFT executor scheduler");
@@ -720,6 +778,7 @@ impl Executor {
                 completed_interactive,
                 completed_maintenance,
                 dispatch_liveness,
+                dispatch_loop_liveness,
             }),
         }
     }
@@ -1325,6 +1384,30 @@ impl Executor {
         Some(snapshots)
     }
 
+    /// Progress marker of the scheduler loop, for the subc stall watchdog.
+    pub fn dispatch_loop_liveness(&self) -> Arc<DispatchLoopLiveness> {
+        Arc::clone(&self.inner.dispatch_loop_liveness)
+    }
+
+    /// Holds the scheduler state mutex on a helper thread and wakes the
+    /// scheduler, so the scheduler loop receives an event and then blocks on
+    /// the lock: a stalled dispatch loop with pending work. The hold ends when
+    /// `release` receives a message or its sender is dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_dispatch_loop_for_test(&self, release: Receiver<()>) -> JoinHandle<()> {
+        let state = Arc::clone(&self.inner.state);
+        let event_tx = self.inner.event_tx.clone();
+        let (held_tx, held_rx) = crossbeam_channel::bounded(1);
+        let handle = thread::spawn(move || {
+            let _state = state.lock();
+            let _ = event_tx.send(SchedulerEvent::Wake);
+            let _ = held_tx.send(());
+            let _ = release.recv();
+        });
+        held_rx.recv().expect("dispatch hold thread started");
+        handle
+    }
+
     pub fn nonrunnable_dispatch_count(&self) -> usize {
         self.inner.nonrunnable_dispatches.load(Ordering::Acquire)
     }
@@ -1367,6 +1450,7 @@ struct ExecutorInner {
     completed_interactive: Arc<AtomicU64>,
     completed_maintenance: Arc<AtomicU64>,
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
+    dispatch_loop_liveness: Arc<DispatchLoopLiveness>,
 }
 
 impl Drop for ExecutorInner {
@@ -2230,8 +2314,10 @@ fn scheduler_loop(
     completed_interactive: Arc<AtomicU64>,
     completed_maintenance: Arc<AtomicU64>,
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
+    loop_liveness: Arc<DispatchLoopLiveness>,
 ) {
     while let Ok(event) = event_rx.recv() {
+        loop_liveness.begin_event();
         let shutdown;
         {
             let mut state = state.lock();
@@ -2254,6 +2340,7 @@ fn scheduler_loop(
             }
             dispatch_liveness.record(&state.dispatch_liveness_snapshot());
         }
+        loop_liveness.end_event();
 
         if shutdown {
             break;

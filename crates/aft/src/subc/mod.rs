@@ -3610,6 +3610,12 @@ where
             );
         }
 
+        // The drain-tick arm below guarantees this select returns by
+        // `next_drain_at`; publishing that promise lets the stall watchdog tell
+        // an idle-but-ticking loop from one that stopped taking turns.
+        dispatch_path_metrics.publish_frame_loop_wake_deadline(
+            next_drain_at.saturating_duration_since(tokio::time::Instant::now()),
+        );
         tokio::select! {
             biased;
             Some(completion) = control_completion_rx.recv() => {
@@ -4304,6 +4310,9 @@ where
         }
     };
 
+    // The loop no longer promises drain ticks; teardown below may legitimately
+    // take longer than a tick and must not read as a stalled frame loop.
+    dispatch_path_metrics.clear_frame_loop_wake_deadline();
     shared_app.set_open_route_count(0);
     if let Some(progress) = drain_progress.as_ref() {
         let census = drain::held_request_census(

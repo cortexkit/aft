@@ -261,6 +261,9 @@ pub(super) fn take_bg_observability_logs_for_test() -> Vec<String> {
 pub(super) struct DispatchPathMetrics {
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
+    /// When the frame loop next promised to wake (its drain-tick timer), as
+    /// milliseconds since `origin` plus one; `0` means no loop is running.
+    frame_loop_wake_deadline_ms_plus_one: AtomicU64,
     pub(super) writer_queued: AtomicUsize,
     pub(super) writer_active: AtomicBool,
     pub(super) writer_saturation_count: AtomicU64,
@@ -290,6 +293,7 @@ impl DispatchPathMetrics {
         Self {
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
+            frame_loop_wake_deadline_ms_plus_one: AtomicU64::new(0),
             writer_queued: AtomicUsize::new(0),
             writer_active: AtomicBool::new(false),
             writer_saturation_count: AtomicU64::new(0),
@@ -321,6 +325,41 @@ impl DispatchPathMetrics {
     pub(super) fn mark_frame_loop_tick(&self) {
         self.frame_loop_last_tick_ms
             .store(self.now_ms(), Ordering::Relaxed);
+    }
+
+    /// Records that the frame loop is about to park and will wake again within
+    /// `within` because its drain-tick timer fires then.
+    pub(super) fn publish_frame_loop_wake_deadline(&self, within: Duration) {
+        let deadline = self
+            .now_ms()
+            .saturating_add(duration_millis_u64(within))
+            .saturating_add(1);
+        self.frame_loop_wake_deadline_ms_plus_one
+            .store(deadline, Ordering::Relaxed);
+    }
+
+    /// Called when the frame loop exits, so a finished loop never reads as a
+    /// stalled one.
+    pub(super) fn clear_frame_loop_wake_deadline(&self) {
+        self.frame_loop_wake_deadline_ms_plus_one
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// Time since the frame loop last started a turn.
+    pub(super) fn frame_loop_progress_age(&self) -> Duration {
+        let last = self.frame_loop_last_tick_ms.load(Ordering::Relaxed);
+        Duration::from_millis(self.now_ms().saturating_sub(last))
+    }
+
+    /// The frame loop always parks on a drain-tick timer at most one tick
+    /// away, so once that promised wake time has passed the loop owes a turn.
+    /// Before the loop starts and after it exits there is no deadline, and
+    /// nothing is owed.
+    pub(super) fn frame_loop_has_pending_work(&self) -> bool {
+        let deadline = self
+            .frame_loop_wake_deadline_ms_plus_one
+            .load(Ordering::Relaxed);
+        deadline != 0 && self.now_ms() >= deadline
     }
 
     /// Returns whether the retained-roots summary changed since the last sweep.
@@ -584,10 +623,11 @@ impl DispatchPathMetrics {
             .values()
             .map(|bind| duration_millis_u64(now.saturating_duration_since(bind.started_at)))
             .max();
-        let last_tick_ms = self.frame_loop_last_tick_ms.load(Ordering::Relaxed);
+        let last_tick_age_ms = duration_millis_u64(self.frame_loop_progress_age());
         json!({
             "frame_loop": {
-                "last_tick_age_ms": self.now_ms().saturating_sub(last_tick_ms),
+                "last_tick_age_ms": last_tick_age_ms,
+                "wake_overdue": self.frame_loop_has_pending_work(),
             },
             "pending_binds": {
                 "count": pending_binds.len(),
@@ -1713,6 +1753,27 @@ mod tests {
             refresh_until_root_count(&cache, executor, app, root_count);
         }
         build_health_report(&cache, executor, pending_binds, metrics, app)
+    }
+
+    #[test]
+    fn frame_loop_owes_a_turn_only_after_its_promised_wake_passes() {
+        let metrics = DispatchPathMetrics::new();
+        assert!(
+            !metrics.frame_loop_has_pending_work(),
+            "a loop that never parked promised nothing"
+        );
+
+        metrics.mark_frame_loop_tick();
+        metrics.publish_frame_loop_wake_deadline(Duration::from_secs(60));
+        assert!(!metrics.frame_loop_has_pending_work());
+
+        metrics.publish_frame_loop_wake_deadline(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(metrics.frame_loop_has_pending_work());
+        assert!(metrics.frame_loop_progress_age() >= Duration::from_millis(20));
+
+        metrics.clear_frame_loop_wake_deadline();
+        assert!(!metrics.frame_loop_has_pending_work());
     }
 
     fn refresh_until_root_count(

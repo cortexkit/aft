@@ -113,6 +113,36 @@ fn scheduler_event_batch_leaves_excess_wakes_for_the_next_lock_turn() {
 }
 
 #[test]
+fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
+    let executor = test_executor(2, 1, 1, 2);
+    let liveness = executor.dispatch_loop_liveness();
+    assert!(
+        !liveness.has_pending_work(),
+        "an idle scheduler parked in recv() owes no work"
+    );
+
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let holder = executor.hold_dispatch_loop_for_test(release_rx);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !liveness.has_pending_work() {
+        assert!(Instant::now() < deadline, "held scheduler never read as pending");
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(50));
+    assert!(liveness.has_pending_work());
+    assert!(liveness.progress_age() >= Duration::from_millis(50));
+
+    release_tx.send(()).expect("release hold");
+    holder.join().expect("hold thread");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while liveness.has_pending_work() {
+        assert!(Instant::now() < deadline, "released scheduler stayed pending");
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(liveness.progress_age() < Duration::from_secs(5));
+}
+
+#[test]
 fn actor_contexts_returns_registered_contexts() {
     let executor = test_executor(2, 1, 1, 2);
     let (_dir_a, root_a) = test_root("contexts-a");
