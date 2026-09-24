@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "gh",
+    "api",
+    "-X",
+    "PATCH",
+    "/repos/cortexkit/aft/issues/comments/123",
+    "-f",
+    "body=Edited comment text."
+  ],
+  "request": "requests/v14-api-patch-issue-comment.request.json",
+  "response": "responses/refusal-custody_unreachable.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 86,
+  "stdout": "",
+  "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: custody_unreachable\n"
+}

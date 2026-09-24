@@ -1,0 +1,1 @@
+{"operation":"gh.route","gh_route_schema":1,"action":"pr comment","target":{"number":"7"},"body":{"body":"A governed pull-request comment."},"repository":"cortexkit/aft","manifest_version":14,"rung_as_of_unix_secs":1790209658,"metadata":{"agent_id":"alfonso-aft","pid":6014}}

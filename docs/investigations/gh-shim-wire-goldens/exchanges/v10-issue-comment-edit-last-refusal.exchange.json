@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "comment",
+    "42",
+    "--edit-last",
+    "--body",
+    "Replacement text for the bot's last comment."
+  ],
+  "request": "requests/v10-issue-comment-edit-last.request.json",
+  "response": "responses/refusal-identity_mismatch.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 86,
+  "stdout": "",
+  "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: identity_mismatch\n"
+}

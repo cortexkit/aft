@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "gh",
+    "pr",
+    "reopen",
+    "7"
+  ],
+  "request": "requests/v12-pr-reopen.request.json",
+  "response": "responses/success-applied-open.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "open\n",
+  "stderr": ""
+}

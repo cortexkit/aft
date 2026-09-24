@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "gh",
+    "api",
+    "-X",
+    "PATCH",
+    "/repos/cortexkit/aft/issues/comments/123",
+    "-f",
+    "body=Edited comment text."
+  ],
+  "request": "requests/v14-api-patch-issue-comment.request.json",
+  "response": null,
+  "holder_behavior": "read the request and never replied",
+  "exit_code": 87,
+  "stdout": "",
+  "stderr": "gh-shim: gh_shim_outcome_unknown: the governed request was sent but no reply arrived within 5000 ms — it may have executed; check before retrying (for comments: gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1]')\n"
+}

@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "reaction",
+    "42",
+    "--reaction",
+    "+1"
+  ],
+  "request": "requests/v1-issue-reaction.request.json",
+  "response": "responses/success-result.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "url: \"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"\nid: 1\n",
+  "stderr": ""
+}

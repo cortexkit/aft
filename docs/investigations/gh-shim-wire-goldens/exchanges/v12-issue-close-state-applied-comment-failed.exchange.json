@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "close",
+    "42",
+    "--reason",
+    "not planned",
+    "--comment",
+    "Closing as not planned."
+  ],
+  "request": "requests/v12-issue-close.request.json",
+  "response": "responses/state-applied-comment-failed.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 1,
+  "stdout": "APPLIED closed\ncompleted\ncomment_error: rate_limited: secondary rate limit on issue comments\n",
+  "stderr": ""
+}

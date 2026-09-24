@@ -1,0 +1,1 @@
+{"operation":"gh.route","gh_route_schema":1,"action":"issue create","target":{},"body":{"title":"A governed issue","body":"Filed by the bot.","labels":["bug","p1"]},"repository":"cortexkit/aft","manifest_version":14,"rung_as_of_unix_secs":1790209661,"metadata":{"agent_id":"alfonso-aft","pid":6331}}

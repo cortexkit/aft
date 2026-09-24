@@ -1,0 +1,18 @@
+{
+  "verb": "v1-issue-comment",
+  "note": "request frame bodies the fake holder read, in arrival order; <project_root> and <pid> replace per-run values",
+  "frames": [
+    {
+      "on_route_channel": false,
+      "body": "{\"op\":\"catalog.list\"}"
+    },
+    {
+      "on_route_channel": false,
+      "body": "{\"op\":\"route.open\",\"target\":{\"kind\":\"management_surface\",\"module_id\":\"prefrontal-core\"},\"identity\":{\"project_root\":\"<project_root>\",\"harness\":\"aft-gh-shim\",\"session\":\"gh-shim:alfonso-aft\"}}"
+    },
+    {
+      "on_route_channel": true,
+      "body": "{\"operation\":\"gh.route\",\"gh_route_schema\":1,\"action\":\"issue comment\",\"target\":{\"number\":\"42\"},\"body\":{\"body\":\"A governed issue comment.\"},\"repository\":\"cortexkit/aft\",\"manifest_version\":14,\"rung_as_of_unix_secs\":1790209658,\"metadata\":{\"agent_id\":\"alfonso-aft\",\"pid\":<pid>}}"
+    }
+  ]
+}

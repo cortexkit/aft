@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "close",
+    "42",
+    "--reason",
+    "not planned",
+    "--comment",
+    "Closing as not planned."
+  ],
+  "request": "requests/v12-issue-close.request.json",
+  "response": "responses/success-applied-closed.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "closed\nnot_planned\n",
+  "stderr": ""
+}

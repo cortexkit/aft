@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "gh",
+    "api",
+    "-X",
+    "PATCH",
+    "/repos/cortexkit/aft/issues/comments/123",
+    "-f",
+    "body=Edited comment text."
+  ],
+  "request": "requests/v14-api-patch-issue-comment.request.json",
+  "response": "responses/success-result.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "url: \"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"\nid: 1\n",
+  "stderr": ""
+}

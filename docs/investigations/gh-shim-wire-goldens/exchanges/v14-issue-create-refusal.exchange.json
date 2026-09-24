@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "create",
+    "--title",
+    "A governed issue",
+    "--body",
+    "Filed by the bot.",
+    "--label",
+    "bug",
+    "--label",
+    "p1"
+  ],
+  "request": "requests/v14-issue-create.request.json",
+  "response": "responses/refusal-identity_mismatch.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 86,
+  "stdout": "",
+  "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: identity_mismatch\n"
+}

@@ -1,0 +1,17 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "comment",
+    "42",
+    "--edit-last",
+    "--body",
+    "Replacement text for the bot's last comment."
+  ],
+  "request": "requests/v10-issue-comment-edit-last.request.json",
+  "response": "responses/success-result.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "url: \"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"\nid: 1\n",
+  "stderr": ""
+}

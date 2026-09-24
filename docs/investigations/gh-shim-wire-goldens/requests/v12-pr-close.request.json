@@ -1,0 +1,1 @@
+{"operation":"gh.route","gh_route_schema":1,"verb":"pr close","repository":"cortexkit/aft","number":"7","manifest_version":14,"rung_as_of_unix_secs":1790209661,"metadata":{"agent_id":"alfonso-aft","pid":6272},"comment":"Superseded by a newer pull request."}

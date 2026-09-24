@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "reopen",
+    "42",
+    "--comment",
+    "Reopening for another pass."
+  ],
+  "request": "requests/v12-issue-reopen.request.json",
+  "response": "responses/success-applied-open.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "open\n",
+  "stderr": ""
+}

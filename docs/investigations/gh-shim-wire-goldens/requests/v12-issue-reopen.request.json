@@ -1,0 +1,1 @@
+{"operation":"gh.route","gh_route_schema":1,"verb":"issue reopen","repository":"cortexkit/aft","number":"42","manifest_version":14,"rung_as_of_unix_secs":1790209660,"metadata":{"agent_id":"alfonso-aft","pid":6238},"comment":"Reopening for another pass."}

@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "gh",
+    "pr",
+    "close",
+    "7",
+    "--comment",
+    "Superseded by a newer pull request."
+  ],
+  "request": "requests/v12-pr-close.request.json",
+  "response": "responses/success-applied-closed.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "closed\nnot_planned\n",
+  "stderr": ""
+}
