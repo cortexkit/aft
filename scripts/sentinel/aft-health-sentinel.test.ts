@@ -191,7 +191,7 @@ describe("health sentinel pure detectors", () => {
     const holders = [{ kind: "search", root: "/repo/holder", age_ms: 900_000 }];
     const found = detectLimiter(sample({ health: { metrics: { cold_build_limiter: { holders } } } }), { findings: {}, limiter: window });
     expect(found[0].fingerprint).toBe("limiter:cold-build");
-    expect(found[0].text).toContain("6 cold-build deferrals with no acquisition in 15m");
+    expect(found[0].text).toContain("6 cold-build deferrals with no acquisition in the 15m before the latest one");
     expect(found[0].text).toContain("holders: search@/repo/holder age=900000ms");
     expect(found[0].text).not.toContain("holders unavailable");
   });
@@ -211,15 +211,45 @@ describe("health sentinel pure detectors", () => {
     expect(adopted.events).toHaveLength(6);
   });
 
-  test("limiter window prunes entries older than 15 minutes", () => {
-    const old = Array.from({ length: 6 }, (_, index) => `2026-09-17T14:0${index}:00Z [aft] tier2 refresh deferred by cold build limit`);
-    const seeded = updateLimiterWindow(undefined, old, Date.parse("2026-09-17T14:06:00Z"), 42);
+  test("limiter window prunes entries older than 30 minutes", () => {
+    const old = Array.from({ length: 6 }, (_, index) => `2026-09-17T13:4${index}:00Z [aft] tier2 refresh deferred by cold build limit`);
+    const seeded = updateLimiterWindow(undefined, old, Date.parse("2026-09-17T13:46:00Z"), 42);
     const pruned = updateLimiterWindow(seeded, [], NOW, 42);
     expect(pruned.events).toEqual([]);
     // A recent acquisition keeps pruned old deferrals from paging.
     const withAcquisition = updateLimiterWindow(seeded, ["2026-09-17T14:29:30Z [aft] maintenance build slot acquired after 2ms wait: search"], NOW, 42);
     expect(withAcquisition.events.map((event) => event.kind)).toEqual(["acquired"]);
     expect(detectLimiter(sample(), { findings: {}, limiter: withAcquisition })).toEqual([]);
+  });
+
+  test("acquisitions that aged out just before their deferrals do not page", () => {
+    // Replays the 2026-09-24 specimen: two semantic refreshes acquired at
+    // 07:24:15, Tier-2 deferred from 07:24:36 to 07:25:07, then nothing waited
+    // and Tier-2 ran normally. At 07:39:57 the acquisitions were 15m42s old and
+    // the deferrals still inside 15m, so judging the 15 minutes ending NOW
+    // paged CRITICAL on a limiter that had turned over.
+    const lines = [
+      "2026-09-24T07:24:15Z [aft] maintenance cold-build slot acquired after 20741ms wait: request=semantic refresh kind=semantic refresh",
+      "2026-09-24T07:24:15Z [aft] maintenance cold-build slot acquired after 1770ms wait: request=semantic refresh kind=semantic refresh",
+      ...["07:24:36", "07:24:36", "07:24:37", "07:25:06", "07:25:07", "07:25:07"].map(
+        (time) => `2026-09-24T${time}Z [aft] tier2 refresh deferred by cold build limit: categories=["dead_code"]`,
+      ),
+    ];
+    const tickAt = Date.parse("2026-09-24T07:25:10Z");
+    const now = Date.parse("2026-09-24T07:39:57Z");
+    const window = updateLimiterWindow(updateLimiterWindow(undefined, lines, tickAt, 42), [], now, 42);
+    expect(window.events.filter((event) => event.kind === "acquired")).toHaveLength(2);
+    expect(detectLimiter(sample({ now_ms: now }), { findings: {}, limiter: window })).toEqual([]);
+    // Without the acquisitions the same deferrals still page.
+    const starved = updateLimiterWindow(undefined, lines.slice(2), tickAt, 42);
+    expect(detectLimiter(sample({ now_ms: now }), { findings: {}, limiter: updateLimiterWindow(starved, [], now, 42) })[0].fingerprint)
+      .toBe("limiter:cold-build");
+  });
+
+  test("deferrals older than 15 minutes no longer page", () => {
+    const deferrals = Array.from({ length: 6 }, (_, index) => `2026-09-17T14:0${index}:00Z [aft] tier2 refresh deferred by cold build limit`);
+    const window = updateLimiterWindow(undefined, deferrals, Date.parse("2026-09-17T14:06:00Z"), 42);
+    expect(detectLimiter(sample(), { findings: {}, limiter: updateLimiterWindow(window, [], NOW, 42) })).toEqual([]);
   });
 
   test("the limiter window is bounded and drops the oldest entries", () => {

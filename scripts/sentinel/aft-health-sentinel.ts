@@ -201,6 +201,16 @@ const LIMITER_ACQUIRED_LINE = /cold-build slot acquired|maintenance build slot a
 // now covers less than the full 15 minutes rather than the state file
 // growing past this bound.
 export const LIMITER_EVENT_LIMIT = 2000;
+// Saturation is judged over the 15 minutes that END at the newest deferral,
+// so the buffer keeps twice that. Judging the 15 minutes ending now instead
+// pages on stale evidence: a burst that deferred right after two acquisitions
+// keeps its deferrals in the window about half a minute longer than the
+// acquisitions that served it, and reads as "no acquisition" long after
+// anything was waiting.
+const LIMITER_EVENT_RETENTION_MS = 2 * FIFTEEN_MINUTES;
+// Only a deferral inside the last 15 minutes can raise the finding at all,
+// matching the window the rule has always reported on.
+const LIMITER_RECENT_DEFERRAL_MS = FIFTEEN_MINUTES;
 
 /**
  * Roll the persisted limiter evidence window forward by one tick.
@@ -229,7 +239,7 @@ export function updateLimiterWindow(prior: LimiterWindow | undefined, lines: str
     // deferral text carries nothing the count does not.
     events.push(kind === "acquired" ? { ts_ms, kind, line: line.trim() } : { ts_ms, kind });
   }
-  const kept = events.filter((event) => nowMs - event.ts_ms <= FIFTEEN_MINUTES);
+  const kept = events.filter((event) => nowMs - event.ts_ms <= LIMITER_EVENT_RETENTION_MS);
   const overflow = kept.length - LIMITER_EVENT_LIMIT;
   return { pid, events: overflow > 0 ? kept.slice(overflow) : kept, ...(overflow > 0 ? { truncated: true } : {}) };
 }
@@ -291,9 +301,15 @@ export function detectLimiter(sample: SentinelSample, state: SentinelState): Fin
   // ticks, not this tick's log lines: sample.log_lines covers only what the
   // daemon appended since the previous tick, so judging "in 15m" from it
   // pages on every restart storm that defers right after acquiring.
-  const events = (state.limiter?.events ?? []).filter((event) => sample.now_ms - event.ts_ms <= FIFTEEN_MINUTES);
-  const deferred = events.filter((event) => event.kind === "deferred");
-  const acquired = events.filter((event) => event.kind === "acquired");
+  const events = state.limiter?.events ?? [];
+  const newestDeferral = events.reduce<number | undefined>(
+    (latest, event) => (event.kind === "deferred" && (latest === undefined || event.ts_ms > latest) ? event.ts_ms : latest),
+    undefined,
+  );
+  if (newestDeferral === undefined || sample.now_ms - newestDeferral > LIMITER_RECENT_DEFERRAL_MS) return [];
+  const windowed = events.filter((event) => event.ts_ms <= newestDeferral && newestDeferral - event.ts_ms <= FIFTEEN_MINUTES);
+  const deferred = windowed.filter((event) => event.kind === "deferred");
+  const acquired = windowed.filter((event) => event.kind === "acquired");
   if (deferred.length < 5 || acquired.length > 0) return [];
   const limiter = metrics(sample).cold_build_limiter;
   const holders: LimiterEntry[] = limiter?.holders ?? [];
@@ -301,7 +317,7 @@ export function detectLimiter(sample: SentinelSample, state: SentinelState): Fin
     acquired.slice(-2).map((event) => event.line ?? "").filter(Boolean).reverse().join(" | ")
     || holders.map((h) => `${h.kind ?? h.domain ?? "build"}@${h.root ?? "unknown"} age=${h.age_ms ?? "?"}ms`).join(", ")
     || "holders unavailable";
-  return [finding("limiter.saturated", "CRITICAL", "limiter:cold-build", `${deferred.length} cold-build deferrals with no acquisition in 15m; holders: ${holderText}`, "a slot is acquired or fewer than five deferrals occur in the 15-minute window")];
+  return [finding("limiter.saturated", "CRITICAL", "limiter:cold-build", `${deferred.length} cold-build deferrals with no acquisition in the 15m before the latest one; holders: ${holderText}`, "a slot is acquired, or fewer than five deferrals occur in the 15 minutes before the latest one")];
 }
 
 export function detectRetention(sample: SentinelSample): Finding[] {
