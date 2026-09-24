@@ -1486,11 +1486,11 @@
     },
     {
       "path": "crates/aft/tests/integration/safety_test.rs",
-      "line": 2219,
+      "line": 2220,
       "column": 29,
       "token": "filePath",
       "text": "\"arguments\": { \"filePath\": written, \"content\": \"after write\" },",
-      "location": "line 2219, column 29",
+      "location": "line 2220, column 29",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -1772,11 +1772,11 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_translate_test.rs",
-      "line": 595,
+      "line": 600,
       "column": 19,
       "token": "filePath",
       "text": "&json!({ \"filePath\": \"src/main.ts\", \"oldString\": \"1\", \"newString\": \"2\" }),",
-      "location": "line 595, column 19",
+      "location": "line 600, column 19",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
