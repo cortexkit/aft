@@ -5869,6 +5869,11 @@ fn run_configure_maintenance_unit(
                             suspension.death_count
                         );
                     }
+                    CallgraphStoreAccess::Off => {
+                        slog_debug!(
+                            "callgraph index is off; configure maintenance starts no build"
+                        );
+                    }
                     CallgraphStoreAccess::Unavailable => {
                         slog_info!(
                             "callgraph store unavailable at configure maintenance; dead_code will retry later"
@@ -10662,7 +10667,11 @@ mod tests {
         let suspended =
             crate::commands::callers::handle_callers(&suspended_navigation, &suspended_ctx);
         assert!(!suspended.success);
-        assert_eq!(suspended.data["code"], json!("build_suspended"));
+        assert_eq!(suspended.data["code"], json!("callgraph_unavailable"));
+        assert_eq!(
+            suspended.data["index"]["callgraph"]["reason"],
+            json!("build_suspended")
+        );
         let message = suspended.data["message"].as_str().unwrap();
         assert!(
             message.starts_with("callers: build_suspended domain=callgraph_cold deaths=3 age_ms=")

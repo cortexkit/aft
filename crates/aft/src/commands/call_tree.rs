@@ -1,9 +1,8 @@
 use std::path::Path;
 
-use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, call_tree_result, note_callgraph_building, note_callgraph_served,
-    serialized_response, store_error_response, unavailable_for,
+    call_tree_result, index_refusal_response, note_callgraph_served, serialized_response,
+    store_error_response,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -69,17 +68,10 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => {
-            note_callgraph_building(ctx, "call_tree");
-            return building_response(&req.id, "call_tree");
-        }
-        CallgraphStoreAccess::Suspended(suspension) => {
-            return suspended_response(&req.id, "call_tree", &suspension)
-        }
-        CallgraphStoreAccess::Unavailable => return unavailable_for(&req.id, "call_tree", ctx),
         CallgraphStoreAccess::Error(error) => {
             return store_error_response(&req.id, "call_tree", error)
         }
+        other => return index_refusal_response(&req.id, "call_tree", ctx, &other),
     };
 
     match call_tree_result(&store, &file_path, symbol, depth, include_tests_param(req)) {

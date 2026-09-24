@@ -8,9 +8,10 @@ use crate::callgraph::{self, TraceToSymbolCandidate};
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
 };
-use crate::context::AppContext;
+use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
+use crate::feature_status::{cause, IndexObservation};
 use crate::inspect::job::is_test_file;
 use crate::list_envelope::{ListEnvelope, Unit};
 use crate::parser::{
@@ -1930,19 +1931,76 @@ pub fn note_callgraph_served(
     );
 }
 
+/// Refusal payload shared by every callgraph query whose index is not usable:
+/// the analysis code plus the callgraph index status and cause, and a null
+/// `results` so an unavailable graph is never read as an empty one.
+fn callgraph_index_refusal(
+    req_id: &str,
+    code: &str,
+    message: String,
+    observation: IndexObservation,
+) -> Response {
+    Response::error_with_data(
+        req_id,
+        code,
+        message,
+        serde_json::json!({
+            "index": { "callgraph": observation.consumer_json() },
+            "results": serde_json::Value::Null,
+        }),
+    )
+}
+
+/// Refuse a callgraph query whose store is not ready. `Ready` and `Error`
+/// are not refusals and must be handled by the caller; they fall back to the
+/// unavailable refusal here only so the match stays total.
+pub fn index_refusal_response(
+    req_id: &str,
+    operation: &str,
+    ctx: &AppContext,
+    access: &CallgraphStoreAccess,
+) -> Response {
+    match access {
+        CallgraphStoreAccess::Off => off_response(req_id, operation),
+        CallgraphStoreAccess::Building => {
+            note_callgraph_building(ctx, operation);
+            building_response(req_id, operation)
+        }
+        CallgraphStoreAccess::Suspended(suspension) => {
+            suspended_response(req_id, operation, suspension)
+        }
+        CallgraphStoreAccess::Unavailable
+        | CallgraphStoreAccess::Ready(_)
+        | CallgraphStoreAccess::Error(_) => unavailable_for(req_id, operation, ctx),
+    }
+}
+
+/// The callgraph index is turned off in the resolved configuration. Nothing
+/// was started; the user can enable `indexes.callgraph` to use this query.
+pub fn off_response(req_id: &str, operation: &str) -> Response {
+    callgraph_index_refusal(
+        req_id,
+        "callgraph_off",
+        format!("{operation}: the callgraph index is off (indexes.callgraph: false); enable it with aft setup to use callgraph queries"),
+        IndexObservation::off(),
+    )
+}
+
 /// The persisted callgraph store is cold-building in the background. The op did
 /// not block the request thread; the agent should retry shortly. Mirrors how
 /// semantic search reports a build in progress.
 pub fn building_response(req_id: &str, operation: &str) -> Response {
-    Response::error(
+    callgraph_index_refusal(
         req_id,
         "callgraph_building",
         format!("{operation}: callgraph store is building in the background; retry shortly"),
+        IndexObservation::building(),
     )
 }
 
-/// A tripped breaker is terminal for this request. It deliberately does not
-/// reuse `Unavailable`: the store is configured, but its builder was suspended.
+/// A tripped breaker is terminal for this request: the store is configured,
+/// but its builder was suspended. The index is unavailable with the
+/// `build_suspended` cause; the message says how to resume.
 pub fn suspended_response(
     req_id: &str,
     operation: &str,
@@ -1963,34 +2021,32 @@ pub(crate) fn suspended_response_at(
     now_ms: u64,
 ) -> Response {
     let age_ms = suspension.age_millis_at(now_ms);
-    Response::error(
+    callgraph_index_refusal(
         req_id,
-        "build_suspended",
+        "callgraph_unavailable",
         format!(
             "{operation}: build_suspended domain={} deaths={} age_ms={age_ms} reason={}; run doctor reset-build-breaker to resume",
             suspension.domain.as_str(),
             suspension.death_count,
             suspension.reason,
         ),
+        IndexObservation::unavailable(cause::BUILD_SUSPENDED),
     )
 }
 
 /// Return the terminal navigation response for a HOME-root callgraph store.
 ///
-/// This is intentionally distinct from `callgraph_unavailable`: HOME is
-/// configured successfully, but it is not a project root and must never enter
-/// the cold-build/retry loop.
+/// HOME is configured successfully, but it is not a project root and must
+/// never enter the cold-build/retry loop, so the index is unavailable with the
+/// `home_root` cause rather than building.
 pub fn home_root_disabled_response(req_id: &str, operation: &str) -> Response {
-    Response::error_with_data(
+    callgraph_index_refusal(
         req_id,
-        "callgraph_disabled",
+        "callgraph_unavailable",
         format!(
             "{operation}: callgraph store is disabled for home roots; open a project subdirectory to enable it"
         ),
-        serde_json::json!({
-            "status": "disabled",
-            "reason": "home_root",
-        }),
+        IndexObservation::unavailable(cause::HOME_ROOT),
     )
 }
 
@@ -2002,19 +2058,21 @@ pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Respo
 }
 
 pub fn unavailable_response(req_id: &str, operation: &str, worktree: bool) -> Response {
-    let message = if worktree {
-        format!(
-            "{operation}: persisted callgraph store is unavailable in this read-only worktree; run a callgraph operation in the main checkout to build it first"
-        )
-    } else {
-        format!("{operation}: project not configured — send 'configure' first")
-    };
-    let code = if worktree {
-        "callgraph_unavailable"
-    } else {
-        "not_configured"
-    };
-    Response::error(req_id, code, message)
+    if worktree {
+        return callgraph_index_refusal(
+            req_id,
+            "callgraph_unavailable",
+            format!(
+                "{operation}: persisted callgraph store is unavailable in this read-only worktree; run a callgraph operation in the main checkout to build it first"
+            ),
+            IndexObservation::unavailable(cause::READ_ONLY_STORE_NOT_BUILT),
+        );
+    }
+    Response::error(
+        req_id,
+        "not_configured",
+        format!("{operation}: project not configured — send 'configure' first"),
+    )
 }
 
 fn resolve_symbol_query(

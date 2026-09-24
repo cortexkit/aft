@@ -854,7 +854,11 @@ mod tests {
             suspension,
             snapshot_at,
         );
-        assert_eq!(navigation.data["code"], "build_suspended");
+        assert_eq!(navigation.data["code"], "callgraph_unavailable");
+        assert_eq!(
+            navigation.data["index"]["callgraph"]["reason"],
+            "build_suspended"
+        );
         assert_eq!(
             navigation.data["message"],
             "callers: build_suspended domain=callgraph_cold deaths=3 age_ms=5000 reason=zero_credit_death_limit; run doctor reset-build-breaker to resume"

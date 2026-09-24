@@ -622,6 +622,7 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
         // Building (or just-started cold build) -> drive to completion via the
         // wait loop draining `callgraph_store_rx`.
         CallgraphStoreAccess::Building => None,
+        CallgraphStoreAccess::Off => Some(SubsystemState::Disabled),
         CallgraphStoreAccess::Suspended(suspension) => Some(SubsystemState::Failed(format!(
             "build_suspended domain={} deaths={}",
             suspension.domain.as_str(),

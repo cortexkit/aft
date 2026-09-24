@@ -1,9 +1,8 @@
 use std::path::Path;
 
-use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, note_callgraph_building, note_callgraph_served, serialized_value,
-    store_error_response, trace_data_result, unavailable_for,
+    index_refusal_response, note_callgraph_served, serialized_value, store_error_response,
+    trace_data_result,
 };
 use crate::commands::trace_to::trace;
 use crate::context::{AppContext, CallgraphStoreAccess};
@@ -100,17 +99,10 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => {
-            note_callgraph_building(ctx, "trace_data");
-            return building_response(&req.id, "trace_data");
-        }
-        CallgraphStoreAccess::Suspended(suspension) => {
-            return suspended_response(&req.id, "trace_data", &suspension)
-        }
-        CallgraphStoreAccess::Unavailable => return unavailable_for(&req.id, "trace_data", ctx),
         CallgraphStoreAccess::Error(error) => {
             return store_error_response(&req.id, "trace_data", error)
         }
+        other => return index_refusal_response(&req.id, "trace_data", ctx, &other),
     };
 
     match trace_data_result(

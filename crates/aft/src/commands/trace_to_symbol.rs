@@ -1,10 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
-    building_response, ensure_symbol_resolves, note_callgraph_building, note_callgraph_served,
-    serialized_response, serialized_value, store_error_response, trace_to_symbol_candidates,
-    trace_to_symbol_result, unavailable_for,
+    ensure_symbol_resolves, index_refusal_response, note_callgraph_served, serialized_response,
+    serialized_value, store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::inspect::job::is_test_file;
@@ -81,19 +79,10 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let store = match ctx.callgraph_store_for_ops() {
         CallgraphStoreAccess::Ready(store) => store,
-        CallgraphStoreAccess::Building => {
-            note_callgraph_building(ctx, "trace_to_symbol");
-            return building_response(&req.id, "trace_to_symbol");
-        }
-        CallgraphStoreAccess::Suspended(suspension) => {
-            return suspended_response(&req.id, "trace_to_symbol", &suspension)
-        }
-        CallgraphStoreAccess::Unavailable => {
-            return unavailable_for(&req.id, "trace_to_symbol", ctx)
-        }
         CallgraphStoreAccess::Error(error) => {
             return store_error_response(&req.id, "trace_to_symbol", error)
         }
+        other => return index_refusal_response(&req.id, "trace_to_symbol", ctx, &other),
     };
 
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {

@@ -2568,6 +2568,9 @@ pub enum CallgraphStoreAccess {
     /// The durable build-death breaker refuses this domain until an explicit reset
     /// or a time-to-live check confirms the suspension has expired.
     Suspended(crate::build_breaker::BuildSuspension),
+    /// Resolved configuration turns the callgraph index off. No build is
+    /// started for a disabled index.
+    Off,
     /// Not configured, or a read-only worktree whose store was never built.
     Unavailable,
     /// A store open/build check failed with a real error (DB/IO).
@@ -5047,7 +5050,9 @@ impl AppContext {
         *self.callgraph_store_build_suspension.lock() = None;
     }
 
-    fn callgraph_store_build_suspension(&self) -> Option<crate::build_breaker::BuildSuspension> {
+    pub(crate) fn callgraph_store_build_suspension(
+        &self,
+    ) -> Option<crate::build_breaker::BuildSuspension> {
         let generation = self.configure_generation();
         let mut suspended = self.callgraph_store_build_suspension.lock();
         match suspended.as_ref() {
@@ -5062,7 +5067,7 @@ impl AppContext {
         }
     }
 
-    fn callgraph_store_build_denial(&self) -> Option<String> {
+    pub(crate) fn callgraph_store_build_denial(&self) -> Option<String> {
         let generation = self.configure_generation();
         let mut denied = self.callgraph_store_build_denied.lock();
         match denied.as_ref() {
@@ -5267,6 +5272,10 @@ impl AppContext {
     }
 
     fn callgraph_store_for_ops_with_wait(&self, wait: Duration) -> CallgraphStoreAccess {
+        // A disabled index never starts: refuse before any open or cold build.
+        if !self.config().indexes.callgraph {
+            return CallgraphStoreAccess::Off;
+        }
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
         }
@@ -9242,9 +9251,14 @@ mod callgraph_store_for_ops_tests {
             };
             let response = crate::commands::callers::handle_callers(&navigation, &ctx);
             assert!(!response.success);
-            assert_eq!(response.data["code"], "callgraph_disabled");
-            assert_eq!(response.data["status"], "disabled");
-            assert_eq!(response.data["reason"], "home_root");
+            // HOME is an unavailable callgraph with a named cause, never a
+            // retryable build.
+            assert_eq!(response.data["code"], "callgraph_unavailable");
+            assert_eq!(
+                response.data["index"],
+                json!({"callgraph": {"status": "unavailable", "reason": "home_root"}})
+            );
+            assert!(response.data["results"].is_null());
             assert!(response.data["message"]
                 .as_str()
                 .is_some_and(|message| message.contains("disabled for home roots")));

@@ -303,6 +303,7 @@ fn ensure_callgraph_store_ready(ctx: &AppContext) {
             CallgraphStoreAccess::Suspended(suspension) => {
                 panic!("callgraph store unexpectedly suspended in test: {suspension:?}")
             }
+            CallgraphStoreAccess::Off => panic!("callgraph index unexpectedly off in test"),
             CallgraphStoreAccess::Unavailable => {
                 panic!("callgraph store unexpectedly unavailable in test")
             }

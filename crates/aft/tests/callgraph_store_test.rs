@@ -1545,6 +1545,7 @@ fn app_context_revalidates_to_newer_published_generation() {
                 panic!("expected Ready store, got Suspended: {suspension:?}")
             }
             CallgraphStoreAccess::Unavailable => panic!("expected Ready store, got Unavailable"),
+            CallgraphStoreAccess::Off => panic!("expected Ready store, got Off"),
             CallgraphStoreAccess::Error(error) => {
                 panic!("expected Ready store, got Error: {error}")
             }
@@ -2877,6 +2878,7 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
         CallgraphStoreAccess::Unavailable => {
             panic!("expected ready read-only store, got unavailable")
         }
+        CallgraphStoreAccess::Off => panic!("expected ready read-only store, got off"),
     }
 }
 

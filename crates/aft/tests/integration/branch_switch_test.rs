@@ -369,6 +369,7 @@ fn wait_until_ready(ctx: &AppContext) -> Arc<aft::callgraph_store::ReadonlyCallG
                 panic!("callgraph suspended while waiting: {reason:?}")
             }
             CallgraphStoreAccess::Unavailable => panic!("callgraph unavailable while waiting"),
+            CallgraphStoreAccess::Off => panic!("callgraph index off while waiting"),
             CallgraphStoreAccess::Error(error) => panic!("callgraph failed while waiting: {error}"),
         };
         let search_ready = ctx

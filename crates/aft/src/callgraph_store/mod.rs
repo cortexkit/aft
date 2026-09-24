@@ -22613,7 +22613,14 @@ mod bounded_build_breaker_tests {
             "callers",
             &suspension,
         );
-        assert_eq!(response.data["code"], serde_json::json!("build_suspended"));
+        assert_eq!(
+            response.data["code"],
+            serde_json::json!("callgraph_unavailable")
+        );
+        assert_eq!(
+            response.data["index"]["callgraph"]["reason"],
+            serde_json::json!("build_suspended")
+        );
         let message = response.data["message"].as_str().unwrap();
         assert!(
             message.starts_with("callers: build_suspended domain=callgraph_cold deaths=3 age_ms=")
