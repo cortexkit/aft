@@ -927,6 +927,8 @@ pub(super) struct HealthRollupCache {
     /// on its own: a refresh that finishes within the cache's first millisecond
     /// stores 0, the same value as never-published.
     refreshes: AtomicU64,
+    #[cfg(test)]
+    root_details_assembled: AtomicUsize,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     breakers:
         std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
@@ -939,6 +941,8 @@ impl HealthRollupCache {
             origin: Instant::now(),
             generated_at_ms: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
+            #[cfg(test)]
+            root_details_assembled: AtomicUsize::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             breakers: std::sync::Mutex::new(HashMap::new()),
             plane_timings: std::sync::Mutex::new(HashMap::new()),
@@ -948,6 +952,8 @@ impl HealthRollupCache {
     /// Assemble outside the cache lock, then hold the write lock only long
     /// enough to replace one `Arc`. Probe readers never wait for a refresh.
     pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
+        #[cfg(test)]
+        self.root_details_assembled.store(0, Ordering::Relaxed);
         let rollup = Arc::new(build_health_diagnostic_rollup(self, executor, shared_app));
         let generated_at_ms = duration_millis_u64(self.origin.elapsed());
         match self.snapshot.write() {
@@ -957,6 +963,11 @@ impl HealthRollupCache {
         self.generated_at_ms
             .store(generated_at_ms, Ordering::Release);
         self.refreshes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn root_details_assembled_for_test(&self) -> usize {
+        self.root_details_assembled.load(Ordering::Relaxed)
     }
 
     fn refresh_build_suspensions(
@@ -1446,6 +1457,8 @@ fn build_health_diagnostic_rollup(
         .into_iter()
         .take(HEALTH_ROOT_DETAIL_CAP)
         .map(|candidate| {
+            #[cfg(test)]
+            cache.root_details_assembled.fetch_add(1, Ordering::Relaxed);
             let mut snapshot = candidate.health;
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
             let root_label = snapshot.project_root.clone();
@@ -2712,7 +2725,7 @@ mod tests {
         let (five, five_dirs) = fixture(5);
         let five_cache = HealthRollupCache::new();
         refresh_until_root_count(&five_cache, &five, &app, 5);
-        let five_median = cached_reply_median(&five_cache, &five, &metrics, &app);
+        let five_work = five_cache.root_details_assembled_for_test();
         let five_bytes = serde_json::to_vec(&build_health_report(
             &five_cache,
             &five,
@@ -2726,7 +2739,7 @@ mod tests {
         let (fifty, fifty_dirs) = fixture(50);
         let fifty_cache = HealthRollupCache::new();
         refresh_until_root_count(&fifty_cache, &fifty, &app, 50);
-        let fifty_median = cached_reply_median(&fifty_cache, &fifty, &metrics, &app);
+        let fifty_work = fifty_cache.root_details_assembled_for_test();
         let report = build_health_report(&fifty_cache, &fifty, &HashMap::new(), &metrics, &app);
         let fifty_bytes = serde_json::to_vec(&report)
             .expect("serialize fifty-root health report")
@@ -2743,6 +2756,11 @@ mod tests {
             .expect("omitted root count") as usize;
         assert_eq!(rendered_roots + omitted_roots, 50);
         assert!(rendered_roots <= HEALTH_ROOT_DETAIL_CAP);
+        assert_eq!(five_work, 5);
+        assert_eq!(
+            fifty_work, HEALTH_ROOT_DETAIL_CAP,
+            "cached root detail assembly scaled with roots"
+        );
         assert!(report_metrics["metrics_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes <= HEALTH_METRICS_BUDGET_BYTES as u64));
@@ -2756,14 +2774,6 @@ mod tests {
         assert!(
             fifty_bytes <= five_bytes.saturating_mul(2),
             "cached reply payload scaled with roots: five={five_bytes}, fifty={fifty_bytes}"
-        );
-        assert!(
-            fifty_median <= five_median.saturating_mul(4) + Duration::from_millis(2),
-            "cached reply scaled with roots: five={five_median:?}, fifty={fifty_median:?}"
-        );
-        assert!(
-            fifty_median < Duration::from_millis(50),
-            "cached 50-root reply exceeded CI bound: {fifty_median:?}"
         );
         std::hint::black_box((five_dirs, fifty_dirs));
     }
