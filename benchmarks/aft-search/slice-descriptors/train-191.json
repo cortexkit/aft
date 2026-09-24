@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "no-exec-on-host-thread",
+    "plugin-test-log-348"
+  ],
+  "note": "No ranking-fence file changed. The plugins resolve the aft binary through an identity sidecar and never execute or hash it on the host thread, and test-run plugin logs move to the temp directory (#348)."
+}
