@@ -2491,10 +2491,65 @@ impl BgTaskRegistry {
             }
 
             if validate_task_id(&metadata.task_id).is_err() {
-                crate::slog_warn!(
-                    "ignoring persisted background task with invalid id {:?}",
-                    metadata.task_id
-                );
+                // Only the historical eight-hex form is safe to use as an artifact prefix.
+                // A still-running process must keep its durable row and artifacts even when
+                // this daemon can no longer rehydrate its identifier.
+                let id = metadata.task_id.as_bytes();
+                let old_id = id.len() == 13
+                    && id.starts_with(b"bash-")
+                    && id[5..].iter().all(|byte| byte.is_ascii_hexdigit());
+                if !old_id || Self::persisted_task_process_is_alive(&metadata) {
+                    crate::slog_warn!(
+                        "ignoring persisted background task with invalid id {:?}: reason={}",
+                        metadata.task_id,
+                        if old_id { "process_alive" } else { "unrecognized_id" }
+                    );
+                    continue;
+                }
+                let session_dir = session_tasks_dir(storage_dir, &metadata.session_id);
+                let prefix = format!("{}.", metadata.task_id);
+                let cleanup = (|| -> std::io::Result<()> {
+                    match fs::read_dir(&session_dir) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                let entry = entry?;
+                                let name = entry.file_name();
+                                if name == std::ffi::OsStr::new(&metadata.task_id)
+                                    || name.to_str().is_some_and(|name| name.starts_with(&prefix))
+                                {
+                                    quarantine_invalid_entry(storage_dir, &session_dir, &name)?;
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = cleanup {
+                    crate::slog_warn!(
+                        "failed to retire old-id background task {}: reason=bundle_cleanup_failed error={error}",
+                        metadata.task_id
+                    );
+                    continue;
+                }
+                if let Some((harness, pool)) = self.db_harness_and_pool() {
+                    let result = pool.lock().map_err(|_| "database_lock_poisoned".to_string())
+                        .and_then(|conn| crate::db::bash_tasks::delete_bash_task(
+                            &conn, &harness, &metadata.session_id, &metadata.task_id,
+                        ).map_err(|error| error.to_string()));
+                    match result {
+                        Ok(removed) if removed > 0 => crate::slog_warn!(
+                            "retired old-id background task {}: reason=invalid_legacy_id",
+                            metadata.task_id
+                        ),
+                        Ok(_) => {},
+                        Err(error) => crate::slog_warn!(
+                            "failed to retire old-id background task {}: reason=row_delete_failed error={error}",
+                            metadata.task_id
+                        ),
+                    }
+                }
                 continue;
             }
             // Another session in this daemon may bind the same project. Keep the

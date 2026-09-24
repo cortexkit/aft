@@ -622,6 +622,41 @@ fn cross_session_project_restart_sweep_retires_fate_unknown_without_delivery() {
 }
 
 #[test]
+fn replay_retires_old_id_once_without_touching_valid_id() {
+    init_test_logger();
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let old_id = "bash-deadbeef";
+    let valid_id = "bash-00000000deadbeef";
+    let session_dir = session_tasks_dir(storage.path(), SESSION);
+    fs::create_dir_all(&session_dir).unwrap();
+    let old_bundle = session_dir.join(format!("{old_id}.json"));
+    fs::write(&old_bundle, b"legacy bundle").unwrap();
+    let registry = registry();
+    registry.set_harness(aft::harness::Harness::Opencode);
+    let conn = Arc::new(Mutex::new(aft::db::open(&storage.path().join("aft.db")).unwrap()));
+    for id in [old_id, valid_id] {
+        let metadata = PersistedTask::starting(
+            id.to_string(), SESSION.to_string(), "true".to_string(),
+            project.path().to_path_buf(), Some(project.path().to_path_buf()),
+            None, false, true,
+        );
+        let mut row = metadata.to_bash_task_row("opencode", &task_paths(storage.path(), SESSION, valid_id).unwrap()).unwrap();
+        row.task_id = id.to_string();
+        aft::db::bash_tasks::upsert_bash_task(&conn.lock().unwrap(), &row).unwrap();
+    }
+    registry.set_db_pool(Arc::clone(&conn));
+    registry.replay_session_for_project(storage.path(), SESSION, project.path()).unwrap();
+    registry.replay_session_for_project(storage.path(), SESSION, project.path()).unwrap();
+    let db = conn.lock().unwrap();
+    assert!(aft::db::bash_tasks::get_bash_task(&db, "opencode", SESSION, old_id).unwrap().is_none());
+    assert!(aft::db::bash_tasks::get_bash_task(&db, "opencode", SESSION, valid_id).unwrap().is_some());
+    assert!(!old_bundle.exists());
+    let warnings = take_logs().into_iter().filter(|line| line.contains(&format!("retired old-id background task {old_id}: reason=invalid_legacy_id"))).count();
+    assert_eq!(warnings, 1);
+}
+
+#[test]
 fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
     init_test_logger();
     let storage = tempfile::tempdir().unwrap();
