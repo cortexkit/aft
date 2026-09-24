@@ -19,9 +19,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import {
   __waitForIdentityWritesForTests,
   identitySidecarPath,
@@ -30,6 +38,8 @@ import {
 } from "../binary-identity.js";
 import {
   __setEnsureBinaryForTests,
+  __setNpmPlatformPackageForTests,
+  __waitForCacheCopiesForTests,
   findBinary,
   findBinarySync,
   readBinaryVersion,
@@ -333,5 +343,89 @@ describe("AFT_BINARY_PATH override", () => {
 
     expect(() => findBinarySync("1.2.3")).toThrow(/AFT_BINARY_PATH.*native executable/);
     await expect(findBinary("1.2.3")).rejects.toThrow(/AFT_BINARY_PATH.*native executable/);
+  });
+});
+
+describe.skipIf(skipPosixPathLookup)("npm platform package copy into the versioned cache", () => {
+  let tmpDir: string;
+  let execLog: string;
+  let npmBinary: string;
+  let cachedPath: string;
+  let releaseEnv: (() => void) | undefined;
+
+  function writeRecordingStub(path: string, label: string, version: string): void {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      `#!/bin/sh\nprintf '%s\\n' "${label} $*" >> ${JSON.stringify(execLog)}\necho "aft ${version}"\n`,
+    );
+    chmodSync(path, 0o755);
+  }
+
+  beforeEach(async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "aft-npm-copy-test-"));
+    execLog = join(tmpDir, "exec.log");
+    releaseEnv = await acquireEnv({
+      AFT_BINARY_PATH: undefined,
+      AFT_CACHE_DIR: join(tmpDir, "cache"),
+      PATH: "",
+      HOME: tmpDir,
+    });
+    npmBinary = join(tmpDir, "node_modules", "@cortexkit", "aft-test", "bin", "aft");
+    writeRecordingStub(npmBinary, "npm", "1.2.3");
+    cachedPath = join(tmpDir, "cache", "bin", "v1.2.3", "aft");
+    __setNpmPlatformPackageForTests(() => ({ binaryPath: npmBinary, version: "1.2.3" }));
+  });
+
+  afterEach(async () => {
+    await __waitForCacheCopiesForTests();
+    await __waitForIdentityWritesForTests();
+    __setNpmPlatformPackageForTests(null);
+    __setEnsureBinaryForTests(null);
+    releaseEnv?.();
+    releaseEnv = undefined;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function execs(): string {
+    return existsSync(execLog) ? readFileSync(execLog, "utf8") : "";
+  }
+
+  test("findBinarySync returns the npm binary while the copy runs, then the recorded cache copy", async () => {
+    expect(findBinarySync("1.2.3")).toBe(npmBinary);
+    // The copy has not landed synchronously: nothing was waited on.
+    expect(existsSync(identitySidecarPath(cachedPath))).toBe(false);
+
+    await __waitForCacheCopiesForTests();
+    await __waitForIdentityWritesForTests();
+
+    expect(readFileSync(cachedPath, "utf8")).toBe(readFileSync(npmBinary, "utf8"));
+    expect(findBinarySync("1.2.3")).toBe(cachedPath);
+    expect(execs()).toBe("");
+  });
+
+  test("a boot racing the sidecar write never runs the unrecorded cache copy", async () => {
+    // State another process leaves between renaming its copy into place and
+    // writing the sidecar: a cache entry with no sidecar. Its bytes are a stub
+    // that records any execution, so running it unverified would show up.
+    writeRecordingStub(cachedPath, "unverified-cache", "1.2.3");
+    const staleBytes = readFileSync(cachedPath, "utf8");
+    __setEnsureBinaryForTests(async () => {
+      throw new Error("no download expected");
+    });
+
+    const syncPath = findBinarySync("1.2.3");
+    const asyncPath = await findBinary("1.2.3");
+
+    expect(syncPath).toBe(npmBinary);
+    // findBinary waits for its own copy, so it may return the cache path, but
+    // only after replacing the unrecorded bytes with the npm package's.
+    expect([npmBinary, cachedPath]).toContain(asyncPath);
+    await __waitForCacheCopiesForTests();
+    await __waitForIdentityWritesForTests();
+    expect(readFileSync(cachedPath, "utf8")).not.toBe(staleBytes);
+    expect(findBinarySync("1.2.3")).toBe(cachedPath);
+    expect(execs()).not.toContain("unverified-cache");
+    expect(execs()).toBe("");
   });
 });

@@ -1,14 +1,10 @@
 import {
-  chmodSync,
   closeSync,
-  copyFileSync,
   existsSync,
-  mkdirSync,
+  promises as fsPromises,
   openSync,
   readFileSync,
   readSync,
-  renameSync,
-  unlinkSync,
 } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
@@ -32,54 +28,93 @@ export function __setEnsureBinaryForTests(impl: EnsureBinary | null): void {
   ensureBinaryForResolver = impl ?? ensureBinary;
 }
 
+type NpmPlatformPackage = { binaryPath: string; version: string };
+type NpmPlatformPackageReader = (ext: string) => NpmPlatformPackage | null;
+
+let npmPlatformPackageReader: NpmPlatformPackageReader | null = null;
+
+/** Test seam: stand in for the installed `@cortexkit/aft-<platform>` package. Pass null to restore. */
+export function __setNpmPlatformPackageForTests(impl: NpmPlatformPackageReader | null): void {
+  npmPlatformPackageReader = impl;
+}
+
 type ResolverEnv = typeof process.env;
 
 export { readBinaryVersion };
 
+/** Copies into the versioned cache that are still running, keyed by destination. */
+const cacheCopiesInFlight = new Map<string, Promise<string | null>>();
+
 /**
- * Copy an npm platform binary to the versioned cache so we never run from
+ * Copy an npm platform binary into the versioned cache so we never run from
  * node_modules directly. This prevents corruption when npm updates the
  * package while a bridge process is running the binary.
  *
  * `version` comes from the platform package's own package.json, so nothing is
  * executed. An existing cache entry is reused only when its identity sidecar
- * vouches for it; otherwise it is replaced from the npm package, which is
- * cheaper than proving the old file's version by running it. The new entry's
- * sidecar needs a hash of the bytes, so it is recorded in the background.
+ * vouches for it; an entry without one, or whose sidecar no longer matches
+ * (for example a copy another process finished but has not recorded yet), is
+ * replaced from the npm package rather than run to learn its version.
+ *
+ * The copy itself (~85 MB) runs asynchronously so the host thread never waits
+ * on it. Until it lands, callers use the npm package's own binary, whose
+ * identity is already known from its manifest.
  */
-function copyToVersionedCache(npmBinaryPath: string, version: string): string | null {
+function copyToVersionedCache(
+  npmBinaryPath: string,
+  version: string,
+): { cachedPath: string } | { pendingCopy: Promise<string | null> } {
+  const tag = version.startsWith("v") ? version : `v${version}`;
+  const ext = process.platform === "win32" ? ".exe" : "";
+  const versionedDir = join(getAftBinaryCacheDir(), tag);
+  const cachedPath = join(versionedDir, `aft${ext}`);
+
+  if (existsSync(cachedPath) && isTrustedCachedBinary(cachedPath, version)) return { cachedPath };
+
+  const existing = cacheCopiesInFlight.get(cachedPath);
+  if (existing) return { pendingCopy: existing };
+  const task = copyIntoCache(npmBinaryPath, version, versionedDir, cachedPath).finally(() => {
+    cacheCopiesInFlight.delete(cachedPath);
+  });
+  cacheCopiesInFlight.set(cachedPath, task);
+  return { pendingCopy: task };
+}
+
+async function copyIntoCache(
+  npmBinaryPath: string,
+  version: string,
+  versionedDir: string,
+  cachedPath: string,
+): Promise<string | null> {
+  const tmpPath = `${cachedPath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
-    const tag = version.startsWith("v") ? version : `v${version}`;
-    const cacheDir = getAftBinaryCacheDir();
-    const versionedDir = join(cacheDir, tag);
-    const ext = process.platform === "win32" ? ".exe" : "";
-    const cachedPath = join(versionedDir, `aft${ext}`);
-
-    if (existsSync(cachedPath) && isTrustedCachedBinary(cachedPath, version)) return cachedPath;
-
-    // Copy to versioned cache
-    mkdirSync(versionedDir, { recursive: true });
-    const tmpPath = `${cachedPath}.${process.pid}.${Date.now()}.tmp`;
-    copyFileSync(npmBinaryPath, tmpPath);
+    await fsPromises.mkdir(versionedDir, { recursive: true });
+    await fsPromises.copyFile(npmBinaryPath, tmpPath);
     if (process.platform !== "win32") {
-      chmodSync(tmpPath, 0o755);
+      await fsPromises.chmod(tmpPath, 0o755);
     }
     removeBinaryIdentitySidecar(cachedPath);
-    // Best-effort replace — unlink first on Windows where renameSync fails if target exists
-    if (process.platform === "win32" && existsSync(cachedPath)) {
-      try {
-        unlinkSync(cachedPath);
-      } catch {
-        // best-effort; renameSync will surface the error if unlink fails
-      }
+    // Best-effort replace — unlink first on Windows where rename fails if target exists
+    if (process.platform === "win32") {
+      await fsPromises.unlink(cachedPath).catch(() => {});
     }
-    renameSync(tmpPath, cachedPath);
+    await fsPromises.rename(tmpPath, cachedPath);
     log(`Copied npm binary to versioned cache: ${cachedPath}`);
+    // The sidecar needs a hash of the bytes; until it is written the entry is
+    // untrusted, so other processes copy again rather than run it unverified.
     void recordBinaryIdentity(cachedPath, version);
     return cachedPath;
   } catch (err) {
+    await fsPromises.unlink(tmpPath).catch(() => {});
     warn(`Failed to copy binary to cache: ${err instanceof Error ? err.message : String(err)}`);
     return null;
+  }
+}
+
+/** Test helper: wait for every background copy into the versioned cache. */
+export async function __waitForCacheCopiesForTests(): Promise<void> {
+  while (cacheCopiesInFlight.size > 0) {
+    await Promise.all([...cacheCopiesInFlight.values()]);
   }
 }
 
@@ -231,6 +266,11 @@ type BinaryResolutionSource =
 type BinaryResolution = {
   path: string;
   source: BinaryResolutionSource;
+  /**
+   * Set when `path` is the npm package's own binary because its copy into the
+   * versioned cache is still running; resolves to the cached copy, or null.
+   */
+  pendingCopy?: Promise<string | null>;
 };
 
 function logBinaryResolution(resolution: BinaryResolution): void {
@@ -263,7 +303,8 @@ function ownPackageVersion(): string | null {
  * from the package's package.json, which npm installs together with the
  * binary, so no exec is needed to learn it.
  */
-function npmPlatformPackage(ext: string): { binaryPath: string; version: string } | null {
+function npmPlatformPackage(ext: string): NpmPlatformPackage | null {
+  if (npmPlatformPackageReader) return npmPlatformPackageReader(ext);
   try {
     const req = createRequire(import.meta.url);
     const manifestPath = req.resolve(`@cortexkit/aft-${platformKey()}/package.json`);
@@ -285,7 +326,9 @@ function npmPlatformPackage(ext: string): { binaryPath: string; version: string 
  * 1. The versioned cache (`~/.cache/aft/bin/v<version>/aft`), accepted only
  *    when its identity sidecar still matches the file (stat only)
  * 2. The npm platform package `@cortexkit/aft-<platform>`, whose version is
- *    read from its package.json; the binary is copied into the versioned cache
+ *    read from its package.json. It is copied into the versioned cache in the
+ *    background; until that copy is in place (and recorded), the package's
+ *    own binary is returned for this boot.
  *
  * PATH and `~/.cargo/bin` binaries are not considered here: their version is
  * unknown until they run. {@link findBinary} probes them on a worker thread.
@@ -337,8 +380,13 @@ function findTrustedBinarySync(
         `npm platform package binary v${npm.version} does not match plugin v${pluginVersion}; skipping`,
       );
     } else {
-      const copied = copyToVersionedCache(npm.binaryPath, npm.version);
-      return { path: copied ?? npm.binaryPath, source: "npm platform package" };
+      const copy = copyToVersionedCache(npm.binaryPath, npm.version);
+      if ("cachedPath" in copy) return { path: copy.cachedPath, source: "npm platform package" };
+      return {
+        path: npm.binaryPath,
+        source: "npm platform package",
+        pendingCopy: copy.pendingCopy,
+      };
     }
   }
 
@@ -441,8 +489,12 @@ export async function findBinary(expectedVersion?: string): Promise<string> {
   const resolution =
     findTrustedBinarySync(expectedVersion, env) ?? (await findProbedBinary(expectedVersion, env));
   if (resolution) {
-    logBinaryResolution(resolution);
-    return resolution.path;
+    // An async caller can wait for the npm copy without blocking the host
+    // thread, and then avoids running from node_modules at all.
+    const copied = resolution.pendingCopy ? await resolution.pendingCopy : null;
+    const path = copied ?? resolution.path;
+    logBinaryResolution({ path, source: resolution.source });
+    return path;
   }
 
   // 6. Auto-download from GitHub releases
