@@ -717,7 +717,7 @@
     "required": [
       "files"
     ],
-    "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`."
+    "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. For directories, every file inside is individually backed up before the tree is removed. The deleted file's contents stay in the undo store until its retention expires. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`."
   },
   "move": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
