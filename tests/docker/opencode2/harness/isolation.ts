@@ -174,19 +174,18 @@ export async function createScenarioIsolation(options: {
       2,
     )}\n`,
   );
+  // User tier: an explicit empty disable list registers every tool, including
+  // aft_delete and aft_move, which are off by default. A project config cannot
+  // do this, because a project may disable tools but never enable one.
+  await mkdir(join(paths.config, "cortexkit"), { recursive: true });
+  await writeFile(
+    join(paths.config, "cortexkit", "aft.jsonc"),
+    `${JSON.stringify({ disabled_tools: [] }, null, 2)}\n`,
+  );
   await mkdir(join(paths.project, ".cortexkit"), { recursive: true });
   await writeFile(
     join(paths.project, ".cortexkit", "aft.jsonc"),
-    `${JSON.stringify(
-      {
-        tool_surface: "all",
-        semantic_search: true,
-        search_index: true,
-        ...options.projectConfig,
-      },
-      null,
-      2,
-    )}\n`,
+    `${JSON.stringify({ ...options.projectConfig }, null, 2)}\n`,
   );
   const pluginLog = join(paths.data, "cortexkit", "aft", "logs", "aft-plugin.log");
   await mkdir(join(paths.data, "cortexkit", "aft", "logs"), { recursive: true });

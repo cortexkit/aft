@@ -262,11 +262,11 @@ describe("scenario isolation and liveness", () => {
     const aftConfig = JSON.parse(
       await readFile(join(isolated.project, ".cortexkit", "aft.jsonc"), "utf8"),
     );
-    expect(aftConfig).toMatchObject({
-      tool_surface: "all",
-      semantic_search: true,
-      search_index: true,
-    });
+    expect(aftConfig).toEqual({});
+    const userAftConfig = JSON.parse(
+      await readFile(join(isolated.config, "cortexkit", "aft.jsonc"), "utf8"),
+    );
+    expect(userAftConfig).toEqual({ disabled_tools: [] });
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
     expect(hostConfig.plugin[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
     expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
