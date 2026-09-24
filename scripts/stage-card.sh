@@ -57,6 +57,14 @@ if [ "$(uname -s)" = "Darwin" ]; then
   if [ "$SKIP_BUILD" -eq 1 ] && [ -d "$BIN.dSYM" ] && [ ! -L "$BIN.dSYM" ]; then
     echo "==> using existing $BIN.dSYM"
     DSYM="$BIN.dSYM"
+  elif [ "$SKIP_BUILD" -eq 0 ] && [ -L "$BIN.dSYM" ] && [ -d "$BIN.dSYM" ]; then
+    # The release profile packs debug info into cargo's own dSYM and links
+    # the binary without a debug map, so running dsymutil on the binary
+    # mints a bundle with the right UUID and no DWARF (1.8 MB instead of
+    # ~200 MB): it passes the UUID check and symbolicates nothing. Copy
+    # cargo's bundle instead (the symlink points into deps/).
+    rm -rf "$DSYM"
+    ditto "$BIN.dSYM/" "$DSYM"
   else
     rm -rf "$DSYM"
     dsymutil "$BIN" -o "$DSYM"
@@ -83,6 +91,17 @@ if [ "$(uname -s)" = "Darwin" ]; then
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   if [ -z "$IMAGE_UUID" ] || [ -z "$DSYM_UUID" ] || [ "$IMAGE_UUID" != "$DSYM_UUID" ]; then
     echo "stage-card: dSYM mismatch: card UUID ${IMAGE_UUID:-missing}, dSYM UUID ${DSYM_UUID:-missing}" >&2
+    exit 2
+  fi
+  # A matching UUID does not prove the bundle carries DWARF. Symbolicate the
+  # executable's entry point (LC_MAIN) through it: a bundle with debug info
+  # names it `main`, an empty one echoes the raw address back.
+  DSYM_DWARF="$(find "$DSYM/Contents/Resources/DWARF" -type f | head -1)"
+  ENTRY_OFF="$(otool -l "$TMP" | awk '/LC_MAIN/ { found = 1 } found && /entryoff/ { print $2; exit }')"
+  if [ -z "$DSYM_DWARF" ] || [ -z "$ENTRY_OFF" ] ||
+    ! atos -o "$DSYM_DWARF" -arch arm64 "$(printf '0x%x' $((0x100000000 + ENTRY_OFF)))" 2>/dev/null |
+    grep -q '^main '; then
+    echo "stage-card: dSYM $DSYM has no usable debug info (the entry point does not symbolicate)" >&2
     exit 2
   fi
   DSYM_ROOT="${AFT_DSYM_DIR:-$HOME/.local/share/cortexkit/aft/dsym}"
