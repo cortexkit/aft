@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "glob-walk-depth-349",
+    "drain-held-waits-exit-code",
+    "gh-shim-target-repo-binding"
+  ],
+  "note": "No ranking-fence file changed. Glob expansion is bounded to the pattern's depth (#349); held bash waits are answered on client Cancel and within the drain budget, and a daemon-initiated shutdown exits 0; the gh shim resolves the bot binding from the target repository."
+}
