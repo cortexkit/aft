@@ -378,11 +378,13 @@ fn run(args: &[OsString]) -> i32 {
         };
     }
 
-    let determination = determine_rung(&paths, &cwd, now);
+    let target = TargetRepository::from_invocation(args);
+    let determination = determine_rung(&paths, &target, &cwd, now);
     if determination.record.rung != Rung::R3 {
         let disposition = match resolve_manifest(&paths, now) {
             ManifestResolution::Active(manifest) => non_r3_governance_disposition(
                 &cwd,
+                &target,
                 &determination,
                 args,
                 &manifest,
@@ -436,11 +438,11 @@ fn run(args: &[OsString]) -> i32 {
         }
         ManifestResolution::Dormant => return delegate(args),
     };
-    let Some(agent_binding) = resolved_agent_binding(&manifest, &cwd) else {
+    let classification = classify(args, &manifest, current_platform());
+    let Some(agent_binding) = governing_binding(&classification, &manifest, &target, &cwd) else {
         return delegate(args);
     };
 
-    let classification = classify(args, &manifest, current_platform());
     dispatch_r3(
         args,
         classification,
@@ -481,7 +483,9 @@ where
                 );
             }
             if operator_bypass_requested() {
-                let repository = explicit_repo(args).or_else(infer_repository_from_git);
+                let repository = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| TargetRepository::from_invocation(args).resolve(&cwd));
                 if let Err(error) = append_bypass_audit(paths, &tuple, repository.as_deref(), now) {
                     return refuse(
                         RefusalCode::BypassAuditUnavailable,
@@ -520,6 +524,19 @@ where
                 Ok(request) => request,
                 Err(error) => return refuse_governed_canonicalization(&error),
             };
+            // The binding was chosen for the repository the command appeared
+            // to target; the canonical request is the authoritative reading.
+            // Were they to differ, the request would speak in one repository
+            // as another repository's bot, so refuse instead.
+            if request.repository.as_deref() != Some(agent_binding.repo.as_str()) {
+                return refuse_governed_canonicalization(&CanonicalizeError::unclassified(
+                    format!(
+                        "the command targets {} but was resolved to {}'s binding; name one repository with --repo",
+                        request.repository.as_deref().unwrap_or("no repository"),
+                        agent_binding.repo
+                    ),
+                ));
+            }
             let mutation = GithubReadMutation::from_governed_request(&request);
             let outcome = route_governed(paths, rung, agent_binding, request, now);
             invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
@@ -1126,8 +1143,27 @@ fn structural_governance_disposition(
     }
 }
 
+/// The binding that decides how a classified command is dispatched.
+///
+/// Speech belongs to the repository it is aimed at: a bound target routes as
+/// its own bot, and an unbound target is not governed even from inside a bound
+/// checkout. Every other write also refuses when only the checkout is bound
+/// (see `target_or_checkout_binding`).
+fn governing_binding(
+    classification: &Classification,
+    manifest: &Manifest,
+    target: &TargetRepository,
+    cwd: &Path,
+) -> Option<AgentBinding> {
+    match classification {
+        Classification::Governed { .. } => resolved_agent_binding(manifest, target, cwd),
+        _ => target_or_checkout_binding(manifest, target, cwd),
+    }
+}
+
 fn non_r3_governance_disposition(
     cwd: &Path,
+    target: &TargetRepository,
     determination: &RungDetermination,
     args: &[OsString],
     manifest: &Manifest,
@@ -1148,7 +1184,7 @@ fn non_r3_governance_disposition(
     // Binding resolution runs `git` to inspect the origin. Classify first so
     // unmanifested public repositories keep the R1 fast path for mechanical
     // reads; only a verb that could refuse pays the subprocess latency.
-    let agent_binding = resolved_agent_binding(manifest, cwd);
+    let agent_binding = governing_binding(&classification, manifest, target, cwd);
     structural_governance_disposition(
         determination,
         &classification,
@@ -1157,13 +1193,37 @@ fn non_r3_governance_disposition(
     )
 }
 
-fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungDetermination {
+fn determine_rung(
+    paths: &StatePaths,
+    target: &TargetRepository,
+    cwd: &Path,
+    now: u64,
+) -> RungDetermination {
     // The budget starts before the config read and connection-file stat. This
     // keeps a slow filesystem from silently extending discovery beyond the
     // per-stage budget.
     let deadline = std::time::Instant::now() + DISCOVERY_BUDGET;
     let config_doc = read_user_config_doc();
-    determine_rung_from_doc(paths, cwd, now, deadline, config_doc.as_deref())
+    determine_rung_for_target(paths, target, cwd, now, deadline, config_doc.as_deref())
+}
+
+/// Rung determination for a command that names no repository of its own.
+#[cfg(test)]
+fn determine_rung_from_doc(
+    paths: &StatePaths,
+    cwd: &Path,
+    now: u64,
+    deadline: std::time::Instant,
+    config_doc: Option<&str>,
+) -> RungDetermination {
+    determine_rung_for_target(
+        paths,
+        &TargetRepository::default(),
+        cwd,
+        now,
+        deadline,
+        config_doc,
+    )
 }
 
 /// Pure rung determination over the user config document. `config_doc` is the
@@ -1171,8 +1231,12 @@ fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungDetermination
 /// config file was absent or unreadable. Splitting the config read from the
 /// decision keeps the disabled short-circuit testable without mutating process
 /// env (which races under the parallel test runner).
-fn determine_rung_from_doc(
+///
+/// Governance is needed whenever the target or the checkout is bound, so the
+/// binding that gates discovery is `target_or_checkout_binding`.
+fn determine_rung_for_target(
     paths: &StatePaths,
+    target: &TargetRepository,
     cwd: &Path,
     now: u64,
     deadline: std::time::Instant,
@@ -1224,7 +1288,7 @@ fn determine_rung_from_doc(
         if record.rung != Rung::R3
             || resolve_manifest(paths, now)
                 .manifest()
-                .and_then(|manifest| resolved_agent_binding(manifest, cwd))
+                .and_then(|manifest| target_or_checkout_binding(manifest, target, cwd))
                 .is_some()
         {
             return RungDetermination::cached(record.clone());
@@ -1242,7 +1306,7 @@ fn determine_rung_from_doc(
         write_rung_record_silently(paths, &determination.record);
         return determination;
     };
-    let Some(agent_binding) = resolved_agent_binding(&manifest, cwd) else {
+    let Some(agent_binding) = target_or_checkout_binding(&manifest, target, cwd) else {
         let determination = RungDetermination::r2(
             now,
             R2Reason::AgentBindingUnavailable,
@@ -1662,9 +1726,13 @@ struct AgentBinding {
     agent_id: String,
 }
 
-fn resolved_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBinding> {
-    let project_root = project_root_for(cwd);
-    let repo = repository_key_from_origin(&project_root)?;
+/// The binding of the repository the command targets (see `TargetRepository`).
+fn resolved_agent_binding(
+    manifest: &Manifest,
+    target: &TargetRepository,
+    cwd: &Path,
+) -> Option<AgentBinding> {
+    let repo = target.repository_key(cwd)?;
     manifest
         .bindings
         .get(&repo)
@@ -1672,10 +1740,39 @@ fn resolved_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBindin
         .map(|agent_id| AgentBinding { repo, agent_id })
 }
 
+/// The binding of the checkout the working directory sits in, whatever a
+/// command might name.
+fn checkout_agent_binding(manifest: &Manifest, cwd: &Path) -> Option<AgentBinding> {
+    resolved_agent_binding(manifest, &TargetRepository::default(), cwd)
+}
+
+/// The target's binding, else the checkout's.
+///
+/// Speech is governed by the target alone. This wider answer serves the
+/// questions where a bound checkout matters too: whether governance must be
+/// probed at all, and whether a non-speech write (admin, undeclared,
+/// destructive) must refuse. An agent working in a governed checkout goes
+/// through the audited operator bypass for administration whichever
+/// repository it aims at.
+fn target_or_checkout_binding(
+    manifest: &Manifest,
+    target: &TargetRepository,
+    cwd: &Path,
+) -> Option<AgentBinding> {
+    resolved_agent_binding(manifest, target, cwd).or_else(|| {
+        // With nothing named, the target already was the checkout.
+        target
+            .named()
+            .and_then(|_| checkout_agent_binding(manifest, cwd))
+    })
+}
+
 fn co_author_line(paths: &StatePaths) -> Option<String> {
+    // Commits are made in the checkout, so the trailer names the checkout's
+    // bot rather than any repository a `gh` command might target.
     let cwd = std::env::current_dir().ok()?;
     let manifest = load_manifest(paths, unix_seconds()).ok()?;
-    let binding = resolved_agent_binding(&manifest, &cwd)?;
+    let binding = checkout_agent_binding(&manifest, &cwd)?;
     let login = binding.agent_id;
     if !valid_github_login(&login) {
         return None;
@@ -3342,7 +3439,7 @@ fn canonicalize_governed_from<R: Read>(
                 .and_then(|arg| arg.to_str())
                 .ok_or_else(|| CanonicalizeError::unclassified("--repo requires a value"))?;
             explicit_repository = Some(repository.to_string());
-        } else if let Some(repository) = value.strip_prefix("--repo=") {
+        } else if let Some(repository) = attached_repo_value(value) {
             explicit_repository = Some(repository.to_string());
         } else if fields_only {
             if let Some(label) = declared_label_value(value, args.get(index + 1))? {
@@ -3475,6 +3572,10 @@ fn canonicalize_governed_from<R: Read>(
             Value::Array(values.into_iter().map(Value::String).collect()),
         );
     }
+    // A thread URL positional names its own repository.
+    let url_repository = positional
+        .iter()
+        .find_map(|value| thread_url_repository(value));
     let target = canonical
         .target_fields
         .iter()
@@ -3483,10 +3584,26 @@ fn canonicalize_governed_from<R: Read>(
         .map(|(field, value)| (field, Value::String(value)))
         .collect::<Map<_, _>>();
     // A global `--repo` may precede the command head, so inspect the original
-    // argv before falling back to a command-local flag or remote inference.
-    let repository = explicit_repo(args)
-        .or(explicit_repository)
-        .or_else(infer_repository_from_git)
+    // argv before a command-local flag. The shared resolver then falls back
+    // to the URL, GH_REPO, and the working directory's origin.
+    let explicit = explicit_repo(args).or(explicit_repository);
+    if let (Some(explicit), Some(from_url)) = (&explicit, &url_repository) {
+        // The same ambiguity rule as the operator label rows: a URL and a
+        // --repo that disagree leave the target a guess.
+        if canonical_repository_key(explicit).as_ref() != Some(from_url) {
+            return Err(CanonicalizeError::unclassified(format!(
+                "the thread URL names {from_url} but --repo names {explicit}"
+            )));
+        }
+    }
+    let target_repository = TargetRepository {
+        explicit,
+        url: url_repository,
+        gh_repo: gh_repo_env(),
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let repository = target_repository
+        .resolve(&cwd)
         .map(|repository| {
             canonical_repository_key(&repository)
                 .ok_or_else(|| format!("repository {repository} is not owner/name"))
@@ -3915,16 +4032,205 @@ fn explicit_repo(args: &[OsString]) -> Option<String> {
         if value == "--repo" || value == "-R" {
             return args.next()?.to_str().map(str::to_string);
         }
-        if let Some(repository) = value.strip_prefix("--repo=") {
+        if let Some(repository) = attached_repo_value(value) {
             return Some(repository.to_string());
         }
     }
     None
 }
 
+/// The value of `--repo=<r>`, or of the shorthand spelling upstream `gh`
+/// also accepts, `-R=<r>`. The glued `-R<r>` form is not read: a comment body
+/// such as `-Really?` would otherwise be taken for a repository.
+fn attached_repo_value(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("--repo=")
+        .or_else(|| value.strip_prefix("-R="))
+        .filter(|repository| !repository.is_empty())
+}
+
+/// The repository when the command names none itself: `GH_REPO`, else the
+/// working directory's origin. Same order and resolver as a full invocation.
 fn infer_repository_from_git() -> Option<String> {
     let cwd = std::env::current_dir().ok()?;
-    canonical_repository_key(&origin_remote(&cwd)?)
+    TargetRepository {
+        gh_repo: gh_repo_env(),
+        ..TargetRepository::default()
+    }
+    .resolve(&cwd)
+}
+
+fn gh_repo_env() -> Option<String> {
+    std::env::var("GH_REPO")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Where a `gh` invocation says which repository it acts on, collected before
+/// any git lookup.
+///
+/// Resolution follows upstream `gh`: `-R`/`--repo`, then a thread URL (or a
+/// `gh api` endpoint) naming a repository, then `GH_REPO`, and only then the
+/// working directory's `origin` remote. The agent binding and the repository
+/// sent on a governed route both come from this one resolver, so a command
+/// aimed at a bound repository is governed as that repository wherever it
+/// runs from, and can never be spoken as the working directory's bot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TargetRepository {
+    /// `-R`/`--repo` exactly as spelled.
+    explicit: Option<String>,
+    /// Canonical `owner/name` from a thread URL or an API endpoint.
+    url: Option<String>,
+    /// `GH_REPO` exactly as set.
+    gh_repo: Option<String>,
+}
+
+impl TargetRepository {
+    fn from_invocation(args: &[OsString]) -> Self {
+        Self {
+            explicit: explicit_repo(args),
+            url: positional_target_repository(args),
+            gh_repo: gh_repo_env(),
+        }
+    }
+
+    /// The repository the command names itself, without consulting git.
+    fn named(&self) -> Option<&str> {
+        self.explicit
+            .as_deref()
+            .or(self.url.as_deref())
+            .or(self.gh_repo.as_deref())
+    }
+
+    /// The named repository as spelled, else the canonical key of the
+    /// working directory's origin. A name that is not a github.com
+    /// `owner/name` (another host, a malformed value) is returned as spelled
+    /// and never falls back to the origin: the command is not aimed at the
+    /// checkout it happens to run in.
+    fn resolve(&self, cwd: &Path) -> Option<String> {
+        match self.named() {
+            Some(named) => Some(named.to_string()),
+            None => repository_key_from_origin(&project_root_for(cwd)),
+        }
+    }
+
+    /// Canonical `owner/name` of the target, or `None` when it is unresolvable
+    /// or not a github.com repository.
+    fn repository_key(&self, cwd: &Path) -> Option<String> {
+        canonical_repository_key(&self.resolve(cwd)?)
+    }
+}
+
+/// Canonical `owner/name` of a `https://github.com/<owner>/<repo>/issues/<n>`
+/// or `.../pull/<n>` URL. Trailing path segments, a query, or a fragment
+/// (`#issuecomment-1`) do not change which repository the URL names.
+fn thread_url_repository(value: &str) -> Option<String> {
+    let path = ["https://github.com/", "http://github.com/"]
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix))?;
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if !matches!(segments.next()?, "issues" | "pull") {
+        return None;
+    }
+    let number = segments.next()?;
+    let digits = number.split(['#', '?']).next().unwrap_or("");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    canonical_repository_key(&format!("{owner}/{name}"))
+}
+
+/// Canonical `owner/name` of a `/repos/<owner>/<repo>/...` API endpoint. The
+/// `{owner}`/`{repo}` placeholders are filled by upstream `gh` from the other
+/// sources, so an endpoint using them names nothing itself.
+fn api_endpoint_repository(path: &str) -> Option<String> {
+    let mut segments = path.strip_prefix('/').unwrap_or(path).split('/');
+    (segments.next()? == "repos").then_some(())?;
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    if owner.contains(['{', '}']) || name.contains(['{', '}']) {
+        return None;
+    }
+    canonical_repository_key(&format!("{owner}/{name}"))
+}
+
+/// Flags of the issue and pull request verbs whose next argument is their
+/// value rather than a positional. A thread URL passed as `--body <url>` is
+/// prose, not the target. A flag outside this list is read as a switch, so an
+/// unknown flag's URL value can at worst make the command look aimed at that
+/// URL's repository; the governed route then refuses the mismatch by name
+/// instead of running upstream `gh` as the operator.
+const VALUE_FLAGS: &[&str] = &[
+    "--body",
+    "-b",
+    "--body-file",
+    "-F",
+    "--title",
+    "-t",
+    "--label",
+    "-l",
+    "--add-label",
+    "--remove-label",
+    "--assignee",
+    "-a",
+    "--add-assignee",
+    "--remove-assignee",
+    "--milestone",
+    "-m",
+    "--project",
+    "-p",
+    "--add-project",
+    "--remove-project",
+    "--comment",
+    "-c",
+    "--reason",
+    "-r",
+    "--reaction",
+    "--template",
+    "-T",
+    "--base",
+    "-B",
+    "--head",
+    "-H",
+    "--json",
+    "--jq",
+    "-q",
+    "--repo",
+    "-R",
+    "--hostname",
+    "--config-dir",
+];
+
+/// Repository named by a positional thread URL or, for `gh api`, by the
+/// endpoint.
+fn positional_target_repository(args: &[OsString]) -> Option<String> {
+    let (verb, subcommand, head_index) = command_head(args)?;
+    if verb == "api" {
+        let (_, path, _) = api_method_and_path(&args[head_index..])?;
+        return api_endpoint_repository(&path);
+    }
+    // `pr review --comment` is a switch selecting the review event, not a
+    // comment value as it is on the close and reopen verbs.
+    let comment_is_switch = verb == "pr" && subcommand.as_deref() == Some("review");
+    let mut skip_value = false;
+    for arg in args.iter().skip(head_index + 1) {
+        let value = arg.to_str()?;
+        if std::mem::take(&mut skip_value) {
+            continue;
+        }
+        if value.starts_with('-') {
+            let is_switch = comment_is_switch && matches!(value, "--comment" | "-c");
+            skip_value = !value.contains('=') && !is_switch && VALUE_FLAGS.contains(&value);
+            continue;
+        }
+        if let Some(repository) = thread_url_repository(value) {
+            return Some(repository);
+        }
+    }
+    None
 }
 
 /// Which kind of thread a label-only edit targets: `gh issue edit` or
@@ -9570,6 +9876,144 @@ INHERITED FLAGS
     }
 
     #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
+    #[test]
+    fn target_repository_reads_positional_urls_and_endpoints_but_not_flag_values() {
+        let named = |raw: &[&str]| positional_target_repository(&os_args(raw));
+        assert_eq!(
+            named(&[
+                "issue",
+                "comment",
+                "https://github.com/Owner/Repo/issues/5#issuecomment-1",
+                "--body",
+                "x"
+            ]),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            named(&[
+                "pr",
+                "review",
+                "--comment",
+                "https://github.com/o/r/pull/7",
+                "-b",
+                "x"
+            ]),
+            Some("o/r".to_string())
+        );
+        // A URL given as the body is prose, not the target.
+        assert_eq!(
+            named(&[
+                "issue",
+                "comment",
+                "5",
+                "--body",
+                "https://github.com/o/r/issues/1"
+            ]),
+            None
+        );
+        assert_eq!(
+            named(&[
+                "pr",
+                "close",
+                "7",
+                "--comment",
+                "https://github.com/o/r/pull/1"
+            ]),
+            None
+        );
+        assert_eq!(
+            named(&[
+                "api",
+                "-X",
+                "PATCH",
+                "repos/o/r/issues/comments/1",
+                "-f",
+                "body=x"
+            ]),
+            Some("o/r".to_string())
+        );
+        // Placeholders are filled from the other sources by upstream gh.
+        assert_eq!(named(&["api", "repos/{owner}/{repo}/issues"]), None);
+
+        let explicit = explicit_repo(&os_args(&["issue", "comment", "5", "-R=o/r"]));
+        assert_eq!(explicit.as_deref(), Some("o/r"));
+        let target = TargetRepository {
+            explicit: Some("o/explicit".to_string()),
+            url: Some("o/url".to_string()),
+            gh_repo: Some("o/env".to_string()),
+        };
+        assert_eq!(target.named(), Some("o/explicit"));
+        let target = TargetRepository {
+            explicit: None,
+            ..target
+        };
+        assert_eq!(target.named(), Some("o/url"));
+        let target = TargetRepository {
+            url: None,
+            ..target
+        };
+        assert_eq!(target.named(), Some("o/env"));
+        // A named repository on another host never falls back to the origin.
+        let foreign = TargetRepository {
+            explicit: Some("ghe.example.com/o/r".to_string()),
+            ..TargetRepository::default()
+        };
+        assert_eq!(foreign.repository_key(Path::new(".")), None);
+    }
+
+    /// The binding and the canonical request must name the same repository;
+    /// otherwise the request would speak in one repository as another's bot.
+    #[test]
+    fn governed_request_for_a_repository_other_than_the_binding_refuses_before_routing() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().expect("create mismatch state directory");
+        // No user config under this HOME, so a request that got past the
+        // check could not reach any real governance daemon.
+        let _home = ScopedTestEnvVar::set("HOME", Some(directory.path().to_str().unwrap()));
+        let _config = ScopedTestEnvVar::set(
+            "XDG_CONFIG_HOME",
+            Some(directory.path().join("config").to_str().unwrap()),
+        );
+        let _gh_repo = ScopedTestEnvVar::set("GH_REPO", None);
+        let paths = StatePaths::from_root(directory.path().join("state"));
+        let manifest = v12_fixture_manifest();
+        let rung =
+            RungDetermination::r3(TEST_NOW, manifest.manifest_version, &test_rung_provenance())
+                .record;
+        let binding = AgentBinding {
+            repo: "cortexkit/magic-context".to_string(),
+            agent_id: "alfonso-magic-context".to_string(),
+        };
+        let args = os_args(&[
+            "issue",
+            "comment",
+            "42",
+            "-R",
+            "cortexkit/aft",
+            "--body",
+            "hello",
+        ]);
+        let classification = classify(&args, &manifest, "macos");
+        assert!(matches!(classification, Classification::Governed { .. }));
+        let status = dispatch_r3(
+            &args,
+            classification,
+            &manifest,
+            &paths,
+            &rung,
+            &binding,
+            TEST_NOW,
+            |_| panic!("a governed request reached upstream gh"),
+        );
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        // Routing records the binding in the seam state before it dials, so
+        // an absent file shows the refusal came before any route attempt.
+        assert!(
+            !paths.seam_state.exists(),
+            "the mismatched request was sent toward the route"
+        );
+    }
+
     #[test]
     fn dev_signed_admin_api_dispatch_requires_bypass_and_audits_delegation() {
         use std::cell::Cell;

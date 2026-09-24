@@ -44,6 +44,12 @@ const DEV_MANIFEST_SEED: [u8; 32] = [
 ];
 const REGEN_ENV: &str = "AFT_GH_SHIM_WIRE_GOLDENS_REGEN";
 const REPOSITORY: &str = "cortexkit/aft";
+/// Bound in the test manifest next to `REPOSITORY`, and never the origin of
+/// any checkout a test runs in.
+const OTHER_BOUND_REPOSITORY: &str = "cortexkit/magic-context";
+const OTHER_BOUND_AGENT: &str = "alfonso-magic-context";
+/// Named by no binding in the test manifest.
+const UNBOUND_REPOSITORY: &str = "someone/unbound";
 /// Route channel the fake holder hands out on `route.open`; a request frame on
 /// this channel is the governed `gh.route` payload.
 const ROUTE_CHANNEL: u16 = 42;
@@ -639,6 +645,9 @@ fn v14_manifest(now: u64) -> Value {
             .expect("admin tier")
             .push(json!({"tuple": tuple, "platform": ["macos", "linux"]}));
     }
+    // A second bound repository, so a command can target a bound repository
+    // other than the checkout it runs in.
+    manifest["bindings"][OTHER_BOUND_REPOSITORY] = json!(OTHER_BOUND_AGENT);
     manifest
 }
 
@@ -1035,4 +1044,400 @@ fn write_session_record(run: &Run) {
         text,
     )
     .expect("write session record");
+}
+
+// ---------------------------------------------------------------------------
+// Target repository
+// ---------------------------------------------------------------------------
+//
+// The binding and the routed repository come from the repository a command
+// targets (`-R`/`--repo`, a thread URL, `GH_REPO`, then the working
+// directory's origin), not from the working directory alone. Each run records
+// every upstream `gh` invocation through the stand-in, so "delegated" is an
+// observed call rather than an inference from the exit code.
+
+/// Where the shim runs.
+#[derive(Clone, Copy)]
+enum RunFrom {
+    /// A checkout whose origin is `REPOSITORY` (bound).
+    BoundCheckout,
+    /// A directory in no git repository at all.
+    ScratchDirectory,
+    /// A checkout whose origin is `UNBOUND_REPOSITORY`.
+    UnboundCheckout,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Governance {
+    /// The fake holder answers every governed request with success.
+    Available,
+    /// The connection file names a holder that is gone, and no rung record is
+    /// cached, so discovery finds the daemon unreachable.
+    Unavailable,
+}
+
+struct TargetRun {
+    exit_code: Option<i32>,
+    stderr: String,
+    /// The governed request the holder received, if any.
+    route_request: Option<Value>,
+    /// One line per upstream `gh` invocation, its argv joined by spaces.
+    upstream_calls: Vec<String>,
+    bypass_audit: Vec<Value>,
+}
+
+fn write_checkout(root: &Path, repository: &str) -> PathBuf {
+    let checkout = root.join(repository.replace('/', "-"));
+    fs::create_dir_all(&checkout).expect("create checkout");
+    for args in [
+        vec!["init".to_string(), "--quiet".to_string()],
+        vec![
+            "remote".to_string(),
+            "add".to_string(),
+            "origin".to_string(),
+            format!("https://github.com/{repository}.git"),
+        ],
+    ] {
+        let status = Command::new("git")
+            .args(&args)
+            .current_dir(&checkout)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed: {status}");
+    }
+    checkout
+}
+
+fn run_targeting(
+    argv: &[&str],
+    from: RunFrom,
+    env: &[(&str, &str)],
+    governance: Governance,
+) -> TargetRun {
+    let reply = fs::read(goldens_dir().join("responses/success-result.response.json"))
+        .expect("read success response");
+    let mut holder = Some(CapturingHolder::spawn(Some(reply)));
+    let temp = tempfile::tempdir().expect("temp root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let state_dir = state_home.join("cortexkit/aft/gh-shim");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("create HOME");
+    let cwd = match from {
+        RunFrom::BoundCheckout => write_checkout(temp.path(), REPOSITORY),
+        RunFrom::UnboundCheckout => write_checkout(temp.path(), UNBOUND_REPOSITORY),
+        RunFrom::ScratchDirectory => {
+            let directory = temp.path().join("scratch");
+            fs::create_dir_all(&directory).expect("create scratch directory");
+            directory
+        }
+    };
+    let connection_file = temp.path().join("subc-connection.json");
+    holder
+        .as_ref()
+        .expect("holder")
+        .write_connection_file(&connection_file);
+    write_user_config(&config_home, &connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_signed_manifest(&state_dir, now);
+    match governance {
+        Governance::Available => write_fresh_r3_cache(&state_dir, now),
+        Governance::Unavailable => drop(holder.take()),
+    }
+
+    let inherited_path = std::env::var_os("PATH").expect("test PATH");
+    let path = std::env::join_paths(
+        std::iter::once(upstream_bin.clone()).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("build PATH");
+    let mut command = Command::new(aft_binary());
+    command
+        .arg("gh-shim")
+        .args(argv)
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("AFT_GH_SHIM_STATE_DIR", &state_dir)
+        .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
+        .env("PATH", path)
+        .env("GH_SHIM_TEST_RECORD", &recorder)
+        // Keep git from finding a repository above the temporary directory.
+        .env("GIT_CEILING_DIRECTORIES", temp.path())
+        .env_remove("GIT_DIR")
+        .env_remove("GH_REPO")
+        .env_remove("GH_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_ENTERPRISE_TOKEN")
+        .env_remove("GH_SHIM_BYPASS")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let output = command.output().expect("run gh shim");
+
+    let route_requests = holder
+        .as_ref()
+        .map(|holder| holder.captured())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|frame| frame.on_route)
+        .map(|frame| serde_json::from_slice::<Value>(&frame.body).expect("request is JSON"))
+        .collect::<Vec<_>>();
+    assert!(route_requests.len() <= 1, "more than one governed request");
+    let upstream_calls = fs::read_to_string(&recorder)
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    let bypass_audit = fs::read_to_string(state_dir.join("operator-bypass.jsonl"))
+        .map(|text| {
+            text.lines()
+                .map(|line| serde_json::from_str(line).expect("audit line is JSON"))
+                .collect()
+        })
+        .unwrap_or_default();
+    TargetRun {
+        exit_code: output.status.code(),
+        stderr: String::from_utf8(output.stderr).expect("stderr is UTF-8"),
+        route_request: route_requests.into_iter().next(),
+        upstream_calls,
+        bypass_audit,
+    }
+}
+
+/// The run spoke through the governed route as `agent` in `repository` and
+/// never reached upstream `gh`.
+fn assert_routed_as(run: &TargetRun, repository: &str, agent: &str) {
+    assert!(
+        run.upstream_calls.is_empty(),
+        "a governed call reached upstream gh as the operator: {:?}; stderr: {}",
+        run.upstream_calls,
+        run.stderr
+    );
+    let request = run.route_request.as_ref().unwrap_or_else(|| {
+        panic!(
+            "no governed request reached the holder; stderr: {}",
+            run.stderr
+        )
+    });
+    assert_eq!(
+        request["repository"],
+        json!(repository),
+        "routed repository"
+    );
+    assert_eq!(
+        request["metadata"]["agent_id"],
+        json!(agent),
+        "routed agent"
+    );
+    assert_eq!(run.exit_code, Some(0), "stderr: {}", run.stderr);
+}
+
+/// The run passed straight through to upstream `gh` with its argv untouched.
+fn assert_delegated(run: &TargetRun, argv: &[&str]) {
+    assert!(
+        run.route_request.is_none(),
+        "an unbound target was routed: {:?}",
+        run.route_request
+    );
+    assert_eq!(
+        run.upstream_calls,
+        vec![argv.join(" ")],
+        "upstream gh calls"
+    );
+    assert_eq!(run.exit_code, Some(73), "the stand-in gh's exit status");
+}
+
+/// The run refused with `code` and neither routed nor reached upstream `gh`.
+fn assert_refused(run: &TargetRun, code: &str) {
+    assert!(
+        run.upstream_calls.is_empty(),
+        "a refused call reached upstream gh: {:?}",
+        run.upstream_calls
+    );
+    assert!(run.route_request.is_none(), "a refused call was routed");
+    assert!(
+        run.stderr.contains(code),
+        "expected refusal {code}; stderr: {}",
+        run.stderr
+    );
+    assert_ne!(run.exit_code, Some(0));
+}
+
+#[test]
+fn speech_with_repo_flag_naming_a_bound_repository_routes_as_its_bot_from_outside_any_checkout() {
+    let run = run_targeting(
+        &[
+            "issue",
+            "comment",
+            "513",
+            "-R",
+            OTHER_BOUND_REPOSITORY,
+            "--body",
+            "hello",
+        ],
+        RunFrom::ScratchDirectory,
+        &[],
+        Governance::Available,
+    );
+    assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+}
+
+#[test]
+fn speech_with_repo_equals_naming_a_bound_repository_routes_as_its_bot_from_outside_any_checkout() {
+    for repo_flag in [
+        format!("--repo={OTHER_BOUND_REPOSITORY}"),
+        format!("-R={OTHER_BOUND_REPOSITORY}"),
+    ] {
+        let run = run_targeting(
+            &["issue", "comment", "513", &repo_flag, "--body", "hello"],
+            RunFrom::ScratchDirectory,
+            &[],
+            Governance::Available,
+        );
+        assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+    }
+}
+
+#[test]
+fn speech_with_a_thread_url_naming_a_bound_repository_routes_as_its_bot_from_outside_any_checkout()
+{
+    let url = format!("https://github.com/{OTHER_BOUND_REPOSITORY}/issues/513");
+    let run = run_targeting(
+        &["issue", "comment", &url, "--body", "hello"],
+        RunFrom::ScratchDirectory,
+        &[],
+        Governance::Available,
+    );
+    assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+    assert_eq!(
+        run.route_request.as_ref().unwrap()["target"]["number"],
+        json!(url)
+    );
+}
+
+#[test]
+fn speech_with_gh_repo_naming_a_bound_repository_routes_as_its_bot_from_an_unbound_checkout() {
+    let run = run_targeting(
+        &["issue", "comment", "513", "--body", "hello"],
+        RunFrom::UnboundCheckout,
+        &[("GH_REPO", OTHER_BOUND_REPOSITORY)],
+        Governance::Available,
+    );
+    assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+}
+
+#[test]
+fn speech_aimed_at_a_bound_repository_refuses_when_governance_is_unavailable_and_never_delegates() {
+    let run = run_targeting(
+        &[
+            "issue",
+            "comment",
+            "513",
+            "-R",
+            OTHER_BOUND_REPOSITORY,
+            "--body",
+            "hello",
+        ],
+        RunFrom::ScratchDirectory,
+        &[],
+        Governance::Unavailable,
+    );
+    assert_refused(&run, "gh_shim_governance_unavailable");
+}
+
+#[test]
+fn speech_with_repo_flag_naming_an_unbound_repository_delegates_from_an_unbound_directory() {
+    let argv = [
+        "issue",
+        "comment",
+        "513",
+        "-R",
+        UNBOUND_REPOSITORY,
+        "--body",
+        "hello",
+    ];
+    let run = run_targeting(
+        &argv,
+        RunFrom::ScratchDirectory,
+        &[],
+        Governance::Available,
+    );
+    assert_delegated(&run, &argv);
+}
+
+#[test]
+fn speech_from_one_bound_checkout_aimed_at_another_bound_repository_uses_the_target_binding() {
+    let run = run_targeting(
+        &[
+            "issue",
+            "comment",
+            "513",
+            "-R",
+            OTHER_BOUND_REPOSITORY,
+            "--body",
+            "hello",
+        ],
+        RunFrom::BoundCheckout,
+        &[],
+        Governance::Available,
+    );
+    assert_routed_as(&run, OTHER_BOUND_REPOSITORY, OTHER_BOUND_AGENT);
+}
+
+#[test]
+fn speech_from_a_bound_checkout_aimed_at_an_unbound_repository_delegates() {
+    let argv = [
+        "issue",
+        "comment",
+        "513",
+        "-R",
+        UNBOUND_REPOSITORY,
+        "--body",
+        "hello",
+    ];
+    let run = run_targeting(&argv, RunFrom::BoundCheckout, &[], Governance::Available);
+    assert_delegated(&run, &argv);
+}
+
+#[test]
+fn speech_whose_url_and_repo_flag_disagree_refuses_instead_of_guessing() {
+    let url = format!("https://github.com/{OTHER_BOUND_REPOSITORY}/issues/513");
+    let run = run_targeting(
+        &[
+            "issue", "comment", &url, "-R", REPOSITORY, "--body", "hello",
+        ],
+        RunFrom::ScratchDirectory,
+        &[],
+        Governance::Available,
+    );
+    assert_refused(&run, "gh_shim_unclassified");
+}
+
+/// A bound checkout keeps administration behind the audited operator bypass
+/// even when the command targets an unbound repository.
+#[test]
+fn admin_from_a_bound_checkout_aimed_at_an_unbound_repository_still_needs_the_bypass() {
+    let argv = ["pr", "merge", "7", "-R", UNBOUND_REPOSITORY];
+    let refused = run_targeting(&argv, RunFrom::BoundCheckout, &[], Governance::Available);
+    assert_refused(&refused, "gh_shim_admin_tier");
+    assert!(refused.bypass_audit.is_empty());
+
+    let bypassed = run_targeting(
+        &argv,
+        RunFrom::BoundCheckout,
+        &[("GH_SHIM_BYPASS", "operator")],
+        Governance::Available,
+    );
+    assert_delegated(&bypassed, &argv);
+    assert_eq!(bypassed.bypass_audit.len(), 1, "one audit line");
+    assert_eq!(
+        bypassed.bypass_audit[0]["repository"],
+        json!(UNBOUND_REPOSITORY)
+    );
+    assert_eq!(bypassed.bypass_audit[0]["tuple"], json!("pr merge"));
 }
