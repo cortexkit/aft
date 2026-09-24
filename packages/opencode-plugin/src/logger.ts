@@ -1,12 +1,11 @@
-import { RotatingLogSink, resolveAftLogPath } from "@cortexkit/aft-bridge";
+import { RotatingLogSink, resolvePluginLogPath } from "@cortexkit/aft-bridge";
 
 const TAG = "[aft-plugin]";
 
-// Route test runs to a separate log file so `bun test` never pollutes the
-// live session log that users read to diagnose problems. Bun sets BUN_TEST=1
-// automatically; NODE_ENV=test covers other test harnesses.
-const isTestEnv = process.env.BUN_TEST === "1" || process.env.NODE_ENV === "test";
-const logFile = resolveAftLogPath(isTestEnv ? "aft-plugin-test.log" : "aft-plugin.log");
+// Test runs log to aft-plugin-test.log under the system temp directory, so
+// `bun test` never writes into the live log directory users read to diagnose
+// problems.
+const logFile = resolvePluginLogPath();
 const fileSink = new RotatingLogSink(logFile);
 
 /**

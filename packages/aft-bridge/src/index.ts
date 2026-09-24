@@ -229,9 +229,11 @@ export { RevivableTransportPool } from "./revivable-transport.js";
 export type { SemanticIndexStatusKind } from "./semantic-status.js";
 export { formatSemanticIndexStatus, semanticIndexStatusKind } from "./semantic-status.js";
 export {
+  isTestEnvironment,
   resolveAftLogPath,
   resolveAftStorageRoot,
   resolveDataHome,
+  resolvePluginLogPath,
   resolveStoragePath,
   type StorageEnvironmentLookup,
   type StoragePathContext,

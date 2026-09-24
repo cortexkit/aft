@@ -1,9 +1,9 @@
-import { RotatingLogSink, resolveAftLogPath } from "@cortexkit/aft-bridge";
+import { RotatingLogSink, resolvePluginLogPath } from "@cortexkit/aft-bridge";
 
 const TAG = "[aft-pi]";
 
-const isTestEnv = process.env.BUN_TEST === "1" || process.env.NODE_ENV === "test";
-const logFile = resolveAftLogPath(isTestEnv ? "aft-plugin-test.log" : "aft-plugin.log");
+// Test runs log under the system temp directory, never the live log directory.
+const logFile = resolvePluginLogPath();
 const fileSink = new RotatingLogSink(logFile);
 
 /**

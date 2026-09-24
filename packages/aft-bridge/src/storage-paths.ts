@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 export type StoragePlatform = "windows" | "other";
@@ -100,4 +100,25 @@ export function resolveAftLogPath(
   context: StoragePathContext = {},
 ): string {
   return join(resolveAftStorageRoot(configuredRoot, context), "logs", filename);
+}
+
+/** True under a test runner: Bun sets BUN_TEST=1, other harnesses NODE_ENV=test. */
+export function isTestEnvironment(context: StoragePathContext = {}): boolean {
+  return (
+    environmentValue(context, "BUN_TEST") === "1" ||
+    environmentValue(context, "NODE_ENV") === "test"
+  );
+}
+
+/**
+ * Path of the plugin's own log. Test runs write `aft-plugin-test.log` under the
+ * system temp directory instead of the storage root, which on a developer
+ * machine is the live log directory next to the production `aft-plugin.log`
+ * and the daemon's logs.
+ */
+export function resolvePluginLogPath(context: StoragePathContext = {}): string {
+  if (isTestEnvironment(context)) {
+    return join(environmentValue(context, "TMPDIR") ?? tmpdir(), "aft-plugin-test.log");
+  }
+  return resolveAftLogPath("aft-plugin.log", undefined, context);
 }
