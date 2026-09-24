@@ -20,6 +20,7 @@
 //!   - mean pool: sum(mask · tok, over seq) / max(sum(mask), 1)
 //!   - L2 normalize: v / (||v|| + 1e-12)
 
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 
 use ort::session::builder::GraphOptimizationLevel;
@@ -196,7 +197,9 @@ fn intra_thread_derivation() -> IntraThreadDerivation {
 }
 
 pub struct LocalEmbedder {
-    session: Session,
+    /// Released explicitly in `Drop` so the native release can be skipped
+    /// once the process has started exiting (see `crate::ort_lifecycle`).
+    session: ManuallyDrop<Session>,
     tokenizer: Tokenizer,
     wants_token_type_ids: bool,
 }
@@ -222,6 +225,11 @@ impl LocalEmbedder {
 
         let thread_derivation = intra_thread_derivation();
         let threads = thread_derivation.threads;
+        // Environment creation and model loading are native ORT work; hold the
+        // exit gate so process exit cannot destroy ORT's statics underneath it.
+        let _ort_section = crate::ort_lifecycle::enter().ok_or_else(|| {
+            "semantic embedder not started: the process is shutting down".to_string()
+        })?;
         let session = Session::builder()
             .map_err(|e| format!("failed to create ONNX session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -263,7 +271,7 @@ impl LocalEmbedder {
         );
 
         Ok(Self {
-            session,
+            session: ManuallyDrop::new(session),
             tokenizer,
             wants_token_type_ids,
         })
@@ -329,6 +337,10 @@ impl LocalEmbedder {
         if encodings.is_empty() {
             return Ok(Vec::new());
         }
+        // Tensor creation, inference and output extraction all call into ORT.
+        let _ort_section = crate::ort_lifecycle::enter().ok_or_else(|| {
+            "semantic embedding stopped: the process is shutting down".to_string()
+        })?;
 
         let batch = encodings.len();
         let max_len = encodings
@@ -425,6 +437,20 @@ impl LocalEmbedder {
             result.push(emb);
         }
         Ok(result)
+    }
+}
+
+impl Drop for LocalEmbedder {
+    fn drop(&mut self) {
+        match crate::ort_lifecycle::enter() {
+            Some(_ort_section) => {
+                // SAFETY: `session` is never used again; this is its only drop.
+                unsafe { ManuallyDrop::drop(&mut self.session) };
+            }
+            // The process is exiting. Releasing the session now could race
+            // ORT's own static teardown, and the OS reclaims the memory anyway.
+            None => {}
+        }
     }
 }
 

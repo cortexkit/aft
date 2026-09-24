@@ -218,6 +218,7 @@ fn main() {
         {
             Ok(()) => {
                 aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+                aft::ort_lifecycle::quiesce_before_return(0);
                 return;
             }
             // A lost connection is a restart request, not a failure to attach:
@@ -227,17 +228,19 @@ fn main() {
                 aft::slog_error!(
                     "subc connection lost after attach; exiting for supervisor restart"
                 );
-                std::process::exit(exit_after_log_flush(SUBC_CONNECTION_LOST_EXIT_CODE));
+                aft::ort_lifecycle::exit_process(exit_after_log_flush(
+                    SUBC_CONNECTION_LOST_EXIT_CODE,
+                ));
             }
             Err(aft::subc::SubcError::ActorFatal) => {
                 aft::slog_error!(
                     "executor actor went fatal after attach; exiting for supervisor restart"
                 );
-                std::process::exit(exit_after_log_flush(SUBC_ACTOR_FATAL_EXIT_CODE));
+                aft::ort_lifecycle::exit_process(exit_after_log_flush(SUBC_ACTOR_FATAL_EXIT_CODE));
             }
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");
-                std::process::exit(exit_after_log_flush(1));
+                aft::ort_lifecycle::exit_process(exit_after_log_flush(1));
             }
         }
     }
@@ -579,6 +582,11 @@ fn main() {
         shutdown_started.elapsed().as_millis()
     );
     aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
+    // A detached semantic worker may still be inside ONNX Runtime (creating its
+    // environment, loading the model, or embedding). Returning from main would
+    // run ORT's C++ static destructors underneath it and crash at exit, so wait
+    // for that native work to finish, or skip native teardown if it will not.
+    aft::ort_lifecycle::quiesce_before_return(0);
 }
 
 #[cfg(test)]
@@ -826,7 +834,7 @@ fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspC
             if killed > 0 {
                 aft::slog_info!("signal {}: killed {} LSP child process(es)", signal, killed);
             }
-            std::process::exit(exit_after_log_flush(128 + signal));
+            aft::ort_lifecycle::exit_process(exit_after_log_flush(128 + signal));
         }
     });
 }
@@ -871,7 +879,7 @@ fn install_subc_signal_handler(
                     killed
                 );
             }
-            std::process::exit(exit_after_log_flush(128 + signal));
+            aft::ort_lifecycle::exit_process(exit_after_log_flush(128 + signal));
         }
     });
 }

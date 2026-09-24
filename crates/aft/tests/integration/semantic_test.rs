@@ -58,7 +58,15 @@ fn configure_semantic(
             "harness": "opencode",
             "project_root": root.display().to_string(),
             "storage_dir": storage_dir.display().to_string(),
-            "config": user_config(serde_json::json!({ "semantic_search": enabled })),
+            // With semantic off, keep the trigram index off as well: these
+            // tests assert the bounded-walk ("literal") fallback, and a trigram
+            // index that finishes building before the query would instead
+            // answer through the ranked lexical engine.
+            "config": user_config(if enabled {
+                serde_json::json!({ "indexes": { "semantic": true } })
+            } else {
+                serde_json::json!({ "indexes": { "semantic": false, "trigram": false } })
+            }),
         }),
     )
 }

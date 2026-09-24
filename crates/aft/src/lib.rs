@@ -108,6 +108,7 @@ pub mod memory;
 pub mod migrate_storage;
 pub mod migration;
 pub mod ndjson_text;
+pub mod ort_lifecycle;
 pub mod parser;
 pub mod patch;
 pub mod path_identity;
