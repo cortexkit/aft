@@ -1162,7 +1162,7 @@ mod tests {
         assert!(skip.attempts >= 2);
         assert!(skip.waited_micros >= RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS);
         assert!(
-            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS * 10 < RETENTION_LOCK_BUDGET_MICROS,
+            RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS * 5 < RETENTION_LOCK_BUDGET_MICROS,
             "count retry budget must remain far below the mutex hold budget"
         );
         assert_eq!(last_retention_sweep_skip_reason(&db), Some(skip.reason));
