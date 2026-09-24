@@ -99,13 +99,6 @@ function buildSchema(): Record<string, unknown> {
     properties: {
       $schema: { type: "string" },
 
-      enabled: {
-        type: "boolean",
-        default: true,
-        description:
-          "Master switch for AFT. Set false in user config to disable AFT everywhere, or in project config to disable it only for that project. Project config can set this because turning AFT off is trust-safe.",
-      },
-
       edit_mode: {
         type: "string",
         enum: ["default", "hashline"],
@@ -159,26 +152,11 @@ function buildSchema(): Record<string, unknown> {
           "How missing formatter/checker/LSP binary warnings are shown after configure. 'toast' (default) uses a 10s TUI or HTTP toast without adding session chat messages. 'log' writes to the plugin log only. 'chat' uses legacy ignored user messages in the session transcript. Warnings for formatters/checkers are only emitted when format_on_edit is true or a per-language formatter is set; checker warnings require validate_on_edit 'syntax' or 'full' or an explicit checker. There is no top-level 'formatters' key — use format_on_edit, formatter, and checker instead.",
       },
 
-      hoist_builtin_tools: {
-        type: "boolean",
-        default: true,
-        description:
-          "Replace the host's native file and shell tools with AFT's Rust implementations. Default true. When false, AFT registers its replacements under aft_ names and leaves host-native tools available.",
-      },
-
-      tool_surface: {
-        type: "string",
-        enum: ["minimal", "recommended", "all"],
-        default: "recommended",
-        description:
-          "Tool surface level. 'minimal' = aft_outline+aft_zoom+aft_safety only. 'recommended' (default) adds hoisted read/write/edit/apply_patch + lsp_diagnostics + ast_grep + aft_import. 'all' adds aft_callgraph, aft_delete, aft_move.",
-      },
-
       disabled_tools: {
         type: "array",
         items: { type: "string" },
         description:
-          "Tool names to disable. Hoisted names ('read', 'edit') and aft-prefixed names both work. Applied after tool_surface filtering.",
+          "Tool names that are not registered; every other AFT tool is registered. When absent from the user config it defaults to [\"aft_move\", \"aft_delete\"]; an explicit list (including []) replaces that default. Host tool names ('read', 'grep', 'bash', ...) leave the host's own tool in place. Project config may only add names and cannot disable aft_safety or a host tool slot.",
       },
 
       restrict_to_project_root: {
@@ -188,24 +166,29 @@ function buildSchema(): Record<string, unknown> {
           "Restrict file operations to within project root. When true, write-capable commands reject paths outside project_root. Default: false (matches OpenCode built-in behavior).",
       },
 
-      search_index: {
-        type: "boolean",
-        default: false,
+      indexes: {
+        type: "object",
+        properties: {
+          trigram: {
+            type: "boolean",
+            default: true,
+            description: "Trigram index for indexed grep/glob and the lexical aft_search lane.",
+          },
+          semantic: {
+            type: "boolean",
+            default: true,
+            description:
+              "Semantic (embedding) index for the semantic aft_search lane. The default local backend may download an ONNX runtime and model and use CPU.",
+          },
+          callgraph: {
+            type: "boolean",
+            default: true,
+            description: "Persisted call-graph store used by aft_callgraph and enrichment.",
+          },
+        },
+        additionalProperties: false,
         description:
-          "Enable indexed search (trigram index) for grep and glob hoisting. Builds a per-project index for sub-100ms queries on large repos.",
-      },
-
-      semantic_search: {
-        type: "boolean",
-        default: false,
-        description:
-          "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field.",
-      },
-
-      callgraph_store: {
-        type: "boolean",
-        default: true,
-        description: "Enable the persisted callgraph store substrate. Default: true.",
+          "Background indexes. Each defaults on and builds independently of which tools are registered. Project config can only turn an index off.",
       },
 
       callgraph_chunk_size: {
@@ -222,7 +205,7 @@ function buildSchema(): Record<string, unknown> {
             type: "boolean",
             default: true,
             description:
-              "Master switch for the aft_inspect tool. Defaults to true. Set false to hide aft_inspect from the tool surface.",
+              "Runtime switch for aft_inspect. Defaults to true. When false the registered tool reports inspect_disabled; use disabled_tools to unregister it.",
           },
           diagnostics_timeout_ms: {
             type: "integer",
@@ -335,7 +318,7 @@ function buildSchema(): Record<string, unknown> {
             type: "boolean",
             default: true,
             description:
-              "Master switch for agent-facing undo backups. User-only; project config is ignored.",
+              "Master switch for agent-facing undo backups. When false aft_safety stays registered and reports that backups are disabled. User-only; project config is ignored.",
           },
           max_depth: {
             type: "integer",
@@ -388,11 +371,17 @@ function buildSchema(): Record<string, unknown> {
           {
             type: "boolean",
             description:
-              "Shorthand: `true` enables hoisting with rewrite + compress + background all on; `false` disables AFT bash hoisting entirely and keeps the host's native bash.",
+              "Shorthand: `true` turns the bash runtime on with rewrite + compress + background; `false` turns the runtime gate off (bash operations report bash_disabled).",
           },
           {
             type: "object",
             properties: {
+              enabled: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Runtime gate for every bash operation, including bash_status/bash_write/bash_watch/bash_kill. When false they report bash_disabled; registration is controlled by disabled_tools.",
+              },
               rewrite: {
                 type: "boolean",
                 default: true,
@@ -474,7 +463,7 @@ function buildSchema(): Record<string, unknown> {
           },
         ],
         description:
-          "Bash tool family (hoist + rewrite + compress + background execution). Default on for `tool_surface: recommended`/`all`, off for `minimal`. Replaces `experimental.bash.*` (still accepted for backward compat).",
+          "Bash runtime configuration (runtime gate + rewrite + compress + background execution). Registration of bash and its companions is controlled by disabled_tools. Replaces `experimental.bash.*` (still accepted for backward compat).",
       },
 
       experimental: {
@@ -700,12 +689,6 @@ function buildSchema(): Record<string, unknown> {
       github: {
         type: "object",
         properties: {
-          enabled: {
-            type: "boolean",
-            default: true,
-            description:
-              "Master switch for every AFT GitHub integration. When false, shim routing, resource reads, comment writes, and GitHub-specific tool descriptions are all disabled.",
-          },
           shim: {
             type: "boolean",
             default: true,
@@ -721,7 +704,7 @@ function buildSchema(): Record<string, unknown> {
             type: "boolean",
             default: false,
             description:
-              "Enable creating and editing issue and pull-request conversation comments.",
+              "Enable creating and editing issue and pull-request conversation comments. Implies github.read.",
           },
         },
         additionalProperties: false,
@@ -732,13 +715,6 @@ function buildSchema(): Record<string, unknown> {
       gh_shim: {
         type: "object",
         properties: {
-          enabled: {
-            type: "boolean",
-            default: true,
-            deprecated: true,
-            description:
-              "Deprecated alias for github.shim; accepted through v0.56.x and removed in v0.57.0.",
-          },
           binary_path: {
             type: "string",
             description:
@@ -747,23 +723,7 @@ function buildSchema(): Record<string, unknown> {
         },
         additionalProperties: false,
         description:
-          "Legacy gh shim settings. Use github.shim for the gate; binary_path remains the advanced AFT-image override.",
-      },
-
-      gh_read: {
-        type: "object",
-        properties: {
-          enabled: {
-            type: "boolean",
-            default: false,
-            deprecated: true,
-            description:
-              "Deprecated alias for github.read; accepted through v0.56.x and removed in v0.57.0.",
-          },
-        },
-        additionalProperties: false,
-        deprecated: true,
-        description: "Deprecated alias block for github.read; removed in v0.57.0.",
+          "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override.",
       },
 
       git: {

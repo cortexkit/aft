@@ -40,17 +40,16 @@ its harness override is combined: project harness overrides can change project-s
 as `edit_mode`, but cannot supply user-only settings such as LSP executable configuration,
 semantic credentials, subc transport, or sandbox weakening.
 
-For example, keep OpenCode's built-ins hoisted while Pi exposes both its native tools and the
-`aft_*` alternatives:
+For example, keep every tool on OpenCode while Pi keeps its native `grep`
+(a harness block can only add disables to the base list; removing a base
+disable requires editing the base list):
 
 ```jsonc
 {
+  "disabled_tools": [],
   "harnesses": {
-    "opencode": {
-      "hoist_builtin_tools": true
-    },
     "pi": {
-      "hoist_builtin_tools": false
+      "disabled_tools": ["grep"]
     }
   }
 }
@@ -103,20 +102,9 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
 
 ```jsonc
 {
-  // Master switch. Default: true. Set false in user config to disable AFT
-  // everywhere, or in project config to disable only that project. Project
-  // config can set true to re-enable over a user-level false.
-  "enabled": true,
-
    // Edit/read surface: "default" (default) or "hashline". User and project
    // tiers both accept this key; ordinary project-over-user precedence applies.
    "edit_mode": "default",
-
-   // Replace the host harness's native tools with AFT-enhanced versions. Default: true.
-   // Set false to keep host-native tools and register AFT replacements under aft_ names
-   // (for example, aft_read and aft_bash). The bash companion tools remain unprefixed
-   // because they control AFT-owned background task IDs.
-   "hoist_builtin_tools": true,
 
   // Auto-format files after edits. Default: false. When enabled, formatting is
   // queued and runs after ~90s without further edits to the file.
@@ -148,24 +136,32 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // (There is no top-level "formatters" key — use format_on_edit / formatter / checker.)
   "configure_warnings_delivery": "toast",
 
-  // Tool surface level: "minimal" | "recommended" (default) | "all"
-  // minimal:     aft_outline, aft_zoom, aft_safety only (no hoisting)
-  // recommended: minimal + hoisted tools (read/write/edit/apply_patch/bash)
-  //              + lsp_diagnostics + ast_grep + aft_import + aft_conflicts
-  //              + aft_inspect + grep/glob (when search_index is enabled)
-  //              + aft_search (when semantic_search is enabled)
-  //              (bash sub-features are gated by the top-level `bash` block)
-  // all:         recommended + aft_callgraph, aft_delete, aft_move
-  "tool_surface": "recommended",
+  // Tools that are NOT registered. Every other AFT tool is registered:
+  // read, write, edit, apply_patch, grep, glob, bash (plus the independent
+  // bash_status/bash_watch/bash_write/bash_kill companions), aft_outline,
+  // aft_zoom, aft_search, aft_callgraph, aft_inspect, aft_import, aft_safety,
+  // aft_conflicts, aft_delete, aft_move, ast_grep_search, ast_grep_replace.
+  // Absent from the user config => ["aft_move", "aft_delete"]. An explicit list
+  // replaces that default: [] enables both, ["aft_search"] disables only search.
+  // Disabling a host name (read, grep, bash, ...) leaves the host's own tool.
+  // Harness blocks and project config can only add names; a project cannot
+  // disable aft_safety or a host tool slot. Unknown names are kept and
+  // reported once per load. Pi/OMP have no apply_patch or glob tools.
+  "disabled_tools": ["aft_move", "aft_delete"],
 
-  // List of tool names to disable after surface filtering
-  "disabled_tools": [],
-
-  // Trigram-indexed grep/glob (graduated from experimental in v0.18).
-  // Builds a background index on session start, persists to disk, updates via file watcher.
-  // Falls back to direct scanning when the index isn't ready or for out-of-project paths.
-  // Default: false
-  "search_index": false,
+  // Background indexes. Each defaults on and builds independently of which
+  // tools are registered. A project config can switch an index off but never
+  // back on. Consumers (grep/glob, aft_search, aft_callgraph, ...) report an
+  // off or building index instead of disappearing.
+  "indexes": {
+    // Trigram index for indexed grep/glob and the lexical aft_search lane.
+    "trigram": true,
+    // Semantic index for the semantic aft_search lane. The local default backend
+    // may download an ONNX runtime and model and use CPU.
+    "semantic": true,
+    // Persisted call-graph store for aft_callgraph and enrichment.
+    "callgraph": true
+  },
 
   // Linked-worktree RAM overlay. Default: false.
   // When true, a borrow-only worktree applies its own file-watcher events to
@@ -178,15 +174,6 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "ram_overlay": false
   },
 
-  // Semantic code search (graduated from experimental in v0.18; aft_search tool).
-  // Default backend is fastembed (local ONNX, no network) and requires ONNX Runtime
-  // installed (brew install onnxruntime on macOS). The model is downloaded on first
-  // use. Index persists to disk for fast cold start. To use a remote provider
-  // (OpenAI-compatible) or self-hosted Ollama instead, see the "semantic" block
-  // below and the aft_search "Embedding backends" section above.
-  // Default: false
-  "semantic_search": false,
-
   // Content-addressed index views. When enabled, semantic and callgraph artifacts
   // are assembled from reusable per-file blobs behind an atomic manifest.
   // User and project tiers may both set this. Default: false.
@@ -194,8 +181,8 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "enabled": false
   },
 
-  // When project_root is exactly $HOME, search_index, semantic_search, and callgraph_store
-  // are force-disabled because the home directory is not treated as a project root.
+  // When project_root is exactly $HOME, every index is force-disabled because the
+  // home directory is not treated as a project root.
 
   // Optional embedding-backend configuration for aft_search. Omit this block to use
   // the local fastembed default. Three backends are supported: "fastembed" (default,
@@ -291,10 +278,14 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "diagnostic_cache_size": 5000
   },
 
-  // Bash hoisting and sub-features (graduated from experimental.bash.* in v0.27.2).
-  // Setting any sub-feature true also registers the hoisted `bash` tool plus
-  // `bash_status`, `bash_kill`, `bash_watch`, and `bash_write`.
+  // Bash runtime configuration (graduated from experimental.bash.* in v0.27.2).
+  // Registration of `bash` and its companions is controlled by disabled_tools;
+  // `bash: false` or `bash.enabled: false` turns the runtime gate off, and
+  // every bash operation (including the companions) then reports bash_disabled.
   "bash": {
+    // Runtime gate. Default true.
+    "enabled": true,
+
     // Rewrite common shell commands (cat / grep / find / sed / ls / rg / cat >>)
     // to AFT tools. Adds a footer hint nudging the agent to call the AFT tool
     // directly next time. Default false.
@@ -344,7 +335,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
 
   // aft_inspect codebase-health scanner (recommended/all tiers).
   "inspect": {
-    "enabled": true,              // set false to drop the aft_inspect tool
+    "enabled": true,              // runtime switch; false makes aft_inspect report inspect_disabled
     // Blocking LSP diagnostics deadline. Default 120000; values clamp to
     // 10000..600000. User config sets the baseline; project config may raise
     // it but cannot lower it, so a repository cannot silently reduce another
@@ -402,10 +393,9 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
 
   // User-only GitHub integration gates.
   "github": {
-    "enabled": true, // Master switch; false forces every setting below off.
     "shim": true,    // Interpose the governed gh shim in agent child PATHs.
     "read": false,   // Enable issue:// and pr:// reads, outlines, and zooms.
-    "write": false   // Create and edit conversation comments.
+    "write": false   // Create and edit conversation comments (implies read).
   },
 
   // Git co-authorship for commits made by AFT-spawned agent children.
@@ -417,7 +407,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   }
 ```
 
-On Pi versions that expose the live default-tool registry, AFT hoists `powershell` only when Pi has enabled its optional built-in tool. If that registry is unavailable, set `bash.powershell_tool` to `true` to mirror Pi's setting explicitly. The default is `false`; this key does not register a tool on OpenCode.
+On Pi versions that expose the live default-tool registry, AFT registers `powershell` only when Pi has enabled its optional built-in tool. If that registry is unavailable, set `bash.powershell_tool` to `true` to mirror Pi's setting explicitly. The default is `false`; this key does not register a tool on OpenCode.
 
 AFT auto-detects the formatter and checker from project config files (`biome.json` → biome,
 `.oxfmtrc.json` / `.oxfmtrc.jsonc` / `oxfmt.config.ts` → oxfmt, `.prettierrc` → prettier,
@@ -434,16 +424,15 @@ See the [Hashline patch grammar](hashline.md) for section headers, addresses, op
 
 A hashline mutation attempts to register every affected path before changing files. An actual backup error still fails the edit before mutation. Policy skips for an oversized file or an OS temporary path allow the edit to proceed, and the response states that undo is unavailable for that change.
 
-Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
+Hashline mode needs both the `read` and `edit` tools. If `disabled_tools` removes either, AFT keeps the ordinary edit/read behavior for the registered tools and emits exactly one configure-time warning per load: `hashline_read_disabled` when `read` is disabled (it takes precedence), otherwise `hashline_edit_disabled`. No other tool is unregistered.
 
 ## GitHub integration
 
-The user-only `github` block controls the complete GitHub surface. `enabled` and `shim` default to `true`; `read` and `write` default to `false`. Setting `enabled: false` forces shim routing, resource reads, comment writes, and GitHub-specific tool-description sentences off, producing zero AFT-originated `gh` traffic. Project `github` blocks are ignored with a configuration warning because repositories cannot grant themselves network-backed capabilities or vary host-wide tool descriptions.
+The user-only `github` block controls the complete GitHub surface. `shim` defaults to `true`; `read` and `write` default to `false`. Set all three to `false` for zero AFT-originated `gh` traffic. GitHub capabilities never unregister host tools. Project `github` blocks are ignored with a configuration warning because repositories cannot grant themselves network-backed capabilities or vary host-wide tool descriptions.
 
 ```jsonc
 {
   "github": {
-    "enabled": true,
     "shim": true,
     "read": true,
     "write": false
@@ -451,9 +440,9 @@ The user-only `github` block controls the complete GitHub surface. `enabled` and
 }
 ```
 
-`github.write: true` with `github.read: false` is treated as read-enabled and emits a warning naming both keys. This prevents edits from addressing a comment ordinal the agent cannot inspect. Untrusted MCP and forced-restrict binds treat every GitHub integration as disabled regardless of user configuration.
+`github.write: true` implies read: with `github.read` absent or `false`, read is still enabled and a warning names both keys. This prevents edits from addressing a comment ordinal the agent cannot inspect. Untrusted MCP and forced-restrict binds treat every GitHub integration as disabled regardless of user configuration.
 
-AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image. `gh_shim.enabled` is a deprecated alias for `github.shim`, and `gh_read.enabled` is a deprecated alias for `github.read`; new keys win conflicts, both aliases emit deprecation warnings, and both aliases are removed in v0.57.0.
+AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image; a `gh_shim` block containing only `binary_path` loads normally. The retired `gh_read` block and the `gh_shim.enabled` leaf are rejected immediately with `removed_config_key:gh_read:use:github.read` and `removed_config_key:gh_shim:use:github.shim`; the whole configuration is then not used until `npx @cortexkit/aft doctor --fix` rewrites them.
 
 When reads are enabled, `read`, `aft_outline`, and `aft_zoom` accept `issue://NUMBER` and `pr://NUMBER`, including `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`. When writes are enabled, `write` on a base resource publishes a conversation comment after the host's edit-class permission prompt displays the exact body. `edit` accepts only an `edits[]` find/replace request on `issue://.../comments/K` or `pr://.../comments/K`; it fetches the live body, applies the normal matcher, and then attempts an id-addressed edit through the governed shim. Review-thread comments are not supported. GitHub comment mutations do not create aft_safety snapshots and cannot be undone through aft_safety.
 
@@ -501,6 +490,42 @@ Compared with Codex's default sandbox, AFT is stricter about credential reads: C
 
 ## Config schema migration
 
+### Feature-based configuration (v0.58)
+
+v0.58 replaces surface levels with one rule — a tool is registered unless it is
+in `disabled_tools` — and makes the background indexes first-class
+(`indexes.trigram`, `indexes.semantic`, `indexes.callgraph`, all default on).
+During v0.58 the retired keys below are translated in memory on every load and
+one migration notice is delivered per unchanged file state; from v0.59 each is
+rejected with `removed_config_key:<old>:use:<replacement>` and the whole
+configuration is not used until `npx @cortexkit/aft doctor --fix` rewrites it.
+
+| Retired input | Replacement |
+| --- | --- |
+| `tool_surface`, `hoist_builtin_tools`, `enabled` | `disabled_tools` |
+| `search_index`, `experimental_search_index` | `indexes.trigram` |
+| `semantic_search`, `experimental_semantic_search` | `indexes.semantic` |
+| `callgraph_store` | `indexes.callgraph` |
+| `github.enabled` | `github.read`, `github.write`, `github.shim` |
+| `aft_read`, `aft_write`, `aft_edit`, `aft_apply_patch`, `aft_grep`, `aft_glob`, `aft_bash` in `disabled_tools` | `read`, `write`, `edit`, `apply_patch`, `grep`, `glob`, `bash` |
+
+Translation rules: an explicit `tool_surface` in the user base is a complete
+registration choice (`"all"` → `[]`, `"recommended"` → `["aft_callgraph",
+"aft_delete", "aft_move"]`, `"minimal"` → everything except `aft_outline`,
+`aft_zoom` and `aft_safety`); without one, the default `["aft_move",
+"aft_delete"]` is united with names generated by other legacy gates.
+`hoist_builtin_tools: false` generates the seven host names; top-level
+`enabled: false` generates every tool. False `backup.enabled`,
+`inspect.enabled` and `bash`/`bash.enabled` keep restricting runtime behavior
+and, during v0.58 only, also generate `aft_safety`, `aft_inspect` and
+`bash`+companions respectively (each such load warns
+`legacy_runtime_gate_requires_fix`). An explicit `disabled_tools` in the same
+block, including `[]`, wins over every generated name. Project configs cannot
+disable `aft_safety` or host tool slots, whether directly or through a legacy
+key.
+
+### Earlier migrations
+
 v0.18 reorganized experimental flags. Old config files using the flat shape:
 
 ```jsonc
@@ -514,12 +539,12 @@ v0.18 reorganized experimental flags. Old config files using the flat shape:
 }
 ```
 
-are migrated automatically on first load to the v0.18 shape:
+had their `experimental_lsp_ty` and `experimental_bash_*` keys migrated
+automatically on first load to the v0.18 shape (the two index keys are now
+translated as described above instead of being rewritten):
 
 ```jsonc
 {
-  "search_index": true,        // graduated
-  "semantic_search": true,     // graduated
   "experimental": {
     "lsp_ty": true,
     "bash": { "rewrite": true, "compress": true, "background": true }

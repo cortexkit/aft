@@ -27,6 +27,11 @@ import {
   resolvePiToolSurface,
 } from "../packages/pi-plugin/src/tool-registration.ts";
 import { buildHintsFromConfig as buildPiHints } from "../packages/pi-plugin/src/workflow-hints.ts";
+import {
+  DEFAULT_DISABLED_TOOLS,
+  sortedUnique,
+  translateConfigDocument,
+} from "../packages/aft-bridge/src/feature-config.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
 const SOURCE_INVENTORY_PATH = "docs/v0.49-agent-surface-sources.json";
@@ -121,7 +126,21 @@ const profiles: Profile[] = [
   { id: "REG-V049-PI-ALL", harness: "pi", surface: "all" },
 ];
 
-const profileConfigs: Record<string, Record<string, unknown>> = {
+/**
+ * Resolve a legacy v0.49 profile through the loaders' in-window translation so
+ * the audited surfaces are exactly what the translated disabled list registers.
+ */
+function resolvedProfile(raw: Record<string, unknown>): Record<string, unknown> {
+  const doc = structuredClone(raw);
+  const translation = translateConfigDocument(doc, "window");
+  if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
+  doc.disabled_tools = sortedUnique(
+    (doc.disabled_tools as string[] | undefined) ?? DEFAULT_DISABLED_TOOLS,
+  );
+  return doc;
+}
+
+const legacyProfileConfigs: Record<string, Record<string, unknown>> = {
   "REG-V049-OC-MIN": { tool_surface: "minimal", backup: { enabled: true }, bash: false },
   "REG-V049-OC-REC": {
     tool_surface: "recommended",
@@ -155,6 +174,10 @@ const profileConfigs: Record<string, Record<string, unknown>> = {
     semantic_search: true,
   },
 };
+
+const profileConfigs: Record<string, Record<string, unknown>> = Object.fromEntries(
+  Object.entries(legacyProfileConfigs).map(([id, raw]) => [id, resolvedProfile(raw)]),
+);
 
 function git(args: string[]): string {
   return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();

@@ -24,14 +24,15 @@ from "ran but partial":
 
 ## Hoisted tools
 
-These replace the host harness's built-ins. Registered under the same names by default. When
-`hoist_builtin_tools: false`, AFT file, search, and primary bash replacements get the `aft_`
-prefix instead (for example, `aft_read` and `aft_bash`). The `bash_status`, `bash_watch`,
-`bash_write`, and `bash_kill` companions remain unprefixed because they control AFT-owned task IDs.
+These replace the host harness's built-ins under the same names. A tool is registered unless
+its name is in `disabled_tools`; disabling a host name (for example `"grep"`) leaves the
+host's own tool in place. There are no `aft_`-prefixed alternatives. The `bash_status`,
+`bash_watch`, `bash_write`, and `bash_kill` companions register independently of `bash`.
+Index state and runtime settings never remove a registration: a tool whose index is off or
+building reports that when called.
 
-Tools that don't exist natively in a given harness are simply registered as new tools — no
-hoisting needed. (Pi, for example, doesn't ship `apply_patch` or `lsp_diagnostics`; AFT adds
-them either way when the surface tier includes them.)
+The Pi/OMP adapter has no `apply_patch` or `glob` implementation, so those two tools are not
+registered there.
 
 | Tool | Description | Key Params |
 |------|-------------|------------|
@@ -47,9 +48,7 @@ them either way when the surface tier includes them.)
 
 ## AFT-only tools
 
-Always registered with `aft_` prefix regardless of hoisting setting.
-
-**Recommended tier** (default):
+Registered unless listed in `disabled_tools`.
 
 | Tool | Description | Key Params |
 |------|-------------|------------|
@@ -61,7 +60,8 @@ Always registered with `aft_` prefix regardless of hoisting setting.
 | `aft_inspect` | Codebase-health snapshot (TODOs, metrics, dead code, unused exports, duplicates) | `sections`, `scope`, `topK` |
 | `aft_safety` | Undo, history, checkpoints, restore | `op`, `path`, `name` |
 
-**All tier** (set `tool_surface: "all"`):
+Default-off tools (in the default `disabled_tools`; set an explicit list such as `[]` to
+enable them) plus the call graph:
 
 | Tool | Description | Key Params |
 |------|-------------|------------|
@@ -572,7 +572,7 @@ suggesting `aft_conflicts` to the bash output.
 ### grep
 
 Trigram-indexed regex search that hoists the host harness's built-in `grep`. Requires
-`search_index: true` in config. The trigram index is built in a background thread
+`indexes.trigram` (on by default). The trigram index is built in a background thread
 at session start, persisted to disk for fast cold starts, and kept fresh via file watcher.
 Falls back to direct file scanning when the index isn't ready.
 
@@ -607,8 +607,8 @@ Parameters: `pattern` (required), `path` (optional — scope to subdirectory or 
 
 ### glob
 
-Indexed file discovery that hoists the host harness's built-in `glob`. Requires
-`search_index: true`. Returns absolute paths sorted by modification time,
+Indexed file discovery that hoists the host harness's built-in `glob`. Uses
+`indexes.trigram` (on by default) and scans directly while the index is off or building. Returns absolute paths sorted by modification time,
 capped at 100 files.
 
 ```json
@@ -648,7 +648,7 @@ Parameters: `pattern` (required), `path` (optional — scope to subdirectory or 
 The primary code-search tool: concepts, identifiers, error strings, regex, literals, and
 filenames are auto-routed to the right engine and returned ranked. Works even when you only
 know what the code does, not what it's named (*"where is rate limiting handled"*, *"retry
-logic"*, `^export`, `Cargo.lock`). Requires `semantic_search: true` and
+logic"*, `^export`, `Cargo.lock`). The semantic lane uses `indexes.semantic` (on by default) and
 [ONNX Runtime](https://onnxruntime.ai/) installed on the system when using the default
 `fastembed` backend.
 
@@ -763,7 +763,7 @@ search outside the session's root is denied.
 
 ```jsonc
 {
-  "semantic_search": true
+  "indexes": { "semantic": true }
   // No "semantic" block needed — fastembed is the default.
 }
 ```
@@ -773,7 +773,7 @@ OpenAI, Together, Voyage, Anyscale, Fireworks, vLLM, LM Studio, etc.
 
 ```jsonc
 {
-  "semantic_search": true,
+  "indexes": { "semantic": true },
   "semantic": {
     "backend": "openai_compatible",
     "model": "text-embedding-3-small",
@@ -792,7 +792,7 @@ time. The key itself is never stored in config or logs.
 
 ```jsonc
 {
-  "semantic_search": true,
+  "indexes": { "semantic": true },
   "semantic": {
     "backend": "ollama",
     "model": "nomic-embed-text",

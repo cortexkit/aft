@@ -55,9 +55,9 @@ AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai
 
 | Harness | Support | Plugin | Configuration knobs |
 |---|---|---|---|
-| **[OpenCode](https://opencode.ai)** | Native adapter | `@cortexkit/aft-opencode` | `hoist_builtin_tools`, `tool_surface`, `edit_mode` |
-| **[Pi](https://github.com/badlogic/pi-mono)** | Native extension | `@cortexkit/aft-pi` | `hoist_builtin_tools`, `tool_surface`, `edit_mode` |
-| **[OMP (oh-my-pi)](https://omp.sh)** | Supported via the Pi plugin | `@cortexkit/aft-pi` | `pi.tool_presentation` (`"top_level"` default, `"host_default"`), `hoist_builtin_tools` |
+| **[OpenCode](https://opencode.ai)** | Native adapter | `@cortexkit/aft-opencode` | `disabled_tools`, `indexes`, `edit_mode` |
+| **[Pi](https://github.com/badlogic/pi-mono)** | Native extension | `@cortexkit/aft-pi` | `disabled_tools`, `indexes`, `edit_mode` |
+| **[OMP (oh-my-pi)](https://omp.sh)** | Supported via the Pi plugin | `@cortexkit/aft-pi` | `pi.tool_presentation` (`"top_level"` default, `"host_default"`), `disabled_tools` |
 
 ---
 
@@ -73,7 +73,7 @@ Auto-detects which harnesses you have installed and configures each one. On the 
 
 - **OpenCode**: replaces built-in `read`, `write`, `edit`, and `apply_patch` with AFT-backed versions, and adds the `aft_` family on top.
 - **Pi**: replaces built-in `read`, `write`, `edit`, and `grep`, and adds the `aft_` family on top.
-- **OMP (oh-my-pi)**: supported via the Pi plugin (`@cortexkit/aft-pi`). Registers tools top-level by default via `pi.tool_presentation: "top_level"` (`loadMode: "essential"`), folding per-tool guidance into descriptions; set `pi.tool_presentation: "host_default"` to opt into OMP's `xd://` device mounting model. `hoist_builtin_tools` toggles replacing host built-ins vs. registering `aft_` prefixed alternatives.
+- **OMP (oh-my-pi)**: supported via the Pi plugin (`@cortexkit/aft-pi`). Registers tools top-level by default via `pi.tool_presentation: "top_level"` (`loadMode: "essential"`), folding per-tool guidance into descriptions; set `pi.tool_presentation: "host_default"` to opt into OMP's `xd://` device mounting model. Every AFT tool registers unless listed in `disabled_tools`.
 
 See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`, and cache-management commands.
 

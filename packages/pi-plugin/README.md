@@ -22,7 +22,7 @@ pi install npm:@cortexkit/aft-pi@0.13.1
 
 ### Hoisted built-in overrides
 
-Pi's default `read`, `write`, `edit`, and `grep` are replaced with AFT-backed versions by default. Set `hoist_builtin_tools: false` to keep Pi's native tools and use `aft_read`, `aft_write`, `aft_edit`, `aft_grep`, and `aft_bash` for AFT instead; AFT background-bash companions remain `bash_status`, `bash_watch`, `bash_write`, and `bash_kill`.
+Pi's default `read`, `write`, `edit`, `grep`, and `bash` are replaced with AFT-backed versions. List a name in `disabled_tools` (for example `["grep"]`) to keep Pi's native tool for that slot. The AFT background-bash companions `bash_status`, `bash_watch`, `bash_write`, and `bash_kill` register independently of `bash`.
 
 | Tool    | Pi built-in              | AFT replacement                                                                              |
 | ------- | ------------------------ | -------------------------------------------------------------------------------------------- |
@@ -65,13 +65,6 @@ All keys are optional. Example:
 
 ```jsonc
 {
-  // "minimal" | "recommended" (default) | "all"
-  "tool_surface": "recommended",
-
-  // Default true replaces Pi's native file and bash tools.
-  // Set false to retain Pi's tools and use aft_read/aft_write/aft_edit/aft_bash for AFT.
-  "hoist_builtin_tools": false,
-
   // Auto-format on write/edit using project formatter config.
   "format_on_edit": true,
 
@@ -82,14 +75,12 @@ All keys are optional. Example:
   // Defaults to false to match Pi's built-in behavior.
   "restrict_to_project_root": false,
 
-  // Enable the trigram-indexed grep/glob (hoists them when true).
-  "experimental_search_index": true,
+  // Background indexes, all on by default. The local semantic backend may
+  // download an ONNX runtime and model and use CPU.
+  "indexes": { "trigram": true, "semantic": true, "callgraph": true },
 
-  // Enable semantic search (aft_search). Requires ONNX runtime for local
-  // embeddings; downloaded automatically on supported platforms.
-  "experimental_semantic_search": true,
-
-  // Disable specific tool names (applied after tool_surface selection).
+  // Tools that are not registered. Absent => ["aft_move", "aft_delete"];
+  // an explicit list replaces that default ([] enables every tool).
   "disabled_tools": ["aft_move"],
 
   // Pi / OMP harness options:
@@ -112,7 +103,7 @@ All keys are optional. Example:
   // Missing formatter/checker/LSP warnings after configure: "toast" (default), "log", or "chat".
   "configure_warnings_delivery": "toast",
 
-  // Semantic backend (when experimental_semantic_search=true).
+  // Semantic backend for the semantic index.
   // "fastembed" (default, local ONNX) | "openai_compatible" | "ollama"
   "semantic": {
     "backend": "fastembed",
@@ -125,13 +116,15 @@ All keys are optional. Example:
 
 Sensitive semantic backend fields (`backend`, `base_url`, `api_key_env`) are only read from **user-level** config. Project configs that try to set them are ignored with a warning to prevent credential-exfiltration via malicious repos.
 
-### Tool surface tiers
+### Registered tools
 
-| Tier              | Tools                                                                                                                   |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `minimal`         | `aft_outline`, `aft_zoom`, `aft_safety`                                                                                 |
-| `recommended` (default) | `minimal` + `read`/`write`/`edit` (or `aft_` alternatives when hoisting is disabled) + `aft_import` + `ast_grep_*` + `lsp_diagnostics` + `aft_conflicts` + (optional) `grep`/`aft_grep` + (optional) `aft_search` |
-| `all`             | `recommended` + `aft_callgraph` + `aft_delete` + `aft_move`                                             |
+Every AFT tool registers unless listed in `disabled_tools`: `read`, `write`, `edit`, `grep`,
+`bash` and its companions, `aft_outline`, `aft_zoom`, `aft_search`, `aft_callgraph`,
+`aft_inspect`, `aft_import`, `aft_safety`, `aft_conflicts`, `ast_grep_search`,
+`ast_grep_replace`, `aft_delete` and `aft_move` (the last two are in the default disabled
+list). Pi has no AFT `apply_patch` or `glob` tool. Index state and runtime settings never
+remove a registration. `tool_surface`, `hoist_builtin_tools` and the `search_index` /
+`semantic_search` keys are translated during v0.58 and rejected from v0.59.
 
 ## Architecture
 
