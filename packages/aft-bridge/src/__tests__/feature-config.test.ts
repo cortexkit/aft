@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  legacyConfigNoticeMessage,
   noticeDigest,
   noticeProjection,
   policyPhaseForVersion,
@@ -66,6 +67,23 @@ describe("feature-config policy", () => {
     translateConfigDocument(explicit, "window");
     expect(explicit.disabled_tools).toEqual([]);
     expect(explicit.hoist_builtin_tools).toBeUndefined();
+  });
+
+  test("a retired enabled:false notice says indexes still build and how to stop them", () => {
+    const doc: Record<string, unknown> = { enabled: false };
+    const out = translateConfigDocument(doc, "window");
+    expect(out.retiredEnabledFalse).toBe(true);
+    expect(doc.indexes).toBeUndefined();
+    expect(out.warnings.map((warning) => warning.code)).toContain(
+      "legacy_enabled_false_indexes_still_build",
+    );
+    const message = legacyConfigNoticeMessage("/cfg/aft.jsonc", out);
+    expect(message).toContain("indexes still build");
+    expect(message).toContain("indexes.trigram, indexes.semantic and indexes.callgraph to false");
+
+    const other = translateConfigDocument({ tool_surface: "all" }, "window");
+    expect(other.retiredEnabledFalse).toBe(false);
+    expect(legacyConfigNoticeMessage("/cfg/aft.jsonc", other)).not.toContain("indexes still build");
   });
 
   test("resolved validation reports sorted paths and containers only", () => {

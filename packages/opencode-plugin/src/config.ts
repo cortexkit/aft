@@ -7,6 +7,7 @@ import {
   type ConfigTier,
   DEFAULT_DISABLED_TOOLS,
   deliverMigrationNoticeOnce,
+  legacyConfigNoticeMessage,
   mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
   noticeDigest,
@@ -1479,7 +1480,7 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     configLoadNotices.push({
       configPath,
       digest: noticeDigest(projection),
-      message: `AFT config ${configPath} uses retired keys (tool_surface, hoist_builtin_tools, enabled, search_index, semantic_search, callgraph_store, github.enabled or aft_-prefixed tool names). They are translated for this release and rejected from v0.59; run \`npx @cortexkit/aft doctor --fix\` to migrate.`,
+      message: legacyConfigNoticeMessage(configPath, translation),
     });
   }
 

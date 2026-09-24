@@ -253,6 +253,12 @@ fn false_runtime_gates(map: &Map<String, Value>) -> Vec<&'static str> {
 }
 
 /// Translate or reject the retired keys of one tier/harness block in place.
+/// What a retired `enabled: false` no longer does. The translation only hides
+/// tools; indexing continues, so a user who relied on it to keep AFT out of a
+/// repository must also switch the indexes off. Mirrors the TypeScript
+/// `RETIRED_ENABLED_FALSE_INDEXES_NOTE`.
+pub const RETIRED_ENABLED_FALSE_INDEXES_NOTE: &str = "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
+
 fn translate_block(
     map: &mut Map<String, Value>,
     is_base: bool,
@@ -431,6 +437,15 @@ fn translate_block(
     }
     if enabled == Some(Value::Bool(false)) {
         generated.extend(CANONICAL_TOOLS.iter().map(|name| (*name).to_string()));
+        out.warnings.push(TranslationWarning {
+            code: "legacy_enabled_false_indexes_still_build",
+            key: if block_label == "base" {
+                "enabled".to_string()
+            } else {
+                format!("{block_label}.enabled")
+            },
+            message: RETIRED_ENABLED_FALSE_INDEXES_NOTE.to_string(),
+        });
     }
     for gate in &gates {
         match *gate {
@@ -755,6 +770,23 @@ pub fn notice_digest(projection: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn legacy_enabled_false_warns_that_indexes_still_build() {
+        let (doc, out) = translate(json!({"enabled": false}), PolicyPhase::Window);
+        assert!(
+            doc.get("indexes").is_none(),
+            "indexes stay at their defaults"
+        );
+        let warning = out
+            .warnings
+            .iter()
+            .find(|warning| warning.code == "legacy_enabled_false_indexes_still_build")
+            .expect("enabled:false notice");
+        assert_eq!(warning.key, "enabled");
+        assert!(warning.message.contains("indexes still build"));
+        assert!(warning.message.contains("indexes.trigram"));
+    }
     use super::*;
     use serde_json::json;
 

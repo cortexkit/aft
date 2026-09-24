@@ -169,6 +169,12 @@ export interface DocumentTranslation {
   warnings: TranslationWarning[];
   /** True when a retired key or alias was supplied (a migration notice applies). */
   legacyInput: boolean;
+  /**
+   * True when some block set the retired top-level `enabled: false`. It is
+   * translated into a disabled_tools list only, so indexes keep building;
+   * the migration notice has to say so.
+   */
+  retiredEnabledFalse: boolean;
 }
 
 type JsonRecord = Record<string, unknown>;
@@ -335,7 +341,15 @@ function translateBlock(
     }
   }
   if (hoist === false) for (const name of HOST_TOOL_NAMES) generated.add(name);
-  if (enabled === false) for (const name of CANONICAL_TOOLS) generated.add(name);
+  if (enabled === false) {
+    for (const name of CANONICAL_TOOLS) generated.add(name);
+    out.retiredEnabledFalse = true;
+    out.warnings.push({
+      code: "legacy_enabled_false_indexes_still_build",
+      key: blockLabel === "base" ? "enabled" : `${blockLabel}.enabled`,
+      message: RETIRED_ENABLED_FALSE_INDEXES_NOTE,
+    });
+  }
   for (const gate of gates) {
     if (gate === "backup.enabled") generated.add("aft_safety");
     else if (gate === "inspect.enabled") generated.add("aft_inspect");
@@ -371,9 +385,31 @@ function translateBlock(
   }
 }
 
+/**
+ * What a retired `enabled: false` no longer does. The translation only hides
+ * tools; it never stops indexing, so a user who relied on it to keep AFT out
+ * of a repository must also switch the indexes off.
+ */
+export const RETIRED_ENABLED_FALSE_INDEXES_NOTE =
+  "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
+
+/** The once-per-identity migration notice for a config file that used retired keys. */
+export function legacyConfigNoticeMessage(
+  configPath: string,
+  translation: Pick<DocumentTranslation, "retiredEnabledFalse">,
+): string {
+  const base = `AFT config ${configPath} uses retired keys (tool_surface, hoist_builtin_tools, enabled, search_index, semantic_search, callgraph_store, github.enabled or aft_-prefixed tool names). They are translated for this release and rejected from v0.59; run \`npx @cortexkit/aft doctor --fix\` to migrate.`;
+  return translation.retiredEnabledFalse ? `${base} ${RETIRED_ENABLED_FALSE_INDEXES_NOTE}` : base;
+}
+
 /** Translate or reject every block (base plus each `harnesses.<id>`) in place. */
 export function translateConfigDocument(map: JsonRecord, phase: PolicyPhase): DocumentTranslation {
-  const out: DocumentTranslation = { errors: [], warnings: [], legacyInput: false };
+  const out: DocumentTranslation = {
+    errors: [],
+    warnings: [],
+    legacyInput: false,
+    retiredEnabledFalse: false,
+  };
   translateBlock(map, true, phase, "base", out);
   if (isRecord(map.harnesses)) {
     for (const [name, block] of Object.entries(map.harnesses)) {
