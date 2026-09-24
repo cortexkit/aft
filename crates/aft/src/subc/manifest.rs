@@ -1,9 +1,9 @@
 //! Manifest, lane classification, and control-surface helpers exposed over subc.
 
 use super::{
-    json, Bindings, Concurrency, ExecutionMode, Flags, IdentityBinding, IdentityScope, Lane,
-    LazyLock, ManagementOperation, ManagementOperationKind, ModuleManifest, Priority, ProviderRole,
-    StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
+    json, Bindings, Concurrency, ConsumerRole, ExecutionMode, Flags, IdentityBinding,
+    IdentityScope, Lane, LazyLock, ManagementOperation, ManagementOperationKind, ModuleManifest,
+    Priority, ProviderRole, StorageBinding, StorageKind, StorageScope, Tool, TrustTier, Value,
     MODULE_CONTROL_OP_HEALTH_CHECK, PROTOCOL_VERSION,
 };
 
@@ -240,9 +240,14 @@ pub(super) fn build_manifest() -> ModuleManifest {
     // module as ready, which is the behaviour before readiness existed.
     //
     // The builder leaves `capabilities`, `self_signals` and `provenance`
-    // unset, so none of them reaches the wire. The empty
-    // `consumes` list is omitted by the protocol crate, which a subc daemon
-    // older than 0.17.20 rejects; that daemon version is the floor.
+    // unset, so none of them reaches the wire. `consumes` is descriptive (the
+    // daemon doesn't read it) and lists the modules AFT opens routes to: the
+    // fleet status holder always, and synapse only when it is the configured
+    // embedding backend. The manifest is static, so the config-dependent synapse
+    // route is declared unconditionally. Neither is a `capabilities.requires`
+    // entry, because a required capability with no provider would hold AFT
+    // not-ready. A subc daemon older than 0.17.20 refuses this manifest, so
+    // that version is the floor.
     ModuleManifest::builder("aft", env!("CARGO_PKG_VERSION"))
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
@@ -323,6 +328,14 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 optional: vec![IdentityScope::Session],
             },
         }))
+        .consumes(vec![
+            ConsumerRole::ServiceClient {
+                of: vec!["prefrontal-core".to_string()],
+            },
+            ConsumerRole::ServiceClient {
+                of: vec!["synapse".to_string()],
+            },
+        ])
         .build()
 }
 
@@ -650,8 +663,15 @@ mod tests {
         ))
         .expect("parse manifest snapshot");
         let top = expected.as_object_mut().expect("manifest object");
-        // The protocol crate omits an empty `consumes` list.
+        // `consumes` names the modules AFT opens service routes to.
         assert_eq!(top.remove("consumes"), Some(json!([])));
+        top.insert(
+            "consumes".to_string(),
+            json!([
+                {"role": "service_client", "of": ["prefrontal-core"]},
+                {"role": "service_client", "of": ["synapse"]}
+            ]),
+        );
         // The scheduled-task vocabulary was retired from the manifest.
         assert_eq!(top.remove("scheduled_tasks"), Some(json!([])));
         // The management role now always serializes its delivery concurrency;

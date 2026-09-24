@@ -42,9 +42,9 @@ use crate::runtime_drain;
 use crate::sandbox_spawn::{AuthenticatedPrincipal, PrincipalTrust};
 
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ExecutionMode, IdentityBinding, IdentityScope, ManagementOperation,
-    ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
-    StorageScope, Tool, TrustTier,
+    Bindings, Concurrency, ConsumerRole, ExecutionMode, IdentityBinding, IdentityScope,
+    ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding,
+    StorageKind, StorageScope, Tool, TrustTier,
 };
 use subc_protocol::session::{
     HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
