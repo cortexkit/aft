@@ -1,0 +1,9 @@
+{
+  "disabled_tools": [
+    "read",
+    "bash",
+    "aft_safety",
+    "aft_zoom",
+    "bash_kill"
+  ]
+}

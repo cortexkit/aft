@@ -1,0 +1,17 @@
+{
+  "disabled_tools": [
+    "aft_zoom"
+  ],
+  "harnesses": {
+    "pi": {
+      "disabled_tools": [
+        "aft_callgraph"
+      ]
+    },
+    "opencode": {
+      "disabled_tools": [
+        "grep"
+      ]
+    }
+  }
+}

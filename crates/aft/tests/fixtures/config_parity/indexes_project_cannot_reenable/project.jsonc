@@ -1,0 +1,6 @@
+{
+  "indexes": {
+    "trigram": true,
+    "callgraph": false
+  }
+}

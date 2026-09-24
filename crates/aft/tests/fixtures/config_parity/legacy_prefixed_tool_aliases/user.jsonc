@@ -1,0 +1,11 @@
+{
+  "disabled_tools": [
+    "aft_read",
+    "aft_write",
+    "aft_edit",
+    "aft_apply_patch",
+    "aft_grep",
+    "aft_glob",
+    "aft_bash"
+  ]
+}

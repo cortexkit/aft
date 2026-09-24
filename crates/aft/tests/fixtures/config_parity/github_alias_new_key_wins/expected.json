@@ -1,19 +1,6 @@
 {
-  "experimental_bash_background": true,
-  "experimental_bash_compress": true,
-  "experimental_bash_rewrite": true,
-  "gh_read": {
-    "enabled": false
-  },
-  "gh_shim": {
-    "enabled": true
-  },
-  "github": {
-    "enabled": true,
-    "read": false,
-    "shim": true,
-    "write": false
-  },
-  "hoist_builtin_tools": true,
-  "restrict_to_project_root": false
+  "rejected": [
+    "removed_config_key:gh_read:use:github.read",
+    "removed_config_key:gh_shim:use:github.shim"
+  ]
 }

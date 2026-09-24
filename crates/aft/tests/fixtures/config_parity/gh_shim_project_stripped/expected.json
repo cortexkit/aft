@@ -1,7 +1,5 @@
 {
-  "experimental_bash_background": true,
-  "experimental_bash_compress": true,
-  "experimental_bash_rewrite": true,
-  "hoist_builtin_tools": true,
-  "restrict_to_project_root": false
+  "rejected": [
+    "removed_config_key:gh_shim:use:github.shim"
+  ]
 }

@@ -14,14 +14,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  ConfigRejectedError,
   loadAftConfig as loadOpenCodeAftConfig,
-  resolveGithubConfig as resolveOpenCodeGithubConfig,
   resolveProjectOverridesForConfigure as resolveOpenCodeProjectOverridesForConfigure,
   type AftConfig as OpenCodeAftConfig,
 } from "../packages/opencode-plugin/src/config.ts";
 import {
+  ConfigRejectedError as PiConfigRejectedError,
   loadAftConfig as loadPiAftConfig,
-  resolveGithubConfig as resolvePiGithubConfig,
   resolveProjectOverridesForConfigure as resolvePiProjectOverridesForConfigure,
   type AftConfig as PiAftConfig,
 } from "../packages/pi-plugin/src/config.ts";
@@ -74,34 +74,19 @@ function goldenParamsFromMerged(
       ? resolvePiProjectOverridesForConfigure(merged as PiAftConfig)
       : resolveOpenCodeProjectOverridesForConfigure(merged as OpenCodeAftConfig)),
   };
-  // Hoisting is used only during plugin registration, but the generated parity
-  // fixture retains its resolved value so Rust verifies harness selection.
-  params.hoist_builtin_tools = merged.hoist_builtin_tools ?? true;
-  // Same reasoning for the surface tier and the disabled-tool list: the plugin
-  // owns registration, but the core answers "did the tagged read slot survive?"
-  // from these two fields, so the resolver has to agree on them.
-  if (merged.tool_surface !== undefined) {
-    params.tool_surface = merged.tool_surface;
-  }
-  if (merged.disabled_tools !== undefined) {
-    params.disabled_tools = merged.disabled_tools;
-  }
+  // aft_search_registered is derived from the resolved list on both sides:
+  // registration only, independent of index state.
+  params.aft_search_registered = !(merged.disabled_tools ?? []).includes("aft_search");
+  // The resolved registration list and index switches are always present (the
+  // overrides helper emits them); the parity test also validates their
+  // presence so an omitted list can never pass as a Rust default.
   if (merged.url_fetch_allow_private !== undefined) {
     params.url_fetch_allow_private = merged.url_fetch_allow_private;
   }
-  // gh_shim is a user-only operator gate read directly by the shim from disk;
-  // it is not part of the configure-params surface, so carry it through the
-  // golden explicitly to keep the Rust resolver in parity.
+  // gh_shim carries only the user-tier binary override; it is not part of the
+  // configure-params surface, so carry it through the golden explicitly.
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
-  }
-  if (merged.github !== undefined || merged.gh_shim?.enabled !== undefined || merged.gh_read !== undefined) {
-    const github =
-      harness === "pi"
-        ? resolvePiGithubConfig(merged as PiAftConfig)
-        : resolveOpenCodeGithubConfig(merged as OpenCodeAftConfig);
-    params.gh_shim = { ...(params.gh_shim as object | undefined), enabled: github.shim };
-    params.gh_read = { enabled: github.read };
   }
   return sortKeysDeep(params) as Record<string, unknown>;
 }
@@ -129,14 +114,31 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
     writeTierFile(projectCortexKitDir, "aft.jsonc", caseDef.project);
 
     const harness = caseDef.harness ?? "opencode";
-    const merged =
-      harness === "pi" ? loadPiAftConfig(projectDir) : loadOpenCodeAftConfig(projectDir);
-    const expected = goldenParamsFromMerged(merged, harness);
+    let expected: Record<string, unknown>;
+    try {
+      const merged =
+        harness === "pi" ? loadPiAftConfig(projectDir) : loadOpenCodeAftConfig(projectDir);
+      expected = goldenParamsFromMerged(merged, harness);
+    } catch (err) {
+      // A rejected load is captured as its sorted diagnostics; the Rust
+      // resolver must reject the same candidate with the same codes.
+      if (!(err instanceof ConfigRejectedError) && !(err instanceof PiConfigRejectedError)) {
+        throw err;
+      }
+      expected = { rejected: err.errors };
+    }
 
     const outDir = join(FIXTURES_ROOT, caseDef.name);
     mkdirSync(outDir, { recursive: true });
-    writeTierFile(outDir, "user.jsonc", caseDef.user);
-    writeTierFile(outDir, "project.jsonc", caseDef.project);
+    // Remove tier files a case no longer defines so the Rust side never reads
+    // a stale tier the TypeScript capture did not see.
+    for (const [filename, tier] of [
+      ["user.jsonc", caseDef.user],
+      ["project.jsonc", caseDef.project],
+    ] as const) {
+      if (tier === undefined) rmSync(join(outDir, filename), { force: true });
+      else writeTierFile(outDir, filename, tier);
+    }
     const harnessPath = join(outDir, "harness.json");
     if (caseDef.harness) {
       writeFileSync(harnessPath, `${JSON.stringify(caseDef.harness)}\n`, "utf-8");
@@ -214,20 +216,26 @@ const CASES: ParityCase[] = [
     project: { index: { roots: [{ path: "~/.aft-project-root", indexes: ["callgraph"] }] } },
   },
   {
+    name: "edit_mode_project_precedence",
+    user: { edit_mode: "default" },
+    project: { edit_mode: "hashline" },
+  },
+  {
     name: "enabled_plugin_init_only",
+    // Legacy top-level enabled:false translates to disabling every tool.
     user: { enabled: false },
     project: { enabled: true },
   },
   {
-    // Registration-local but project-safe: a repository may choose explicit
-    // aft_ names without changing AFT's permissions or Rust configure payload.
+    // Legacy hoist choices translate to disabled host names; a project's are
+    // all protected slots and are therefore ignored.
     name: "hoist_builtin_tools_project_safe",
     user: { hoist_builtin_tools: true },
     project: { hoist_builtin_tools: false },
   },
   {
-    // The exact same file resolves differently for each plugin's active
-    // harness. The Rust fixture records the same active-harness choice.
+    // The same file resolved for each active harness. The base hoist false
+    // already disables host names, and a harness block can only add disables.
     name: "harness_opencode_hoist",
     harness: "opencode",
     user: {
@@ -475,13 +483,12 @@ const CASES: ParityCase[] = [
     user: { inspect: { tier2_pass_timeout_ms: 45000 } },
   },
   {
-    // User disables the gh routing shim; the resolved config must carry the
-    // disabled gate so the Rust resolver matches.
+    // The retired gh_shim.enabled alias rejects the whole load.
     name: "gh_shim_user_disabled",
     user: { gh_shim: { enabled: false } },
   },
   {
-    // A project trying to disable the shim must be stripped (user-tier only).
+    // The retired alias rejects even from the project tier.
     name: "gh_shim_project_stripped",
     user: {},
     project: { gh_shim: { enabled: false } },
@@ -535,6 +542,103 @@ const CASES: ParityCase[] = [
     user: { git: { co_author: "auto" } },
     project: { git: { co_author: "AFT Pair <pair@example.test>" } },
   },
+  // --- Feature-config registration and index resolution. ---
+  { name: "disabled_tools_explicit_empty", user: { disabled_tools: [] } },
+  { name: "disabled_tools_search_only", user: { disabled_tools: ["aft_search"] } },
+  {
+    name: "disabled_tools_user_empty_project_zoom",
+    user: { disabled_tools: [] },
+    project: { disabled_tools: ["aft_zoom"] },
+  },
+  {
+    // Protected slots are ignored from the project tier; others union.
+    name: "disabled_tools_project_protected_ignored",
+    user: { disabled_tools: ["write"] },
+    project: { disabled_tools: ["read", "bash", "aft_safety", "aft_zoom", "bash_kill"] },
+  },
+  {
+    // A harness block only adds disables to its base list.
+    name: "disabled_tools_harness_union",
+    harness: "pi",
+    user: {
+      disabled_tools: ["aft_zoom"],
+      harnesses: { pi: { disabled_tools: ["aft_callgraph"] }, opencode: { disabled_tools: ["grep"] } },
+    },
+  },
+  { name: "unknown_disabled_names_preserved", user: { disabled_tools: ["aft_future_tool", "typo_name"] } },
+  { name: "legacy_tool_surface_all", user: { tool_surface: "all" } },
+  { name: "legacy_tool_surface_recommended", user: { tool_surface: "recommended" } },
+  { name: "legacy_tool_surface_minimal", user: { tool_surface: "minimal" } },
+  {
+    // Explicit canonical disables (even []) override every generated disable in that block.
+    name: "legacy_tool_surface_minimal_explicit_empty",
+    user: { tool_surface: "minimal", disabled_tools: [] },
+  },
+  { name: "legacy_hoist_false", user: { hoist_builtin_tools: false } },
+  {
+    name: "legacy_hoist_false_explicit_empty",
+    user: { hoist_builtin_tools: false, disabled_tools: [] },
+  },
+  { name: "legacy_backup_false", user: { backup: { enabled: false } } },
+  {
+    name: "legacy_backup_false_explicit_empty",
+    user: { backup: { enabled: false }, disabled_tools: [] },
+  },
+  { name: "legacy_inspect_false", user: { inspect: { enabled: false } } },
+  { name: "legacy_bash_enabled_false", user: { bash: { enabled: false } } },
+  { name: "legacy_enabled_false_project", project: { enabled: false } },
+  {
+    // Surface translation plus a gate in the same base block union.
+    name: "legacy_surface_recommended_with_gates",
+    user: { tool_surface: "recommended", inspect: { enabled: false } },
+  },
+  {
+    // The seven prefixed names canonicalize to host names inside disabled lists.
+    name: "legacy_prefixed_tool_aliases",
+    user: {
+      disabled_tools: [
+        "aft_read",
+        "aft_write",
+        "aft_edit",
+        "aft_apply_patch",
+        "aft_grep",
+        "aft_glob",
+        "aft_bash",
+      ],
+    },
+  },
+  {
+    // Project hoist false only generates protected host names: all ignored.
+    name: "legacy_project_hoist_false_ignored",
+    user: {},
+    project: { hoist_builtin_tools: false },
+  },
+  { name: "legacy_search_index_false", user: { search_index: false } },
+  { name: "legacy_experimental_search_index_false", user: { experimental_search_index: false } },
+  {
+    name: "legacy_index_precedence_canonical_wins",
+    user: {
+      indexes: { trigram: true },
+      search_index: false,
+      experimental_semantic_search: false,
+      semantic_search: true,
+    },
+  },
+  { name: "legacy_callgraph_store_false", user: { callgraph_store: false } },
+  { name: "legacy_github_enabled_false", user: { github: { enabled: false, write: true } } },
+  { name: "indexes_user_off", user: { indexes: { semantic: false } } },
+  {
+    // A project may only turn an index off.
+    name: "indexes_project_cannot_reenable",
+    user: { indexes: { trigram: false } },
+    project: { indexes: { trigram: true, callgraph: false } },
+  },
+  {
+    name: "indexes_user_harness_override",
+    harness: "opencode",
+    user: { indexes: { semantic: false }, harnesses: { opencode: { indexes: { semantic: true } } } },
+  },
+  { name: "gh_read_alias_rejected", user: { gh_read: { enabled: false }, github: { read: true } } },
   { name: "bash_true", user: { bash: true } },
   { name: "bash_false", user: { bash: false } },
   { name: "bash_empty_obj", user: { bash: {} } },

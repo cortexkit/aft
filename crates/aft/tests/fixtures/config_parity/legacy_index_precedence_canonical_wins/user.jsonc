@@ -1,0 +1,8 @@
+{
+  "indexes": {
+    "trigram": true
+  },
+  "search_index": false,
+  "experimental_semantic_search": false,
+  "semantic_search": true
+}

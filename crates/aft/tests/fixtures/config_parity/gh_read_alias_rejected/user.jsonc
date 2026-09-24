@@ -1,0 +1,8 @@
+{
+  "gh_read": {
+    "enabled": false
+  },
+  "github": {
+    "read": true
+  }
+}

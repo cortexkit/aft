@@ -1,0 +1,12 @@
+{
+  "indexes": {
+    "semantic": false
+  },
+  "harnesses": {
+    "opencode": {
+      "indexes": {
+        "semantic": true
+      }
+    }
+  }
+}
