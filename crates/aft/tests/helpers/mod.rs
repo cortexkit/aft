@@ -154,11 +154,114 @@ pub struct AftProcess {
     /// before it hung. Shared with the AFT_TEST_DIAG capture thread.
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
     _cache_dir: tempfile::TempDir,
+    /// When false (the default), every configure request this process sends
+    /// has semantic indexing switched off unless the request's own user config
+    /// already decides it. See [`AftProcess::opt_into_semantic`].
+    semantic_opt_in: bool,
 }
 
 impl AftProcess {
     pub fn cache_dir(&self) -> &Path {
         self._cache_dir.path()
+    }
+
+    /// Keep semantic indexing at the product default (on) for this process.
+    ///
+    /// By default the harness switches semantic indexing off in every
+    /// configure request, because loading ONNX Runtime and the MiniLM model in
+    /// each of the ~600 spawned processes slows the suite and exercises a
+    /// native dependency most tests do not need. Tests that exercise semantic
+    /// search call this (or spawn through [`AftProcess::spawn_with_semantic`]).
+    /// The model cache still points at this process's private temp directory.
+    pub fn opt_into_semantic(&mut self) -> &mut Self {
+        self.semantic_opt_in = true;
+        self
+    }
+
+    /// Spawn with semantic indexing left at the product default.
+    pub fn spawn_with_semantic() -> Self {
+        let mut aft = Self::spawn_inner(&[]);
+        aft.semantic_opt_in = true;
+        aft
+    }
+
+    /// Spawn with extra environment variables and semantic indexing left at
+    /// the product default.
+    pub fn spawn_with_semantic_env(envs: &[(&str, &std::ffi::OsStr)]) -> Self {
+        let mut aft = Self::spawn_inner(envs);
+        aft.semantic_opt_in = true;
+        aft
+    }
+
+    /// Apply the harness's default semantic setting to an outgoing request.
+    ///
+    /// Only configure requests change. The harness adds
+    /// `indexes.semantic: false` to the request's user-tier config (creating
+    /// that tier when absent) unless the test opted in, or the user doc
+    /// already sets `indexes.semantic` or the legacy `semantic_search` key.
+    /// Requests that are not valid JSON, or whose user doc is not a JSON object,
+    /// are sent unchanged.
+    fn prepare_request(&self, request: &str) -> String {
+        if self.semantic_opt_in {
+            return request.to_string();
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(request) else {
+            return request.to_string();
+        };
+        if value.get("command").and_then(|command| command.as_str()) != Some("configure") {
+            return request.to_string();
+        }
+        // Configure params arrive either at the top level or nested under
+        // `params`, matching how the engine reads them.
+        let params = match value.get_mut("params") {
+            Some(params) if params.is_object() => params,
+            _ => &mut value,
+        };
+        let Some(params) = params.as_object_mut() else {
+            return request.to_string();
+        };
+        let tiers = params
+            .entry("config")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(tiers) = tiers.as_array_mut() else {
+            return request.to_string();
+        };
+        let user_index = tiers
+            .iter()
+            .position(|tier| tier.get("tier").and_then(|t| t.as_str()) == Some("user"));
+        let Some(user_index) = user_index else {
+            tiers.insert(
+                0,
+                user_config_tier(serde_json::json!({ "indexes": { "semantic": false } })),
+            );
+            return value.to_string();
+        };
+        let Some(doc_text) = tiers[user_index].get("doc").and_then(|doc| doc.as_str()) else {
+            return request.to_string();
+        };
+        let Ok(serde_json::Value::Object(mut doc)) =
+            serde_json::from_str::<serde_json::Value>(doc_text)
+        else {
+            return request.to_string();
+        };
+        if doc.contains_key("semantic_search")
+            || doc
+                .get("indexes")
+                .and_then(|indexes| indexes.get("semantic"))
+                .is_some()
+        {
+            return request.to_string();
+        }
+        let indexes = doc
+            .entry("indexes")
+            .or_insert_with(|| serde_json::json!({}));
+        let Some(indexes) = indexes.as_object_mut() else {
+            return request.to_string();
+        };
+        indexes.insert("semantic".to_string(), serde_json::Value::Bool(false));
+        tiers[user_index]["doc"] =
+            serde_json::Value::String(serde_json::Value::Object(doc).to_string());
+        value.to_string()
     }
 
     /// Spawn the aft binary with piped stdin/stdout/stderr.
@@ -225,6 +328,9 @@ impl AftProcess {
         command
             .envs(hermetic_git_env())
             .env("AFT_CACHE_DIR", cache_dir.path())
+            // Keep the embedding model cache inside this process's temp
+            // directory so no test reads or writes the real ~/.cache/fastembed.
+            .env("FASTEMBED_CACHE_DIR", cache_dir.path().join("fastembed"))
             // Callgraph store cold build is pure-async in production (returns
             // `Building`, agent retries). Fixture projects are tiny (build in
             // ~100ms), so default the test harness to a large inline-wait window
@@ -360,6 +466,7 @@ impl AftProcess {
             stderr_capture_thread,
             stderr_tail,
             _cache_dir: cache_dir,
+            semantic_opt_in: false,
         }
     }
 
@@ -369,11 +476,12 @@ impl AftProcess {
     }
 
     pub fn send_with_timeout(&mut self, request: &str, timeout: Duration) -> serde_json::Value {
+        let request = self.prepare_request(request);
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");
 
-        let request_id = serde_json::from_str::<serde_json::Value>(request)
+        let request_id = serde_json::from_str::<serde_json::Value>(&request)
             .ok()
             .and_then(|value| value["id"].as_str().map(str::to_string));
         loop {
@@ -596,6 +704,7 @@ impl AftProcess {
     /// Send a raw line that should produce no response (e.g. empty line).
     /// Verifies the process is still alive by sending a follow-up ping.
     pub fn send_silent(&mut self, request: &str) {
+        let request = self.prepare_request(request);
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");
@@ -606,6 +715,7 @@ impl AftProcess {
     where
         F: FnMut(&serde_json::Value) -> bool,
     {
+        let request = self.prepare_request(request);
         let stdin = self.child.stdin.as_mut().expect("stdin handle");
         writeln!(stdin, "{}", request).expect("write to stdin");
         stdin.flush().expect("flush stdin");

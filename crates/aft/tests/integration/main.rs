@@ -66,6 +66,7 @@ mod github_read_restriction_responsiveness;
 mod github_read_routing;
 mod grep_glob_multi_path_test;
 mod grep_glob_test;
+mod harness_semantic_default_test;
 mod honest_failures_test;
 mod import_golden_test;
 mod import_test;
