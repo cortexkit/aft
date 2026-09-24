@@ -50,6 +50,16 @@ set of exits.
   `--assignee` and similar), `gh_shim_unclassified` (`:3072-3329`,
   `:3356-3469`, surfaced by `:541-543`).
 - Local self-report write failure: `gh_shim_seam_unavailable` (`:584`).
+- `issue edit` under `GH_SHIM_BYPASS=operator` with a v14 manifest never
+  routes: a label-only edit (`--add-label` / `--remove-label`, one issue
+  number or URL, `--repo`/`-R`) appends an operator-bypass audit line with
+  `repository`, `issue_number`, `labels_added` and `labels_removed`, then runs
+  upstream `gh` and returns its exit. Any other flag, even beside a label
+  flag, is exit 86 `gh_shim_unsupported_flag` naming the flag; a second or
+  malformed positional is exit 86 `gh_shim_unclassified` naming it; an audit
+  write failure is exit 86 `gh_shim_bypass_audit_unavailable` and upstream is
+  not run (`parse_operator_label_edit`, `dispatch_operator_label_edit`).
+  Under a v13 manifest `issue edit` stays `gh_shim_unclassified`.
 
 ## When the outcome is unknown versus not run
 

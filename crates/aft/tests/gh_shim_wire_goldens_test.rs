@@ -271,8 +271,8 @@ fn refusal_exchanges() -> Vec<Exchange> {
             verb: "v14-issue-edit-title-body",
             reply: HolderReply::Respond("refusal-identity_mismatch.response.json"),
         },
-        // The code prefrontal's route holder returns when the issue was not
-        // opened by the calling seat's bot.
+        // The route holder (prefrontal-core) refuses with this code when the
+        // issue was not opened by the calling seat's bot.
         Exchange {
             name: "v14-issue-edit-title-body-refusal-issue_edit_not_own",
             verb: "v14-issue-edit-title-body",
