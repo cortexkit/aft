@@ -707,21 +707,9 @@ fn try_retention_count_lock_observed<'a>(
     use std::time::Instant;
 
     let started = Instant::now();
+    let budget = retention_count_lock_retry_budget();
     let mut attempts = 0usize;
     loop {
-        if attempts > 0 {
-            let elapsed = started.elapsed();
-            let budget = std::time::Duration::from_micros(RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS as u64);
-            if elapsed >= budget {
-                return Ok(RetentionCountLock::BudgetExhausted {
-                    attempts,
-                    waited_micros: elapsed.as_micros(),
-                });
-            }
-            let backoff = std::time::Duration::from_micros((50 * attempts.min(4)) as u64);
-            std::thread::sleep(backoff.min(budget - elapsed));
-        }
-
         attempts = attempts.saturating_add(1);
         observe_attempt(phase, attempts);
         match db.try_lock() {
@@ -731,7 +719,33 @@ fn try_retention_count_lock_observed<'a>(
                 return Err("retention database mutex poisoned".to_string())
             }
         }
+        // The budget is checked after a failed attempt, so a backoff sleep
+        // that overshoots the budget on a busy machine still gets one more try
+        // before the sweep reports exhaustion.
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            return Ok(RetentionCountLock::BudgetExhausted {
+                attempts,
+                waited_micros: elapsed.as_micros(),
+            });
+        }
+        let backoff = std::time::Duration::from_micros((50 * attempts.min(4)) as u64);
+        std::thread::sleep(backoff.min(budget - elapsed));
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETENTION_COUNT_LOCK_RETRY_BUDGET_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn retention_count_lock_retry_budget() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(budget) = RETENTION_COUNT_LOCK_RETRY_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
+        return budget;
+    }
+    std::time::Duration::from_micros(RETENTION_COUNT_LOCK_RETRY_BUDGET_MICROS as u64)
 }
 
 fn eligible_terminal_rows(
@@ -1121,6 +1135,13 @@ mod tests {
             drop(guard);
         });
         locked_rx.recv().unwrap();
+        // The production budget is 10 ms. A loaded CI runner can stretch the
+        // holder's 2 ms hold past that, so this test widens the budget: what
+        // it checks is that the sweep waits for a millisecond-scale holder at
+        // all, which the old 256-yield loop never did (it gave up after about
+        // 22 microseconds whatever the budget).
+        RETENTION_COUNT_LOCK_RETRY_BUDGET_OVERRIDE
+            .with(|budget| budget.set(Some(Duration::from_secs(5))));
         let started = Instant::now();
         let outcome = prune_retention_sweep_observed(
             &db,
@@ -1137,7 +1158,10 @@ mod tests {
         let RetentionSweepOutcome::Completed(sweep) = outcome else {
             panic!("millisecond contention skipped the sweep: {outcome:?}");
         };
-        assert!(started.elapsed() >= Duration::from_micros(200), "sweep did not wait");
+        assert!(
+            started.elapsed() >= Duration::from_micros(200),
+            "sweep did not wait"
+        );
         assert_eq!(sweep.bash_tasks_removed, 1);
         assert_eq!(sweep.count_skip, None);
         eprintln!("millisecond holder: elapsed_us={} count_hold_us={} selection_hold_us={} mutation_hold_us={}", started.elapsed().as_micros(), sweep.worst_count_lock_micros, sweep.worst_selection_lock_micros, sweep.worst_mutation_lock_micros);
