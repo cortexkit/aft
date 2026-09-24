@@ -4057,8 +4057,10 @@ fn trim_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) {
 /// user files (including secrets such as credential files), so they must never
 /// be readable by other users regardless of the source file's own mode or of
 /// the permissions on the configurable storage directory above the store.
+#[cfg(unix)]
 pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Unix mode for every directory the backup store creates.
+#[cfg(unix)]
 pub(crate) const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Creates `path` and any missing ancestors as owner-only directories (0700 on
@@ -4160,10 +4162,13 @@ fn fsync_dir(_path: &Path) -> std::io::Result<()> {
 /// large store is tightened across several processes instead of stalling that
 /// request. Loose entries left behind meanwhile still expire with the store's
 /// normal session retention.
+#[cfg(unix)]
 pub(crate) const PERMISSION_TIGHTEN_BUDGET: usize = 1024;
+#[cfg(unix)]
 const PERMISSION_PROGRESS_VERSION: u64 = 1;
 
 /// Outcome of one bounded permission-tightening pass over a store directory.
+#[cfg(unix)]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct TightenReport {
     /// Directory entries looked at during this pass.
@@ -4177,6 +4182,7 @@ pub(crate) struct TightenReport {
 /// Progress record for the tightening pass over `store_dir`, kept next to (not
 /// inside) that directory so the store's own directory scans never see it:
 /// `<parent>/.<store name>-permissions.json`, e.g. `.backups-permissions.json`.
+#[cfg(unix)]
 fn permission_progress_path(store_dir: &Path) -> Option<PathBuf> {
     let name = store_dir.file_name()?.to_string_lossy();
     store_dir
