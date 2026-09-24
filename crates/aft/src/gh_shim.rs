@@ -77,6 +77,14 @@ const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
 // already wrote. They speak publicly under the bot identity and create no
 // authority, which is the same class as `issue comment` and `issue close`.
 const V14_GOVERNED_TUPLES: &[&str] = &["issue create", "issue edit"];
+// v14 also gives the operator bypass one narrow administration shape of a
+// governed verb: an `issue edit` that changes labels and nothing else. Triage
+// labels on any issue are repository administration, not bot speech, so they
+// run under the operator's own `gh` with an audit line, like `pr merge`. Every
+// other `issue edit` argument (title, body, assignees, milestones, projects)
+// is refused on this path, and without the bypass `issue edit` stays on the
+// governed own-issue route.
+const V14_OPERATOR_LABEL_TUPLES: &[&str] = &["issue edit"];
 /// The only API endpoint admitted as governed speech: the id-addressed edit of
 /// an issue comment. The shim classifies and forwards; the route holder is what
 /// verifies the comment was written by the calling seat's bot.
@@ -453,7 +461,7 @@ where
     match classification {
         Classification::Mechanical => delegate_to_upstream(args),
         Classification::Admin { tuple } => {
-            if std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator")) {
+            if operator_bypass_requested() {
                 let repository = explicit_repo(args).or_else(infer_repository_from_git);
                 if let Err(error) = append_bypass_audit(paths, &tuple, repository.as_deref(), now) {
                     return refuse(
@@ -467,6 +475,14 @@ where
             }
         }
         Classification::Governed { tuple, canonical } => {
+            // The classification already proves the manifest declares this
+            // tuple at a version that reviewed it; the label row adds its own
+            // version check so the bypass cannot reach an older declaration.
+            if operator_bypass_requested()
+                && is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
+            {
+                return dispatch_operator_label_edit(args, &tuple, paths, now, delegate_to_upstream);
+            }
             // An API row is addressed by endpoint rather than by subcommand and
             // positional, so it has its own argv reader.
             let canonicalized = if is_api_tuple(&tuple) {
@@ -492,6 +508,43 @@ where
             "destructive GitHub operations are not available through the shim",
         ),
     }
+}
+
+/// True when the operator asked to run administration under their own `gh`.
+fn operator_bypass_requested() -> bool {
+    std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator"))
+}
+
+/// Run a label-only `gh issue edit` as the operator.
+///
+/// The argv must be exactly the label row (see `parse_operator_label_edit`);
+/// anything else refuses by name without touching the audit or upstream. The
+/// audit record is appended and synced before upstream `gh` is spawned, so an
+/// attempt that crashes mid-call is still on record.
+fn dispatch_operator_label_edit<F>(
+    args: &[OsString],
+    tuple: &str,
+    paths: &StatePaths,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    let edit = match parse_operator_label_edit(args) {
+        Ok(edit) => edit,
+        Err(error) => return refuse_governed_canonicalization(&error),
+    };
+    let repository = edit.repository.clone().or_else(infer_repository_from_git);
+    if let Err(error) =
+        append_label_bypass_audit(paths, tuple, repository.as_deref(), &edit, now)
+    {
+        return refuse(
+            RefusalCode::BypassAuditUnavailable,
+            &format!("operator bypass audit could not be appended: {error}"),
+        );
+    }
+    delegate_to_upstream(args)
 }
 
 /// Refusal text for an administration-tier verb reached without the operator
@@ -2647,6 +2700,12 @@ fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 14 && V14_GOVERNED_TUPLES.contains(&tuple))
 }
 
+/// True for a governed tuple whose label-only form the operator bypass may run
+/// upstream. Only reached for a tuple the manifest already declares governed.
+fn is_reviewed_operator_label_tuple(manifest_version: u64, tuple: &str) -> bool {
+    manifest_version >= 14 && V14_OPERATOR_LABEL_TUPLES.contains(&tuple)
+}
+
 /// True for the one API rule that may be governed rather than admin: the v14
 /// own-comment PATCH. Every other governed API rule stays undeclared, so a
 /// signed rule alone cannot widen raw API writes into bot speech.
@@ -3752,6 +3811,193 @@ fn infer_repository_from_git() -> Option<String> {
     canonical_repository_key(&origin_remote(&cwd)?)
 }
 
+/// A label-only `gh issue edit` accepted for the operator bypass: what the
+/// audit line records before upstream `gh` runs.
+#[derive(Debug, Eq, PartialEq)]
+struct OperatorLabelEdit {
+    /// From an issue URL, else from `--repo`/`-R`; `None` means the caller
+    /// falls back to the git origin, as upstream `gh` does.
+    repository: Option<String>,
+    issue_number: u64,
+    labels_added: Vec<String>,
+    labels_removed: Vec<String>,
+}
+
+const OPERATOR_LABEL_ROW_TEXT: &str = "under GH_SHIM_BYPASS=operator `gh issue edit` admits only label changes: --add-label, --remove-label, one issue number or URL, and --repo/-R";
+
+/// Read the argv of the operator label row, refusing everything that is not
+/// part of it.
+///
+/// Accepted, and nothing else: `--add-label` and `--remove-label` as
+/// `--flag value` or `--flag=value` with comma-separated labels; exactly one
+/// positional, an issue number or issue URL; `--repo`/`-R` as `--repo value`,
+/// `--repo=value`, `-R value` or `-R=value`, before or after the command. At
+/// least one label flag is required. Any other argument refuses by name even
+/// when a label flag is also present, because upstream `gh` runs the whole
+/// argv: a title or assignee change riding along with a label would run under
+/// the operator's identity without being recorded as such.
+fn parse_operator_label_edit(args: &[OsString]) -> Result<OperatorLabelEdit, CanonicalizeError> {
+    let (_, _, head_index) = command_head(args)
+        .ok_or_else(|| CanonicalizeError::unclassified("missing command head"))?;
+    let mut explicit_repository: Option<String> = None;
+    let mut target: Option<&str> = None;
+    let mut labels_added = Vec::new();
+    let mut labels_removed = Vec::new();
+    let mut saw_label_flag = false;
+    let mut index = 0;
+    while index < args.len() {
+        // The two command words (`issue`, `edit`); command_head found them.
+        if index == head_index || index == head_index + 1 {
+            index += 1;
+            continue;
+        }
+        let value = args[index].to_str().ok_or_else(|| {
+            CanonicalizeError::unclassified("non-UTF-8 arguments are outside the label row")
+        })?;
+        let next = args.get(index + 1);
+        if let Some((supplied, consumed)) = operator_row_flag_value(value, "--add-label", next)?
+            .or(operator_row_flag_value(value, "--remove-label", next)?)
+        {
+            let flag = value.split('=').next().unwrap_or(value);
+            let labels = supplied
+                .split(',')
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if labels.is_empty() {
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::UnsupportedFlag,
+                    format!("{flag}: names no label"),
+                ));
+            }
+            if flag == "--add-label" {
+                labels_added.extend(labels);
+            } else {
+                labels_removed.extend(labels);
+            }
+            saw_label_flag = true;
+            index += consumed;
+            continue;
+        }
+        if let Some((supplied, consumed)) = operator_row_flag_value(value, "--repo", next)?
+            .or(operator_row_flag_value(value, "-R", next)?)
+        {
+            if explicit_repository.replace(supplied).is_some() {
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::UnsupportedFlag,
+                    "--repo: given more than once",
+                ));
+            }
+            index += consumed;
+            continue;
+        }
+        if value.starts_with('-') {
+            // Name the flag without any inline value: `--body=...` must not
+            // echo the text it carried.
+            let flag = value.split('=').next().unwrap_or(value);
+            return Err(CanonicalizeError::typed(
+                RefusalCode::UnsupportedFlag,
+                format!("{flag}: {OPERATOR_LABEL_ROW_TEXT}"),
+            ));
+        }
+        if let Some(first) = target {
+            return Err(CanonicalizeError::unclassified(format!(
+                "{value}: a second positional after issue {first}; {OPERATOR_LABEL_ROW_TEXT}"
+            )));
+        }
+        target = Some(value);
+        index += 1;
+    }
+
+    if !saw_label_flag {
+        return Err(CanonicalizeError::typed(
+            RefusalCode::UnsupportedFlag,
+            format!("no --add-label or --remove-label: {OPERATOR_LABEL_ROW_TEXT}"),
+        ));
+    }
+    let target = target.ok_or_else(|| {
+        CanonicalizeError::unclassified(format!(
+            "no issue number or URL: {OPERATOR_LABEL_ROW_TEXT}"
+        ))
+    })?;
+    let (url_repository, issue_number) = parse_issue_target(target).ok_or_else(|| {
+        CanonicalizeError::unclassified(format!(
+            "{target}: not an issue number or https://github.com/<owner>/<repo>/issues/<number> URL"
+        ))
+    })?;
+    let explicit_repository = explicit_repository.map(|repository| {
+        canonical_repository_key(&repository).unwrap_or(repository)
+    });
+    // An issue URL names its own repository. If --repo names a different one
+    // the target is ambiguous, and the audit line would record a guess.
+    if let (Some(from_url), Some(explicit)) = (&url_repository, &explicit_repository) {
+        if from_url != explicit {
+            return Err(CanonicalizeError::unclassified(format!(
+                "{target}: the issue URL names {from_url} but --repo names {explicit}"
+            )));
+        }
+    }
+    Ok(OperatorLabelEdit {
+        repository: url_repository.or(explicit_repository),
+        issue_number,
+        labels_added,
+        labels_removed,
+    })
+}
+
+/// The value of `flag` when `value` is that flag, spelled `flag value` (the
+/// value is the next argument) or `flag=value`, and how many arguments the
+/// spelling used. `None` when `value` is a different argument. A missing,
+/// empty or flag-shaped value refuses rather than letting upstream `gh`
+/// interpret it differently.
+fn operator_row_flag_value(
+    value: &str,
+    flag: &str,
+    next: Option<&OsString>,
+) -> Result<Option<(String, usize)>, CanonicalizeError> {
+    let (supplied, consumed) = if value == flag {
+        (next.and_then(|arg| arg.to_str()), 2)
+    } else if let Some(inline) = value.strip_prefix(flag).and_then(|rest| rest.strip_prefix('=')) {
+        (Some(inline), 1)
+    } else {
+        return Ok(None);
+    };
+    match supplied {
+        Some(supplied) if !supplied.is_empty() && !supplied.starts_with('-') => {
+            Ok(Some((supplied.to_string(), consumed)))
+        }
+        _ => Err(CanonicalizeError::typed(
+            RefusalCode::UnsupportedFlag,
+            format!("{flag}: requires a value"),
+        )),
+    }
+}
+
+/// An issue number, or a `https://github.com/<owner>/<repo>/issues/<number>`
+/// URL together with the repository it names.
+fn parse_issue_target(target: &str) -> Option<(Option<String>, u64)> {
+    let number = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+            .filter(|number| *number > 0)
+    };
+    if let Some(issue_number) = number(target) {
+        return Some((None, issue_number));
+    }
+    let path = ["https://github.com/", "http://github.com/"]
+        .iter()
+        .find_map(|prefix| target.strip_prefix(prefix))?
+        .trim_end_matches('/');
+    let parts = path.split('/').collect::<Vec<_>>();
+    let [owner, repository, "issues", issue] = parts.as_slice() else {
+        return None;
+    };
+    let repository = canonical_repository_key(&format!("{owner}/{repository}"))?;
+    Some((Some(repository), number(issue)?))
+}
+
 #[derive(Debug)]
 enum RouteOutcome {
     Result(String),
@@ -4331,13 +4577,42 @@ fn append_bypass_audit(
     repository: Option<&str>,
     now: u64,
 ) -> io::Result<()> {
+    append_bypass_audit_record(
+        paths,
+        &json!({
+            "as_of_unix_secs": now,
+            "tuple": tuple,
+            "repository": repository,
+        }),
+    )
+}
+
+/// The operator label row's audit line: the common bypass fields plus the
+/// issue and the labels added and removed, so `gh --status` shows what the
+/// operator changed and not just that a bypass happened.
+fn append_label_bypass_audit(
+    paths: &StatePaths,
+    tuple: &str,
+    repository: Option<&str>,
+    edit: &OperatorLabelEdit,
+    now: u64,
+) -> io::Result<()> {
+    append_bypass_audit_record(
+        paths,
+        &json!({
+            "as_of_unix_secs": now,
+            "tuple": tuple,
+            "repository": repository,
+            "issue_number": edit.issue_number,
+            "labels_added": edit.labels_added,
+            "labels_removed": edit.labels_removed,
+        }),
+    )
+}
+
+fn append_bypass_audit_record(paths: &StatePaths, record: &Value) -> io::Result<()> {
     fs::create_dir_all(&paths.root)?;
-    let mut record = serde_json::to_vec(&json!({
-        "as_of_unix_secs": now,
-        "tuple": tuple,
-        "repository": repository,
-    }))
-    .map_err(io::Error::other)?;
+    let mut record = serde_json::to_vec(record).map_err(io::Error::other)?;
     record.push(b'\n');
     let mut file = OpenOptions::new()
         .create(true)
@@ -7587,6 +7862,347 @@ mod tests {
         assert_eq!(request.body["add_assignees"], json!(["octocat"]));
         assert_eq!(request.body["remove_assignees"], json!(["hubot"]));
         assert_eq!(request.repository.as_deref(), Some("cortexkit/aft"));
+    }
+
+    /// The operator label row's argv for a manifest-declared `issue edit`.
+    fn parse_label_row(args: &[&str]) -> Result<OperatorLabelEdit, CanonicalizeError> {
+        let args = os_args(args);
+        assert!(
+            matches!(
+                classify(&args, &v14_manifest(), "macos"),
+                Classification::Governed { ref tuple, .. } if tuple == "issue edit"
+            ),
+            "{args:?} must reach the declared issue edit row"
+        );
+        parse_operator_label_edit(&args)
+    }
+
+    #[test]
+    fn v14_operator_label_row_accepts_every_label_form() {
+        type Case<'a> = (&'a [&'a str], Option<&'a str>, u64, &'a [&'a str], &'a [&'a str]);
+        let aft = Some("cortexkit/aft");
+        let cases: &[Case] = &[
+            (&["issue", "edit", "42", "--add-label", "bug"], None, 42, &["bug"], &[]),
+            (&["issue", "edit", "42", "--add-label=bug,p1"], None, 42, &["bug", "p1"], &[]),
+            (
+                &["issue", "edit", "42", "--remove-label", "needs-triage"],
+                None,
+                42,
+                &[],
+                &["needs-triage"],
+            ),
+            (&["issue", "edit", "42", "--remove-label=a, b"], None, 42, &[], &["a", "b"]),
+            (
+                &["issue", "edit", "--add-label", "x,y", "7", "--remove-label=z"],
+                None,
+                7,
+                &["x", "y"],
+                &["z"],
+            ),
+            (
+                &["issue", "edit", "42", "--add-label", "a", "--add-label=b"],
+                None,
+                42,
+                &["a", "b"],
+                &[],
+            ),
+            (
+                &["issue", "edit", "42", "--add-label", "bug", "--repo", "CortexKit/AFT"],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &["issue", "edit", "42", "--add-label", "bug", "--repo=cortexkit/aft"],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &["issue", "edit", "42", "--add-label", "bug", "-R", "cortexkit/aft"],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &["issue", "edit", "42", "--add-label", "bug", "-R=cortexkit/aft"],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &["-R", "cortexkit/aft", "issue", "edit", "42", "--add-label", "bug"],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &["--repo=cortexkit/aft", "issue", "edit", "42", "--remove-label", "bug"],
+                aft,
+                42,
+                &[],
+                &["bug"],
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "https://github.com/CortexKit/aft/issues/42",
+                    "--add-label",
+                    "bug",
+                ],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "https://github.com/cortexkit/aft/issues/42/",
+                    "--add-label",
+                    "bug",
+                    "--repo",
+                    "cortexkit/aft",
+                ],
+                aft,
+                42,
+                &["bug"],
+                &[],
+            ),
+        ];
+        for (argv, repository, issue_number, added, removed) in cases {
+            let edit = parse_label_row(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} must be accepted: {}", error.text));
+            assert_eq!(
+                edit,
+                OperatorLabelEdit {
+                    repository: repository.map(str::to_string),
+                    issue_number: *issue_number,
+                    labels_added: added.iter().map(|label| label.to_string()).collect(),
+                    labels_removed: removed.iter().map(|label| label.to_string()).collect(),
+                },
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v14_operator_label_row_refuses_every_other_flag_by_name_even_beside_a_label() {
+        // Spelled out rather than derived from any list the parser reads: the
+        // row is "only labels", so every one of these must refuse whether or
+        // not a valid label flag is also present.
+        let forbidden = [
+            "--body",
+            "--body-file",
+            "--title",
+            "--milestone",
+            "--remove-milestone",
+            "--assignee",
+            "--add-assignee",
+            "--remove-assignee",
+            "--project",
+            "--add-project",
+            "--remove-project",
+            // Unknown to the row: issue create's label flag, a plural
+            // misspelling, and a flag gh does not have at all.
+            "--label",
+            "--add-labels",
+            "--frobnicate",
+        ];
+        for flag in forbidden {
+            let inline = format!("{flag}=value");
+            for argv in [
+                vec!["issue", "edit", "42", flag, "value"],
+                vec!["issue", "edit", "42", inline.as_str()],
+                vec!["issue", "edit", "42", "--add-label", "bug", flag, "value"],
+                vec!["issue", "edit", "42", flag, "value", "--remove-label=bug"],
+                vec!["issue", "edit", "42", "--add-label=bug", inline.as_str()],
+            ] {
+                let error = parse_label_row(&argv)
+                    .expect_err(&format!("{argv:?} must refuse: only labels are admitted"));
+                assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{argv:?}");
+                assert!(
+                    error.text.starts_with(&format!("{flag}: ")),
+                    "{argv:?}: the refusal must name {flag}: {}",
+                    error.text
+                );
+                assert!(
+                    !error.text.contains("value"),
+                    "{argv:?}: the refusal must not echo the flag's value: {}",
+                    error.text
+                );
+            }
+        }
+        // A label flag cannot swallow a following flag as its value.
+        let error = parse_label_row(&["issue", "edit", "42", "--add-label", "--body", "x"])
+            .expect_err("a flag-shaped label value must refuse");
+        assert!(error.text.starts_with("--add-label: "), "{}", error.text);
+        let error = parse_label_row(&["issue", "edit", "42", "--remove-label="])
+            .expect_err("an empty label value must refuse");
+        assert!(error.text.starts_with("--remove-label: "), "{}", error.text);
+        let error = parse_label_row(&["issue", "edit", "42", "--add-label", " , "])
+            .expect_err("a value naming no label must refuse");
+        assert!(error.text.starts_with("--add-label: "), "{}", error.text);
+    }
+
+    #[test]
+    fn v14_operator_label_row_needs_exactly_one_issue_and_at_least_one_label_flag() {
+        let error = parse_label_row(&["issue", "edit", "42", "43", "--add-label", "bug"])
+            .expect_err("a second positional must refuse");
+        assert!(error.text.starts_with("43: "), "{}", error.text);
+        let error = parse_label_row(&[
+            "issue",
+            "edit",
+            "42",
+            "--add-label",
+            "bug",
+            "https://github.com/cortexkit/aft/issues/43",
+        ])
+        .expect_err("a second positional must refuse whatever its shape");
+        assert!(
+            error.text.starts_with("https://github.com/cortexkit/aft/issues/43: "),
+            "{}",
+            error.text
+        );
+        for (argv, named) in [
+            (vec!["issue", "edit", "--add-label", "bug"], "no issue number or URL"),
+            (vec!["issue", "edit", "42"], "no --add-label or --remove-label"),
+            (
+                vec!["issue", "edit", "42", "--repo", "cortexkit/aft"],
+                "no --add-label or --remove-label",
+            ),
+            (vec!["issue", "edit", "#42", "--add-label", "bug"], "#42: "),
+            (
+                vec!["issue", "edit", "https://github.com/o/r/pull/42", "--add-label", "bug"],
+                "https://github.com/o/r/pull/42: ",
+            ),
+            (
+                vec![
+                    "issue",
+                    "edit",
+                    "https://github.com/o/r/issues/42",
+                    "--add-label",
+                    "bug",
+                    "-R",
+                    "other/repo",
+                ],
+                "names o/r but --repo names other/repo",
+            ),
+            (
+                vec!["issue", "edit", "42", "--add-label", "bug", "-R", "a/b", "--repo", "a/b"],
+                "--repo: given more than once",
+            ),
+        ] {
+            let error = parse_label_row(&argv).expect_err(&format!("{argv:?} must refuse"));
+            assert!(error.text.contains(named), "{argv:?}: {}", error.text);
+        }
+    }
+
+    #[test]
+    fn v14_operator_label_row_audits_before_upstream_runs_and_v13_stays_unclassified() {
+        use std::cell::Cell;
+
+        let _env_lock = crate::test_env::process_env_lock();
+        let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+        let directory = tempfile::tempdir().expect("create label row state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = v14_manifest();
+        assert!(is_reviewed_operator_label_tuple(14, "issue edit"));
+        assert!(!is_reviewed_operator_label_tuple(13, "issue edit"));
+        assert!(!is_reviewed_operator_label_tuple(14, "issue create"));
+        let rung = RungDetermination::r3(TEST_NOW, 14, &test_rung_provenance()).record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+        let args = os_args(&[
+            "issue",
+            "edit",
+            "42",
+            "--add-label",
+            "triaged,p1",
+            "--remove-label=needs-triage",
+            "--repo",
+            "CortexKit/AFT",
+        ]);
+
+        let delegated = Cell::new(0);
+        let status = dispatch_r3(
+            &args,
+            classify(&args, &manifest, "macos"),
+            &manifest,
+            &paths,
+            &rung,
+            &binding,
+            TEST_NOW,
+            |delegated_args| {
+                // Stand-in for upstream gh: the audit line must already be on
+                // disk when it starts, so a crash mid-call is still recorded.
+                assert!(
+                    paths.bypass_audit.exists(),
+                    "the bypass audit must exist before upstream gh runs"
+                );
+                let (records, error) = read_bypass_audit(&paths);
+                assert!(error.is_none(), "{error:?}");
+                assert_eq!(
+                    records.expect("audit records"),
+                    vec![json!({
+                        "as_of_unix_secs": TEST_NOW,
+                        "tuple": "issue edit",
+                        "repository": "cortexkit/aft",
+                        "issue_number": 42,
+                        "labels_added": ["triaged", "p1"],
+                        "labels_removed": ["needs-triage"],
+                    })]
+                );
+                assert_eq!(delegated_args, args, "upstream gh gets the argv unchanged");
+                delegated.set(delegated.get() + 1);
+                73
+            },
+        );
+        assert_eq!(status, 73);
+        assert_eq!(delegated.get(), 1);
+
+        // A label edit carrying a body refuses before the audit or upstream.
+        let with_body = os_args(&["issue", "edit", "42", "--add-label", "bug", "--body", "x"]);
+        let status = dispatch_r3(
+            &with_body,
+            classify(&with_body, &manifest, "macos"),
+            &manifest,
+            &paths,
+            &rung,
+            &binding,
+            TEST_NOW,
+            |_| panic!("a non-label issue edit reached upstream gh under the bypass"),
+        );
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
+
+        // Under the deployed v13 manifest the row does not exist: the same
+        // argv stays unclassified, and the bypass does not reach it.
+        let v13 = v13_manifest();
+        assert_eq!(v13.manifest_version, 13);
+        let classification = classify(&args, &v13, "macos");
+        assert!(matches!(classification, Classification::Unclassified));
+        let status = dispatch_r3(
+            &args,
+            classification,
+            &v13,
+            &paths,
+            &rung,
+            &binding,
+            TEST_NOW,
+            |_| panic!("v13 issue edit reached upstream gh under the bypass"),
+        );
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
     }
 
     #[test]
