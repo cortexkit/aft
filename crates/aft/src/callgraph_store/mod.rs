@@ -2492,6 +2492,10 @@ pub struct RefreshFilesProfile {
     pub dependent_parse: Duration,
     pub index_load: Duration,
     pub index_loads: usize,
+    /// Stored files whose index (nodes and module refs) the resolver loaded.
+    pub index_files_loaded: usize,
+    /// `files`, `nodes` and `refs` rows read to build those file indexes.
+    pub index_rows_read: usize,
     pub ref_resolution: Duration,
     pub method_dispatch: Duration,
     pub commit: Duration,
@@ -2501,7 +2505,7 @@ pub struct RefreshFilesProfile {
 impl RefreshFilesProfile {
     pub fn report(&self) -> String {
         format!(
-            "parse={}ms dependency_selection={}ms created_file_scan={}ms row_deletes={}ms row_inserts={}ms dependent_parse={}ms index_load={}ms ref_resolution={}ms method_dispatch={}ms commit={}ms total={}ms",
+            "parse={}ms dependency_selection={}ms created_file_scan={}ms row_deletes={}ms row_inserts={}ms dependent_parse={}ms index_load={}ms index_files_loaded={} index_rows_read={} ref_resolution={}ms method_dispatch={}ms commit={}ms total={}ms",
             self.parse.as_millis(),
             self.dependency_selection.as_millis(),
             self.created_file_scan.as_millis(),
@@ -2509,6 +2513,8 @@ impl RefreshFilesProfile {
             self.row_inserts.as_millis(),
             self.dependent_parse.as_millis(),
             self.index_load.as_millis(),
+            self.index_files_loaded,
+            self.index_rows_read,
             self.ref_resolution.as_millis(),
             self.method_dispatch.as_millis(),
             self.commit.as_millis(),
@@ -4922,6 +4928,7 @@ impl CallGraphStore {
             &self.project_root,
             &caller_extracts,
             workspace_crate_prefixes,
+            &mut profile,
         )?;
         profile.index_load += started.elapsed();
 
@@ -11470,6 +11477,7 @@ impl<'a> ProjectIndex<'a> {
         project_root: &Path,
         caller_extracts: &'a HashMap<String, FileExtract>,
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
+        profile: &mut RefreshFilesProfile,
     ) -> Result<Self> {
         // Incremental refreshes get a fresh snapshot memo so a watcher rewrite can
         // never observe declarations retained by an earlier refresh generation.
@@ -11489,7 +11497,9 @@ impl<'a> ProjectIndex<'a> {
             &caller_paths,
             &module_resolution_memo,
             &facts,
+            &mut profile.index_rows_read,
         )?;
+        profile.index_files_loaded += files.len();
         let caller_indexes = caller_extracts
             .iter()
             .map(|(rel_path, extract)| {
@@ -11775,6 +11785,7 @@ fn load_db_file_indexes(
     extra_indexed_files: &HashSet<String>,
     module_resolution_memo: &callgraph::ModuleResolutionMemo,
     facts: &FactPaths<'_>,
+    rows_read: &mut usize,
 ) -> Result<HashMap<String, DbFileIndex>> {
     let mut files = HashMap::new();
     let mut stmt = tx.prepare("SELECT path, lang FROM files")?;
@@ -11783,6 +11794,7 @@ fn load_db_file_indexes(
     })?;
     for row in rows {
         let (rel_path, lang) = row?;
+        *rows_read += 1;
         files.insert(rel_path, DbFileIndex::empty(lang_from_label(&lang)));
     }
 
@@ -11803,6 +11815,7 @@ fn load_db_file_indexes(
     })?;
     for row in nodes {
         let (file_path, id, name, scoped_name, kind, exported, is_default_export) = row?;
+        *rows_read += 1;
         files
             .entry(file_path)
             .or_insert_with(|| DbFileIndex::empty(None))
@@ -11834,6 +11847,7 @@ fn load_db_file_indexes(
     })?;
     for row in ref_rows {
         let (caller_file, raw) = row?;
+        *rows_read += 1;
         if let Some(file) = files.get_mut(&caller_file) {
             file.note_module_ref(
                 project_root,
