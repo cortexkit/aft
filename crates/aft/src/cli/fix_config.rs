@@ -14,7 +14,10 @@ use aft::config_fix::{fix_files, fix_targets};
 
 pub fn run(args: Vec<OsString>) -> i32 {
     if let Some(arg) = args.first() {
-        eprintln!("usage: aft fix-config (unexpected argument {})", arg.to_string_lossy());
+        eprintln!(
+            "usage: aft fix-config (unexpected argument {})",
+            arg.to_string_lossy()
+        );
         return 2;
     }
     let cwd = match std::env::current_dir() {

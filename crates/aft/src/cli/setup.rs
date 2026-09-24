@@ -79,10 +79,14 @@ fn parse_args(args: Vec<OsString>, env_harness: Option<String>) -> Result<Args, 
     let mut harness_flag = None;
     let mut plan_version = None;
     let mut quiet_load_warnings = false;
-    let mut args = args.into_iter().map(|arg| arg.to_string_lossy().into_owned());
+    let mut args = args
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned());
     while let Some(arg) = args.next() {
         let (flag, inline) = match arg.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
+            Some((flag, value)) if flag.starts_with("--") => {
+                (flag.to_string(), Some(value.to_string()))
+            }
             _ => (arg.clone(), None),
         };
         let mut value = |name: &str| {
@@ -103,13 +107,23 @@ fn parse_args(args: Vec<OsString>, env_harness: Option<String>) -> Result<Args, 
     }
     let mode = match modes.as_slice() {
         [mode] => mode.clone(),
-        [] => return Err(SetupError::usage("choose one of --plan, --answers or --yes")),
+        [] => {
+            return Err(SetupError::usage(
+                "choose one of --plan, --answers or --yes",
+            ))
+        }
         _ if modes.iter().any(|mode| *mode == Mode::Yes)
             && modes.iter().any(|mode| matches!(mode, Mode::Answers(_))) =>
         {
-            return Err(SetupError::usage("--yes and --answers are mutually exclusive"))
+            return Err(SetupError::usage(
+                "--yes and --answers are mutually exclusive",
+            ))
         }
-        _ => return Err(SetupError::usage("choose only one of --plan, --answers or --yes")),
+        _ => {
+            return Err(SetupError::usage(
+                "choose only one of --plan, --answers or --yes",
+            ))
+        }
     };
     if let Some(version) = plan_version {
         if mode != Mode::Plan {
@@ -138,8 +152,9 @@ pub struct SetupPaths {
 }
 
 pub fn run(args: Vec<OsString>) -> Result<(), SetupError> {
-    let cwd = std::env::current_dir()
-        .map_err(|error| SetupError::failed(format!("could not determine current directory: {error}")))?;
+    let cwd = std::env::current_dir().map_err(|error| {
+        SetupError::failed(format!("could not determine current directory: {error}"))
+    })?;
     let paths = SetupPaths {
         cwd,
         user_config_path: aft::subc_config::cortexkit_user_config_path(),
@@ -159,13 +174,14 @@ pub fn run(args: Vec<OsString>) -> Result<(), SetupError> {
 fn read_answers(source: &str, stdin: &mut dyn Read) -> Result<String, SetupError> {
     if source == "-" {
         let mut text = String::new();
-        stdin
-            .read_to_string(&mut text)
-            .map_err(|error| SetupError::failed(format!("could not read answers from stdin: {error}")))?;
+        stdin.read_to_string(&mut text).map_err(|error| {
+            SetupError::failed(format!("could not read answers from stdin: {error}"))
+        })?;
         Ok(text)
     } else {
-        std::fs::read_to_string(source)
-            .map_err(|error| SetupError::failed(format!("could not read answers {source}: {error}")))
+        std::fs::read_to_string(source).map_err(|error| {
+            SetupError::failed(format!("could not read answers {source}: {error}"))
+        })
     }
 }
 
@@ -189,8 +205,8 @@ fn run_with(
         )),
     };
 
-    let inputs = read_inputs(paths.user_config_path.as_deref(), &paths.cwd)
-        .map_err(SetupError::failed)?;
+    let inputs =
+        read_inputs(paths.user_config_path.as_deref(), &paths.cwd).map_err(SetupError::failed)?;
     let outcome = derive_plan(&inputs, args.harness, observer, phase).map_err(|errors| {
         SetupError::failed(format!(
             "{}\nAFT cannot load this configuration. Run `aft doctor --fix` to migrate it, then rerun setup.",
@@ -253,7 +269,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("repo");
         std::fs::create_dir_all(&project).unwrap();
-        let user_path = dir.path().join("config").join("cortexkit").join("aft.jsonc");
+        let user_path = dir
+            .path()
+            .join("config")
+            .join("cortexkit")
+            .join("aft.jsonc");
         if let Some(text) = user {
             std::fs::create_dir_all(user_path.parent().unwrap()).unwrap();
             std::fs::write(&user_path, text).unwrap();
@@ -360,7 +380,12 @@ mod tests {
         let (_, from_env, _) = invoke(&fixture, &["--plan"], Some("pi"), "");
         assert_eq!(plan_row(&from_env, "aft_outline")["effective"], "off");
         assert_eq!(plan_row(&from_env, "aft_zoom")["effective"], "ready");
-        let (_, from_flag, _) = invoke(&fixture, &["--plan", "--harness", "opencode"], Some("pi"), "");
+        let (_, from_flag, _) = invoke(
+            &fixture,
+            &["--plan", "--harness", "opencode"],
+            Some("pi"),
+            "",
+        );
         assert_eq!(plan_row(&from_flag, "aft_zoom")["effective"], "off");
         assert_eq!(plan_row(&from_flag, "aft_outline")["effective"], "ready");
         let (_, neither, _) = invoke(&fixture, &["--plan"], None, "");
@@ -388,11 +413,7 @@ mod tests {
     fn rejected_configuration_fails_every_mode_without_output_or_writes() {
         let original = r#"{"gh_shim": {"enabled": false}}"#;
         let fixture = fixture(Some(original));
-        for args in [
-            vec!["--plan"],
-            vec!["--yes"],
-            vec!["--answers", "-"],
-        ] {
+        for args in [vec!["--plan"], vec!["--yes"], vec!["--answers", "-"]] {
             let (result, stdout, _) = invoke(
                 &fixture,
                 &args,
@@ -400,7 +421,10 @@ mod tests {
                 r#"{"plan_version": 1, "selections": {"aft_move": true}}"#,
             );
             let error = result.unwrap_err().to_string();
-            assert!(error.contains("removed_config_key:gh_shim:use:github.shim"), "{error}");
+            assert!(
+                error.contains("removed_config_key:gh_shim:use:github.shim"),
+                "{error}"
+            );
             assert!(error.contains("aft doctor --fix"), "{error}");
             assert!(stdout.is_empty());
             assert_eq!(user_text(&fixture).as_deref(), Some(original));
@@ -429,7 +453,10 @@ mod tests {
         );
         result.unwrap();
         let text = user_text(&fixture).unwrap();
-        assert!(text.contains("// mine") && text.contains("\"disabled_tools\": []"), "{text}");
+        assert!(
+            text.contains("// mine") && text.contains("\"disabled_tools\": []"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -447,8 +474,12 @@ mod tests {
         let (result, stdout, _) = invoke_with(&fixture, &["--yes"], None, "", &Ready);
         result.unwrap();
         assert!(stdout.contains("written"));
-        let written: serde_json::Value = serde_json::from_str(&user_text(&fixture).unwrap()).unwrap();
-        assert_eq!(written["disabled_tools"], serde_json::json!(["aft_delete", "aft_move"]));
+        let written: serde_json::Value =
+            serde_json::from_str(&user_text(&fixture).unwrap()).unwrap();
+        assert_eq!(
+            written["disabled_tools"],
+            serde_json::json!(["aft_delete", "aft_move"])
+        );
         assert_eq!(written["indexes"]["semantic"], true);
     }
 }

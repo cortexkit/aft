@@ -45,7 +45,8 @@ impl FeatureObserver for Observed {
     fn index(&self, _plane: IndexPlane) -> IndexObservation {
         IndexObservation {
             effective: self.index,
-            unavailable_reason: (self.index == Effective::Unavailable).then(|| "backend_missing".to_string()),
+            unavailable_reason: (self.index == Effective::Unavailable)
+                .then(|| "backend_missing".to_string()),
         }
     }
     fn semantic_unsupported(&self) -> Option<String> {
@@ -105,14 +106,22 @@ fn plan_tuples_equal_the_committed_catalog() {
 
     let exclusions = catalog["exclusions"].as_array().unwrap();
     for excluded in exclusions.iter().filter_map(Value::as_str) {
-        assert!(catalog_entry(excluded).is_none(), "{excluded} must not be a row");
+        assert!(
+            catalog_entry(excluded).is_none(),
+            "{excluded} must not be a row"
+        );
     }
 }
 
 #[test]
 fn plan_rows_carry_exactly_the_v1_fields() {
     let emitted = serde_json::to_value(plan(&ConfigInputs::default(), None)).unwrap();
-    let top: BTreeSet<&str> = emitted.as_object().unwrap().keys().map(String::as_str).collect();
+    let top: BTreeSet<&str> = emitted
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     assert_eq!(top, BTreeSet::from(["plan_version", "features"]));
     let expected: BTreeSet<&str> = BTreeSet::from([
         "id",
@@ -134,7 +143,12 @@ fn plan_rows_carry_exactly_the_v1_fields() {
         "prerequisites",
     ]);
     for row in emitted["features"].as_array().unwrap() {
-        let keys: BTreeSet<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: BTreeSet<&str> = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(keys, expected);
     }
     // Semantic indexing explains its download and CPU cost.
@@ -154,9 +168,19 @@ fn harness_selectors_equal_the_committed_list() {
         .collect();
     assert_eq!(accepted, SETUP_HARNESS_SELECTORS);
     for selector in SETUP_HARNESS_SELECTORS {
-        assert_eq!(SetupHarness::from_selector(selector).unwrap().selector(), selector);
+        assert_eq!(
+            SetupHarness::from_selector(selector).unwrap().selector(),
+            selector
+        );
     }
-    for rejected in ["opencode-v1", "opencode-v2", "runner", "mcp:x", "", "OpenCode"] {
+    for rejected in [
+        "opencode-v1",
+        "opencode-v2",
+        "runner",
+        "mcp:x",
+        "",
+        "OpenCode",
+    ] {
         assert!(SetupHarness::from_selector(rejected).is_err(), "{rejected}");
     }
     assert_eq!(SetupHarness::Omp.runtime_harness(), Harness::Pi);
@@ -209,7 +233,10 @@ fn explicitly_enabled_indexes_report_configured_and_observed_states_keep_it() {
         assert_eq!(row["available"], json!(true));
         assert_eq!(row["reason"], json!("configured"));
         assert_eq!(row["unavailable_reason"], Value::Null);
-        assert_eq!(matrix(&plan, "indexes.callgraph")["reason"], json!("default"));
+        assert_eq!(
+            matrix(&plan, "indexes.callgraph")["reason"],
+            json!("default")
+        );
     }
 }
 
@@ -262,7 +289,10 @@ fn write_implied_read_row_is_exactly_the_literal_matrix_row() {
     assert_eq!(matrix(&plan, "github.write")["effective"], json!("ready"));
 
     // Read absent as well: same derivation, now default-sourced.
-    let absent = plan_with(&user(r#"{"github": {"write": true}}"#), &NoRuntimeObservation);
+    let absent = plan_with(
+        &user(r#"{"github": {"write": true}}"#),
+        &NoRuntimeObservation,
+    );
     let row = matrix(&absent, "github.read");
     assert_eq!(row["configured"], json!(false));
     assert_eq!(row["effective"], json!("ready"));
@@ -281,14 +311,19 @@ fn write_implied_read_row_is_exactly_the_literal_matrix_row() {
     );
 
     // Independently enabled read keeps its own derivation.
-    let both = plan_with(&user(r#"{"github": {"write": true, "read": true}}"#), &NoRuntimeObservation);
+    let both = plan_with(
+        &user(r#"{"github": {"write": true, "read": true}}"#),
+        &NoRuntimeObservation,
+    );
     assert_eq!(matrix(&both, "github.read")["reason"], json!("configured"));
 }
 
 #[test]
 fn registered_runtime_blocked_tools_stay_ready_with_a_separate_cause() {
     let plan = plan(
-        &user(r#"{"disabled_tools": [], "backup": {"enabled": false}, "inspect": {"enabled": false}, "bash": {"enabled": false}}"#),
+        &user(
+            r#"{"disabled_tools": [], "backup": {"enabled": false}, "inspect": {"enabled": false}, "bash": {"enabled": false}}"#,
+        ),
         None,
     );
     for (id, cause) in [
@@ -328,24 +363,51 @@ fn harness_and_project_context_change_effective_state_but_not_base_choices() {
     let none = plan(&outside, None);
     let project = plan(&inside, Some(SetupHarness::Opencode));
 
-    assert_eq!(opencode.feature("aft_zoom").unwrap().effective, Effective::Off);
+    assert_eq!(
+        opencode.feature("aft_zoom").unwrap().effective,
+        Effective::Off
+    );
     assert_eq!(pi.feature("aft_zoom").unwrap().effective, Effective::Ready);
-    assert_eq!(none.feature("aft_zoom").unwrap().effective, Effective::Ready);
-    assert_eq!(pi.feature("indexes.callgraph").unwrap().effective, Effective::Off);
-    assert_eq!(pi.feature("indexes.callgraph").unwrap().reason, Some(REASON_CONFIGURED));
-    assert_eq!(opencode.feature("indexes.callgraph").unwrap().effective, Effective::Unavailable);
+    assert_eq!(
+        none.feature("aft_zoom").unwrap().effective,
+        Effective::Ready
+    );
+    assert_eq!(
+        pi.feature("indexes.callgraph").unwrap().effective,
+        Effective::Off
+    );
+    assert_eq!(
+        pi.feature("indexes.callgraph").unwrap().reason,
+        Some(REASON_CONFIGURED)
+    );
+    assert_eq!(
+        opencode.feature("indexes.callgraph").unwrap().effective,
+        Effective::Unavailable
+    );
     assert_eq!(omp, pi, "omp resolves the pi harness block");
 
     // Inside the project: project disables and index offs apply; protected
     // slots and project re-enables are ignored.
-    assert_eq!(project.feature("aft_outline").unwrap().effective, Effective::Off);
-    assert_eq!(none.feature("aft_outline").unwrap().effective, Effective::Ready);
+    assert_eq!(
+        project.feature("aft_outline").unwrap().effective,
+        Effective::Off
+    );
+    assert_eq!(
+        none.feature("aft_outline").unwrap().effective,
+        Effective::Ready
+    );
     assert_eq!(
         matrix(&project, "read"),
         json!({"configured": true, "source": "config", "effective": "ready", "available": true, "reason": "configured", "unavailable_reason": null})
     );
-    assert_eq!(project.feature("indexes.trigram").unwrap().effective, Effective::Off);
-    assert_eq!(project.feature("indexes.trigram").unwrap().reason, Some(REASON_CONFIGURED));
+    assert_eq!(
+        project.feature("indexes.trigram").unwrap().effective,
+        Effective::Off
+    );
+    assert_eq!(
+        project.feature("indexes.trigram").unwrap().reason,
+        Some(REASON_CONFIGURED)
+    );
 
     for (a, b) in [(&opencode, &pi), (&opencode, &project), (&pi, &none)] {
         for (left, right) in a.features.iter().zip(&b.features) {
@@ -359,7 +421,10 @@ fn harness_and_project_context_change_effective_state_but_not_base_choices() {
 
 #[test]
 fn default_membership_disabled_by_a_later_tier_becomes_configured() {
-    let inputs = with_project(ConfigInputs::default(), r#"{"disabled_tools": ["aft_zoom"]}"#);
+    let inputs = with_project(
+        ConfigInputs::default(),
+        r#"{"disabled_tools": ["aft_zoom"]}"#,
+    );
     let plan = plan(&inputs, None);
     assert_eq!(matrix(&plan, "aft_zoom")["reason"], json!("configured"));
     assert_eq!(matrix(&plan, "aft_zoom")["source"], json!("default"));
@@ -383,13 +448,25 @@ fn rejected_configuration_produces_no_plan() {
         PolicyPhase::Rejecting,
     )
     .unwrap_err();
-    assert_eq!(errors, vec!["removed_config_key:search_index:use:indexes.trigram"]);
-    assert!(derive_plan(&user("{ nope"), None, &NoRuntimeObservation, PolicyPhase::Window).is_err());
+    assert_eq!(
+        errors,
+        vec!["removed_config_key:search_index:use:indexes.trigram"]
+    );
+    assert!(derive_plan(
+        &user("{ nope"),
+        None,
+        &NoRuntimeObservation,
+        PolicyPhase::Window
+    )
+    .is_err());
 }
 
 #[test]
 fn in_window_legacy_inputs_count_as_configured_choices() {
-    let plan = plan(&user(r#"{"tool_surface": "all", "semantic_search": false}"#), None);
+    let plan = plan(
+        &user(r#"{"tool_surface": "all", "semantic_search": false}"#),
+        None,
+    );
     assert_eq!(matrix(&plan, "aft_move")["source"], json!("config"));
     assert_eq!(matrix(&plan, "aft_move")["effective"], json!("ready"));
     assert_eq!(matrix(&plan, "indexes.semantic")["source"], json!("config"));
@@ -402,7 +479,10 @@ fn answers_are_validated_before_anything_is_written() {
         parse_answers(r#"{"plan_version": 2, "selections": {}}"#).unwrap_err(),
         UNSUPPORTED_PLAN_VERSION
     );
-    assert_eq!(parse_answers(r#"{"selections": {}}"#).unwrap_err(), UNSUPPORTED_PLAN_VERSION);
+    assert_eq!(
+        parse_answers(r#"{"selections": {}}"#).unwrap_err(),
+        UNSUPPORTED_PLAN_VERSION
+    );
     assert_eq!(
         parse_answers(r#"{"plan_version": 1, "selections": {"aft_nope": true}}"#).unwrap_err(),
         "unknown_feature_id:aft_nope"
@@ -467,7 +547,10 @@ fn yes_on_an_existing_file_keeps_explicit_choices_and_fills_the_rest() {
     let (value, write) = written(Some(existing), SetupSelections::Yes);
     assert!(write.text.contains("// user comment"));
     assert_eq!(value["edit_mode"], json!("hashline"));
-    assert_eq!(value["indexes"], json!({"semantic": false, "trigram": true, "callgraph": true}));
+    assert_eq!(
+        value["indexes"],
+        json!({"semantic": false, "trigram": true, "callgraph": true})
+    );
     assert_eq!(value["github"], json!({"read": true, "write": false}));
     assert_eq!(value["disabled_tools"], json!(["aft_delete", "aft_move"]));
 }
@@ -477,7 +560,12 @@ fn yes_on_an_existing_file_keeps_explicit_choices_and_fills_the_rest() {
 #[test]
 fn write_only_github_leaves_read_absent() {
     let (value, _) = written(Some(r#"{"github": {"write": true}}"#), SetupSelections::Yes);
-    let github: BTreeSet<&str> = value["github"].as_object().unwrap().keys().map(String::as_str).collect();
+    let github: BTreeSet<&str> = value["github"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     assert_eq!(github, BTreeSet::from(["write"]));
     assert_eq!(value["github"]["write"], json!(true));
 
@@ -485,20 +573,33 @@ fn write_only_github_leaves_read_absent() {
     assert_eq!(value["github"], json!({"write": true}));
 
     // An independently explicit read choice survives unless edited.
-    let (value, _) = written(Some(r#"{"github": {"read": false, "write": true}}"#), SetupSelections::Yes);
+    let (value, _) = written(
+        Some(r#"{"github": {"read": false, "write": true}}"#),
+        SetupSelections::Yes,
+    );
     assert_eq!(value["github"], json!({"read": false, "write": true}));
     let resolved = plan(&user(&serde_json::to_string(&value).unwrap()), None);
-    assert_eq!(resolved.feature("github.read").unwrap().effective, Effective::Ready);
+    assert_eq!(
+        resolved.feature("github.read").unwrap().effective,
+        Effective::Ready
+    );
 }
 
 #[test]
 fn partial_answers_preserve_omitted_base_fields() {
-    let existing = r#"{"github": {"write": true}, "harnesses": {"pi": {"disabled_tools": ["aft_zoom"]}}}"#;
+    let existing =
+        r#"{"github": {"write": true}, "harnesses": {"pi": {"disabled_tools": ["aft_zoom"]}}}"#;
     let (value, _) = written(Some(existing), answers(&[("aft_move", true)]));
     assert_eq!(value["disabled_tools"], json!(["aft_delete"]));
-    assert!(value.get("indexes").is_none(), "omitted indexes stay omitted");
+    assert!(
+        value.get("indexes").is_none(),
+        "omitted indexes stay omitted"
+    );
     assert_eq!(value["github"], json!({"write": true}));
-    assert_eq!(value["harnesses"], json!({"pi": {"disabled_tools": ["aft_zoom"]}}));
+    assert_eq!(
+        value["harnesses"],
+        json!({"pi": {"disabled_tools": ["aft_zoom"]}})
+    );
 }
 
 #[test]
@@ -508,9 +609,15 @@ fn empty_desired_disables_write_a_literal_empty_list() {
     assert!(write.text.contains("\"disabled_tools\": []"));
     // `[]` and absence resolve differently: absence restores the default disables.
     let explicit = plan(&user(&write.text), None);
-    assert_eq!(explicit.feature("aft_move").unwrap().effective, Effective::Ready);
+    assert_eq!(
+        explicit.feature("aft_move").unwrap().effective,
+        Effective::Ready
+    );
     let absent = plan(&user("{}"), None);
-    assert_eq!(absent.feature("aft_move").unwrap().effective, Effective::Off);
+    assert_eq!(
+        absent.feature("aft_move").unwrap().effective,
+        Effective::Off
+    );
 }
 
 #[test]
@@ -528,18 +635,39 @@ fn unknown_disabled_entries_are_preserved_and_reported() {
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert!(list.contains(&"aft_future_tool") && list.contains(&"typo_name"), "{list:?}");
-        assert_eq!(write.unknown_disabled_tools, vec!["aft_future_tool", "typo_name"]);
+        assert!(
+            list.contains(&"aft_future_tool") && list.contains(&"typo_name"),
+            "{list:?}"
+        );
+        assert_eq!(
+            write.unknown_disabled_tools,
+            vec!["aft_future_tool", "typo_name"]
+        );
     }
-    let outcome = derive_plan(&user(existing), None, &NoRuntimeObservation, PolicyPhase::Window).unwrap();
-    assert_eq!(outcome.unknown_disabled_tools, vec!["aft_future_tool", "typo_name"]);
+    let outcome = derive_plan(
+        &user(existing),
+        None,
+        &NoRuntimeObservation,
+        PolicyPhase::Window,
+    )
+    .unwrap();
+    assert_eq!(
+        outcome.unknown_disabled_tools,
+        vec!["aft_future_tool", "typo_name"]
+    );
     let warning = unknown_disabled_warning(&outcome.unknown_disabled_tools).unwrap();
-    assert!(warning.starts_with("unknown_disabled_tools:") && warning.ends_with("aft_future_tool, typo_name"));
+    assert!(
+        warning.starts_with("unknown_disabled_tools:")
+            && warning.ends_with("aft_future_tool, typo_name")
+    );
 }
 
 #[test]
 fn historical_aliases_are_written_canonically() {
-    let (value, write) = written(Some(r#"{"disabled_tools": ["aft_glob", "aft_move"]}"#), SetupSelections::Yes);
+    let (value, write) = written(
+        Some(r#"{"disabled_tools": ["aft_glob", "aft_move"]}"#),
+        SetupSelections::Yes,
+    );
     assert_eq!(value["disabled_tools"], json!(["aft_move", "glob"]));
     assert!(write.unknown_disabled_tools.is_empty());
 }
@@ -555,7 +683,11 @@ fn unsupported_default_semantic_is_saved_false_only_when_the_save_covers_it() {
     assert_eq!(value["indexes"]["semantic"], json!(false));
     let (value, _) = written_with(Some("{}"), answers(&[("aft_move", true)]), &unsupported);
     assert!(value.get("indexes").is_none());
-    let (value, _) = written_with(Some(r#"{"indexes": {"semantic": true}}"#), SetupSelections::Yes, &unsupported);
+    let (value, _) = written_with(
+        Some(r#"{"indexes": {"semantic": true}}"#),
+        SetupSelections::Yes,
+        &unsupported,
+    );
     assert_eq!(value["indexes"]["semantic"], json!(true));
 }
 
@@ -565,5 +697,8 @@ fn setup_writes_only_the_base_and_keeps_comments_and_unrelated_keys() {
     let (value, write) = written(Some(existing), answers(&[("indexes.semantic", true)]));
     assert!(write.text.contains("// why hashline") && write.text.contains("/* block */"));
     assert_eq!(value["indexes"], json!({"semantic": true}));
-    assert_eq!(value["harnesses"], json!({"opencode": {"indexes": {"semantic": false}}}));
+    assert_eq!(
+        value["harnesses"],
+        json!({"opencode": {"indexes": {"semantic": false}}})
+    );
 }

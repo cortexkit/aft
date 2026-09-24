@@ -29,15 +29,25 @@ fn resolved(doc: &str, tier: &str, harness: Option<&Harness>, phase: PolicyPhase
     })
 }
 
-/// Fixing a file must preserve the intent the translation window derives from
-/// it, and the fixed file must load after the window closes.
+/// Fixing a file must preserve the values ordinary loading derives from its
+/// retired keys while it still accepts them (`PolicyPhase::Window`), and the
+/// fixed file must load once those keys are rejected (`PolicyPhase::Rejecting`).
 fn assert_fix_preserves_intent(doc: &str, tier: FixTier) -> Migration {
-    let tier_name = if tier == FixTier::User { "user" } else { "project" };
+    let tier_name = if tier == FixTier::User {
+        "user"
+    } else {
+        "project"
+    };
     let migration = migrate_config_text(doc, tier).unwrap();
     assert!(migration.changed, "{doc} needed migration");
     for harness in [None, Some(Harness::Opencode), Some(Harness::Pi)] {
         let before = resolved(doc, tier_name, harness.as_ref(), PolicyPhase::Window);
-        let after = resolved(&migration.text, tier_name, harness.as_ref(), PolicyPhase::Rejecting);
+        let after = resolved(
+            &migration.text,
+            tier_name,
+            harness.as_ref(),
+            PolicyPhase::Rejecting,
+        );
         assert_eq!(before, after, "{doc}\n=>\n{}", migration.text);
     }
     let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&migration.text)).unwrap();
@@ -68,7 +78,11 @@ fn legacy_registration_and_index_keys_become_canonical() {
         for (retired, _) in RETIRED_PATHS {
             let value: Value = serde_json::from_str(&migration.text).unwrap();
             let pointer = format!("/{}", retired.replace('.', "/"));
-            assert!(value.pointer(&pointer).is_none(), "{retired} left in {}", migration.text);
+            assert!(
+                value.pointer(&pointer).is_none(),
+                "{retired} left in {}",
+                migration.text
+            );
         }
     }
 }
@@ -84,8 +98,17 @@ fn an_empty_generated_base_list_is_persisted() {
 fn comments_and_unrelated_keys_survive_a_fix() {
     let doc = "{\n  // pick the fast path\n  \"edit_mode\": \"hashline\",\n  /* old */\n  \"search_index\": false,\n  \"harnesses\": {\n    // pi only\n    \"pi\": {\"hoist_builtin_tools\": false}\n  }\n}\n";
     let migration = assert_fix_preserves_intent(doc, FixTier::User);
-    for kept in ["// pick the fast path", "/* old */", "// pi only", "\"edit_mode\": \"hashline\""] {
-        assert!(migration.text.contains(kept), "{kept} missing from {}", migration.text);
+    for kept in [
+        "// pick the fast path",
+        "/* old */",
+        "// pi only",
+        "\"edit_mode\": \"hashline\"",
+    ] {
+        assert!(
+            migration.text.contains(kept),
+            "{kept} missing from {}",
+            migration.text
+        );
     }
 }
 
@@ -115,7 +138,10 @@ fn retired_github_aliases_are_repaired_only_here() {
         json!({"gh_shim": {"binary_path": "/opt/aft"}, "github": {"read": true, "shim": false}})
     );
     let after = resolved(&migration.text, "user", None, PolicyPhase::Rejecting);
-    assert_eq!(after["github"], json!({"shim": false, "read": true, "write": false}));
+    assert_eq!(
+        after["github"],
+        json!({"shim": false, "read": true, "write": false})
+    );
 
     // Canonical leaves win over the aliases; conflicts are reported.
     let migration = migrate_config_text(
@@ -125,7 +151,10 @@ fn retired_github_aliases_are_repaired_only_here() {
     .unwrap();
     let value: Value = serde_json::from_str(&migration.text).unwrap();
     assert_eq!(value, json!({"github": {"read": false, "shim": true}}));
-    assert!(migration.notes.iter().any(|note| note.contains("gh_read.enabled=true ignored")));
+    assert!(migration
+        .notes
+        .iter()
+        .any(|note| note.contains("gh_read.enabled=true ignored")));
 
     // The master switch's generated value outranks the older alias.
     let migration = migrate_config_text(
@@ -134,8 +163,14 @@ fn retired_github_aliases_are_repaired_only_here() {
     )
     .unwrap();
     let value: Value = serde_json::from_str(&migration.text).unwrap();
-    assert_eq!(value, json!({"github": {"read": false, "write": false, "shim": false}}));
-    assert!(migration.notes.iter().any(|note| note.contains("gh_shim.enabled=true ignored")));
+    assert_eq!(
+        value,
+        json!({"github": {"read": false, "write": false, "shim": false}})
+    );
+    assert!(migration
+        .notes
+        .iter()
+        .any(|note| note.contains("gh_shim.enabled=true ignored")));
 }
 
 #[test]
@@ -148,17 +183,27 @@ fn project_fixes_never_materialize_protected_disables() {
         .iter()
         .filter_map(Value::as_str)
         .collect();
-    for protected in feature_config::HOST_TOOL_NAMES.iter().chain(["aft_safety"].iter()) {
+    for protected in feature_config::HOST_TOOL_NAMES
+        .iter()
+        .chain(["aft_safety"].iter())
+    {
         assert!(!list.contains(protected), "{protected}");
-        assert!(migration.notes.iter().any(|note| note.contains(&format!("disable {protected};"))));
+        assert!(migration
+            .notes
+            .iter()
+            .any(|note| note.contains(&format!("disable {protected};"))));
     }
     assert!(list.contains(&"aft_zoom"));
 
-    let migration = assert_fix_preserves_intent(r#"{"hoist_builtin_tools": false}"#, FixTier::Project);
+    let migration =
+        assert_fix_preserves_intent(r#"{"hoist_builtin_tools": false}"#, FixTier::Project);
     let value: Value = serde_json::from_str(&migration.text).unwrap();
     let list = value["disabled_tools"].as_array().unwrap();
     assert!(
-        !list.iter().filter_map(Value::as_str).any(feature_config::is_project_protected_tool),
+        !list
+            .iter()
+            .filter_map(Value::as_str)
+            .any(feature_config::is_project_protected_tool),
         "{list:?}"
     );
 }
@@ -170,12 +215,18 @@ fn a_multi_file_run_keeps_successful_repairs_when_another_file_fails() {
     let bad = dir.path().join("project.jsonc");
     std::fs::write(&good, r#"{"search_index": false}"#).unwrap();
     std::fs::write(&bad, r#"{"search_index": false"#).unwrap();
-    let outcomes = fix_files(&[(good.clone(), FixTier::User), (bad.clone(), FixTier::Project)]);
+    let outcomes = fix_files(&[
+        (good.clone(), FixTier::User),
+        (bad.clone(), FixTier::Project),
+    ]);
     assert_eq!(outcomes[0].status, "rewritten");
     assert_eq!(outcomes[1].status, "failed");
     let fixed: Value = serde_json::from_str(&std::fs::read_to_string(&good).unwrap()).unwrap();
     assert_eq!(fixed, json!({"indexes": {"trigram": false}}));
-    assert_eq!(std::fs::read_to_string(&bad).unwrap(), r#"{"search_index": false"#);
+    assert_eq!(
+        std::fs::read_to_string(&bad).unwrap(),
+        r#"{"search_index": false"#
+    );
 }
 
 #[test]
@@ -185,7 +236,10 @@ fn without_a_project_file_only_the_user_file_is_a_target() {
     std::fs::write(&user, "{}").unwrap();
     let cwd = dir.path().join("elsewhere");
     std::fs::create_dir_all(&cwd).unwrap();
-    assert_eq!(fix_targets(Some(&user), &cwd), vec![(user.clone(), FixTier::User)]);
+    assert_eq!(
+        fix_targets(Some(&user), &cwd),
+        vec![(user.clone(), FixTier::User)]
+    );
     std::fs::create_dir_all(cwd.join(".cortexkit")).unwrap();
     std::fs::write(cwd.join(".cortexkit/aft.jsonc"), "{}").unwrap();
     assert_eq!(fix_targets(None, &cwd).len(), 1);

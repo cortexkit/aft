@@ -567,7 +567,10 @@ mod tests {
         doc.set(&["github", "write"], &json!(true)).unwrap();
         doc.set(&["disabled_tools"], &json!([])).unwrap();
         let value = doc.value().unwrap();
-        assert_eq!(value["indexes"], json!({"trigram": false, "semantic": false}));
+        assert_eq!(
+            value["indexes"],
+            json!({"trigram": false, "semantic": false})
+        );
         assert_eq!(value["github"], json!({"write": true}));
         assert_eq!(value["disabled_tools"], json!([]));
         assert!(doc.text().contains("\n  \"disabled_tools\": []"));

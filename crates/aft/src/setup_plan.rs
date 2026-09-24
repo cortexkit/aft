@@ -569,7 +569,11 @@ struct TierBlocks {
     harness: Map<String, Value>,
 }
 
-fn tier_blocks(raw: Option<Map<String, Value>>, harness_key: Option<&str>, phase: PolicyPhase) -> TierBlocks {
+fn tier_blocks(
+    raw: Option<Map<String, Value>>,
+    harness_key: Option<&str>,
+    phase: PolicyPhase,
+) -> TierBlocks {
     let Some(mut map) = raw else {
         return TierBlocks::default();
     };
@@ -610,7 +614,9 @@ fn tool_runtime_block(tool: &str, config: &Config) -> Option<&'static str> {
     match tool {
         "aft_safety" if config.backup.enabled == Some(false) => Some("backup_disabled"),
         "aft_inspect" if !config.inspect.enabled => Some("inspect_disabled"),
-        "bash" | "bash_status" | "bash_write" | "bash_watch" | "bash_kill" if !config.bash.enabled => {
+        "bash" | "bash_status" | "bash_write" | "bash_watch" | "bash_kill"
+            if !config.bash.enabled =>
+        {
             Some("bash_disabled")
         }
         _ => None,
@@ -633,7 +639,8 @@ pub fn derive_plan(
     let (user_raw, project_raw) = match (user_raw, project_raw) {
         (Ok(user), Ok(project)) => (user, project),
         (user, project) => {
-            let mut errors: Vec<String> = [user.err(), project.err()].into_iter().flatten().collect();
+            let mut errors: Vec<String> =
+                [user.err(), project.err()].into_iter().flatten().collect();
             errors.sort();
             return Err(errors);
         }
@@ -680,7 +687,8 @@ pub fn derive_plan(
                 .filter(|name| !feature_config::is_project_protected_tool(name)),
         );
     }
-    let resolved_disabled: BTreeSet<&str> = config.disabled_tools.iter().map(String::as_str).collect();
+    let resolved_disabled: BTreeSet<&str> =
+        config.disabled_tools.iter().map(String::as_str).collect();
 
     let semantic_unsupported = observer.semantic_unsupported();
     let mut features = Vec::with_capacity(CATALOG.len());
@@ -697,14 +705,20 @@ pub fn derive_plan(
                 } else {
                     REASON_DEFAULT
                 };
-                let block = (!disabled).then(|| tool_runtime_block(entry.id, &config)).flatten();
+                let block = (!disabled)
+                    .then(|| tool_runtime_block(entry.id, &config))
+                    .flatten();
                 row(
                     entry,
                     default,
                     configured,
                     base_list.is_some(),
                     configured,
-                    if disabled { Effective::Off } else { Effective::Ready },
+                    if disabled {
+                        Effective::Off
+                    } else {
+                        Effective::Ready
+                    },
                     reason,
                     block.map(str::to_string),
                 )
@@ -743,7 +757,8 @@ pub fn derive_plan(
                 } else if let Some(cause) = unsupported {
                     (Effective::Unavailable, Some(cause))
                 } else {
-                    let plane = IndexPlane::from_feature_id(entry.id).unwrap_or(IndexPlane::Trigram);
+                    let plane =
+                        IndexPlane::from_feature_id(entry.id).unwrap_or(IndexPlane::Trigram);
                     let observed = observer.index(plane);
                     match observed.effective {
                         Effective::Ready | Effective::Building => (observed.effective, None),
@@ -886,8 +901,8 @@ pub enum SetupSelections {
 
 /// Parse an answers document `{"plan_version":1,"selections":{"<id>":bool}}`.
 pub fn parse_answers(text: &str) -> Result<BTreeMap<String, bool>, String> {
-    let value: Value = serde_json::from_str(text)
-        .map_err(|error| format!("invalid_setup_answers: {error}"))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|error| format!("invalid_setup_answers: {error}"))?;
     let Value::Object(object) = value else {
         return Err("invalid_setup_answers: expected a JSON object".to_string());
     };
@@ -949,7 +964,8 @@ pub fn render_setup(
     if let Some(Value::Array(entries)) = raw.get("disabled_tools") {
         for name in entries.iter().filter_map(Value::as_str) {
             let canonical = feature_config::legacy_tool_alias(name).unwrap_or(name);
-            if !feature_config::is_known_tool(canonical) && !unknown.iter().any(|n| n == canonical) {
+            if !feature_config::is_known_tool(canonical) && !unknown.iter().any(|n| n == canonical)
+            {
                 unknown.push(canonical.to_string());
             }
         }

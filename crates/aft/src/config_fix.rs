@@ -1,9 +1,13 @@
 //! The `aft doctor --fix` configuration migration.
 //!
-//! Ordinary loading translates the keys retired by the feature-config change
-//! during the migration window and rejects them afterwards; it rejects the
-//! already-retired GitHub enable aliases (`gh_read`, `gh_shim.enabled`) at
-//! every version. This module is the only reader allowed to repair them. It
+//! Ordinary loading translates the keys retired by the switch to
+//! `disabled_tools`/`indexes` (`tool_surface`, `hoist_builtin_tools`,
+//! top-level `enabled`, `search_index`, `semantic_search`, `callgraph_store`,
+//! `github.enabled` and the prefixed `aft_*` host names) during the migration
+//! window ([`PolicyPhase::Window`], the releases that still accept them) and
+//! rejects them afterwards; it rejects the already-retired GitHub enable
+//! aliases (`gh_read`, `gh_shim.enabled`) at every version. This module is the
+//! only reader allowed to repair them. It
 //! rewrites each consumed config file so that it states the same intent with
 //! canonical keys, and splices the changes into the original text so comments,
 //! formatting and unrelated keys survive.
@@ -82,8 +86,22 @@ fn repair_github_aliases(
     let label = block_label(prefix);
     let master_off = get_bool(block, "github", "enabled") == Some(false);
     let aliases = [
-        ("gh_read", "read", block.get("gh_read").and_then(|v| v.get("enabled")).and_then(Value::as_bool)),
-        ("gh_shim", "shim", block.get("gh_shim").and_then(|v| v.get("enabled")).and_then(Value::as_bool)),
+        (
+            "gh_read",
+            "read",
+            block
+                .get("gh_read")
+                .and_then(|v| v.get("enabled"))
+                .and_then(Value::as_bool),
+        ),
+        (
+            "gh_shim",
+            "shim",
+            block
+                .get("gh_shim")
+                .and_then(|v| v.get("enabled"))
+                .and_then(Value::as_bool),
+        ),
     ];
     for (alias, leaf, alias_value) in aliases {
         let canonical = get_bool(block, "github", leaf);
@@ -101,7 +119,10 @@ fn repair_github_aliases(
                     ));
                 }
             } else {
-                doc.set(&path_of(prefix, &["github", leaf]), &Value::Bool(alias_value))?;
+                doc.set(
+                    &path_of(prefix, &["github", leaf]),
+                    &Value::Bool(alias_value),
+                )?;
             }
         }
     }
@@ -119,8 +140,8 @@ fn repair_github_aliases(
     Ok(())
 }
 
-/// Rewrite one block's retired keys to the canonical values the translation
-/// window derives from them.
+/// Rewrite one block's retired keys to the canonical values ordinary loading
+/// derives from them while it still accepts them ([`PolicyPhase::Window`]).
 fn migrate_block(
     doc: &mut JsoncDocument,
     prefix: &[String],
@@ -139,13 +160,16 @@ fn migrate_block(
             .filter_map(Value::as_str)
             .map(str::to_string)
             .collect();
-        let current: Option<Vec<String>> = raw.get("disabled_tools").and_then(Value::as_array).map(|entries| {
-            entries
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        });
+        let current: Option<Vec<String>> =
+            raw.get("disabled_tools")
+                .and_then(Value::as_array)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                });
         if current.as_ref() != Some(&wanted) {
             let mut kept = Vec::new();
             for name in wanted {
@@ -241,11 +265,19 @@ pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, Strin
     }
     let translated = Value::Object(translated);
     for prefix in &prefixes {
-        let (Some(raw_block), Some(translated_block)) = (lookup(&raw, prefix), lookup(&translated, prefix))
+        let (Some(raw_block), Some(translated_block)) =
+            (lookup(&raw, prefix), lookup(&translated, prefix))
         else {
             continue;
         };
-        migrate_block(&mut doc, prefix, raw_block, translated_block, tier, &mut notes)?;
+        migrate_block(
+            &mut doc,
+            prefix,
+            raw_block,
+            translated_block,
+            tier,
+            &mut notes,
+        )?;
     }
 
     let changed = doc.text() != text;
@@ -303,7 +335,11 @@ pub fn fix_files(targets: &[(PathBuf, FixTier)]) -> Vec<FixOutcome> {
                 Ok(migration) => FixOutcome {
                     path: path.clone(),
                     tier: *tier,
-                    status: if migration.changed { "rewritten" } else { "unchanged" },
+                    status: if migration.changed {
+                        "rewritten"
+                    } else {
+                        "unchanged"
+                    },
                     notes: migration.notes,
                     error: None,
                 },
