@@ -2303,6 +2303,38 @@ mod deferred_semantic_search_tests {
         (format!("http://{addr}"), started_rx, handle)
     }
 
+    /// Embedding server that holds its reply until the test releases it, so a
+    /// test can observe what happens while a query embedding is in flight
+    /// without racing a timer.
+    fn start_gated_embedding_server() -> (
+        String,
+        mpsc::Receiver<()>,
+        mpsc::SyncSender<()>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind gated embedding server");
+        let addr = listener
+            .local_addr()
+            .expect("gated embedding server address");
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept embedding request");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            started_tx.send(()).expect("signal embedding request start");
+            let _ = release_rx.recv();
+            let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        (format!("http://{addr}"), started_rx, release_tx, handle)
+    }
+
     fn register_deferred(outcome: DispatchOutcome) -> PendingResponses {
         let mut pending = PendingResponses::default();
         match outcome {
@@ -2349,38 +2381,43 @@ mod deferred_semantic_search_tests {
         assert!(inline_status.success);
         inline_server.join().expect("inline embedding server joins");
 
-        let (deferred_url, deferred_started, deferred_server) =
-            start_slow_embedding_server(EMBED_DELAY);
+        let (deferred_url, deferred_started, release_embedding, deferred_server) =
+            start_gated_embedding_server();
         let deferred_ctx = semantic_context(root.path(), deferred_url);
         let mut pending = register_deferred(dispatch_outcome(
             slow_search_request("deferred-search"),
             &deferred_ctx,
         ));
         deferred_started
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(10))
             .expect("deferred query embedding starts");
-        let status_started_at = Instant::now();
+        // The embedding server holds its reply until released below, so the
+        // query embedding is provably still in flight while status runs. If
+        // status waited behind it, status could only return after the query
+        // timeout gave up on the embedding, and by then the deferred search
+        // would have resolved, which the poll below would see.
         let deferred_status = dispatch(
             request("deferred-status", "status", serde_json::json!({})),
             &deferred_ctx,
         );
-        let deferred_sibling_latency = status_started_at.elapsed();
         assert!(deferred_status.success);
+        assert!(
+            pending.poll_ready(&deferred_ctx).is_empty(),
+            "status must not wait behind the deferred query embedding"
+        );
 
         eprintln!(
-            "standalone sibling status latency: inline={}ms deferred={}ms",
+            "standalone sibling status latency: inline={}ms",
             inline_sibling_latency.as_millis(),
-            deferred_sibling_latency.as_millis()
         );
         assert!(
             inline_sibling_latency >= Duration::from_millis(500),
             "inline control must include the slow query embedding"
         );
-        assert!(
-            deferred_sibling_latency < Duration::from_millis(250),
-            "status must not wait behind the deferred query embedding"
-        );
 
+        release_embedding
+            .send(())
+            .expect("release the held query embedding");
         let response = wait_for_response(&deferred_ctx, &mut pending);
         assert!(response.success);
         deferred_server
