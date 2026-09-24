@@ -2,10 +2,11 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
+import { writeBinaryIdentitySidecar } from "../binary-identity.js";
 import {
   BinaryBridge,
   BridgeTransportUnknownOutcomeError,
@@ -13,6 +14,8 @@ import {
 } from "../bridge.js";
 import type { Logger, LogMeta } from "../logger.js";
 import { BridgePool } from "../pool.js";
+import { findBinarySync } from "../resolver.js";
+import { acquireEnv } from "./test-utils/env-guard.js";
 
 let workDir: string;
 
@@ -1216,6 +1219,65 @@ process.stdin.on("data", (chunk) => {
       expect(response).toMatchObject({ success: true, source: "compatible", command: "ping" });
     } finally {
       await pool.shutdown();
+    }
+  });
+
+  test("the handshake still catches a stale binary whose identity sidecar vouches for it", async () => {
+    // Resolution trusts a cached binary by its sidecar without running it, so
+    // a sidecar that is wrong about the version (hand-edited, or written by a
+    // buggy installer) must not let a stale binary serve requests: the
+    // bridge's own version handshake is the authoritative check.
+    const releaseEnv = await acquireEnv({
+      AFT_BINARY_PATH: undefined,
+      AFT_CACHE_DIR: join(workDir, "cache"),
+      PATH: process.env.PATH,
+    });
+    let pool: BridgePool | undefined;
+    try {
+      mkdirSync(join(workDir, "cache", "bin", "v1.0.0"), { recursive: true });
+      const cached = join(workDir, "cache", "bin", "v1.0.0", "aft");
+      writeFileSync(
+        cached,
+        `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const req = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    const body = req.command === "version" ? { version: "0.1.0" } : req.command === "configure" ? { warnings: [] } : { source: "stale" };
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, ...body }) + "\\n");
+  }
+});
+`,
+      );
+      chmodSync(cached, 0o755);
+      writeBinaryIdentitySidecar(cached, "1.0.0", "0".repeat(64));
+
+      const resolved = findBinarySync("1.0.0");
+      expect(resolved).toBe(cached);
+
+      const mismatches: Array<[string, string]> = [];
+      pool = new BridgePool(resolved as string, {
+        timeoutMs: 5_000,
+        maxRestarts: 0,
+        minVersion: "1.0.0",
+        onVersionMismatch: async (binaryVersion, minVersion) => {
+          mismatches.push([binaryVersion, minVersion]);
+          return null;
+        },
+      });
+      await pool
+        .getBridge(workDir)
+        .send("ping")
+        .catch(() => undefined);
+
+      expect(mismatches).toEqual([["0.1.0", "1.0.0"]]);
+    } finally {
+      await pool?.shutdown();
+      releaseEnv();
     }
   });
 
