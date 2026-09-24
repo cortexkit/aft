@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-operator-label-rows",
+    "health-test-work-count"
+  ],
+  "note": "No ranking-fence file changed. The train adds the v14-gated gh-shim operator label rows for pr edit and label create, and replaces a wall-clock ratio in a health test with an assembly work count."
+}
