@@ -32,6 +32,7 @@
 import { createRequire } from "node:module";
 import {
   type AftTransportPool,
+  canonicalizeProjectRoot,
   createAftTransportPool,
   ensureBinary,
   ensureOnnxRuntime,
@@ -845,7 +846,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       // killed, then silently retries on every reload. The first real tool
       // call from a session will still warm the correct project bridge.
       const cwd = process.cwd();
-      if (isHomeDirectoryRoot(cwd)) {
+      if (isHomeDirectoryRoot(canonicalizeProjectRoot(cwd))) {
         log(
           `Eager configure skipped: cwd=${cwd} is the user home directory. ` +
             `The first real tool call will warm the correct project bridge.`,

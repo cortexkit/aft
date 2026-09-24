@@ -122,7 +122,13 @@ describe.serial.skipIf(process.platform === "win32")(
 
       // Tools registered means init resolved a binary and finished.
       expect(tools.length).toBeGreaterThan(0);
-      expect(existsSync(execLog) ? readFileSync(execLog, "utf8") : "").toBe("");
+      // Pi's eager warmup may legitimately spawn the bridge process (the
+      // stub logs that as an exec with no arguments): whether it is skipped
+      // depends on the host's home directory, which Bun resolves from the
+      // real account on Linux regardless of this test's HOME. What must never
+      // happen during init is a version probe of the binary.
+      const execs = existsSync(execLog) ? readFileSync(execLog, "utf8") : "";
+      expect(execs.split("\n").filter((line) => line.trim() !== "exec" && line !== "")).toEqual([]);
     });
 
     test("subc mode resolves no local binary at all", async () => {
