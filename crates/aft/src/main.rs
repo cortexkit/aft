@@ -152,6 +152,20 @@ fn main() {
         }
     }
 
+    // `aft setup` prints the feature plan (stdout must stay pure JSON) or
+    // writes the user's base choices, then exits. Like `index`, it runs
+    // before logging and never starts the application.
+    if std::env::args().nth(1).as_deref() == Some("setup") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::setup::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
+            }
+        }
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();

@@ -5,4 +5,5 @@ pub mod probe_login_shell_path;
 // by name at runtime where it is unsupported.
 pub mod profile;
 pub mod sandbox_launch;
+pub mod setup;
 pub mod warmup;
