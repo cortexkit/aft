@@ -24,7 +24,7 @@ use rayon::prelude::*;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Statement, Transaction,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Read;
@@ -2523,6 +2523,42 @@ impl RefreshFilesProfile {
     }
 }
 
+/// A refresh batch whose stored-index load reaches either limit is logged at
+/// info level; every other batch is logged at debug level only.
+///
+/// A one-file edit loads the index of the edited file's re-export and module
+/// neighbours: tens to a few thousand rows and a few milliseconds. Loading
+/// every stored file of a mid-sized TypeScript monorepo (about 7,000 files)
+/// reads a few hundred thousand rows and takes seconds. 250 ms is well above
+/// the one-file case and below anything a user waiting on the refresh worker
+/// would notice as a stall; 50,000 rows flags a batch that reaches a large
+/// share of such a repository even when a fast disk keeps it under 250 ms.
+const INDEX_LOAD_INFO_ELAPSED: Duration = Duration::from_millis(250);
+const INDEX_LOAD_INFO_ROWS: usize = 50_000;
+
+/// One line per refresh batch with the cost of loading stored file indexes,
+/// so production logs show it without the benchmark switch.
+fn log_refresh_index_load(project_root: &Path, profile: &RefreshFilesProfile) {
+    let line = format!(
+        "callgraph refresh index load: root={} index_loads={} files_loaded={} rows_read={} index_load_ms={} total_ms={}",
+        project_root.display(),
+        profile.index_loads,
+        profile.index_files_loaded,
+        profile.index_rows_read,
+        profile.index_load.as_millis(),
+        profile.total.as_millis(),
+    );
+    if index_load_is_notable(profile) {
+        crate::slog_info!("{line}");
+    } else {
+        crate::slog_debug!("{line}");
+    }
+}
+
+fn index_load_is_notable(profile: &RefreshFilesProfile) -> bool {
+    profile.index_load >= INDEX_LOAD_INFO_ELAPSED || profile.index_rows_read >= INDEX_LOAD_INFO_ROWS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct StoredEdge {
     pub source_file: String,
@@ -2818,6 +2854,9 @@ struct ProjectIndex<'a> {
     project_root: PathBuf,
     files: HashMap<String, DbFileIndex>,
     caller_data: HashMap<String, &'a FileCallData>,
+    /// Stored file indexes loaded on demand, for an incremental refresh. Files
+    /// in `files` take precedence over it.
+    lazy: Option<Rc<LazyDbFileIndexes<'a>>>,
     /// Root-scoped map shared by successive refresh-worker batches. Cargo.toml
     /// watcher events replace the cache before another batch can resolve refs.
     /// Cold/direct refreshes use a private cache so each refresh builds and uses
@@ -2866,24 +2905,26 @@ impl ResolverIndex for ProjectIndex<'_> {
 
     fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
         let mut parents = self
-            .files
-            .iter()
-            .flat_map(|(file, index)| {
-                index
+            .scan_paths(LazyDbFileIndexes::module_declaring_files)
+            .into_iter()
+            .filter_map(|file| {
+                let index = self.file_index(&file)?;
+                let modules = index
                     .declared_module_targets
                     .iter()
-                    .filter_map(move |(module, target)| {
-                        (target.as_deref() == Some(target_file))
-                            .then(|| (file.clone(), module.clone()))
-                    })
+                    .filter(|(_, target)| target.as_deref() == Some(target_file))
+                    .map(|(module, _)| (file.clone(), module.clone()))
+                    .collect::<Vec<_>>();
+                Some(modules)
             })
+            .flatten()
             .collect::<Vec<_>>();
         parents.sort();
         parents.into_iter().next()
     }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
-        self.reexports_for(file).to_vec()
+        self.reexports_for(file)
     }
 
     fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String> {
@@ -2895,26 +2936,26 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn export_alias(&self, file: &str, symbol: &str) -> Option<String> {
-        self.files
-            .get(file)
-            .and_then(|item| item.export_aliases.get(symbol))
-            .cloned()
+        self.file_index(file)
+            .and_then(|item| item.export_aliases.get(symbol).cloned())
     }
 
     fn has_export(&self, file: &str, symbol: &str) -> bool {
-        self.files
-            .get(file)
+        self.file_index(file)
             .is_some_and(|item| item.exports.contains(symbol))
     }
 
     fn default_export(&self, file: &str) -> Option<String> {
-        self.files
-            .get(file)
+        self.file_index(file)
             .and_then(|item| item.default_export.clone())
     }
 
     fn contains_file(&self, file: &str) -> bool {
         self.files.contains_key(file)
+            || self
+                .lazy
+                .as_ref()
+                .is_some_and(|lazy| lazy.contains_file(file))
     }
 
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
@@ -2960,20 +3001,24 @@ impl ResolverIndex for ProjectIndex<'_> {
         short_name: &str,
     ) -> Option<(String, String)> {
         let src_prefix = rust_src_prefix(caller_file);
-        let mut file_paths = self.files.keys().cloned().collect::<Vec<_>>();
+        // Stored files outside `files` are limited to Rust ones up front; the
+        // language check below still applies to every path.
+        let mut file_paths = self.scan_paths(LazyDbFileIndexes::rust_files);
         file_paths.sort();
         if let Some(position) = file_paths.iter().position(|file| file == caller_file) {
             let caller = file_paths.remove(position);
             file_paths.insert(0, caller);
         }
         for file_path in file_paths {
-            if self.lang_for(&file_path) != Some(LangId::Rust)
-                || rust_src_prefix(&file_path) != src_prefix
-            {
+            // Path checks come before the language check so that a stored
+            // file's index is loaded only when its module path can match.
+            if rust_src_prefix(&file_path) != src_prefix {
                 continue;
             }
             let file_module_segments = rust_module_segments_for_rel(&file_path);
-            if !module_segments.starts_with(&file_module_segments) {
+            if !module_segments.starts_with(&file_module_segments)
+                || self.lang_for(&file_path) != Some(LangId::Rust)
+            {
                 continue;
             }
             let scoped_segments = &module_segments[file_module_segments.len()..];
@@ -4907,6 +4952,7 @@ impl CallGraphStore {
             }
             profile.commit += started.elapsed();
             profile.total = total_started.elapsed();
+            log_refresh_index_load(&self.project_root, &profile);
             return Ok((
                 IncrementalStats {
                     changed_files: changed,
@@ -4928,9 +4974,12 @@ impl CallGraphStore {
             &self.project_root,
             &caller_extracts,
             workspace_crate_prefixes,
-            &mut profile,
-        )?;
+        );
         profile.index_load += started.elapsed();
+        // Stored indexes load on demand during resolution too. Their time is
+        // added to `index_load` once resolution ends; this is the part already
+        // counted above.
+        let lazy_load_during_construction = index.lazy_load_counts().unwrap_or_default().elapsed;
 
         let workspace_root = self.project_root.display().to_string();
         // Re-resolved callers whose set of unresolved calls changed: only
@@ -5022,6 +5071,17 @@ impl CallGraphStore {
             }
             profile.ref_resolution += started.elapsed();
         }
+        let lazy_counts = index.lazy_load_counts().unwrap_or_default();
+        profile.index_files_loaded += lazy_counts.files_loaded;
+        profile.index_rows_read += lazy_counts.rows_read;
+        // Lazy loads made during resolution are also inside `ref_resolution`.
+        profile.index_load += lazy_counts
+            .elapsed
+            .saturating_sub(lazy_load_during_construction);
+        if let Some(error) = index.take_lazy_load_error() {
+            return Err(error.into());
+        }
+        drop(index);
 
         let started = Instant::now();
         // Rewritten files, re-resolved callers whose unresolved calls changed
@@ -5052,6 +5112,7 @@ impl CallGraphStore {
         self.record_commit(total_changes_before, &conn);
         profile.commit += started.elapsed();
         profile.total = total_started.elapsed();
+        log_refresh_index_load(&self.project_root, &profile);
         Ok((
             IncrementalStats {
                 changed_files: changed,
@@ -11467,85 +11528,101 @@ impl<'a> ProjectIndex<'a> {
             project_root: project_root.to_path_buf(),
             files,
             caller_data,
+            lazy: None,
             workspace_crate_prefixes,
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
         }
     }
 
+    /// Builds the resolver index for one incremental refresh batch. The files
+    /// this batch re-resolves get their index from their new extract; every
+    /// other stored file is loaded from SQLite only when resolution reaches it
+    /// (see `LazyDbFileIndexes`), so a small edit does not read the whole graph.
     fn from_db_and_callers(
-        tx: &Transaction<'_>,
+        conn: &'a Connection,
         project_root: &Path,
         caller_extracts: &'a HashMap<String, FileExtract>,
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
-        profile: &mut RefreshFilesProfile,
-    ) -> Result<Self> {
-        // Incremental refreshes get a fresh snapshot memo so a watcher rewrite can
-        // never observe declarations retained by an earlier refresh generation.
-        let module_resolution_memo = callgraph::ModuleResolutionMemo::default();
-        let disk = DiskFacts::new(project_root);
-        let facts = FactPaths {
-            root: project_root,
-            facts: &disk,
-        };
+    ) -> Self {
         // Files created in this refresh have no `files` row yet (their rows are
         // written after resolution), but a cold build of the same tree indexes
         // them, so they count as indexed module targets here too.
         let caller_paths = caller_extracts.keys().cloned().collect::<HashSet<_>>();
-        let mut files = load_db_file_indexes(
-            tx,
-            project_root,
-            &caller_paths,
-            &module_resolution_memo,
-            &facts,
-            &mut profile.index_rows_read,
-        )?;
-        profile.index_files_loaded += files.len();
+        let lazy = LazyDbFileIndexes::new(conn, project_root, caller_paths);
         let caller_indexes = caller_extracts
             .iter()
             .map(|(rel_path, extract)| {
                 let index = DbFileIndex::from_store_extract(
                     project_root,
                     extract,
-                    &module_resolution_memo,
-                    &facts,
-                    |file| files.contains_key(file) || caller_paths.contains(file),
+                    &lazy.module_resolution_memo,
+                    &lazy.fact_paths(),
+                    |file| lazy.contains_file(file),
                 );
                 (rel_path.clone(), index)
             })
-            .collect::<Vec<_>>();
-        files.extend(caller_indexes);
+            .collect::<HashMap<_, _>>();
         let caller_data = caller_extracts
             .iter()
             .map(|(rel_path, extract)| (rel_path.clone(), &extract.data))
             .collect();
-        Ok(Self::from_parts(
+        let mut index = Self::from_parts(
             project_root,
-            files,
+            caller_indexes,
             caller_data,
             workspace_crate_prefixes,
             Rc::new(DiskFacts::new(project_root)),
-        ))
+        );
+        index.lazy = Some(Rc::new(lazy));
+        index
+    }
+
+    /// The index of one file: the in-memory entry when there is one (every
+    /// file of an eagerly built index, or a file this refresh re-resolves),
+    /// otherwise the stored rows, loaded on first use.
+    fn file_index(&self, rel_path: &str) -> Option<FileIndexRef<'_>> {
+        if let Some(index) = self.files.get(rel_path) {
+            return Some(FileIndexRef::Borrowed(index));
+        }
+        self.lazy
+            .as_ref()
+            .and_then(|lazy| lazy.file_index(rel_path))
+            .map(FileIndexRef::Shared)
+    }
+
+    /// Row counts and time spent loading stored file indexes so far, or `None`
+    /// for an index built entirely in memory.
+    fn lazy_load_counts(&self) -> Option<IndexLoadCounts> {
+        self.lazy.as_ref().map(|lazy| lazy.counts.get())
+    }
+
+    /// The first SQLite error a lazy load hit. Loads run inside resolution
+    /// callbacks that cannot return errors, so the refresh checks this after
+    /// resolution and fails the batch instead of committing a graph built on a
+    /// partial read.
+    fn take_lazy_load_error(&self) -> Option<rusqlite::Error> {
+        self.lazy
+            .as_ref()
+            .and_then(|lazy| lazy.error.borrow_mut().take())
     }
 
     fn lang_for(&self, rel_path: &str) -> Option<LangId> {
-        self.files.get(rel_path).and_then(|file| file.lang)
+        self.file_index(rel_path).and_then(|file| file.lang)
     }
 
     fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
-        self.files
-            .get(caller_file)
+        self.file_index(caller_file)
             .and_then(|file| file.module_targets.get(module_path).cloned().flatten())
     }
 
-    fn reexports_for(&self, rel_path: &str) -> &[ReexportIndex] {
-        self.files
-            .get(rel_path)
-            .map(|file| file.reexports.as_slice())
-            .unwrap_or(&[])
+    fn reexports_for(&self, rel_path: &str) -> Vec<ReexportIndex> {
+        self.file_index(rel_path)
+            .map(|file| file.reexports.clone())
+            .unwrap_or_default()
     }
 
     fn node_for_symbol(&self, rel_path: &str, symbol: &str) -> Option<String> {
-        self.files.get(rel_path).and_then(|file| {
+        self.file_index(rel_path).and_then(|file| {
             file.node_by_scoped
                 .get(symbol)
                 .cloned()
@@ -11554,10 +11631,311 @@ impl<'a> ProjectIndex<'a> {
     }
 
     fn node_is_callable(&self, rel_path: &str, node_id: &str) -> bool {
-        self.files
-            .get(rel_path)
-            .and_then(|file| file.node_kind_by_id.get(node_id))
+        self.file_index(rel_path)
+            .and_then(|file| file.node_kind_by_id.get(node_id).cloned())
             .is_some_and(|kind| matches!(kind.as_str(), "function" | "kernel" | "method"))
+    }
+
+    /// Every indexed file path an index-wide scan must consider, in no order:
+    /// the in-memory entries plus the stored files `stored` lists that have no
+    /// in-memory entry (an in-memory entry replaces the stored rows).
+    fn scan_paths(
+        &self,
+        stored: impl FnOnce(&LazyDbFileIndexes<'a>) -> Vec<String>,
+    ) -> Vec<String> {
+        let mut paths = self.files.keys().cloned().collect::<Vec<_>>();
+        if let Some(lazy) = &self.lazy {
+            paths.extend(
+                stored(lazy)
+                    .into_iter()
+                    .filter(|path| !self.files.contains_key(path)),
+            );
+        }
+        paths
+    }
+}
+
+/// A file index borrowed from an in-memory map or shared from the lazy memo.
+enum FileIndexRef<'a> {
+    Borrowed(&'a DbFileIndex),
+    Shared(Rc<DbFileIndex>),
+}
+
+impl std::ops::Deref for FileIndexRef<'_> {
+    type Target = DbFileIndex;
+
+    fn deref(&self) -> &DbFileIndex {
+        match self {
+            Self::Borrowed(index) => index,
+            Self::Shared(index) => index,
+        }
+    }
+}
+
+/// Rows read and time spent by an incremental refresh's stored-index loads.
+#[derive(Debug, Default, Clone, Copy)]
+struct IndexLoadCounts {
+    files_loaded: usize,
+    rows_read: usize,
+    elapsed: Duration,
+}
+
+/// Stored file indexes for one incremental refresh batch, loaded per file on
+/// first use and kept for the rest of the batch.
+///
+/// A file's index reads exactly the rows the former whole-store load read for
+/// it (its `files` row, its `nodes` rows and its `module`, `reexport` and
+/// `export_alias` refs, in the same order), so resolution results do not
+/// change. The memo is unbounded: it lives for one batch and holds only the
+/// files resolution reached.
+///
+/// Between construction and the last lookup the refresh writes rows only for
+/// the files it re-resolves (which always use their in-memory index and count
+/// as indexed through `extra_indexed_files`) and resolution outputs (ref status
+/// and edges), which no index reads. Files the batch deletes are removed before
+/// construction. A later load therefore sees the same rows an up-front load
+/// would have.
+struct LazyDbFileIndexes<'a> {
+    conn: &'a Connection,
+    project_root: PathBuf,
+    /// Files this batch re-resolves. They count as indexed even when their
+    /// `files` row does not exist yet (a file created by this batch).
+    extra_indexed_files: HashSet<String>,
+    // Incremental refreshes get a fresh snapshot memo so a watcher rewrite can
+    // never observe declarations retained by an earlier refresh generation.
+    module_resolution_memo: callgraph::ModuleResolutionMemo,
+    // One instance for the whole batch: it caches a walk of the project's
+    // symlinks the first time a lookup needs one.
+    disk: DiskFacts,
+    indexes: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
+    indexed: RefCell<HashMap<String, bool>>,
+    rust_files: RefCell<Option<Vec<String>>>,
+    module_declaring_files: RefCell<Option<Vec<String>>>,
+    counts: Cell<IndexLoadCounts>,
+    /// Nesting depth of timed sections, so a load nested in another (an
+    /// existence check made while noting a file's module refs) is timed once.
+    timing_depth: Cell<u32>,
+    error: RefCell<Option<rusqlite::Error>>,
+}
+
+impl<'a> LazyDbFileIndexes<'a> {
+    fn new(
+        conn: &'a Connection,
+        project_root: &Path,
+        extra_indexed_files: HashSet<String>,
+    ) -> Self {
+        Self {
+            conn,
+            project_root: project_root.to_path_buf(),
+            extra_indexed_files,
+            module_resolution_memo: callgraph::ModuleResolutionMemo::default(),
+            disk: DiskFacts::new(project_root),
+            indexes: RefCell::new(HashMap::new()),
+            indexed: RefCell::new(HashMap::new()),
+            rust_files: RefCell::new(None),
+            module_declaring_files: RefCell::new(None),
+            counts: Cell::new(IndexLoadCounts::default()),
+            timing_depth: Cell::new(0),
+            error: RefCell::new(None),
+        }
+    }
+
+    fn fact_paths(&self) -> FactPaths<'_> {
+        FactPaths {
+            root: &self.project_root,
+            facts: &self.disk,
+        }
+    }
+
+    fn timed<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let depth = self.timing_depth.get();
+        self.timing_depth.set(depth + 1);
+        let started = Instant::now();
+        let result = operation();
+        self.timing_depth.set(depth);
+        if depth == 0 {
+            let mut counts = self.counts.get();
+            counts.elapsed += started.elapsed();
+            self.counts.set(counts);
+        }
+        result
+    }
+
+    fn add_rows(&self, rows: usize) {
+        let mut counts = self.counts.get();
+        counts.rows_read += rows;
+        self.counts.set(counts);
+    }
+
+    /// Keeps the first failed read and returns `None`; the refresh reports
+    /// that error after resolution.
+    fn note_error<T>(&self, result: rusqlite::Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.error.borrow_mut().get_or_insert(error);
+                None
+            }
+        }
+    }
+
+    /// Whether `rel_path` is an indexed file: one this batch re-resolves, or
+    /// one with a stored `files` or `nodes` row.
+    fn contains_file(&self, rel_path: &str) -> bool {
+        if self.extra_indexed_files.contains(rel_path) {
+            return true;
+        }
+        if let Some(known) = self.indexed.borrow().get(rel_path) {
+            return *known;
+        }
+        let exists = self.timed(|| {
+            self.note_error(self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)
+                     OR EXISTS(SELECT 1 FROM nodes WHERE file_path = ?1)",
+                params![rel_path],
+                |row| row.get::<_, bool>(0),
+            ))
+            .unwrap_or(false)
+        });
+        self.add_rows(usize::from(exists));
+        self.indexed
+            .borrow_mut()
+            .insert(rel_path.to_string(), exists);
+        exists
+    }
+
+    fn file_index(&self, rel_path: &str) -> Option<Rc<DbFileIndex>> {
+        if let Some(cached) = self.indexes.borrow().get(rel_path) {
+            return cached.clone();
+        }
+        let loaded = self.timed(|| self.load_file_index(rel_path)).map(Rc::new);
+        self.indexes
+            .borrow_mut()
+            .insert(rel_path.to_string(), loaded.clone());
+        loaded
+    }
+
+    fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
+        let lang = self.note_error(
+            self.conn
+                .query_row(
+                    "SELECT lang FROM files WHERE path = ?1",
+                    params![rel_path],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional(),
+        )?;
+        self.add_rows(usize::from(lang.is_some()));
+        let nodes = self.note_error(self.query_nodes(rel_path))?;
+        self.add_rows(nodes.len());
+        // A file with `nodes` rows but no `files` row is still indexed, with
+        // no language, as it was when every stored row was loaded up front.
+        if lang.is_none() && nodes.is_empty() {
+            return None;
+        }
+        let mut index = DbFileIndex::empty(lang.as_deref().and_then(lang_from_label));
+        for (id, name, scoped_name, kind, exported, is_default_export) in nodes {
+            index.note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
+        }
+        let refs = self.note_error(self.query_module_refs(rel_path))?;
+        self.add_rows(refs.len());
+        let facts = self.fact_paths();
+        for raw in refs {
+            index.note_module_ref(
+                &self.project_root,
+                rel_path,
+                &raw,
+                &self.module_resolution_memo,
+                &facts,
+                &|file: &str| self.contains_file(file),
+            );
+        }
+        let mut counts = self.counts.get();
+        counts.files_loaded += 1;
+        self.counts.set(counts);
+        Some(index)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn query_nodes(
+        &self,
+        rel_path: &str,
+    ) -> rusqlite::Result<Vec<(String, String, String, String, bool, bool)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, name, scoped_name, kind, exported, is_default_export
+             FROM nodes WHERE file_path = ?1 ORDER BY scoped_name, id",
+        )?;
+        let rows = stmt.query_map(params![rel_path], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)? != 0,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// The refs a stored file's index is built from, in source order. Imports
+    /// are not among them: a file resolves its own imports only when this
+    /// batch re-resolves it, and then it uses its in-memory index.
+    fn query_module_refs(&self, rel_path: &str) -> rusqlite::Result<Vec<RawRef>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ref_id, kind, module_path, full_ref, wildcard, local_name, requested_name
+             FROM refs
+             WHERE caller_file = ?1 AND kind IN ('module', 'reexport', 'export_alias')
+             ORDER BY byte_start, byte_end, ref_id",
+        )?;
+        let rows = stmt.query_map(params![rel_path], |row| {
+            Ok(module_index_ref(
+                row.get::<_, String>(0)?,
+                rel_path.to_string(),
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        rows.collect()
+    }
+
+    /// Stored paths from a one-column query, read once per batch.
+    fn stored_paths(&self, memo: &RefCell<Option<Vec<String>>>, sql: &str) -> Vec<String> {
+        if let Some(paths) = memo.borrow().as_ref() {
+            return paths.clone();
+        }
+        let paths = self.timed(|| {
+            self.note_error(self.conn.prepare(sql).and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            }))
+            .unwrap_or_default()
+        });
+        self.add_rows(paths.len());
+        *memo.borrow_mut() = Some(paths.clone());
+        paths
+    }
+
+    /// Stored Rust files: the only files a Rust inline-module lookup can match.
+    fn rust_files(&self) -> Vec<String> {
+        self.stored_paths(
+            &self.rust_files,
+            "SELECT path FROM files WHERE lang = 'rust'",
+        )
+    }
+
+    /// Stored files with a `module` declaration: the only files that can be a
+    /// module's parent.
+    fn module_declaring_files(&self) -> Vec<String> {
+        self.stored_paths(
+            &self.module_declaring_files,
+            "SELECT DISTINCT caller_file FROM refs
+             WHERE kind = 'module' AND module_path IS NOT NULL",
+        )
     }
 }
 
@@ -11777,90 +12155,6 @@ fn node_row_order(
     right_id: &str,
 ) -> std::cmp::Ordering {
     (left_scoped, left_id).cmp(&(right_scoped, right_id))
-}
-
-fn load_db_file_indexes(
-    tx: &Transaction<'_>,
-    project_root: &Path,
-    extra_indexed_files: &HashSet<String>,
-    module_resolution_memo: &callgraph::ModuleResolutionMemo,
-    facts: &FactPaths<'_>,
-    rows_read: &mut usize,
-) -> Result<HashMap<String, DbFileIndex>> {
-    let mut files = HashMap::new();
-    let mut stmt = tx.prepare("SELECT path, lang FROM files")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (rel_path, lang) = row?;
-        *rows_read += 1;
-        files.insert(rel_path, DbFileIndex::empty(lang_from_label(&lang)));
-    }
-
-    let mut node_stmt = tx.prepare(
-        "SELECT file_path, id, name, scoped_name, kind, exported, is_default_export FROM nodes
-         ORDER BY file_path, scoped_name, id",
-    )?;
-    let nodes = node_stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, i64>(5)? != 0,
-            row.get::<_, i64>(6)? != 0,
-        ))
-    })?;
-    for row in nodes {
-        let (file_path, id, name, scoped_name, kind, exported, is_default_export) = row?;
-        *rows_read += 1;
-        files
-            .entry(file_path)
-            .or_insert_with(|| DbFileIndex::empty(None))
-            .note_node(&id, &name, &scoped_name, &kind, exported, is_default_export);
-    }
-    let file_keys: HashSet<String> = files.keys().cloned().collect();
-    let is_indexed = |file: &str| file_keys.contains(file) || extra_indexed_files.contains(file);
-    // Caller extracts replace their own files' indexes afterwards; these rows
-    // serve every other file a resolution walk can reach through re-exports.
-    let mut ref_stmt = tx.prepare(
-        "SELECT ref_id, caller_file, kind, module_path, full_ref, wildcard, local_name, requested_name
-             FROM refs WHERE kind IN ('module', 'reexport', 'export_alias')
-             ORDER BY caller_file, byte_start, byte_end, ref_id",
-    )?;
-    let ref_rows = ref_stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(1)?,
-            module_index_ref(
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, i64>(5)? != 0,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-            ),
-        ))
-    })?;
-    for row in ref_rows {
-        let (caller_file, raw) = row?;
-        *rows_read += 1;
-        if let Some(file) = files.get_mut(&caller_file) {
-            file.note_module_ref(
-                project_root,
-                &caller_file,
-                &raw,
-                module_resolution_memo,
-                facts,
-                &is_indexed,
-            );
-        }
-    }
-
-    Ok(files)
 }
 
 /// A persisted `import`/`module`/`reexport`/`export_alias` row, rebuilt with
@@ -21279,6 +21573,7 @@ mod reexport_resolution_tests {
             project_root: PathBuf::from("/fixture"),
             files: files.into_iter().collect(),
             caller_data: HashMap::new(),
+            lazy: None,
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
             rust_crate_roots: callgraph::RustCrateRootMemo::default(),
         }

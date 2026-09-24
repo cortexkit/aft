@@ -137,6 +137,35 @@ fn cold_snapshot(root: &Path, store_dir: &Path) -> Snapshot {
     snapshot(&store)
 }
 
+/// Fails unless `refreshed` holds exactly the refs, edges and dependency rows
+/// of `cold`.
+fn assert_same_graph(name: &str, refreshed: &Snapshot, cold: &Snapshot) {
+    let only_refreshed: Vec<_> = refreshed.refs.difference(&cold.refs).collect();
+    let only_cold: Vec<_> = cold.refs.difference(&refreshed.refs).collect();
+    assert!(
+        only_refreshed.is_empty() && only_cold.is_empty(),
+        "scenario {name}: ref states differ\nonly after refresh: {only_refreshed:#?}\nonly in cold build: {only_cold:#?}"
+    );
+    let edges_only_refreshed: Vec<_> = refreshed.edges.difference(&cold.edges).collect();
+    let edges_only_cold: Vec<_> = cold.edges.difference(&refreshed.edges).collect();
+    assert!(
+        edges_only_refreshed.is_empty() && edges_only_cold.is_empty(),
+        "scenario {name}: edges differ\nonly after refresh: {edges_only_refreshed:#?}\nonly in cold build: {edges_only_cold:#?}"
+    );
+    let deps_only_refreshed: Vec<_> = refreshed
+        .dependencies
+        .difference(&cold.dependencies)
+        .collect();
+    let deps_only_cold: Vec<_> = cold
+        .dependencies
+        .difference(&refreshed.dependencies)
+        .collect();
+    assert!(
+        deps_only_refreshed.is_empty() && deps_only_cold.is_empty(),
+        "scenario {name}: file dependencies differ\nonly after refresh: {deps_only_refreshed:#?}\nonly in cold build: {deps_only_cold:#?}"
+    );
+}
+
 type Step<'a> = &'a [(&'a str, Option<&'a str>)];
 
 /// Builds `before` cold, then applies each step (a `None` content deletes the
@@ -178,30 +207,7 @@ fn assert_refresh_matches_cold(
     drop(store);
 
     let cold = cold_snapshot(&root, &stores.path().join("cold"));
-    let only_refreshed: Vec<_> = refreshed.refs.difference(&cold.refs).collect();
-    let only_cold: Vec<_> = cold.refs.difference(&refreshed.refs).collect();
-    assert!(
-        only_refreshed.is_empty() && only_cold.is_empty(),
-        "scenario {name}: ref states differ\nonly after refresh: {only_refreshed:#?}\nonly in cold build: {only_cold:#?}"
-    );
-    let edges_only_refreshed: Vec<_> = refreshed.edges.difference(&cold.edges).collect();
-    let edges_only_cold: Vec<_> = cold.edges.difference(&refreshed.edges).collect();
-    assert!(
-        edges_only_refreshed.is_empty() && edges_only_cold.is_empty(),
-        "scenario {name}: edges differ\nonly after refresh: {edges_only_refreshed:#?}\nonly in cold build: {edges_only_cold:#?}"
-    );
-    let deps_only_refreshed: Vec<_> = refreshed
-        .dependencies
-        .difference(&cold.dependencies)
-        .collect();
-    let deps_only_cold: Vec<_> = cold
-        .dependencies
-        .difference(&refreshed.dependencies)
-        .collect();
-    assert!(
-        deps_only_refreshed.is_empty() && deps_only_cold.is_empty(),
-        "scenario {name}: file dependencies differ\nonly after refresh: {deps_only_refreshed:#?}\nonly in cold build: {deps_only_cold:#?}"
-    );
+    assert_same_graph(name, &refreshed, &cold);
     cold
 }
 
@@ -780,6 +786,131 @@ fn dispatch_edges_follow_new_rust_path_candidates() {
     );
     assert!(
         !edges_to(&cold, "Widget::build").is_empty(),
+        "{:#?}",
+        cold.edges
+    );
+}
+
+/// Unrelated stored files, each a small re-export chain of its own. A one-file
+/// refresh elsewhere must not need to read any of them.
+fn padding_files() -> Vec<(String, String)> {
+    (0..30)
+        .map(|index| {
+            let next = if index < 29 {
+                format!("export * from \"./pad{}\";\n", index + 1)
+            } else {
+                String::new()
+            };
+            (
+                format!("pad{index}.ts"),
+                format!("{next}export function pad{index}() {{}}\n"),
+            )
+        })
+        .collect()
+}
+
+/// A one-file edit whose call resolves through a three-hop re-export chain
+/// (`export *`, a named re-export, `export *` again) into files the batch does
+/// not touch. The refresh loads stored file indexes on demand: it must reach
+/// the same target a cold build does while loading only the four files on
+/// that chain, not the whole store.
+#[test]
+fn one_file_edit_resolves_through_untouched_reexport_chain_loading_only_that_chain() {
+    let project = tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    let stores = tempdir().unwrap();
+    let mut before = vec![
+        (
+            "main.ts".to_string(),
+            "import { foo } from \"./barrel\";\nexport function main() { foo(); }\n".to_string(),
+        ),
+        ("barrel.ts".to_string(), "export * from \"./mid\";\n".to_string()),
+        (
+            "mid.ts".to_string(),
+            "export { foo } from \"./deep\";\n".to_string(),
+        ),
+        ("deep.ts".to_string(), "export * from \"./impl\";\n".to_string()),
+        (
+            "impl.ts".to_string(),
+            "export function foo() {}\n".to_string(),
+        ),
+    ];
+    before.extend(padding_files());
+    for (rel, content) in &before {
+        write_file(&root, rel, content);
+    }
+    let store =
+        CallGraphStore::open(stores.path().join("incremental"), root.to_path_buf()).unwrap();
+    let files: Vec<PathBuf> = walk_project_files(&root).collect();
+    store.cold_build(&files).unwrap();
+
+    let main = write_file(
+        &root,
+        "main.ts",
+        "import { foo } from \"./barrel\";\nexport function main() { foo(); foo(); }\n",
+    );
+    let (stats, profile) = store.refresh_files_profiled(&[main]).unwrap();
+    assert_eq!(stats.refreshed_own_files, 1, "{stats:?}");
+    let refreshed = snapshot(&store);
+    drop(store);
+
+    let cold = cold_snapshot(&root, &stores.path().join("cold"));
+    assert_same_graph("one-file edit through a re-export chain", &refreshed, &cold);
+    let targets = edges_to(&cold, "foo");
+    assert_eq!(targets.len(), 2, "{targets:#?}");
+    assert!(
+        targets.iter().all(|target| target.0 == "impl.ts"),
+        "{targets:#?}"
+    );
+
+    // barrel.ts, mid.ts, deep.ts and impl.ts; main.ts is re-resolved from its
+    // new extract and none of the 30 padding files is on the chain.
+    assert_eq!(profile.index_loads, 1, "{}", profile.report());
+    assert_eq!(profile.index_files_loaded, 4, "{}", profile.report());
+    // Their four `files` rows, one node, three re-export refs and a handful of
+    // existence checks: far below the 30 padding files' rows alone.
+    assert!(
+        profile.index_rows_read <= 20,
+        "a one-file refresh must not read the whole store: {}",
+        profile.report()
+    );
+}
+
+/// A Rust file registered through `mod` declarations in two stored files and
+/// calling into an inline module of one of them. Resolving it walks the module
+/// parents and searches inline modules across stored files, both of which
+/// consult every indexed file rather than one import.
+#[test]
+fn rust_edit_resolves_through_stored_module_parents_and_inline_modules() {
+    let cold = assert_refresh_matches_cold(
+        "rust edit through stored module declarations",
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+            ),
+            ("src/lib.rs", "pub mod net;\nmod app;\n"),
+            (
+                "src/net/mod.rs",
+                "pub mod http;\npub mod wire {\n    pub fn ping() {}\n}\n",
+            ),
+            (
+                "src/net/http.rs",
+                "pub fn get() {\n    super::wire::ping();\n}\n",
+            ),
+            ("src/app.rs", "pub fn run() {\n    crate::net::http::get();\n}\n"),
+        ],
+        &[&[(
+            "src/net/http.rs",
+            Some("pub fn get() {\n    super::wire::ping();\n    super::wire::ping();\n}\n"),
+        )]],
+    );
+    assert_eq!(
+        edges_to(&cold, "wire::ping")
+            .into_iter()
+            .map(|target| target.0)
+            .collect::<Vec<_>>(),
+        vec!["src/net/mod.rs".to_string(), "src/net/mod.rs".to_string()],
         "{:#?}",
         cold.edges
     );
