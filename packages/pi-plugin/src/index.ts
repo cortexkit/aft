@@ -442,12 +442,23 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   log(`AFT extension loading (plugin v${PLUGIN_VERSION})`);
 
-  // Probe synchronously so a missing or mismatched cache entry can start its
-  // download before the rest of plugin startup does any work. The resolver and
-  // first-tool-call path share ensureBinary's in-process promise; its filesystem
-  // lock also coordinates a second Pi/OpenCode process without duplicate fetches.
-  const cachedBinaryPath = findBinarySync(PLUGIN_VERSION);
-  if (!cachedBinaryPath) {
+  // Never execute a binary on the host thread. `findBinarySync` only accepts
+  // binaries whose identity is known without running them (a versioned-cache
+  // entry with a matching identity sidecar, or the npm platform package by its
+  // manifest version). When it misses, a download starts in the background
+  // while `findBinary` checks the remaining candidates on a worker thread. The
+  // resolver and first-tool-call path share ensureBinary's in-process promise;
+  // its filesystem lock also coordinates a second Pi/OpenCode process without
+  // duplicate fetches. An explicit AFT_BINARY_PATH goes straight to
+  // `findBinary`, which verifies its version off-thread.
+  //
+  // With a subc connection file the daemon runs the binary and the plugin never
+  // spawns one (the transport factory fails loud instead of falling back to a
+  // standalone bridge), so no local binary is resolved at all.
+  const usesSubc = Boolean(config.subc?.connection_file?.trim());
+  const explicitBinary = Boolean(process.env.AFT_BINARY_PATH?.trim());
+  const trustedBinaryPath = usesSubc || explicitBinary ? null : findBinarySync(PLUGIN_VERSION);
+  if (!usesSubc && !explicitBinary && !trustedBinaryPath) {
     void ensureBinary(PLUGIN_VERSION).then(
       (path) => {
         if (path) log(`Background binary warmup ready at ${path}`);
@@ -462,18 +473,24 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
   // Resolve the AFT binary. On first run this downloads the platform binary to
   // ~/.cache/aft/bin/vX.Y.Z/aft; failures are reported through Pi's plugin loader.
-  let binaryPath: string;
-  try {
-    binaryPath = cachedBinaryPath ?? (await findBinary(PLUGIN_VERSION));
-  } catch (err) {
-    warn(
-      `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +
-        "Tools will not be registered.",
-    );
-    return;
+  let binaryPath: string | null = null;
+  if (!usesSubc) {
+    try {
+      binaryPath = trustedBinaryPath ?? (await findBinary(PLUGIN_VERSION));
+    } catch (err) {
+      warn(
+        `Failed to resolve AFT binary: ${err instanceof Error ? err.message : String(err)}. ` +
+          "Tools will not be registered.",
+      );
+      return;
+    }
   }
 
-  await ensureStorageMigrated({ harness: "pi", binaryPath, logger: bridgeLogger });
+  await ensureStorageMigrated({
+    harness: "pi",
+    binaryPath: binaryPath ?? undefined,
+    logger: bridgeLogger,
+  });
 
   const storageDir = resolveCortexKitStorageRoot();
 
