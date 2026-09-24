@@ -18,9 +18,13 @@ export {
 } from "./bash-format.js";
 export {
   commandInvokesCodeSearch,
+  DEFAULT_PRIMARY_WATCH_TIMEOUT_MS,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
-  WATCH_TIMEOUT_STEER,
+  resolveWatchTimeoutMs,
+  WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  type WatchCallerRole,
+  watchTimeoutSteer,
 } from "./bash-hints.js";
 export {
   BASH_HOST_FALLBACK_BANNER,

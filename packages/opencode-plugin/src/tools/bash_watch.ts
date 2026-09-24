@@ -3,8 +3,11 @@ import {
   coerceBoolean,
   isBridgeTransportTimeout,
   isTerminalStatus,
+  resolveWatchTimeoutMs,
   sleep,
-  WATCH_TIMEOUT_STEER,
+  WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  type WatchCallerRole,
+  watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -24,7 +27,6 @@ import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "
 
 const z = tool.schema;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
-const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
@@ -79,9 +81,7 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "When true, register an async watch and return immediately. Defaults to false (sync wait).",
         ),
-      timeoutMs: optionalInt(1, 1800000).describe(
-        "Sync-only timeout in milliseconds. Default 30000; max `bash.watch_sync_max_ms` (120000 by default).",
-      ),
+      timeoutMs: optionalInt(1, 1800000).describe(WATCH_TIMEOUT_PARAM_DESCRIPTION),
       once: z
         .boolean()
         .optional()
@@ -131,11 +131,12 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
       }
 
       const syncWaitCap = bashCfg.watch_sync_max_ms;
+      const role: WatchCallerRole = isSubagent ? "worker" : "primary";
       const effectiveWaitMs = subagentForcedSync
         ? syncWaitCap
-        : Math.min(
-            coerceConfiguredWatchTimeout(args.timeoutMs, syncWaitCap) ??
-              DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
+        : resolveWatchTimeoutMs(
+            coerceConfiguredWatchTimeout(args.timeoutMs, syncWaitCap),
+            role,
             syncWaitCap,
           );
       const data = await waitForBashStatus(
@@ -164,8 +165,8 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         return convertedText;
       }
       const metadata = (context as { metadata?: (data: Record<string, unknown>) => void }).metadata;
-      if (waited) metadata?.({ taskId, status: data.status, waited });
-      return formatWatchResultText(taskId, data, waited);
+      if (waited) metadata?.({ taskId, status: data.status, waited, effectiveWaitMs });
+      return formatWatchResultText(taskId, data, waited, role, syncWaitCap);
     },
   };
 }
@@ -235,6 +236,8 @@ function formatWatchResultText(
   taskId: string,
   data: Record<string, unknown>,
   waited: BashStatusWaited | undefined,
+  role: WatchCallerRole,
+  syncWaitCap: number,
 ): string {
   const status = data.status as string;
   const exit = typeof data.exit_code === "number" ? ` (exit ${data.exit_code})` : "";
@@ -247,10 +250,9 @@ function formatWatchResultText(
       text += `\nWaited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
     } else if (waited.reason === "timeout") {
       // A watch deadline is not a failure of the command, and a delegated
-      // worker that reads it as one declares a failed result mid-run (a
-      // mason did exactly that on a 12-minute docker matrix). Say what it
-      // is and what to do in both roles.
-      text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match. ${WATCH_TIMEOUT_STEER}`;
+      // worker that reads it as one declares a failed result mid-run. Tell
+      // the caller what it is and the move that fits its own role.
+      text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match. ${watchTimeoutSteer(role, syncWaitCap)}`;
     } else if (waited.reason === "unavailable") {
       text += `\nWaited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
     } else {

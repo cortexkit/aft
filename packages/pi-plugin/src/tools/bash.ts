@@ -10,9 +10,12 @@ import {
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
   resolveBashKillTimeout,
+  resolveWatchTimeoutMs,
   runBashHostFallback,
   sleep,
-  WATCH_TIMEOUT_STEER,
+  WATCH_TIMEOUT_PARAM_DESCRIPTION,
+  type WatchCallerRole,
+  watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -46,8 +49,34 @@ import {
 import { collapsibleResult, type RenderResultOptionsLike } from "./render-helpers.js";
 
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
-const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
+
+/**
+ * Set to "1" by the pi-magic-context extension in the child `pi --print`
+ * processes it launches as delegated agents, so they count as workers here.
+ */
+const MAGIC_CONTEXT_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
+
+/**
+ * Decide whether a bash_watch caller should be treated as a delegated worker.
+ *
+ * Pi has no parent-session link comparable to OpenCode's `parentID`, so there
+ * is no direct "is this a subagent" signal. The closest one is the run mode:
+ * delegated Pi agents run as headless `pi --print`/JSON children, where the
+ * extension context has no UI and ending the turn ends the process, so a
+ * completion reminder can never wake the session. That is exactly the
+ * situation the worker steer describes. Interactive and RPC sessions both have
+ * a UI context and are treated as primary. A context without `hasUI` at all
+ * (older hosts, tests) is also treated as primary unless pi-magic-context
+ * marked the process as its subagent.
+ */
+export function watchCallerRole(
+  extCtx: Pick<ExtensionContext, "hasUI"> | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): WatchCallerRole {
+  if (env[MAGIC_CONTEXT_SUBAGENT_ENV] === "1") return "worker";
+  return extCtx?.hasUI === false ? "worker" : "primary";
+}
 
 function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | undefined {
   try {
@@ -207,7 +236,7 @@ const BashWatchParams = Type.Object({
   }),
   pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
   background: Type.Optional(Type.Boolean()),
-  timeout_ms: optionalInt(1, 1800000, "Maximum time to wait in milliseconds"),
+  timeout_ms: optionalInt(1, 1800000, WATCH_TIMEOUT_PARAM_DESCRIPTION),
   once: Type.Optional(Type.Boolean()),
 });
 
@@ -772,7 +801,10 @@ export function createBashStatusTool(ctx: PluginContext) {
       const data = await bashStatusSnapshot(bridge, extCtx, params.task_id, params.output_mode);
       const details = data as unknown as BashStatusDetails;
       return bashStatusResult(
-        await formatBashStatus(extCtx, params.task_id, details, params.output_mode),
+        await formatBashStatus(extCtx, params.task_id, details, params.output_mode, {
+          role: watchCallerRole(extCtx),
+          capMs: resolveBashConfig(ctx.config).watch_sync_max_ms,
+        }),
         details,
       );
     },
@@ -830,6 +862,12 @@ export function createBashWatchTool(ctx: PluginContext) {
         );
       }
       const syncWaitCap = resolveBashConfig(ctx.config).watch_sync_max_ms;
+      const role = watchCallerRole(extCtx);
+      const effectiveWaitMs = resolveWatchTimeoutMs(
+        coerceConfiguredWatchTimeout(params.timeout_ms, syncWaitCap),
+        role,
+        syncWaitCap,
+      );
       const data = await waitForBashStatus(
         ctx,
         bridge,
@@ -838,11 +876,7 @@ export function createBashWatchTool(ctx: PluginContext) {
         undefined,
         waitFor,
         true,
-        Math.min(
-          coerceConfiguredWatchTimeout(params.timeout_ms, syncWaitCap) ??
-            DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-          syncWaitCap,
-        ),
+        effectiveWaitMs,
       );
       // User-message abort: the sync wait was interrupted because the user
       // sent a message. Auto-register the equivalent async watch so the
@@ -862,8 +896,9 @@ export function createBashWatchTool(ctx: PluginContext) {
         params.task_id,
         data as unknown as BashStatusDetails,
         undefined,
+        { role, capMs: syncWaitCap },
       );
-      return textResult(text, data as BashWatchDetails);
+      return textResult(text, { ...data, effectiveWaitMs } as BashWatchDetails);
     },
   };
 }
@@ -1371,14 +1406,19 @@ function withWaited(
   return { ...data, waited };
 }
 
-function formatWaitSummary(waited: BashStatusWaited, details: BashStatusDetails): string {
+function formatWaitSummary(
+  waited: BashStatusWaited,
+  details: BashStatusDetails,
+  watchRole: WatchRoleContext,
+): string {
   if (waited.reason === "matched") {
     const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
     return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
   }
   if (waited.reason === "timeout") {
-    // A watch deadline is not a failure of the command; see WATCH_TIMEOUT_STEER.
-    return `Waited ${waited.elapsed_ms}ms; timeout reached without match. ${WATCH_TIMEOUT_STEER}`;
+    // A watch deadline is not a failure of the command; the steer tells the
+    // caller so, with the next move that fits its role.
+    return `Waited ${waited.elapsed_ms}ms; timeout reached without match. ${watchTimeoutSteer(watchRole.role, watchRole.capMs, "timeout_ms")}`;
   }
   if (waited.reason === "unavailable") {
     return `Waited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
@@ -1387,11 +1427,15 @@ function formatWaitSummary(waited: BashStatusWaited, details: BashStatusDetails)
   return `Waited ${waited.elapsed_ms}ms; task exited (${details.status}${exit}).`;
 }
 
+/** Role and resolved sync cap used to word a bash_watch timeout reply. */
+type WatchRoleContext = { role: WatchCallerRole; capMs: number };
+
 async function formatBashStatus(
   extCtx: ExtensionContext,
   taskId: string,
   details: BashStatusDetails,
   requestedOutputMode: string | undefined,
+  watchRole: WatchRoleContext,
 ): Promise<string> {
   const exit = typeof details.exit_code === "number" ? ` (exit ${details.exit_code})` : "";
   const dur =
@@ -1402,7 +1446,7 @@ async function formatBashStatus(
   }
   if (details.waited)
     text += `
-${formatWaitSummary(details.waited, details)}`;
+${formatWaitSummary(details.waited, details, watchRole)}`;
   if (details.mode === "pty") {
     // PTY output is rendered from the raw terminal spill file; never feed it
     // through the piped-output compression/line renderer.
@@ -1412,7 +1456,9 @@ ${formatWaitSummary(details.waited, details)}`;
       text += `
 ${details.output_preview}`;
     }
-    if (!isTerminalStatus(details.status)) {
+    // A worker told to watch again must not also be told not to poll.
+    const workerWatchTimeout = watchRole.role === "worker" && details.waited?.reason === "timeout";
+    if (!isTerminalStatus(details.status) && !workerWatchTimeout) {
       text += `
 A completion reminder will be delivered automatically; don't poll.`;
     }

@@ -9,15 +9,54 @@ import * as path from "node:path";
 // the original when no hint should fire). The appended "[Hint] ..." line is
 // agent-visible and persists in the tool result.
 
+/** Who is calling bash_watch: a delegated worker session or a primary one. */
+export type WatchCallerRole = "worker" | "primary";
+
+/** Sync bash_watch deadline used by a primary session that passes no timeout. */
+export const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Description of the bash_watch timeout parameter. It must stay true for both
+ * roles without naming them, because every caller sees the same schema.
+ */
+export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
+  "Sync-only timeout in milliseconds. Default 30000 (the configured maximum for delegated sessions); max `bash.watch_sync_max_ms` (120000 by default).";
+
+/**
+ * Effective sync bash_watch deadline. A delegated worker cannot end its turn
+ * while a command runs, so a short default only makes it loop, re-reading its
+ * whole context on every call; it gets the configured cap instead. A primary
+ * keeps the short default because it can do other work or end its turn.
+ */
+export function resolveWatchTimeoutMs(
+  requestedMs: number | undefined,
+  role: WatchCallerRole,
+  capMs: number,
+): number {
+  const fallback = role === "worker" ? capMs : DEFAULT_PRIMARY_WATCH_TIMEOUT_MS;
+  return Math.min(requestedMs ?? fallback, capMs);
+}
+
 /**
  * Appended to a bash_watch reply whose sync deadline passed without a match.
  * The deadline is a property of the watch, not of the command: a delegated
  * worker that read the bare "timeout reached" line as its own execution being
- * interrupted declared a failed result while its 12-minute docker matrix was
- * still running. The sentence names the state and the move in both roles.
+ * interrupted declared a failed result while its long-running command was
+ * still going. Each role gets only the move that applies to it: a worker must
+ * keep watching and not report, while a primary may end its turn because the
+ * completion reminder wakes it. `timeoutParam` is the host's spelling of the
+ * bash_watch timeout argument, so the worker is told a name it can pass.
  */
-export const WATCH_TIMEOUT_STEER =
-  "The command is still running; this deadline is not a failure. Call bash_watch again or do other work in this turn. Only a primary session may end its turn on it (the completion reminder wakes it); a delegated worker must not end its turn or declare a result while the command runs.";
+export function watchTimeoutSteer(
+  role: WatchCallerRole,
+  capMs: number,
+  timeoutParam = "timeoutMs",
+): string {
+  if (role === "worker") {
+    return `The command is still running; this is not a failure. Watch again (${timeoutParam} up to ${capMs}) and don't report a result until it finishes.`;
+  }
+  return "The command is still running; this is not a failure. Watch again, do other work, or end your turn: the completion reminder wakes you.";
+}
 
 const CONFLICT_HINT =
   "\n\n[Hint] Use aft_conflicts to see all conflict regions across files in a single call.";

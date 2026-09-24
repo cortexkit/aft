@@ -8,6 +8,7 @@ import {
   type BridgePool,
   type BridgeRequestOptions,
   BridgeTransportUnavailableError,
+  watchTimeoutSteer,
 } from "@cortexkit/aft-bridge";
 import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
@@ -1485,6 +1486,56 @@ describe("bash_status tool", () => {
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }
+  });
+
+  test("bash_watch timeout gives a delegated worker only the worker steer with the resolved cap", async () => {
+    _resetSubagentCacheForTest();
+    const { ctx, watchTool } = makeCtx(() => ({ success: true, status: "running" }), {
+      bash: { watch_sync_max_ms: 90_000 },
+    } as PluginContext["config"]);
+    ctx.client = createSubagentClient();
+    const result = await watchTool.execute(
+      { taskId: "bash-worker-timeout", timeoutMs: 1 },
+      createMockSdkContext({ sessionID: "ses_watch_worker_text" }),
+    );
+    expect(result).toContain("timeout reached without match");
+    expect(result).toContain(watchTimeoutSteer("worker", 90_000));
+    expect(result).toContain("timeoutMs up to 90000");
+    expect(result).not.toContain("end your turn");
+  });
+
+  test("bash_watch timeout gives a primary session only the primary steer", async () => {
+    _resetSubagentCacheForTest();
+    const { watchTool } = makeCtx(() => ({ success: true, status: "running" }));
+    const result = await watchTool.execute(
+      { taskId: "bash-primary-timeout", timeoutMs: 1 },
+      createMockSdkContext({ sessionID: "ses_watch_primary_text" }),
+    );
+    expect(result).toContain("timeout reached without match");
+    expect(result).toContain(watchTimeoutSteer("primary", 120_000));
+    expect(result).not.toContain("don't report a result");
+  });
+
+  test("bash_watch without timeoutMs waits up to the cap for a worker and 30000 for a primary", async () => {
+    const effectiveFor = async (subagent: boolean, sessionID: string) => {
+      _resetSubagentCacheForTest();
+      let polls = 0;
+      const { ctx, watchTool } = makeCtx(() => {
+        polls += 1;
+        return polls === 1
+          ? { success: true, status: "running" }
+          : { success: true, status: "completed", exit_code: 0 };
+      });
+      if (subagent) ctx.client = createSubagentClient();
+      const metadata = mock((_data: Record<string, unknown>) => {});
+      await watchTool.execute(
+        { taskId: `bash-default-${sessionID}` },
+        createMockSdkContext({ sessionID, metadata }),
+      );
+      return metadata.mock.calls.at(-1)?.[0].effectiveWaitMs;
+    };
+    expect(await effectiveFor(true, "ses_watch_worker_default")).toBe(120_000);
+    expect(await effectiveFor(false, "ses_watch_primary_default")).toBe(30_000);
   });
 
   test("bash_watch pattern + exit race scans terminal output before returning exited", async () => {
