@@ -84,15 +84,34 @@ struct Verb {
 const VERBS: &[Verb] = &[
     Verb {
         name: "v1-issue-comment",
-        argv: &["issue", "comment", "42", "--body", "A governed issue comment."],
+        argv: &[
+            "issue",
+            "comment",
+            "42",
+            "--body",
+            "A governed issue comment.",
+        ],
     },
     Verb {
         name: "v1-pr-comment",
-        argv: &["pr", "comment", "7", "--body", "A governed pull-request comment."],
+        argv: &[
+            "pr",
+            "comment",
+            "7",
+            "--body",
+            "A governed pull-request comment.",
+        ],
     },
     Verb {
         name: "v1-pr-review",
-        argv: &["pr", "review", "7", "--comment", "--body", "A governed review comment."],
+        argv: &[
+            "pr",
+            "review",
+            "7",
+            "--comment",
+            "--body",
+            "A governed review comment.",
+        ],
     },
     Verb {
         name: "v1-issue-reaction",
@@ -134,11 +153,23 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "v12-issue-reopen",
-        argv: &["issue", "reopen", "42", "--comment", "Reopening for another pass."],
+        argv: &[
+            "issue",
+            "reopen",
+            "42",
+            "--comment",
+            "Reopening for another pass.",
+        ],
     },
     Verb {
         name: "v12-pr-close",
-        argv: &["pr", "close", "7", "--comment", "Superseded by a newer pull request."],
+        argv: &[
+            "pr",
+            "close",
+            "7",
+            "--comment",
+            "Superseded by a newer pull request.",
+        ],
     },
     // Deliberately without --comment: the optional comment key is then absent
     // from the wire rather than null.
@@ -369,7 +400,9 @@ fn response_frame(request: &Frame, body: Vec<u8>) -> Frame {
 impl CapturingHolder {
     fn spawn(reply: Option<Vec<u8>>) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake holder");
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         let port = listener.local_addr().expect("fake holder address").port();
         let key = vec![0x42; KEY_LEN];
         let daemon_id = [0x24; DAEMON_ID_LEN];
@@ -385,8 +418,7 @@ impl CapturingHolder {
                 .build()
                 .expect("fake holder runtime");
             runtime.block_on(async move {
-                let listener =
-                    tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+                let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
                 loop {
                     tokio::select! {
                         _ = &mut shutdown_rx => break,
@@ -590,13 +622,16 @@ fn v14_manifest(now: u64) -> Value {
             "remove_assignees"
         ]
     });
-    manifest["api_rules"].as_array_mut().expect("api rules").push(json!({
-        "method": "PATCH",
-        "path_glob": "/repos/*/*/issues/comments/*",
-        "tier": "governed",
-        "platform": ["macos", "linux"],
-        "rationale": "Own-comment edit: body-only speech; the holder verifies authorship"
-    }));
+    manifest["api_rules"]
+        .as_array_mut()
+        .expect("api rules")
+        .push(json!({
+            "method": "PATCH",
+            "path_glob": "/repos/*/*/issues/comments/*",
+            "tier": "governed",
+            "platform": ["macos", "linux"],
+            "rationale": "Own-comment edit: body-only speech; the holder verifies authorship"
+        }));
     manifest
 }
 
@@ -892,7 +927,8 @@ fn write_or_check_exchange(exchange: &Exchange, run: &Run) {
         return;
     }
     let golden: Value = serde_json::from_slice(
-        &fs::read(&path).unwrap_or_else(|error| panic!("{}: read exchange: {error}", exchange.name)),
+        &fs::read(&path)
+            .unwrap_or_else(|error| panic!("{}: read exchange: {error}", exchange.name)),
     )
     .expect("exchange golden is JSON");
     assert_eq!(
@@ -987,6 +1023,9 @@ fn write_session_record(run: &Run) {
     }))
     .expect("serialize session record");
     text.push('\n');
-    fs::write(goldens_dir().join("requests/session-v1-issue-comment.frames.json"), text)
-        .expect("write session record");
+    fs::write(
+        goldens_dir().join("requests/session-v1-issue-comment.frames.json"),
+        text,
+    )
+    .expect("write session record");
 }
