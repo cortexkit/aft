@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -243,23 +243,13 @@ pub struct CheckpointStore {
 /// Owns a checkpoint mutation lock and removes its project scope directory after
 /// the filesystem lock has released. The directory scopes only the transient
 /// lockfile; durable checkpoint bytes live under the harness namespace instead.
+///
+/// Releasing the lock leaves the scope directory in place. Removing it on
+/// release deleted the directory other acquirers were blocked on, so with two
+/// or more waiters one of them failed with NotFound. Empty scope directories
+/// are reaped by `sweep_empty_scope_dirs` during cleanup instead.
 struct CheckpointLockGuard {
-    guard: Option<fs_lock::LockGuard>,
-    scope_dir: Option<PathBuf>,
-}
-
-impl Drop for CheckpointLockGuard {
-    fn drop(&mut self) {
-        // LockGuard::drop must join the heartbeat before removing the lockfile.
-        // Drop it first, then make the best-effort directory cleanup so a new
-        // owner can keep the scope directory when it races this release.
-        if let Some(guard) = self.guard.take() {
-            drop(guard);
-        }
-        if let Some(scope_dir) = &self.scope_dir {
-            remove_empty_scope_dir(scope_dir);
-        }
-    }
+    _guard: fs_lock::LockGuard,
 }
 
 impl CheckpointStore {
@@ -328,27 +318,27 @@ impl CheckpointStore {
 
     fn acquire_mutation_lock(&self) -> Result<CheckpointLockGuard, AftError> {
         let scope_dir = self.lock_path.parent().map(Path::to_path_buf);
-        if let Some(parent) = scope_dir.as_deref() {
-            fs::create_dir_all(parent).map_err(|error| AftError::IoError {
-                path: parent.display().to_string(),
-                message: format!("failed to create checkpoint lock directory: {error}"),
-            })?;
-        }
-
-        let acquire_result = match fs_lock::try_acquire(&self.lock_path, self.lock_timeout) {
-            // A releasing peer removes the empty lock scope after its heartbeat
-            // exits. It can win the tiny interval after our create_dir_all and
-            // before lock creation, so recreate once and retry the acquisition.
-            Err(fs_lock::AcquireError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                if let Some(parent) = scope_dir.as_deref() {
-                    fs::create_dir_all(parent).map_err(|error| AftError::IoError {
-                        path: parent.display().to_string(),
-                        message: format!("failed to recreate checkpoint lock directory: {error}"),
-                    })?;
-                }
-                fs_lock::try_acquire(&self.lock_path, self.lock_timeout)
+        let deadline = Instant::now() + self.lock_timeout;
+        let acquire_result = loop {
+            if let Some(parent) = scope_dir.as_deref() {
+                fs::create_dir_all(parent).map_err(|error| AftError::IoError {
+                    path: parent.display().to_string(),
+                    message: format!("failed to create checkpoint lock directory: {error}"),
+                })?;
             }
-            result => result,
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match fs_lock::try_acquire(&self.lock_path, remaining) {
+                // The cleanup sweep may remove an empty scope directory between
+                // our create_dir_all and the lock-file creation. Recreate it and
+                // keep trying until the caller's deadline, however many times it
+                // happens, instead of failing the waiter.
+                Err(fs_lock::AcquireError::Io(error))
+                    if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline =>
+                {
+                    continue;
+                }
+                result => break result,
+            }
         };
         let guard = acquire_result.map_err(|error| match error {
             fs_lock::AcquireError::Timeout => AftError::IoError {
@@ -361,10 +351,7 @@ impl CheckpointStore {
             },
         })?;
 
-        Ok(CheckpointLockGuard {
-            guard: Some(guard),
-            scope_dir,
-        })
+        Ok(CheckpointLockGuard { _guard: guard })
     }
 
     /// Create a checkpoint by reading the given files, scoped to `session`.
@@ -1942,20 +1929,61 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_lock_scope_is_removed_after_release() {
+    fn checkpoint_lock_scope_stays_after_release() {
         let dir = tempfile::tempdir().unwrap();
         let scope_dir = dir.path().join("checkpoints").join("project-scope");
         let lock_path = scope_dir.join("checkpoint.lock");
         let path = dir.path().join("checkpoint.txt");
         fs::write(&path, "data").unwrap();
         let backup_store = BackupStore::new();
-        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        let mut store = CheckpointStore::with_lock_path(lock_path.clone(), CHECKPOINT_LOCK_TIMEOUT);
 
         store
             .create(DEFAULT_SESSION_ID, "released", vec![path], &backup_store)
             .unwrap();
 
-        assert!(!scope_dir.exists(), "released lock scope should be removed");
+        // Blocked acquirers poll for the lock file inside this directory, so a
+        // release must not remove it; empty scopes are reaped by cleanup.
+        assert!(scope_dir.is_dir(), "released lock scope must stay");
+        assert!(!lock_path.exists(), "the lock file itself is released");
+    }
+
+    /// Reproduces issue #342: a holder releases while several waiters are
+    /// blocked on the same scope. When the release removed the scope
+    /// directory, one waiter's lock-file creation failed with NotFound
+    /// (20 of 20 trials failed with five waiters). Every waiter must acquire.
+    #[test]
+    fn every_waiter_acquires_after_a_contended_release() {
+        for _ in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let lock_path = dir
+                .path()
+                .join("checkpoints")
+                .join("scope")
+                .join("checkpoint.lock");
+            let holder =
+                CheckpointStore::with_lock_path(lock_path.clone(), CHECKPOINT_LOCK_TIMEOUT);
+            let held = holder.acquire_mutation_lock().unwrap();
+            let waiters: Vec<_> = (0..5)
+                .map(|_| {
+                    let path = lock_path.clone();
+                    std::thread::spawn(move || {
+                        let store = CheckpointStore::with_lock_path(path, CHECKPOINT_LOCK_TIMEOUT);
+                        store.acquire_mutation_lock().map(|guard| {
+                            std::thread::sleep(Duration::from_millis(50));
+                            drop(guard);
+                        })
+                    })
+                })
+                .collect();
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+            for waiter in waiters {
+                if let Err(error) = waiter.join().unwrap() {
+                    panic!("a waiter lost the contended release: {error:?}");
+                }
+            }
+        }
     }
 
     #[test]
