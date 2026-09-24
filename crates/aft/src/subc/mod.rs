@@ -152,6 +152,7 @@ mod manifest;
 mod push;
 mod readiness;
 mod standing;
+mod stall_watchdog;
 mod wire;
 
 use self::health::{
@@ -3341,6 +3342,9 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    // Lives until this function returns, i.e. for the whole attached session,
+    // including teardown. Dropping it stops the thread.
+    let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor);
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
     let control_replies = readiness::PendingControlReplies::default();
@@ -4415,6 +4419,31 @@ where
     drop(writer_tx);
     let writer_result = finish_writer_task(writer_task).await;
     loop_result.and_then(|exit| writer_result.map(|_| exit))
+}
+
+fn spawn_stall_watchdog(
+    dispatch_path_metrics: &Arc<DispatchPathMetrics>,
+    executor: &Executor,
+) -> Option<stall_watchdog::StallWatchdog> {
+    let markers: Vec<Box<dyn stall_watchdog::LivenessMarker>> = vec![
+        Box::new(stall_watchdog::FrameLoopMarker(Arc::clone(
+            dispatch_path_metrics,
+        ))),
+        Box::new(stall_watchdog::DispatchLoopMarker(
+            executor.dispatch_loop_liveness(),
+        )),
+    ];
+    match stall_watchdog::StallWatchdog::spawn(
+        markers,
+        Arc::clone(&dispatch_path_metrics.stall_stats),
+        stall_watchdog::StallWatchdogConfig::production(),
+    ) {
+        Ok(watchdog) => Some(watchdog),
+        Err(error) => {
+            log::warn!("stall watchdog: could not start its thread: {error}");
+            None
+        }
+    }
 }
 
 fn spawn_writer_task<W>(

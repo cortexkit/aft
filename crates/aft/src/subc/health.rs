@@ -264,6 +264,8 @@ pub(super) struct DispatchPathMetrics {
     /// When the frame loop next promised to wake (its drain-tick timer), as
     /// milliseconds since `origin` plus one; `0` means no loop is running.
     frame_loop_wake_deadline_ms_plus_one: AtomicU64,
+    /// Stall counts published by the stall watchdog thread.
+    pub(super) stall_stats: Arc<super::stall_watchdog::StallStats>,
     pub(super) writer_queued: AtomicUsize,
     pub(super) writer_active: AtomicBool,
     pub(super) writer_saturation_count: AtomicU64,
@@ -294,6 +296,7 @@ impl DispatchPathMetrics {
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
             frame_loop_wake_deadline_ms_plus_one: AtomicU64::new(0),
+            stall_stats: Arc::default(),
             writer_queued: AtomicUsize::new(0),
             writer_active: AtomicBool::new(false),
             writer_saturation_count: AtomicU64::new(0),
@@ -628,6 +631,11 @@ impl DispatchPathMetrics {
             "frame_loop": {
                 "last_tick_age_ms": last_tick_age_ms,
                 "wake_overdue": self.frame_loop_has_pending_work(),
+            },
+            "stall_watchdog": {
+                "stall_count": self.stall_stats.stall_count(),
+                "last_stall_duration_ms": self.stall_stats.last_stall_duration_ms(),
+                "active_stalls": self.stall_stats.active_stalls(),
             },
             "pending_binds": {
                 "count": pending_binds.len(),
