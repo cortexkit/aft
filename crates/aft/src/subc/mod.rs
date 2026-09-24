@@ -4903,6 +4903,11 @@ async fn handle_route_bind_completion(
     }
 
     let inserted_new_actor = pending.inserted_new_actor || completion.inserted_new_actor;
+    // The deadline path already answered (and recorded) an overdue bind, and a
+    // torn-down bind is never answered.
+    if !pending.cancelled && !pending.deadline_reported {
+        metrics.record_bind_ack(pending.started_at.elapsed());
+    }
     if pending.cancelled {
         rollback_pending_bind_actor(
             executor,
@@ -5092,6 +5097,7 @@ async fn expire_overdue_route_binds(
             );
         }
         remove_installed_route(installed_route_epochs, route);
+        metrics.record_bind_ack(age);
         let age_ms = age.as_millis().min(u128::from(u64::MAX)) as u64;
         let deadline_ms = ROUTE_BIND_DEADLINE.as_millis();
         send_route_bind_error_parts(
@@ -11005,5 +11011,81 @@ mod tests {
             (route_frame.header.channel, route_frame.header.epoch),
             (route.channel, route.epoch)
         );
+    }
+
+    /// The bind ack path feeds the health report's bind-latency window.
+    #[tokio::test]
+    async fn answered_route_bind_is_counted_in_the_bind_ack_window() {
+        let (_dir, root) = test_root("route-bind-ack-latency");
+        let route = route_key(8, 1);
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: root.clone(),
+            project_root: root.as_path().to_path_buf(),
+            harness: "opencode".to_string(),
+            session: "ack-latency-session".to_string(),
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::FirstParty,
+            consumer_elicitation_capable: false,
+        }));
+        let completion = RouteBindCompletion {
+            route,
+            identity,
+            bind_root_id: root.clone(),
+            inserted_new_actor: false,
+            configure_response: Response::success("subc-bind-8", json!({})),
+            diagnostics_on_edit: false,
+            ver: PROTOCOL_VERSION,
+            corr: 92,
+            flags: control_flags(),
+        };
+        let arrived = Instant::now()
+            .checked_sub(Duration::from_secs(7))
+            .expect("monotonic clock is older than seven seconds");
+        let mut pending_binds = HashMap::from([(
+            route,
+            PendingBind {
+                bind_root_id: root,
+                inserted_new_actor: false,
+                cancelled: false,
+                configure_request_id: "subc-bind-8".to_string(),
+                started_at: arrived,
+                warned_half_deadline: false,
+                deadline_reported: false,
+                corr: 92,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                cancellation: crate::executor::JobCancellation::new(),
+            },
+        )]);
+        let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
+        let (writer_tx, _writer_rx) = mpsc::channel(8);
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let executor = Arc::new(Executor::new());
+        let standing_actor =
+            standing::StandingActor::new(App::default_shared(), Arc::clone(&executor));
+
+        handle_route_bind_completion(
+            &writer_tx,
+            completion,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut pending_binds,
+            &mut installed_route_epochs,
+            &executor,
+            &standing_actor,
+            &Arc::new(Notify::new()),
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let acks = &metrics.snapshot(&HashMap::new())["bind_acks"];
+        assert_eq!(acks["count"], 1);
+        assert_eq!(acks["slow_count"], 1, "{acks}");
+        assert!(acks["worst_ms"].as_u64().is_some_and(|ms| ms >= 7_000));
     }
 }

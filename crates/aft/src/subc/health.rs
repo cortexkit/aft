@@ -258,6 +258,75 @@ pub(super) fn take_bg_observability_logs_for_test() -> Vec<String> {
     BG_OBSERVABILITY_TEST_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
 }
 
+/// How far back the health report looks at route-bind answer latency.
+const BIND_ACK_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// A bind answered slower than this counts as slow. The daemon refuses a
+/// module's binds once relays pass 12 s, so a rising slow count is the early
+/// warning before that happens.
+const BIND_ACK_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
+/// Upper bound on retained samples; a restart storm is a few hundred binds.
+const BIND_ACK_MAX_SAMPLES: usize = 4096;
+
+/// Route-bind answer latencies over the last `BIND_ACK_WINDOW`, plus the
+/// worst latency since the process started.
+#[derive(Debug, Default)]
+struct BindAckLatencies {
+    samples: std::collections::VecDeque<(Instant, Duration)>,
+    worst_since_start: Duration,
+    total: u64,
+    slow_total: u64,
+}
+
+impl BindAckLatencies {
+    fn record(&mut self, now: Instant, latency: Duration) {
+        self.prune(now);
+        if self.samples.len() >= BIND_ACK_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((now, latency));
+        self.worst_since_start = self.worst_since_start.max(latency);
+        self.total = self.total.saturating_add(1);
+        if latency > BIND_ACK_SLOW_THRESHOLD {
+            self.slow_total = self.slow_total.saturating_add(1);
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > BIND_ACK_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    fn snapshot(&mut self, now: Instant) -> Value {
+        self.prune(now);
+        let slow_in_window = self
+            .samples
+            .iter()
+            .filter(|(_, latency)| *latency > BIND_ACK_SLOW_THRESHOLD)
+            .count();
+        let worst_in_window_ms = self
+            .samples
+            .iter()
+            .map(|(_, latency)| duration_millis_u64(*latency))
+            .max();
+        json!({
+            "window_s": BIND_ACK_WINDOW.as_secs(),
+            "slow_threshold_ms": duration_millis_u64(BIND_ACK_SLOW_THRESHOLD),
+            "count": self.samples.len(),
+            "slow_count": slow_in_window,
+            "worst_ms": worst_in_window_ms,
+            "worst_since_start_ms": (self.total > 0)
+                .then(|| duration_millis_u64(self.worst_since_start)),
+            "total": self.total,
+            "slow_total": self.slow_total,
+        })
+    }
+}
+
 pub(super) struct DispatchPathMetrics {
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
@@ -288,6 +357,7 @@ pub(super) struct DispatchPathMetrics {
     bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
     bg_event_rates: BgEventRates,
     reap: ReapMetrics,
+    bind_acks: StdMutex<BindAckLatencies>,
 }
 
 impl DispatchPathMetrics {
@@ -318,7 +388,23 @@ impl DispatchPathMetrics {
             bg_events: StdMutex::new(HashMap::new()),
             bg_event_rates: BgEventRates::new(),
             reap: ReapMetrics::new(),
+            bind_acks: StdMutex::new(BindAckLatencies::default()),
         }
+    }
+
+    /// Record how long a RouteBind took from arrival to its answer: a
+    /// configure ack or error, or the deadline refusal.
+    pub(super) fn record_bind_ack(&self, latency: Duration) {
+        if let Ok(mut acks) = self.bind_acks.lock() {
+            acks.record(Instant::now(), latency);
+        }
+    }
+
+    fn bind_ack_snapshot(&self) -> Value {
+        self.bind_acks
+            .lock()
+            .map(|mut acks| acks.snapshot(Instant::now()))
+            .unwrap_or(Value::Null)
     }
 
     fn now_ms(&self) -> u64 {
@@ -620,7 +706,7 @@ impl DispatchPathMetrics {
         self.reap.snapshot()
     }
 
-    fn snapshot(&self, pending_binds: &HashMap<RouteChannel, PendingBind>) -> Value {
+    pub(super) fn snapshot(&self, pending_binds: &HashMap<RouteChannel, PendingBind>) -> Value {
         let now = Instant::now();
         let oldest_pending_age_ms = pending_binds
             .values()
@@ -642,6 +728,7 @@ impl DispatchPathMetrics {
                 "count": pending_binds.len(),
                 "oldest_age_ms": oldest_pending_age_ms,
             },
+            "bind_acks": self.bind_ack_snapshot(),
             "completion_channels": {
                 "control": self.control_completion_queued.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_queued.load(Ordering::Relaxed),
@@ -1795,6 +1882,46 @@ mod tests {
 
         metrics.clear_frame_loop_wake_deadline();
         assert!(!metrics.frame_loop_has_pending_work());
+    }
+
+    #[test]
+    fn health_reports_slow_bind_acks_in_the_window_and_the_worst_latency() {
+        let metrics = DispatchPathMetrics::new();
+        let executor = Executor::new();
+        let app = crate::context::App::default_shared();
+        let quiet = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let quiet_acks = &quiet.metrics.as_ref().unwrap()["dispatch_path"]["bind_acks"];
+        assert_eq!(quiet_acks["count"], 0);
+        assert_eq!(quiet_acks["slow_count"], 0);
+        assert!(quiet_acks["worst_ms"].is_null());
+
+        for latency_ms in [40, 6_100, 26_500, 900, 17_800] {
+            metrics.record_bind_ack(Duration::from_millis(latency_ms));
+        }
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let acks = &report.metrics.as_ref().unwrap()["dispatch_path"]["bind_acks"];
+        assert_eq!(acks["count"], 5);
+        assert_eq!(acks["slow_count"], 3, "acks over 5 s: {acks}");
+        assert_eq!(acks["slow_threshold_ms"], 5_000);
+        assert_eq!(acks["worst_ms"], 26_500);
+        assert_eq!(acks["worst_since_start_ms"], 26_500);
+    }
+
+    #[test]
+    fn bind_ack_window_forgets_old_acks_but_keeps_the_all_time_worst() {
+        let mut acks = BindAckLatencies::default();
+        let start = Instant::now();
+        acks.record(start, Duration::from_secs(9));
+        acks.record(start + Duration::from_secs(1), Duration::from_millis(30));
+        let later = start + BIND_ACK_WINDOW + Duration::from_secs(1);
+        acks.record(later, Duration::from_millis(50));
+        let snapshot = acks.snapshot(later);
+        assert_eq!(snapshot["count"], 2);
+        assert_eq!(snapshot["slow_count"], 0);
+        assert_eq!(snapshot["worst_ms"], 50);
+        assert_eq!(snapshot["worst_since_start_ms"], 9_000);
+        assert_eq!(snapshot["slow_total"], 1);
+        assert_eq!(snapshot["total"], 3);
     }
 
     fn refresh_until_root_count(
