@@ -108,6 +108,16 @@ const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 4] = [
     MaintenanceDrainKind::ConfigureTail,
     MaintenanceDrainKind::CompletionDrains,
 ];
+/// Most configure tails (the post-bind catch-up: artifact load starts, symbol
+/// prewarm, storage sweeps, watcher start) running at once across every root.
+/// After a daemon restart every session rebinds within a few minutes; without
+/// a cap each root's tail started as soon as its bind acked and they all
+/// competed for CPU and disk together.
+const CONFIGURE_TAIL_CONCURRENCY: usize = 4;
+/// Most configure tails a single maintenance tick (every 250 ms) may start, so
+/// a burst of binds is admitted a few roots at a time even while tails finish
+/// quickly.
+const CONFIGURE_TAIL_ADMISSIONS_PER_TICK: usize = 2;
 #[cfg(test)]
 const INITIAL_MAINTENANCE_JOB_COUNT: usize = INITIAL_MAINTENANCE_DRAIN_KINDS.len();
 
@@ -887,6 +897,9 @@ struct RootMeta {
     idle_artifacts_evicted: bool,
     unbound_quiesced: bool,
     consecutive_missing_sweeps: u8,
+    /// A ConfigureTail drain for this root is submitted and has not completed.
+    /// Counted across roots against `CONFIGURE_TAIL_CONCURRENCY`.
+    configure_tail_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -1052,6 +1065,7 @@ impl RootMeta {
             idle_artifacts_evicted: false,
             unbound_quiesced: false,
             consecutive_missing_sweeps: 0,
+            configure_tail_in_flight: false,
         }
     }
 
@@ -1076,6 +1090,11 @@ fn due_maintenance_jobs(
 ) -> (Vec<(ProjectRootId, MaintenanceDrainKind)>, bool) {
     let mut jobs = Vec::new();
     let mut deferred = false;
+    let mut tails_in_flight = live_roots
+        .values()
+        .filter(|meta| meta.configure_tail_in_flight)
+        .count();
+    let mut tails_admitted = 0usize;
     let mut roots = live_roots.keys().cloned().collect::<Vec<_>>();
     roots.sort_by(|left, right| {
         let left_last = live_roots
@@ -1162,15 +1181,33 @@ fn due_maintenance_jobs(
             meta.maintenance_queued_kinds.extend(kinds_with_work);
         }
 
+        let mut held_tail = false;
         while let Some(kind) = meta.maintenance_queued_kinds.pop_front() {
             if jobs.len() >= budget {
                 meta.maintenance_queued_kinds.push_front(kind);
                 deferred = true;
                 break;
             }
+            if kind == MaintenanceDrainKind::ConfigureTail {
+                if tails_in_flight >= CONFIGURE_TAIL_CONCURRENCY
+                    || tails_admitted >= CONFIGURE_TAIL_ADMISSIONS_PER_TICK
+                {
+                    // Hold only the tail; this root's other drains still run.
+                    held_tail = true;
+                    deferred = true;
+                    continue;
+                }
+                tails_in_flight += 1;
+                tails_admitted += 1;
+                meta.configure_tail_in_flight = true;
+            }
             meta.maintenance_jobs_in_flight += 1;
             meta.maintenance_last_submitted = Some(Instant::now());
             jobs.push((root_id.clone(), kind));
+        }
+        if held_tail {
+            meta.maintenance_queued_kinds
+                .push_front(MaintenanceDrainKind::ConfigureTail);
         }
 
         meta.maintenance_pending =
@@ -4203,6 +4240,9 @@ where
                     .values()
                     .any(|pending| pending.bind_root_id == root_id);
                 let requiesce = if let Some(meta) = live_roots.get_mut(&root_id) {
+                    if completion.kind == MaintenanceDrainKind::ConfigureTail {
+                        meta.configure_tail_in_flight = false;
+                    }
                     let defer_requeue = meta.unbound_quiesced || bind_pending;
                     note_maintenance_completion(
                         meta,
@@ -10430,6 +10470,93 @@ mod tests {
         assert!(!deferred);
         assert_eq!(live_roots[&root].maintenance_jobs_in_flight, 2);
         assert!(live_roots[&root].maintenance_queued_kinds.is_empty());
+    }
+
+    /// Many roots binding in one burst each queue a configure tail. The loop
+    /// must admit them a few at a time and never run more than the cap at
+    /// once, while every root's other drains keep running.
+    #[test]
+    fn configure_tails_of_a_bind_burst_are_admitted_gradually() {
+        const ROOTS: usize = 40;
+        let mut live_roots = HashMap::new();
+        let mut _dirs = Vec::new();
+        for index in 0..ROOTS {
+            let (dir, root_id) = test_root(&format!("tail-burst-{index}"));
+            let mut meta = RootMeta::new(Instant::now());
+            meta.maintenance_pending = true;
+            meta.maintenance_queued_kinds.extend([
+                MaintenanceDrainKind::ConfigureTail,
+                MaintenanceDrainKind::CompletionDrains,
+            ]);
+            live_roots.insert(root_id, meta);
+            _dirs.push(dir);
+        }
+        let tails = |due: &[(ProjectRootId, MaintenanceDrainKind)]| {
+            due.iter()
+                .filter(|(_, kind)| *kind == MaintenanceDrainKind::ConfigureTail)
+                .map(|(root, _)| root.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let (first, deferred) = due_maintenance_jobs_without_actor_context(
+            &mut live_roots,
+            usize::MAX,
+            &HashSet::new(),
+        );
+        assert!(deferred);
+        assert_eq!(tails(&first).len(), CONFIGURE_TAIL_ADMISSIONS_PER_TICK);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|(_, kind)| *kind == MaintenanceDrainKind::CompletionDrains)
+                .count(),
+            ROOTS,
+            "a held tail must not hold the root's other drains"
+        );
+
+        let mut running = tails(&first);
+        while running.len() < CONFIGURE_TAIL_CONCURRENCY {
+            let (next, _) = due_maintenance_jobs_without_actor_context(
+                &mut live_roots,
+                usize::MAX,
+                &HashSet::new(),
+            );
+            let admitted = tails(&next);
+            assert!(!admitted.is_empty());
+            assert!(admitted.len() <= CONFIGURE_TAIL_ADMISSIONS_PER_TICK);
+            running.extend(admitted);
+        }
+        assert_eq!(running.len(), CONFIGURE_TAIL_CONCURRENCY);
+        let (at_cap, deferred) = due_maintenance_jobs_without_actor_context(
+            &mut live_roots,
+            usize::MAX,
+            &HashSet::new(),
+        );
+        assert!(deferred);
+        assert!(
+            tails(&at_cap).is_empty(),
+            "no tail starts while the cap is full"
+        );
+
+        // One tail finishes; exactly one slot opens.
+        let finished = running.remove(0);
+        let meta = live_roots.get_mut(&finished).unwrap();
+        meta.configure_tail_in_flight = false;
+        note_maintenance_completion(meta, None, false, false);
+        let (after_one, _) = due_maintenance_jobs_without_actor_context(
+            &mut live_roots,
+            usize::MAX,
+            &HashSet::new(),
+        );
+        assert_eq!(tails(&after_one).len(), 1);
+        let still_waiting = live_roots
+            .values()
+            .filter(|meta| {
+                meta.maintenance_queued_kinds
+                    .contains(&MaintenanceDrainKind::ConfigureTail)
+            })
+            .count();
+        assert_eq!(still_waiting, ROOTS - CONFIGURE_TAIL_CONCURRENCY - 1);
     }
 
     #[test]

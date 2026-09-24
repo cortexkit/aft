@@ -6571,9 +6571,17 @@ impl AppContext {
     }
 
     pub fn reset_tier2_refresh_scheduler(&self) {
-        self.reset_tier2_refresh_scheduler_at(Instant::now());
+        let now = Instant::now();
+        let cold_ready_at = crate::inspect::tier2_scheduler::process_tier2_cold_start_pacer()
+            .lock()
+            .reserve(now);
+        self.tier2_refresh_scheduler
+            .lock()
+            .reset_after_configure_with_cold_ready_at(cold_ready_at);
     }
 
+    /// Reset as of `now` with the plain cold-cache delay, outside the
+    /// process-wide pacing. Tests use this to place deadlines exactly.
     #[doc(hidden)]
     pub fn reset_tier2_refresh_scheduler_at(&self, now: Instant) {
         self.tier2_refresh_scheduler
@@ -9548,6 +9556,36 @@ mod callgraph_store_for_ops_tests {
         assert!(
             ctx.tier2_pull_demand_pending(),
             "semantic worker disconnect must resume deferred Tier-2 work"
+        );
+    }
+
+    /// Configure resets use the process-wide pacer, so two roots configured in
+    /// the same instant do not publish the same cold-refresh deadline.
+    #[test]
+    fn configure_resets_of_two_roots_get_spaced_cold_refresh_deadlines() {
+        let ctx_a = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx_b = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let before = Instant::now();
+        ctx_a.reset_tier2_refresh_scheduler();
+        ctx_b.reset_tier2_refresh_scheduler();
+        let deadline = |ctx: &AppContext| {
+            ctx.tier2_refresh_scheduler
+                .lock()
+                .next_dispatch_at(before)
+                .expect("a configure publishes a cold-refresh deadline")
+        };
+        let (first, second) = (deadline(&ctx_a), deadline(&ctx_b));
+        assert!(first >= before + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY);
+        // Other tests configure roots in parallel through the same pacer, so
+        // a crowded run may already have pushed reservations to the spread
+        // ceiling, where roots share the last slot by design.
+        let ceiling = before
+            + crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY
+            + crate::inspect::tier2_scheduler::TIER2_COLD_START_MAX_SPREAD;
+        assert!(
+            second >= first + crate::inspect::tier2_scheduler::TIER2_COLD_START_SPACING
+                || second >= ceiling,
+            "the second root's cold refresh must be paced after the first"
         );
     }
 

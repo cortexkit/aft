@@ -16,6 +16,51 @@ pub const TIER2_REFRESH_STORM_PATH_THRESHOLD: usize = 200;
 // keeps being refused would retry (and log) several times a second for as long
 // as the limiter stays full.
 pub const TIER2_REFRESH_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
+/// Minimum gap between two roots' first (cold-cache) Tier-2 refreshes.
+///
+/// Every root configured in the same burst (all sessions rebinding after a
+/// daemon restart) used to come due at exactly `configured + 90s`, so dozens
+/// of scans each opening their root's callgraph and build-breaker stores
+/// started together while the fleet was still rebinding. The process-wide
+/// pacer hands out cold-refresh start times at least this far apart.
+pub const TIER2_COLD_START_SPACING: Duration = Duration::from_secs(3);
+/// Upper bound on how far past the cold-cache delay pacing may push one root's
+/// first refresh. A burst larger than `MAX_SPREAD / SPACING` roots shares the
+/// last slot rather than delaying later roots' first refresh without limit.
+pub const TIER2_COLD_START_MAX_SPREAD: Duration = Duration::from_secs(5 * 60);
+
+/// Hands out first-refresh times for roots configured close together, so
+/// their cold-cache Tier-2 refreshes start one at a time instead of at once.
+#[derive(Debug, Default)]
+pub struct Tier2ColdStartPacer {
+    last_slot: Option<Instant>,
+}
+
+impl Tier2ColdStartPacer {
+    pub const fn new() -> Self {
+        Self { last_slot: None }
+    }
+
+    /// Reserve the earliest moment a root configured at `now` may run its
+    /// cold-cache refresh: never before `now + TIER2_REFRESH_COLD_CACHE_DELAY`,
+    /// and at least `TIER2_COLD_START_SPACING` after the previous reservation.
+    pub fn reserve(&mut self, now: Instant) -> Instant {
+        let earliest = now + TIER2_REFRESH_COLD_CACHE_DELAY;
+        let paced = self.last_slot.map_or(earliest, |last| {
+            earliest.max(last + TIER2_COLD_START_SPACING)
+        });
+        let slot = paced.min(earliest + TIER2_COLD_START_MAX_SPREAD);
+        self.last_slot = Some(self.last_slot.map_or(slot, |last| last.max(slot)));
+        slot
+    }
+}
+
+/// The pacer shared by every root this process hosts.
+pub fn process_tier2_cold_start_pacer() -> &'static parking_lot::Mutex<Tier2ColdStartPacer> {
+    static PACER: parking_lot::Mutex<Tier2ColdStartPacer> =
+        parking_lot::Mutex::new(Tier2ColdStartPacer::new());
+    &PACER
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2TriggerReason {
@@ -103,7 +148,10 @@ struct Tier2DispatchRollback {
 
 #[derive(Debug, Clone)]
 pub struct Tier2RefreshScheduler {
-    configured_at: Option<Instant>,
+    /// When the first scan after the last configure may start: the
+    /// cold-cache delay, pushed later by the process-wide pacer when many
+    /// roots were configured together.
+    cold_ready_at: Option<Instant>,
     last_change_at: Option<Instant>,
     activity_started_at: Option<Instant>,
     debounce_delay: Duration,
@@ -119,7 +167,7 @@ pub struct Tier2RefreshScheduler {
 impl Tier2RefreshScheduler {
     pub fn new() -> Self {
         Self {
-            configured_at: None,
+            cold_ready_at: None,
             last_change_at: None,
             activity_started_at: None,
             debounce_delay: TIER2_REFRESH_DEBOUNCE,
@@ -134,7 +182,13 @@ impl Tier2RefreshScheduler {
     }
 
     pub fn reset_after_configure(&mut self, now: Instant) {
-        self.configured_at = Some(now);
+        self.reset_after_configure_with_cold_ready_at(now + TIER2_REFRESH_COLD_CACHE_DELAY);
+    }
+
+    /// Reset after a configure whose first scan must wait until `cold_ready_at`
+    /// (a slot from [`Tier2ColdStartPacer::reserve`]).
+    pub fn reset_after_configure_with_cold_ready_at(&mut self, cold_ready_at: Instant) {
+        self.cold_ready_at = Some(cold_ready_at);
         self.last_change_at = None;
         self.activity_started_at = None;
         self.debounce_delay = TIER2_REFRESH_DEBOUNCE;
@@ -278,17 +332,13 @@ impl Tier2RefreshScheduler {
                 (deadline, None) | (None, deadline) => deadline,
             }
         } else if self.configure_warm_pending {
-            self.configured_at
-                .map(|configured| configured + TIER2_REFRESH_COLD_CACHE_DELAY)
+            self.cold_ready_at
         } else {
             None
         }?;
 
         let cold_cache_at = (self.last_scan_started_at.is_none() && !self.pull_demand_pending)
-            .then(|| {
-                self.configured_at
-                    .map(|configured| configured + TIER2_REFRESH_COLD_CACHE_DELAY)
-            })
+            .then_some(self.cold_ready_at)
             .flatten();
 
         Some(
@@ -367,10 +417,7 @@ impl Tier2RefreshScheduler {
 
     fn cold_delay_elapsed(&self, now: Instant) -> bool {
         self.last_scan_started_at.is_some()
-            || self
-                .configured_at
-                .map(|configured| elapsed_since(now, configured) >= TIER2_REFRESH_COLD_CACHE_DELAY)
-                .unwrap_or(false)
+            || self.cold_ready_at.is_some_and(|ready_at| now >= ready_at)
     }
 
     fn ceiling_elapsed(&self, now: Instant) -> bool {
@@ -458,6 +505,67 @@ mod tests {
             callgraph_cold_build_active: true,
             ..Tier2ExternalGates::default()
         }
+    }
+
+    #[test]
+    fn cold_refreshes_of_roots_configured_together_start_one_at_a_time() {
+        const ROOTS: usize = 40;
+        let base = Instant::now();
+        let mut pacer = Tier2ColdStartPacer::new();
+        let mut schedulers = (0..ROOTS)
+            .map(|_| {
+                let mut scheduler = Tier2RefreshScheduler::new();
+                scheduler.reset_after_configure_with_cold_ready_at(pacer.reserve(base));
+                scheduler
+            })
+            .collect::<Vec<_>>();
+
+        // Tick every root once a second, as the maintenance loop would, from
+        // the plain cold-cache deadline until the last paced slot.
+        let first = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        let last = first + TIER2_COLD_START_SPACING * (ROOTS as u32 - 1);
+        let mut started_at = vec![None; ROOTS];
+        let mut now = base + TIER2_REFRESH_COLD_CACHE_DELAY - Duration::from_secs(1);
+        while now <= last {
+            let mut started_this_tick = 0;
+            for (index, scheduler) in schedulers.iter_mut().enumerate() {
+                if started_at[index].is_none() && scheduler.tick(now, 0, true, false).is_some() {
+                    started_at[index] = Some(now);
+                    started_this_tick += 1;
+                }
+            }
+            assert!(
+                started_this_tick <= 1,
+                "{started_this_tick} cold refreshes started together at +{:?}",
+                now - base
+            );
+            now += Duration::from_secs(1);
+        }
+
+        assert!(
+            started_at.iter().all(Option::is_some),
+            "every root's cold refresh still runs by the last paced slot"
+        );
+        assert_eq!(started_at[0], Some(first), "the first root is not delayed");
+        let mut starts = started_at.into_iter().flatten().collect::<Vec<_>>();
+        starts.sort();
+        for pair in starts.windows(2) {
+            assert!(pair[1] - pair[0] >= TIER2_COLD_START_SPACING);
+        }
+    }
+
+    #[test]
+    fn cold_start_pacing_is_bounded_and_idle_after_a_quiet_gap() {
+        let base = Instant::now();
+        let mut pacer = Tier2ColdStartPacer::new();
+        let slots = (0..1000).map(|_| pacer.reserve(base)).collect::<Vec<_>>();
+        let ceiling = base + TIER2_REFRESH_COLD_CACHE_DELAY + TIER2_COLD_START_MAX_SPREAD;
+        assert!(slots.iter().all(|slot| *slot <= ceiling));
+        assert_eq!(slots.last().copied(), Some(ceiling));
+
+        // A root configured long after the burst gets the plain delay.
+        let later = ceiling + Duration::from_secs(60);
+        assert_eq!(pacer.reserve(later), later + TIER2_REFRESH_COLD_CACHE_DELAY);
     }
 
     #[test]
