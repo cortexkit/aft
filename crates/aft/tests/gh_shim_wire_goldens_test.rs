@@ -161,6 +161,32 @@ const VERBS: &[Verb] = &[
             "p1",
         ],
     },
+    // Own-issue edit: the holder checks the issue was opened by the calling
+    // seat's bot, so the request carries `author_scope: "own"`.
+    Verb {
+        name: "v14-issue-edit-title-body",
+        argv: &[
+            "issue",
+            "edit",
+            "42",
+            "--title",
+            "A retitled issue",
+            "--body",
+            "Edited by the bot.",
+        ],
+    },
+    Verb {
+        name: "v14-issue-edit-labels",
+        argv: &[
+            "issue",
+            "edit",
+            "42",
+            "--add-label",
+            "triaged",
+            "--remove-label",
+            "needs-triage",
+        ],
+    },
     Verb {
         name: "v14-api-patch-issue-comment",
         argv: &[
@@ -239,6 +265,23 @@ fn refusal_exchanges() -> Vec<Exchange> {
             name: "v14-issue-create-refusal",
             verb: "v14-issue-create",
             reply: HolderReply::Respond("refusal-identity_mismatch.response.json"),
+        },
+        Exchange {
+            name: "v14-issue-edit-title-body-refusal",
+            verb: "v14-issue-edit-title-body",
+            reply: HolderReply::Respond("refusal-identity_mismatch.response.json"),
+        },
+        // The code prefrontal's route holder returns when the issue was not
+        // opened by the calling seat's bot.
+        Exchange {
+            name: "v14-issue-edit-title-body-refusal-issue_edit_not_own",
+            verb: "v14-issue-edit-title-body",
+            reply: HolderReply::Respond("refusal-issue_edit_not_own.response.json"),
+        },
+        Exchange {
+            name: "v14-issue-edit-labels-refusal-issue_edit_not_own",
+            verb: "v14-issue-edit-labels",
+            reply: HolderReply::Respond("refusal-issue_edit_not_own.response.json"),
         },
         Exchange {
             name: "v14-api-patch-issue-comment-refusal-custody_unreachable",
@@ -512,9 +555,10 @@ async fn serve_connection(
 // Isolated shim environment
 // ---------------------------------------------------------------------------
 
-/// The v12 manifest fixture plus the two v14 speech rows, signed with the dev
-/// key and published as version 14, so one manifest admits every governed
-/// family exercised here (v1, v10 `--edit-last`, v12, v14).
+/// The v12 manifest fixture plus the three v14 speech rows (`issue create`,
+/// own-issue `issue edit`, the own-comment PATCH), signed with the dev key and
+/// published as version 14, so one manifest admits every governed family
+/// exercised here (v1, v10 `--edit-last`, v12, v14).
 fn v14_manifest(now: u64) -> Value {
     let mut manifest: Value =
         serde_json::from_str(include_str!("fixtures/gh_shim/v12-manifest.json"))
@@ -529,6 +573,22 @@ fn v14_manifest(now: u64) -> Value {
         "argv_forms": ["fields-only"],
         "target_fields": [],
         "body_fields": ["title", "body", "labels"]
+    });
+    manifest["tiers"]["governed"]
+        .as_array_mut()
+        .expect("governed tier")
+        .push(json!({"tuple": "issue edit", "platform": ["macos", "linux"]}));
+    manifest["canonicalization"]["issue edit"] = json!({
+        "argv_forms": ["target-and-fields"],
+        "target_fields": ["number"],
+        "body_fields": [
+            "title",
+            "body",
+            "add_labels",
+            "remove_labels",
+            "add_assignees",
+            "remove_assignees"
+        ]
     });
     manifest["api_rules"].as_array_mut().expect("api rules").push(json!({
         "method": "PATCH",

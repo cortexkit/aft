@@ -9,7 +9,7 @@ the four governed families:
 | v1 | `issue comment`, `pr comment`, `pr review`, `issue reaction` |
 | v10 | `--edit-last` on `issue comment` / `pr comment` |
 | v12 | `issue close` (with reason), `issue reopen`, `pr close`, `pr reopen` |
-| v14 | `issue create`, `api -X PATCH /repos/{o}/{r}/issues/comments/{id}` (body only) |
+| v14 | `issue create`, own-issue `issue edit` (title/body, labels), `api -X PATCH /repos/{o}/{r}/issues/comments/{id}` (body only) |
 
 ## Real captures and derived files
 
@@ -37,7 +37,8 @@ Each run gets its own temporary HOME, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
 `GH_ENTERPRISE_TOKEN` and `GH_SHIM_BYPASS` are removed; PATH starts with a
 recording stand-in for upstream `gh`, and every run asserts it was never
 called. The manifest is the dev-signed `v12-manifest.json` fixture plus the
-two v14 speech rows, published as `manifest_version: 14`, bound
+three v14 speech rows (`issue create`, own-issue `issue edit`, the own-comment
+PATCH), published as `manifest_version: 14`, bound
 `cortexkit/aft` → agent `alfonso-aft`. A fresh R3 rung record skips discovery.
 Nothing contacted GitHub, prefrontal, the live daemon, or the real
 `~/.local/state/cortexkit/aft/gh-shim/`.
@@ -84,8 +85,8 @@ Two shapes:
   (`1`), `action` (the verb tuple, or `api:PATCH:/repos/*/*/issues/comments/*`
   for the PATCH), `target`, `body`, `repository`, `manifest_version`,
   `rung_as_of_unix_secs`, `metadata`; plus `edit_last: true` only for
-  `--edit-last`, and `author_scope: "own"` only for the PATCH (and
-  `issue edit`, which is not part of this set).
+  `--edit-last`, and `author_scope: "own"` only for the PATCH and
+  `issue edit`.
 - **Thread state** (v12): `operation`, `gh_route_schema`, `verb`,
   `repository`, `number`, `manifest_version`, `rung_as_of_unix_secs`,
   `metadata`; plus `reason` (`completed` / `not_planned`, `issue close` only)
@@ -102,7 +103,32 @@ Target values are strings even when numeric (`"number":"42"`,
 `"comment_id":"123"`). `issue create` sends `"target":{}` and collects repeated
 `--label` flags into a `labels` array. `pr review` carries the event in
 `body.event` (`COMMENT`, `APPROVE`, `REQUEST_CHANGES`). `issue close --reason
-"not planned"` goes out as `not_planned`.
+"not planned"` goes out as `not_planned`. `issue edit` sends the issue number
+as `target.number`, only the fields given (`title`, `body`), and collects
+`--add-label` / `--remove-label` into `add_labels` / `remove_labels` arrays
+(`--add-assignee` / `--remove-assignee` likewise, not captured here).
+
+### Own-issue `issue edit`
+
+The shim does not check authorship; it marks the request `author_scope:
+"own"` and the holder reads the issue and refuses when its author is not the
+calling seat's bot. That refusal code is `issue_edit_not_own`, taken from
+prefrontal's `crates/prefrontal-core-module/src/gh_route.rs`
+(`REFUSAL_ISSUE_EDIT_NOT_OWN`, line 52; returned by `route_issue_edit` at line
+1251, prefrontal commit `1d8066e9e`). The holder builds it with its `refusal`
+helper (line 1810), whose JSON is exactly
+`{"outcome":"refusal","refusal_code":"issue_edit_not_own"}`; that is the byte
+content of `responses/refusal-issue_edit_not_own.response.json`. The code is
+read from prefrontal's source, not captured from a live holder. Two requests
+are captured: `v14-issue-edit-title-body` and `v14-issue-edit-labels`, each
+with success and not-own refusal exchanges, plus one generic
+(`identity_mismatch`) refusal for the title/body edit. The success exchanges
+reuse the generic `success-result.response.json`; the holder's real success
+body for an issue edit was not available.
+
+Under `GH_SHIM_BYPASS=operator` a label-only `issue edit` does not use this
+route at all: it runs upstream `gh` as the operator after an audit line (see
+`exits.md`). That path writes nothing to `gh.route`, so it has no golden here.
 
 ### Values that change per run
 
@@ -135,5 +161,6 @@ Coverage: every verb has a success exchange; each family has one refusal
 exchange and one outcome-unknown exchange (v1 `issue comment`, v10 `pr comment
 --edit-last`, v12 `pr close`, v14 PATCH for outcome unknown; v1 `issue
 comment`, v10 `issue comment --edit-last`, v12 `issue close`, v14 `issue
-create` and PATCH for refusal); upstream error, unbound identity and the
+create`, `issue edit` and PATCH for refusal, plus the holder's
+`issue_edit_not_own` refusal for both `issue edit` requests); upstream error, unbound identity and the
 partial state change are exercised once each.

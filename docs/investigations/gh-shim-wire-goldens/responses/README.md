@@ -25,6 +25,7 @@ this directory.
 | `upstream-error.response.json` | upstream GitHub error relayed inside a result | `upstream_error_body` `gh_shim.rs:4177-4198` (a `status`/`status_code` outside 200-299 on the response or inside `result`; body taken from `error`, then `body`, else the whole `result`); fixture `gh_shim.rs:6830-6837` | prints the error body on stderr; exit 1 |
 | `refusal-identity_mismatch.response.json` | holder refusal | parser `gh_shim.rs:4155-4164` (`refusal_code` must be a string; any string is accepted); fixture `crates/aft/tests/fixtures/gh_shim/holder-responses-v1.json:13-19` | `gh_shim_seam_refusal`; exit 86 |
 | `refusal-custody_unreachable.response.json` | holder refusal | same parser. The code `custody_unreachable` is the one real value observed: it is the `last_seam_refusal.code` recorded in this machine's live `seam-state.json` (at unix time 1790181348). The surrounding bytes are constructed. | `gh_shim_seam_refusal`; exit 86 |
+| `refusal-issue_edit_not_own.response.json` | holder refusal: the issue named by an own-issue `issue edit` was not opened by the calling seat's bot | same parser. The code and bytes follow prefrontal's `gh_route.rs` (`REFUSAL_ISSUE_EDIT_NOT_OWN = "issue_edit_not_own"` at line 52, returned through `refusal()` at line 1251, which builds `{"outcome","refusal_code"}`; prefrontal commit `1d8066e9e`). Read from source, not captured live. | `gh_shim_seam_refusal`; exit 86 |
 | `unbound-identity.response.json` | holder says the route's identity is unbound | parser `gh_shim.rs:4166` (no other field read) | `gh_shim_unbound_identity`; exit 86 |
 | *(no file)* | outcome unknown | the holder reads the request and never replies; `gh_shim.rs:3872-3881` (request error after the write) and `3936-3951` (5 s overall timeout while the stage is `request`), call timeout set at `3810` | `gh_shim_outcome_unknown`; exit 87 |
 
@@ -37,7 +38,8 @@ The codes named in the existing fixture
 `identity_mismatch`, `unmapped_operation`, `custody_unavailable`,
 `schema_unsupported`, `rate_limited`; `custody_unreachable` is the one seen
 live. All of them take the same path, so one file per code would be the same
-bytes with a different string. Only the two above are exercised.
+bytes with a different string. Only `identity_mismatch`, `custody_unreachable`
+and `issue_edit_not_own` are exercised.
 
 ## Shapes the shim rejects
 

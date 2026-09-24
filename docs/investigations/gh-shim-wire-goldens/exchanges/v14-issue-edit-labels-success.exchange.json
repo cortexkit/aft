@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "gh",
+    "issue",
+    "edit",
+    "42",
+    "--add-label",
+    "triaged",
+    "--remove-label",
+    "needs-triage"
+  ],
+  "request": "requests/v14-issue-edit-labels.request.json",
+  "response": "responses/success-result.response.json",
+  "holder_behavior": "replied with the response file bytes",
+  "exit_code": 0,
+  "stdout": "url: \"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"\nid: 1\n",
+  "stderr": ""
+}
