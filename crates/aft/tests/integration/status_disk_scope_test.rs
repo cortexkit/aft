@@ -79,6 +79,13 @@ fn status_disk_bytes_only_count_current_project() {
             "harness": "opencode",
         "project_root": project_a.to_str().expect("project a utf-8"),
         "storage_dir": storage_root.to_str().expect("storage utf-8"),
+        // The trigram and semantic indexes default on; keep them off so a real
+        // build cannot add bytes to the fake slices this test measures.
+        "config": [{
+            "tier": "user",
+            "source": "test",
+            "doc": r#"{ "indexes": { "trigram": false, "semantic": false } }"#
+        }],
     });
     let response = aft.send(&configure.to_string());
     assert_eq!(response["success"], true, "configure failed: {response}");
@@ -140,6 +147,12 @@ fn status_disk_bytes_zero_when_no_cache_for_project() {
             "harness": "opencode",
         "project_root": project_root.to_str().expect("utf-8"),
         "storage_dir": storage_root.to_str().expect("utf-8"),
+        // Same reason as above: no real index build may write into the slice.
+        "config": [{
+            "tier": "user",
+            "source": "test",
+            "doc": r#"{ "indexes": { "trigram": false, "semantic": false } }"#
+        }],
     });
     let response = aft.send(&configure.to_string());
     assert_eq!(response["success"], true);

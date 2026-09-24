@@ -129,7 +129,9 @@ fn assert_case(dir: &Path) -> Option<String> {
     // itself; otherwise the overlay below would silently fill them from
     // `Config::default()` and the comparison could pass for the wrong reason.
     if let Err(errors) = validate_resolved_config(&golden) {
-        return Some(format!("case `{case}`: golden is not a resolved config: {errors:?}"));
+        return Some(format!(
+            "case `{case}`: golden is not a resolved config: {errors:?}"
+        ));
     }
     let resolved = result.config;
     let mut resolved_json = serde_json::to_value(&resolved).expect("serialize resolved config");

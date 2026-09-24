@@ -78,8 +78,7 @@ fn spawned_with_slow_fake_gh(bin_dir: &Path, started: &Path) -> AftProcess {
 /// gate's default-off contract is pinned by the dedicated disabled-read tests.
 fn configure_gh_read_enabled(aft: &mut AftProcess, project: &Path) {
     let user_config = project.join("user-aft.jsonc");
-    fs::write(&user_config, "{\"gh_read\": {\"enabled\": true}}")
-        .expect("write gh_read user config");
+    fs::write(&user_config, "{\"github\": {\"read\": true}}").expect("write gh_read user config");
     let response = aft.send(
         &json!({
             "id": "configure-gh-read",

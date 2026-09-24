@@ -22,8 +22,20 @@ fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     temp_dir
 }
 
+/// Configure with the trigram index switched off, so grep and glob exercise
+/// the direct-scan fallback path. The index defaults on, so the fallback cases
+/// must turn it off explicitly.
 fn configure(aft: &mut AftProcess, root: &Path) {
-    let resp = aft.configure(root);
+    let resp = send(
+        aft,
+        json!({
+            "id": "cfg-no-index",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "config": user_config(serde_json::json!({ "indexes": { "trigram": false } }))
+        }),
+    );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
 }
 
@@ -35,7 +47,7 @@ fn configure_with_index(aft: &mut AftProcess, root: &Path) {
             "command": "configure",
             "harness": "opencode",
             "project_root": root,
-            "config": user_config(serde_json::json!({ "search_index": true }))
+            "config": user_config(serde_json::json!({ "indexes": { "trigram": true } }))
         }),
     );
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");

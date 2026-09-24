@@ -248,8 +248,7 @@ fn configure_harness(aft: &mut AftProcess, project: &Path, storage: &Path, harne
     // config (the only tier that can enable it); the gate's default-off
     // contract is covered by the dedicated disabled-read tests.
     let user_config = project.join("user-aft.jsonc");
-    fs::write(&user_config, "{\"gh_read\": {\"enabled\": true}}")
-        .expect("write gh_read user config");
+    fs::write(&user_config, "{\"github\": {\"read\": true}}").expect("write gh_read user config");
     let response = aft.send(
         &json!({
             "id": format!("configure-github-render-{harness}"),

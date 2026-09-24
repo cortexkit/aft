@@ -94,10 +94,10 @@ fn path_with(bin_dir: &Path) -> std::ffi::OsString {
 }
 
 fn configure_gh_read(aft: &mut AftProcess, project: &Path, harness: &str) {
-    // gh_read.enabled is USER-tier only (project tiers drop it), so tests
+    // github.read is USER-tier only (project tiers drop it), so tests
     // enable through an injected user config file.
     let user_config = project.join("user-aft.jsonc");
-    fs::write(&user_config, r#"{"gh_read":{"enabled":true}}"#)
+    fs::write(&user_config, r#"{"github":{"read":true}}"#)
         .expect("write enabled GitHub-read user config");
     let configured = aft.send(
         &json!({

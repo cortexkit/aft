@@ -275,7 +275,8 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
             "project_root": project,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
-                "gh_shim": { "enabled": true, "binary_path": binary },
+                "github": { "shim": true },
+                "gh_shim": { "binary_path": binary },
                 "git": { "co_author": "off" }
             })),
         })
@@ -316,7 +317,7 @@ fn bash_child_path_and_git_hook_environment_follow_the_resolved_gates() {
             "project_root": project,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
-                "gh_shim": { "enabled": false },
+                "github": { "shim": false },
                 "git": { "co_author": "off" }
             })),
         })

@@ -1409,7 +1409,7 @@ fn ast_search_member_access_pattern_completes_in_reasonable_time() {
     let body = r#"
         pub fn handle(ctx: &Ctx, req: &Request) -> Response {
             let cfg = ctx.config();
-            if cfg.indexes.trigram {
+            if cfg.search_index {
                 run_indexed(req)
             } else {
                 run_direct(req)

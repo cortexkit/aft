@@ -10203,10 +10203,16 @@ mod callgraph_store_for_ops_tests {
     #[test]
     fn watcher_gap_invalidation_marks_force_rebuild_for_writer_roots() {
         let project = TempDir::new().expect("project tempdir");
+        // Semantic indexing now defaults on; this case exercises the
+        // semantic-off mapping, so it switches that index off explicitly.
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(project.path().to_path_buf()),
+                indexes: crate::config::IndexesConfig {
+                    semantic: false,
+                    ..crate::config::IndexesConfig::default()
+                },
                 ..Config::default()
             },
         );
