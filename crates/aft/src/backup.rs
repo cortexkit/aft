@@ -4054,9 +4054,9 @@ fn trim_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) {
 /// user files (including secrets such as credential files), so they must never
 /// be readable by other users regardless of the source file's own mode or of
 /// the permissions on the configurable storage directory above the store.
-const PRIVATE_FILE_MODE: u32 = 0o600;
+pub(crate) const PRIVATE_FILE_MODE: u32 = 0o600;
 /// Unix mode for every directory the backup store creates.
-const PRIVATE_DIR_MODE: u32 = 0o700;
+pub(crate) const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Creates `path` and any missing ancestors as owner-only directories (0700 on
 /// Unix). The mode is applied at creation, so a directory never exists with
@@ -4064,7 +4064,7 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 /// `tighten_store_permissions` repairs stores written by older versions.
 /// Use this for backup-store directories only, never for directories that hold
 /// restored user files.
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -4155,31 +4155,33 @@ fn fsync_dir(_path: &Path) -> std::io::Result<()> {
 /// Maximum directory entries one tightening pass examines. The pass runs inside
 /// per-process backup maintenance, so a very large store is tightened across
 /// several processes instead of stalling the first undo-capable operation.
-const PERMISSION_TIGHTEN_BUDGET: usize = 4096;
-/// Progress record for the tightening pass, kept next to (not inside) the
-/// `backups` directory so the store's own directory scans never see it.
-const PERMISSION_PROGRESS_FILE: &str = ".backups-permissions.json";
+pub(crate) const PERMISSION_TIGHTEN_BUDGET: usize = 4096;
 const PERMISSION_PROGRESS_VERSION: u64 = 1;
 
-/// Outcome of one bounded permission-tightening pass over a backup store.
+/// Outcome of one bounded permission-tightening pass over a store directory.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-struct TightenReport {
+pub(crate) struct TightenReport {
     /// Directory entries looked at during this pass.
-    examined: usize,
+    pub(crate) examined: usize,
     /// Files or directories whose mode this pass changed.
-    tightened: usize,
+    pub(crate) tightened: usize,
     /// True once the whole store has been walked; later passes then do nothing.
-    complete: bool,
+    pub(crate) complete: bool,
 }
 
-fn permission_progress_path(backups_dir: &Path) -> Option<PathBuf> {
-    backups_dir
+/// Progress record for the tightening pass over `store_dir`, kept next to (not
+/// inside) that directory so the store's own directory scans never see it:
+/// `<parent>/.<store name>-permissions.json`, e.g. `.backups-permissions.json`.
+fn permission_progress_path(store_dir: &Path) -> Option<PathBuf> {
+    let name = store_dir.file_name()?.to_string_lossy();
+    store_dir
         .parent()
-        .map(|parent| parent.join(PERMISSION_PROGRESS_FILE))
+        .map(|parent| parent.join(format!(".{}-permissions.json", name)))
 }
 
-/// Brings a backup store written by an older version (0644 files, 0755
-/// directories) to owner-only permissions: files 0600, directories 0700.
+/// Brings a store directory written by an older version (0644 files, 0755
+/// directories) to owner-only permissions: files 0600, directories 0700. Used
+/// for the undo backup store and for durable checkpoints.
 ///
 /// At most `budget` directory entries are examined per call; the budget is
 /// checked inside the walk loop, before each entry is consumed. Handled
@@ -4192,7 +4194,7 @@ fn permission_progress_path(backups_dir: &Path) -> Option<PathBuf> {
 /// Returns `Ok(None)` when there is nothing to do (no store yet, or already
 /// complete).
 #[cfg(unix)]
-fn tighten_store_permissions(
+pub(crate) fn tighten_store_permissions(
     backups_dir: &Path,
     budget: usize,
 ) -> std::io::Result<Option<TightenReport>> {
@@ -4211,13 +4213,17 @@ fn tighten_store_permissions(
         // A malformed or foreign-version record just restarts the walk, which
         // is safe: tightening is idempotent.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if value.get("version").and_then(|v| v.as_u64()) == Some(PERMISSION_PROGRESS_VERSION)
-            {
+            if value.get("version").and_then(|v| v.as_u64()) == Some(PERMISSION_PROGRESS_VERSION) {
                 if value.get("complete").and_then(|v| v.as_bool()) == Some(true) {
                     return Ok(None);
                 }
                 if let Some(entries) = value.get("done").and_then(|v| v.as_array()) {
-                    done.extend(entries.iter().filter_map(|v| v.as_str()).map(str::to_string));
+                    done.extend(
+                        entries
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(str::to_string),
+                    );
                 }
             }
         }
@@ -4227,6 +4233,7 @@ fn tighten_store_permissions(
         budget,
         report: TightenReport::default(),
         done,
+        boundary: crate::walk_boundary::DeviceBoundary::for_root(backups_dir)?,
     };
     walk.tighten(backups_dir, PRIVATE_DIR_MODE);
     let complete = walk.walk(backups_dir, "")?;
@@ -4241,12 +4248,11 @@ fn tighten_store_permissions(
             "done": walk.done.iter().collect::<Vec<_>>(),
         })
     };
-    if let Some(parent) = progress_path.parent() {
-        write_temp_fsync_rename(
-            parent,
-            PERMISSION_PROGRESS_FILE,
-            record.to_string().as_bytes(),
-        )?;
+    if let (Some(parent), Some(file_name)) = (
+        progress_path.parent(),
+        progress_path.file_name().and_then(|name| name.to_str()),
+    ) {
+        write_temp_fsync_rename(parent, file_name, record.to_string().as_bytes())?;
     }
     Ok(Some(walk.report))
 }
@@ -4258,6 +4264,8 @@ struct TightenWalk {
     /// Store-relative paths (`/`-joined) already handled: finished directories,
     /// plus individual entries inside directories that are only partly done.
     done: std::collections::BTreeSet<String>,
+    /// Keeps the walk on the store's own filesystem (see `walk_boundary`).
+    boundary: crate::walk_boundary::DeviceBoundary,
 }
 
 #[cfg(unix)]
@@ -4293,6 +4301,12 @@ impl TightenWalk {
             };
             let path = entry.path();
             if file_type.is_dir() {
+                // Never enter or chmod a directory on another mounted
+                // filesystem; it is not part of the store.
+                if !self.boundary.should_descend(&path).unwrap_or(false) {
+                    self.done.insert(child_rel);
+                    continue;
+                }
                 self.tighten(&path, PRIVATE_DIR_MODE);
                 let finished = match self.walk(&path, &child_rel) {
                     Ok(finished) => finished,
@@ -6361,8 +6375,12 @@ mod tests {
 
         let mut store = BackupStore::new();
         store.set_storage_dir(storage.clone(), 72);
-        store.snapshot(DEFAULT_SESSION_ID, &secret, "secret").unwrap();
-        store.snapshot(DEFAULT_SESSION_ID, &public, "public").unwrap();
+        store
+            .snapshot(DEFAULT_SESSION_ID, &secret, "secret")
+            .unwrap();
+        store
+            .snapshot(DEFAULT_SESSION_ID, &public, "public")
+            .unwrap();
 
         let backups = storage.join("backups");
         let modes = store_modes(&backups);
@@ -6441,13 +6459,14 @@ mod tests {
         let outside_dir = temp.path().join("outside-dir");
         loose_dir(&outside_dir);
         loose_file(&outside_dir.join("inner.txt"));
-        std::os::unix::fs::symlink(&outside_file, backups.join("session-a").join("link"))
-            .unwrap();
+        std::os::unix::fs::symlink(&outside_file, backups.join("session-a").join("link")).unwrap();
         std::os::unix::fs::symlink(&outside_dir, backups.join("session-b").join("dir-link"))
             .unwrap();
 
         let budget = 4;
-        let first = tighten_store_permissions(&backups, budget).unwrap().unwrap();
+        let first = tighten_store_permissions(&backups, budget)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.examined, budget, "the pass must stop at the budget");
         assert!(!first.complete, "one small pass cannot cover the store");
         let loose_after_first = store_modes(&backups)
@@ -6461,7 +6480,9 @@ mod tests {
         let mut passes = 1;
         let mut total_tightened = first.tightened;
         loop {
-            let report = tighten_store_permissions(&backups, budget).unwrap().unwrap();
+            let report = tighten_store_permissions(&backups, budget)
+                .unwrap()
+                .unwrap();
             assert!(report.examined <= budget);
             total_tightened += report.tightened;
             passes += 1;
@@ -6469,7 +6490,10 @@ mod tests {
                 break;
             }
             // A restarting walk would re-examine the same prefix forever.
-            assert!(passes < 50, "tightening never resumed past its first entries");
+            assert!(
+                passes < 50,
+                "tightening never resumed past its first entries"
+            );
         }
         assert!(passes > 2);
         // 1 root + 2 sessions + 4 path dirs + 2 markers + 4 * (meta + 3 bak).
