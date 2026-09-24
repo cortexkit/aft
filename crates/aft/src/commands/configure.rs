@@ -5304,7 +5304,20 @@ fn cancel_unbound_configure_jobs(
 }
 
 pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
-    let jobs = ctx.drain_configure_maintenance();
+    let parked = ctx
+        .take_parked_configure_tail()
+        .map(|state| {
+            state
+                .jobs
+                .into_iter()
+                .map(|pending| pending.job)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let jobs = parked
+        .into_iter()
+        .chain(ctx.drain_configure_maintenance())
+        .collect::<Vec<_>>();
     let cancelled = jobs.len();
     cancel_unbound_configure_jobs(ctx, jobs);
     cancelled
@@ -5394,6 +5407,15 @@ impl ConfigureMaintenanceState {
                 .into_iter()
                 .map(ConfigureMaintenanceContinuation::new),
         );
+    }
+
+    /// True when the next unit to run starts a job or continues one past its
+    /// request-critical prefix, so stopping here leaves no prefix half done.
+    fn can_step_aside(&self) -> bool {
+        self.jobs.front().is_none_or(|continuation| {
+            continuation.stage == ConfigureMaintenanceStage::Admission
+                || !continuation.stage.is_non_yielding_prefix()
+        })
     }
 }
 
@@ -5514,8 +5536,54 @@ pub(crate) fn drain_deferred_configure_maintenance_unit(
 }
 
 pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
-    let mut state = ConfigureMaintenanceState::default();
-    while drain_deferred_configure_maintenance_unit(ctx, &mut state) {}
+    drain_configure_tail(ctx, false);
+}
+
+/// Drain deferred configure work, stepping aside when an interactive writer
+/// (a route-bind configure or a tool edit) queues on this root's actor.
+///
+/// The drain runs as one maintenance job holding the actor's epoch read gate,
+/// and a queued writer cannot start until that gate is free. Across a daemon
+/// restart one root's tail (artifact loads, storage sweeps, watcher start) ran
+/// for over ten seconds while the next session's bind for the same root
+/// waited behind it, past the daemon's relay deadline. Between units the drain
+/// now checks for a waiting writer and, at a point where no request-critical
+/// stage is half done, parks the remaining work on the context and returns
+/// `true`. The caller requeues the drain; it resumes where it stopped once the
+/// writer has run.
+///
+/// Off an executor worker no writer can be observed, so this drains fully.
+pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) -> bool {
+    drain_configure_tail(ctx, true)
+}
+
+fn drain_configure_tail(ctx: &AppContext, allow_step_aside: bool) -> bool {
+    let mut state = ctx.take_parked_configure_tail().unwrap_or_default();
+    drop_superseded_parked_continuations(ctx, &mut state);
+    while drain_deferred_configure_maintenance_unit(ctx, &mut state) {
+        if allow_step_aside
+            && crate::executor::current_actor_writer_waiting()
+            && state.can_step_aside()
+        {
+            ctx.park_configure_tail(state);
+            return true;
+        }
+    }
+    false
+}
+
+/// A configure that ran while a tail was parked may have replaced the
+/// generation the parked work belongs to. That configure queued its own tail,
+/// which repeats every root-scoped stage, so a started continuation from the
+/// older generation has nothing left to do. Its request-critical prefix (bash
+/// replay included) already ran before it parked, so the session binding
+/// stays. Unstarted continuations keep their normal Admission-stage handling.
+fn drop_superseded_parked_continuations(ctx: &AppContext, state: &mut ConfigureMaintenanceState) {
+    let current = ctx.configure_generation();
+    state.jobs.retain(|continuation| {
+        continuation.stage == ConfigureMaintenanceStage::Admission
+            || continuation.job.generation == current
+    });
 }
 
 fn import_legacy_view_once(
@@ -6728,6 +6796,73 @@ mod tests {
                 .get("views")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn configure_tail_steps_aside_for_a_queued_writer_and_resumes_after_it() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": project.path(),
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+        assert!(ctx.configure_tail_has_work());
+
+        // A route bind for this root is queued behind the running tail.
+        let waiting_writers = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        {
+            let _writer_waiting = crate::executor::install_actor_waiting_writers_for_test(
+                Arc::clone(&waiting_writers),
+            );
+            assert!(
+                super::drain_deferred_configure_maintenance_yielding(&ctx),
+                "the tail must step aside while a writer waits on its actor"
+            );
+        }
+        assert!(
+            ctx.configure_tail_has_work(),
+            "the unfinished tail stays visible to the maintenance probe"
+        );
+        let parked = ctx
+            .take_parked_configure_tail()
+            .expect("the rest of the tail is parked on the context");
+        let stage = parked.jobs.front().map(|continuation| continuation.stage);
+        assert!(
+            stage.is_some_and(|stage| !stage.is_non_yielding_prefix()),
+            "the tail may only stop after its request-critical prefix, parked at {stage:?}"
+        );
+        ctx.park_configure_tail(parked);
+
+        // The writer ran; the requeued drain finishes the parked work.
+        waiting_writers.store(0, std::sync::atomic::Ordering::Release);
+        {
+            let _no_writer = crate::executor::install_actor_waiting_writers_for_test(Arc::clone(
+                &waiting_writers,
+            ));
+            assert!(!super::drain_deferred_configure_maintenance_yielding(&ctx));
+        }
+        assert!(!ctx.configure_tail_has_work());
+        assert!(ctx.take_parked_configure_tail().is_none());
     }
 
     #[test]

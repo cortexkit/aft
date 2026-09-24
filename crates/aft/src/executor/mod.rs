@@ -84,6 +84,17 @@ pub type ExecutorJob = Box<dyn FnOnce(&AppContext) -> Response + Send + 'static>
 /// daemon rejects binds at 12s, so promotion at 6s leaves half the budget for
 /// draining readers and running the configure itself.
 const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
+/// Age at which a queued route-bind configure stops new same-root pure reads
+/// from being admitted ahead of it. Much shorter than the general writer
+/// promotion: a bind is a short configure, and after a daemon restart dozens
+/// arrive together, so reads-first admission must not spend the relay budget.
+const BIND_PROMOTION_AGE: Duration = Duration::from_millis(500);
+/// Worker threads reserved for route-bind configures, on top of `pool_size`.
+/// General interactive and maintenance jobs never occupy them, so a bind never
+/// waits for another session's long read, bash call, or maintenance tail to
+/// release a worker. Two, so a cold root's slower full configure does not
+/// serialize every other bind behind it.
+const BIND_RESERVE_WORKERS: usize = 2;
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
 const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
@@ -131,6 +142,16 @@ struct EffectiveConfig {
     deficit_cap: isize,
     interactive_reserve: usize,
     maintenance_cap: usize,
+    /// Workers beyond `pool_size` that only route-bind configures may use.
+    bind_reserve: usize,
+}
+
+impl EffectiveConfig {
+    /// Every worker thread the executor runs: the general pool plus the
+    /// bind-only reserve.
+    fn total_workers(&self) -> usize {
+        self.pool_size + self.bind_reserve
+    }
 }
 
 impl ExecutorConfig {
@@ -161,6 +182,7 @@ impl ExecutorConfig {
             deficit_cap,
             interactive_reserve,
             maintenance_cap,
+            bind_reserve: BIND_RESERVE_WORKERS,
         }
     }
 }
@@ -389,12 +411,14 @@ impl DispatchLoopLiveness {
     }
 
     fn begin_event(&self) {
-        self.last_progress_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
         self.in_event.store(true, Ordering::Release);
     }
 
     fn end_event(&self) {
-        self.last_progress_ms.store(self.now_ms(), Ordering::Relaxed);
+        self.last_progress_ms
+            .store(self.now_ms(), Ordering::Relaxed);
         self.in_event.store(false, Ordering::Release);
     }
 
@@ -673,6 +697,55 @@ pub fn install_job_cancellation(token: JobCancellation) -> JobCancellationContex
     JobCancellationContextGuard::install(Some(token))
 }
 
+thread_local! {
+    static CURRENT_ACTOR_WAITING_WRITERS: std::cell::RefCell<Option<Arc<AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// True when interactive mutating work (a route-bind configure or a tool
+/// edit) is queued on the actor whose job runs on this worker thread.
+///
+/// A long maintenance job holds its actor's epoch read gate, and a queued
+/// writer can only start once that gate is free. Maintenance that runs in
+/// resumable steps polls this between steps and hands the actor back instead
+/// of making the writer wait for the whole job. Always false off an executor
+/// worker.
+pub fn current_actor_writer_waiting() -> bool {
+    CURRENT_ACTOR_WAITING_WRITERS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|waiting| waiting.load(Ordering::Acquire) > 0)
+    })
+}
+
+pub(crate) struct ActorWaitingWritersGuard {
+    previous: Option<Arc<AtomicUsize>>,
+}
+
+impl ActorWaitingWritersGuard {
+    fn install(waiting: Arc<AtomicUsize>) -> Self {
+        let previous = CURRENT_ACTOR_WAITING_WRITERS.with(|slot| slot.replace(Some(waiting)));
+        Self { previous }
+    }
+}
+
+impl Drop for ActorWaitingWritersGuard {
+    fn drop(&mut self) {
+        CURRENT_ACTOR_WAITING_WRITERS.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Make [`current_actor_writer_waiting`] report the given counter on this
+/// thread, for tests that run a maintenance step outside an executor worker.
+#[cfg(test)]
+pub(crate) fn install_actor_waiting_writers_for_test(
+    waiting: Arc<AtomicUsize>,
+) -> ActorWaitingWritersGuard {
+    ActorWaitingWritersGuard::install(waiting)
+}
+
 #[derive(Debug, Clone)]
 struct RunningJob {
     root_id: ProjectRootId,
@@ -751,8 +824,8 @@ impl Executor {
             })
             .expect("spawn AFT executor scheduler");
 
-        let mut worker_handles = Vec::with_capacity(effective.pool_size);
-        for worker_id in 0..effective.pool_size {
+        let mut worker_handles = Vec::with_capacity(effective.total_workers());
+        for worker_id in 0..effective.total_workers() {
             let worker_rx = run_rx.clone();
             // Workers run every tool call, including tree-sitter walks over
             // whatever a URL or file turns out to contain. The standalone loop
@@ -1486,7 +1559,7 @@ impl SchedulerState {
             actors: HashMap::new(),
             actor_order: Vec::new(),
             cursor: 0,
-            idle_workers: config.pool_size,
+            idle_workers: config.total_workers(),
             interactive_inflight: 0,
             maintenance_inflight: 0,
             config,
@@ -1563,7 +1636,7 @@ impl SchedulerState {
         debug_assert_eq!(self.maintenance_inflight, maintenance);
         debug_assert_eq!(
             self.idle_workers + self.running_jobs.len(),
-            self.config.pool_size
+            self.config.total_workers()
         );
         debug_assert!(self
             .running_jobs
@@ -1801,6 +1874,10 @@ struct ActorState {
     interactive: ClassQueues,
     maintenance: ClassQueues,
     fatal: bool,
+    /// Number of queued interactive mutating jobs, shared with this actor's
+    /// running jobs through [`current_actor_writer_waiting`]. Kept equal to
+    /// `interactive.mutating.len()` by every method that changes that queue.
+    waiting_writers: Arc<AtomicUsize>,
 }
 
 impl ActorState {
@@ -1819,11 +1896,18 @@ impl ActorState {
             interactive: ClassQueues::new(),
             maintenance: ClassQueues::new(),
             fatal: false,
+            waiting_writers: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn sync_waiting_writers(&self) {
+        self.waiting_writers
+            .store(self.interactive.mutating.len(), Ordering::Release);
     }
 
     fn push_job(&mut self, job_class: JobClass, lane: Lane, job: QueuedJob) {
         self.class_queues_mut(job_class).push_job(lane, job);
+        self.sync_waiting_writers();
     }
 
     fn has_queued_jobs(&self) -> bool {
@@ -1845,7 +1929,9 @@ impl ActorState {
     }
 
     fn pop_front_job(&mut self, job_class: JobClass, lane: Lane) -> Option<QueuedJob> {
-        self.class_queues_mut(job_class).pop_front_job(lane)
+        let job = self.class_queues_mut(job_class).pop_front_job(lane);
+        self.sync_waiting_writers();
+        job
     }
 
     fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
@@ -1873,6 +1959,7 @@ impl ActorState {
     fn fail_queued_jobs(&mut self) {
         self.interactive.fail_queued_jobs();
         self.maintenance.fail_queued_jobs();
+        self.sync_waiting_writers();
     }
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
@@ -1881,9 +1968,12 @@ impl ActorState {
     }
 
     fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
-        self.interactive
+        let removed = self
+            .interactive
             .remove_cancellable(token)
-            .or_else(|| self.maintenance.remove_cancellable(token))
+            .or_else(|| self.maintenance.remove_cancellable(token));
+        self.sync_waiting_writers();
+        removed
     }
 
     fn oldest_queued_writer_at(&self) -> Option<Instant> {
@@ -1941,14 +2031,21 @@ impl ClassQueues {
         self.order.front().copied()
     }
 
-    /// Interactive admission order: a hard-starved configure (queued RouteBind
-    /// older than the promotion age) preempts everything so its daemon deadline
-    /// survives; otherwise pure reads go first (they overlap each other and
-    /// never barrier the actor), then remaining lanes in arrival order.
-    /// Maintenance keeps strict arrival order via `front_lane`.
+    /// Interactive admission order: a starved writer preempts everything so
+    /// its deadline survives. A queued RouteBind configure counts as starved
+    /// after `BIND_PROMOTION_AGE`, any other writer after
+    /// `INTERACTIVE_WRITER_PROMOTION_AGE`. Otherwise pure reads go first (they
+    /// overlap each other and never barrier the actor), then remaining lanes
+    /// in arrival order. Maintenance keeps strict arrival order via
+    /// `front_lane`.
     fn next_interactive_lane(&self, now: Instant) -> Option<Lane> {
         let starved_writer = self.mutating.iter().any(|job| {
-            now.saturating_duration_since(job.queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
+            let promotion_age = if is_configure_request(&job.request_id) {
+                BIND_PROMOTION_AGE
+            } else {
+                INTERACTIVE_WRITER_PROMOTION_AGE
+            };
+            now.saturating_duration_since(job.queued_at) >= promotion_age
         });
         if starved_writer {
             // Also stops NEW readers from being admitted on this actor while
@@ -2101,6 +2198,15 @@ impl ClassQueues {
             .count()
     }
 
+    /// Queue time of the oldest queued route-bind configure, if any.
+    fn oldest_queued_bind_at(&self) -> Option<Instant> {
+        self.mutating
+            .iter()
+            .filter(|job| is_configure_request(&job.request_id))
+            .map(|job| job.queued_at)
+            .min()
+    }
+
     fn queue(&self, lane: Lane) -> &VecDeque<QueuedJob> {
         match lane {
             Lane::PureRead => &self.pure_reads,
@@ -2248,6 +2354,9 @@ struct RunJob {
     cancellation: Option<JobCancellation>,
     execution_started: Arc<AtomicBool>,
     completion_guard: Option<JobCompletionGuard>,
+    /// The actor's queued-interactive-writer counter, exposed to the running
+    /// job through [`current_actor_writer_waiting`].
+    waiting_writers: Arc<AtomicUsize>,
 }
 
 struct JobCompletionOwnership;
@@ -2482,6 +2591,21 @@ fn dispatch_runnable(
         let mut made_progress = false;
         let mut dispatch_failed = false;
 
+        // Route binds first, on any idle worker including the bind reserve:
+        // subc refuses the module once a bind relay exceeds its deadline, so a
+        // bind must never wait for a DRR turn behind other roots' work.
+        made_progress |= dispatch_queued_binds(
+            state,
+            heavy,
+            run_tx,
+            event_tx,
+            nonrunnable_dispatches,
+            &mut dispatch_failed,
+        );
+        if dispatch_failed || state.idle_workers == 0 {
+            return;
+        }
+
         made_progress |= dispatch_runnable_class(
             state,
             JobClass::Interactive,
@@ -2569,52 +2693,18 @@ fn dispatch_runnable_class(
                 continue;
             }
 
-            try_admit_actor(&root_id, actor, job_class, &state.config, heavy)
+            try_admit_actor(
+                &root_id,
+                actor,
+                AdmissionPass::Class(job_class),
+                &state.config,
+                heavy,
+            )
         };
 
-        if let Some(mut run_job) = run_job {
-            let job_id = state.next_job_id();
-            let ownership = Arc::new(JobCompletionOwnership);
-            run_job.completion_guard = Some(JobCompletionGuard::new(
-                event_tx.clone(),
-                CompletionEvent {
-                    job_id,
-                    heavy_permit: run_job.heavy_permit.take(),
-                    outcome: JobCompletionOutcome::Abandoned,
-                    ownership: Arc::clone(&ownership),
-                },
-            ));
-            let replaced = state.running_jobs.insert(
-                job_id,
-                RunningJob {
-                    root_id: run_job.root_id.clone(),
-                    request_id: run_job.request_id.clone(),
-                    command: run_job.command.clone(),
-                    job_class: run_job.job_class,
-                    lane: run_job.lane,
-                    started_at: Instant::now(),
-                    execution_started: Arc::clone(&run_job.execution_started),
-                    completion_ownership: Arc::downgrade(&ownership),
-                    occupancy_reported: false,
-                },
-            );
-            debug_assert!(replaced.is_none());
-            state.idle_workers -= 1;
-            match job_class {
-                JobClass::Interactive => state.interactive_inflight += 1,
-                JobClass::Maintenance => state.maintenance_inflight += 1,
-            }
-            state.assert_running_invariants();
-            log::debug!(
-                "executor dispatch: job_id={job_id} class={:?} lane={:?} request_id={} root={}",
-                run_job.job_class,
-                run_job.lane,
-                run_job.request_id,
-                run_job.root_id.as_path().display()
-            );
+        if let Some(run_job) = run_job {
             made_progress = true;
-            if run_tx.send(run_job).is_err() {
-                nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
                 *dispatch_failed = true;
                 return made_progress;
             }
@@ -2624,31 +2714,160 @@ fn dispatch_runnable_class(
     made_progress
 }
 
+/// Admit every queued route-bind configure whose actor can take a writer now,
+/// oldest bind first. Binds skip the DRR deficit and the per-actor interactive
+/// cap: a configure is short, and waiting a round-robin turn behind dozens of
+/// busy roots is what pushed binds past the daemon's relay deadline.
+fn dispatch_queued_binds(
+    state: &mut SchedulerState,
+    heavy: &Arc<HeavySemaphore>,
+    run_tx: &Sender<RunJob>,
+    event_tx: &Sender<SchedulerEvent>,
+    nonrunnable_dispatches: &AtomicUsize,
+    dispatch_failed: &mut bool,
+) -> bool {
+    let mut candidates = state
+        .actors
+        .iter()
+        .filter(|(_, actor)| !actor.fatal)
+        .filter_map(|(root_id, actor)| {
+            actor
+                .interactive
+                .oldest_queued_bind_at()
+                .map(|queued_at| (queued_at, root_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return false;
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut made_progress = false;
+    for (_, root_id) in candidates {
+        if state.idle_workers == 0 {
+            break;
+        }
+        let run_job = {
+            let Some(actor) = state.actors.get_mut(&root_id) else {
+                continue;
+            };
+            try_admit_actor(&root_id, actor, AdmissionPass::Bind, &state.config, heavy)
+        };
+        if let Some(run_job) = run_job {
+            made_progress = true;
+            if !launch_run_job(state, run_job, run_tx, event_tx, nonrunnable_dispatches) {
+                *dispatch_failed = true;
+                return made_progress;
+            }
+        }
+    }
+    made_progress
+}
+
+/// Record an admitted job as running and hand it to a worker. Returns false
+/// when the worker channel is closed.
+fn launch_run_job(
+    state: &mut SchedulerState,
+    mut run_job: RunJob,
+    run_tx: &Sender<RunJob>,
+    event_tx: &Sender<SchedulerEvent>,
+    nonrunnable_dispatches: &AtomicUsize,
+) -> bool {
+    let job_id = state.next_job_id();
+    let ownership = Arc::new(JobCompletionOwnership);
+    run_job.completion_guard = Some(JobCompletionGuard::new(
+        event_tx.clone(),
+        CompletionEvent {
+            job_id,
+            heavy_permit: run_job.heavy_permit.take(),
+            outcome: JobCompletionOutcome::Abandoned,
+            ownership: Arc::clone(&ownership),
+        },
+    ));
+    let replaced = state.running_jobs.insert(
+        job_id,
+        RunningJob {
+            root_id: run_job.root_id.clone(),
+            request_id: run_job.request_id.clone(),
+            command: run_job.command.clone(),
+            job_class: run_job.job_class,
+            lane: run_job.lane,
+            started_at: Instant::now(),
+            execution_started: Arc::clone(&run_job.execution_started),
+            completion_ownership: Arc::downgrade(&ownership),
+            occupancy_reported: false,
+        },
+    );
+    debug_assert!(replaced.is_none());
+    state.idle_workers -= 1;
+    match run_job.job_class {
+        JobClass::Interactive => state.interactive_inflight += 1,
+        JobClass::Maintenance => state.maintenance_inflight += 1,
+    }
+    state.assert_running_invariants();
+    log::debug!(
+        "executor dispatch: job_id={job_id} class={:?} lane={:?} request_id={} root={}",
+        run_job.job_class,
+        run_job.lane,
+        run_job.request_id,
+        run_job.root_id.as_path().display()
+    );
+    if run_tx.send(run_job).is_err() {
+        nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
+        return false;
+    }
+    true
+}
+
 fn can_dispatch_class(state: &SchedulerState, job_class: JobClass) -> bool {
-    if state.idle_workers == 0 {
+    // The bind reserve sits on top of the general pool: only
+    // `dispatch_queued_binds` may take those last workers.
+    let general_idle = state.idle_workers.saturating_sub(state.config.bind_reserve);
+    if general_idle == 0 {
         return false;
     }
     match job_class {
         JobClass::Interactive => true,
         JobClass::Maintenance => {
             state.maintenance_inflight < state.config.maintenance_cap
-                && state.idle_workers > state.config.interactive_reserve
+                && general_idle > state.config.interactive_reserve
         }
     }
+}
+
+/// Which dispatch pass is asking an actor for a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionPass {
+    /// The route-bind pass: only the actor's head Mutating job, and only when
+    /// a route-bind configure is queued in that lane.
+    Bind,
+    /// The ordinary DRR pass for one job class.
+    Class(JobClass),
 }
 
 fn try_admit_actor(
     root_id: &ProjectRootId,
     actor: &mut ActorState,
-    job_class: JobClass,
+    pass: AdmissionPass,
     config: &EffectiveConfig,
     heavy: &Arc<HeavySemaphore>,
 ) -> Option<RunJob> {
-    let lane = match job_class {
-        JobClass::Interactive => actor
+    let bind_pass = pass == AdmissionPass::Bind;
+    let job_class = match pass {
+        AdmissionPass::Bind => JobClass::Interactive,
+        AdmissionPass::Class(job_class) => job_class,
+    };
+    let lane = match pass {
+        // Mutating jobs stay FIFO within an actor: a bind queued behind an
+        // edit admits that edit first, and the bind follows on the next pass.
+        AdmissionPass::Bind => actor
+            .interactive
+            .oldest_queued_bind_at()
+            .map(|_| Lane::Mutating)?,
+        AdmissionPass::Class(JobClass::Interactive) => actor
             .class_queues(JobClass::Interactive)
             .next_interactive_lane(Instant::now())?,
-        JobClass::Maintenance => actor.front_lane(job_class)?,
+        AdmissionPass::Class(JobClass::Maintenance) => actor.front_lane(job_class)?,
     };
     let mut heavy_permit = None;
 
@@ -2680,7 +2899,10 @@ fn try_admit_actor(
                 false
             }
         }
-        Lane::Mutating => !has_epoch_reader && actor_has_interactive_capacity,
+        // A bind skips the per-actor interactive cap: HeavyInit jobs count
+        // toward that cap without holding the epoch gate, and the writer only
+        // needs the gate itself to be free.
+        Lane::Mutating => !has_epoch_reader && (bind_pass || actor_has_interactive_capacity),
         // This lane has separate global and per-actor bounds: maintenance_cap
         // reserves workers globally, and the boolean prevents same-actor
         // maintenance from stacking without consuming an interactive slot.
@@ -2701,7 +2923,10 @@ fn try_admit_actor(
     }
 
     let queued = actor.pop_front_job(job_class, lane)?;
-    actor.deficit -= JOB_COST;
+    // The bind pass runs outside DRR, so it does not spend the actor's turn.
+    if !bind_pass {
+        actor.deficit -= JOB_COST;
+    }
     if lane == Lane::Mutating {
         actor.mutating_inflight = Some(RunningMutatingJob {
             request_id: queued.request_id.clone(),
@@ -2745,6 +2970,7 @@ fn try_admit_actor(
         cancellation: queued.cancellation,
         execution_started: Arc::new(AtomicBool::new(false)),
         completion_guard: None,
+        waiting_writers: Arc::clone(&actor.waiting_writers),
     })
 }
 
@@ -2781,6 +3007,8 @@ fn run_lane_job(run_job: &mut RunJob) -> Response {
     let _actor_scope =
         view_publication::ActorScope::install(Arc::clone(&run_job.ctx), Arc::clone(&run_job.epoch));
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
+    let _waiting_writers_ctx =
+        ActorWaitingWritersGuard::install(Arc::clone(&run_job.waiting_writers));
     let missing_request_id = run_job.request_id.clone();
     let job = std::mem::replace(
         &mut run_job.job,

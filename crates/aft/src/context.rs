@@ -2447,6 +2447,11 @@ pub struct AppContext {
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
+    /// Configure-tail work that stepped aside mid-drain so a queued
+    /// interactive writer (usually a route bind) could take the actor. The
+    /// next tail drain resumes it before anything newly enqueued.
+    parked_configure_tail:
+        parking_lot::Mutex<Option<crate::commands::configure::ConfigureMaintenanceState>>,
     artifact_cache_keys: parking_lot::Mutex<BTreeMap<PathBuf, String>>,
     artifact_cache_key_derivations: AtomicU64,
     borrowed_index_cache: parking_lot::Mutex<BorrowedIndexCache>,
@@ -2913,6 +2918,7 @@ impl AppContext {
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
+            parked_configure_tail: parking_lot::Mutex::new(None),
             artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
             borrowed_index_cache: parking_lot::Mutex::new(BorrowedIndexCache::default()),
@@ -3936,7 +3942,26 @@ impl AppContext {
     }
 
     pub fn configure_tail_has_work(&self) -> bool {
-        !self.configure_maintenance_jobs.lock().is_empty() || !self.configure_warnings_rx.is_empty()
+        !self.configure_maintenance_jobs.lock().is_empty()
+            || self.parked_configure_tail.lock().is_some()
+            || !self.configure_warnings_rx.is_empty()
+    }
+
+    pub(crate) fn park_configure_tail(
+        &self,
+        state: crate::commands::configure::ConfigureMaintenanceState,
+    ) {
+        let previous = self.parked_configure_tail.lock().replace(state);
+        debug_assert!(
+            previous.is_none(),
+            "a configure tail parked while another parked tail was pending"
+        );
+    }
+
+    pub(crate) fn take_parked_configure_tail(
+        &self,
+    ) -> Option<crate::commands::configure::ConfigureMaintenanceState> {
+        self.parked_configure_tail.lock().take()
     }
 
     pub(crate) fn configure_maintenance_has_capacity(&self) -> bool {

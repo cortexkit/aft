@@ -151,8 +151,8 @@ mod health;
 mod manifest;
 mod push;
 mod readiness;
-mod standing;
 mod stall_watchdog;
+mod standing;
 mod wire;
 
 use self::health::{
@@ -6828,9 +6828,16 @@ fn submit_maintenance_job(
                 }
             }
             MaintenanceDrainKind::ConfigureTail => {
-                runtime_drain::drain_deferred_configure_maintenance(ctx);
+                // Stepping aside leaves the rest parked on the context; the
+                // requeue (or the next tick's tail probe) resumes it once the
+                // waiting writer has run.
+                let stepped_aside =
+                    runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
                 runtime_drain::drain_configure_warning_events(ctx);
-                MaintenanceJobOutcome::default()
+                MaintenanceJobOutcome {
+                    requeue_kind: stepped_aside.then_some(kind),
+                    ..MaintenanceJobOutcome::default()
+                }
             }
             MaintenanceDrainKind::CompletionDrains => {
                 runtime_drain::drain_search_index_events(ctx);

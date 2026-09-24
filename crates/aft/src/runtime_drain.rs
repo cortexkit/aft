@@ -433,6 +433,13 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
 }
 
+/// Executor-maintenance form of [`drain_deferred_configure_maintenance`]:
+/// returns `true` when the drain stepped aside for a queued interactive
+/// writer on the same root and left the rest parked for a requeued drain.
+pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) -> bool {
+    crate::commands::configure::drain_deferred_configure_maintenance_yielding(ctx)
+}
+
 /// Tracks deferred configure work for the standalone NDJSON loop. The attached-
 /// daemon (`subc`) path schedules this work through its executor instead.
 #[derive(Debug)]

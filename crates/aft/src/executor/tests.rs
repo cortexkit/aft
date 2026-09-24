@@ -125,7 +125,10 @@ fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
     let holder = executor.hold_dispatch_loop_for_test(release_rx);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !liveness.has_pending_work() {
-        assert!(Instant::now() < deadline, "held scheduler never read as pending");
+        assert!(
+            Instant::now() < deadline,
+            "held scheduler never read as pending"
+        );
         thread::sleep(Duration::from_millis(5));
     }
     thread::sleep(Duration::from_millis(50));
@@ -136,7 +139,10 @@ fn dispatch_loop_liveness_is_pending_only_while_the_loop_owes_work() {
     holder.join().expect("hold thread");
     let deadline = Instant::now() + Duration::from_secs(10);
     while liveness.has_pending_work() {
-        assert!(Instant::now() < deadline, "released scheduler stayed pending");
+        assert!(
+            Instant::now() < deadline,
+            "released scheduler stayed pending"
+        );
         thread::sleep(Duration::from_millis(5));
     }
     assert!(liveness.progress_age() < Duration::from_secs(5));
@@ -825,6 +831,35 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
     occupied_started_rx
         .recv_timeout(Duration::from_secs(12))
         .expect("second worker starts");
+    // The general pool is now full, but binds have their own reserved
+    // workers. Hold those with binds of other roots so the target bind finds
+    // every worker busy.
+    let (reserve_started_tx, reserve_started_rx) = crossbeam_channel::unbounded();
+    let (release_reserve_tx, release_reserve_rx) = crossbeam_channel::unbounded::<()>();
+    let mut reserve_binds = Vec::new();
+    let mut reserve_dirs = Vec::new();
+    for index in 0..BIND_RESERVE_WORKERS {
+        let (dir, root) = test_root(&format!("blocker-reserve-{index}"));
+        executor.register_actor(root.clone(), test_ctx());
+        reserve_dirs.push(dir);
+        let started = reserve_started_tx.clone();
+        let release = release_reserve_rx.clone();
+        reserve_binds.push(executor.submit(
+            root,
+            Lane::Mutating,
+            format!("subc-bind-reserve-{index}"),
+            Box::new(move |_| {
+                started.send(()).expect("reserve bind starts");
+                release.recv().expect("release reserve bind");
+                ok("reserve-bind")
+            }),
+        ));
+    }
+    for _ in 0..BIND_RESERVE_WORKERS {
+        reserve_started_rx
+            .recv_timeout(Duration::from_secs(12))
+            .expect("reserved bind worker starts");
+    }
     let target_bind = executor.submit(
         target_root.clone(),
         Lane::Mutating,
@@ -850,6 +885,15 @@ fn bind_blocker_snapshot_attributes_queue_reader_maintenance_and_worker_pressure
         .send(())
         .expect("release maintenance");
     release_occupied_tx.send(()).expect("release occupied read");
+    for _ in 0..BIND_RESERVE_WORKERS {
+        release_reserve_tx.send(()).expect("release reserve bind");
+    }
+    for reserve_bind in reserve_binds {
+        reserve_bind
+            .recv_timeout(Duration::from_secs(12))
+            .expect("reserve bind completion");
+    }
+    assert_eq!(reserve_dirs.len(), BIND_RESERVE_WORKERS);
     assert!(recv_async(maintenance, "maintenance completion").success);
     occupied
         .recv_timeout(Duration::from_secs(12))
@@ -2990,4 +3034,185 @@ fn duplicate_maintenance_request_ids_keep_distinct_completion_owners() {
         assert!(recv_async(job, "duplicate-id maintenance completion").success);
     }
     assert_follow_up_maintenance_admitted(&executor, other_root, "after-duplicate-request-ids");
+}
+
+/// Bound on how long a route bind may wait in the executor before its
+/// configure starts. subc refuses a module's binds once relays exceed 12s; the
+/// bind path has to stay far inside that no matter what else is running.
+const BIND_STORM_ACK_BOUND: Duration = Duration::from_secs(3);
+
+/// Forty sessions rebind forty roots at once (a daemon restart) while every
+/// general worker is already held by other roots' maintenance tails and
+/// long interactive reads, with more interactive work queued behind them.
+/// Every bind must still start its configure within the bound: none may wait
+/// for one of those long jobs to finish.
+#[test]
+fn bind_storm_reaches_ack_while_maintenance_and_interactive_saturate_the_pool() {
+    const BUSY_ROOTS: usize = 8;
+    const READS_PER_BUSY_ROOT: usize = 3;
+    const BIND_ROOTS: usize = 40;
+
+    let executor = test_executor(4, 2, 2, 2);
+    let pool_size = executor.pool_size();
+    let mut dirs = Vec::new();
+
+    let (busy_started_tx, busy_started_rx) = crossbeam_channel::unbounded::<()>();
+    let (release_tx, release_rx) = crossbeam_channel::unbounded::<()>();
+    let mut busy_handles = Vec::new();
+    for index in 0..BUSY_ROOTS {
+        let (dir, root) = test_root(&format!("bind-storm-busy-{index}"));
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        dirs.push(dir);
+
+        // A configure tail from an earlier bind of another root.
+        let started = busy_started_tx.clone();
+        let release = release_rx.clone();
+        busy_handles.push(executor.submit_maintenance_async(
+            root.clone(),
+            Lane::MaintenanceCommit,
+            format!("subc-maintenance-drain-configure-tail-busy-{index}"),
+            Box::new(move |_| {
+                let _ = started.send(());
+                let _ = release.recv_timeout(Duration::from_secs(30));
+                ok("tail")
+            }),
+        ));
+        // Long interactive reads of other sessions (bash, grep).
+        for read in 0..READS_PER_BUSY_ROOT {
+            let started = busy_started_tx.clone();
+            let release = release_rx.clone();
+            busy_handles.push(executor.submit_async(
+                root.clone(),
+                Lane::PureRead,
+                format!("busy-read-{index}-{read}"),
+                Box::new(move |_| {
+                    let _ = started.send(());
+                    let _ = release.recv_timeout(Duration::from_secs(30));
+                    ok("busy-read")
+                }),
+            ));
+        }
+    }
+    for occupied in 0..pool_size {
+        busy_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("busy work occupies worker {occupied}"));
+    }
+
+    let (bind_started_tx, bind_started_rx) = crossbeam_channel::unbounded::<(usize, Duration)>();
+    let mut bind_handles = Vec::new();
+    for index in 0..BIND_ROOTS {
+        let (dir, root) = test_root(&format!("bind-storm-bind-{index}"));
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        dirs.push(dir);
+        let started = bind_started_tx.clone();
+        let submitted_at = Instant::now();
+        bind_handles.push(executor.submit_async(
+            root,
+            Lane::Mutating,
+            format!("subc-bind-{index}"),
+            Box::new(move |_| {
+                let _ = started.send((index, submitted_at.elapsed()));
+                // A fast-path configure: resolve config, register the session.
+                thread::sleep(Duration::from_millis(5));
+                ok(format!("subc-bind-{index}"))
+            }),
+        ));
+    }
+
+    let deadline = Instant::now() + BIND_STORM_ACK_BOUND;
+    let mut waits = Vec::new();
+    while waits.len() < BIND_ROOTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match bind_started_rx.recv_timeout(remaining) {
+            Ok(started) => waits.push(started),
+            Err(_) => break,
+        }
+    }
+    let started_in_bound = waits.len();
+
+    // Release the saturating work either way so the executor drains.
+    for _ in 0..busy_handles.len() {
+        let _ = release_tx.send(());
+    }
+    for handle in bind_handles {
+        assert!(recv_async(handle, "bind-storm bind completion").success);
+    }
+    for handle in busy_handles {
+        let _ = recv_async(handle, "bind-storm busy completion");
+    }
+
+    let worst = waits.iter().map(|(_, wait)| *wait).max();
+    assert_eq!(
+        started_in_bound, BIND_ROOTS,
+        "only {started_in_bound} of {BIND_ROOTS} binds started within {BIND_STORM_ACK_BOUND:?} \
+         while the pool was saturated (worst observed wait {worst:?})"
+    );
+    assert!(
+        waits.iter().all(|(_, wait)| *wait < BIND_STORM_ACK_BOUND),
+        "a bind waited past the bound: {waits:?}"
+    );
+    assert_eq!(dirs.len(), BUSY_ROOTS + BIND_ROOTS);
+}
+
+/// A same-root configure tail holds the actor's epoch read gate, so a bind for
+/// that root cannot start until the tail lets go. A tail that polls
+/// `current_actor_writer_waiting` between its steps must see the queued bind
+/// and return, so the bind starts within one step rather than after the
+/// whole tail.
+#[test]
+fn same_root_maintenance_tail_observes_a_queued_bind_and_lets_it_run() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("tail-steps-aside");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+
+    let (tail_started_tx, tail_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let tail = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "subc-maintenance-drain-configure-tail-same-root".to_string(),
+        Box::new(move |_| {
+            assert!(
+                !current_actor_writer_waiting(),
+                "no writer is queued when the tail starts"
+            );
+            tail_started_tx.send(()).expect("signal tail start");
+            // Up to ten seconds of 20 ms steps, like a tail loading artifacts.
+            for step in 0..500 {
+                if current_actor_writer_waiting() {
+                    return ok(format!("stepped-aside-after-{step}"));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            ok("ran-to-completion")
+        }),
+    );
+    tail_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("tail starts");
+
+    let submitted_at = Instant::now();
+    let bind = executor.submit_async(
+        root,
+        Lane::Mutating,
+        "subc-bind-same-root".to_string(),
+        Box::new(move |_| ok(format!("{}", submitted_at.elapsed().as_millis()))),
+    );
+    let bind_response = recv_async(bind, "same-root bind");
+    let waited = submitted_at.elapsed();
+    let tail_response = recv_async(tail, "same-root tail");
+    assert!(
+        tail_response.id.starts_with("stepped-aside-after-"),
+        "the tail must observe the queued bind: {}",
+        tail_response.id
+    );
+    assert!(bind_response.success);
+    assert!(
+        waited < Duration::from_secs(1),
+        "the bind waited {waited:?} behind a same-root tail"
+    );
+    assert!(
+        !current_actor_writer_waiting(),
+        "off a worker thread no actor is observed"
+    );
 }
