@@ -38,12 +38,19 @@ describe("OpenCode V2 shared behavioral cases", () => {
       };
       const dependencies = {
         loadConfig: () => ({}),
+        // Bootstrap side effects are inert: this test is about tool execution.
+        migrateConfigLocations: () => [],
+        ensureStorageMigrated: async () => {},
+        ensureOnnxRuntime: async () => null,
+        startLspAutoInstall: () => null,
+        pushLspPaths: async () => {},
+        isOrtAutoDownloadSupported: () => true,
         resolveStorageRoot: () => "/isolated/storage",
         buildConfigureParams: () => ({}),
         resolveVersion: () => "test",
         resolveBinary: async () => "/isolated/bin/aft",
         resolvePoolOptions: () => ({}),
-        acquireBridge: async () => ({}),
+        acquireBridge: async () => ({ setConfigureOverride: () => {} }),
         releaseBridge: async () => {},
         // The behavioral cases are about tool execution; the host stub here
         // carries no rpc surface, so the RPC registration is injected inert.

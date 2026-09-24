@@ -1,17 +1,15 @@
-import {
-  acquireBridge,
-  findBinary,
-  releaseBridge,
-  resolveCortexKitStorageRoot,
-} from "@cortexkit/aft-bridge";
+import { acquireBridge, releaseBridge } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import {
-  buildConfigTierConfigureParams,
-  loadAftConfig,
-  resolveBridgePoolTransportOptions,
-} from "../config.js";
-import { debug, log } from "../logger.js";
+  applyToolSurfaceOverrides,
+  createSharedPoolOptions,
+  defaultBridgeBootstrapDependencies,
+  loadBootstrapConfig,
+  prepareBridgeEnvironment,
+} from "../bridge-bootstrap.js";
+import { resolveBridgePoolTransportOptions } from "../config.js";
+import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
@@ -22,8 +20,11 @@ import {
   registerAftTools,
 } from "../tool-registration.js";
 
+// The bridge environment (binary, storage migration, configure overrides, ONNX
+// Runtime, LSP installs) comes from the bootstrap shared with the OpenCode 1
+// entry; every one of those steps can be replaced here through overrides.
 const defaults = {
-  buildConfigureParams: buildConfigTierConfigureParams,
+  ...defaultBridgeBootstrapDependencies,
   buildToolMap: buildAftToolDefinitions,
   registerTools: registerAftTools,
   registerRpc: registerAftRpc,
@@ -32,48 +33,62 @@ const defaults = {
     ...createV2RuntimeConsumer(context),
   }),
   acquireBridge,
-  loadConfig: loadAftConfig,
   releaseBridge,
-  resolveBinary: findBinary,
   resolvePoolOptions: resolveBridgePoolTransportOptions,
-  resolveStorageRoot: resolveCortexKitStorageRoot,
   resolveVersion: () => resolvePluginVersion(import.meta.url),
 };
 
 async function bootLocation(context, location, dependencies) {
   const directory = location.directory;
-  const config = dependencies.loadConfig(directory);
-  if (config.enabled === false) return undefined;
+  // The V2 host has no session UI to deliver startup warnings into, so they
+  // go to the plugin log.
+  const notify = (message) => warn(message);
+  const config = loadBootstrapConfig(directory, notify, dependencies);
+  if (!config) return undefined;
 
-  const storageDir = dependencies.resolveStorageRoot();
-  const configOverrides = dependencies.buildConfigureParams(directory, {
-    bash_permissions: true,
-    harness: "opencode",
-    storage_dir: storageDir,
-  });
-  const binaryPath = await dependencies.resolveBinary(dependencies.resolveVersion());
+  const pluginVersion = dependencies.resolveVersion();
+  const environment = await prepareBridgeEnvironment(
+    { configRoot: directory, lspDirectory: directory, config, pluginVersion, notify },
+    dependencies,
+  );
   const canonicalDirectory = location.project?.canonical ?? directory;
   const consumers = dependencies.toolConsumers(context);
+  const isProjectEnabled = (projectRoot) =>
+    projectRoot === directory ? true : dependencies.loadConfig(projectRoot).enabled !== false;
+  // getPool is only called on a version mismatch, after the pool exists.
   const pool = await dependencies.acquireBridge(canonicalDirectory, {
     harness: "opencode",
-    binaryPath,
+    binaryPath: environment.binaryPath,
     poolOptions: {
       ...dependencies.resolvePoolOptions(config),
+      ...createSharedPoolOptions({
+        pluginVersion,
+        getPool: () => pool,
+        isProjectEnabled,
+        notifyForRoot: (_projectRoot, message) => notify(message),
+        dependencies,
+      }),
       ...consumers.bridgeOptions,
     },
-    configOverrides,
+    configOverrides: environment.configOverrides,
     subcConnectionFile: config.subc?.connection_file,
   });
+  environment.attach(pool);
   const toolContext = {
     pool,
     client: context,
     config,
     hashlineEffective: openCodeHashlineEffective(config),
-    storageDir,
-    isProjectEnabled: (projectRoot) =>
-      projectRoot === directory ? true : dependencies.loadConfig(projectRoot).enabled !== false,
+    storageDir: environment.storageDir,
+    isProjectEnabled,
   };
   const tools = dependencies.buildToolMap(toolContext, config);
+  const { hashlineEditRegistered } = applyToolSurfaceOverrides(
+    pool,
+    config,
+    new Set(Object.keys(tools)),
+  );
+  toolContext.hashlineEffective = hashlineEditRegistered;
   return { consumers, pool, tools };
 }
 

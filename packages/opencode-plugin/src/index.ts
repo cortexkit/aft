@@ -1,14 +1,8 @@
 import {
   createAftTransportPool,
-  ensureBinary,
-  ensureOnnxRuntime,
-  ensureStorageMigrated,
-  findBinary,
-  findBinarySync,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
   markAnnouncementSeen,
-  resolveCortexKitStorageRoot,
   setActiveLogger,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
@@ -32,10 +26,14 @@ import {
   observeOpenCodeBgNotificationEvent,
 } from "./bg-notifications.js";
 import {
-  buildConfigTierConfigureParams,
+  applyToolSurfaceOverrides,
+  createSharedPoolOptions,
+  loadBootstrapConfig,
+  prepareBridgeEnvironment,
+} from "./bridge-bootstrap.js";
+import {
   getConfigLoadErrors,
   loadAftConfig,
-  migrateAftConfigLocations,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
   resolveOpenCodeRegistrationRoot,
@@ -47,20 +45,9 @@ import {
   flushConfigureWarningsOnIdle,
 } from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
-import { bridgeLogger, error, log, warn } from "./logger.js";
-import {
-  abortInFlightAutoInstalls,
-  pushLspPathsAfterAutoInstall,
-  runAutoInstall,
-} from "./lsp-auto-install.js";
-import { type AutoInstallPassLease, claimLspAutoInstallPass } from "./lsp-cache.js";
-import {
-  abortInFlightGithubInstalls,
-  discoverRelevantGithubServers,
-  runGithubAutoInstall,
-} from "./lsp-github-install.js";
-import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
-import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
+import { bridgeLogger, log, warn } from "./logger.js";
+import { abortInFlightAutoInstalls } from "./lsp-auto-install.js";
+import { abortInFlightGithubInstalls } from "./lsp-github-install.js";
 import { prepareOpenCodeArguments } from "./normalize-schemas.js";
 import {
   cleanupWarnings,
@@ -91,7 +78,6 @@ import { instrumentToolMap } from "./tool-perf.js";
 import {
   buildAftToolDefinitions,
   openCodeHashlineDowngrade,
-  openCodeHashlineEditRegistered,
   openCodeHashlineEffective,
 } from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
@@ -256,45 +242,37 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Load the AFT config before any binary or storage work. This ensures
   // `enabled: false` makes AFT do nothing except read the config file.
-  let aftConfig = loadAftConfig(registrationRoot);
-  if (aftConfig.enabled === false) {
-    log(`AFT disabled by config for ${registrationRoot}`);
-    return { tool: {} };
-  }
-
-  deliverConfigMigrationWarnings(
-    registrationRoot,
-    migrateAftConfigLocations(registrationRoot, bridgeLogger).flatMap((result) => result.warnings),
+  // Load order: ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
+  const loadedConfig = loadBootstrapConfig(registrationRoot, (message) =>
+    deliverConfigMigrationWarnings(registrationRoot, [message]),
   );
-
-  // Load config: ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
-  aftConfig = loadAftConfig(registrationRoot);
-  enqueueConfigParseWarnings(registrationRoot, getConfigLoadErrors());
-  if (aftConfig.enabled === false) {
+  if (!loadedConfig) {
     log(`AFT disabled by config for ${registrationRoot}`);
     return { tool: {} };
   }
+  const aftConfig = loadedConfig;
+  enqueueConfigParseWarnings(registrationRoot, getConfigLoadErrors());
 
-  // Probe synchronously so a missing or mismatched cache entry can start its
-  // download before the rest of plugin startup does any work. The resolver and
-  // first-tool-call path share ensureBinary's in-process promise; its filesystem
-  // lock also coordinates a second OpenCode process without duplicate fetches.
-  const cachedBinaryPath = findBinarySync(PLUGIN_VERSION);
-  if (!cachedBinaryPath) {
-    void ensureBinary(PLUGIN_VERSION).then(
-      (path) => {
-        if (path) log(`Background binary warmup ready at ${path}`);
-      },
-      (err) => {
-        warn(
-          `Background binary warmup failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      },
-    );
-  }
-  const binaryPath = cachedBinaryPath ?? (await findBinary(PLUGIN_VERSION));
-
-  await ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger });
+  const notifyOpts: NotificationOptions = {
+    client: input.client,
+    directory: input.directory,
+  };
+  // Binary resolution, storage migration, the flat configure overrides, ONNX
+  // Runtime, and LSP auto-install all come from the bootstrap shared with the
+  // OpenCode 2 entry, so both hosts configure bridges identically.
+  const bridgeEnvironment = await prepareBridgeEnvironment({
+    configRoot: registrationRoot,
+    lspDirectory: input.directory,
+    config: aftConfig,
+    pluginVersion: PLUGIN_VERSION,
+    notify: (message) => {
+      sendWarning(notifyOpts, message).catch((err) => {
+        warn(`failed to deliver startup warning: ${err}`);
+      });
+    },
+  });
+  const { binaryPath, configOverrides, storageDir } = bridgeEnvironment;
+  const onnxRuntimePromise = bridgeEnvironment.onnxRuntime;
   const autoUpdateAbort = new AbortController();
   const projectEnabledCache = new Map<string, boolean>([[registrationRoot, true]]);
   const loggedDisabledProjects = new Set<string>();
@@ -311,292 +289,31 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     return enabled;
   };
 
-  // Build configure params for the Rust binary.
+  // Configure params for the Rust binary come in two layers:
+  //   1. `configOverrides` — GLOBAL per-process state shared by every bridge
+  //      (see bridge-bootstrap.ts), plus raw config tiers for the init-time
+  //      project so the first bridge configures without an extra loader call.
+  //   2. `projectConfigLoader` — PER-BRIDGE raw config tiers, loaded from each
+  //      project's own `.cortexkit/aft.jsonc` at bridge-spawn time.
+  // The pool merges them with per-project values winning.
   //
-  // **Two layers**:
-  //   1. `configOverrides` (this block) — GLOBAL per-process state shared by
-  //      every bridge: storage_dir, _ort_dylib_dir (patched later), harness,
-  //      bash_permissions, lsp_paths_extra (LSP install cache), plus raw config
-  //      tiers for the init-time project so the first bridge configures without
-  //      an extra loader call.
-  //   2. `projectConfigLoader` (wired below) — PER-BRIDGE raw config tiers,
-  //      loaded from each project's own `.cortexkit/aft.jsonc` at bridge-spawn
-  //      time. Rust owns merge + trust-boundary stripping for the core domain.
-  //
-  // The pool merges them with per-project values winning. Without this split,
-  // OpenCode Desktop / `opencode serve` (one plugin instance, many projects)
-  // would burn the wrong project's config into every bridge — the project
-  // visible at plugin init time would override everything.
-  //
-  // Core-domain config now flows only through `config: [{ tier, source, doc }]`.
-  // Do not add resolved aft.jsonc fields (format_on_edit, semantic, lsp, etc.)
-  // to this flat map; flat params below are plugin-computed process state.
-  const storageDir = resolveCortexKitStorageRoot();
-  const configOverrides: Record<string, unknown> = buildConfigTierConfigureParams(
-    registrationRoot,
-    {
-      bash_permissions: true,
-      storage_dir: storageDir,
-    },
-  );
   // Build tool schemas from the requested hashline setting. After disabled-tool
   // filtering, the code below freezes whether the final edit tool supports hashline.
   const hashlineEffective = openCodeHashlineEffective(aftConfig);
-  let lspInstallCompletion: Promise<string[] | null> | null = null;
-
   const isFastembedSemanticBackend = (aftConfig.semantic?.backend ?? "fastembed") === "fastembed";
-
-  // v0.27 stores runtime state under the shared CortexKit root. Migration from
-  // the legacy OpenCode plugin root completed synchronously before any storage
-  // consumer (ONNX, RPC server, bridge configure) can touch this path.
-
-  // Auto-resolve ONNX Runtime for semantic search.
-  //
-  // We deliberately do NOT block plugin load on this. The ONNX runtime archive
-  // is 60–80 MB and on a slow connection this can take 30–120 seconds. Awaiting
-  // it inline used to make OpenCode appear to hang ("blackscreen on launch")
-  // until the download finished, and SIGKILL'ing the host mid-download left
-  // partial state that the next launch had to recover from.
-  //
-  // Instead: kick off the download as a background promise, let the plugin
-  // finish registering tools immediately, and patch `_ort_dylib_dir` into the
-  // pool's configure overrides as soon as the download settles. Bridges that
-  // spawn AFTER the download finishes pick it up automatically; bridges spawned
-  // before will configure without ORT and semantic search will return its
-  // existing "still building" status until the user restarts that session.
-  //
-  // The resolved path is passed to bridges via ORT_DYLIB_PATH env var.
-  let onnxRuntimePromise: Promise<string | null> | null = null;
-  if (aftConfig.semantic_search && isFastembedSemanticBackend) {
-    const storageDir = configOverrides.storage_dir as string;
-    onnxRuntimePromise = ensureOnnxRuntime(storageDir).catch((err) => {
-      warn(
-        `ONNX Runtime setup failed: ${err instanceof Error ? err.message : String(err)}. Semantic search will be unavailable.`,
-      );
-      return null;
-    });
-  }
-
-  // ─────────────────────────── LSP auto-install ───────────────────────────
-  //
-  // Discover which LSPs the project actually needs, then surface every
-  // already-cached binary directory to Rust as `lsp_paths_extra`. The Rust
-  // resolver checks this list (after project-local node_modules and before
-  // PATH), so any LSP we previously installed is found without users having
-  // to put it on PATH.
-  //
-  // For LSPs that aren't yet cached, we kick off a background install (npm
-  // for typescript-language-server / pyright / yaml-ls / bash-ls / dockerfile-ls
-  // / @vue/language-server / @astrojs/language-server / svelte-language-server
-  // / intelephense / @biomejs/biome; GitHub releases for clangd / lua-ls / zls
-  // / tinymist / texlab). The 7-day grace window in `lsp.grace_days` defends
-  // against newly-published malicious versions. Newly-installed binaries
-  // appear in the cache for the user's NEXT plugin session — matching the
-  // OpenCode "may need restart" UX and avoiding mid-session bridge restarts.
-  //
-  // The whole step is best-effort: if both probes fail, `cachedBinDirs` is
-  // still populated from `isInstalled()` checks, so previously-installed
-  // binaries continue to work.
-  let lspAutoInstallPassLease: AutoInstallPassLease | null = null;
-  try {
-    const lspAutoInstall = aftConfig.lsp?.auto_install ?? true;
-    const lspGraceDays = aftConfig.lsp?.grace_days ?? 7;
-    const lspVersions = aftConfig.lsp?.versions ?? {};
-    const lspDisabled = new Set(aftConfig.lsp?.disabled ?? []);
-    lspAutoInstallPassLease = lspAutoInstall ? claimLspAutoInstallPass() : null;
-    const skippedByRecentAutoInstall = lspAutoInstall && lspAutoInstallPassLease === null;
-    if (skippedByRecentAutoInstall) {
-      log("[lsp] skipping auto-install (another instance ran one recently)");
-    }
-    const runSharedAutoInstall = lspAutoInstall && !skippedByRecentAutoInstall;
-    // When `lsp.auto_install: false`, leave the list empty so the Rust-side
-    // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
-    // server walk entirely. Without this gate, users who opted out of
-    // auto-install still received `lsp_binary_missing` toasts/ignored-message
-    // warnings on every configure. Explicit `lsp.servers` entries are
-    // unaffected — those still warn (they're user-configured, not auto).
-    configOverrides.lsp_auto_install_binaries = lspAutoInstall
-      ? [...new Set([...NPM_LSP_TABLE, ...GITHUB_LSP_TABLE].map((spec) => spec.binary))]
-      : [];
-
-    const npmResult = runAutoInstall(input.directory, {
-      autoInstall: runSharedAutoInstall,
-      graceDays: lspGraceDays,
-      versions: lspVersions,
-      disabled: lspDisabled,
-    });
-
-    // GitHub-distributed servers gate on relevance separately because the
-    // binaries are heavier (10-100 MB).
-    const relevantGithub = discoverRelevantGithubServers(input.directory);
-    const ghResult = runGithubAutoInstall(relevantGithub, {
-      autoInstall: runSharedAutoInstall,
-      graceDays: lspGraceDays,
-      versions: lspVersions,
-      disabled: lspDisabled,
-    });
-
-    const mergedBinDirs = [...npmResult.cachedBinDirs, ...ghResult.cachedBinDirs];
-    if (mergedBinDirs.length > 0) {
-      configOverrides.lsp_paths_extra = mergedBinDirs;
-    }
-    const lspInflightInstalls = [
-      ...new Set([...npmResult.installingBinaries, ...ghResult.installingBinaries]),
-    ];
-    if (lspInflightInstalls.length > 0) {
-      configOverrides.lsp_inflight_installs = lspInflightInstalls;
-    }
-    const installsWereStarted = npmResult.installsStarted > 0 || ghResult.installsStarted > 0;
-    if (installsWereStarted) {
-      log(
-        `[lsp] auto-install: ${npmResult.installsStarted} npm + ${ghResult.installsStarted} github install(s) running in background`,
-      );
-    }
-
-    // ─── Surface install outcomes once installs settle ───
-    //
-    // Both `runAutoInstall` and `runGithubAutoInstall` return synchronously
-    // with the obvious skips (disabled, irrelevant, auto_install: false). The
-    // backgrounded installs append additional reasons (grace blocked, registry
-    // probe failed, install crashed) into `skipped` as their promises settle.
-    //
-    // We deliver ONE consolidated ignored message per session listing only
-    // actionable reasons — the user can act on "grace blocked" (set a pin) or
-    // "install failed" (check `/aft-status` and the plugin log), but not on
-    // "not relevant to project" or "already installed" which are routine.
-    //
-    // Fire-and-forget; never block plugin startup.
-    const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
-      .then(() => {
-        if (installsWereStarted || skippedByRecentAutoInstall) {
-          const updatedPaths = [
-            ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
-          ];
-          if (updatedPaths.length > 0) {
-            configOverrides.lsp_paths_extra = updatedPaths;
-          } else {
-            delete configOverrides.lsp_paths_extra;
-          }
-          return updatedPaths;
-        }
-        return null;
-      })
-      .then((updatedPaths) => {
-        const actionable = [...npmResult.skipped, ...ghResult.skipped].filter((s) => {
-          const r = s.reason.toLowerCase();
-          // Routine skips — don't notify.
-          if (r === "auto_install: false") return false;
-          if (r === "disabled by config") return false;
-          if (r === "not relevant to project") return false;
-          if (r === "already installed") return false;
-          if (r === "another install in progress") return false;
-          return true;
-        });
-        if (actionable.length > 0) {
-          const lines = actionable.map((s) => `  • ${s.id}: ${s.reason}`).join("\n");
-          const message =
-            `AFT skipped or failed to install ${actionable.length} LSP server(s):\n${lines}\n\n` +
-            "See `/aft-status` for details, or check the plugin log. " +
-            'Pin a working version with `lsp.versions: { "<package>": "<version>" }` if grace is blocking, ' +
-            "or set `lsp.auto_install: false` to suppress this entirely.";
-          sendWarning({ client: input.client, directory: input.directory }, message).catch(
-            (err) => {
-              warn(`[lsp] failed to deliver install summary: ${err}`);
-            },
-          );
-        }
-        return updatedPaths;
-      })
-      .catch((err) => {
-        warn(`[lsp] install-summary aggregation failed: ${err}`);
-        return null;
-      })
-      .finally(() => {
-        lspAutoInstallPassLease?.release();
-        lspAutoInstallPassLease = null;
-      });
-    if (installsWereStarted || skippedByRecentAutoInstall) {
-      lspInstallCompletion = installCompletion;
-    }
-  } catch (err) {
-    lspAutoInstallPassLease?.release();
-    lspAutoInstallPassLease = null;
-    // Auto-install failures must never block plugin startup.
-    warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
-  }
-
-  // Coordinate concurrent version mismatches so followers wait for the first
-  // download/hot-swap for the target plugin version instead of failing with
-  // "already attempted" while the compatible binary is still in flight.
-  const versionUpgradePromises = new Map<string, Promise<string | null>>();
 
   const poolOptions: import("@cortexkit/aft-bridge").PoolOptions & {
     onBashLongRunning: (reminder: BashLongRunningPayload, bridge: BridgePendingState) => void;
     onBashPatternMatch: (frame: BashPatternMatchPayload, bridge: BridgePendingState) => void;
   } = {
     ...resolveBridgePoolTransportOptions(aftConfig),
-    errorPrefix: "[aft-plugin]",
-    minVersion: PLUGIN_VERSION,
-    // Per-project configure overrides — fixes OpenCode Desktop /
-    // `opencode serve` mode where one plugin instance serves many projects.
-    // Without this, every bridge inherits the project config visible at
-    // plugin init; with it, each project's `.cortexkit/aft.jsonc` wins for
-    // that project's bridge. See PoolOptions.projectConfigLoader doc.
-    projectConfigLoader: (projectRoot) => {
-      try {
-        if (!isProjectEnabled(projectRoot)) return {};
-        deliverConfigMigrationWarnings(
-          projectRoot,
-          migrateAftConfigLocations(projectRoot, bridgeLogger).flatMap((result) => result.warnings),
-        );
-        return buildConfigTierConfigureParams(projectRoot);
-      } catch (err) {
-        warn(
-          `readConfigTiers(${projectRoot}) failed; falling back to plugin-init config: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-        return {};
-      }
-    },
-    onVersionMismatch: async (binaryVersion, minVersion) => {
-      const existing = versionUpgradePromises.get(minVersion);
-      if (existing) {
-        log(
-          `Version ${binaryVersion} < ${minVersion}; awaiting in-flight compatible binary upgrade`,
-        );
-        return existing;
-      }
-
-      const upgradePromise = (async () => {
-        warn(
-          `WARNING: aft binary v${binaryVersion} is older than plugin v${minVersion}. ` +
-            "Some features may not work. Attempting to download a compatible binary...",
-        );
-        try {
-          const path = await ensureBinary(`v${minVersion}`);
-          if (!path) {
-            warn(`Could not find or download v${minVersion}. Continuing with v${binaryVersion}.`);
-            return null;
-          }
-          log(`Found/downloaded compatible binary at ${path}. Replacing running bridges...`);
-          const replaced = await pool.replaceBinary(path);
-          log("Binary replaced successfully. New bridges will use the updated binary.");
-          // Returning the new path triggers aft-bridge's coordinated retry of the
-          // in-flight request against the replacement binary.
-          return replaced;
-        } catch (err) {
-          error(
-            `Auto-download failed: ${(err as Error).message}. Install manually: cargo install agent-file-tools@${minVersion}`,
-          );
-          return null;
-        } finally {
-          versionUpgradePromises.delete(minVersion);
-        }
-      })();
-      versionUpgradePromises.set(minVersion, upgradePromise);
-      return upgradePromise;
-    },
+    ...createSharedPoolOptions({
+      pluginVersion: PLUGIN_VERSION,
+      getPool: () => pool,
+      isProjectEnabled,
+      notifyForRoot: (projectRoot, message) =>
+        deliverConfigMigrationWarnings(projectRoot, [message]),
+    }),
     onConfigureWarnings: ({ projectRoot, sessionId, client, warnings, configDroppedKeys }) => {
       const bridge = pool.getActiveBridgeForRoot(projectRoot);
       if (!bridge) return;
@@ -692,21 +409,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       });
     },
   });
-  if (lspInstallCompletion) {
-    lspInstallCompletion.then((updatedPaths) => {
-      if (!updatedPaths) return;
-      void pushLspPathsAfterAutoInstall(pool, input.directory, updatedPaths)
-        .then(() => {
-          log(
-            `[lsp] lsp_paths_extra updated after auto-install: ${updatedPaths.length} dirs pushed to live bridges`,
-          );
-        })
-        .catch((err) => {
-          warn(`[lsp] live bridge lsp_paths_extra update failed: ${err}`);
-        });
-    });
-  }
-  pool.setConfigureOverride("harness", "opencode");
+  // Patches `_ort_dylib_dir` and late LSP install paths into the pool once
+  // they settle; bridges spawned afterwards pick them up, running bridges keep
+  // their warm state.
+  bridgeEnvironment.attach(pool);
   const ctx: PluginContext = {
     pool,
     client: input.client,
@@ -751,32 +457,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     return result;
   };
 
-  // Settle the ONNX runtime download promise (started above) and patch the
-  // resolved path into the pool's configure overrides. Bridges spawned AFTER
-  // this resolves will pass `_ort_dylib_dir` through configure and pick up
-  // the runtime; bridges already running at resolution time keep going
-  // without ORT (we don't restart them — that would discard warm
-  // trigram/semantic/LSP state). Result: semantic search becomes available
-  // for new sessions automatically once the download completes, without
-  // forcing the user to restart OpenCode.
-  if (onnxRuntimePromise) {
-    onnxRuntimePromise.then(
-      (ortDylibDir) => {
-        if (ortDylibDir) {
-          pool.setConfigureOverride("_ort_dylib_dir", ortDylibDir);
-          log(`ONNX Runtime ready at ${ortDylibDir}; new bridges will load semantic backend.`);
-        } else if (!isOrtAutoDownloadSupported()) {
-          // Logged once; the manual-install warning is dispatched separately
-          // through the warning channel below.
-          log(`ONNX Runtime auto-download not supported on ${process.platform}/${process.arch}.`);
-        }
-      },
-      (err) => {
-        warn(`ONNX Runtime resolution rejected unexpectedly: ${err}`);
-      },
-    );
-  }
-
   // Bridge spawn is lazy: the first tool call routed through `callBridge()`
   // (see `tools/_shared.ts`) creates the bridge on demand. Plugin init used
   // to fire-and-forget an eager configure here, but on OpenCode Desktop the
@@ -786,13 +466,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // even ones the user never tool-touched — multiplying memory, CPU, and
   // file-watcher load by 10x or more for no benefit.
   //
-  // ONNX Runtime resolution still happens in the background (kicked off
-  // above). The `.then(...)` handler at line ~485 pushes `_ort_dylib_dir`
-  // into the pool's configure overrides as soon as the download finishes,
-  // so any bridge spawned later (including the first lazy spawn) picks it
-  // up automatically. If a tool call lands before ONNX finishes, semantic
-  // is unavailable on that specific bridge — same behavior as today on
-  // first install, and a small price for skipping the eager wait.
+  // ONNX Runtime resolution still happens in the background (kicked off by
+  // the bridge bootstrap). `bridgeEnvironment.attach` pushes `_ort_dylib_dir`
+  // into the pool's configure overrides as soon as it resolves, so any bridge
+  // spawned later (including the first lazy spawn) picks it up automatically.
+  // If a tool call lands before a download finishes, semantic is unavailable
+  // on that specific bridge, a small price for skipping the eager wait.
 
   // Start RPC server for TUI plugin communication
   const rpcServer = new AftRpcServer(configOverrides.storage_dir as string, input.directory);
@@ -993,12 +672,6 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
 
-  // --- Startup notifications (fire-and-forget, best-effort) ---
-  const notifyOpts: NotificationOptions = {
-    client: input.client,
-    directory: input.directory,
-  };
-
   // Feature announcements in TUI are handled by the TUI plugin via RPC (get-announcement + dialog).
   // In Desktop, sendFeatureAnnouncement sends an ignored message to the active session.
   // Both share the same last_announced_version file and the same ANNOUNCEMENT_VERSION
@@ -1015,29 +688,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     }, 8000);
   }
 
-  // Warn about ONNX Runtime if semantic search is enabled but ORT is unavailable.
-  //
-  // We branch on the promise we kicked off earlier rather than peeking at
-  // configOverrides synchronously — the download is intentionally non-blocking
-  // and the override is patched in only after it settles. If the promise
-  // resolves to a path, no warning. If it resolves to null AND auto-download
-  // is unsupported on this platform, surface the manual-install hint.
-  if (onnxRuntimePromise) {
-    onnxRuntimePromise.then(
-      (ortDylibDir) => {
-        if (!ortDylibDir && !isOrtAutoDownloadSupported()) {
-          sendWarning(
-            notifyOpts,
-            `Semantic search requires ONNX Runtime.\nInstall: ${getManualInstallHint()}`,
-          ).catch(() => {});
-        }
-      },
-      () => {
-        // Already logged in the .catch above; don't double-warn.
-      },
-    );
-  } else {
-    // No warnings needed — clean up any stale warnings from previous runs
+  // The missing-ONNX-Runtime warning is sent by the bridge bootstrap once
+  // resolution settles. Without semantic search there is nothing to warn
+  // about, so clear any stale warning from a previous run.
+  if (!onnxRuntimePromise) {
     cleanupWarnings(notifyOpts).catch(() => {});
   }
 
@@ -1091,21 +745,20 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // The registration flag describes the hashline edit arm, not merely the
   // presence of the default edit tool. A config/schema mismatch must downgrade
   // Rust to the default surface instead of making both argument shapes fail.
-  const hashlineEditRegistered = openCodeHashlineEditRegistered(aftConfig, registeredTools);
+  // `aft_search_registered` lets the Rust grep-rewrite footer steer to
+  // aft_search (vs the grep tool). Both are shared with the OpenCode 2 entry.
+  const { hashlineEditRegistered, aftSearchRegistered } = applyToolSurfaceOverrides(
+    pool,
+    aftConfig,
+    registeredTools,
+  );
   ctx.hashlineEffective = hashlineEditRegistered;
-  pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
   const hashlineDowngrade = openCodeHashlineDowngrade(aftConfig, registeredTools);
   log(
     `hashline activation decision requested=${aftConfig.edit_mode === "hashline"} ` +
       `edit_slot_survives=${hashlineEditRegistered} effective=${ctx.hashlineEffective}` +
       (hashlineDowngrade ? ` downgraded=${hashlineDowngrade.reason}` : ""),
   );
-  const aftSearchRegistered = registeredTools.has("aft_search");
-  // Tell Rust whether `aft_search` is registered for this surface so the
-  // grep-rewrite footer can steer to it (vs the grep tool). The pool records
-  // runtime overrides for lazy bridge spawns, so this reaches every bridge —
-  // the same pattern used for `_ort_dylib_dir` and `lsp_paths_extra`.
-  pool.setConfigureOverride("aft_search_registered", aftSearchRegistered);
   // Also expose the same surface decision to the TypeScript-side native bash
   // output finalizer, which catches leading grep/rg commands that Rust could
   // not rewrite (for example, greps with unsupported flags or pipes).

@@ -10,6 +10,12 @@ function testDependencies(events: string[]) {
       events.push(`config:${directory}`);
       return {};
     },
+    migrateConfigLocations: () => [],
+    ensureStorageMigrated: async () => {},
+    ensureOnnxRuntime: async () => null,
+    startLspAutoInstall: () => null,
+    pushLspPaths: async () => {},
+    isOrtAutoDownloadSupported: () => true,
     resolveStorageRoot: () => {
       events.push("storage");
       return "/isolated/storage";
@@ -26,7 +32,7 @@ function testDependencies(events: string[]) {
     resolvePoolOptions: () => ({ timeoutMs: 30_000, hangThreshold: 2 }),
     acquireBridge: async (directory: string, { binaryPath }: { binaryPath: string }) => {
       events.push(`acquire:${directory}:${binaryPath}`);
-      return { directory };
+      return { directory, setConfigureOverride: () => {} };
     },
     releaseBridge: async ({ directory }: { directory: string }) => {
       events.push(`release:${directory}`);
@@ -110,10 +116,13 @@ describe("V2 server effect", () => {
       expect(added[0]?.options).toEqual({ codemode: false });
       expect(events).toEqual([
         `location:${directory}`,
+        // Loaded once to honour `enabled: false`, then again after the
+        // legacy config-location migration may have moved the file.
         `config:${directory}`,
+        `config:${directory}`,
+        "binary:0.55.1",
         "storage",
         `configure:${directory}`,
-        "binary:0.55.1",
         `acquire:${directory}:/isolated/bin/aft`,
         "tools:/isolated/storage",
         `rpc:${directory}`,
