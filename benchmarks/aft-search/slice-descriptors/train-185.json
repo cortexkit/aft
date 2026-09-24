@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "callgraph-refresh-lazy-index-load"
+  ],
+  "note": "No ranking-fence file changed. The train makes the incremental callgraph refresh load stored file indexes on demand, adds an investigation note and a benchmark script, and logs the index-load cost of a refresh batch."
+}
