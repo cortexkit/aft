@@ -1604,6 +1604,30 @@ impl SearchIndex {
         }
     }
 
+    /// Cheap validity probe for a persisted trigram cache: the cache file
+    /// exists and its headers carry this build's magic and index version, so
+    /// a reload would read it rather than rebuild. Reads a few header bytes
+    /// only; it does not load or verify postings.
+    pub(crate) fn disk_cache_header_valid(cache_dir: &Path) -> bool {
+        (|| -> Option<bool> {
+            let cache_file = open_cache_file_read(&cache_dir.join("cache.bin")).ok()?;
+            if cache_file.metadata().ok()?.len() < 16 {
+                return Some(false);
+            }
+            let mut reader = BufReader::new(cache_file);
+            if read_u32(&mut reader).ok()? != CACHE_MAGIC
+                || read_u32(&mut reader).ok()? != INDEX_VERSION
+            {
+                return Some(false);
+            }
+            let _postings_len_total = read_u64(&mut reader).ok()?;
+            let mut magic = [0u8; 8];
+            reader.read_exact(&mut magic).ok()?;
+            Some(&magic == INDEX_MAGIC && read_u32(&mut reader).ok()? == INDEX_VERSION)
+        })()
+        .unwrap_or(false)
+    }
+
     pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }

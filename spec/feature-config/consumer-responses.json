@@ -140,14 +140,16 @@
         "name": "example",
         "content": "function example() {}",
         "annotations": {
+          "calls_out": [],
+          "called_by": []
+        },
+        "callgraph": {
           "status": "unavailable",
           "code": "callgraph_off",
           "index": {
             "status": "off",
             "reason": null
-          },
-          "calls_out": null,
-          "called_by": null
+          }
         }
       }
     },
@@ -305,14 +307,16 @@
         "name": "example",
         "content": "function example() {}",
         "annotations": {
+          "calls_out": [],
+          "called_by": []
+        },
+        "callgraph": {
           "status": "unavailable",
           "code": "callgraph_building",
           "index": {
             "status": "building",
             "reason": null
-          },
-          "calls_out": null,
-          "called_by": null
+          }
         }
       }
     },
@@ -470,14 +474,16 @@
         "name": "example",
         "content": "function example() {}",
         "annotations": {
+          "calls_out": [],
+          "called_by": []
+        },
+        "callgraph": {
           "status": "unavailable",
           "code": "callgraph_unavailable",
           "index": {
             "status": "unavailable",
             "reason": "runtime_not_observed"
-          },
-          "calls_out": null,
-          "called_by": null
+          }
         }
       }
     },
@@ -640,14 +646,16 @@
         "name": "example",
         "content": "function example() {}",
         "annotations": {
+          "calls_out": [],
+          "called_by": []
+        },
+        "callgraph": {
           "status": "unavailable",
           "code": "callgraph_building",
           "index": {
             "status": "building",
             "reason": null
-          },
-          "calls_out": null,
-          "called_by": null
+          }
         }
       }
     },
@@ -685,5 +693,6 @@
         }
       }
     }
-  ]
+  ],
+  "zoom_correction_note": "aft_zoom call annotations (calls_out/called_by) are computed from the file's own syntax tree, not the callgraph index, so they are always returned. When the callgraph index is not ready, zoom adds a separate `callgraph` field with the analysis code and index status/cause. Earlier revisions of these rows assumed the annotations were index-backed and nulled them."
 }

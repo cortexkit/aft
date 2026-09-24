@@ -218,11 +218,31 @@ fn observe_trigram(ctx: &AppContext) -> IndexObservation {
             };
             if loading {
                 IndexObservation::building()
+            } else if trigram_disk_cache_valid(ctx) {
+                // Not resident (for example after idle eviction) but a valid
+                // persisted cache exists: the next query reloads it, so the
+                // lane is usable.
+                IndexObservation::ready()
             } else {
                 IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED)
             }
         }
     }
+}
+
+/// Whether this root's persisted trigram cache exists and has a valid header.
+/// Uses only the artifact key configure already derived; it never derives a
+/// key (a git probe) or reads the index body.
+fn trigram_disk_cache_valid(ctx: &AppContext) -> bool {
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return false;
+    };
+    let Some(key) = ctx.cached_artifact_cache_key(&root) else {
+        return false;
+    };
+    let cache_dir =
+        crate::search_index::resolve_cache_dir_with_key(&key, ctx.config().storage_dir.as_deref());
+    crate::search_index::SearchIndex::disk_cache_header_valid(&cache_dir)
 }
 
 fn observe_semantic(ctx: &AppContext) -> IndexObservation {

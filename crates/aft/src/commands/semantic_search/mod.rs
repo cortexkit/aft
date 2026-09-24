@@ -786,7 +786,12 @@ impl SearchLaneStatus {
         let trigram = if trigram_ready {
             IndexObservation::ready()
         } else {
-            observed_index_status(ctx, IndexPlane::Trigram)
+            match observed_index_status(ctx, IndexPlane::Trigram) {
+                // Usable from its persisted cache but not loaded in time for
+                // this request: its reload is in flight.
+                observation if observation.is_ready() => IndexObservation::building(),
+                observation => observation,
+            }
         };
         let semantic = match observed_index_status(ctx, IndexPlane::Semantic) {
             // Enabled but not resident: a query is the signal that recovers an
@@ -815,7 +820,15 @@ impl SearchLaneStatus {
     /// for trigram readiness, so a reload that finishes inside the wait
     /// budget serves this query (grep and glob recover the same way).
     fn recover_evicted_trigram(ctx: &AppContext) {
-        if Self::not_observed(&observed_index_status(ctx, IndexPlane::Trigram)) {
+        let resident_or_loading = ctx
+            .search_index()
+            .try_read()
+            .map_or(true, |index| index.is_some())
+            || ctx
+                .search_index_rx()
+                .try_read()
+                .map_or(true, |receiver| receiver.is_some());
+        if ctx.config().indexes.trigram && !resident_or_loading {
             super::configure::trigger_search_index_reload_if_evicted(ctx);
         }
     }

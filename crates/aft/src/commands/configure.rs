@@ -10726,6 +10726,56 @@ mod tests {
     }
 
     #[test]
+    fn evicted_trigram_index_with_a_valid_disk_cache_reports_ready() {
+        use crate::feature_status::{cause, observed_index_status, IndexEffective, IndexPlane};
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (root, storage) = lifecycle_fixture();
+        let ctx = Arc::new(test_context());
+        ctx.isolate_cold_build_limiter_for_test(2);
+        configure_and_settle_indexes(
+            &ctx,
+            root.path(),
+            storage.path(),
+            json!({ "indexes": { "trigram": true, "semantic": false, "callgraph": false } }),
+        );
+        assert_eq!(
+            observed_index_status(&ctx, IndexPlane::Trigram).effective,
+            IndexEffective::Ready
+        );
+
+        // Idle eviction drops the resident index but keeps the persisted cache,
+        // which the next query reloads: the lane stays usable.
+        assert!(ctx.evict_idle_artifacts(), "trigram index should be idle");
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert_eq!(
+            observed_index_status(&ctx, IndexPlane::Trigram).effective,
+            IndexEffective::Ready,
+            "an evicted index with a valid cache on disk is usable"
+        );
+        // Observing did not start the reload.
+        assert!(ctx.search_index_rx().read().unwrap().is_none());
+
+        // With nothing valid on disk, nothing is known about the index.
+        let canonical_root = ctx.canonical_cache_root_opt().expect("canonical root");
+        let key = ctx
+            .cached_artifact_cache_key(&canonical_root)
+            .expect("configure derived the artifact key");
+        let cache_file =
+            crate::search_index::resolve_cache_dir_with_key(&key, Some(storage.path()))
+                .join("cache.bin");
+        std::fs::write(&cache_file, b"not a trigram cache").unwrap();
+        let observed = observed_index_status(&ctx, IndexPlane::Trigram);
+        assert_eq!(observed.effective, IndexEffective::Unavailable);
+        assert_eq!(
+            observed.unavailable_reason.as_deref(),
+            Some(cause::RUNTIME_NOT_OBSERVED)
+        );
+    }
+
+    #[test]
     fn disabled_indexes_never_start_and_are_retired_on_reconfigure() {
         use crate::feature_status::{observed_index_status, IndexObservation, IndexPlane};
         let _artifact_guard = artifact_owner_test_lock();
