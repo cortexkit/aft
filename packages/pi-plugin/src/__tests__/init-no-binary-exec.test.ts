@@ -60,6 +60,10 @@ describe.serial.skipIf(process.platform === "win32")(
         AFT_BINARY_PATH: undefined,
         PATH: "",
         HOME: home,
+        // CI runners export XDG_CONFIG_HOME, which would point config reads
+        // at the runner's real config instead of this test's.
+        XDG_CONFIG_HOME: join(tempDir, "config"),
+        XDG_STATE_HOME: join(tempDir, "state"),
         XDG_DATA_HOME: join(tempDir, "data"),
         XDG_CACHE_HOME: cacheHome,
       });
@@ -73,11 +77,8 @@ describe.serial.skipIf(process.platform === "win32")(
       );
       chmodSync(cachedAft, 0o755);
 
-      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
-      writeFileSync(
-        join(home, ".pi", "agent", "aft.json"),
-        JSON.stringify({ lsp: { auto_install: false }, semantic_search: false }),
-      );
+      mkdirSync(home, { recursive: true });
+      writeUserConfig({ lsp: { auto_install: false }, semantic_search: false });
       prevCwd = process.cwd();
       process.chdir(home);
     });
@@ -89,6 +90,12 @@ describe.serial.skipIf(process.platform === "win32")(
       releaseEnv = undefined;
       rmSync(tempDir, { recursive: true, force: true });
     });
+
+    function writeUserConfig(config: Record<string, unknown>): void {
+      const dir = join(tempDir, "config", "cortexkit");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "aft.jsonc"), JSON.stringify(config));
+    }
 
     async function loadPlugin(): Promise<PiPlugin> {
       const mod = await import(`../index.js?no-binary-exec-${Date.now()}-${Math.random()}`);
@@ -119,14 +126,11 @@ describe.serial.skipIf(process.platform === "win32")(
     });
 
     test("subc mode resolves no local binary at all", async () => {
-      writeFileSync(
-        join(home, ".pi", "agent", "aft.json"),
-        JSON.stringify({
-          lsp: { auto_install: false },
-          semantic_search: false,
-          subc: { connection_file: join(tempDir, "subc-connection.json") },
-        }),
-      );
+      writeUserConfig({
+        lsp: { auto_install: false },
+        semantic_search: false,
+        subc: { connection_file: join(tempDir, "subc-connection.json") },
+      });
       const resolverCalls: string[] = [];
       spyOn(bridge, "findBinarySync").mockImplementation(() => {
         resolverCalls.push("findBinarySync");
