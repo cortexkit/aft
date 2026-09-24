@@ -481,7 +481,13 @@ where
             if operator_bypass_requested()
                 && is_reviewed_operator_label_tuple(manifest.manifest_version, &tuple)
             {
-                return dispatch_operator_label_edit(args, &tuple, paths, now, delegate_to_upstream);
+                return dispatch_operator_label_edit(
+                    args,
+                    &tuple,
+                    paths,
+                    now,
+                    delegate_to_upstream,
+                );
             }
             // An API row is addressed by endpoint rather than by subcommand and
             // positional, so it has its own argv reader.
@@ -536,9 +542,7 @@ where
         Err(error) => return refuse_governed_canonicalization(&error),
     };
     let repository = edit.repository.clone().or_else(infer_repository_from_git);
-    if let Err(error) =
-        append_label_bypass_audit(paths, tuple, repository.as_deref(), &edit, now)
-    {
+    if let Err(error) = append_label_bypass_audit(paths, tuple, repository.as_deref(), &edit, now) {
         return refuse(
             RefusalCode::BypassAuditUnavailable,
             &format!("operator bypass audit could not be appended: {error}"),
@@ -3926,9 +3930,8 @@ fn parse_operator_label_edit(args: &[OsString]) -> Result<OperatorLabelEdit, Can
             "{target}: not an issue number or https://github.com/<owner>/<repo>/issues/<number> URL"
         ))
     })?;
-    let explicit_repository = explicit_repository.map(|repository| {
-        canonical_repository_key(&repository).unwrap_or(repository)
-    });
+    let explicit_repository = explicit_repository
+        .map(|repository| canonical_repository_key(&repository).unwrap_or(repository));
     // An issue URL names its own repository. If --repo names a different one
     // the target is ambiguous, and the audit line would record a guess.
     if let (Some(from_url), Some(explicit)) = (&url_repository, &explicit_repository) {
@@ -3958,7 +3961,10 @@ fn operator_row_flag_value(
 ) -> Result<Option<(String, usize)>, CanonicalizeError> {
     let (supplied, consumed) = if value == flag {
         (next.and_then(|arg| arg.to_str()), 2)
-    } else if let Some(inline) = value.strip_prefix(flag).and_then(|rest| rest.strip_prefix('=')) {
+    } else if let Some(inline) = value
+        .strip_prefix(flag)
+        .and_then(|rest| rest.strip_prefix('='))
+    {
         (Some(inline), 1)
     } else {
         return Ok(None);
@@ -7879,11 +7885,29 @@ mod tests {
 
     #[test]
     fn v14_operator_label_row_accepts_every_label_form() {
-        type Case<'a> = (&'a [&'a str], Option<&'a str>, u64, &'a [&'a str], &'a [&'a str]);
+        type Case<'a> = (
+            &'a [&'a str],
+            Option<&'a str>,
+            u64,
+            &'a [&'a str],
+            &'a [&'a str],
+        );
         let aft = Some("cortexkit/aft");
         let cases: &[Case] = &[
-            (&["issue", "edit", "42", "--add-label", "bug"], None, 42, &["bug"], &[]),
-            (&["issue", "edit", "42", "--add-label=bug,p1"], None, 42, &["bug", "p1"], &[]),
+            (
+                &["issue", "edit", "42", "--add-label", "bug"],
+                None,
+                42,
+                &["bug"],
+                &[],
+            ),
+            (
+                &["issue", "edit", "42", "--add-label=bug,p1"],
+                None,
+                42,
+                &["bug", "p1"],
+                &[],
+            ),
             (
                 &["issue", "edit", "42", "--remove-label", "needs-triage"],
                 None,
@@ -7891,9 +7915,22 @@ mod tests {
                 &[],
                 &["needs-triage"],
             ),
-            (&["issue", "edit", "42", "--remove-label=a, b"], None, 42, &[], &["a", "b"]),
             (
-                &["issue", "edit", "--add-label", "x,y", "7", "--remove-label=z"],
+                &["issue", "edit", "42", "--remove-label=a, b"],
+                None,
+                42,
+                &[],
+                &["a", "b"],
+            ),
+            (
+                &[
+                    "issue",
+                    "edit",
+                    "--add-label",
+                    "x,y",
+                    "7",
+                    "--remove-label=z",
+                ],
                 None,
                 7,
                 &["x", "y"],
@@ -7907,42 +7944,87 @@ mod tests {
                 &[],
             ),
             (
-                &["issue", "edit", "42", "--add-label", "bug", "--repo", "CortexKit/AFT"],
+                &[
+                    "issue",
+                    "edit",
+                    "42",
+                    "--add-label",
+                    "bug",
+                    "--repo",
+                    "CortexKit/AFT",
+                ],
                 aft,
                 42,
                 &["bug"],
                 &[],
             ),
             (
-                &["issue", "edit", "42", "--add-label", "bug", "--repo=cortexkit/aft"],
+                &[
+                    "issue",
+                    "edit",
+                    "42",
+                    "--add-label",
+                    "bug",
+                    "--repo=cortexkit/aft",
+                ],
                 aft,
                 42,
                 &["bug"],
                 &[],
             ),
             (
-                &["issue", "edit", "42", "--add-label", "bug", "-R", "cortexkit/aft"],
+                &[
+                    "issue",
+                    "edit",
+                    "42",
+                    "--add-label",
+                    "bug",
+                    "-R",
+                    "cortexkit/aft",
+                ],
                 aft,
                 42,
                 &["bug"],
                 &[],
             ),
             (
-                &["issue", "edit", "42", "--add-label", "bug", "-R=cortexkit/aft"],
+                &[
+                    "issue",
+                    "edit",
+                    "42",
+                    "--add-label",
+                    "bug",
+                    "-R=cortexkit/aft",
+                ],
                 aft,
                 42,
                 &["bug"],
                 &[],
             ),
             (
-                &["-R", "cortexkit/aft", "issue", "edit", "42", "--add-label", "bug"],
+                &[
+                    "-R",
+                    "cortexkit/aft",
+                    "issue",
+                    "edit",
+                    "42",
+                    "--add-label",
+                    "bug",
+                ],
                 aft,
                 42,
                 &["bug"],
                 &[],
             ),
             (
-                &["--repo=cortexkit/aft", "issue", "edit", "42", "--remove-label", "bug"],
+                &[
+                    "--repo=cortexkit/aft",
+                    "issue",
+                    "edit",
+                    "42",
+                    "--remove-label",
+                    "bug",
+                ],
                 aft,
                 42,
                 &[],
@@ -8067,20 +8149,34 @@ mod tests {
         ])
         .expect_err("a second positional must refuse whatever its shape");
         assert!(
-            error.text.starts_with("https://github.com/cortexkit/aft/issues/43: "),
+            error
+                .text
+                .starts_with("https://github.com/cortexkit/aft/issues/43: "),
             "{}",
             error.text
         );
         for (argv, named) in [
-            (vec!["issue", "edit", "--add-label", "bug"], "no issue number or URL"),
-            (vec!["issue", "edit", "42"], "no --add-label or --remove-label"),
+            (
+                vec!["issue", "edit", "--add-label", "bug"],
+                "no issue number or URL",
+            ),
+            (
+                vec!["issue", "edit", "42"],
+                "no --add-label or --remove-label",
+            ),
             (
                 vec!["issue", "edit", "42", "--repo", "cortexkit/aft"],
                 "no --add-label or --remove-label",
             ),
             (vec!["issue", "edit", "#42", "--add-label", "bug"], "#42: "),
             (
-                vec!["issue", "edit", "https://github.com/o/r/pull/42", "--add-label", "bug"],
+                vec![
+                    "issue",
+                    "edit",
+                    "https://github.com/o/r/pull/42",
+                    "--add-label",
+                    "bug",
+                ],
                 "https://github.com/o/r/pull/42: ",
             ),
             (
@@ -8096,7 +8192,17 @@ mod tests {
                 "names o/r but --repo names other/repo",
             ),
             (
-                vec!["issue", "edit", "42", "--add-label", "bug", "-R", "a/b", "--repo", "a/b"],
+                vec![
+                    "issue",
+                    "edit",
+                    "42",
+                    "--add-label",
+                    "bug",
+                    "-R",
+                    "a/b",
+                    "--repo",
+                    "a/b",
+                ],
                 "--repo: given more than once",
             ),
         ] {
