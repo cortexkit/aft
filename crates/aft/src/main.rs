@@ -166,6 +166,12 @@ fn main() {
         }
     }
 
+    // `aft fix-config` is the configuration migration behind `aft doctor --fix`.
+    if std::env::args().nth(1).as_deref() == Some("fix-config") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        std::process::exit(cli::fix_config::run(args));
+    }
+
     // Daemon launches can miss user shell PATH entries. Initialize before any
     // AFT threads or executors start so all subprocesses inherit one PATH.
     aft::effective_path::initialize_process_path();

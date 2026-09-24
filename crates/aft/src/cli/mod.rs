@@ -1,3 +1,4 @@
+pub mod fix_config;
 pub mod index;
 pub mod probe_login_shell_path;
 // Compiled everywhere: the memory census view has no OS dependency, and the

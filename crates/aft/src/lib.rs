@@ -68,6 +68,7 @@ pub mod cold_build_limiter;
 pub mod commands;
 pub mod compress;
 pub mod config;
+pub mod config_fix;
 pub mod config_resolve;
 pub mod context;
 pub mod db;
