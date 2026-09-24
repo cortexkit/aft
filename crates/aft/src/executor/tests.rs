@@ -3216,3 +3216,93 @@ fn same_root_maintenance_tail_observes_a_queued_bind_and_lets_it_run() {
         "off a worker thread no actor is observed"
     );
 }
+
+/// The reserved bind workers run route-bind configures only. An edit queued
+/// on the same root ahead of a bind must not ride the bind pass onto a
+/// reserved worker (a long edit would then hold it); it waits for the general
+/// pool, and the bind is admitted ahead of it.
+#[test]
+fn reserved_bind_workers_run_only_binds_and_the_bind_jumps_a_queued_edit() {
+    let executor = test_executor(4, 2, 2, 2);
+    let pool_size = executor.pool_size();
+    let mut dirs = Vec::new();
+
+    let (busy_started_tx, busy_started_rx) = crossbeam_channel::unbounded::<()>();
+    let (release_busy_tx, release_busy_rx) = crossbeam_channel::unbounded::<()>();
+    let mut busy = Vec::new();
+    for index in 0..pool_size {
+        let (dir, root) = test_root(&format!("reserve-only-busy-{index}"));
+        assert!(executor.register_actor(root.clone(), test_ctx()));
+        dirs.push(dir);
+        let started = busy_started_tx.clone();
+        let release = release_busy_rx.clone();
+        busy.push(executor.submit_async(
+            root,
+            Lane::PureRead,
+            format!("busy-{index}"),
+            Box::new(move |_| {
+                let _ = started.send(());
+                let _ = release.recv_timeout(Duration::from_secs(30));
+                ok("busy")
+            }),
+        ));
+    }
+    for occupied in 0..pool_size {
+        busy_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("general worker {occupied} occupied"));
+    }
+
+    let (_dir, root) = test_root("reserve-only-target");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let edit_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let edit_flag = Arc::clone(&edit_started);
+    let (release_edit_tx, release_edit_rx) = crossbeam_channel::bounded::<()>(1);
+    let edit = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "edit-before-bind".to_string(),
+        Box::new(move |_| {
+            edit_flag.store(true, Ordering::SeqCst);
+            let _ = release_edit_rx.recv_timeout(Duration::from_secs(30));
+            ok("edit")
+        }),
+    );
+    let (bind_started_tx, bind_started_rx) = crossbeam_channel::bounded::<bool>(1);
+    let edit_seen_by_bind = Arc::clone(&edit_started);
+    let bind = executor.submit_async(
+        root,
+        Lane::Mutating,
+        "subc-bind-after-edit".to_string(),
+        Box::new(move |_| {
+            let _ = bind_started_tx.send(edit_seen_by_bind.load(Ordering::SeqCst));
+            ok("bind")
+        }),
+    );
+
+    let bind_start = bind_started_rx.recv_timeout(Duration::from_secs(1));
+    // Hold the general pool a moment longer: the edit must not have found a
+    // worker while only the reserved ones were free.
+    thread::sleep(Duration::from_millis(100));
+    let edit_ran_on_reserve = edit_started.load(Ordering::SeqCst);
+    for _ in 0..pool_size {
+        let _ = release_busy_tx.send(());
+    }
+    let _ = release_edit_tx.send(());
+    assert!(recv_async(bind, "bind behind edit").success);
+    assert!(recv_async(edit, "edit ahead of bind").success);
+    for handle in busy {
+        let _ = recv_async(handle, "busy read");
+    }
+
+    assert_eq!(
+        bind_start,
+        Ok(false),
+        "the bind must start within 1s on a reserved worker, before the queued edit"
+    );
+    assert!(
+        !edit_ran_on_reserve,
+        "an edit must never start on a reserved bind worker"
+    );
+    assert_eq!(dirs.len(), pool_size);
+}

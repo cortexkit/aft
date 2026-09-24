@@ -1934,6 +1934,12 @@ impl ActorState {
         job
     }
 
+    fn pop_first_bind_job(&mut self) -> Option<QueuedJob> {
+        let job = self.interactive.remove_first_bind_job();
+        self.sync_waiting_writers();
+        job
+    }
+
     fn higher_priority_writer_barrier_blocks(&self, job_class: JobClass) -> bool {
         // Maintenance must not start while interactive mutating work (tool
         // mutations, route binds) waits: a maintenance job that takes the
@@ -2147,6 +2153,29 @@ impl ClassQueues {
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
         self.mutating.iter().any(|job| job.request_id == request_id)
+    }
+
+    /// Remove the oldest queued route-bind configure from the Mutating lane,
+    /// even when other mutating jobs are ahead of it. Keeps `order` paired
+    /// with the lane queue the same way `remove_cancellable` does.
+    fn remove_first_bind_job(&mut self) -> Option<QueuedJob> {
+        let position = self
+            .mutating
+            .iter()
+            .position(|job| is_configure_request(&job.request_id))?;
+        let removed = self.mutating.remove(position);
+        let mut occurrence = 0usize;
+        if let Some(order_position) = self.order.iter().position(|entry| {
+            if *entry != Lane::Mutating {
+                return false;
+            }
+            let matched = occurrence == position;
+            occurrence += 1;
+            matched
+        }) {
+            self.order.remove(order_position);
+        }
+        removed
     }
 
     /// Remove the queued job carrying this exact cancellation token.
@@ -2838,8 +2867,9 @@ fn can_dispatch_class(state: &SchedulerState, job_class: JobClass) -> bool {
 /// Which dispatch pass is asking an actor for a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmissionPass {
-    /// The route-bind pass: only the actor's head Mutating job, and only when
-    /// a route-bind configure is queued in that lane.
+    /// The route-bind pass: only a queued route-bind configure, taken from the
+    /// Mutating lane ahead of any other writer queued before it. This pass may
+    /// use the reserved bind workers, so it must never admit anything else.
     Bind,
     /// The ordinary DRR pass for one job class.
     Class(JobClass),
@@ -2858,8 +2888,9 @@ fn try_admit_actor(
         AdmissionPass::Class(job_class) => job_class,
     };
     let lane = match pass {
-        // Mutating jobs stay FIFO within an actor: a bind queued behind an
-        // edit admits that edit first, and the bind follows on the next pass.
+        // Only the bind itself: an edit queued ahead of it waits for the
+        // general pool (it is not admitted here, so it can never occupy a
+        // reserved bind worker), and the bind runs first.
         AdmissionPass::Bind => actor
             .interactive
             .oldest_queued_bind_at()
@@ -2922,7 +2953,11 @@ fn try_admit_actor(
             .saturating_add(1);
     }
 
-    let queued = actor.pop_front_job(job_class, lane)?;
+    let queued = if bind_pass {
+        actor.pop_first_bind_job()?
+    } else {
+        actor.pop_front_job(job_class, lane)?
+    };
     // The bind pass runs outside DRR, so it does not spend the actor's turn.
     if !bind_pass {
         actor.deficit -= JOB_COST;
