@@ -650,7 +650,15 @@ pub fn resolve_config_for_harness_with_phase(
         for warning in translation.warnings {
             // Migration notices are delivered once per identity by the host
             // plugin or CLI; the engine only records them in its log so the
-            // same notice is not re-delivered on every configure.
+            // same notice is not re-delivered on every configure. A
+            // superseded-legacy note describes a file that is already fixed
+            // (it only keeps a runtime gate), so it is logged once per process
+            // for the same file and text instead of on every configure.
+            if warning.code == "superseded_legacy_config"
+                && !first_superseded_note(&tier.source, &warning.key, &warning.message)
+            {
+                continue;
+            }
             crate::slog_info!(
                 "config {} [{}]: {} ({})",
                 tier.tier,
@@ -838,6 +846,16 @@ fn carry_process_state(base: &Config, resolved: &mut Config) {
     resolved.lsp_inflight_installs = base.lsp_inflight_installs.clone();
 }
 
+/// Whether this superseded-legacy note is new to this process.
+fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(format!("{source}\u{0}{key}\u{0}{message}"))
+}
+
 fn parse_tier(
     tier: &ConfigTier,
     phase: PolicyPhase,
@@ -848,8 +866,14 @@ fn parse_tier(
         return None;
     };
     // Retired keys are translated (or rejected) on the raw document, before
-    // the strict schema sees it, so they never reach `RawAftConfig`.
-    let translation = feature_config::translate_document(&mut map, phase);
+    // the strict schema sees it, so they never reach `RawAftConfig`. Only the
+    // user tier's base block may receive the absent-base default disables.
+    let document_tier = if tier.tier == "user" {
+        feature_config::DocumentTier::User
+    } else {
+        feature_config::DocumentTier::Project
+    };
+    let translation = feature_config::translate_document(&mut map, phase, document_tier);
 
     let raw = match serde_json::from_value::<RawAftConfig>(Value::Object(map.clone())) {
         Ok(config) => config,
@@ -2449,6 +2473,42 @@ mod tests {
             .iter()
             .map(|dropped| dropped.key.clone())
             .collect()
+    }
+
+    #[test]
+    fn a_superseded_legacy_note_is_logged_once_per_file_and_text() {
+        let source = "/tmp/superseded-note-test/aft.jsonc";
+        assert!(first_superseded_note(source, "base", "note"));
+        assert!(!first_superseded_note(source, "base", "note"));
+        assert!(first_superseded_note(source, "base", "changed note"));
+        assert!(first_superseded_note(
+            "/tmp/other/aft.jsonc",
+            "base",
+            "note"
+        ));
+    }
+
+    /// A project's legacy keys never bring back the move/delete default the
+    /// user switched off with an explicit empty list.
+    #[test]
+    fn project_legacy_keys_do_not_reapply_the_default_disables() {
+        for project in [
+            r#"{"hoist_builtin_tools": false}"#,
+            r#"{"backup": {"enabled": false}}"#,
+            r#"{"bash": false}"#,
+        ] {
+            let result = resolve_config(&[
+                tier("user", r#"{"disabled_tools": []}"#),
+                tier("project", project),
+            ]);
+            assert!(result.errors.is_empty());
+            for kept in ["aft_move", "aft_delete"] {
+                assert!(
+                    !result.config.disabled_tools.iter().any(|name| name == kept),
+                    "{project}: {kept}"
+                );
+            }
+        }
     }
 
     /// Security invariant (Oracle drift decision): nested objects are non-strict

@@ -573,11 +573,12 @@ fn tier_blocks(
     raw: Option<Map<String, Value>>,
     harness_key: Option<&str>,
     phase: PolicyPhase,
+    tier: feature_config::DocumentTier,
 ) -> TierBlocks {
     let Some(mut map) = raw else {
         return TierBlocks::default();
     };
-    feature_config::translate_document(&mut map, phase);
+    feature_config::translate_document(&mut map, phase, tier);
     let harness = harness_key
         .and_then(|key| map.get("harnesses")?.get(key)?.as_object().cloned())
         .unwrap_or_default();
@@ -669,8 +670,18 @@ pub fn derive_plan(
     let config = resolved.config;
 
     let harness_key = runtime_harness.as_ref().map(Harness::wire_label);
-    let user = tier_blocks(user_raw, harness_key.as_deref(), phase);
-    let project = tier_blocks(project_raw, harness_key.as_deref(), phase);
+    let user = tier_blocks(
+        user_raw,
+        harness_key.as_deref(),
+        phase,
+        feature_config::DocumentTier::User,
+    );
+    let project = tier_blocks(
+        project_raw,
+        harness_key.as_deref(),
+        phase,
+        feature_config::DocumentTier::Project,
+    );
 
     let base_list = string_list(&user.base, "disabled_tools");
     // Disables accepted after the user base: the user's harness block, and

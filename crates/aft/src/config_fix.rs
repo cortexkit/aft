@@ -259,7 +259,12 @@ pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, Strin
 
     let raw = doc.value()?;
     let mut translated = raw.as_object().cloned().unwrap_or_default();
-    let translation = feature_config::translate_document(&mut translated, PolicyPhase::Window);
+    let document_tier = match tier {
+        FixTier::User => feature_config::DocumentTier::User,
+        FixTier::Project => feature_config::DocumentTier::Project,
+    };
+    let translation =
+        feature_config::translate_document(&mut translated, PolicyPhase::Window, document_tier);
     if !translation.errors.is_empty() {
         return Err(translation.errors.join("\n"));
     }

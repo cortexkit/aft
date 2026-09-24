@@ -261,7 +261,9 @@ pub const RETIRED_ENABLED_FALSE_INDEXES_NOTE: &str = "enabled: false no longer t
 
 fn translate_block(
     map: &mut Map<String, Value>,
-    is_base: bool,
+    // True only for the user file's base block, the one place the
+    // absent-base default disables may be added.
+    user_base: bool,
     phase: PolicyPhase,
     block_label: &str,
     out: &mut DocumentTranslation,
@@ -470,7 +472,7 @@ fn translate_block(
         return;
     }
 
-    let list = if is_base {
+    let list = if user_base {
         if explicit_surface {
             Some(generated)
         } else if !generated.is_empty() {
@@ -505,11 +507,28 @@ fn translate_block(
     }
 }
 
+/// Which trust tier a raw document belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentTier {
+    User,
+    Project,
+}
+
 /// Translate or reject every block (base plus each `harnesses.<id>` object)
 /// of one raw configuration document, in place.
-pub fn translate_document(map: &mut Map<String, Value>, phase: PolicyPhase) -> DocumentTranslation {
+///
+/// Only the user file's base block receives the absent-base default
+/// (`aft_move`/`aft_delete`) when its legacy keys generate disables: that
+/// default applies once, at user-base resolution. A project file's base block
+/// contributes only the names its own legacy keys imply, so a legacy key in a
+/// repository can never re-disable tools the user enabled.
+pub fn translate_document(
+    map: &mut Map<String, Value>,
+    phase: PolicyPhase,
+    tier: DocumentTier,
+) -> DocumentTranslation {
     let mut out = DocumentTranslation::default();
-    translate_block(map, true, phase, "base", &mut out);
+    translate_block(map, tier == DocumentTier::User, phase, "base", &mut out);
     if let Some(Value::Object(harnesses)) = map.get_mut("harnesses") {
         for (name, block) in harnesses.iter_mut() {
             if let Value::Object(block) = block {
@@ -794,8 +813,53 @@ mod tests {
         let Value::Object(mut map) = doc else {
             panic!("object")
         };
-        let out = translate_document(&mut map, phase);
+        let out = translate_document(&mut map, phase, DocumentTier::User);
         (Value::Object(map), out)
+    }
+
+    fn translate_project(doc: Value) -> Value {
+        let Value::Object(mut map) = doc else {
+            panic!("object")
+        };
+        translate_document(&mut map, PolicyPhase::Window, DocumentTier::Project);
+        Value::Object(map)
+    }
+
+    /// A project block contributes only what its own legacy keys imply; the
+    /// move/delete default belongs to the user base alone.
+    #[test]
+    fn project_base_blocks_never_receive_the_default_disables() {
+        assert_eq!(
+            translate_project(json!({"hoist_builtin_tools": false}))["disabled_tools"],
+            json!([
+                "apply_patch",
+                "bash",
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "write"
+            ])
+        );
+        assert_eq!(
+            translate_project(json!({"backup": {"enabled": false}}))["disabled_tools"],
+            json!(["aft_safety"])
+        );
+        assert_eq!(
+            translate_project(json!({"bash": false}))["disabled_tools"],
+            json!([
+                "bash",
+                "bash_kill",
+                "bash_status",
+                "bash_watch",
+                "bash_write"
+            ])
+        );
+        assert_eq!(translate_project(json!({"tool_surface": "all"})), json!({}));
+        assert_eq!(
+            translate_project(json!({"tool_surface": "recommended"}))["disabled_tools"],
+            json!(["aft_callgraph", "aft_delete", "aft_move"])
+        );
     }
 
     #[test]

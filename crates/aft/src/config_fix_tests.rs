@@ -52,7 +52,13 @@ fn assert_fix_preserves_intent(doc: &str, tier: FixTier) -> Migration {
     }
     let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&migration.text)).unwrap();
     let mut rejected = value.as_object().unwrap().clone();
-    let check = feature_config::translate_document(&mut rejected, PolicyPhase::Rejecting);
+    let document_tier = if tier == FixTier::User {
+        feature_config::DocumentTier::User
+    } else {
+        feature_config::DocumentTier::Project
+    };
+    let check =
+        feature_config::translate_document(&mut rejected, PolicyPhase::Rejecting, document_tier);
     assert!(check.errors.is_empty(), "{:?}", check.errors);
     migration
 }
@@ -198,14 +204,49 @@ fn project_fixes_never_materialize_protected_disables() {
     let migration =
         assert_fix_preserves_intent(r#"{"hoist_builtin_tools": false}"#, FixTier::Project);
     let value: Value = serde_json::from_str(&migration.text).unwrap();
-    let list = value["disabled_tools"].as_array().unwrap();
-    assert!(
-        !list
-            .iter()
-            .filter_map(Value::as_str)
-            .any(feature_config::is_project_protected_tool),
-        "{list:?}"
-    );
+    assert_eq!(value, json!({"disabled_tools": []}));
+}
+
+/// The move/delete default belongs to the user base: fixing a project file
+/// writes only the names its own legacy keys imply, so a user who enabled
+/// move and delete keeps them.
+#[test]
+fn project_fixes_never_materialize_the_default_disables() {
+    for (doc, want) in [
+        (r#"{"hoist_builtin_tools": false}"#, json!([])),
+        (r#"{"backup": {"enabled": false}}"#, json!([])),
+        (
+            r#"{"bash": false}"#,
+            json!(["bash_kill", "bash_status", "bash_watch", "bash_write"]),
+        ),
+        (r#"{"inspect": {"enabled": false}}"#, json!(["aft_inspect"])),
+    ] {
+        let migration = migrate_config_text(doc, FixTier::Project).unwrap();
+        let value: Value = serde_json::from_str(&migration.text).unwrap();
+        assert_eq!(value["disabled_tools"], want, "{doc}");
+        for text in [doc, migration.text.as_str()] {
+            let tiers = [
+                ConfigTier {
+                    tier: "user".to_string(),
+                    source: "user".to_string(),
+                    doc: r#"{"disabled_tools": []}"#.to_string(),
+                },
+                ConfigTier {
+                    tier: "project".to_string(),
+                    source: "project".to_string(),
+                    doc: text.to_string(),
+                },
+            ];
+            let result = resolve_config_for_harness_with_phase(&tiers, None, PolicyPhase::Window);
+            assert!(result.errors.is_empty());
+            for kept in ["aft_move", "aft_delete"] {
+                assert!(
+                    !result.config.disabled_tools.iter().any(|name| name == kept),
+                    "{text}: {kept} must stay registered"
+                );
+            }
+        }
+    }
 }
 
 #[test]

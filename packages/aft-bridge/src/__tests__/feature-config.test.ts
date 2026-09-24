@@ -57,21 +57,54 @@ describe("feature-config policy", () => {
 
   test("gate-only bases union with the default and explicit [] wins", () => {
     const backup: Record<string, unknown> = { backup: { enabled: false } };
-    const out = translateConfigDocument(backup, "window");
+    const out = translateConfigDocument(backup, "window", "user");
     expect(backup.disabled_tools).toEqual(["aft_delete", "aft_move", "aft_safety"]);
     expect(out.warnings.map((warning) => warning.code)).toContain(
       "legacy_runtime_gate_requires_fix",
     );
 
     const explicit: Record<string, unknown> = { hoist_builtin_tools: false, disabled_tools: [] };
-    translateConfigDocument(explicit, "window");
+    translateConfigDocument(explicit, "window", "user");
     expect(explicit.disabled_tools).toEqual([]);
     expect(explicit.hoist_builtin_tools).toBeUndefined();
   });
 
+  test("project base blocks contribute only what their own legacy keys imply", () => {
+    const hoist: Record<string, unknown> = { hoist_builtin_tools: false };
+    translateConfigDocument(hoist, "window", "project");
+    expect(hoist.disabled_tools).toEqual([
+      "apply_patch",
+      "bash",
+      "edit",
+      "glob",
+      "grep",
+      "read",
+      "write",
+    ]);
+    const backup: Record<string, unknown> = { backup: { enabled: false } };
+    translateConfigDocument(backup, "window", "project");
+    expect(backup.disabled_tools).toEqual(["aft_safety"]);
+    const all: Record<string, unknown> = { tool_surface: "all" };
+    translateConfigDocument(all, "window", "project");
+    expect(all.disabled_tools).toBeUndefined();
+  });
+
+  test("only the retained-gate note on an explicit list is delivered once, not per load", () => {
+    const fixed: Record<string, unknown> = { backup: { enabled: false }, disabled_tools: [] };
+    const out = translateConfigDocument(fixed, "window", "user");
+    const note = out.warnings.find((warning) => warning.code === "superseded_legacy_config");
+    expect(note?.once).toBe(true);
+    const conflict = translateConfigDocument(
+      { search_index: false, experimental_search_index: true },
+      "window",
+      "user",
+    );
+    expect(conflict.warnings.every((warning) => warning.once !== true)).toBe(true);
+  });
+
   test("a retired enabled:false notice says indexes still build and how to stop them", () => {
     const doc: Record<string, unknown> = { enabled: false };
-    const out = translateConfigDocument(doc, "window");
+    const out = translateConfigDocument(doc, "window", "user");
     expect(out.retiredEnabledFalse).toBe(true);
     expect(doc.indexes).toBeUndefined();
     expect(out.warnings.map((warning) => warning.code)).toContain(
@@ -81,7 +114,7 @@ describe("feature-config policy", () => {
     expect(message).toContain("indexes still build");
     expect(message).toContain("indexes.trigram, indexes.semantic and indexes.callgraph to false");
 
-    const other = translateConfigDocument({ tool_surface: "all" }, "window");
+    const other = translateConfigDocument({ tool_surface: "all" }, "window", "user");
     expect(other.retiredEnabledFalse).toBe(false);
     expect(legacyConfigNoticeMessage("/cfg/aft.jsonc", other)).not.toContain("indexes still build");
   });

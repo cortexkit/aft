@@ -1464,12 +1464,23 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
   // Retired keys are translated (inside the migration window) or rejected on
   // the raw document, before schema validation, so they never reach Zod.
   const projection = noticeProjection(structuredClone(cleanConfig));
-  const translation = translateConfigDocument(cleanConfig, currentPolicyPhase());
+  const translation = translateConfigDocument(cleanConfig, currentPolicyPhase(), tier);
   if (translation.errors.length > 0) {
     throw new ConfigRejectedError(translation.errors, configPath);
   }
   for (const warning of translation.warnings) {
-    warn(`Config ${configPath} [${warning.key}]: ${warning.message} (${warning.code})`);
+    const text = `Config ${configPath} [${warning.key}]: ${warning.message} (${warning.code})`;
+    if (warning.once) {
+      // A note about an already-fixed file: deliver it once per input
+      // identity like the migration notices, not on every load.
+      configLoadNotices.push({
+        configPath,
+        digest: `${noticeDigest(projection)}:${warning.code}:${warning.key}`,
+        message: text,
+      });
+    } else {
+      warn(text);
+    }
   }
   if (translation.legacyInput) {
     configLoadNotices.push({

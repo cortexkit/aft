@@ -78,7 +78,7 @@ const manifest = JSON.parse(
  */
 function resolvedProfile(raw: Record<string, unknown>): Record<string, unknown> {
   const doc = structuredClone(raw);
-  const translation = translateConfigDocument(doc, "window");
+  const translation = translateConfigDocument(doc, "window", "user");
   if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
   doc.disabled_tools = sortedUnique(
     (doc.disabled_tools as string[] | undefined) ?? DEFAULT_DISABLED_TOOLS,

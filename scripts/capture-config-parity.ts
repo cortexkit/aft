@@ -613,6 +613,18 @@ const CASES: ParityCase[] = [
     user: {},
     project: { hoist_builtin_tools: false },
   },
+  // The move/delete default applies once, at the user base: a project's legacy
+  // key must not disable tools the user enabled with an explicit empty list.
+  {
+    name: "legacy_project_hoist_false_keeps_user_enabled_move_delete",
+    user: { disabled_tools: [] },
+    project: { hoist_builtin_tools: false },
+  },
+  {
+    name: "legacy_project_bash_false_keeps_user_enabled_move_delete",
+    user: { disabled_tools: [] },
+    project: { bash: false },
+  },
   { name: "legacy_search_index_false", user: { search_index: false } },
   { name: "legacy_experimental_search_index_false", user: { experimental_search_index: false } },
   {

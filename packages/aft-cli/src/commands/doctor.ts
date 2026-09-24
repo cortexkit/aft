@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  clearMigrationNotices,
   npmInvocation,
   npmSpawnEnv,
   type ResolvedNpm,
@@ -1275,6 +1276,15 @@ function applyConfigMigration(run: NativeRunner): { changed: number; errors: num
     if (file.status === "rewritten") {
       changed += 1;
       log.success(`Migrated ${file.tier} config ${file.path}`);
+      // Only a successfully rewritten file loses its delivered-notice records,
+      // so its next notice (if any still applies) is delivered afresh.
+      try {
+        clearMigrationNotices(file.path);
+      } catch (error) {
+        log.warn(
+          `  could not clear migration notice records for ${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     } else if (file.status === "failed") {
       errors += 1;
       log.error(

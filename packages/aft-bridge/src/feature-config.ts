@@ -161,6 +161,12 @@ export interface TranslationWarning {
   code: string;
   key: string;
   message: string;
+  /**
+   * Deliver through the once-per-identity migration notice channel instead of
+   * warning on every load. Set for notes about files that are already fixed
+   * and only keep a retained runtime gate, which would otherwise repeat forever.
+   */
+  once?: boolean;
 }
 
 export interface DocumentTranslation {
@@ -209,7 +215,9 @@ export function sortedUnique(names: Iterable<string>): string[] {
 
 function translateBlock(
   map: JsonRecord,
-  isBase: boolean,
+  // True only for the user file's base block, the one place the absent-base
+  // default disables may be added.
+  userBase: boolean,
   phase: PolicyPhase,
   blockLabel: string,
   out: DocumentTranslation,
@@ -363,13 +371,14 @@ function translateBlock(
         key: blockLabel,
         message:
           "disabled_tools is set explicitly, so legacy tool_surface/hoist_builtin_tools/enabled and runtime gates do not change registration",
+        once: true,
       });
     }
     return;
   }
 
   let list: string[] | undefined;
-  if (isBase) {
+  if (userBase) {
     if (explicitSurface) list = sortedUnique(generated);
     else if (generated.size > 0) list = sortedUnique([...generated, ...DEFAULT_DISABLED_TOOLS]);
   } else if (generated.size > 0) {
@@ -402,15 +411,27 @@ export function legacyConfigNoticeMessage(
   return translation.retiredEnabledFalse ? `${base} ${RETIRED_ENABLED_FALSE_INDEXES_NOTE}` : base;
 }
 
-/** Translate or reject every block (base plus each `harnesses.<id>`) in place. */
-export function translateConfigDocument(map: JsonRecord, phase: PolicyPhase): DocumentTranslation {
+/**
+ * Translate or reject every block (base plus each `harnesses.<id>`) in place.
+ *
+ * Only the user file's base block receives the absent-base default
+ * (`aft_move`/`aft_delete`) when its legacy keys generate disables: that
+ * default applies once, at user-base resolution. A project file's base block
+ * contributes only the names its own legacy keys imply, so a legacy key in a
+ * repository can never re-disable tools the user enabled.
+ */
+export function translateConfigDocument(
+  map: JsonRecord,
+  phase: PolicyPhase,
+  tier: "user" | "project",
+): DocumentTranslation {
   const out: DocumentTranslation = {
     errors: [],
     warnings: [],
     legacyInput: false,
     retiredEnabledFalse: false,
   };
-  translateBlock(map, true, phase, "base", out);
+  translateBlock(map, tier === "user", phase, "base", out);
   if (isRecord(map.harnesses)) {
     for (const [name, block] of Object.entries(map.harnesses)) {
       if (isRecord(block)) translateBlock(block, false, phase, `harnesses.${name}`, out);

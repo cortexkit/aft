@@ -1,0 +1,21 @@
+{
+  "aft_search_registered": true,
+  "bash": {
+    "enabled": false
+  },
+  "disabled_tools": [
+    "bash_kill",
+    "bash_status",
+    "bash_watch",
+    "bash_write"
+  ],
+  "experimental_bash_background": false,
+  "experimental_bash_compress": false,
+  "experimental_bash_rewrite": false,
+  "indexes": {
+    "callgraph": true,
+    "semantic": true,
+    "trigram": true
+  },
+  "restrict_to_project_root": false
+}
