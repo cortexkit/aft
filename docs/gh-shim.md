@@ -34,6 +34,9 @@ on the verb alone.
 | `workflow run`, `run rerun` | ADMINISTRATION | v10 |
 | `release edit`, `release upload` | ADMINISTRATION | v13 |
 | `api` PUT and DELETE `/repos/*/*/branches/*/protection` | ADMINISTRATION | v13 |
+| **`issue edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
+| **`pr edit`, label flags only, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
+| **`label create`, under `GH_SHIM_BYPASS=operator`** | **ADMINISTRATION (operator label row)** | **v14** |
 | `release delete`, `release delete-asset`, and any `release` verb with a `--delete-*` flag | refused as destructive | — |
 
 Every row is declared for `macos` and `linux`: the schema requires a non-empty
@@ -81,3 +84,52 @@ dropping a flag would change what the caller asked for.
 Ownership is the route holder's check: the comment's author must be the calling
 seat's bot. PATCH on any other path — including `/repos/*/*/issues/*`, the issue
 itself — is not admitted by this row, and every other PATCH stays as v13 has it.
+
+## Operator label rows (v14)
+
+Maintainers running the shared design gate put `design-approved` on issues and
+`trivial` on pull requests, and create those labels where a repository lacks
+them. Labels are repository administration, not bot speech, so these rows run
+under the operator's own `gh` with `GH_SHIM_BYPASS=operator`, like `pr merge`.
+Each row is live only when the signed manifest declares its tuple at v14 or
+later: `issue edit` in the governed tier, `pr edit` and `label create` in the
+admin tier. Under the deployed v13 manifest none of them exists and the argv
+stays `gh_shim_unclassified`.
+
+Upstream `gh` runs the whole argv, so every argument outside a row refuses by
+name (exit 86, nothing sent, no audit line), even beside an admitted flag: a
+title, body or reviewer change riding along with a label would otherwise run
+under the operator's identity without being recorded. The refusal names the
+flag without echoing its value. The audit line is appended and synced before
+upstream `gh` is spawned, so an attempt that dies mid-call is still on record.
+
+### `issue edit` and `pr edit`, labels only
+
+Admitted, and nothing else: `--add-label` and `--remove-label` (`--flag value`
+or `--flag=value`, comma-separated labels, repeatable), `--repo`/`-R`, and
+exactly one positional — an issue number or `https://github.com/<o>/<r>/issues/<n>`
+URL for `issue edit`, a pull request number or
+`https://github.com/<o>/<r>/pull/<n>` URL for `pr edit`. At least one label flag
+is required. A branch name is not admitted for `pr edit`: the audit line records
+the number that changed. `pr edit` works on any pull request, not only the
+bot's own.
+
+Audit line: `{as_of_unix_secs, tuple, repository, issue_number, labels_added,
+labels_removed}` for `issue edit`, and the same with `pr_number` in place of
+`issue_number` for `pr edit`.
+
+Without the bypass `issue edit` stays on the governed own-issue route, and
+`pr edit` has no bot-speech route: it refuses as `gh_shim_unclassified`, as it
+did before v14.
+
+### `label create`
+
+Admitted, and nothing else (the flags `gh label create --help` lists): one
+positional, the label name; `--color`/`-c` and `--description`/`-d` with a value;
+`--force`/`-f`; `--repo`/`-R`. A second positional or any other flag refuses.
+
+Audit line: `{as_of_unix_secs, tuple: "label create", repository, label, color}`;
+`color` is `null` when none was given and upstream picks one.
+
+Without the bypass it refuses as `gh_shim_unclassified`. `label delete` and
+`label edit` stay undeclared.

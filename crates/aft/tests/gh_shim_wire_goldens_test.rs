@@ -588,9 +588,10 @@ async fn serve_connection(
 // ---------------------------------------------------------------------------
 
 /// The v12 manifest fixture plus the three v14 speech rows (`issue create`,
-/// own-issue `issue edit`, the own-comment PATCH), signed with the dev key and
-/// published as version 14, so one manifest admits every governed family
-/// exercised here (v1, v10 `--edit-last`, v12, v14).
+/// own-issue `issue edit`, the own-comment PATCH) and the two v14 admin-tier
+/// operator rows (label-only `pr edit`, `label create`), signed with the dev
+/// key and published as version 14, so one manifest admits every governed
+/// family exercised here (v1, v10 `--edit-last`, v12, v14).
 fn v14_manifest(now: u64) -> Value {
     let mut manifest: Value =
         serde_json::from_str(include_str!("fixtures/gh_shim/v12-manifest.json"))
@@ -632,6 +633,12 @@ fn v14_manifest(now: u64) -> Value {
             "platform": ["macos", "linux"],
             "rationale": "Own-comment edit: body-only speech; the holder verifies authorship"
         }));
+    for tuple in ["pr edit", "label create"] {
+        manifest["tiers"]["admin"]
+            .as_array_mut()
+            .expect("admin tier")
+            .push(json!({"tuple": tuple, "platform": ["macos", "linux"]}));
+    }
     manifest
 }
 

@@ -86,9 +86,9 @@ const V14_GOVERNED_TUPLES: &[&str] = &["issue create", "issue edit"];
 // governed own-issue route.
 const V14_OPERATOR_LABEL_TUPLES: &[&str] = &["issue edit"];
 // v14 extends the same operator row to two verbs that have no bot-speech route
-// at all, for the design gate every seat runs: maintainers put labels such as
-// `design-approved` on issues and `trivial` on pull requests, and create those
-// labels when a repository lacks them. The manifest declares them in the admin
+// at all. Maintainers gating design work put labels such as `design-approved`
+// on issues and `trivial` on pull requests, and create those labels when a
+// repository lacks them. The manifest declares them in the admin
 // tier, but each runs only in its row's narrow shape: a label-only `pr edit` on
 // any pull request, and a `label create` with a name, color, description and
 // `--force`. Without the bypass both refuse as undeclared, exactly as before
@@ -3990,8 +3990,9 @@ const OPERATOR_PR_LABEL_ROW_TEXT: &str = "under GH_SHIM_BYPASS=operator `gh pr e
 const OPERATOR_LABEL_CREATE_ROW_TEXT: &str = "under GH_SHIM_BYPASS=operator `gh label create` admits only one label name, --color/-c, --description/-d, --force/-f, and --repo/-R";
 
 /// Read the argv of the operator label row, refusing everything that is not
-/// part of it. `gh issue edit` and `gh pr edit` share this reader; `target`
-/// says which of the two the positional must name.
+/// part of it. `gh issue edit` and `gh pr edit` share this reader;
+/// `target_kind` says whether the positional must name an issue or a pull
+/// request.
 ///
 /// Accepted, and nothing else: `--add-label` and `--remove-label` as
 /// `--flag value` or `--flag=value` with comma-separated labels; exactly one
