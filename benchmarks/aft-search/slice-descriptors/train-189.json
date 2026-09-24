@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "feature-config-slice-b"
+  ],
+  "note": "Slice B touches ranking-fence files without changing ranking. semantic_search/mod.rs gains the per-lane status gate, lane labels and evicted-lane recovery: with both lanes ready, as in the benchmark, the same candidates are admitted and scored. search_index.rs gains a header-only disk-cache validity probe used for status reporting. No fusion, scoring, truncation or lane-selection code changed, so the rows should be byte-equal to the reference."
+}
