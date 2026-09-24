@@ -82,9 +82,13 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
     }
 
     if (!harness.onnxRuntime.systemPath && !harness.onnxRuntime.cachedPath) {
-      const ignoredCopy = harness.onnxRuntime.ignoredSystemPath
-        ? ` The Windows system copy at ${harness.onnxRuntime.ignoredSystemPath} was ignored because its version is unreadable.`
-        : "";
+      const ignoredPath = harness.onnxRuntime.ignoredSystemPath;
+      const ignoredReason = harness.onnxRuntime.ignoredSystemReason ?? "";
+      const ignoredCopy = !ignoredPath
+        ? ""
+        : ignoredReason.startsWith("version unreadable")
+          ? ` The Windows system copy at ${ignoredPath} was ignored because its version is unreadable.`
+          : ` The system copy at ${ignoredPath} was ignored (${ignoredReason}).`;
       candidates.push({
         harness,
         reason: `no compatible ONNX Runtime is installed.${ignoredCopy} AFT will download v1.24 into managed storage.`,

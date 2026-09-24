@@ -156,6 +156,7 @@ export {
   resolveNpm,
   terminateNpmProcessTree,
 } from "./npm-resolver.js";
+export { type OnnxRuntimeLoadProbe, probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 // --- ONNX runtime ---
 export {
   __test__ as __onnxTest__,

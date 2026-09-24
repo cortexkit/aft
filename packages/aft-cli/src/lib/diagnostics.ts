@@ -25,8 +25,8 @@ import {
   detectOrtVersion,
   findCachedOnnxRuntime,
   findIgnoredWindowsSystemOnnxRuntime,
-  findSystemOnnxRuntime,
   getManualInstallHint,
+  inspectSystemOnnxRuntime,
   isOrtVersionCompatible,
   REQUIRED_ORT_MAJOR,
   REQUIRED_ORT_MIN_MINOR,
@@ -193,8 +193,19 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       (aftConfigRead.value as Record<string, unknown> | null)?.experimental_semantic_search ===
         true);
 
-  const systemOrtDir = findSystemOnnxRuntime();
-  const ignoredSystemOrtDir = systemOrtDir ? null : findIgnoredWindowsSystemOnnxRuntime();
+  const systemInspection = inspectSystemOnnxRuntime();
+  const systemOrtDir = systemInspection.path;
+  const ignoredWindowsOrtDir = systemOrtDir ? null : findIgnoredWindowsSystemOnnxRuntime();
+  // An unloadable system runtime is reported even when another candidate or
+  // the managed runtime is used, so the broken copy stays visible.
+  const ignoredSystem =
+    systemInspection.ignored ??
+    (ignoredWindowsOrtDir
+      ? {
+          path: ignoredWindowsOrtDir,
+          reason: "version unreadable (Windows system copy) — ignored",
+        }
+      : null);
   const cachedOrtDir = findCachedOnnxRuntime(storage);
   const systemVersion = systemOrtDir ? detectOrtVersion(systemOrtDir) : null;
   const cachedVersion = cachedOrtDir ? detectOrtVersion(cachedOrtDir) : null;
@@ -226,10 +237,8 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       systemPath: systemOrtDir,
       systemVersion,
       systemCompatible: systemVersion ? isOrtVersionCompatible(systemVersion) : null,
-      ignoredSystemPath: ignoredSystemOrtDir,
-      ignoredSystemReason: ignoredSystemOrtDir
-        ? "version unreadable (Windows system copy) — ignored"
-        : null,
+      ignoredSystemPath: ignoredSystem?.path ?? null,
+      ignoredSystemReason: ignoredSystem?.reason ?? null,
       cachedPath: cachedOrtDir,
       cachedVersion,
       cachedCompatible: cachedVersion ? isOrtVersionCompatible(cachedVersion) : null,
@@ -445,7 +454,7 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
           severity: "medium",
           scope: h.displayName,
           message: h.onnxRuntime.ignoredSystemPath
-            ? `ONNX Runtime at ${h.onnxRuntime.ignoredSystemPath} has a ${h.onnxRuntime.ignoredSystemReason}; no compatible runtime was detected.`
+            ? `ONNX Runtime at ${h.onnxRuntime.ignoredSystemPath} was skipped (${h.onnxRuntime.ignoredSystemReason}); no compatible runtime was detected.`
             : "ONNX Runtime is required for semantic search but was not detected.",
           // Only send the user to a manual install where AFT has nothing to
           // download for them. On a platform AFT fetches the runtime for,

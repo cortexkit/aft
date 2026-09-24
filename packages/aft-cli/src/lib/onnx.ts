@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, join, resolve, win32 } from "node:path";
-import { isOrtAutoDownloadSupported } from "@cortexkit/aft-bridge";
+import { isOrtAutoDownloadSupported, probeOnnxRuntimeLoadable } from "@cortexkit/aft-bridge";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
 
@@ -99,11 +99,39 @@ export function findIgnoredWindowsSystemOnnxRuntime(): string | null {
   return null;
 }
 
-export function findSystemOnnxRuntime(): string | null {
-  const libName = getOnnxLibraryName();
-  const searchPaths: string[] = [];
+/** A system runtime the bridge resolver will skip, and why. */
+export interface IgnoredSystemOnnxRuntime {
+  path: string;
+  reason: string;
+}
 
-  if (process.platform === "darwin") {
+export interface SystemOnnxRuntimeInspection {
+  /** The system runtime the bridge resolver would use, if any. */
+  path: string | null;
+  /** The first candidate skipped because it cannot be loaded. */
+  ignored: IgnoredSystemOnnxRuntime | null;
+}
+
+export function findSystemOnnxRuntime(): string | null {
+  return inspectSystemOnnxRuntime().path;
+}
+
+/**
+ * Mirror of the bridge resolver's system search, including its loadability
+ * probe, so doctor reports the runtime AFT will really use. A library whose
+ * required dependencies are missing is reported as ignored with the reason
+ * instead of as a compatible system runtime.
+ */
+export function inspectSystemOnnxRuntime(
+  searchPathsOverride?: string[],
+): SystemOnnxRuntimeInspection {
+  const libName = getOnnxLibraryName();
+  const searchPaths: string[] = [...(searchPathsOverride ?? [])];
+  let ignored: IgnoredSystemOnnxRuntime | null = null;
+
+  if (searchPathsOverride) {
+    // Tests supply the exact candidate list.
+  } else if (process.platform === "darwin") {
     searchPaths.push("/opt/homebrew/lib", "/usr/local/lib");
   } else if (process.platform === "linux") {
     searchPaths.push(
@@ -158,6 +186,16 @@ export function findSystemOnnxRuntime(): string | null {
     seen.add(key);
     if (!directoryContainsLibrary(dir, libName)) continue;
 
+    // PE imports cannot be checked by reading the file; the bridge resolver
+    // does not probe Windows candidates either.
+    if (process.platform !== "win32") {
+      const probe = probeOnnxRuntimeLoadable(join(dir, libName));
+      if (!probe.loadable) {
+        ignored ??= { path: dir, reason: `unloadable: ${probe.reason} — ignored` };
+        continue;
+      }
+    }
+
     const version = detectOrtVersion(dir);
     if (!version) {
       // Windows ships an unversioned ONNX Runtime in System32 on some releases.
@@ -168,9 +206,9 @@ export function findSystemOnnxRuntime(): string | null {
       continue;
     }
     if (!isOrtVersionCompatible(version)) continue;
-    return dir;
+    return { path: dir, ignored };
   }
-  return unknownVersionPaths[0] ?? null;
+  return { path: unknownVersionPaths[0] ?? null, ignored };
 }
 export function findCachedOnnxRuntime(storageDir: string): string | null {
   const ortDir = join(storageDir, "onnxruntime", ONNX_RUNTIME_VERSION);
@@ -218,6 +256,14 @@ export function detectOrtVersion(libDir: string): string | null {
   // Match libonnxruntime.so.1.24.4, libonnxruntime.1.24.4.dylib,
   // onnxruntime.1.24.4.dll, symlink targets, and Windows NuGet parent dirs.
   const libName = getOnnxLibraryName();
+  // The file the bare name resolves to is what the loader opens, so its
+  // version wins over a stale versioned sibling left in the same directory.
+  try {
+    const resolved = parseOrtVersionFromPath(realpathSync(join(libDir, libName)));
+    if (resolved && resolved !== INVALID_ORT_VERSION) return resolved;
+  } catch {
+    // No bare library, or a dangling link; fall back to the directory scan.
+  }
   try {
     const entries = readdirSync(libDir);
     const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");

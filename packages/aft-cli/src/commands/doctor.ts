@@ -346,7 +346,8 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
         parts.push(
           `system: ${h.onnxRuntime.systemVersion ?? "unknown"}${h.onnxRuntime.systemCompatible === false ? " (incompatible)" : ""}`,
         );
-      } else if (h.onnxRuntime.ignoredSystemPath) {
+      }
+      if (h.onnxRuntime.ignoredSystemPath) {
         parts.push(
           `system: ${h.onnxRuntime.ignoredSystemReason} at ${h.onnxRuntime.ignoredSystemPath}`,
         );

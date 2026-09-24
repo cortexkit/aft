@@ -56,6 +56,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "n
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 import { withPathPrepended } from "./path-env.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 import { execTarExtractionSync } from "./tar-executable.js";
@@ -179,7 +180,24 @@ export function getManualInstallHint(): string {
  *   4. null (user needs manual install)
  */
 export async function ensureOnnxRuntime(storageDir: string): Promise<string | null> {
-  const info = getPlatformInfo();
+  return resolveOnnxRuntime(storageDir, {});
+}
+
+/**
+ * Test seams for {@link resolveOnnxRuntime}. Production passes none: the
+ * platform table, the standard system locations, and the real download.
+ */
+interface OnnxRuntimeResolutionSeams {
+  platformInfo?: OrtPlatformInfo | null;
+  systemSearchPaths?: string[];
+  download?: (info: OrtPlatformInfo, targetDir: string) => Promise<string | null>;
+}
+
+async function resolveOnnxRuntime(
+  storageDir: string,
+  seams: OnnxRuntimeResolutionSeams,
+): Promise<string | null> {
+  const info = seams.platformInfo !== undefined ? seams.platformInfo : getPlatformInfo();
 
   // 1. Cached location with TOFU.
   const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
@@ -227,7 +245,7 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
   }
 
   // 2. System locations.
-  const systemPath = findSystemOnnxRuntime(info?.libName);
+  const systemPath = findSystemOnnxRuntime(info?.libName, seams.systemSearchPaths);
   if (systemPath) {
     log(`ONNX Runtime found at system path: ${systemPath}`);
     return systemPath;
@@ -271,7 +289,7 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
 
   try {
     cleanupIncompleteTargetIfUnowned(ortVersionDir);
-    return await downloadOnnxRuntime(info, ortVersionDir);
+    return await (seams.download ?? downloadOnnxRuntime)(info, ortVersionDir);
   } finally {
     releaseLock(lockPath);
   }
@@ -417,6 +435,16 @@ function detectOnnxVersion(libDir: string, libName: string): string | null {
     // (libName with the platform suffix stripped) so both Linux's
     // `libonnxruntime.so.1.24.4` and macOS's `libonnxruntime.1.24.4.dylib`
     // are picked up.
+    // The file the bare name resolves to is the one the loader opens, so its
+    // version wins. A directory scan alone can report a stale sibling: a
+    // leftover `libonnxruntime.1.30.0.dylib` next to a link that points at a
+    // 1.28.0 keg reported 1.30.0 for a runtime that was really 1.28.0.
+    try {
+      const resolved = parseOnnxVersionFromPath(realpathSync(join(libDir, libName)));
+      if (resolved && resolved !== INVALID_ORT_VERSION) return resolved;
+    } catch {
+      // No bare library, or a dangling link; fall back to the directory scan.
+    }
     const barePrefix = libName.replace(/\.(so|dylib|dll)$/, "");
     const expectedPrefix = process.platform === "win32" ? barePrefix.toLowerCase() : barePrefix;
     for (const entry of entries) {
@@ -524,12 +552,14 @@ function resolveCachedOnnxRuntimeDir(ortVersionDir: string, libName: string): st
   return ortVersionDir;
 }
 
-function findSystemOnnxRuntime(libName?: string): string | null {
+function findSystemOnnxRuntime(libName?: string, searchPathsOverride?: string[]): string | null {
   if (!libName) return null;
 
-  const searchPaths: string[] = [];
+  const searchPaths: string[] = [...(searchPathsOverride ?? [])];
 
-  if (process.platform === "darwin") {
+  if (searchPathsOverride) {
+    // Tests supply the exact candidate list.
+  } else if (process.platform === "darwin") {
     // Homebrew locations
     searchPaths.push("/opt/homebrew/lib", "/usr/local/lib");
   } else if (process.platform === "linux") {
@@ -612,6 +642,21 @@ function findSystemOnnxRuntime(libName?: string): string | null {
     // also mine version-bearing parent directories and symlink targets. When a
     // version is unknown, keep it as a last-choice fallback rather than letting
     // it shadow a later candidate with a known compatible version.
+    // A compatible version number does not mean the library loads: a Homebrew
+    // runtime whose abseil dependency was upgraded away fails dlopen while its
+    // file name still reads 1.2x. Skip anything whose required dependencies
+    // are missing so AFT's own runtime is used instead. PE imports cannot be
+    // checked by reading the file, so Windows candidates are not probed.
+    if (process.platform !== "win32") {
+      const probe = probeOnnxRuntimeLoadable(libPath);
+      if (!probe.loadable) {
+        warn(
+          `Ignoring system ONNX Runtime at ${dir}: ${probe.reason}. Falling through to AFT-managed download.`,
+        );
+        continue;
+      }
+    }
+
     const version = detectOnnxVersion(dir, libName);
     if (!version) {
       // Windows ships an unversioned ONNX Runtime in System32 on some releases.
@@ -1204,6 +1249,7 @@ export const __test__ = {
   parseOnnxVersionFromPath,
   isOnnxVersionCompatible,
   findSystemOnnxRuntime,
+  resolveOnnxRuntime,
   acquireLock,
   releaseLock,
   REQUIRED_ORT_MAJOR,
