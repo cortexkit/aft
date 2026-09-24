@@ -617,6 +617,33 @@ impl BackupStore {
         self.repair_root_backups_if_needed();
         self.gc_stale_sessions(self.maintenance_ttl_hours);
         self.migrate_legacy_layout_if_needed();
+        self.tighten_permissions_if_needed();
+    }
+
+    /// Stores written before backups were owner-only may still hold 0644
+    /// copies of secret files; tighten them in bounded, resumable passes.
+    fn tighten_permissions_if_needed(&self) {
+        let Some(backups_dir) = self.backups_dir() else {
+            return;
+        };
+        #[cfg(unix)]
+        match tighten_store_permissions(&backups_dir, PERMISSION_TIGHTEN_BUDGET) {
+            Ok(Some(report)) => crate::slog_info!(
+                "tightened undo backup permissions under {}: examined={} tightened={} complete={}",
+                backups_dir.display(),
+                report.examined,
+                report.tightened,
+                report.complete
+            ),
+            Ok(None) => {}
+            Err(error) => crate::slog_warn!(
+                "failed to tighten undo backup permissions under {}: {}",
+                backups_dir.display(),
+                error
+            ),
+        }
+        #[cfg(not(unix))]
+        let _ = backups_dir;
     }
 
     #[cfg(test)]
@@ -4125,6 +4152,202 @@ fn fsync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Maximum directory entries one tightening pass examines. The pass runs inside
+/// per-process backup maintenance, so a very large store is tightened across
+/// several processes instead of stalling the first undo-capable operation.
+const PERMISSION_TIGHTEN_BUDGET: usize = 4096;
+/// Progress record for the tightening pass, kept next to (not inside) the
+/// `backups` directory so the store's own directory scans never see it.
+const PERMISSION_PROGRESS_FILE: &str = ".backups-permissions.json";
+const PERMISSION_PROGRESS_VERSION: u64 = 1;
+
+/// Outcome of one bounded permission-tightening pass over a backup store.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TightenReport {
+    /// Directory entries looked at during this pass.
+    examined: usize,
+    /// Files or directories whose mode this pass changed.
+    tightened: usize,
+    /// True once the whole store has been walked; later passes then do nothing.
+    complete: bool,
+}
+
+fn permission_progress_path(backups_dir: &Path) -> Option<PathBuf> {
+    backups_dir
+        .parent()
+        .map(|parent| parent.join(PERMISSION_PROGRESS_FILE))
+}
+
+/// Brings a backup store written by an older version (0644 files, 0755
+/// directories) to owner-only permissions: files 0600, directories 0700.
+///
+/// At most `budget` directory entries are examined per call; the budget is
+/// checked inside the walk loop, before each entry is consumed. Handled
+/// entries are recorded in a progress file (a finished directory collapses to
+/// one record), so the next call skips them and resumes where this one
+/// stopped. Once the whole
+/// store is done the progress file is marked complete and later calls return
+/// `Ok(None)` without walking. Symlinks are skipped and never followed.
+///
+/// Returns `Ok(None)` when there is nothing to do (no store yet, or already
+/// complete).
+#[cfg(unix)]
+fn tighten_store_permissions(
+    backups_dir: &Path,
+    budget: usize,
+) -> std::io::Result<Option<TightenReport>> {
+    let Some(progress_path) = permission_progress_path(backups_dir) else {
+        return Ok(None);
+    };
+    match std::fs::symlink_metadata(backups_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let mut done = std::collections::BTreeSet::new();
+    if let Ok(raw) = std::fs::read_to_string(&progress_path) {
+        // A malformed or foreign-version record just restarts the walk, which
+        // is safe: tightening is idempotent.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if value.get("version").and_then(|v| v.as_u64()) == Some(PERMISSION_PROGRESS_VERSION)
+            {
+                if value.get("complete").and_then(|v| v.as_bool()) == Some(true) {
+                    return Ok(None);
+                }
+                if let Some(entries) = value.get("done").and_then(|v| v.as_array()) {
+                    done.extend(entries.iter().filter_map(|v| v.as_str()).map(str::to_string));
+                }
+            }
+        }
+    }
+
+    let mut walk = TightenWalk {
+        budget,
+        report: TightenReport::default(),
+        done,
+    };
+    walk.tighten(backups_dir, PRIVATE_DIR_MODE);
+    let complete = walk.walk(backups_dir, "")?;
+    walk.report.complete = complete;
+
+    let record = if complete {
+        serde_json::json!({ "version": PERMISSION_PROGRESS_VERSION, "complete": true })
+    } else {
+        serde_json::json!({
+            "version": PERMISSION_PROGRESS_VERSION,
+            "complete": false,
+            "done": walk.done.iter().collect::<Vec<_>>(),
+        })
+    };
+    if let Some(parent) = progress_path.parent() {
+        write_temp_fsync_rename(
+            parent,
+            PERMISSION_PROGRESS_FILE,
+            record.to_string().as_bytes(),
+        )?;
+    }
+    Ok(Some(walk.report))
+}
+
+#[cfg(unix)]
+struct TightenWalk {
+    budget: usize,
+    report: TightenReport,
+    /// Store-relative paths (`/`-joined) already handled: finished directories,
+    /// plus individual entries inside directories that are only partly done.
+    done: std::collections::BTreeSet<String>,
+}
+
+#[cfg(unix)]
+impl TightenWalk {
+    /// Tightens every entry below `dir`. Returns `Ok(true)` when the whole
+    /// subtree was handled and `Ok(false)` when the budget ran out part way.
+    fn walk(&mut self, dir: &Path, rel: &str) -> std::io::Result<bool> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let name = entry.file_name();
+            let child_rel = if rel.is_empty() {
+                name.to_string_lossy().into_owned()
+            } else {
+                format!("{}/{}", rel, name.to_string_lossy())
+            };
+            // Entries handled by an earlier pass cost no budget, so a directory
+            // with more entries than the budget still finishes over several
+            // passes instead of re-examining the same prefix forever.
+            if self.done.contains(&child_rel) {
+                continue;
+            }
+            if self.report.examined >= self.budget {
+                return Ok(false);
+            }
+            self.report.examined += 1;
+            // `DirEntry::file_type` does not follow symlinks.
+            let Ok(file_type) = entry.file_type() else {
+                self.done.insert(child_rel);
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                self.tighten(&path, PRIVATE_DIR_MODE);
+                let finished = match self.walk(&path, &child_rel) {
+                    Ok(finished) => finished,
+                    // A subdirectory that vanished or cannot be listed must not
+                    // pin the whole pass; treat it as handled.
+                    Err(_) => true,
+                };
+                if !finished {
+                    return Ok(false);
+                }
+                // Collapse the finished children into their parent's record so
+                // the progress file stays small.
+                let prefix = format!("{}/", child_rel);
+                self.done.retain(|done| !done.starts_with(&prefix));
+                self.done.insert(child_rel);
+            } else {
+                // Symlinks (and anything else that is not a regular file) are
+                // left alone; only regular files are tightened.
+                if file_type.is_file() {
+                    self.tighten(&path, PRIVATE_FILE_MODE);
+                }
+                self.done.insert(child_rel);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Sets `mode` on `path` if it differs. The path is opened with
+    /// `O_NOFOLLOW` and changed through that handle, so a symlink swapped in
+    /// after the directory listing is refused instead of followed. Failures
+    /// (entry removed, unreadable) are skipped: this is best-effort repair.
+    fn tighten(&mut self, path: &Path, mode: u32) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o777 == mode {
+            return;
+        }
+        if file
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .is_ok()
+        {
+            self.report.tightened += 1;
+        }
+    }
+}
+
 fn prune_unreferenced_backup_files(
     dir: &Path,
     referenced: &HashSet<String>,
@@ -6179,6 +6402,118 @@ mod tests {
         assert_eq!(
             fs::metadata(&public).unwrap().permissions().mode() & 0o777,
             0o644
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tightening_pass_fixes_loose_store_in_bounded_resumable_passes() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let backups = storage.join("backups");
+        let loose_file = |path: &Path| {
+            fs::write(path, "x").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        let loose_dir = |path: &Path| {
+            fs::create_dir_all(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // A store as older versions left it: 0755 directories, 0644 files.
+        loose_dir(&backups);
+        for session in ["session-a", "session-b"] {
+            let session_dir = backups.join(session);
+            loose_dir(&session_dir);
+            loose_file(&session_dir.join("session.json"));
+            for path_hash in ["path-1", "path-2"] {
+                let path_dir = session_dir.join(path_hash);
+                loose_dir(&path_dir);
+                loose_file(&path_dir.join("meta.json"));
+                for n in 0..3 {
+                    loose_file(&path_dir.join(format!("bak_{}.bak", n)));
+                }
+            }
+        }
+        // Symlinks inside the store point outside it; their targets must keep
+        // their own permissions.
+        let outside_file = temp.path().join("outside.txt");
+        loose_file(&outside_file);
+        let outside_dir = temp.path().join("outside-dir");
+        loose_dir(&outside_dir);
+        loose_file(&outside_dir.join("inner.txt"));
+        std::os::unix::fs::symlink(&outside_file, backups.join("session-a").join("link"))
+            .unwrap();
+        std::os::unix::fs::symlink(&outside_dir, backups.join("session-b").join("dir-link"))
+            .unwrap();
+
+        let budget = 4;
+        let first = tighten_store_permissions(&backups, budget).unwrap().unwrap();
+        assert_eq!(first.examined, budget, "the pass must stop at the budget");
+        assert!(!first.complete, "one small pass cannot cover the store");
+        let loose_after_first = store_modes(&backups)
+            .into_iter()
+            .filter(|(_, mode, is_dir)| *mode != if *is_dir { 0o700 } else { 0o600 })
+            .filter(|(path, _, _)| !fs::symlink_metadata(path).unwrap().is_symlink())
+            .count();
+        assert!(loose_after_first > 0, "the budget must stop mid-walk");
+        assert!(permission_progress_path(&backups).unwrap().exists());
+
+        let mut passes = 1;
+        let mut total_tightened = first.tightened;
+        loop {
+            let report = tighten_store_permissions(&backups, budget).unwrap().unwrap();
+            assert!(report.examined <= budget);
+            total_tightened += report.tightened;
+            passes += 1;
+            if report.complete {
+                break;
+            }
+            // A restarting walk would re-examine the same prefix forever.
+            assert!(passes < 50, "tightening never resumed past its first entries");
+        }
+        assert!(passes > 2);
+        // 1 root + 2 sessions + 4 path dirs + 2 markers + 4 * (meta + 3 bak).
+        assert_eq!(total_tightened, 1 + 2 + 4 + 2 + 16);
+
+        for (path, mode, is_dir) in store_modes(&backups) {
+            if fs::symlink_metadata(&path).unwrap().is_symlink() {
+                continue;
+            }
+            let expected = if is_dir { 0o700 } else { 0o600 };
+            assert_eq!(mode, expected, "{} still loose", path.display());
+        }
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&outside_file), 0o644);
+        assert_eq!(mode_of(&outside_dir), 0o755);
+        assert_eq!(mode_of(&outside_dir.join("inner.txt")), 0o644);
+
+        // Once complete, later passes do nothing.
+        assert_eq!(tighten_store_permissions(&backups, budget).unwrap(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_maintenance_tightens_existing_loose_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let path_dir = storage.join("backups").join("session").join("path");
+        fs::create_dir_all(&path_dir).unwrap();
+        let content = path_dir.join("bak_1.bak");
+        fs::write(&content, "secret").unwrap();
+        fs::set_permissions(&content, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&path_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.clone(), 72);
+        store.run_process_maintenance_once();
+
+        assert_eq!(
+            fs::metadata(&content).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&path_dir).unwrap().permissions().mode() & 0o777,
+            0o700
         );
     }
 
