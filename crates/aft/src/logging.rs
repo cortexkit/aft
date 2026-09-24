@@ -793,9 +793,13 @@ impl Write for TeeWriter {
         // is durable too: in standalone mode the plugin relays it into its own
         // log file.
         let line = crate::log_redact::aft_redact_bytes(buf);
-        io::stderr().write_all(&line)?;
+        // The durable file copy goes first and does not depend on stderr: in
+        // subc mode stderr is a pipe the daemon reads, and once the daemon is
+        // shutting down that pipe can be closed. A failed stderr write used to
+        // return early here and drop the file copy too, which is how a module
+        // exit could leave no line explaining it.
         if let Some(tx) = self.file_tx.as_ref() {
-            match tx.try_send(LogMessage::Write(line.into_owned())) {
+            match tx.try_send(LogMessage::Write(line.to_vec())) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     PERF.file_lines_dropped.fetch_add(1, Ordering::Relaxed);
@@ -803,11 +807,13 @@ impl Write for TeeWriter {
                 Err(TrySendError::Disconnected(_)) => self.file_tx = None,
             }
         }
+        let _ = io::stderr().write_all(&line);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        io::stderr().flush()
+        let _ = io::stderr().flush();
+        Ok(())
     }
 }
 

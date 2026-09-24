@@ -4463,7 +4463,46 @@ where
     reader_task.abort();
     drop(writer_tx);
     let writer_result = finish_writer_task(writer_task).await;
-    loop_result.and_then(|exit| writer_result.map(|_| exit))
+    classify_connection_end(loop_result, writer_result, drain_progress.is_some())
+}
+
+/// Decides how the module loop ended once the connection is gone.
+///
+/// An I/O failure that only says the daemon closed the socket (see
+/// [`SubcError::is_connection_closed`]) is an end of the connection, not a
+/// module failure: it used to surface as "subc attach failed" and exit 1,
+/// which the supervisor records as a crash. After a `module.draining` notice
+/// the daemon is ending this module on purpose (a restart or its own
+/// shutdown), so however the connection then ends, the exit is the clean one.
+/// Without that notice a lost connection stays the connection-lost exit, so
+/// the supervisor still respawns the module.
+fn classify_connection_end(
+    loop_result: Result<ModuleLoopExit, SubcError>,
+    writer_result: Result<(), SubcError>,
+    drain_announced: bool,
+) -> Result<ModuleLoopExit, SubcError> {
+    let exit = match loop_result {
+        Err(error) if error.is_connection_closed() => {
+            log::warn!("subc attach: daemon connection closed under the module loop: {error}");
+            ModuleLoopExit::ConnectionLost
+        }
+        Err(error) => return Err(error),
+        Ok(exit) => exit,
+    };
+    match writer_result {
+        Ok(()) => {}
+        Err(error) if error.is_connection_closed() => {
+            log::info!("subc attach: final writes found the daemon connection closed: {error}");
+        }
+        Err(error) => return Err(error),
+    }
+    if exit == ModuleLoopExit::ConnectionLost && drain_announced {
+        log::info!(
+            "subc attach: daemon closed the connection after its module.draining notice; supervisor-initiated shutdown, exiting 0"
+        );
+        return Ok(ModuleLoopExit::Graceful);
+    }
+    Ok(exit)
 }
 
 fn spawn_stall_watchdog(
@@ -8127,6 +8166,60 @@ mod tests {
             module_loop_exit_result(ModuleLoopExit::SkipSearchFlush),
             Err(SubcError::ActorFatal)
         ));
+    }
+
+    fn broken_pipe() -> SubcError {
+        SubcError::FrameIo(subc_transport::FrameIoError::Io(io::Error::from(
+            io::ErrorKind::BrokenPipe,
+        )))
+    }
+
+    #[test]
+    fn connection_closed_after_a_drain_notice_is_a_clean_exit() {
+        // The daemon announced the drain, then closed the connection: however
+        // the close surfaced, the daemon ended this module on purpose.
+        for (loop_result, writer_result) in [
+            (Ok(ModuleLoopExit::ConnectionLost), Ok(())),
+            (Err(SubcError::WriterClosed), Ok(())),
+            (Err(broken_pipe()), Ok(())),
+            (Ok(ModuleLoopExit::ConnectionLost), Err(broken_pipe())),
+            (Ok(ModuleLoopExit::Graceful), Err(broken_pipe())),
+        ] {
+            assert_eq!(
+                classify_connection_end(loop_result, writer_result, true).ok(),
+                Some(ModuleLoopExit::Graceful)
+            );
+        }
+    }
+
+    #[test]
+    fn connection_closed_without_a_drain_notice_stays_a_lost_connection() {
+        for loop_result in [
+            Ok(ModuleLoopExit::ConnectionLost),
+            Err(SubcError::WriterClosed),
+            Err(broken_pipe()),
+        ] {
+            assert_eq!(
+                classify_connection_end(loop_result, Ok(()), false).ok(),
+                Some(ModuleLoopExit::ConnectionLost)
+            );
+        }
+        assert_eq!(
+            classify_connection_end(Ok(ModuleLoopExit::Graceful), Err(broken_pipe()), false).ok(),
+            Some(ModuleLoopExit::Graceful)
+        );
+    }
+
+    #[test]
+    fn real_failures_keep_their_error_even_after_a_drain_notice() {
+        assert!(matches!(
+            classify_connection_end(Err(SubcError::WriterBackpressureTimeout), Ok(()), true),
+            Err(SubcError::WriterBackpressureTimeout)
+        ));
+        assert_eq!(
+            classify_connection_end(Ok(ModuleLoopExit::SkipSearchFlush), Ok(()), true).ok(),
+            Some(ModuleLoopExit::SkipSearchFlush)
+        );
     }
 
     #[test]

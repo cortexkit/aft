@@ -237,6 +237,7 @@ fn main() {
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
             Ok(()) => {
+                aft::slog_info!("subc module stopped at the daemon's request; exiting 0");
                 aft::logging::flush_durable_log(DURABLE_LOG_EXIT_FLUSH);
                 aft::ort_lifecycle::quiesce_before_return(0);
                 return;

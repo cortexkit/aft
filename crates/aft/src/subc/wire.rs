@@ -934,6 +934,30 @@ impl fmt::Display for SubcError {
     }
 }
 
+impl SubcError {
+    /// True when this error only says the daemon connection is gone after
+    /// attach: the socket was closed or reset under a read or write, or the
+    /// writer task ended because its socket write failed. Such an error means
+    /// the connection ended, not that the module failed, and the exit code is
+    /// decided the way a clean end of the connection decides it.
+    pub(super) fn is_connection_closed(&self) -> bool {
+        match self {
+            Self::WriterClosed | Self::FrameIo(subc_transport::FrameIoError::UnexpectedEof { .. }) => {
+                true
+            }
+            Self::FrameIo(subc_transport::FrameIoError::Io(error)) => matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+}
+
 impl std::error::Error for SubcError {}
 
 #[cfg(test)]

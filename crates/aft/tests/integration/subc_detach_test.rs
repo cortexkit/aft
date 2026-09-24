@@ -171,6 +171,98 @@ fn subc_bare_eof_exits_nonzero_and_goodbye_exits_zero() {
     });
 }
 
+/// A supervisor restart or daemon shutdown sends `module.draining`, then the
+/// daemon closes the module's connection. That end is initiated by the
+/// supervisor, so the module must exit 0 and say so in its log; the supervisor
+/// reads any non-zero exit as a crash. A 2026-09-24 daemon shutdown recorded
+/// such an exit as `exit 1` with no log line explaining it. Both ways the
+/// daemon can drop the socket are driven: an orderly close (EOF) and an abort
+/// (reset) while a request is still held open. The bare-EOF test above is the
+/// control: without the drain notice the same close is still a lost
+/// connection (exit 3).
+#[test]
+fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
+    const DRAIN_CLOSE_LINE: &str = "daemon closed the connection after its module.draining notice; supervisor-initiated shutdown, exiting 0";
+    const EXIT_LINE: &str = "subc module stopped at the daemon's request; exiting 0";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let config_home = tempfile::tempdir().expect("config home tempdir");
+        let data_home = tempfile::tempdir().expect("data home tempdir");
+        let logs = tempfile::tempdir().expect("module stderr tempdir");
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+
+        for abort in [false, true] {
+            let label = if abort { "reset" } else { "close" };
+            let stderr_path = logs.path().join(format!("module-{label}.stderr"));
+            let mut module = ModuleProcess::spawn_with_stderr(
+                &conn_path,
+                config_home.path(),
+                data_home.path(),
+                Some(&stderr_path),
+            );
+            let mut stream = accept_module(&listener).await;
+            bind_route(&mut stream, project.path()).await;
+            if abort {
+                // A request still held when the daemon aborts the socket: the
+                // module is mid-answer when the connection goes.
+                send_tool_call(
+                    &mut stream,
+                    ROUTE_CHANNEL,
+                    40,
+                    "bash",
+                    json!({
+                        "command": "sleep 5",
+                        "foreground_orchestrate": true,
+                        "wait": true,
+                        "timeout": 60_000,
+                        "compressed": false,
+                    }),
+                )
+                .await;
+            }
+            send_module_draining(&mut stream).await;
+            // Let the module act on the notice before the daemon drops it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if abort {
+                // Linger 0 makes the drop send a reset instead of a FIN. It
+                // cannot block here: there is nothing left to flush.
+                #[allow(deprecated)]
+                let linger = stream.set_linger(Some(Duration::ZERO));
+                linger.expect("set linger 0");
+            }
+            drop(stream);
+
+            let exit = module.wait_for_exit(&format!("module after drain and {label}"));
+            let log = std::fs::read_to_string(&stderr_path).expect("read module stderr");
+            assert_eq!(
+                exit.code(),
+                Some(0),
+                "a connection {label} after module.draining is a supervisor-initiated shutdown and must exit 0; status={exit}; log tail:\n{}",
+                log_tail(&log)
+            );
+            assert!(
+                log.contains(DRAIN_CLOSE_LINE) && log.contains(EXIT_LINE),
+                "the module log must say why it exited 0 after the drain ({label}); log tail:\n{}",
+                log_tail(&log)
+            );
+        }
+    });
+}
+
+fn log_tail(log: &str) -> String {
+    let lines = log.lines().collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(20)..].join("\n")
+}
+
 fn write_user_config(config_home: &Path, storage: &Path) {
     let config_dir = config_home.join("cortexkit");
     std::fs::create_dir_all(&config_dir).expect("create user config dir");
@@ -217,8 +309,23 @@ struct ModuleProcess {
 
 impl ModuleProcess {
     fn spawn(conn_path: &Path, config_home: &Path, data_home: &Path) -> Self {
+        Self::spawn_with_stderr(conn_path, config_home, data_home, None)
+    }
+
+    /// Spawns the module, sending its stderr (which carries every log line)
+    /// to `stderr_path` when given.
+    fn spawn_with_stderr(
+        conn_path: &Path,
+        config_home: &Path,
+        data_home: &Path,
+        stderr_path: Option<&Path>,
+    ) -> Self {
         use std::os::unix::process::CommandExt;
 
+        let stderr = match stderr_path {
+            Some(path) => Stdio::from(std::fs::File::create(path).expect("create module stderr file")),
+            None => Stdio::null(),
+        };
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_aft")));
@@ -233,7 +340,7 @@ impl ModuleProcess {
             .env_remove("SUBC_LAUNCH_NONCE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -450,6 +557,33 @@ async fn send_connection_goodbye(stream: &mut TcpStream) {
         stream,
         Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 99, Vec::new())
             .expect("goodbye frame"),
+    )
+    .await;
+}
+
+/// Sends the daemon's one-way `module.draining` notice (a channel-0 Push), the
+/// first step of a supervisor restart or a daemon shutdown.
+async fn send_module_draining(stream: &mut TcpStream) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock after epoch")
+        .as_millis() as u64;
+    let body = json!({
+        "op": "module.draining",
+        "reason": "restart",
+        "deadline_ms": now_ms + 30_000,
+    });
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Push,
+            control_flags(),
+            0,
+            0,
+            0,
+            serde_json::to_vec(&body).expect("module.draining body"),
+        )
+        .expect("module.draining frame"),
     )
     .await;
 }
