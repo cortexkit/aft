@@ -786,6 +786,7 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) paths_dispatched_total: u64,
     pub(crate) paths_dispatched_since_last_rescan: u64,
     pub(crate) overflows_total: u64,
+    pub(crate) watch_lost_races_total: u64,
     pub(crate) overflows_during_rescan: u64,
     pub(crate) last_overflow_prefixes: Vec<WatcherOverflowPrefix>,
     pub(crate) rescans_buffer_overflow_total: u64,
@@ -815,6 +816,7 @@ pub(crate) struct WatcherCounters {
     paths_dispatched_total: AtomicU64,
     paths_dispatched_since_last_rescan: AtomicU64,
     overflows_total: AtomicU64,
+    watch_lost_races_total: AtomicU64,
     overflows_during_rescan: AtomicU64,
     last_overflow_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
     observed_exclusion_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
@@ -864,6 +866,11 @@ impl WatcherCounters {
             .fetch_add(count, Ordering::Relaxed);
         self.paths_dispatched_since_last_rescan
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn note_watch_lost_race(&self) {
+        self.watch_lost_races_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_overflow(
@@ -1064,6 +1071,7 @@ impl WatcherCounters {
                 .paths_dispatched_since_last_rescan
                 .load(Ordering::Relaxed),
             overflows_total: self.overflows_total.load(Ordering::Relaxed),
+            watch_lost_races_total: self.watch_lost_races_total.load(Ordering::Relaxed),
             overflows_during_rescan: self.overflows_during_rescan.load(Ordering::Relaxed),
             last_overflow_prefixes: self
                 .last_overflow_prefixes

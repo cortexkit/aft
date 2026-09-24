@@ -5,8 +5,8 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use notify::event::CreateKind;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::event::{CreateKind, ModifyKind, RenameMode};
+use notify::{ErrorKind, Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
     derive_watcher_exclusion_plan, watcher_exclusion_paths, watcher_path_is_ignored_by_matcher,
@@ -29,6 +29,27 @@ impl ProjectWatcher {
         matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
+        Self::create_with_watch(
+            root,
+            extra_watch_paths,
+            tx,
+            matcher,
+            matcher_generation,
+            |watcher, path| watcher.watch(path, RecursiveMode::NonRecursive),
+        )
+    }
+
+    fn create_with_watch<F>(
+        root: PathBuf,
+        extra_watch_paths: Vec<PathBuf>,
+        tx: mpsc::Sender<notify::Result<Event>>,
+        matcher: SharedGitignore,
+        matcher_generation: Arc<AtomicU64>,
+        mut watch: F,
+    ) -> notify::Result<Self>
+    where
+        F: FnMut(&mut notify::RecommendedWatcher, &Path) -> notify::Result<()> + Send + 'static,
+    {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         // The watch set below describes the matcher at this generation. Capture
         // it here, not on the backend thread: a bump between spawn and the
@@ -49,12 +70,18 @@ impl ProjectWatcher {
             exclusion_paths.clone(),
             watcher_exclusion_paths(&plan.dropped),
         );
+        let mut installed = BTreeSet::new();
         for directory in &watched_directories {
-            watcher.watch(directory, RecursiveMode::NonRecursive)?;
+            if watch_directory(&mut watcher, directory, &mut watch, &counters)? {
+                installed.insert(directory.clone());
+            } else if directory == &root {
+                return Err(notify::Error::path_not_found().add_path(root));
+            }
         }
+        watched_directories = installed;
         for path in extra_watch_paths {
             if path.exists() {
-                watcher.watch(&path, RecursiveMode::NonRecursive)?;
+                let _ = watch_directory(&mut watcher, &path, &mut watch, &counters)?;
             }
         }
 
@@ -84,15 +111,23 @@ impl ProjectWatcher {
                         for directory in watched_directories.difference(&desired) {
                             let _ = watcher.unwatch(directory);
                         }
+                        let mut installed = watched_directories
+                            .intersection(&desired)
+                            .cloned()
+                            .collect::<BTreeSet<_>>();
                         for directory in desired.difference(&watched_directories) {
-                            if let Err(error) =
-                                watcher.watch(directory, RecursiveMode::NonRecursive)
-                            {
-                                let _ = tx.send(Err(error));
-                                return;
+                            match watch_directory(&mut watcher, directory, &mut watch, &counters) {
+                                Ok(true) => {
+                                    installed.insert(directory.clone());
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    let _ = tx.send(Err(error));
+                                    return;
+                                }
                             }
                         }
-                        watched_directories = desired;
+                        watched_directories = installed;
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = generation;
 
@@ -110,18 +145,33 @@ impl ProjectWatcher {
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
-                            if matches!(event.kind, EventKind::Create(CreateKind::Folder)) {
+                            // A move into the root is reported as Rename(To), not Create.
+                            // Scan its descendants too so their later writes are watched.
+                            if matches!(
+                                event.kind,
+                                EventKind::Create(CreateKind::Folder)
+                                    | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+                            ) {
                                 for path in &event.paths {
                                     for directory in
                                         collect_watch_directories(path, &matcher, &exclusion_paths)
                                     {
                                         if watched_directories.insert(directory.clone()) {
-                                            if let Err(error) = watcher
-                                                .watch(&directory, RecursiveMode::NonRecursive)
-                                            {
-                                                watched_directories.remove(&directory);
-                                                let _ = tx.send(Err(error));
-                                                return;
+                                            match watch_directory(
+                                                &mut watcher,
+                                                &directory,
+                                                &mut watch,
+                                                &counters,
+                                            ) {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    watched_directories.remove(&directory);
+                                                }
+                                                Err(error) => {
+                                                    watched_directories.remove(&directory);
+                                                    let _ = tx.send(Err(error));
+                                                    return;
+                                                }
                                             }
                                         }
                                     }
@@ -167,6 +217,39 @@ impl Drop for ProjectWatcher {
     }
 }
 
+// A removed directory cannot contain live files to invalidate. A move out
+// produces a rename event for its old path; a move into the root is scanned
+// on Rename(To), including any files already present in its subtree.
+fn watch_directory<F>(
+    watcher: &mut notify::RecommendedWatcher,
+    path: &Path,
+    watch: &mut F,
+    counters: &crate::context::WatcherCounters,
+) -> notify::Result<bool>
+where
+    F: FnMut(&mut notify::RecommendedWatcher, &Path) -> notify::Result<()>,
+{
+    match watch(watcher, path) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            // Limits and resource exhaustion are failures of the watcher, even
+            // if the directory happens to disappear before the recheck.
+            let fatal = matches!(error.kind, ErrorKind::MaxFilesWatch)
+                || matches!(&error.kind, ErrorKind::Io(io) if matches!(io.raw_os_error(), Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE)));
+            if !fatal
+                && (matches!(error.kind, ErrorKind::PathNotFound)
+                    || matches!(&error.kind, ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+                    || matches!(std::fs::metadata(path), Err(io) if io.kind() == std::io::ErrorKind::NotFound))
+            {
+                counters.note_watch_lost_race();
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn collect_watch_directories(
     root: &Path,
     matcher: &SharedGitignore,
@@ -208,6 +291,98 @@ mod tests {
     use ignore::gitignore::GitignoreBuilder;
 
     use super::*;
+
+    #[test]
+    fn vanished_directory_does_not_stop_root_watch() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let vanished = canonical_root.join("ephemeral");
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create_with_watch(
+            canonical_root.clone(),
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+            {
+                let vanished = vanished.clone();
+                move |watcher, path| {
+                    if path == vanished {
+                        std::fs::remove_dir(&vanished).unwrap();
+                    }
+                    watcher.watch(path, RecursiveMode::NonRecursive)
+                }
+            },
+        )
+        .unwrap();
+        std::fs::create_dir(&vanished).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while counters.snapshot().watch_lost_races_total == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(counters.snapshot().watch_lost_races_total, 1);
+        assert_eq!(watcher.watched_directory_count(), 1);
+
+        let later = canonical_root.join("later.txt");
+        std::fs::write(&later, "still watched").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("root event after vanished directory")
+                .expect("backend should remain available");
+            if event.paths.contains(&later) {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn watch_limit_error_remains_fatal() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create_with_watch(
+            canonical_root.clone(),
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+            move |watcher, path| {
+                if path.ends_with("limit") {
+                    return Err(notify::Error::io(std::io::Error::from_raw_os_error(
+                        libc::ENOSPC,
+                    )));
+                }
+                watcher.watch(path, RecursiveMode::NonRecursive)
+            },
+        )
+        .unwrap();
+        std::fs::create_dir(canonical_root.join("limit")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("fatal watcher error")
+            {
+                Err(error) => {
+                    assert!(
+                        matches!(error.kind, ErrorKind::Io(ref io) if io.raw_os_error() == Some(libc::ENOSPC))
+                    );
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+        assert_eq!(
+            crate::context::watcher_counters_for_root(&canonical_root)
+                .snapshot()
+                .watch_lost_races_total,
+            0
+        );
+        drop(watcher);
+    }
 
     #[test]
     fn inotify_walk_does_not_watch_ignored_subtrees() {
