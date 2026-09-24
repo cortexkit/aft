@@ -824,12 +824,18 @@ fn one_file_edit_resolves_through_untouched_reexport_chain_loading_only_that_cha
             "main.ts".to_string(),
             "import { foo } from \"./barrel\";\nexport function main() { foo(); }\n".to_string(),
         ),
-        ("barrel.ts".to_string(), "export * from \"./mid\";\n".to_string()),
+        (
+            "barrel.ts".to_string(),
+            "export * from \"./mid\";\n".to_string(),
+        ),
         (
             "mid.ts".to_string(),
             "export { foo } from \"./deep\";\n".to_string(),
         ),
-        ("deep.ts".to_string(), "export * from \"./impl\";\n".to_string()),
+        (
+            "deep.ts".to_string(),
+            "export * from \"./impl\";\n".to_string(),
+        ),
         (
             "impl.ts".to_string(),
             "export function foo() {}\n".to_string(),
@@ -876,10 +882,11 @@ fn one_file_edit_resolves_through_untouched_reexport_chain_loading_only_that_cha
     );
 }
 
-/// A Rust file registered through `mod` declarations in two stored files and
-/// calling into an inline module of one of them. Resolving it walks the module
-/// parents and searches inline modules across stored files, both of which
-/// consult every indexed file rather than one import.
+/// A Rust file placed with `#[path]`, so only the stored `mod` declaration in
+/// `lib.rs` (not its location) says which module it is, calling into an inline
+/// module of another stored file. Resolving `super::` walks module parents and
+/// the call's target is found by searching inline modules; both look across
+/// every indexed file rather than following one import.
 #[test]
 fn rust_edit_resolves_through_stored_module_parents_and_inline_modules() {
     let cold = assert_refresh_matches_cold(
@@ -889,20 +896,24 @@ fn rust_edit_resolves_through_stored_module_parents_and_inline_modules() {
                 "Cargo.toml",
                 "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
             ),
-            ("src/lib.rs", "pub mod net;\nmod app;\n"),
+            (
+                "src/lib.rs",
+                "#[path = \"impls/handler.rs\"]\npub mod handler;\npub mod net;\n",
+            ),
             (
                 "src/net/mod.rs",
-                "pub mod http;\npub mod wire {\n    pub fn ping() {}\n}\n",
+                "pub mod wire {\n    pub fn ping() {}\n}\n",
             ),
             (
-                "src/net/http.rs",
-                "pub fn get() {\n    super::wire::ping();\n}\n",
+                "src/impls/handler.rs",
+                "pub fn get() {\n    super::net::wire::ping();\n}\n",
             ),
-            ("src/app.rs", "pub fn run() {\n    crate::net::http::get();\n}\n"),
         ],
         &[&[(
-            "src/net/http.rs",
-            Some("pub fn get() {\n    super::wire::ping();\n    super::wire::ping();\n}\n"),
+            "src/impls/handler.rs",
+            Some(
+                "pub fn get() {\n    super::net::wire::ping();\n    super::net::wire::ping();\n}\n",
+            ),
         )]],
     );
     assert_eq!(

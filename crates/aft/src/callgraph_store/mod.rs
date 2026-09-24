@@ -2526,13 +2526,14 @@ impl RefreshFilesProfile {
 /// A refresh batch whose stored-index load reaches either limit is logged at
 /// info level; every other batch is logged at debug level only.
 ///
-/// A one-file edit loads the index of the edited file's re-export and module
-/// neighbours: tens to a few thousand rows and a few milliseconds. Loading
-/// every stored file of a mid-sized TypeScript monorepo (about 7,000 files)
-/// reads a few hundred thousand rows and takes seconds. 250 ms is well above
-/// the one-file case and below anything a user waiting on the refresh worker
-/// would notice as a stall; 50,000 rows flags a batch that reaches a large
-/// share of such a repository even when a fast disk keeps it under 250 ms.
+/// Measured on a 6,761-file TypeScript monorepo: loading every stored file
+/// index up front read 109,514 rows in 1.1-2.2 s per batch. Loading on demand,
+/// a comment-only save read 1,431 rows in 48 ms and a created file 750 rows in
+/// 156 ms, while an edit to a hub file read 24,335 rows (0.9 s) and a 51-file
+/// batch 31,453 rows (1.4-2.3 s). 250 ms sits above the ordinary one-file
+/// saves and below the batches whose index load is worth seeing. 50,000 rows,
+/// about half of that repository's whole index, flags a batch that reads a
+/// large share of the store even when a warm page cache keeps it under 250 ms.
 const INDEX_LOAD_INFO_ELAPSED: Duration = Duration::from_millis(250);
 const INDEX_LOAD_INFO_ROWS: usize = 50_000;
 
@@ -22658,5 +22659,26 @@ mod bounded_build_breaker_tests {
                 if suspension.domain == BuildDomain::CallgraphCold
                     && suspension.death_count == 3
         ));
+    }
+}
+
+#[cfg(test)]
+mod refresh_index_load_log_tests {
+    use super::*;
+
+    fn profile(index_load_ms: u64, rows: usize) -> RefreshFilesProfile {
+        RefreshFilesProfile {
+            index_load: Duration::from_millis(index_load_ms),
+            index_rows_read: rows,
+            ..RefreshFilesProfile::default()
+        }
+    }
+
+    #[test]
+    fn index_load_reaches_info_level_at_either_limit() {
+        assert!(!index_load_is_notable(&profile(0, 0)));
+        assert!(!index_load_is_notable(&profile(249, 49_999)));
+        assert!(index_load_is_notable(&profile(250, 0)));
+        assert!(index_load_is_notable(&profile(0, 50_000)));
     }
 }
