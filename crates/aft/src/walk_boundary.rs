@@ -64,6 +64,15 @@ impl DeviceBoundary {
 pub(crate) fn expand_glob_same_file_system(
     full_pattern: &str,
 ) -> Result<Vec<PathBuf>, glob::PatternError> {
+    expand_glob_with_visit(full_pattern, |_| {})
+}
+
+// The observer runs on walked entries before matching, so tests can verify
+// traversal depth independently of the paths returned by the glob.
+fn expand_glob_with_visit(
+    full_pattern: &str,
+    mut visit: impl FnMut(&Path),
+) -> Result<Vec<PathBuf>, glob::PatternError> {
     let normalized = full_pattern.replace('\\', "/");
     let Some(first_glob) = normalized.find(['*', '?', '[', '{']) else {
         return Ok(Vec::new());
@@ -77,6 +86,10 @@ pub(crate) fn expand_glob_same_file_system(
         None => (PathBuf::from("."), normalized.as_str()),
     };
     let relative = glob::Pattern::new(relative_pattern)?;
+    // Normalization above makes '/' the separator even for Windows input.
+    // A whole-component ** can match descendants at arbitrarily deep levels.
+    let components: Vec<_> = relative_pattern.split('/').collect();
+    let max_depth = (!components.contains(&"**")).then_some(components.len());
     let options = glob::MatchOptions {
         case_sensitive: !cfg!(windows),
         require_literal_separator: true,
@@ -87,6 +100,7 @@ pub(crate) fn expand_glob_same_file_system(
     // child ReadDir can panic in Drop after closedir reports ENXIO and abort AFT.
     Ok(ignore::WalkBuilder::new(&base)
         .same_file_system(true)
+        .max_depth(max_depth)
         .hidden(false)
         .parents(false)
         .git_ignore(false)
@@ -94,7 +108,11 @@ pub(crate) fn expand_glob_same_file_system(
         .git_exclude(false)
         .build()
         .filter_map(Result::ok)
-        .map(|entry| entry.into_path())
+        .map(|entry| {
+            let path = entry.into_path();
+            visit(&path);
+            path
+        })
         .filter(|path| {
             path.strip_prefix(&base)
                 .ok()
@@ -130,9 +148,81 @@ pub(crate) fn filesystem_device_id(_path: &Path) -> io::Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{same_filesystem_device, DeviceBoundary};
+    use super::{expand_glob_with_visit, same_filesystem_device, DeviceBoundary};
+
+    fn observed_glob(pattern: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let mut visited = Vec::new();
+        let mut matches = expand_glob_with_visit(pattern, |path| visited.push(path.to_path_buf()))
+            .expect("valid glob");
+        matches.sort();
+        (matches, visited)
+    }
+
+    #[test]
+    fn single_level_glob_does_not_visit_descendants() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("gh-alfonso-one");
+        let deep = selected.join("profile/deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir(root.path().join("other")).unwrap();
+
+        let (matches, visited) = observed_glob(&format!("{}/gh-alfonso-*", root.path().display()));
+        assert_eq!(matches, vec![selected.clone()]);
+        assert!(visited.contains(&selected));
+        assert!(
+            !visited.contains(&selected.join("profile")),
+            "walk entered a matched directory"
+        );
+        assert!(!visited.contains(&deep), "walk visited a deeper descendant");
+    }
+
+    #[test]
+    fn multi_level_glob_visits_only_matching_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("crates/alpha");
+        std::fs::create_dir_all(member.join("src/nested")).unwrap();
+        let manifest = member.join("Cargo.toml");
+        std::fs::write(&manifest, "").unwrap();
+        let deep = member.join("src/nested/lib.rs");
+        std::fs::write(&deep, "").unwrap();
+
+        let (matches, visited) = observed_glob(&format!(
+            "{}/crates/[ab]*/Cargo.toml",
+            root.path().display()
+        ));
+        assert_eq!(matches, vec![manifest.clone()]);
+        assert!(visited.contains(&manifest));
+        assert!(!visited.contains(&deep), "walk exceeded the pattern depth");
+        assert!(!visited.contains(&member.join("src/nested")));
+
+        // Backslash-separated input is normalized before counting components.
+        let windows_style = format!("{}\\crates\\[ab]*\\Cargo.toml", root.path().display())
+            .replace('/', "\\");
+        let (matches, visited) = observed_glob(&windows_style);
+        assert_eq!(matches, vec![manifest]);
+        assert!(!visited.contains(&deep), "backslash pattern exceeded its depth");
+    }
+
+    #[test]
+    fn recursive_glob_still_visits_and_matches_deep_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let member = root.path().join("crates/alpha");
+        let deep = member.join("src/nested/Cargo.toml");
+        std::fs::create_dir_all(deep.parent().unwrap()).unwrap();
+        let manifest = member.join("Cargo.toml");
+        std::fs::write(&manifest, "").unwrap();
+        std::fs::write(&deep, "").unwrap();
+
+        let (matches, visited) =
+            observed_glob(&format!("{}/crates/**/Cargo.toml", root.path().display()));
+        assert_eq!(matches, vec![manifest, deep.clone()]);
+        assert!(
+            visited.contains(&deep),
+            "recursive walk must reach deep entries"
+        );
+    }
 
     #[test]
     fn device_predicate_accepts_root_device_and_rejects_foreign_device() {
