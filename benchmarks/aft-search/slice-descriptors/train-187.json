@@ -1,13 +1,15 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "gh-shim-operator-label-rows",
-    "health-test-work-count"
+    "health-test-work-count",
+    "feature-config-slice-c",
+    "timing-test-fixes"
   ],
-  "note": "No ranking-fence file changed. The train adds the v14-gated gh-shim operator label rows for pr edit and label create, and replaces a wall-clock ratio in a health test with an assembly work count."
+  "note": "The only ranking-fence file touched is crates/aft/src/lib.rs, which gains module declarations for the setup plan, config fix and JSONC editor. No ranking, fusion, lane or truncation code changed, so the rows should be byte-equal to the reference. The train also adds the v14-gated gh-shim operator label rows, `aft setup --plan` and doctor --fix, and replaces three wall-clock test assertions with state checks."
 }
