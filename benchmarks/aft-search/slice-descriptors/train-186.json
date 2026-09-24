@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "feature-config-slice-a",
+    "sentinel-limiter-window"
+  ],
+  "note": "The ranking-fence edits are configuration plumbing only. semantic_search/mod.rs renames config.semantic_search to config.indexes.semantic in two test setups, lib.rs declares the new feature_config and ort_lifecycle modules, and the two plugin search tool files read the renamed index setting. No ranking, fusion, lane or truncation code changed, so the rows should be byte-equal to the reference."
+}
