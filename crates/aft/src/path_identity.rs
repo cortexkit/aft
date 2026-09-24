@@ -84,22 +84,19 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_root(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aft-path-identity-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create temp root");
-        dir
+    /// A fresh root directory, removed when the returned guard drops.
+    fn temp_root(label: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("aft-path-identity-{label}-"))
+            .tempdir()
+            .expect("create temp root");
+        let path = dir.path().to_path_buf();
+        (dir, path)
     }
 
     #[test]
     fn scope_key_is_stable_and_16_hex() {
-        let root = temp_root("stable");
+        let (_root_dir, root) = temp_root("stable");
         let a = project_scope_key(&root);
         let b = project_scope_key(&root);
         assert_eq!(a, b);
@@ -109,14 +106,14 @@ mod tests {
 
     #[test]
     fn scope_key_distinguishes_distinct_roots() {
-        let a = temp_root("root-a");
-        let b = temp_root("root-b");
+        let (_a_dir, a) = temp_root("root-a");
+        let (_b_dir, b) = temp_root("root-b");
         assert_ne!(project_scope_key(&a), project_scope_key(&b));
     }
 
     #[test]
     fn scope_key_canonicalizes_equivalent_spellings() {
-        let root = temp_root("spelling");
+        let (_root_dir, root) = temp_root("spelling");
         let nested = root.join("nested");
         fs::create_dir_all(&nested).expect("create nested");
         // `root/nested/..` and `root/.` both canonicalize to `root`.

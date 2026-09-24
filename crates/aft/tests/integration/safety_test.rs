@@ -25,9 +25,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
-/// Helper: create a temp directory with a unique name for this test.
+/// Helper: create a directory for this test inside its private scratch dir,
+/// which is removed when the test ends.
 fn temp_dir(test_name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir()
+    let dir = crate::helpers::thread_scratch_dir()
         .join("aft_safety_tests")
         .join(test_name)
         .join(format!("{}", std::process::id()));

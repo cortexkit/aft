@@ -149,9 +149,11 @@ fn collect_optional_notification(
     })
 }
 
-fn executable_protocol_server_script() -> PathBuf {
+/// Returns the server script with the directory that holds it; the caller keeps
+/// the directory alive until the manager that launches the server is dropped.
+fn executable_protocol_server_script() -> (tempfile::TempDir, PathBuf) {
     let temp_dir = tempdir().expect("tempdir for protocol server");
-    let dir = temp_dir.keep();
+    let dir = temp_dir.path().to_path_buf();
     let script = dir.join("protocol_lsp_server.py");
     fs::write(&script, PROTOCOL_SERVER).expect("write protocol server");
     #[cfg(windows)]
@@ -162,7 +164,7 @@ fn executable_protocol_server_script() -> PathBuf {
             "@echo off\r\npython --version >nul 2>nul\r\nif %ERRORLEVEL% NEQ 0 goto py_launcher\r\npython \"%~dp0protocol_lsp_server.py\"\r\nexit /b %ERRORLEVEL%\r\n:py_launcher\r\npy -3 \"%~dp0protocol_lsp_server.py\"\r\n",
         )
         .expect("write protocol server cmd wrapper");
-        wrapper
+        (temp_dir, wrapper)
     }
     #[cfg(not(windows))]
     {
@@ -174,7 +176,7 @@ fn executable_protocol_server_script() -> PathBuf {
             fs::set_permissions(&script, permissions).expect("chmod protocol server");
         }
         warm_executable(&script, &["--version"]);
-        script
+        (temp_dir, script)
     }
 }
 
@@ -684,8 +686,10 @@ fn static_watched_file_capability_allows_notification_without_dynamic_registrati
         ..Config::default()
     };
     let server_kind = ServerKind::Custom(Arc::from("protocol-static-watch"));
+    // Declared before the manager so the script outlives the server it runs.
+    let (_protocol_server_dir, protocol_server) = executable_protocol_server_script();
     let mut manager = LspManager::new();
-    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.override_binary(server_kind, protocol_server);
     manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "static-watch");
 
     let keys = manager.ensure_server_for_file(&source, &config);
@@ -741,8 +745,10 @@ fn watched_file_notifications_require_dynamic_registration_and_stop_after_unregi
         ..Config::default()
     };
     let server_kind = ServerKind::Custom(Arc::from("protocol-watch"));
+    // Declared before the manager so the script outlives the server it runs.
+    let (_protocol_server_dir, protocol_server) = executable_protocol_server_script();
     let mut manager = LspManager::new();
-    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.override_binary(server_kind, protocol_server);
     manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "watch");
 
     let keys = manager.ensure_server_for_file(&source, &config);
@@ -831,8 +837,10 @@ fn workspace_pull_timeout_sends_cancel_request() {
         ..Config::default()
     };
     let server_kind = ServerKind::Custom(Arc::from("protocol-workspace"));
+    // Declared before the manager so the script outlives the server it runs.
+    let (_protocol_server_dir, protocol_server) = executable_protocol_server_script();
     let mut manager = LspManager::new();
-    manager.override_binary(server_kind, executable_protocol_server_script());
+    manager.override_binary(server_kind, protocol_server);
     manager.set_extra_env("AFT_PROTOCOL_LSP_MODE", "workspace-timeout");
 
     let keys = manager.ensure_server_for_file(&source, &config);

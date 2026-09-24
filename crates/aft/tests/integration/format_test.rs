@@ -158,10 +158,10 @@ fn install_rustfmt_edition_guard(dir: &std::path::Path, expected_edition: Option
     }
 }
 
-/// Create a temp directory scoped to format tests.
-/// Create a unique temp directory for each test invocation.
+/// Create a directory for one format test inside that test's private scratch
+/// dir, which is removed when the test ends.
 fn format_test_dir(test_name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir()
+    let dir = crate::helpers::thread_scratch_dir()
         .join("aft_format_tests")
         .join(test_name);
     fs::create_dir_all(&dir).unwrap();

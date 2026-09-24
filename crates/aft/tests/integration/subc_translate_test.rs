@@ -9,7 +9,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 
 use aft::subc_translate::{subc_translate_with_context, TranslateContext};
 use serde::Deserialize;
@@ -17,7 +16,6 @@ use serde_json::{json, Map, Value};
 
 use super::helpers::AftProcess;
 
-static PROJECT_FIXTURE: Once = Once::new();
 const PROJECT_ROOT_TOKEN: &str = "<PROJECT_ROOT>";
 
 #[derive(Debug, Deserialize)]
@@ -37,23 +35,31 @@ fn fixtures_root() -> PathBuf {
 }
 
 fn setup_project_fixture(root: &Path) {
-    PROJECT_FIXTURE.call_once(|| {
-        fs::create_dir_all(root.join("src")).expect("create src fixture dir");
-        fs::create_dir_all(root.join("docs")).expect("create docs fixture dir");
-        fs::create_dir_all(root.join("packages/app")).expect("create package fixture dir");
-        fs::write(root.join("README.md"), "# parity\n").expect("write README fixture");
-        fs::write(root.join("src/main.ts"), "const value = 1;\n").expect("write main fixture");
-        fs::write(root.join("docs/guide.md"), "# guide\n").expect("write docs fixture");
-        fs::write(
-            root.join("packages/app/index.tsx"),
-            "export const App = () => null;\n",
-        )
-        .expect("write app fixture");
-    });
+    if root.exists() {
+        return;
+    }
+    fs::create_dir_all(root.join("src")).expect("create src fixture dir");
+    fs::create_dir_all(root.join("docs")).expect("create docs fixture dir");
+    fs::create_dir_all(root.join("packages/app")).expect("create package fixture dir");
+    fs::write(root.join("README.md"), "# parity\n").expect("write README fixture");
+    fs::write(root.join("src/main.ts"), "const value = 1;\n").expect("write main fixture");
+    fs::write(root.join("docs/guide.md"), "# guide\n").expect("write docs fixture");
+    fs::write(
+        root.join("packages/app/index.tsx"),
+        "export const App = () => null;\n",
+    )
+    .expect("write app fixture");
 }
 
+/// The fixture project lives in this test's private scratch dir, so concurrent
+/// runs cannot share it and it is removed when the test ends. The goldens
+/// store it as a token, so its exact location does not matter.
 fn fixture_project_root() -> PathBuf {
-    std::env::temp_dir().join("aft-subc-parity").join("project")
+    let root = crate::helpers::thread_scratch_dir()
+        .join("aft-subc-parity")
+        .join("project");
+    setup_project_fixture(&root);
+    root
 }
 
 fn project_root_for_input(raw: &str) -> PathBuf {
@@ -135,7 +141,6 @@ fn assert_case(dir: &Path) -> Option<String> {
         serde_json::from_str(&fs::read_to_string(dir.join("input.json")).expect("read input.json"))
             .expect("parse input.json");
     let project_root = project_root_for_input(&input.project_root);
-    setup_project_fixture(&project_root);
 
     let ctx = TranslateContext {
         diagnostics_on_edit: input.diagnostics_on_edit.unwrap_or(false),

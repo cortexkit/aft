@@ -9112,7 +9112,10 @@ mod callgraph_store_for_ops_tests {
         callgraph_build_wait_ms(0)
     }
 
-    fn cold_build_context() -> Arc<AppContext> {
+    /// Returns the project and storage directories with the context that uses
+    /// them. Callers bind the directories for the whole test, first, so they
+    /// are removed when it ends and only after the context is dropped.
+    fn cold_build_context() -> ([TempDir; 2], Arc<AppContext>) {
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = project.path().join("src");
@@ -9123,15 +9126,16 @@ mod callgraph_store_for_ops_tests {
         )
         .expect("source file");
 
-        Arc::new(AppContext::new(
+        let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
-                project_root: Some(project.keep()),
-                storage_dir: Some(storage.keep()),
+                project_root: Some(project.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
                 callgraph_chunk_size: 1,
                 ..Config::default()
             },
-        ))
+        ));
+        ([project, storage], ctx)
     }
 
     fn with_fake_home_env<R>(home: &Path, f: impl FnOnce() -> R) -> R {
@@ -9349,7 +9353,7 @@ mod callgraph_store_for_ops_tests {
     fn non_home_root_still_allows_callgraph_cold_builds() {
         let _env_guard = force_async_callgraph_builds();
         reset_callgraph_cold_build_spawn_count_for_test();
-        let ctx = cold_build_context();
+        let (_ctx_dirs, ctx) = cold_build_context();
 
         assert!(ctx.heavy_root_work_allowed());
         assert!(matches!(
@@ -9377,7 +9381,7 @@ mod callgraph_store_for_ops_tests {
     fn semantic_ready_event_resumes_tier2_without_rescheduling_callgraph() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-        let ctx = cold_build_context();
+        let (_ctx_dirs, ctx) = cold_build_context();
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.semantic_index_rx().lock() = Some(rx);
         ctx.schedule_semantic_cold_seed_gate_for_configure();
@@ -9426,7 +9430,7 @@ mod callgraph_store_for_ops_tests {
     fn semantic_gate_cleared_event_resumes_tier2_without_rescheduling_callgraph() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-        let ctx = cold_build_context();
+        let (_ctx_dirs, ctx) = cold_build_context();
         ctx.schedule_semantic_cold_seed_gate_for_configure();
 
         assert!(matches!(
@@ -9468,7 +9472,7 @@ mod callgraph_store_for_ops_tests {
     fn semantic_cold_seed_gate_allows_callgraph_cold_spawn_immediately() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
-        let ctx = cold_build_context();
+        let (_ctx_dirs, ctx) = cold_build_context();
 
         ctx.set_semantic_cold_seed_active_for_test(true);
         assert!(matches!(
@@ -10557,7 +10561,7 @@ mod callgraph_store_for_ops_tests {
         let _env_guard = callgraph_build_wait_ms(30_000);
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
 
-        let denied_ctx = cold_build_context();
+        let (_denied_ctx_dirs, denied_ctx) = cold_build_context();
         let denied_reason = match denied_ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Error(CallGraphStoreError::Unavailable(reason)) => reason,
             CallgraphStoreAccess::Building => {
@@ -10582,7 +10586,7 @@ mod callgraph_store_for_ops_tests {
 
         // Control case: granting the artifact-access capability installed by
         // `configure_artifact_access` should change this cold build from denied to ready.
-        let writable_ctx = cold_build_context();
+        let (_writable_ctx_dirs, writable_ctx) = cold_build_context();
         let writable_root = writable_ctx
             .config()
             .project_root

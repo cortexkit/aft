@@ -8,14 +8,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext};
 use serde::Deserialize;
 use serde_json::Value;
 
-static PROJECT_FIXTURE: Once = Once::new();
 const PROJECT_ROOT_TOKEN: &str = "<PROJECT_ROOT>";
 const HOME_ROOT_TOKEN: &str = "<HOME>";
 
@@ -41,14 +39,22 @@ fn fixtures_root() -> PathBuf {
 }
 
 fn setup_project_fixture(root: &Path) {
-    PROJECT_FIXTURE.call_once(|| {
-        fs::create_dir_all(root.join("src")).expect("create src fixture dir");
-        fs::write(root.join("src/main.ts"), "const value = 1;\n").expect("write main fixture");
-    });
+    if root.exists() {
+        return;
+    }
+    fs::create_dir_all(root.join("src")).expect("create src fixture dir");
+    fs::write(root.join("src/main.ts"), "const value = 1;\n").expect("write main fixture");
 }
 
+/// The fixture project lives in this test's private scratch dir, so concurrent
+/// runs cannot share it and it is removed when the test ends. The goldens
+/// store it as a token, so its exact location does not matter.
 fn fixture_project_root() -> PathBuf {
-    std::env::temp_dir().join("aft-subc-parity").join("project")
+    let root = crate::helpers::thread_scratch_dir()
+        .join("aft-subc-parity")
+        .join("project");
+    setup_project_fixture(&root);
+    root
 }
 
 fn project_root_for_input(raw: &str) -> PathBuf {
@@ -122,7 +128,6 @@ fn assert_case(dir: &Path) -> Option<String> {
         serde_json::from_str(&fs::read_to_string(dir.join("input.json")).expect("read input.json"))
             .expect("parse input.json");
     let project_root = project_root_for_input(&input.ctx.project_root);
-    setup_project_fixture(&project_root);
 
     let native_response_json = expand_stable_path_tokens(input.native_response_json, &project_root);
     let agent_args = expand_stable_path_tokens(input.ctx.agent_args, &project_root);

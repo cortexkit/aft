@@ -6666,7 +6666,12 @@ export function bannerUnused() {}
         let sqlite_path = store.sqlite_path().to_path_buf();
         drop(store);
 
-        let still_existing_previous_root = root.with_file_name("previous-root-still-exists");
+        // A different root that still exists on disk. It lives in its own
+        // temp dir: a sibling of the project temp dir would outlive the test.
+        let previous_root_parent = tempfile::tempdir().expect("previous root parent");
+        let still_existing_previous_root = std::fs::canonicalize(previous_root_parent.path())
+            .expect("canonical previous root parent")
+            .join("previous-root-still-exists");
         std::fs::create_dir_all(&still_existing_previous_root).expect("create previous root");
         let conn = rusqlite::Connection::open(&sqlite_path).expect("open store sqlite");
         conn.execute(

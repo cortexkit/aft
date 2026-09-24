@@ -35,6 +35,23 @@ impl Drop for ReleaseOnDrop {
         let _ = std::fs::write(&self.0, b"release");
     }
 }
+
+thread_local! {
+    static THREAD_SCRATCH_DIR: tempfile::TempDir = tempfile::Builder::new()
+        .prefix("aft-test-scratch-")
+        .tempdir()
+        .expect("create per-test scratch dir");
+}
+
+/// A scratch directory private to the calling test's thread.
+///
+/// Use it instead of a fixed name under the OS temp dir: a fixed name is
+/// shared with concurrent runs from other checkouts and is never cleaned up.
+/// libtest runs each test on its own thread, so this directory is removed when
+/// the test finishes.
+pub fn thread_scratch_dir() -> PathBuf {
+    THREAD_SCRATCH_DIR.with(|dir| dir.path().to_path_buf())
+}
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     mpsc::{self, Receiver, RecvTimeoutError},
@@ -158,6 +175,30 @@ pub struct AftProcess {
     /// has semantic indexing switched off unless the request's own user config
     /// already decides it. See [`AftProcess::opt_into_semantic`].
     semantic_opt_in: bool,
+}
+
+/// A test that drops its handle without `shutdown()` (including one that
+/// panics) must not leave the child running: the per-process storage directory
+/// is removed right after this runs, and a child still shutting down would
+/// recreate it under the OS temp dir and leave it there. Close stdin so the
+/// child exits normally, give it the usual shutdown window, then kill it.
+/// Never panics, because this also runs while a failed test unwinds.
+impl Drop for AftProcess {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        drop(self.child.stdin.take());
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                _ => return,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl AftProcess {

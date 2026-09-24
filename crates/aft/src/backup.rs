@@ -4447,8 +4447,18 @@ mod tests {
         MIRROR_SQL_TRACE.lock().unwrap().push(sql.to_string());
     }
 
+    thread_local! {
+        // Each test gets its own directory, removed when the test's thread exits,
+        // instead of a fixed name under the OS temp dir that concurrent runs
+        // would share and nothing would clean up.
+        static TEMP_FILE_DIR: tempfile::TempDir = tempfile::Builder::new()
+            .prefix("aft_backup_tests-")
+            .tempdir()
+            .expect("create backup test dir");
+    }
+
     fn temp_file(name: &str, content: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("aft_backup_tests");
+        let dir = TEMP_FILE_DIR.with(|dir| dir.path().to_path_buf());
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(name);
         fs::write(&path, content).unwrap();

@@ -628,8 +628,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn breaker() -> BuildDeathBreaker {
-        BuildDeathBreaker::open(tempdir().unwrap().keep().join("breaker.sqlite")).unwrap()
+    /// A breaker over a fresh database; the returned directory guard holds the
+    /// database file and removes it when the test drops it.
+    fn breaker() -> (tempfile::TempDir, BuildDeathBreaker) {
+        let dir = tempdir().unwrap();
+        let breaker = BuildDeathBreaker::open(dir.path().join("breaker.sqlite")).unwrap();
+        (dir, breaker)
     }
 
     fn key(domain: BuildDomain) -> BreakerKey {
@@ -666,7 +670,7 @@ mod tests {
 
     #[test]
     fn three_zero_credit_deaths_trip_once_and_are_idempotent() {
-        let breaker = breaker();
+        let (_breaker_dir, breaker) = breaker();
         let key = key(BuildDomain::CallgraphCold);
         let mut final_attempt = None;
         for now in 1..=3 {
@@ -694,7 +698,7 @@ mod tests {
 
     #[test]
     fn one_batch_per_death_still_trips_after_six_credited_attempts() {
-        let breaker = breaker();
+        let (_breaker_dir, breaker) = breaker();
         let key = key(BuildDomain::CallgraphCold);
         for now in 1..=5 {
             let attempt = admitted(&breaker, &key, now);
@@ -718,7 +722,7 @@ mod tests {
 
     #[test]
     fn ttl_lifts_only_suspension_and_retains_death_history() {
-        let breaker = breaker();
+        let (_breaker_dir, breaker) = breaker();
         let key = key(BuildDomain::CallgraphCold);
         for now in 1..=3 {
             let attempt = admitted(&breaker, &key, now);
@@ -751,7 +755,7 @@ mod tests {
     #[test]
     fn root_and_domain_histories_are_isolated() {
         for tripped_domain in BuildDomain::ALL {
-            let breaker = breaker();
+            let (_breaker_dir, breaker) = breaker();
             let tripped = BreakerKey::new(
                 format!("root-{}", tripped_domain.as_str()),
                 tripped_domain,
@@ -805,7 +809,7 @@ mod tests {
 
     #[test]
     fn burn_limit_trips_without_counter_credit() {
-        let breaker = breaker();
+        let (_breaker_dir, breaker) = breaker();
         let key = key(BuildDomain::Tier2Scan);
         let suspension = breaker
             .record_durable_burn_at(&key, IN_BUILD_BURN_LIMIT_MS, 77)

@@ -9648,6 +9648,9 @@ mod tests {
         assert!(crate::bash_background::process::is_process_alive(pid));
         let _ = ctx.bash_background().kill(&task_id, "restored-session");
         wait_for_background_exit(pid);
+        // The test recreated the root after its TempDir was closed, so nothing
+        // else removes it.
+        let _ = std::fs::remove_dir_all(root.as_path());
     }
 
     #[test]

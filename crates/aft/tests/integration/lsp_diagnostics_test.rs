@@ -308,11 +308,13 @@ fn app_context_with_fake_typescript_lsp() -> AppContext {
     ctx
 }
 
-fn executable_crashing_lsp_script(stderr: &str) -> PathBuf {
+/// Returns the script with the directory that holds it; the caller keeps the
+/// directory alive for as long as the language server may be launched.
+fn executable_crashing_lsp_script(stderr: &str) -> (tempfile::TempDir, PathBuf) {
     let temp_dir = tempdir().expect("tempdir for crashing lsp");
     #[cfg(windows)]
     {
-        let script = temp_dir.keep().join("crashing_lsp.cmd");
+        let script = temp_dir.path().join("crashing_lsp.cmd");
         let mut source = String::from("@echo off\r\n");
         for line in stderr.lines() {
             if line.is_empty() {
@@ -323,11 +325,11 @@ fn executable_crashing_lsp_script(stderr: &str) -> PathBuf {
         }
         source.push_str("exit /b 1\r\n");
         fs::write(&script, source).expect("write crashing lsp cmd script");
-        script
+        (temp_dir, script)
     }
 
     #[cfg(not(windows))]
-    let script = temp_dir.keep().join("crashing_lsp.py");
+    let script = temp_dir.path().join("crashing_lsp.py");
     #[cfg(not(windows))]
     let source = format!(
         "#!/usr/bin/env python3
@@ -348,7 +350,7 @@ sys.stderr.flush()
     #[cfg(not(windows))]
     warm_executable(&script, &["--version"]);
     #[cfg(not(windows))]
-    script
+    (temp_dir, script)
 }
 
 #[test]
@@ -1232,7 +1234,7 @@ fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
     let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
     let file = &files[0];
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
-    let script = executable_crashing_lsp_script(
+    let (_script_dir, script) = executable_crashing_lsp_script(
         "Error: Cannot find module '/Users/me/.local/share/pnpm/global/5/.pnpm/typescript-language-server@4.3.4/node_modules/typescript-language-server/lib/cli.mjs'
 code: 'MODULE_NOT_FOUND'
 ",

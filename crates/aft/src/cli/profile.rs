@@ -2731,6 +2731,15 @@ mod tests {
                 .expect("system time after Unix epoch")
                 .as_nanos()
         ));
+        // dsymutil writes a bundle outside any TempDir; remove it however the
+        // test ends.
+        struct RemoveBundleOnDrop(std::path::PathBuf);
+        impl Drop for RemoveBundleOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _dsym_cleanup = RemoveBundleOnDrop(dsym.clone());
         let status = Command::new("dsymutil")
             .arg(&binary)
             .arg("-o")
