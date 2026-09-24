@@ -231,8 +231,7 @@ function translateBlock(
 
   if (phase === "rejecting") {
     for (const path of suppliedPaths) {
-      const replacement =
-        RETIRED_PATHS.find(([old]) => old === path)?.[1] ?? "disabled_tools";
+      const replacement = RETIRED_PATHS.find(([old]) => old === path)?.[1] ?? "disabled_tools";
       out.errors.push(removed(path, replacement));
     }
     if (gates.length > 0 && explicitList === undefined) {
@@ -408,14 +407,17 @@ export function validateResolvedConfig(value: unknown): string[] {
   else if (!isRecord(indexes)) errors.push("invalid_resolved_config:type:indexes");
   else {
     for (const leaf of ["callgraph", "semantic", "trigram"]) {
-      if (indexes[leaf] === undefined) errors.push(`invalid_resolved_config:missing:indexes.${leaf}`);
+      if (indexes[leaf] === undefined)
+        errors.push(`invalid_resolved_config:missing:indexes.${leaf}`);
       else if (typeof indexes[leaf] !== "boolean") {
         errors.push(`invalid_resolved_config:type:indexes.${leaf}`);
       }
     }
   }
   const path = (error: string) => error.slice(error.lastIndexOf(":") + 1);
-  return errors.sort((left, right) => (path(left) < path(right) ? -1 : path(left) > path(right) ? 1 : 0));
+  return errors.sort((left, right) =>
+    path(left) < path(right) ? -1 : path(left) > path(right) ? 1 : 0,
+  );
 }
 
 const ABSENT = { absent: true } as const;
@@ -429,7 +431,8 @@ function projectBlock(block: JsonRecord): JsonRecord {
     } else {
       const container = block[path.slice(0, dot)];
       const leaf = path.slice(dot + 1);
-      if (isRecord(container) && Object.hasOwn(container, leaf)) legacyPaths[path] = container[leaf];
+      if (isRecord(container) && Object.hasOwn(container, leaf))
+        legacyPaths[path] = container[leaf];
     }
   }
   const gates: JsonRecord = {};
@@ -446,7 +449,9 @@ function projectBlock(block: JsonRecord): JsonRecord {
   let aliases: string[] = [];
   let disabled: unknown = ABSENT;
   if (Array.isArray(block.disabled_tools)) {
-    const names = block.disabled_tools.filter((entry): entry is string => typeof entry === "string");
+    const names = block.disabled_tools.filter(
+      (entry): entry is string => typeof entry === "string",
+    );
     aliases = sortedUnique(names.filter((name) => LEGACY_TOOL_ALIASES[name] !== undefined));
     disabled = sortedUnique(names);
   } else if (Object.hasOwn(block, "disabled_tools")) {
@@ -461,7 +466,9 @@ function projectBlock(block: JsonRecord): JsonRecord {
   for (const [leaf, legacy, experimental] of INDEX_INPUTS) {
     const inputs: JsonRecord = {
       canonical:
-        isRecord(block.indexes) && Object.hasOwn(block.indexes, leaf) ? block.indexes[leaf] : ABSENT,
+        isRecord(block.indexes) && Object.hasOwn(block.indexes, leaf)
+          ? block.indexes[leaf]
+          : ABSENT,
       [legacy]: Object.hasOwn(block, legacy) ? block[legacy] : ABSENT,
     };
     if (experimental !== undefined) {
@@ -512,4 +519,103 @@ export function canonicalJson(value: unknown): string {
 /** SHA-256 hex digest of a canonical projection. */
 export function noticeDigest(projection: unknown): string {
   return createHash("sha256").update(canonicalJson(projection), "utf8").digest("hex");
+}
+
+/** Raw `indexes` block as it appears in one config tier. */
+export interface RawIndexesConfig {
+  trigram?: boolean;
+  semantic?: boolean;
+  callgraph?: boolean;
+}
+
+/** Resolved index switches (all default on). */
+export interface ResolvedIndexesConfig {
+  trigram: boolean;
+  semantic: boolean;
+  callgraph: boolean;
+}
+
+export const DEFAULT_INDEXES: ResolvedIndexesConfig = {
+  trigram: true,
+  semantic: true,
+  callgraph: true,
+};
+
+/** Whole-load rejection: the candidate config must not be used at all. */
+export class ConfigRejectedError extends Error {
+  readonly errors: string[];
+  constructor(errors: string[], source?: string) {
+    super(
+      `AFT configuration${source ? ` at ${source}` : ""} was rejected: ${errors.join(", ")}. ` +
+        "Run `npx @cortexkit/aft doctor --fix` to migrate removed keys.",
+    );
+    this.name = "ConfigRejectedError";
+    this.errors = errors;
+  }
+}
+
+/**
+ * Union two raw disabled lists while preserving presence: an explicit empty
+ * list on either side yields an explicit (possibly empty) sorted result.
+ */
+export function unionDisabledTools(
+  base: readonly string[] | undefined,
+  override: readonly string[] | undefined,
+): string[] | undefined {
+  if (override === undefined) return base === undefined ? undefined : [...base];
+  return sortedUnique([...(base ?? []), ...override]);
+}
+
+/**
+ * Merge index switches. Trusted overrides (user harness block) replace each
+ * supplied leaf; restricted overrides (project base or harness) can only turn
+ * a leaf off.
+ */
+export function mergeIndexes(
+  base: RawIndexesConfig | undefined,
+  override: RawIndexesConfig | undefined,
+  restricted: boolean,
+): RawIndexesConfig | undefined {
+  if (override === undefined) return base;
+  const merged: RawIndexesConfig = { ...base };
+  for (const leaf of ["trigram", "semantic", "callgraph"] as const) {
+    const value = override[leaf];
+    if (value === false) merged[leaf] = false;
+    else if (value === true && !restricted) merged[leaf] = true;
+  }
+  return merged;
+}
+
+/** Resolve raw index switches onto their defaults. */
+export function resolveIndexes(raw: RawIndexesConfig | undefined): ResolvedIndexesConfig {
+  return {
+    trigram: raw?.trigram ?? DEFAULT_INDEXES.trigram,
+    semantic: raw?.semantic ?? DEFAULT_INDEXES.semantic,
+    callgraph: raw?.callgraph ?? DEFAULT_INDEXES.callgraph,
+  };
+}
+
+/**
+ * Split a project disabled list into accepted names and ignored protected
+ * slots (aft_safety and the seven host tools).
+ */
+export function partitionProjectDisables(names: readonly string[] | undefined): {
+  accepted: string[] | undefined;
+  ignored: string[];
+} {
+  if (names === undefined) return { accepted: undefined, ignored: [] };
+  return {
+    accepted: names.filter((name) => !isProjectProtectedTool(name)),
+    ignored: sortedUnique(names.filter(isProjectProtectedTool)),
+  };
+}
+
+/** The resolved disabled list of a finalized config; absence is a bug, not []. */
+export function requireResolvedDisabledTools(config: {
+  disabled_tools?: readonly string[];
+}): readonly string[] {
+  if (config.disabled_tools === undefined) {
+    throw new ConfigRejectedError(["invalid_resolved_config:missing:disabled_tools"]);
+  }
+  return config.disabled_tools;
 }

@@ -3,19 +3,38 @@ import { homedir } from "node:os";
 import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:path";
 import {
   type AftConfigFileMigrationResult,
+  ConfigRejectedError,
   type ConfigTier,
+  DEFAULT_DISABLED_TOOLS,
+  deliverMigrationNoticeOnce,
+  mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
+  noticeDigest,
+  noticeProjection,
   PI_ONLY_KEYS,
+  type PolicyPhase,
+  partitionProjectDisables,
+  policyPhaseForVersion,
+  type ResolvedIndexesConfig,
   readConfigTiers,
   resolveCortexKitConfigPaths,
+  resolveIndexes,
   resolveLegacyAftConfigSources,
+  sortedUnique,
   stripHarnessSpecificConfigKeys,
   stripJsoncSymbols,
+  translateConfigDocument,
+  unionDisabledTools,
+  validateResolvedConfig,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
 import { z } from "zod";
 
 import { error, log, warn } from "./logger.js";
+
+export { ConfigRejectedError } from "@cortexkit/aft-bridge";
+
+import { resolvePluginVersion } from "./plugin-version.js";
 
 const ACTIVE_HARNESS = "opencode";
 
@@ -232,15 +251,15 @@ const ExperimentalConfigSchema = z.object({
 
 /**
  * Graduated `bash` config. Replaces `experimental.bash.*` in v0.27.2.
- * Default behavior:
- *   - tool_surface "recommended" or "all" → bash hoist on, all sub-features on
- *   - tool_surface "minimal" → bash hoist off (user explicitly wants minimal)
- * Three shapes:
- *   - `bash: true`     → identical to default (all on)
- *   - `bash: false`    → hoist disabled entirely; OpenCode native bash stays
+ * Registration of the `bash` tool is controlled only by `disabled_tools`;
+ * this block is the runtime configuration. Three shapes:
+ *   - `bash: true`     → runtime on, all sub-features on (the default)
+ *   - `bash: false`    → runtime gate off: bash operations report `bash_disabled`
  *   - `bash: { ... }`  → partial override; missing sub-keys default to true
  */
 const BashFeaturesSchema = z.object({
+  /** Runtime gate for every bash-execution operation. Default: true. */
+  enabled: z.boolean().optional(),
   rewrite: z.boolean().optional(),
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
@@ -335,8 +354,6 @@ const SubcConfigSchema = z.object({
 });
 
 const GhShimConfigSchema = z.object({
-  /** Deprecated alias for github.shim; removed in v0.57.0. */
-  enabled: z.boolean().optional(),
   /** User-tier AFT image used by the managed `gh` entry. Defaults to the running image. */
   binary_path: z
     .string()
@@ -346,19 +363,21 @@ const GhShimConfigSchema = z.object({
 });
 
 const GithubConfigSchema = z.object({
-  /** Master switch for every GitHub integration. Default: true. */
-  enabled: z.boolean().optional(),
   /** Interpose the governed `gh` shim in agent child PATHs. Default: true. */
   shim: z.boolean().optional(),
   /** Allow structured issue:// and pr:// reads. Default: false. */
   read: z.boolean().optional(),
-  /** Allow issue and pull-request comment writes. Default: false. */
+  /** Allow issue and pull-request comment writes (implies read). Default: false. */
   write: z.boolean().optional(),
 });
 
-const GhReadConfigSchema = z.object({
-  /** Deprecated alias for github.read; removed in v0.57.0. */
-  enabled: z.boolean().optional(),
+const IndexesConfigSchema = z.object({
+  /** Trigram index for indexed grep/glob and the lexical search lane. Default: true. */
+  trigram: z.boolean().optional(),
+  /** Semantic (embedding) index for the semantic search lane. Default: true. */
+  semantic: z.boolean().optional(),
+  /** Persisted call-graph store for callgraph queries and enrichment. Default: true. */
+  callgraph: z.boolean().optional(),
 });
 
 const GitCoAuthorSchema = z
@@ -477,13 +496,6 @@ const AftConfigFieldsSchema = z.object({
    * schema for autocomplete + validation. `aft setup` auto-inserts this.
    */
   $schema: z.string().optional(),
-  /**
-   * Master switch for AFT in this config scope. Default: true. Set false in
-   * user config to disable AFT everywhere, or in project config to disable it
-   * only for that project. Project config may set this field because turning
-   * AFT off is not a privilege escalation.
-   */
-  enabled: z.boolean().optional(),
   /** Select the edit/read surface. `hashline` exposes tagged reads and `{ patch }` edits. */
   edit_mode: z.enum(["default", "hashline"]).optional(),
   /**
@@ -516,24 +528,12 @@ const AftConfigFieldsSchema = z.object({
    */
   configure_warnings_delivery: ConfigureWarningsDeliveryEnum.optional(),
   /**
-   * Replace the host's native file and shell tools with AFT implementations.
-   * Default: true. When false, AFT registers its replacements under aft_
-   * names and leaves host-native tools available.
-   */
-  hoist_builtin_tools: z.boolean().optional(),
-  /**
-   * Tool surface level. Controls which tools are registered:
-   * - "minimal":     aft_outline, aft_zoom, aft_safety (no hoisting)
-   * - "recommended": minimal + hoisted read/write/edit/apply_patch
-   *                  + ast_grep_search/replace + aft_import (default)
-   * - "all":         recommended + aft_callgraph, aft_delete, aft_move
-   */
-  tool_surface: z.enum(["minimal", "recommended", "all"]).optional(),
-  /**
-   * List of tool names to disable. Disabled tools are not registered with
-   * OpenCode and will be invisible to agents. Use exact tool names, e.g.
-   * ["aft_callgraph", "aft_move"]. Hoisted names ("read", "edit") and
-   * aft-prefixed names both work. Applied after tool_surface filtering.
+   * Tool names that are not registered. Every other AFT tool is registered.
+   * When absent from the user config, defaults to ["aft_move", "aft_delete"];
+   * an explicit list (including []) replaces that default. Host tool names
+   * ("read", "grep", "bash", ...) leave the host's own tool in place. A
+   * project config may only add names and cannot disable aft_safety or a
+   * host tool slot.
    */
   disabled_tools: z.array(z.string()).optional(),
   /**
@@ -542,19 +542,15 @@ const AftConfigFieldsSchema = z.object({
    * Default: false (matches OpenCode's built-in behavior).
    */
   restrict_to_project_root: z.boolean().optional(),
-  /** Enable indexed search for grep and glob hoisting. Default: false. */
-  search_index: z.boolean().optional(),
+  /** Background indexes. Each defaults on; a project config can only turn one off. */
+  indexes: IndexesConfigSchema.optional(),
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
-  /** Enable semantic search. Default: false. */
-  semantic_search: z.boolean().optional(),
   /** Content-addressed index views. Disabled by default. */
   views: ViewsConfigSchema.optional(),
-  /** Enable the persisted callgraph store substrate. Default: true. */
-  callgraph_store: z.boolean().optional(),
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size: z.number().optional(),
-  /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
+  /** Codebase health inspection config. `inspect.enabled=false` makes aft_inspect report inspect_disabled. */
   inspect: InspectConfigSchema.optional(),
   /** Idle reclamation windows for unbound-root artifacts and language servers. User and project tiers. */
   idle: IdleConfigSchema.optional(),
@@ -568,14 +564,14 @@ const AftConfigFieldsSchema = z.object({
   /** Native first-party bash sandbox. Write allowances are user-only; a project may enable but never disable. */
   sandbox: SandboxConfigSchema.optional(),
   /**
-   * Bash tool family (hoist + rewrite + compress + background execution).
-   * Default on for `tool_surface: recommended`/`all`, off for `minimal`.
+   * Bash runtime configuration (runtime gate + rewrite + compress + background).
+   * Registration of `bash` and its companions is decided by `disabled_tools`.
    *
    * Accepts three shapes:
-   *   - `true`  — all sub-features on, hoist enabled
-   *   - `false` — hoist disabled entirely; OpenCode's native bash stays
-   *   - `{ rewrite?, compress?, background?, ... }` — partial override;
-   *     missing sub-keys default to `true`
+   *   - `true`  — runtime on, all sub-features on (the default)
+   *   - `false` — runtime gate off; bash operations report `bash_disabled`
+   *   - `{ enabled?, rewrite?, compress?, background?, ... }` — partial
+   *     override; missing sub-keys default to `true`
    *
    * Replaces `experimental.bash.*` (still accepted for backward compat).
    */
@@ -594,12 +590,10 @@ const AftConfigFieldsSchema = z.object({
   bridge: BridgeConfigSchema.optional(),
   /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
   subc: SubcConfigSchema.optional(),
-  /** User-only master and feature gates for GitHub integration. */
+  /** User-only GitHub capability gates. */
   github: GithubConfigSchema.optional(),
-  /** Legacy shim config. gh_shim.enabled aliases github.shim until v0.57.0; binary_path remains supported. */
+  /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
   gh_shim: GhShimConfigSchema.optional(),
-  /** Deprecated alias block for github.read; removed in v0.57.0. */
-  gh_read: GhReadConfigSchema.optional(),
   /** Agent-child Git attribution. Project config may override user config. */
   git: GitConfigSchema.optional(),
   /** Pi and OMP harness-specific configuration. */
@@ -623,32 +617,65 @@ export type AftConfig = z.infer<typeof AftConfigSchema>;
 export type GithubConfig = z.infer<typeof GithubConfigSchema>;
 
 export interface ResolvedGithubConfig {
-  enabled: boolean;
   shim: boolean;
   read: boolean;
   write: boolean;
 }
 
-/** Resolve master/feature precedence and the write-implies-read safety rule. */
+/** Resolve GitHub capability leaves and the write-implies-read safety rule. */
 export function resolveGithubConfig(config: AftConfig): ResolvedGithubConfig {
-  const enabled = config.github?.enabled !== false;
-  const write = enabled && config.github?.write === true;
+  const write = config.github?.write === true;
   return {
-    enabled,
-    shim: enabled && (config.github?.shim ?? config.gh_shim?.enabled ?? true),
-    read: enabled && ((config.github?.read ?? config.gh_read?.enabled ?? false) || write),
+    shim: config.github?.shim ?? true,
+    read: (config.github?.read ?? false) || write,
     write,
   };
 }
 
+/**
+ * Whether a tool is registered, for description wording only (for example,
+ * whether to mention `aft_zoom`). Registration itself goes through
+ * {@link resolvedDisabledTools}, which refuses a config without a resolved list.
+ */
 export function toolEnabled(config: AftConfig, toolName: string): boolean {
   return !(config.disabled_tools ?? []).includes(toolName);
 }
+
+/**
+ * The resolved disabled list. `loadAftConfig` always sets it; a config that
+ * reaches registration without it is rejected instead of treated as [].
+ */
+export function resolvedDisabledTools(config: AftConfig): readonly string[] {
+  if (config.disabled_tools === undefined) {
+    throw new ConfigRejectedError(["invalid_resolved_config:missing:disabled_tools"]);
+  }
+  return config.disabled_tools;
+}
+
+/** Resolved index switches (all default on). */
+export function resolvedIndexes(config: AftConfig): ResolvedIndexesConfig {
+  return resolveIndexes(config.indexes);
+}
+
 type AftConfigFields = z.infer<typeof AftConfigFieldsSchema>;
 
-function applyActiveHarnessOverride(config: AftConfig): AftConfig {
+/**
+ * Apply the active harness block. Disables only accumulate (a harness block
+ * can add names, never re-enable a base disable); a user harness block
+ * overrides index switches, a project harness block can only turn them off.
+ */
+function applyActiveHarnessOverride(config: AftConfig, trusted: boolean): AftConfig {
   const { harnesses: _harnesses, ...base } = config;
-  return { ...base, ...config.harnesses?.[ACTIVE_HARNESS] } as AftConfigFields;
+  const override = config.harnesses?.[ACTIVE_HARNESS];
+  if (override === undefined) return base as AftConfigFields;
+  const merged = { ...base, ...override } as AftConfigFields;
+  const disabled = unionDisabledTools(base.disabled_tools, override.disabled_tools);
+  if (disabled === undefined) delete merged.disabled_tools;
+  else merged.disabled_tools = disabled;
+  const indexes = mergeIndexes(base.indexes, override.indexes, !trusted);
+  if (indexes === undefined) delete merged.indexes;
+  else merged.indexes = indexes;
+  return merged;
 }
 
 /** Resolve the blocking diagnostics deadline for tools that wait on `aft_inspect`. */
@@ -760,10 +787,9 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
  * MUST NOT be re-derived per-bridge — they're identical across all bridges in
  * one OpenCode/Pi process.
  *
- * **DO NOT** put fields that affect plugin-side tool registration here.
- * `enabled`, `tool_surface`, and `hoist_builtin_tools` lock
- * at plugin init because OpenCode registers tools synchronously when the plugin
- * function returns. Per-bridge changes to those fields wouldn't take effect.
+ * Registration (`disabled_tools`) locks at plugin init because OpenCode
+ * registers tools synchronously when the plugin function returns; the list is
+ * still forwarded so the engine can answer registration questions.
  */
 export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
   const overrides: Record<string, unknown> = {};
@@ -771,7 +797,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // The Rust server also needs disabled_tools to decide which tools to omit from
   // rendered steering text. loadAftConfig has already merged the project and
   // session values, so forward the merged value unchanged.
-  if (config.disabled_tools !== undefined) overrides.disabled_tools = config.disabled_tools;
+  overrides.disabled_tools = resolvedDisabledTools(config);
 
   // Edit-pipeline behavior — overridable per-project.
   if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
@@ -786,12 +812,10 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   // OpenCode's built-in tools). Users opt in with `restrict_to_project_root: true`.
   overrides.restrict_to_project_root = config.restrict_to_project_root ?? false;
 
-  // Indexed search and semantic search — both are per-project opt-ins.
-  if (config.search_index !== undefined) overrides.search_index = config.search_index;
+  // Background index switches, always resolved (default on).
+  overrides.indexes = resolvedIndexes(config);
   if (config.index !== undefined) overrides.index = config.index;
-  if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
   if (config.views !== undefined) overrides.views = config.views;
-  if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
 
@@ -800,12 +824,14 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveExperimentalConfigForConfigure(config));
   if (
     typeof config.bash === "object" &&
-    (config.bash.host_fallback !== undefined ||
+    (config.bash.enabled !== undefined ||
+      config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
+      ...(config.bash.enabled !== undefined ? { enabled: config.bash.enabled } : {}),
       ...(config.bash.host_fallback !== undefined
         ? { host_fallback: config.bash.host_fallback }
         : {}),
@@ -828,21 +854,21 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
   if (config.github !== undefined) overrides.github = resolveGithubConfig(config);
+  if (config.bash === false) overrides.bash = { enabled: false };
   if (config.git !== undefined) overrides.git = config.git;
 
   return overrides;
 }
 
 /**
- * Resolved bash configuration after merging top-level `bash`, the
- * legacy `experimental.bash.*` fallback, and tool_surface defaults.
- * Everything downstream — hoist gating, configure-override emission,
- * workflow-hints — reads from this single shape.
+ * Resolved bash configuration after merging top-level `bash` and the
+ * legacy `experimental.bash.*` fallback. Everything downstream —
+ * configure-override emission, runtime gating, workflow-hints — reads from
+ * this single shape.
  *
- * `enabled` controls hoist registration ONLY; the three sub-features
- * (rewrite/compress/background) are independent feature flags within
- * an enabled bash surface. `enabled: false` forces all three off and
- * disables hoist; OpenCode's native bash stays in place.
+ * `enabled` is the runtime gate: when false, bash and its companions stay
+ * registered (registration is `disabled_tools` only) and report
+ * `bash_disabled`. `bash: false` also forces the three sub-features off.
  */
 export interface ResolvedBashConfig {
   enabled: boolean;
@@ -894,16 +920,15 @@ export function clampBashWatchSyncMaxMs(value: number | undefined): number {
  * Single source of truth for bash config across the plugin. Resolution
  * order (highest priority wins):
  *
- *   1. Top-level `bash: false` → fully disabled (sub-features all false)
+ *   1. Top-level `bash: false` → runtime off (sub-features all false)
  *   2. Top-level `bash: true`  → fully enabled (sub-features all true)
- *   3. Top-level `bash: { ... }` → enabled; each sub-feature defaults true
- *      when not specified
+ *   3. Top-level `bash: { ... }` → runtime gate from `enabled` (default
+ *      true); each sub-feature defaults true when not specified
  *   4. Top-level `bash` absent + any `experimental.bash.*` set → legacy
  *      fallback; sub-features take their explicit values (default false
- *      to preserve pre-v0.27.2 behavior — that block was opt-in)
- *   5. Top-level `bash` absent + no experimental → tool_surface default:
- *        - "minimal" → disabled
- *        - "recommended" or "all" → enabled with all sub-features on
+ *      to preserve pre-v0.27.2 behavior — that block was opt-in); the
+ *      runtime gate stays on
+ *   5. Top-level `bash` absent + no experimental → everything on
  *
  * The long_running_reminder_* tuning fields are passed through from
  * whichever surface specified them; they live alongside the feature
@@ -913,8 +938,6 @@ export function clampBashWatchSyncMaxMs(value: number | undefined): number {
 export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   const top = config.bash;
   const legacy = config.experimental?.bash;
-  const surface = config.tool_surface ?? "recommended";
-  const surfaceDefaultEnabled = surface !== "minimal";
 
   // Reminder tuning rides along from whichever surface set it — top-level
   // wins, legacy fills in the gap.
@@ -970,7 +993,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
   if (typeof top === "object" && top !== null) {
     return {
       ...base,
-      enabled: true,
+      enabled: top.enabled ?? true,
       rewrite: top.rewrite ?? true,
       compress: top.compress ?? true,
       background: top.background ?? true,
@@ -997,21 +1020,15 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     const background = legacy.background === true;
     return {
       ...base,
-      enabled: rewrite || compress || background,
+      enabled: true,
       rewrite,
       compress,
       background,
     };
   }
 
-  // No top-level, no legacy → fall back to surface default.
-  return {
-    ...base,
-    enabled: surfaceDefaultEnabled,
-    rewrite: surfaceDefaultEnabled,
-    compress: surfaceDefaultEnabled,
-    background: surfaceDefaultEnabled,
-  };
+  // No top-level, no legacy → everything on.
+  return { ...base, enabled: true, rewrite: true, compress: true, background: true };
 }
 
 export function resolveExperimentalConfigForConfigure(
@@ -1019,8 +1036,8 @@ export function resolveExperimentalConfigForConfigure(
 ): ConfigureExperimentalOverrides {
   const overrides: ConfigureExperimentalOverrides = {};
   // Bash sub-features always flow through `resolveBashConfig` now — that
-  // function handles the graduated top-level surface, the legacy
-  // experimental fallback, and the tool_surface default in one place. We
+  // function handles the graduated top-level surface and the legacy
+  // experimental fallback in one place. We
   // still emit the three flat `experimental_bash_*` wire keys because the
   // Rust configure protocol hasn't been renamed; renaming there too would
   // require a coordinated binary bump.
@@ -1050,9 +1067,10 @@ type MigrationTarget = {
   newPath: readonly string[];
 };
 
+// On-disk key relocations still applied on load. The retired index/surface
+// keys are NOT rewritten here: ordinary loading translates them in memory and
+// only `aft doctor --fix` rewrites files for them.
 const CONFIG_MIGRATIONS: readonly MigrationTarget[] = [
-  { oldKey: "experimental_search_index", newPath: ["search_index"] },
-  { oldKey: "experimental_semantic_search", newPath: ["semantic_search"] },
   { oldKey: "experimental_lsp_ty", newPath: ["experimental", "lsp_ty"] },
   { oldKey: "experimental_bash_rewrite", newPath: ["experimental", "bash", "rewrite"] },
   { oldKey: "experimental_bash_compress", newPath: ["experimental", "bash", "compress"] },
@@ -1118,52 +1136,12 @@ function setPath(root: Record<string, unknown>, path: readonly string[], value: 
   parent[path[path.length - 1]] = value;
 }
 
-function migrateGithubAliases(
-  rawConfig: Record<string, unknown>,
-  configPath: string,
-  logger?: Logger,
-): string[] {
-  const oldKeys: string[] = [];
-  const legacyShim = isConfigRecord(rawConfig.gh_shim) ? rawConfig.gh_shim : undefined;
-  if (legacyShim && typeof legacyShim.enabled === "boolean") {
-    logger?.warn(
-      `Deprecated config key gh_shim.enabled at ${configPath}; use github.shim instead (removed in v0.57.0)`,
-    );
-    const githubPresent = Object.hasOwn(rawConfig, "github");
-    const github = isConfigRecord(rawConfig.github) ? rawConfig.github : undefined;
-    if (!githubPresent || (github && !Object.hasOwn(github, "shim"))) {
-      if (!github) rawConfig.github = {};
-      (rawConfig.github as Record<string, unknown>).shim = legacyShim.enabled;
-    }
-    delete legacyShim.enabled;
-    if (Object.keys(legacyShim).length === 0) delete rawConfig.gh_shim;
-    oldKeys.push("gh_shim.enabled");
-  }
-
-  const legacyRead = isConfigRecord(rawConfig.gh_read) ? rawConfig.gh_read : undefined;
-  if (legacyRead && typeof legacyRead.enabled === "boolean") {
-    logger?.warn(
-      `Deprecated config key gh_read.enabled at ${configPath}; use github.read instead (removed in v0.57.0)`,
-    );
-    const githubPresent = Object.hasOwn(rawConfig, "github");
-    const github = isConfigRecord(rawConfig.github) ? rawConfig.github : undefined;
-    if (!githubPresent || (github && !Object.hasOwn(github, "read"))) {
-      if (!github) rawConfig.github = {};
-      (rawConfig.github as Record<string, unknown>).read = legacyRead.enabled;
-    }
-    delete rawConfig.gh_read;
-    oldKeys.push("gh_read.enabled");
-  }
-
-  return oldKeys;
-}
-
 function migrateRawConfig(
   rawConfig: Record<string, unknown>,
   configPath: string,
   logger?: Logger,
 ): string[] {
-  const oldKeys: string[] = migrateGithubAliases(rawConfig, configPath, logger);
+  const oldKeys: string[] = [];
   for (const migration of CONFIG_MIGRATIONS) {
     if (!Object.hasOwn(rawConfig, migration.oldKey)) continue;
 
@@ -1423,7 +1401,49 @@ function recordConfigParseFailure(configPath: string, errorMessage: string): voi
 // Load config from a single file path
 // ---------------------------------------------------------------------------
 
-function loadConfigFromPath(configPath: string): AftConfig | null {
+let policyVersionOverride: string | undefined;
+
+/** Test hook: evaluate the retired-key policy as if running this package version. */
+export function setFeatureConfigPolicyVersionForTests(version: string | undefined): void {
+  policyVersionOverride = version;
+}
+
+let packageVersion: string | undefined;
+
+function currentPolicyPhase(): PolicyPhase {
+  packageVersion ??= resolvePluginVersion(import.meta.url);
+  return policyPhaseForVersion(policyVersionOverride ?? packageVersion);
+}
+
+/** One migration notice awaiting delivery by the plugin. */
+export interface ConfigLoadNotice {
+  configPath: string;
+  digest: string;
+  message: string;
+}
+
+let configLoadNotices: ConfigLoadNotice[] = [];
+
+/** Migration notices from the most recent {@link loadAftConfig} call. */
+export function getConfigLoadNotices(): readonly ConfigLoadNotice[] {
+  return configLoadNotices;
+}
+
+/**
+ * Deliver the notices of the last load through `deliver`, once per notice
+ * identity across restarts (see `deliverMigrationNoticeOnce`).
+ */
+export function deliverConfigLoadNotices(
+  deliver: (message: string) => void,
+  notices: readonly ConfigLoadNotice[] = configLoadNotices,
+): void {
+  for (const notice of notices) {
+    deliverMigrationNoticeOnce({ ...notice, deliver });
+  }
+}
+
+function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftConfig | null {
+  let cleanConfig: Record<string, unknown>;
   try {
     if (!existsSync(configPath)) {
       return null;
@@ -1437,26 +1457,50 @@ function loadConfigFromPath(configPath: string): AftConfig | null {
     // symbols and would silently drop the whole config to defaults (issue #88).
     // Validate against a symbol-free deep copy; the migration disk-write path
     // above still uses the symbol-bearing object so comments survive.
-    const cleanConfig = stripJsoncSymbols(rawConfig);
-    warnIgnoredNestedHarnesses(cleanConfig, configPath);
-    const result = AftConfigSchema.safeParse(cleanConfig);
-
-    if (result.success) {
-      log(`Config loaded from ${configPath}`);
-      return applyActiveHarnessOverride(result.data);
-    }
-
-    const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
-    warn(`Config validation error in ${configPath}: ${errorMsg}`);
-
-    const partial = parseConfigPartially(cleanConfig);
-    return partial ? applyActiveHarnessOverride(partial) : null;
+    cleanConfig = stripJsoncSymbols(rawConfig);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     error(`Error loading config from ${configPath}: ${errorMsg}`);
     recordConfigParseFailure(configPath, errorMsg);
     return null;
   }
+
+  // Retired keys are translated (inside the migration window) or rejected on
+  // the raw document, before schema validation, so they never reach Zod.
+  const projection = noticeProjection(structuredClone(cleanConfig));
+  const translation = translateConfigDocument(cleanConfig, currentPolicyPhase());
+  if (translation.errors.length > 0) {
+    throw new ConfigRejectedError(translation.errors, configPath);
+  }
+  for (const warning of translation.warnings) {
+    warn(`Config ${configPath} [${warning.key}]: ${warning.message} (${warning.code})`);
+  }
+  if (translation.legacyInput) {
+    configLoadNotices.push({
+      configPath,
+      digest: noticeDigest(projection),
+      message: `AFT config ${configPath} uses retired keys (tool_surface, hoist_builtin_tools, enabled, search_index, semantic_search, callgraph_store, github.enabled or aft_-prefixed tool names). They are translated for this release and rejected from v0.59; run \`npx @cortexkit/aft doctor --fix\` to migrate.`,
+    });
+  }
+
+  warnIgnoredNestedHarnesses(cleanConfig, configPath);
+  const result = AftConfigSchema.safeParse(cleanConfig);
+  let parsed: AftConfig | null;
+  if (result.success) {
+    log(`Config loaded from ${configPath}`);
+    parsed = result.data;
+  } else {
+    const errorMsg = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ");
+    warn(`Config validation error in ${configPath}: ${errorMsg}`);
+    parsed = parseConfigPartially(cleanConfig);
+  }
+  if (!parsed) return null;
+  if (tier === "user" && parsed.disabled_tools === undefined) {
+    // The absent-base default applies once, to the user base, before the
+    // harness block and the project tier are merged.
+    parsed = { ...parsed, disabled_tools: [...DEFAULT_DISABLED_TOOLS] };
+  }
+  return applyActiveHarnessOverride(parsed, tier === "user");
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,19 +1722,12 @@ function getProjectLspStrippedKeys(lsp: AftConfig["lsp"]): string[] {
  * it at configure time. It cannot be set from any aft.jsonc file.)
  */
 const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
-  "enabled",
   "edit_mode",
-  "tool_surface",
-  "hoist_builtin_tools",
   "format_on_edit",
   "validate_on_edit",
   "configure_warnings_delivery",
-  // Experimental flags: project-settable so users can enable globally
-  // and toggle per-project (or vice versa). Project value overrides user value.
-  "search_index",
-  "semantic_search",
+  // "indexes" handled separately — a project can only switch an index off.
   "views",
-  "callgraph_store",
   "callgraph_chunk_size",
   "inspect",
   "idle",
@@ -1762,30 +1799,23 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.subc !== undefined) stripped.push("subc");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
-  if (override.gh_read !== undefined) stripped.push("gh_read");
-  if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");
+  for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
+    stripped.push(`disabled_tools.${tool}`);
+  }
   return stripped;
 }
 
 function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
-  // Union disabled_tools from both levels (user + project).
-  // disabled_tools governs WHICH AFT TOOLS the agent sees — a hostile repo
-  // disabling tools is a mild annoyance, not a security boundary, so the
-  // union is acceptable here.
-  const protectedTools = new Set([
-    "aft_safety",
-    "read",
-    "write",
-    "edit",
-    "apply_patch",
-    "grep",
-    "glob",
-    "bash",
-  ]);
-  const disabledTools = [
-    ...(base.disabled_tools ?? []),
-    ...(override.disabled_tools ?? []).filter((tool: string) => !protectedTools.has(tool)),
-  ];
+  // Union disabled_tools from both levels (user + project). A hostile repo
+  // disabling ordinary tools is a mild annoyance, but it may not remove
+  // aft_safety or a host tool slot (those are ignored and reported by
+  // getStrippedTopLevelKeys).
+  const disabledTools = unionDisabledTools(
+    base.disabled_tools,
+    partitionProjectDisables(override.disabled_tools).accepted,
+  );
+  // A project may switch an index off, never back on.
+  const indexes = mergeIndexes(base.indexes, override.indexes, true);
   const formatter = { ...base.formatter, ...override.formatter };
   const checker = { ...base.checker, ...override.checker };
   const semantic = mergeSemanticConfig(base.semantic, override.semantic);
@@ -1804,6 +1834,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   // shallow allowlist spread; otherwise project's `bash: { compress: false }`
   // would wipe out user's `bash: { rewrite: true }`.
   const safeOverride = pickProjectSafeFields(override);
+  delete safeOverride.indexes;
   delete safeOverride.bash;
   delete safeOverride.inspect;
   delete safeOverride.worktree;
@@ -1827,10 +1858,9 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     // override.semantic from leaking through any future spread above.
     semantic,
     ...(bridge !== undefined ? { bridge } : {}),
+    ...(indexes !== undefined ? { indexes } : {}),
     // Union — both levels contribute to the disabled set
-    ...(base.disabled_tools !== undefined || override.disabled_tools !== undefined
-      ? { disabled_tools: [...new Set(disabledTools)].sort() }
-      : {}),
+    ...(disabledTools !== undefined ? { disabled_tools: disabledTools } : {}),
   };
 }
 
@@ -1932,16 +1962,28 @@ export function buildConfigTierConfigureParams(
 // Public API: loadAftConfig
 // ---------------------------------------------------------------------------
 
+/**
+ * Load and resolve the user and project config for one project.
+ *
+ * The result always carries a sorted `disabled_tools` list (absent user base
+ * defaults to aft_move/aft_delete) and fully resolved `indexes`. Throws
+ * {@link ConfigRejectedError} when a retired key must be rejected; callers
+ * must then publish nothing (startup) or keep their last-good config (reload).
+ */
 export function loadAftConfig(projectDirectory: string): AftConfig {
   configLoadErrors = [];
+  configLoadNotices = [];
 
   const { userConfigPath, projectConfigPath } = resolveAftConfigPaths(projectDirectory);
 
-  // Load user config first (base)
-  let config: AftConfig = loadConfigFromPath(userConfigPath) ?? {};
+  // Load user config first (base). A missing or unreadable user file behaves
+  // like `{}`, which still receives the absent-base disabled default.
+  let config: AftConfig = loadConfigFromPath(userConfigPath, "user") ?? {
+    disabled_tools: [...DEFAULT_DISABLED_TOOLS],
+  };
 
   // Override with project config
-  const projectConfig = loadConfigFromPath(projectConfigPath);
+  const projectConfig = loadConfigFromPath(projectConfigPath, "project");
   if (projectConfig) {
     if (
       projectConfig.semantic?.backend !== undefined ||
@@ -1967,5 +2009,16 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
     config = mergeConfigs(config, projectConfig);
   }
 
-  return config;
+  const resolved: AftConfig = {
+    ...config,
+    disabled_tools: sortedUnique(config.disabled_tools ?? []),
+    indexes: resolveIndexes(config.indexes),
+  };
+  if (config.disabled_tools === undefined) {
+    // Unreachable by construction; reject rather than silently enable every tool.
+    throw new ConfigRejectedError(["invalid_resolved_config:missing:disabled_tools"]);
+  }
+  const invalid = validateResolvedConfig(resolved);
+  if (invalid.length > 0) throw new ConfigRejectedError(invalid);
+  return resolved;
 }

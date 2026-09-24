@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { access, mkdir, readFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { aftPrefixedTools, hoistedTools } from "../../tools/hoisted.js";
+import { hoistedTools } from "../../tools/hoisted.js";
 import type { PluginContext } from "../../types.js";
 import { noopAsk, toolResultText } from "../test-helpers";
 import {
@@ -226,9 +226,9 @@ maybeDescribe("e2e format_on_edit write tools", () => {
         },
       }),
     } as unknown as PluginContext["pool"];
-    const tools = aftPrefixedTools(createPluginContext(pool, h.path(".storage")));
+    const tools = hoistedTools(createPluginContext(pool, h.path(".storage")));
     const output = toolResultText(
-      await tools.aft_write.execute({ filePath, content }, createSdkContext(h.tempDir)),
+      await tools.write.execute({ filePath, content }, createSdkContext(h.tempDir)),
     );
     if (!data) throw new Error("write response was not captured");
     return { output, data };

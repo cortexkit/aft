@@ -7,7 +7,7 @@ import { astTools } from "../tools/ast.js";
 import { createBashKillTool, createBashStatusTool, createBashTool } from "../tools/bash.js";
 import { createBashWatchTool } from "../tools/bash_watch.js";
 import { conflictTools } from "../tools/conflicts.js";
-import { aftPrefixedTools, createReadTool, hoistedTools } from "../tools/hoisted.js";
+import { createReadTool, hoistedTools } from "../tools/hoisted.js";
 import { navigationTools } from "../tools/navigation.js";
 import { readingTools } from "../tools/reading.js";
 import { safetyTools } from "../tools/safety.js";
@@ -53,7 +53,7 @@ function makeStubCtx(): PluginContext {
         }) as unknown as ReturnType<BridgePool["getBridge"]>,
     } as unknown as BridgePool,
     client: { lsp: {}, find: {} } as PluginContext["client"],
-    config: { hoist_builtin_tools: true } as PluginContext["config"],
+    config: { disabled_tools: [] } as PluginContext["config"],
     storageDir: "/tmp/aft-schema-test",
   };
 }
@@ -68,7 +68,6 @@ function collectAllTools(ctx: PluginContext): Record<string, ToolDefinition> {
     bash_watch: createBashWatchTool(ctx),
     read: createReadTool(ctx),
     ...hoistedTools(ctx),
-    ...aftPrefixedTools(ctx),
     ...navigationTools(ctx),
     ...readingTools(ctx),
     ...safetyTools(ctx),
@@ -88,10 +87,7 @@ function expectRootObjectSchema(schema: unknown): void {
 describe("tool args MUST be JSON-Schema-convertible by host Zod", () => {
   const ctx = makeStubCtx();
   const allTools = collectAllTools(ctx);
-  const hoistedToolNames = new Set([
-    ...Object.keys(hoistedTools(ctx)),
-    ...Object.keys(aftPrefixedTools(ctx)),
-  ]);
+  const hoistedToolNames = new Set([...Object.keys(hoistedTools(ctx))]);
   const entries = Object.entries(allTools);
 
   test(`registers at least 10 tools (sanity)`, () => {

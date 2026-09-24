@@ -16,7 +16,7 @@ describe("resolveBashConfig (Pi)", () => {
   // ---- Top-level boolean shapes ----------------------------------------
 
   test("bash: true → fully enabled regardless of surface", () => {
-    const r = resolveBashConfig(cfg({ bash: true, tool_surface: "minimal" }));
+    const r = resolveBashConfig(cfg({ bash: true }));
     expect(r).toMatchObject({
       enabled: true,
       rewrite: true,
@@ -26,7 +26,7 @@ describe("resolveBashConfig (Pi)", () => {
   });
 
   test("bash: false → fully disabled regardless of surface", () => {
-    const r = resolveBashConfig(cfg({ bash: false, tool_surface: "all" }));
+    const r = resolveBashConfig(cfg({ bash: false }));
     expect(r).toMatchObject({
       enabled: false,
       rewrite: false,
@@ -94,32 +94,29 @@ describe("resolveBashConfig (Pi)", () => {
     });
   });
 
-  test("legacy experimental.bash with all explicit false → DISABLED (no surface promotion)", () => {
+  test("legacy experimental.bash with all explicit false keeps sub-features off but the runtime gate on", () => {
     const r = resolveBashConfig(
-      cfg({
-        tool_surface: "recommended",
-        experimental: { bash: { rewrite: false, compress: false, background: false } },
-      }),
+      cfg({ experimental: { bash: { rewrite: false, compress: false, background: false } } }),
     );
-    expect(r.enabled).toBe(false);
+    expect(r).toMatchObject({ enabled: true, rewrite: false, compress: false, background: false });
   });
 
-  test("empty legacy experimental.bash: {} → falls through to surface default", () => {
-    const r = resolveBashConfig(cfg({ tool_surface: "recommended", experimental: { bash: {} } }));
+  test("empty legacy experimental.bash: {} → falls through to the default", () => {
+    const r = resolveBashConfig(cfg({ experimental: { bash: {} } }));
     expect(r.enabled).toBe(true);
   });
 
-  // ---- Surface defaults ------------------------------------------------
+  // ---- Defaults and the runtime gate ------------------------------------
 
-  test("no top-level, no legacy, tool_surface=recommended → all on", () => {
-    const r = resolveBashConfig(cfg({ tool_surface: "recommended" }));
+  test("no top-level, no legacy → all on", () => {
+    const r = resolveBashConfig(cfg({}));
     expect(r.enabled).toBe(true);
     expect(r.rewrite).toBe(true);
   });
 
-  test("no top-level, no legacy, tool_surface=minimal → all off", () => {
-    const r = resolveBashConfig(cfg({ tool_surface: "minimal" }));
-    expect(r.enabled).toBe(false);
+  test("bash.enabled:false turns only the runtime gate off", () => {
+    const r = resolveBashConfig(cfg({ bash: { enabled: false } }));
+    expect(r).toMatchObject({ enabled: false, rewrite: true, compress: true, background: true });
   });
 
   test("detach_on_user_message defaults to true and supports opt-out", () => {

@@ -1,7 +1,7 @@
 /**
  * aft_search — unified code search.
- * Only registered when config.semantic_search is enabled AND
- * the ONNX runtime / configured backend is available.
+ * Registered unless `aft_search` is in disabled_tools; index readiness and
+ * backend availability are reported by the engine at call time.
  */
 
 import { homedir } from "node:os";

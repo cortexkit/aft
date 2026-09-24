@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { aftPrefixedTools, hoistedTools } from "../tools/hoisted.js";
+import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
 import { noopAsk } from "./test-helpers";
 
@@ -712,7 +712,7 @@ describe("Hoisted tool execute handlers", () => {
     const pool = {
       getBridge: () => ({ send: async () => ({ success: true }) }),
     } as unknown as BridgePool;
-    const prefixedTools = aftPrefixedTools(createPluginContext(pool));
+    const prefixedTools = hoistedTools(createPluginContext(pool));
 
     // Removed deliberately: agents never used it; diagnostics are the status
     // bar (passive) + aft_inspect (pull) + the lsp.diagnostics_on_edit config.
@@ -720,9 +720,9 @@ describe("Hoisted tool execute handlers", () => {
       tools.write,
       tools.edit,
       tools.apply_patch,
-      prefixedTools.aft_write,
-      prefixedTools.aft_edit,
-      prefixedTools.aft_apply_patch,
+      prefixedTools.write,
+      prefixedTools.edit,
+      prefixedTools.apply_patch,
     ]) {
       expect(toolDef.args.diagnostics).toBeUndefined();
       expect(toolDef.args.preview).toBeUndefined();
@@ -1253,7 +1253,7 @@ describe("Hoisted tool execute handlers", () => {
     });
   });
 
-  test('legacy aft_edit mode:"write" form is retired with a steering error', async () => {
+  test('legacy edit mode:"write" form is rejected before reaching the bridge', async () => {
     tmpDir = await makeTempDir();
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -1266,14 +1266,14 @@ describe("Hoisted tool execute handlers", () => {
         },
       }),
     } as unknown as BridgePool;
-    const tools = aftPrefixedTools(createPluginContext(pool));
+    const tools = hoistedTools(createPluginContext(pool));
 
     await expect(
-      tools.aft_edit.execute(
+      tools.edit.execute(
         { mode: "write", file: "legacy.ts", content: "export const x = 1;\n" },
         sdkCtx,
       ),
-    ).rejects.toThrow(/retired `mode`\/`file` edit form/);
+    ).rejects.toThrow(/retired `mode`\/`file` edit form|Unrecognized keys/);
   });
 
   test("edit forwards replaceAll to Rust for multiple occurrences", async () => {
@@ -1778,17 +1778,13 @@ Patch partially applied — 1 of 2 hunk(s) succeeded. Failed: broken.ts.`,
 });
 
 /**
- * Verify the bash hoisting gate. Hoisted bash replaces OpenCode's built-in
- * bash when the resolved bash config enables it. The primary `bash` tool can
- * be present without the background control surface: `bash.background: false`
- * means foreground commands block to completion and no `bash_status` /
- * `bash_kill` / `bash_write` / `bash_watch` tools are registered.
+ * Registration of `bash` and its companions never depends on the bash runtime
+ * configuration: `bash: false`, `bash.enabled: false` or `bash.background:
+ * false` change runtime behavior (the engine answers `bash_disabled`), while
+ * only `disabled_tools` removes a registration.
  */
-describe("Hoisted bash gating (post v0.27.2 graduation)", () => {
-  function toolsWithConfig(
-    cfg: Partial<PluginContext["config"]>,
-    prefixed = false,
-  ): Record<string, unknown> {
+describe("Hoisted bash registration is independent of runtime bash config", () => {
+  function toolsWithConfig(cfg: Partial<PluginContext["config"]>): Record<string, unknown> {
     const pool = { getBridge: () => ({ send: async () => ({}) }) } as unknown as BridgePool;
     const ctx: PluginContext = {
       pool,
@@ -1796,130 +1792,24 @@ describe("Hoisted bash gating (post v0.27.2 graduation)", () => {
       config: cfg as PluginContext["config"],
       storageDir: "/tmp/aft-test",
     };
-    return prefixed ? aftPrefixedTools(ctx) : hoistedTools(ctx);
+    return hoistedTools(ctx);
   }
 
-  function expectBackgroundControls(
-    tools: Record<string, unknown>,
-    expected: "present" | "absent",
-  ): void {
-    for (const name of ["bash_status", "bash_write", "bash_watch", "bash_kill"]) {
-      if (expected === "present") {
-        expect(tools[name]).toBeDefined();
-      } else {
-        expect(tools[name]).toBeUndefined();
+  for (const [label, cfg] of [
+    ["no bash config", {}],
+    ["bash: true", { bash: true }],
+    ["bash: false", { bash: false }],
+    ["bash.enabled: false", { bash: { enabled: false } }],
+    ["bash.background: false", { bash: { background: false } }],
+    ["legacy rewrite only", { experimental: { bash: { rewrite: true } } }],
+  ] as const) {
+    test(`${label} → bash and every companion registered`, () => {
+      const tools = toolsWithConfig(cfg as Partial<PluginContext["config"]>);
+      for (const name of ["bash", "bash_status", "bash_write", "bash_watch", "bash_kill"]) {
+        expect(tools[name], name).toBeDefined();
       }
-    }
-  }
-
-  // ---- Surface defaults (graduated behavior) ---------------------------
-
-  test("no bash config + tool_surface=recommended → full bash surface registered", () => {
-    const tools = toolsWithConfig({ tool_surface: "recommended" });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "present");
-    expect(tools.read).toBeDefined();
-    expect(tools.edit).toBeDefined();
-  });
-
-  test("no bash config + tool_surface=all → full bash surface registered", () => {
-    const tools = toolsWithConfig({ tool_surface: "all" });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "present");
-  });
-
-  test("no bash config + tool_surface=minimal → bash NOT registered", () => {
-    // Minimal surface opts out of everything not strictly core, including
-    // bash. Users on minimal need to opt back in with explicit `bash: true`.
-    const tools = toolsWithConfig({ tool_surface: "minimal" });
-    expect(tools.bash).toBeUndefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  // ---- Top-level bash shape --------------------------------------------
-
-  test("bash: true → full bash surface registered", () => {
-    const tools = toolsWithConfig({ tool_surface: "recommended", bash: true });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "present");
-  });
-
-  test("bash: false → no bash-family tools registered (hard opt-out)", () => {
-    const tools = toolsWithConfig({ tool_surface: "recommended", bash: false });
-    expect(tools.bash).toBeUndefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  test("bash: { rewrite: false } → object form defaults background on", () => {
-    const tools = toolsWithConfig({ tool_surface: "recommended", bash: { rewrite: false } });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "present");
-  });
-
-  test("bash: { background: false } → bash registered without background controls", () => {
-    const tools = toolsWithConfig({ tool_surface: "recommended", bash: { background: false } });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  // ---- Legacy experimental bash shape (backward compat) ----------------
-
-  test("legacy rewrite=true only → bash registered without background controls", () => {
-    const tools = toolsWithConfig({ experimental: { bash: { rewrite: true } } });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  test("legacy compress=true only → bash registered without background controls", () => {
-    const tools = toolsWithConfig({ experimental: { bash: { compress: true } } });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  test("legacy background=true → full bash surface registered", () => {
-    const tools = toolsWithConfig({ experimental: { bash: { background: true } } });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "present");
-  });
-
-  test("legacy all flags true → full bash surface registered", () => {
-    const tools = toolsWithConfig({
-      experimental: { bash: { rewrite: true, compress: true, background: true } },
+      expect(tools.read).toBeDefined();
+      expect(tools.edit).toBeDefined();
     });
-    expect(tools.bash).toBeDefined();
-    expectBackgroundControls(tools, "present");
-  });
-
-  test("legacy empty block + tool_surface=minimal → NOT registered", () => {
-    // Empty legacy block + minimal surface = no opt-in anywhere, no bash.
-    const tools = toolsWithConfig({ tool_surface: "minimal", experimental: { bash: {} } });
-    expect(tools.bash).toBeUndefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  // ---- Hoist-off mode --------------------------------------------------
-
-  test("hoist-off + legacy rewrite=true only → aft_bash without background controls", () => {
-    const tools = toolsWithConfig(
-      { hoist_builtin_tools: false, experimental: { bash: { rewrite: true } } },
-      true,
-    );
-    expect(tools.aft_bash).toBeDefined();
-    expect(tools.bash).toBeUndefined();
-    expectBackgroundControls(tools, "absent");
-  });
-
-  test("hoist-off + bash background enabled → aft_bash plus background controls", () => {
-    const tools = toolsWithConfig({ hoist_builtin_tools: false, bash: true }, true);
-    expect(tools.aft_bash).toBeDefined();
-    expect(tools.bash).toBeUndefined();
-    expectBackgroundControls(tools, "present");
-  });
-
-  test("hoist-off + bash: false → no bash-family tools registered", () => {
-    const tools = toolsWithConfig({ hoist_builtin_tools: false, bash: false }, true);
-    expect(tools.aft_bash).toBeUndefined();
-    expect(tools.bash).toBeUndefined();
-    expectBackgroundControls(tools, "absent");
-  });
+  }
 });

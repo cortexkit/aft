@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import {
+  DEFAULT_DISABLED_TOOLS,
+  sortedUnique,
+  translateConfigDocument,
+} from "@cortexkit/aft-bridge";
 import type {
   ExtensionAPI,
   ToolDefinition as PiToolDefinition,
@@ -65,7 +70,23 @@ const manifest = JSON.parse(
   ),
 ) as Manifest;
 
-const profileConfigs: Record<Profile["id"], Record<string, unknown>> = {
+/**
+ * Resolve a legacy profile through the same in-window translation the loaders
+ * use. The historical v0.49 registration sets must still come out of the
+ * translated disabled lists, which proves the frozen surface/hoist/gate
+ * mappings against the checked inventory.
+ */
+function resolvedProfile(raw: Record<string, unknown>): Record<string, unknown> {
+  const doc = structuredClone(raw);
+  const translation = translateConfigDocument(doc, "window");
+  if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
+  doc.disabled_tools = sortedUnique(
+    (doc.disabled_tools as string[] | undefined) ?? DEFAULT_DISABLED_TOOLS,
+  );
+  return doc;
+}
+
+const legacyProfileConfigs: Record<Profile["id"], Record<string, unknown>> = {
   "REG-V049-OC-MIN": { tool_surface: "minimal", backup: { enabled: true }, bash: false },
   "REG-V049-OC-REC": {
     tool_surface: "recommended",
@@ -99,6 +120,10 @@ const profileConfigs: Record<Profile["id"], Record<string, unknown>> = {
     semantic_search: true,
   },
 };
+
+const profileConfigs: Record<Profile["id"], Record<string, unknown>> = Object.fromEntries(
+  Object.entries(legacyProfileConfigs).map(([id, raw]) => [id, resolvedProfile(raw)]),
+);
 
 function stubContext(config: Record<string, unknown>): OpenCodeContext & PiContext {
   const pool = {
@@ -336,52 +361,46 @@ describe("v0.49 production registration profiles", () => {
     });
   }
 
-  test("Pi default and explicit hoisting preserve the existing registration bytes", () => {
-    const base = {
-      tool_surface: "all",
-      backup: { enabled: true },
-      bash: true,
-      search_index: true,
-      semantic_search: true,
+  test("index switches and runtime gates never change the registered set", () => {
+    // Descriptions may reflect runtime settings (for example, disabled
+    // backups); the set of registered names must not.
+    const base = { disabled_tools: [] };
+    const gated = {
+      disabled_tools: [],
+      indexes: { trigram: false, semantic: false, callgraph: false },
+      bash: { enabled: false, background: false },
+      inspect: { enabled: false },
+      backup: { enabled: false },
     };
-    const snapshot = (config: Record<string, unknown>) =>
-      JSON.stringify(
-        [...capturePiTools(config)].map(([name, definition]) => ({
-          name,
-          label: definition.label,
-          description: definition.description,
-          parameters: definition.parameters,
-        })),
-      );
-
-    expect(snapshot(base)).toBe(snapshot({ ...base, hoist_builtin_tools: true }));
+    expect(sorted(capturePiTools(gated).keys())).toEqual(sorted(capturePiTools(base).keys()));
+    expect(sorted(Object.keys(openCodeTools(gated)))).toEqual(
+      sorted(Object.keys(openCodeTools(base))),
+    );
   });
 
-  test("Pi prefixed mode preserves native slots and keeps AFT wire names bare", () => {
-    const tools = capturePiTools({
-      tool_surface: "recommended",
-      backup: { enabled: true },
-      bash: true,
-      search_index: true,
-      hoist_builtin_tools: false,
-    });
-    const names = new Set(tools.keys());
-
-    for (const name of [
-      "aft_read",
-      "aft_write",
-      "aft_edit",
-      "aft_grep",
-      "aft_bash",
-      "bash_status",
-      "bash_watch",
-      "bash_write",
-      "bash_kill",
+  test("legacy hoist_builtin_tools:false leaves host slots native and registers no prefixed names", () => {
+    const config = resolvedProfile({ hoist_builtin_tools: false });
+    for (const names of [
+      new Set(capturePiTools(config).keys()),
+      new Set(Object.keys(openCodeTools(config))),
     ]) {
-      expect(names.has(name), `${name} should register`).toBe(true);
-    }
-    for (const hostName of ["read", "write", "edit", "grep", "bash"]) {
-      expect(names.has(hostName), `${hostName} should remain host-native`).toBe(false);
+      for (const hostName of ["read", "write", "edit", "apply_patch", "grep", "glob", "bash"]) {
+        expect(names.has(hostName), `${hostName} should remain host-native`).toBe(false);
+      }
+      for (const prefixed of [
+        "aft_read",
+        "aft_write",
+        "aft_edit",
+        "aft_grep",
+        "aft_glob",
+        "aft_bash",
+      ]) {
+        expect(names.has(prefixed), `${prefixed} must not register`).toBe(false);
+      }
+      // Companions are independent registrations.
+      for (const companion of ["bash_status", "bash_watch", "bash_write", "bash_kill"]) {
+        expect(names.has(companion), `${companion} should register`).toBe(true);
+      }
     }
   });
 
@@ -491,8 +510,7 @@ describe("v0.49 canonical path and subc inventories", () => {
 describe("hashline edit schema selection", () => {
   test("both hosts expose exactly patch under the surviving edit slot", () => {
     const config = {
-      tool_surface: "recommended",
-      hoist_builtin_tools: true,
+      disabled_tools: [],
       edit_mode: "hashline",
     };
 
@@ -536,8 +554,6 @@ describe("hashline edit schema selection", () => {
     // serving its own untagged read while `edit` survives. Nothing in that
     // session can mint a tag, so the patch arm must not be offered.
     const config = {
-      tool_surface: "recommended",
-      hoist_builtin_tools: true,
       edit_mode: "hashline",
       disabled_tools: ["read"],
     } as const;
@@ -558,16 +574,12 @@ describe("hashline edit schema selection", () => {
 
     const registered = new Set(Object.keys(tools));
     expect(openCodeHashlineEditRegistered(config, registered)).toBe(false);
-    expect(openCodeHashlineDowngrade(config, registered)).toEqual({
-      code: "hashline_downgraded",
-      reason: "tagged_read_unavailable",
-    });
+    expect(openCodeHashlineDowngrade(config, registered)?.code).toBe("hashline_read_disabled");
   });
 
   test("the default hashline surface keeps both slots and stays on the patch arm", () => {
     const config = {
-      tool_surface: "recommended",
-      hoist_builtin_tools: true,
+      disabled_tools: [],
       edit_mode: "hashline",
     } as const;
 
@@ -584,18 +596,17 @@ describe("hashline edit schema selection", () => {
     expect(openCodeHashlineDowngrade(config, registered)).toBeNull();
   });
 
-  test("a hashline session missing only the edit slot keeps the original reason", () => {
+  test("a hashline session missing only the edit slot reports hashline_edit_disabled", () => {
     const config = {
-      tool_surface: "recommended",
-      hoist_builtin_tools: true,
       edit_mode: "hashline",
       disabled_tools: ["edit"],
     } as const;
     const registered = new Set(["read"]);
-    expect(openCodeHashlineDowngrade(config, registered)).toEqual({
-      code: "hashline_downgraded",
-      reason: "edit_not_registered",
-    });
+    expect(openCodeHashlineDowngrade(config, registered)?.code).toBe("hashline_edit_disabled");
+    // Read takes precedence when both are disabled.
+    expect(
+      openCodeHashlineDowngrade({ ...config, disabled_tools: ["edit", "read"] }, new Set())?.code,
+    ).toBe("hashline_read_disabled");
   });
 
   test("default schema stays legacy and final surface controls edit-slot eligibility", () => {
@@ -606,24 +617,23 @@ describe("hashline edit schema selection", () => {
     expect(Object.keys(schemaForOpenCode(legacy.edit).properties as JsonObject)).toContain(
       "filePath",
     );
-    expect(openCodeEditSlotSurvives({ tool_surface: "recommended" })).toBe(true);
+    expect(openCodeEditSlotSurvives({ disabled_tools: [] })).toBe(true);
     const hashlineConfig = {
-      tool_surface: "recommended",
-      hoist_builtin_tools: true,
+      disabled_tools: [],
       edit_mode: "hashline",
     } as const;
     expect(openCodeHashlineEffective(hashlineConfig)).toBe(true);
     expect(openCodeHashlineEffective({ ...hashlineConfig, disabled_tools: ["edit"] })).toBe(false);
-    expect(openCodeEditSlotSurvives({ tool_surface: "minimal", edit_mode: "hashline" })).toBe(
-      false,
-    );
     expect(
       openCodeEditSlotSurvives({
-        tool_surface: "recommended",
         edit_mode: "hashline",
         disabled_tools: ["edit"],
       }),
     ).toBe(false);
+    // Registration questions refuse a config without a resolved list.
+    expect(() => openCodeEditSlotSurvives({ edit_mode: "hashline" })).toThrow(
+      "invalid_resolved_config:missing:disabled_tools",
+    );
   });
 });
 

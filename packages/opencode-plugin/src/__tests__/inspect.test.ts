@@ -267,11 +267,9 @@ describe("aft_inspect tool", () => {
     expect(toolCallCalls[0]?.options).not.toHaveProperty("keepBridgeOnTimeout");
   });
 
-  test("registration gate follows surface, disabled_tools, and inspect.enabled", () => {
-    expect(shouldRegisterInspectTool({ tool_surface: "recommended" })).toBe(true);
-    expect(shouldRegisterInspectTool({ tool_surface: "minimal" })).toBe(false);
+  test("registration gate follows disabled_tools only", () => {
+    expect(shouldRegisterInspectTool({ disabled_tools: [] })).toBe(true);
     expect(shouldRegisterInspectTool({ disabled_tools: ["aft_inspect"] })).toBe(false);
-    expect(shouldRegisterInspectTool({ inspect: { enabled: false } })).toBe(false);
   });
 
   test("session idle scheduling remains separate from an inspect terminal", async () => {

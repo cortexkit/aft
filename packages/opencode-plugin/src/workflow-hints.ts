@@ -2,26 +2,18 @@
 // Workflow hints — short system prompt block teaching the agent
 // token-efficient AFT workflows.
 //
-// Conditional on the actual tool surface so we never advertise tools the
-// agent doesn't have. Tool name resolution honors `hoist_builtin_tools`:
-// when hoisting is on (default) the agent sees `read`/`grep`/`bash`; when
-// off it sees `aft_read`/`aft_grep`/`aft_bash`.
+// Conditional on the registered tools so we never advertise tools the agent
+// doesn't have. A tool is registered unless it is in `disabled_tools`.
 // ---------------------------------------------------------------------------
 
 import { type AftConfig, resolveBashConfig } from "./config.js";
 
 export interface WorkflowHintsOpts {
-  /** `tool_surface` setting — controls which tools are registered. */
-  toolSurface: "minimal" | "recommended" | "all";
-  /** `hoist_builtin_tools` setting — affects tool name (read vs aft_read). */
-  hoistBuiltins: boolean;
-  /** `experimental.semantic_search` — gates `aft_search` mention. */
-  semanticEnabled: boolean;
   /** `bash.background` — gates background-bash paragraph. */
   bashBackgroundEnabled: boolean;
   /** Resolved bash compression flag. */
   bashCompressionEnabled: boolean;
-  /** Set of disabled tool names (after surface filtering). */
+  /** Set of tool names that are not registered. */
   disabledTools: Set<string>;
   /** Whether the hashline `edit` arm is the one actually registered. */
   hashlineEffective?: boolean;
@@ -48,25 +40,19 @@ export const HASHLINE_TAG_SOURCE_HINT =
 export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const sections: string[] = [];
 
-  // Tool name resolution. When hoisting is on, OpenCode sees built-in
-  // names; when off, agent-visible names are aft-prefixed.
-  const grepName = opts.hoistBuiltins ? "grep" : "aft_grep";
-  const bashName = opts.hoistBuiltins ? "bash" : "aft_bash";
+  const grepName = "grep";
+  const bashName = "bash";
   const bashStatusName = "bash_status";
   const bashWriteName = "bash_write";
 
-  // aft_outline and aft_zoom are present at "minimal" + above. They're never
-  // hoisted (always aft-prefixed).
   const hasOutline = !opts.disabledTools.has("aft_outline");
   const hasZoom = !opts.disabledTools.has("aft_zoom");
-  const readName = opts.hoistBuiltins ? "read" : "aft_read";
+  const readName = "read";
   const hasRead = !opts.disabledTools.has(readName);
-  const hasGrep = opts.toolSurface !== "minimal" && !opts.disabledTools.has(grepName);
-  const hasSearch =
-    opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.disabledTools.has("aft_search");
-  // aft_callgraph is "all"-tier only.
-  const hasNavigate = opts.toolSurface === "all" && !opts.disabledTools.has("aft_callgraph");
-  const hasInspect = opts.toolSurface !== "minimal" && !opts.disabledTools.has("aft_inspect");
+  const hasGrep = !opts.disabledTools.has(grepName);
+  const hasSearch = !opts.disabledTools.has("aft_search");
+  const hasNavigate = !opts.disabledTools.has("aft_callgraph");
+  const hasInspect = !opts.disabledTools.has("aft_inspect");
   const hasBash = !opts.disabledTools.has(bashName);
   const hasBgBash =
     hasBash && opts.bashBackgroundEnabled && !opts.disabledTools.has(bashStatusName);
@@ -202,9 +188,6 @@ export function buildHintsFromConfig(
   hashlineEffective = false,
 ): string | null {
   return buildWorkflowHints({
-    toolSurface: config.tool_surface ?? "recommended",
-    hoistBuiltins: config.hoist_builtin_tools !== false,
-    semanticEnabled: config.semantic_search === true,
     bashBackgroundEnabled: resolveBashConfig(config).background,
     bashCompressionEnabled: resolveBashConfig(config).compress,
     disabledTools,

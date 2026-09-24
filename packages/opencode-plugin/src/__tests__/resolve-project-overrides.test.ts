@@ -14,12 +14,10 @@
  * The function's contract (see config.ts doc-comment):
  *   - INCLUDES every field that can legitimately differ per project:
  *     format_on_edit, formatter_timeout_secs, validate_on_edit, formatter,
- *     checker, restrict_to_project_root, search_index, semantic_search,
- *     callgraph_store, callgraph_chunk_size,
+ *     checker, restrict_to_project_root, indexes, callgraph_chunk_size,
  *     experimental.bash.*, experimental.lsp_ty, lsp (project-safe subset),
- *   - EXCLUDES tool-registration fields that lock at plugin init:
- *     tool_surface, disabled_tools, hoist_builtin_tools (OpenCode registers
- *     tools synchronously when the plugin function returns).
+ *   - Always forwards the resolved `disabled_tools` and `indexes`; a config
+ *     without a resolved disabled list is refused rather than defaulted.
  *   - EXCLUDES global per-process state injected at plugin init:
  *     storage_dir, _ort_dylib_dir, harness, bash_permissions, lsp_paths_extra.
  *   - Always sets `restrict_to_project_root` (defaulting to false) so the
@@ -29,6 +27,13 @@
 import { describe, expect, test } from "bun:test";
 import { resolveProjectOverridesForConfigure } from "../config.js";
 
+/** Resolved fields `loadAftConfig` always provides. */
+const RESOLVED = { disabled_tools: ["aft_delete", "aft_move"] };
+const RESOLVED_OUT = {
+  disabled_tools: ["aft_delete", "aft_move"],
+  indexes: { callgraph: true, semantic: true, trigram: true },
+};
+
 describe("resolveProjectOverridesForConfigure", () => {
   test("empty config returns restrict_to_project_root default + graduated bash defaults", () => {
     // Rust expects restrict_to_project_root; we explicitly set false (parity
@@ -37,7 +42,8 @@ describe("resolveProjectOverridesForConfigure", () => {
     // Post-v0.27.2 graduation: bash is on by default for the implicit
     // `recommended` tool_surface, so `resolveBashConfig` emits true for all
     // three sub-features. They flow through to Rust as flat keys.
-    expect(resolveProjectOverridesForConfigure({})).toEqual({
+    expect(resolveProjectOverridesForConfigure(RESOLVED)).toEqual({
+      ...RESOLVED_OUT,
       restrict_to_project_root: false,
       experimental_bash_rewrite: true,
       experimental_bash_compress: true,
@@ -47,17 +53,16 @@ describe("resolveProjectOverridesForConfigure", () => {
 
   test("includes every per-project-overridable field when set", () => {
     const overrides = resolveProjectOverridesForConfigure({
+      ...RESOLVED,
       format_on_edit: true,
       formatter_timeout_secs: 30,
       validate_on_edit: "syntax",
       formatter: { typescript: "biome" },
       checker: { typescript: "biome" },
       restrict_to_project_root: true,
-      search_index: true,
-      semantic_search: true,
-      callgraph_store: false,
+      indexes: { trigram: true, semantic: true, callgraph: false },
       callgraph_chunk_size: 3,
-      github: { enabled: true, shim: true, read: false, write: true },
+      github: { shim: true, read: false, write: true },
       experimental: {
         bash: { rewrite: true, compress: true, background: false },
         lsp_ty: true,
@@ -66,17 +71,16 @@ describe("resolveProjectOverridesForConfigure", () => {
     });
 
     expect(overrides).toEqual({
+      disabled_tools: ["aft_delete", "aft_move"],
       format_on_edit: true,
       formatter_timeout_secs: 30,
       validate_on_edit: "syntax",
       formatter: { typescript: "biome" },
       checker: { typescript: "biome" },
       restrict_to_project_root: true,
-      search_index: true,
-      semantic_search: true,
-      callgraph_store: false,
+      indexes: { trigram: true, semantic: true, callgraph: false },
       callgraph_chunk_size: 3,
-      github: { enabled: true, shim: true, read: true, write: true },
+      github: { shim: true, read: true, write: true },
       experimental_bash_rewrite: true,
       experimental_bash_compress: true,
       experimental_bash_background: false,
@@ -87,6 +91,7 @@ describe("resolveProjectOverridesForConfigure", () => {
 
   test("forwards the project-settable host fallback gate as inert bash config", () => {
     const overrides = resolveProjectOverridesForConfigure({
+      ...RESOLVED,
       bash: { host_fallback: true },
     });
 
@@ -100,6 +105,7 @@ describe("resolveProjectOverridesForConfigure", () => {
     // After the fix, mergeConfigs(user, project) produces this shape and
     // resolveProjectOverridesForConfigure flattens it to the Rust wire format.
     const merged = {
+      ...RESOLVED,
       experimental: {
         bash: {
           rewrite: true, // inherited from user
@@ -124,11 +130,13 @@ describe("resolveProjectOverridesForConfigure", () => {
     // resolver materializes the surface default. Other unspecified fields
     // are still omitted as before.
     const overrides = resolveProjectOverridesForConfigure({
+      ...RESOLVED,
       format_on_edit: true,
       // formatter_timeout_secs and validate_on_edit left undefined
     });
 
     expect(overrides).toEqual({
+      ...RESOLVED_OUT,
       format_on_edit: true,
       restrict_to_project_root: false, // always set
       // Graduated bash defaults are always materialized (see resolveBashConfig).
@@ -140,23 +148,14 @@ describe("resolveProjectOverridesForConfigure", () => {
     expect("validate_on_edit" in overrides).toBe(false);
   });
 
-  test("EXCLUDES tool-registration fields that lock at plugin init", () => {
-    // tool_surface and hoist_builtin_tools affect which tools OpenCode
-    // registers when the plugin function returns. They cannot change
-    // per-bridge. disabled_tools is also used by Rust to gate rendered
-    // steering text, so it is forwarded with the project-safe config.
-    const overrides = resolveProjectOverridesForConfigure({
-      tool_surface: "minimal",
-      disabled_tools: ["aft_callgraph"],
-      hoist_builtin_tools: false,
-      // One real per-project field to confirm the function still works.
-      format_on_edit: true,
-    });
-
-    expect("tool_surface" in overrides).toBe(false);
-    expect(overrides.disabled_tools).toEqual(["aft_callgraph"]);
-    expect("hoist_builtin_tools" in overrides).toBe(false);
-    expect(overrides.format_on_edit).toBe(true);
+  test("forwards the resolved disabled list (including []) and refuses an absent one", () => {
+    expect(
+      resolveProjectOverridesForConfigure({ disabled_tools: ["aft_callgraph"] }).disabled_tools,
+    ).toEqual(["aft_callgraph"]);
+    expect(resolveProjectOverridesForConfigure({ disabled_tools: [] }).disabled_tools).toEqual([]);
+    expect(() => resolveProjectOverridesForConfigure({})).toThrow(
+      "invalid_resolved_config:missing:disabled_tools",
+    );
   });
 
   test("EXCLUDES global per-process state keys (defensive guard)", () => {
@@ -164,7 +163,7 @@ describe("resolveProjectOverridesForConfigure", () => {
     // init from process state (XDG dirs, ONNX download path, harness ID,
     // LSP install cache). A future schema change could accidentally surface
     // them; this test catches that.
-    const overrides = resolveProjectOverridesForConfigure({});
+    const overrides = resolveProjectOverridesForConfigure(RESOLVED);
     const forbiddenGlobals = [
       "storage_dir",
       "_ort_dylib_dir",

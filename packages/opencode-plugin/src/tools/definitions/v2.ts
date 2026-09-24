@@ -4,7 +4,7 @@ import { Effect } from "effect";
 
 const V2_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const V2_PATH_HEADER_TOOLS = new Set(["read", "write", "edit"]);
-const V2_BASH_TOOLS = new Set(["bash", "aft_bash"]);
+const V2_BASH_TOOLS = new Set(["bash"]);
 const ROOT_COMBINATORS = ["anyOf", "oneOf", "allOf"] as const;
 
 export interface V2Location {

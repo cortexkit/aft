@@ -130,11 +130,10 @@ describe("hoisted tool adapters", () => {
     expect(batchStartLineVariants.some((variant) => variant.type === "string")).toBe(true);
   });
 
-  test("registers prefixed alternatives while keeping bare Rust command names", async () => {
+  test("registers host slot names with bare Rust command names", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, diff: { additions: 1 } }));
     registerHoistedTools(api, makePluginContext(bridge), {
-      hoistBuiltinTools: false,
       hoistRead: true,
       hoistWrite: true,
       hoistEdit: true,
@@ -142,13 +141,12 @@ describe("hoisted tool adapters", () => {
       restrictToProjectRoot: true,
     });
 
-    expect([...tools.keys()].sort()).toEqual(["aft_edit", "aft_grep", "aft_read", "aft_write"]);
-    expect(tools.has("read")).toBe(false);
-    expect(tools.has("write")).toBe(false);
-    expect(tools.has("edit")).toBe(false);
-    expect(tools.has("grep")).toBe(false);
+    expect([...tools.keys()].sort()).toEqual(["edit", "grep", "read", "write"]);
+    for (const prefixed of ["aft_read", "aft_write", "aft_edit", "aft_grep"]) {
+      expect(tools.has(prefixed)).toBe(false);
+    }
 
-    await executeTool(tools.get("aft_edit")!, {
+    await executeTool(tools.get("edit")!, {
       path: "target.ts",
       edits: [{ oldString: "before", newString: "after" }],
     });

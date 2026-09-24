@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import type { PluginContext } from "../shared/types.js";
 import { astTools } from "../tools/ast.js";
 import { conflictTools } from "../tools/conflicts.js";
-import { aftPrefixedTools, hoistedTools } from "../tools/hoisted.js";
+import { hoistedTools } from "../tools/hoisted.js";
 import { importTools } from "../tools/imports.js";
 import { inspectTools } from "../tools/inspect.js";
 import { navigationTools } from "../tools/navigation.js";
@@ -43,9 +43,7 @@ function buildSurface(pool: PluginContext["pool"]): Record<string, unknown> {
     pool,
     client: {} as PluginContext["client"],
     config: {
-      tool_surface: "all",
-      semantic_search: true,
-      search_index: true,
+      disabled_tools: [],
     },
     storageDir: "/tmp/aft-surface-test",
     isProjectEnabled: () => true,
@@ -53,7 +51,6 @@ function buildSurface(pool: PluginContext["pool"]): Record<string, unknown> {
 
   const tools = {
     ...hoistedTools(ctx),
-    ...aftPrefixedTools(ctx),
     ...readingTools(ctx),
     ...safetyTools(ctx),
     ...importTools(ctx),
@@ -201,7 +198,7 @@ describe("conditional GitHub mutation descriptions", () => {
 
     const disabled = hoistedTools({
       ...base,
-      config: { github: { enabled: false, write: true } },
+      config: { github: { write: false } },
     } as PluginContext);
     expect(disabled.write.description).not.toContain("issue://N");
     expect(disabled.edit.description).not.toContain("issue://N/comments/K");

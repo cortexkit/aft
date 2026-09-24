@@ -12,7 +12,8 @@
  * for), not in what the bridge is configured with.
  *
  * What lives here:
- *   - loading the AFT config after migrating legacy config file locations;
+ *   - loading the AFT config after migrating legacy config file locations,
+ *     refusing a rejected configuration and delivering migration notices;
  *   - resolving the `aft` binary (with a background download when uncached);
  *   - the one-time storage migration into the shared CortexKit root;
  *   - the flat configure overrides: config tiers, `storage_dir`,
@@ -22,7 +23,9 @@
  *   - the version-mismatch upgrade handler and per-project config loader the
  *     transport pool is built with;
  *   - the registration-dependent overrides `edit_slot_survives` and
- *     `aft_search_registered`, applied once the final tool map is known.
+ *     `aft_search_registered`, applied once the final tool map is known;
+ *   - the registration warnings every entry reports the same way: one
+ *     aggregated unknown-name warning per load and the hashline downgrade.
  */
 
 import {
@@ -41,8 +44,12 @@ import {
 import {
   type AftConfig,
   buildConfigTierConfigureParams,
+  ConfigRejectedError,
+  deliverConfigLoadNotices,
+  getConfigLoadNotices,
   loadAftConfig,
   migrateAftConfigLocations,
+  resolvedIndexes,
 } from "./config.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
 import { pushLspPathsAfterAutoInstall, runAutoInstall } from "./lsp-auto-install.js";
@@ -50,7 +57,7 @@ import { type AutoInstallPassLease, claimLspAutoInstallPass } from "./lsp-cache.
 import { discoverRelevantGithubServers, runGithubAutoInstall } from "./lsp-github-install.js";
 import { GITHUB_LSP_TABLE } from "./lsp-github-table.js";
 import { NPM_LSP_TABLE } from "./lsp-npm-table.js";
-import { openCodeHashlineEditRegistered } from "./tool-registration.js";
+import { openCodeHashlineDowngrade, openCodeHashlineEditRegistered } from "./tool-registration.js";
 
 /** Delivers a user-visible warning through whatever channel the host entry has. */
 export type BootstrapNotify = (message: string) => void;
@@ -266,20 +273,75 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
 };
 
 /**
+ * Load `directory`'s config, or null when it is rejected (a retired key after
+ * its migration window, or an already retired GitHub alias). The rejection is
+ * reported through `notify`; other load errors propagate.
+ */
+function loadConfigOrNull(
+  directory: string,
+  notify: BootstrapNotify,
+  dependencies: BridgeBootstrapDependencies,
+): AftConfig | null {
+  try {
+    return dependencies.loadConfig(directory);
+  } catch (err) {
+    if (!(err instanceof ConfigRejectedError)) throw err;
+    error(err.message);
+    notify(err.message);
+    return null;
+  }
+}
+
+/**
  * Load the config for `directory`, migrating legacy config file locations
- * first. Returns null when AFT is disabled for that directory; a disabled
- * project does nothing beyond reading its config, so migration is skipped too.
+ * first. Returns null when the configuration is rejected: a rejected project
+ * publishes no AFT registrations and does no binary, storage or index work,
+ * so migration is skipped too. Migration notices for retired keys that are
+ * still translated are delivered through `notify`, once per notice identity.
  */
 export function loadBootstrapConfig(
   directory: string,
   notify: BootstrapNotify,
   dependencies: BridgeBootstrapDependencies = defaultBridgeBootstrapDependencies,
 ): AftConfig | null {
-  if (dependencies.loadConfig(directory).enabled === false) return null;
+  if (loadConfigOrNull(directory, notify, dependencies) === null) return null;
   for (const message of dependencies.migrateConfigLocations(directory)) notify(message);
   // Reload: migration may have moved the file the first read came from.
-  const config = dependencies.loadConfig(directory);
-  return config.enabled === false ? null : config;
+  const config = loadConfigOrNull(directory, notify, dependencies);
+  if (config === null) return null;
+  deliverConfigLoadNotices(notify, getConfigLoadNotices());
+  return config;
+}
+
+/**
+ * Answer "may AFT work in this project?" for projects other than the one an
+ * entry booted for. There is no config switch that turns AFT off; only a
+ * rejected configuration does, until it is fixed. Answers are cached per
+ * project and a rejection is logged once.
+ */
+export function createProjectAcceptance(
+  bootRoot: string,
+  dependencies: Pick<
+    BridgeBootstrapDependencies,
+    "loadConfig"
+  > = defaultBridgeBootstrapDependencies,
+): (projectRoot: string) => boolean {
+  const accepted = new Map<string, boolean>([[bootRoot, true]]);
+  return (projectRoot) => {
+    const cached = accepted.get(projectRoot);
+    if (cached !== undefined) return cached;
+    let ok = true;
+    try {
+      dependencies.loadConfig(projectRoot);
+    } catch (err) {
+      if (!(err instanceof ConfigRejectedError)) throw err;
+      error(err.message);
+      log(`AFT disabled for ${projectRoot}: its configuration was rejected`);
+      ok = false;
+    }
+    accepted.set(projectRoot, ok);
+    return ok;
+  };
 }
 
 export interface BridgeEnvironmentOptions {
@@ -333,7 +395,7 @@ export async function prepareBridgeEnvironment(
   // only bridges spawned after that point load it.
   let onnxRuntime: Promise<string | null> | null = null;
   const fastembed = (config.semantic?.backend ?? "fastembed") === "fastembed";
-  if (config.semantic_search && fastembed) {
+  if (resolvedIndexes(config).semantic && fastembed) {
     onnxRuntime = dependencies.ensureOnnxRuntime(storageDir).catch((err) => {
       warn(
         `ONNX Runtime setup failed: ${err instanceof Error ? err.message : String(err)}. Semantic search will be unavailable.`,
@@ -492,4 +554,37 @@ export function applyToolSurfaceOverrides(
   }
   pool.setConfigureOverride("aft_search_registered", aftSearchRegistered);
   return { hashlineEditRegistered, aftSearchRegistered };
+}
+
+/**
+ * The callback `buildAftToolDefinitions` reports unknown `disabled_tools`
+ * names through: one aggregated warning per load. Unknown names stay inert
+ * and are kept in the list.
+ */
+export function unknownDisabledToolsReporter(
+  notify: BootstrapNotify,
+): (unknown: readonly string[]) => void {
+  return (unknown) => {
+    const message = `unknown_disabled_tools: disabled_tools lists names AFT does not know: ${unknown.join(", ")}`;
+    warn(message);
+    notify(message);
+  };
+}
+
+/**
+ * Report a requested hashline surface that the registered tools cannot serve
+ * (the tagged read or the edit slot is disabled). One warning per load; the
+ * surviving slots keep their ordinary behavior. Returns the downgrade, if any.
+ */
+export function reportHashlineDowngrade(
+  config: AftConfig,
+  registeredTools: ReadonlySet<string>,
+  notify: BootstrapNotify,
+): ReturnType<typeof openCodeHashlineDowngrade> {
+  const downgrade = openCodeHashlineDowngrade(config, registeredTools);
+  if (downgrade) {
+    warn(`${downgrade.code}: ${downgrade.message}`);
+    notify(downgrade.message);
+  }
+  return downgrade;
 }

@@ -77,7 +77,7 @@ export function makeSubcSchemaStubCtx(): PluginContext {
     } as unknown as BridgePool,
     client: { lsp: {}, find: {} } as PluginContext["client"],
     config: {
-      hoist_builtin_tools: true,
+      disabled_tools: [],
       sandbox: { enabled: true },
     } as PluginContext["config"],
     storageDir: "/tmp/aft-subc-schema",
@@ -112,10 +112,10 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     throw new Error("hoistedTools must expose write, edit, apply_patch, aft_delete, and aft_move");
   }
   const grepTools = searchTools(ctx);
-  const grepTool = grepTools.grep ?? grepTools.aft_grep;
-  const globTool = grepTools.glob ?? grepTools.aft_glob;
+  const grepTool = grepTools.grep;
+  const globTool = grepTools.glob;
   if (!grepTool || !globTool) {
-    throw new Error("searchTools must expose grep/glob or aft_grep/aft_glob");
+    throw new Error("searchTools must expose grep and glob");
   }
   const search = semanticTools(ctx).aft_search;
   const reading = readingTools(ctx);

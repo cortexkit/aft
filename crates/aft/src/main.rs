@@ -1003,6 +1003,22 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         ),
         "echo" => handle_echo(&req),
         "tool_call" => aft::commands::tool_call::handle(&req, ctx),
+        // Registration never depends on runtime gates, so a registered bash
+        // tool or companion reports the gate instead of disappearing.
+        "bash" | "powershell" | "bash_status" | "bash_kill" | "bash_write"
+            if !ctx.config().bash.enabled =>
+        {
+            Response::error(
+                &req.id,
+                "bash_disabled",
+                "bash execution is disabled by configuration (bash.enabled: false)",
+            )
+        }
+        "inspect" if !ctx.config().inspect.enabled => Response::error(
+            &req.id,
+            "inspect_disabled",
+            "aft_inspect is disabled by configuration (inspect.enabled: false)",
+        ),
         "bash" | "powershell" => aft::commands::bash::handle(&req, ctx),
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_artifact_owned" => aft::commands::bash_artifact_owned::handle(&req, ctx),

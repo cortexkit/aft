@@ -165,7 +165,7 @@ describe("OMP description fold golden", () => {
 describe("Full surface registration funnel", () => {
   function registerWithHarness(
     harness: "pi" | "omp" | "unknown",
-    config: AftConfig = { tool_surface: "recommended", search_index: true, bash: true },
+    config: AftConfig = { disabled_tools: [], bash: true },
   ) {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
@@ -176,8 +176,7 @@ describe("Full surface registration funnel", () => {
 
   test("OMP top_level registers every surface tool with loadMode essential and folded description", () => {
     const { tools } = registerWithHarness("omp", {
-      tool_surface: "recommended",
-      search_index: true,
+      disabled_tools: [],
       bash: true,
       pi: { tool_presentation: "top_level" },
     });
@@ -200,8 +199,7 @@ describe("Full surface registration funnel", () => {
 
   test("OMP host_default leaves loadMode undefined on all tools", () => {
     const { tools } = registerWithHarness("omp", {
-      tool_surface: "recommended",
-      search_index: true,
+      disabled_tools: [],
       bash: true,
       pi: { tool_presentation: "host_default" },
     });
@@ -217,8 +215,7 @@ describe("Full surface registration funnel", () => {
 
   test("Pi harness leaves loadMode undefined and description unfolded", () => {
     const { tools } = registerWithHarness("pi", {
-      tool_surface: "recommended",
-      search_index: true,
+      disabled_tools: [],
       bash: true,
       pi: { tool_presentation: "top_level" },
     });

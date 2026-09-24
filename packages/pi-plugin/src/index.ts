@@ -16,7 +16,7 @@
  * AFT-specific:
  *   - aft_outline    Structural outline (symbols, headings) for files/URLs
  *   - aft_zoom       Symbol-level inspection with call-graph annotations
- *   - aft_search     Semantic search (when semantic_search=true)
+ *   - aft_search     Unified lexical/semantic search
  *   - aft_callgraph   Call-graph navigation (callers, call_tree, impact, trace_to, trace_to_symbol, trace_data)
  *   - aft_conflicts  One-call merge conflict inspection
  *   - aft_import     Language-aware import add/remove/organize
@@ -42,7 +42,9 @@ import {
   getManualInstallHint,
   isHomeDirectoryRoot,
   resolveCortexKitStorageRoot,
+  resolveIndexes,
   setActiveLogger,
+  unknownDisabledTools,
 } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -59,11 +61,12 @@ import { registerStatusCommand } from "./commands/aft-status.js";
 import {
   type AftConfig,
   buildConfigTierConfigureParams,
+  ConfigRejectedError,
+  deliverConfigLoadNotices,
   formatConfigParseFailureMessage,
   getConfigLoadErrors,
   loadAftConfig,
   migrateAftConfigLocations,
-  resolveBashConfig,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
 import { bridgeLogger, error, flushLogs, log, warn } from "./logger.js";
@@ -104,7 +107,7 @@ import {
   resolvePiToolSurface,
 } from "./tool-registration.js";
 import { resolveSessionId } from "./tools/_shared.js";
-import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
+import { registerBashTool } from "./tools/bash.js";
 import type { PluginContext } from "./types.js";
 import { registerWorkflowHints } from "./workflow-hints.js";
 
@@ -273,11 +276,9 @@ function enqueueConfigParseWarnings(
   pendingEagerWarnings.set(projectRoot, pending);
 }
 
-function shouldPrepareOnnxRuntime(
-  config: Pick<AftConfig, "semantic_search" | "semantic">,
-): boolean {
+function shouldPrepareOnnxRuntime(config: Pick<AftConfig, "indexes" | "semantic">): boolean {
   const isFastembedSemanticBackend = (config.semantic?.backend ?? "fastembed") === "fastembed";
-  return config.semantic_search === true && isFastembedSemanticBackend;
+  return resolveIndexes(config.indexes).semantic && isFastembedSemanticBackend;
 }
 
 function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string {
@@ -406,24 +407,37 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   };
 
   const projectRoot = process.cwd();
-  // Load the AFT config before any binary or storage work. This ensures
-  // `enabled: false` makes AFT do nothing except read the config file.
-  let config = loadAftConfig(projectRoot);
-  if (config.enabled === false) {
-    log(`AFT disabled by config for ${projectRoot}`);
-    return;
-  }
+  // Load the AFT config before any binary, storage or index work. A rejected
+  // configuration (a retired key after its migration window, or an already
+  // retired GitHub alias) publishes no AFT registrations at all.
+  const loadOrReject = (): AftConfig | null => {
+    try {
+      return loadAftConfig(projectRoot);
+    } catch (err) {
+      if (!(err instanceof ConfigRejectedError)) throw err;
+      error(err.message);
+      deliverConfigMigrationWarnings([err.message]);
+      return null;
+    }
+  };
+  if (loadOrReject() === null) return;
 
   deliverConfigMigrationWarnings(
     migrateAftConfigLocations(projectRoot, bridgeLogger).flatMap((result) => result.warnings),
   );
 
   // Load config (user + project).
-  config = loadAftConfig(projectRoot);
+  const loadedConfig = loadOrReject();
+  if (loadedConfig === null) return;
+  const config = loadedConfig;
   enqueueConfigParseWarnings(projectRoot, getConfigLoadErrors());
-  if (config.enabled === false) {
-    log(`AFT disabled by config for ${projectRoot}`);
-    return;
+  deliverConfigLoadNotices((message) => deliverConfigMigrationWarnings([message]));
+  const unknownDisabled = unknownDisabledTools(config.disabled_tools ?? []);
+  if (unknownDisabled.length > 0) {
+    // One aggregated notice per load; unknown names stay inert and preserved.
+    deliverConfigMigrationWarnings([
+      `unknown_disabled_tools: disabled_tools lists names AFT does not know: ${unknownDisabled.join(", ")}`,
+    ]);
   }
 
   log(`AFT extension loading (plugin v${PLUGIN_VERSION})`);
@@ -749,16 +763,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   const hashlineEditRegistered = piHashlineEffective(config, surface);
   const hashlineDowngrade = piHashlineDowngrade(config, surface);
   if (hashlineDowngrade) {
-    warn(
-      `[hashline] edit_mode: hashline downgraded to the default edit surface (${hashlineDowngrade.reason})`,
-    );
+    // One configure-time warning per load; surviving slots keep ordinary behavior.
+    warn(`[hashline] ${hashlineDowngrade.code}: ${hashlineDowngrade.message}`);
+    deliverConfigMigrationWarnings([hashlineDowngrade.message]);
   }
   pool.setConfigureOverride("edit_slot_survives", hashlineEditRegistered);
   // Tell Rust whether `aft_search` is registered for this surface so the
   // grep-rewrite footer steers there (vs the grep tool). Set before the eager
   // warmup spawn below so even the first bridge configures with the flag.
-  // `resolveToolSurface` is pure; `.semantic` is the same predicate the tool
-  // registration uses (ok("aft_search") && semantic_search === true).
+  // `.semantic` is the registration predicate: aft_search is not disabled.
   pool.setConfigureOverride("aft_search_registered", surface.semantic);
   const ctx: PluginContext = {
     pool,
@@ -873,7 +886,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // Pi binds its live tool registry after extension factories run. A modern Pi
   // can therefore reveal that its optional built-in PowerShell tool is active
   // only at session start; older hosts use bash.powershell_tool instead.
-  let powershellRegistered = surface.hoistPowershell && resolveBashConfig(config).enabled;
+  let powershellRegistered = surface.hoistPowershell;
   (
     pi.on as (
       event: "session_start",
@@ -884,16 +897,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     setActiveSessionId(sessionID);
     if (powershellRegistered) return;
     const liveSurface = resolvePiToolSurface(config, pi);
-    if (!liveSurface.hoistPowershell || !resolveBashConfig(config).enabled) return;
-    registerBashTool(
-      pi,
-      ctx,
-      liveSurface.semantic,
-      liveSurface.hoistBuiltinTools ? "powershell" : "aft_powershell",
-      false,
-      "powershell",
-    );
-    registerBashCompanionTools(pi, ctx);
+    if (!liveSurface.hoistPowershell) return;
+    // Companions were registered by name in the first pass, independently of
+    // which shell tools exist, so only the PowerShell slot is added here.
+    registerBashTool(pi, ctx, liveSurface.semantic, "powershell", false, "powershell");
     powershellRegistered = true;
   });
 
@@ -1020,7 +1027,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     }
   });
 
-  log(`AFT extension ready (surface=${config.tool_surface ?? "recommended"})`);
+  log(`AFT extension ready (disabled_tools=${(config.disabled_tools ?? []).join(",") || "none"})`);
 }
 
 export const __test__ = {

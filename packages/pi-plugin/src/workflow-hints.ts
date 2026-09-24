@@ -11,9 +11,6 @@ import { log } from "./logger.js";
 import { piHashlineEffective } from "./tool-registration.js";
 
 export interface WorkflowHintsOpts {
-  toolSurface: "minimal" | "recommended" | "all";
-  hoistBuiltins: boolean;
-  semanticEnabled: boolean;
   bashBackgroundEnabled: boolean;
   bashCompressionEnabled: boolean;
   /** Set of tool names KNOWN-ABSENT from the registered surface. */
@@ -37,21 +34,17 @@ export const HASHLINE_TAG_SOURCE_HINT =
 export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   const sections: string[] = [];
 
-  // Built-in replacements use host names by default and aft_ alternatives
-  // when hoisting is disabled. Background controls remain unprefixed because
-  // they address AFT-owned task IDs rather than host-native bash tasks.
-  const grepName = opts.hoistBuiltins ? "grep" : "aft_grep";
-  const bashName = opts.hoistBuiltins ? "bash" : "aft_bash";
+  const grepName = "grep";
+  const bashName = "bash";
 
   const hasOutline = !opts.absentTools.has("aft_outline");
   const hasZoom = !opts.absentTools.has("aft_zoom");
-  const readName = opts.hoistBuiltins ? "read" : "aft_read";
+  const readName = "read";
   const hasRead = !opts.absentTools.has(readName);
-  const hasGrep = opts.toolSurface !== "minimal" && !opts.absentTools.has(grepName);
-  const hasSearch =
-    opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.absentTools.has("aft_search");
-  const hasNavigate = opts.toolSurface === "all" && !opts.absentTools.has("aft_callgraph");
-  const hasInspect = opts.toolSurface !== "minimal" && !opts.absentTools.has("aft_inspect");
+  const hasGrep = !opts.absentTools.has(grepName);
+  const hasSearch = !opts.absentTools.has("aft_search");
+  const hasNavigate = !opts.absentTools.has("aft_callgraph");
+  const hasInspect = !opts.absentTools.has("aft_inspect");
   const hasBash = !opts.absentTools.has(bashName);
   const hasBgBash = opts.bashBackgroundEnabled && hasBash && !opts.absentTools.has("bash_status");
 
@@ -160,16 +153,12 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 export function buildHintsFromConfig(
   config: AftConfig,
   absentTools: Set<string>,
-  hoistBuiltins: boolean,
   hashlineEffective = false,
 ): string | null {
   // Background-bash gating reads the resolved bash config so the graduated
   // `bash.background` setting controls whether the hint appears. See
   // `resolveBashConfig` in config.ts.
   return buildWorkflowHints({
-    toolSurface: config.tool_surface ?? "recommended",
-    hoistBuiltins,
-    semanticEnabled: config.semantic_search === true,
     bashBackgroundEnabled: resolveBashConfig(config).background,
     bashCompressionEnabled: resolveBashConfig(config).compress,
     absentTools,
@@ -187,11 +176,11 @@ interface ToolSurfaceFlags {
   semantic: boolean;
   navigate: boolean;
   inspect: boolean;
-  hoistBuiltinTools: boolean;
   hoistGrep: boolean;
   hoistBash: boolean;
   hoistEdit: boolean;
   hoistRead: boolean;
+  bashStatus: boolean;
 }
 
 /**
@@ -207,31 +196,19 @@ export function registerWorkflowHints(
   config: AftConfig,
   surface: ToolSurfaceFlags,
 ): void {
-  // Build the absent-tools set from the resolved tool surface. In prefixed
-  // mode, file/search/bash alternatives are registered under aft_ names while
-  // background controls stay unprefixed for AFT task IDs.
-  const hoistBuiltins = surface.hoistBuiltinTools;
-  const grepName = hoistBuiltins ? "grep" : "aft_grep";
-  const bashName = hoistBuiltins ? "bash" : "aft_bash";
+  // Build the absent-tools set from the resolved registration predicates.
   const absent = new Set<string>();
   if (!surface.outline) absent.add("aft_outline");
   if (!surface.zoom) absent.add("aft_zoom");
   if (!surface.semantic) absent.add("aft_search");
   if (!surface.navigate) absent.add("aft_callgraph");
   if (!surface.inspect) absent.add("aft_inspect");
-  if (!surface.hoistGrep) absent.add(grepName);
-  if (!surface.hoistRead) absent.add(hoistBuiltins ? "read" : "aft_read");
-  if (!surface.hoistBash) {
-    absent.add(bashName);
-    absent.add("bash_status");
-  }
+  if (!surface.hoistGrep) absent.add("grep");
+  if (!surface.hoistRead) absent.add("read");
+  if (!surface.hoistBash) absent.add("bash");
+  if (!surface.bashStatus) absent.add("bash_status");
 
-  const hintsBlock = buildHintsFromConfig(
-    config,
-    absent,
-    hoistBuiltins,
-    piHashlineEffective(config, surface),
-  );
+  const hintsBlock = buildHintsFromConfig(config, absent, piHashlineEffective(config, surface));
   if (!hintsBlock) return;
 
   log(`Workflow hints injected (${hintsBlock.length} chars)`);

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DEFAULT_DISABLED_TOOLS, translateConfigDocument } from "@cortexkit/aft-bridge";
 import { type ToolDefinition, tool } from "@opencode-ai/plugin";
 import { Effect } from "effect";
 
@@ -34,6 +35,19 @@ const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 // artifacts against a fresh generation; an in-process registration never
 // touches those files, so re-reading them around it would assert nothing.
 
+/**
+ * Resolve a profile written with retired keys through the same in-window
+ * translation the loaders use, so registration sees a resolved config with a
+ * present disabled_tools list, exactly as it does in production.
+ */
+function resolved(config: AftConfig): AftConfig {
+  const doc = structuredClone(config) as Record<string, unknown>;
+  const translation = translateConfigDocument(doc, "window");
+  if (translation.errors.length > 0) throw new Error(translation.errors.join(", "));
+  doc.disabled_tools ??= [...DEFAULT_DISABLED_TOOLS];
+  return doc as AftConfig;
+}
+
 function stubContext(config: AftConfig = ALL_TOOLS_CONFIG): PluginContext {
   return {
     pool: {
@@ -49,7 +63,8 @@ function stubContext(config: AftConfig = ALL_TOOLS_CONFIG): PluginContext {
 }
 
 function sharedDefinitions(config: AftConfig = ALL_TOOLS_CONFIG) {
-  return buildAftToolDefinitions(stubContext(config), config);
+  const resolvedConfig = resolved(config);
+  return buildAftToolDefinitions(stubContext(resolvedConfig), resolvedConfig);
 }
 
 async function captureRegistration(config: AftConfig = ALL_TOOLS_CONFIG) {

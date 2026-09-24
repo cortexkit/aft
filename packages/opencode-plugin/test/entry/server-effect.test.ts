@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { z } from "zod";
 
+import { ConfigRejectedError } from "../../src/config.js";
 import { makeServerEffect } from "../../src/entry/server-runtime.mjs";
 
 function testDependencies(events: string[]) {
@@ -213,20 +214,22 @@ describe("V2 server effect", () => {
     });
   });
 
-  test("keeps a disabled Location inert", async () => {
+  test("keeps a Location with a rejected configuration inert", async () => {
+    // Top-level `enabled` is retired; only a rejected configuration keeps AFT
+    // from doing any work for a Location.
     const events: string[] = [];
     const dependencies = {
       ...testDependencies(events),
       loadConfig: (directory: string) => {
         events.push(`config:${directory}`);
-        return { enabled: false };
+        throw new ConfigRejectedError(["removed_config_key:aft_glob:use:glob"], directory);
       },
     };
-    const host = hostContext("/work/disabled", events, []);
+    const host = hostContext("/work/rejected", events, []);
 
     await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(host.context)));
 
-    expect(events).toEqual(["location:/work/disabled", "config:/work/disabled"]);
+    expect(events).toEqual(["location:/work/rejected", "config:/work/rejected"]);
   });
 
   test("returns a no-op when the host context has no location", async () => {

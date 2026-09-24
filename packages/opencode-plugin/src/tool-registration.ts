@@ -1,6 +1,7 @@
+import { unknownDisabledTools } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 
-import type { AftConfig } from "./config.js";
+import { type AftConfig, resolvedDisabledTools } from "./config.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
@@ -10,9 +11,9 @@ import {
   type V2ProviderTool,
   type V2ToolConsumers,
 } from "./tools/definitions/v2.js";
-import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
+import { hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
-import { inspectToolSurfaceEnabled, inspectTools } from "./tools/inspect.js";
+import { inspectTools } from "./tools/inspect.js";
 import { navigationTools } from "./tools/navigation.js";
 import { readingTools } from "./tools/reading.js";
 import { safetyTools } from "./tools/safety.js";
@@ -20,7 +21,6 @@ import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
-const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_delete", "aft_move"] as const;
 /**
  * Host tool names AFT removes before adding its own.
  *
@@ -45,18 +45,13 @@ export interface V2ToolRegistrationContext {
   };
 }
 
-/** Returns true when bare `edit` remains available after surface, hoisting, and disable filters. */
+/** Returns true when `edit` is registered, i.e. not in the resolved disabled list. */
 export function openCodeEditSlotSurvives(config: AftConfig): boolean {
-  return (
-    (config.tool_surface ?? "recommended") !== "minimal" &&
-    config.hoist_builtin_tools !== false &&
-    !(config.disabled_tools ?? []).includes("edit")
-  );
+  return !resolvedDisabledTools(config).includes("edit");
 }
 
 /**
- * Returns true when bare `read` remains available after surface, hoisting, and
- * disable filters.
+ * Returns true when `read` is registered, i.e. not in the resolved disabled list.
  *
  * Only a tagged AFT read mints the `[path#TAG]` snapshots a hashline patch
  * addresses. With the AFT read registration removed, OpenCode keeps serving its
@@ -64,11 +59,7 @@ export function openCodeEditSlotSurvives(config: AftConfig): boolean {
  * patch with.
  */
 export function openCodeReadSlotSurvives(config: AftConfig): boolean {
-  return (
-    (config.tool_surface ?? "recommended") !== "minimal" &&
-    config.hoist_builtin_tools !== false &&
-    !(config.disabled_tools ?? []).includes("read")
-  );
+  return !resolvedDisabledTools(config).includes("read");
 }
 
 /** Select the hashline schema only when both the edit and tagged-read slots survive. */
@@ -90,10 +81,13 @@ export function openCodeHashlineEditRegistered(
   );
 }
 
-/** One `hashline_downgraded` warning describing why the hashline arm was refused. */
+/**
+ * Configure-time warning for a requested hashline surface that cannot be
+ * effective because `read` or `edit` is disabled. Read takes precedence.
+ */
 export interface HashlineDowngradeWarning {
-  code: "hashline_downgraded";
-  reason: "edit_not_registered" | "tagged_read_unavailable";
+  code: "hashline_read_disabled" | "hashline_edit_disabled";
+  message: string;
 }
 
 /**
@@ -111,53 +105,56 @@ export function openCodeHashlineDowngrade(
   if (config.edit_mode !== "hashline") return null;
   if (openCodeHashlineEditRegistered(config, registeredTools)) return null;
   const readSurvives = openCodeReadSlotSurvives(config) && registeredTools.has("read");
-  return {
-    code: "hashline_downgraded",
-    reason: readSurvives ? "edit_not_registered" : "tagged_read_unavailable",
-  };
+  return readSurvives
+    ? {
+        code: "hashline_edit_disabled",
+        message:
+          'edit_mode "hashline" is not in effect because "edit" is in disabled_tools; the registered read tool keeps its ordinary behavior.',
+      }
+    : {
+        code: "hashline_read_disabled",
+        message:
+          'edit_mode "hashline" is not in effect because "read" is in disabled_tools (hashline edits need tagged reads); registered tools keep their ordinary behavior.',
+      };
 }
 
 /**
  * Build the exact OpenCode registration map without starting a bridge.
  *
- * Production calls this after startup has prepared the transport context. Keeping
- * the selection in one function makes the checked profile tests exercise the same
- * registration path rather than a second test-only inventory implementation.
+ * A tool is registered exactly when its canonical name is absent from the
+ * resolved `disabled_tools`. Index state, backends and runtime gates (bash,
+ * backup, inspect) never remove a registration; those tools report their
+ * runtime state when called. Production calls this after startup has prepared
+ * the transport context, and the registration tests call the same function.
+ *
+ * `onUnknownDisabled` receives, once per call, the sorted distinct disabled
+ * names that are not in the canonical tool inventory.
  */
 export function buildAftToolDefinitions(
   ctx: PluginContext,
   config: AftConfig,
-  onUnknownDisabled?: (name: string, available: readonly string[]) => void,
+  onUnknownDisabled?: (names: readonly string[]) => void,
 ): Record<string, ToolDefinition> {
-  const surface = config.tool_surface ?? "recommended";
+  const disabled = resolvedDisabledTools(config);
   const allTools = normalizeToolMap(
     {
-      ...(surface !== "minimal" &&
-        (config.hoist_builtin_tools !== false ? hoistedTools(ctx) : aftPrefixedTools(ctx))),
+      ...hoistedTools(ctx),
       ...readingTools(ctx),
-      ...(config.backup?.enabled === false ? {} : safetyTools(ctx)),
-      ...(surface !== "minimal" && importTools(ctx)),
+      ...safetyTools(ctx),
+      ...importTools(ctx),
       ...navigationTools(ctx),
-      ...(surface !== "minimal" && astTools(ctx)),
-      ...(surface !== "minimal" && config.semantic_search === true && semanticTools(ctx)),
-      ...(inspectToolSurfaceEnabled(config) && inspectTools(ctx)),
-      ...(surface !== "minimal" && config.search_index === true && searchTools(ctx)),
-      ...(surface !== "minimal" && conflictTools(ctx)),
+      ...astTools(ctx),
+      ...semanticTools(ctx),
+      ...inspectTools(ctx),
+      ...searchTools(ctx),
+      ...conflictTools(ctx),
     },
     { hashlineEffective: ctx.hashlineEffective },
   );
 
-  if (surface !== "all") {
-    for (const name of ALL_ONLY_TOOLS) delete allTools[name];
-  }
-
-  for (const name of config.disabled_tools ?? []) {
-    if (name in allTools) {
-      delete allTools[name];
-    } else {
-      onUnknownDisabled?.(name, Object.keys(allTools));
-    }
-  }
+  for (const name of disabled) delete allTools[name];
+  const unknown = unknownDisabledTools(disabled);
+  if (unknown.length > 0) onUnknownDisabled?.(unknown);
 
   return allTools;
 }
@@ -166,7 +163,7 @@ export function buildAftToolDefinitions(
 export function buildOpenCodeToolMap(
   ctx: PluginContext,
   config: AftConfig,
-  onUnknownDisabled?: (name: string, available: readonly string[]) => void,
+  onUnknownDisabled?: (names: readonly string[]) => void,
 ): Record<string, ToolDefinition> {
   return buildAftToolDefinitions(ctx, config, onUnknownDisabled);
 }

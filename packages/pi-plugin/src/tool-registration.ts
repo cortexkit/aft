@@ -1,8 +1,9 @@
+import { ADAPTER_UNIMPLEMENTED_TOOLS, CANONICAL_TOOLS } from "@cortexkit/aft-bridge";
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 
 import type { AftConfig } from "./config.js";
-import { resolveBashConfig } from "./config.js";
+import { resolveBashConfig, resolvedDisabledTools } from "./config.js";
 import { detectPiHarness, type PiHarness } from "./harness.js";
 import { prepareToolDefinitionForRegistration } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
@@ -18,9 +19,12 @@ import { registerSafetyTool } from "./tools/safety.js";
 import { registerSemanticTool } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
+/**
+ * Registration predicates for the Pi/OMP adapter. Each flag is exactly "the
+ * canonical name is not in the resolved disabled list"; nothing else (index
+ * state, runtime gates) removes a registration.
+ */
 export interface PiToolSurface {
-  /** Whether AFT replaces host-native tool names instead of registering aft_ alternatives. */
-  hoistBuiltinTools: boolean;
   hoistBash: boolean;
   hoistPowershell: boolean;
   hoistRead: boolean;
@@ -40,9 +44,20 @@ export interface PiToolSurface {
   move: boolean;
   astSearch: boolean;
   astReplace: boolean;
+  bashStatus: boolean;
+  bashWatch: boolean;
+  bashWrite: boolean;
+  bashKill: boolean;
 }
 
-const ALL_ONLY_TOOLS = new Set(["aft_callgraph", "aft_delete", "aft_move"]);
+/**
+ * Canonical tools the Pi/OMP adapter can register: the full inventory minus
+ * the tools this adapter has no implementation for (`glob`, `apply_patch`),
+ * which are recorded as data in `ADAPTER_UNIMPLEMENTED_TOOLS`.
+ */
+export const PI_REGISTRABLE_TOOLS: readonly string[] = CANONICAL_TOOLS.filter(
+  (name) => !(ADAPTER_UNIMPLEMENTED_TOOLS.pi as readonly string[]).includes(name),
+);
 
 /**
  * Pi's tool registry is unavailable while extension factories load. Older Pi
@@ -99,10 +114,13 @@ export function piHashlineEffective(
   return config.edit_mode === "hashline" && surface.hoistEdit && surface.hoistRead;
 }
 
-/** One `hashline_downgraded` warning describing why the hashline arm was refused. */
+/**
+ * Configure-time warning for a requested hashline surface that cannot be
+ * effective because `read` or `edit` is disabled. Read takes precedence.
+ */
 export interface PiHashlineDowngradeWarning {
-  code: "hashline_downgraded";
-  reason: "edit_not_registered" | "tagged_read_unavailable";
+  code: "hashline_read_disabled" | "hashline_edit_disabled";
+  message: string;
 }
 
 /**
@@ -118,83 +136,52 @@ export function piHashlineDowngrade(
 ): PiHashlineDowngradeWarning | null {
   if (config.edit_mode !== "hashline") return null;
   if (piHashlineEffective(config, surface)) return null;
-  return {
-    code: "hashline_downgraded",
-    reason: surface.hoistRead ? "edit_not_registered" : "tagged_read_unavailable",
-  };
+  return surface.hoistRead
+    ? {
+        code: "hashline_edit_disabled",
+        message:
+          'edit_mode "hashline" is not in effect because "edit" is in disabled_tools; the registered read tool keeps its ordinary behavior.',
+      }
+    : {
+        code: "hashline_read_disabled",
+        message:
+          'edit_mode "hashline" is not in effect because "read" is in disabled_tools (hashline edits need tagged reads); registered tools keep their ordinary behavior.',
+      };
 }
 
-/** Resolve the feature predicates used by Pi's production registration path. */
+/** Resolve the registration predicates used by Pi's production registration path. */
 export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiToolSurface {
-  const surface = config.tool_surface ?? "recommended";
-  const disabled = new Set(config.disabled_tools ?? []);
-  const hoistBuiltinTools = config.hoist_builtin_tools !== false;
+  const disabled = new Set(resolvedDisabledTools(config));
   const ok = (name: string): boolean => !disabled.has(name);
-  const builtinToolEnabled = (bareName: string): boolean =>
-    ok(hoistBuiltinTools ? bareName : `aft_${bareName}`);
-  const allOnly = (name: string): boolean => ALL_ONLY_TOOLS.has(name) && ok(name);
-  const restrictToProjectRoot = config.restrict_to_project_root ?? false;
   const powershellEnabled =
     (pi ? piPowerShellEnabledFromHost(pi) : undefined) ?? resolvePiPowerShellFallback(config);
 
-  if (surface === "minimal") {
-    return {
-      hoistBuiltinTools,
-      hoistBash: builtinToolEnabled("bash"),
-      hoistPowershell: powershellEnabled && builtinToolEnabled("powershell"),
-      hoistRead: false,
-      hoistWrite: false,
-      hoistEdit: false,
-      hoistGrep: false,
-      restrictToProjectRoot,
-      outline: ok("aft_outline"),
-      zoom: ok("aft_zoom"),
-      semantic: false,
-      inspect: false,
-      navigate: false,
-      conflicts: false,
-      importTool: false,
-      safety: ok("aft_safety"),
-      delete: false,
-      move: false,
-      astSearch: false,
-      astReplace: false,
-    };
-  }
-
-  const base: PiToolSurface = {
-    hoistBuiltinTools,
-    hoistBash: builtinToolEnabled("bash"),
-    hoistPowershell: powershellEnabled && builtinToolEnabled("powershell"),
-    hoistRead: builtinToolEnabled("read"),
-    hoistWrite: builtinToolEnabled("write"),
-    hoistEdit: builtinToolEnabled("edit"),
-    hoistGrep: builtinToolEnabled("grep") && config.search_index === true,
-    restrictToProjectRoot,
+  return {
+    hoistBash: ok("bash"),
+    // PowerShell is a host-dependent extra slot, not a canonical tool.
+    hoistPowershell: powershellEnabled && ok("powershell"),
+    hoistRead: ok("read"),
+    hoistWrite: ok("write"),
+    hoistEdit: ok("edit"),
+    hoistGrep: ok("grep"),
+    restrictToProjectRoot: config.restrict_to_project_root ?? false,
     outline: ok("aft_outline"),
     zoom: ok("aft_zoom"),
-    semantic: ok("aft_search") && config.semantic_search === true,
-    inspect: ok("aft_inspect") && config.inspect?.enabled !== false,
-    navigate: false,
+    semantic: ok("aft_search"),
+    inspect: ok("aft_inspect"),
+    navigate: ok("aft_callgraph"),
     conflicts: ok("aft_conflicts"),
     importTool: ok("aft_import"),
     safety: ok("aft_safety"),
-    delete: false,
-    move: false,
+    delete: ok("aft_delete"),
+    move: ok("aft_move"),
     astSearch: ok("ast_grep_search"),
     astReplace: ok("ast_grep_replace"),
+    bashStatus: ok("bash_status"),
+    bashWatch: ok("bash_watch"),
+    bashWrite: ok("bash_write"),
+    bashKill: ok("bash_kill"),
   };
-
-  if (surface === "all") {
-    return {
-      ...base,
-      navigate: allOnly("aft_callgraph"),
-      delete: allOnly("aft_delete"),
-      move: allOnly("aft_move"),
-    };
-  }
-
-  return base;
 }
 
 const FUNNEL_BOUND = Symbol.for("aft.pi.registration_funnel_bound");
@@ -248,31 +235,14 @@ export function registerPiToolSurface(
   harness?: PiHarness,
 ): void {
   const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
-  const bashCfg = resolveBashConfig(ctx.config);
-  const bashRegistered = surface.hoistBash && bashCfg.enabled;
-  const powershellRegistered = surface.hoistPowershell && bashCfg.enabled;
-  if (bashRegistered) {
-    registerBashTool(
-      boundPi,
-      ctx,
-      surface.semantic,
-      surface.hoistBuiltinTools ? "bash" : "aft_bash",
-      false,
-    );
+  // The bash runtime gate (`bash.enabled`) never removes a registration; the
+  // engine answers `bash_disabled` when it is off.
+  if (surface.hoistBash) registerBashTool(boundPi, ctx, surface.semantic, "bash", false);
+  if (surface.hoistPowershell) {
+    registerBashTool(boundPi, ctx, surface.semantic, "powershell", false, "powershell");
   }
-  if (powershellRegistered) {
-    registerBashTool(
-      boundPi,
-      ctx,
-      surface.semantic,
-      surface.hoistBuiltinTools ? "powershell" : "aft_powershell",
-      false,
-      "powershell",
-    );
-  }
-  // These controls address AFT task IDs, so one shell-family registration makes
-  // the shared controls available without colliding with a host-native tool.
-  if (bashRegistered || powershellRegistered) registerBashCompanionTools(boundPi, ctx);
+  // Companions are independent registrations: disabling `bash` leaves them.
+  registerBashCompanionTools(boundPi, ctx, surface);
   registerHoistedTools(boundPi, ctx, surface);
 
   if (surface.outline || surface.zoom) registerReadingTools(boundPi, ctx, surface);
@@ -281,7 +251,7 @@ export function registerPiToolSurface(
   if (surface.navigate) registerNavigateTool(boundPi, ctx);
   if (surface.conflicts) registerConflictsTool(boundPi, ctx);
   if (surface.importTool) registerImportTools(boundPi, ctx);
-  if (surface.safety && ctx.config.backup?.enabled !== false) registerSafetyTool(boundPi, ctx);
+  if (surface.safety) registerSafetyTool(boundPi, ctx);
   if (surface.astSearch || surface.astReplace) registerAstTools(boundPi, ctx, surface);
   if (surface.delete || surface.move) registerFsTools(boundPi, ctx, surface);
 }

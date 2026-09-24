@@ -99,7 +99,7 @@ function formatReadAttachmentText(attachment: ReadAttachment): string {
 const ISSUE_AND_PR_READ_DESCRIPTION =
   "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
 
-/** Reuse the user-tier gh_read description gate across every GitHub-capable tool. */
+/** Reuse the user-tier github.read description gate across every GitHub-capable tool. */
 export function whenGhReadEnabled(enabled: boolean, description: string): string {
   return enabled ? description : "";
 }
@@ -391,8 +391,6 @@ const GrepParams = Type.Object({
 });
 
 export interface ToolSurfaceFlags {
-  /** True keeps AFT on host-native names; false registers aft_ alternatives. */
-  hoistBuiltinTools?: boolean;
   hoistRead: boolean;
   hoistWrite: boolean;
   hoistEdit: boolean;
@@ -534,13 +532,11 @@ export function registerHoistedTools(
   ctx: PluginContext,
   surface: ToolSurfaceFlags,
 ): void {
-  // Registered names are host-local aliases. Permission checks and bridge calls
-  // use the bare command names, preserving the Rust wire protocol in both modes.
-  const prefix = surface.hoistBuiltinTools === false ? "aft_" : "";
-  const readName = `${prefix}read`;
-  const writeName = `${prefix}write`;
-  const editName = `${prefix}edit`;
-  const grepName = `${prefix}grep`;
+  // AFT takes over the host slot names; there are no prefixed variants.
+  const readName = "read";
+  const writeName = "write";
+  const editName = "edit";
+  const grepName = "grep";
 
   if (surface.hoistRead) {
     pi.registerTool(

@@ -27,15 +27,20 @@ import {
 } from "./bg-notifications.js";
 import {
   applyToolSurfaceOverrides,
+  createProjectAcceptance,
   createSharedPoolOptions,
   loadBootstrapConfig,
   prepareBridgeEnvironment,
+  reportHashlineDowngrade,
+  unknownDisabledToolsReporter,
 } from "./bridge-bootstrap.js";
 import {
+  ConfigRejectedError,
   getConfigLoadErrors,
   loadAftConfig,
   resolveBashConfig,
   resolveBridgePoolTransportOptions,
+  resolvedIndexes,
   resolveOpenCodeRegistrationRoot,
 } from "./config.js";
 import {
@@ -45,7 +50,7 @@ import {
   flushConfigureWarningsOnIdle,
 } from "./configure-warnings.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
-import { bridgeLogger, log, warn } from "./logger.js";
+import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls } from "./lsp-auto-install.js";
 import { abortInFlightGithubInstalls } from "./lsp-github-install.js";
 import { prepareOpenCodeArguments } from "./normalize-schemas.js";
@@ -75,11 +80,7 @@ import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
-import {
-  buildAftToolDefinitions,
-  openCodeHashlineDowngrade,
-  openCodeHashlineEffective,
-} from "./tool-registration.js";
+import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
 import { bashToolDescription } from "./tools/bash.js";
 import { createInspectTier2IdleScheduler } from "./tools/inspect.js";
 import type { PluginContext } from "./types.js";
@@ -209,8 +210,9 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
  * - Project: <project>/.opencode/aft.jsonc (or .json)
  *
  * Tools organized into groups:
- * - Hoisted (default): read, write, edit, apply_patch, ast_grep_search, ast_grep_replace
- *   and grep/glob when search_index is enabled
+ * - Host slots: read, write, edit, apply_patch, grep, glob, bash (+ companions)
+ * - AST: ast_grep_search, ast_grep_replace
+ * Every tool registers unless listed in `disabled_tools`.
  * - File ops: aft_delete, aft_move
  * - Reading: aft_outline
  * - Safety: aft_safety
@@ -240,14 +242,15 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // config so schema selection and the bridge's runtime project agree.
   const registrationRoot = resolveOpenCodeRegistrationRoot(input.directory, input.worktree);
 
-  // Load the AFT config before any binary or storage work. This ensures
-  // `enabled: false` makes AFT do nothing except read the config file.
-  // Load order: ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
+  // Load the AFT config before any binary, storage or index work. A rejected
+  // configuration (a retired key after its migration window, or an already
+  // retired GitHub alias) publishes no AFT registrations at all. Load order:
+  // ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
   const loadedConfig = loadBootstrapConfig(registrationRoot, (message) =>
     deliverConfigMigrationWarnings(registrationRoot, [message]),
   );
   if (!loadedConfig) {
-    log(`AFT disabled by config for ${registrationRoot}`);
+    log(`AFT not started for ${registrationRoot}: its configuration was rejected`);
     return { tool: {} };
   }
   const aftConfig = loadedConfig;
@@ -274,20 +277,23 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const { binaryPath, configOverrides, storageDir } = bridgeEnvironment;
   const onnxRuntimePromise = bridgeEnvironment.onnxRuntime;
   const autoUpdateAbort = new AbortController();
-  const projectEnabledCache = new Map<string, boolean>([[registrationRoot, true]]);
-  const loggedDisabledProjects = new Set<string>();
-  const isProjectEnabled = (projectRoot: string): boolean => {
-    const cached = projectEnabledCache.get(projectRoot);
-    if (cached !== undefined) return cached;
-    const projectConfig = loadAftConfig(projectRoot);
-    const enabled = projectConfig.enabled !== false;
-    projectEnabledCache.set(projectRoot, enabled);
-    if (!enabled && !loggedDisabledProjects.has(projectRoot)) {
-      loggedDisabledProjects.add(projectRoot);
-      log(`AFT disabled by config for ${projectRoot}`);
+  // Reloads keep the last configuration that loaded successfully when the
+  // current file is rejected.
+  const lastGoodConfig = new Map<string, typeof aftConfig>([[registrationRoot, aftConfig]]);
+  const loadAftConfigOrLastGood = (projectRoot: string): typeof aftConfig => {
+    try {
+      const loaded = loadAftConfig(projectRoot);
+      lastGoodConfig.set(projectRoot, loaded);
+      return loaded;
+    } catch (err) {
+      if (!(err instanceof ConfigRejectedError)) throw err;
+      error(err.message);
+      return lastGoodConfig.get(projectRoot) ?? aftConfig;
     }
-    return enabled;
   };
+  // A project whose configuration is rejected gets no AFT work until it is
+  // fixed; there is no longer a config switch that disables AFT wholesale.
+  const isProjectEnabled = createProjectAcceptance(registrationRoot);
 
   // Configure params for the Rust binary come in two layers:
   //   1. `configOverrides` — GLOBAL per-process state shared by every bridge
@@ -317,7 +323,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     onConfigureWarnings: ({ projectRoot, sessionId, client, warnings, configDroppedKeys }) => {
       const bridge = pool.getActiveBridgeForRoot(projectRoot);
       if (!bridge) return;
-      const projectConfig = loadAftConfig(projectRoot);
+      const projectConfig = loadAftConfigOrLastGood(projectRoot);
       enqueueConfigureWarningsForSession({
         projectRoot,
         sessionId,
@@ -659,7 +665,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   rpcServer.handle("get-warnings", async () => {
     const warnings: string[] = [];
     if (
-      aftConfig.semantic_search &&
+      resolvedIndexes(aftConfig).semantic &&
       isFastembedSemanticBackend &&
       !configOverrides._ort_dylib_dir
     ) {
@@ -697,9 +703,13 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Build the exact tool map for the configured profile. The builder contains
   // only registration work; startup, transport, and lifecycle hooks stay here.
-  const allTools = buildAftToolDefinitions(ctx, aftConfig, (name, available) => {
-    warn(`disabled_tools: "${name}" not found — available: ${available.join(", ")}`);
-  });
+  const allTools = buildAftToolDefinitions(
+    ctx,
+    aftConfig,
+    unknownDisabledToolsReporter((message) =>
+      deliverConfigMigrationWarnings(registrationRoot, [message]),
+    ),
+  );
   const disabled = aftConfig.disabled_tools ?? [];
   if (disabled.length > 0) {
     log(`Disabled ${disabled.length} tool(s): ${disabled.join(", ")}`);
@@ -734,11 +744,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_callgraph",
     "aft_inspect",
     "grep",
-    "aft_grep",
     "read",
-    "aft_read",
     "bash",
-    "aft_bash",
     "bash_status",
   ];
   const registeredTools = new Set(Object.keys(allTools));
@@ -753,11 +760,14 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     registeredTools,
   );
   ctx.hashlineEffective = hashlineEditRegistered;
-  const hashlineDowngrade = openCodeHashlineDowngrade(aftConfig, registeredTools);
+  // One configure-time warning per load; surviving slots keep ordinary behavior.
+  const hashlineDowngrade = reportHashlineDowngrade(aftConfig, registeredTools, (message) =>
+    deliverConfigMigrationWarnings(registrationRoot, [message]),
+  );
   log(
     `hashline activation decision requested=${aftConfig.edit_mode === "hashline"} ` +
       `edit_slot_survives=${hashlineEditRegistered} effective=${ctx.hashlineEffective}` +
-      (hashlineDowngrade ? ` downgraded=${hashlineDowngrade.reason}` : ""),
+      (hashlineDowngrade ? ` downgraded=${hashlineDowngrade.code}` : ""),
   );
   // Also expose the same surface decision to the TypeScript-side native bash
   // output finalizer, which catches leading grep/rg commands that Rust could
@@ -770,7 +780,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // factory default assumes aft_search is absent. The compression and
   // background/PTY sentences are config-gated too: only advertised when the
   // feature is actually on for this project.
-  for (const name of ["bash", "aft_bash"]) {
+  for (const name of ["bash"]) {
     const def = allTools[name];
     if (def) {
       const bashCfg = resolveBashConfig(aftConfig);
@@ -889,7 +899,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         getSessionDirectoryCached(sid) ??
         (await getSessionDirectory(input.client, sid, input.directory)) ??
         input.directory;
-      const projectConfig = loadAftConfig(sessionDir);
+      const projectConfig = loadAftConfigOrLastGood(sessionDir);
       const messageText = extractUserMessageText(messageOutput);
       const shouldDetach = shouldDetachBashWaitOnUserMessage(projectConfig, messageText);
       stripUserMessageDetachKeyword(messageOutput);

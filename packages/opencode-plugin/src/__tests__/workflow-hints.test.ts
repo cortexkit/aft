@@ -4,11 +4,8 @@ import type { AftConfig } from "../config.js";
 import { buildHintsFromConfig, buildWorkflowHints } from "../workflow-hints.js";
 
 describe("buildWorkflowHints", () => {
-  test("renders all four sections at tool_surface=all with bg + semantic enabled", () => {
+  test("renders all four sections with every tool registered and bg enabled", () => {
     const out = buildWorkflowHints({
-      toolSurface: "all",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: true,
       bashCompressionEnabled: true,
       disabledTools: new Set(),
@@ -57,9 +54,6 @@ describe("buildWorkflowHints", () => {
 
   test("replaces zoom steering with read when zoom is disabled", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       disabledTools: new Set(["aft_zoom"]),
@@ -70,9 +64,6 @@ describe("buildWorkflowHints", () => {
 
   test("omits long-running bash hint when background bash is off (foreground auto-promotes)", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       disabledTools: new Set(),
@@ -89,9 +80,6 @@ describe("buildWorkflowHints", () => {
 
   test("shows pipe guidance only when compression is enabled", () => {
     const on = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: true,
       disabledTools: new Set(),
@@ -103,9 +91,6 @@ describe("buildWorkflowHints", () => {
     expect(on).not.toContain("compression is on,");
 
     const off = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       disabledTools: new Set(),
@@ -114,47 +99,36 @@ describe("buildWorkflowHints", () => {
     expect(off).not.toContain("`bun test | grep fail`");
   });
 
-  test("omits the navigate section at tool_surface=recommended", () => {
+  test("omits the navigate section when aft_callgraph is disabled", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      disabledTools: new Set(),
+      disabledTools: new Set(["aft_callgraph"]),
     });
     expect(out).not.toContain("Use `aft_callgraph`");
     expect(out).not.toContain("- `callers`");
   });
 
-  test("uses aft_grep when hoist_builtin_tools is false", () => {
+  test("never names the removed prefixed host tools", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: false,
-      semanticEnabled: false,
-      bashBackgroundEnabled: false,
-      bashCompressionEnabled: false,
+      bashBackgroundEnabled: true,
+      bashCompressionEnabled: true,
       disabledTools: new Set(),
     });
-    expect(out).toContain("`aft_grep`");
-    expect(out).not.toContain("`grep` to locate");
+    for (const prefixed of ["aft_grep", "aft_read", "aft_bash", "aft_glob"]) {
+      expect(out).not.toContain(`\`${prefixed}\``);
+    }
   });
 
-  test("references aft_search only when semantic is enabled", () => {
+  test("references aft_search only when it is registered", () => {
     const off = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      disabledTools: new Set(),
+      disabledTools: new Set(["aft_search"]),
     });
     expect(off).not.toContain("aft_search");
 
     const on = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       disabledTools: new Set(),
@@ -164,9 +138,6 @@ describe("buildWorkflowHints", () => {
 
   test("inspect hint is gated by registered tool availability", () => {
     const registered = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       disabledTools: new Set(),
@@ -175,33 +146,30 @@ describe("buildWorkflowHints", () => {
     expect(registered).toContain("aft_inspect");
 
     const minimal = buildWorkflowHints({
-      toolSurface: "minimal",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      disabledTools: new Set(),
+      disabledTools: new Set(["aft_inspect"]),
     });
     expect(minimal).not.toContain("**Codebase health & diagnostics**");
     expect(minimal).not.toContain("aft_inspect");
   });
 
-  test("returns null at minimal surface — only safety tool present", () => {
-    // At minimal surface, aft_outline + aft_zoom may still be present, but
-    // grep is not. Code-exploration section needs both. URL section still
-    // works on outline+zoom alone, so we get a non-null block. Test the
-    // truly empty case:
+  test("returns null when only the safety tool is registered", () => {
     const empty = buildWorkflowHints({
-      toolSurface: "minimal",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      // Disable all tools that could produce a hint section. At minimal
-      // surface, aft_callgraph/grep/aft_search are already absent; disabling
-      // outline+zoom kills URL+exploration sections, bash kills the timeout
-      // hint, leaving nothing to render.
-      disabledTools: new Set(["aft_outline", "aft_zoom", "bash"]),
+      // Disable every tool that could produce a hint section.
+      disabledTools: new Set([
+        "aft_outline",
+        "aft_zoom",
+        "aft_search",
+        "aft_callgraph",
+        "aft_inspect",
+        "grep",
+        "read",
+        "bash",
+        "bash_status",
+      ]),
     });
     // null proves the parallel-tool-call frame is never emitted on its own
     // (unshift runs only when sections already have content).
@@ -210,9 +178,6 @@ describe("buildWorkflowHints", () => {
 
   test("section guarded by disabledTools", () => {
     const out = buildWorkflowHints({
-      toolSurface: "all",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: true,
       bashCompressionEnabled: true,
       disabledTools: new Set(["aft_callgraph", "bash_status"]),
@@ -232,43 +197,38 @@ describe("buildWorkflowHints", () => {
 
 describe("buildHintsFromConfig", () => {
   test("emits hints by default", () => {
-    const config: AftConfig = { tool_surface: "recommended" };
+    const config: AftConfig = {};
     const out = buildHintsFromConfig(config, new Set());
     expect(out).not.toBeNull();
     expect(out).toContain("## IMPORTANT NOTICE about your tools");
   });
 
-  test("honors hoist_builtin_tools=false (uses aft_grep)", () => {
-    const config: AftConfig = { tool_surface: "recommended", hoist_builtin_tools: false };
-    const out = buildHintsFromConfig(config, new Set());
-    expect(out).toContain("`aft_grep`");
-  });
-
-  test("appends bg-bash hint by default on recommended (post-v0.27.2 graduation)", () => {
+  test("appends bg-bash hint by default (post-v0.27.2 graduation)", () => {
     // Bash + background are on by default for `recommended` after the bash
     // graduation, so the long-running hint surfaces without explicit opt-in.
-    const defaults: AftConfig = { tool_surface: "recommended" };
+    const defaults: AftConfig = {};
     expect(buildHintsFromConfig(defaults, new Set())).toContain("**Long-running commands**");
   });
 
   test("omits bg-bash hint when bash: false (hard opt-out)", () => {
-    const off: AftConfig = { tool_surface: "recommended", bash: false };
+    const off: AftConfig = { bash: false };
     expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
   });
 
   test("omits bg-bash hint when bash: { background: false }", () => {
-    const off: AftConfig = { tool_surface: "recommended", bash: { background: false } };
+    const off: AftConfig = { bash: { background: false } };
     expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
   });
 
-  test("omits bg-bash hint on tool_surface=minimal (bash off by default)", () => {
-    const off: AftConfig = { tool_surface: "minimal" };
-    expect(buildHintsFromConfig(off, new Set())).not.toContain("**Long-running commands**");
+  test("omits bg-bash hint when bash and its companions are not registered", () => {
+    const config: AftConfig = { disabled_tools: ["bash", "bash_status"] };
+    expect(buildHintsFromConfig(config, new Set(["bash", "bash_status"]))).not.toContain(
+      "**Long-running commands**",
+    );
   });
 
   test("legacy background=true still enables bg-bash hint", () => {
     const on: AftConfig = {
-      tool_surface: "recommended",
       experimental: { bash: { background: true } },
     };
     expect(buildHintsFromConfig(on, new Set())).toContain("**Long-running commands**");

@@ -129,25 +129,17 @@ function createMockSearchHarness(
 
 describe("searchTools", () => {
   test("registers hoisted tool names when built-in hoisting is enabled", () => {
-    const { tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+    const { tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
       success: true,
     }));
 
     expect(Object.keys(tools).sort()).toEqual(["glob", "grep"]);
   });
 
-  test("registers aft-prefixed tool names when built-in hoisting is disabled", () => {
-    const { tools } = createMockSearchHarness({ hoist_builtin_tools: false }, () => ({
-      success: true,
-    }));
-
-    expect(Object.keys(tools).sort()).toEqual(["aft_glob", "aft_grep"]);
-  });
-
   test("returns grep response.text when provided and uses session-scoped bridges", async () => {
     const sdkCtx = createMockSdkContext(projectRoot);
     const { bridgeCalls, sendCalls, toolCallCalls, tools } = createMockSearchHarness(
-      { hoist_builtin_tools: true },
+      { disabled_tools: [] },
       () => ({
         success: true,
         text: [
@@ -186,7 +178,7 @@ describe("searchTools", () => {
 
   test("returns glob response.text when provided", async () => {
     const { sendCalls, toolCallCalls, tools } = createMockSearchHarness(
-      { hoist_builtin_tools: true },
+      { disabled_tools: [] },
       () => ({
         success: true,
         text: [
@@ -223,7 +215,7 @@ describe("searchTools", () => {
   test("grep forwards include strings for server-side brace-aware translation", async () => {
     // The server splits include globs, so the plugin forwards brace groups unchanged.
     const include = "**/" + "*.{vue,ts,tsx}";
-    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
       success: true,
       text: "ok",
     }));
@@ -233,7 +225,7 @@ describe("searchTools", () => {
 
   test("grep forwards mixed comma includes without plugin-side normalization", async () => {
     const nestedVueTsx = "**/" + "*.{vue,tsx}";
-    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
       success: true,
       text: "ok",
     }));
@@ -245,7 +237,7 @@ describe("searchTools", () => {
   });
 
   test("grep forwards comma-separated includes for server normalization", async () => {
-    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
       success: true,
       text: "ok",
     }));
@@ -262,13 +254,10 @@ describe("searchTools", () => {
       fs.mkdirSync(inside, { recursive: true });
       fs.mkdirSync(external, { recursive: true });
       const askCalls: AskCall[] = [];
-      const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
-        () => ({
-          success: true,
-          text: "ok",
-        }),
-      );
+      const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+        success: true,
+        text: "ok",
+      }));
 
       await tools.grep.execute(
         { pattern: "TODO", path: `${inside} ${external}` },
@@ -295,7 +284,7 @@ describe("searchTools", () => {
       fs.mkdirSync(external, { recursive: true });
       const askCalls: AskCall[] = [];
       const { sendCalls, toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => ({
           success: true,
           text: "",
@@ -336,7 +325,7 @@ describe("searchTools", () => {
         text: "src/hit.ts:1: const value = 'needle';\n\nFound 1 match across 1 file",
       };
       const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => bridgeResponse,
       );
 
@@ -364,7 +353,7 @@ describe("searchTools", () => {
       fs.mkdirSync(e2e, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "ok" };
       const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => bridgeResponse,
       );
 
@@ -389,14 +378,11 @@ describe("searchTools", () => {
       fs.mkdirSync(project, { recursive: true });
       const missingA = path.join(project, "missing-a");
       const missingB = path.join(project, "missing-b");
-      const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
-        () => ({
-          success: false,
-          code: "path_not_found",
-          message: "path_not_found",
-        }),
-      );
+      const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+        success: false,
+        code: "path_not_found",
+        message: "path_not_found",
+      }));
 
       let thrown: unknown;
       try {
@@ -424,7 +410,7 @@ describe("searchTools", () => {
       fs.mkdirSync(spaced, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "ok" };
       const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => bridgeResponse,
       );
 
@@ -451,7 +437,7 @@ describe("searchTools", () => {
       fs.mkdirSync(src, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "src/hit.ts" };
       const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => bridgeResponse,
       );
 
@@ -479,7 +465,7 @@ describe("searchTools", () => {
       fs.mkdirSync(e2e, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "src/a.ts\ne2e/b.ts" };
       const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => bridgeResponse,
       );
 
@@ -504,14 +490,11 @@ describe("searchTools", () => {
       fs.mkdirSync(project, { recursive: true });
       const missingA = path.join(project, "missing-a");
       const missingB = path.join(project, "missing-b");
-      const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
-        () => ({
-          success: false,
-          code: "path_not_found",
-          message: "path_not_found",
-        }),
-      );
+      const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+        success: false,
+        code: "path_not_found",
+        message: "path_not_found",
+      }));
 
       let thrown: unknown;
       try {
@@ -539,7 +522,7 @@ describe("searchTools", () => {
       fs.mkdirSync(spaced, { recursive: true });
       const bridgeResponse = { success: true, complete: true, text: "with space/a.ts" };
       const { toolCallCalls, tools } = createMockSearchHarness(
-        { hoist_builtin_tools: true },
+        { disabled_tools: [] },
         () => bridgeResponse,
       );
 
@@ -560,7 +543,7 @@ describe("searchTools", () => {
   test("glob splits exact absolute file patterns into path and basename", async () => {
     const project = projectRoot;
     const absoluteFile = path.join(project, "src", "exact.ts");
-    const { toolCallCalls, tools } = createMockSearchHarness({ hoist_builtin_tools: true }, () => ({
+    const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
       success: true,
       text: absoluteFile,
       files: [absoluteFile],

@@ -8,6 +8,15 @@ import { fileURLToPath } from "node:url";
 import { AftConfigSchema, resolveBridgePoolTransportOptions } from "../config.js";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+
+/**
+ * Fields every resolved config carries: the absent-base disabled default and
+ * the default-on index switches.
+ */
+const RESOLVED_DEFAULTS = {
+  disabled_tools: ["aft_delete", "aft_move"],
+  indexes: { callgraph: true, semantic: true, trigram: true },
+};
 const tempRoots = new Set<string>();
 
 function createConfigFixture() {
@@ -61,14 +70,14 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
-  test("returns an empty config when user and project config files are missing", () => {
+  test("no config resolves the default disables and default-on indexes", () => {
     const fixture = createConfigFixture();
     const result = runConfigLoader(fixture.projectDirectory, {
       HOME: join(fixture.root, "home"),
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout)).toEqual({});
+    expect(JSON.parse(result.stdout)).toEqual(RESOLVED_DEFAULTS);
     expect(result.stderr).toBe("");
   });
 
@@ -110,37 +119,35 @@ describe("loadAftConfig", () => {
     expect(enabled.stderr).toContain("Ignoring github from project config");
   });
 
-  test("deprecated GitHub aliases apply while new keys win", () => {
+  test("retired GitHub aliases reject the whole load even beside canonical leaves", () => {
     const fixture = createConfigFixture();
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    const script = `
+      import { loadAftConfig } from "./src/config.ts";
+      try {
+        loadAftConfig(process.env.PROJECT_DIR!);
+        console.log("loaded");
+      } catch (err) {
+        console.log(JSON.stringify(err.errors));
+      }
+    `;
+    const run = () =>
+      spawnSync(process.execPath, ["-e", script], {
+        cwd: packageRoot,
+        env: { ...process.env, ...env, PROJECT_DIR: fixture.projectDirectory },
+        encoding: "utf8",
+      }).stdout.trim();
+
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({
-        github: { shim: true, read: false },
-        gh_shim: { enabled: false },
-        gh_read: { enabled: true },
-      }),
+      JSON.stringify({ github: { read: false }, gh_read: { enabled: true } }),
     );
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    expect(JSON.parse(result.stdout)).toMatchObject({ github: { shim: true, read: false } });
-    expect(result.stderr).toContain("gh_shim.enabled");
-    expect(result.stderr).toContain("github.shim");
-    expect(result.stderr).toContain("gh_read.enabled");
-    expect(result.stderr).toContain("github.read");
-  });
-
-  test("enabled defaults to true when not configured", () => {
-    const fixture = createConfigFixture();
-    const result = runConfigLoader(fixture.projectDirectory, {
-      HOME: join(fixture.root, "home"),
-      XDG_CONFIG_HOME: fixture.xdgConfigHome,
-    });
-
-    const config = JSON.parse(result.stdout) as { enabled?: boolean };
-    expect(config.enabled ?? true).toBe(true);
+    expect(JSON.parse(run())).toEqual(["removed_config_key:gh_read:use:github.read"]);
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { enabled: false } }));
+    expect(JSON.parse(run())).toEqual(["removed_config_key:gh_shim:use:github.shim"]);
+    // The supported binary override alone loads.
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_shim: { binary_path: "/opt/aft" } }));
+    expect(run()).toBe("loaded");
   });
 
   test("edit_mode uses ordinary project-over-user precedence", () => {
@@ -174,7 +181,19 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout).hoist_builtin_tools).toBe(true);
+    // Legacy hoist false in the base disables host names; the harness block
+    // can only add disables, so its `true` does not re-enable them.
+    expect(JSON.parse(result.stdout).disabled_tools).toEqual([
+      "aft_delete",
+      "aft_move",
+      "apply_patch",
+      "bash",
+      "edit",
+      "glob",
+      "grep",
+      "read",
+      "write",
+    ]);
   });
 
   test("applies project OpenCode overrides before the project trust boundary", () => {
@@ -267,7 +286,7 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("edit_mode");
   });
 
-  test("project enabled false overrides user enabled true", () => {
+  test("legacy project enabled:false disables only unprotected tools", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: false }));
@@ -277,11 +296,16 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect((JSON.parse(result.stdout) as { enabled?: boolean }).enabled).toBe(false);
-    expect(result.stderr).not.toContain("Ignoring enabled from project config");
+    const config = JSON.parse(result.stdout) as { disabled_tools: string[]; enabled?: boolean };
+    expect(config.enabled).toBeUndefined();
+    for (const protectedName of ["aft_safety", "read", "write", "edit", "grep", "glob", "bash"]) {
+      expect(config.disabled_tools).not.toContain(protectedName);
+    }
+    expect(config.disabled_tools).toContain("aft_zoom");
+    expect(result.stderr).toContain("disabled_tools.aft_safety");
   });
 
-  test("project enabled true overrides user enabled false", () => {
+  test("legacy user enabled:false disables every tool and project enabled:true adds nothing", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ enabled: false }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ enabled: true }));
@@ -291,8 +315,9 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect((JSON.parse(result.stdout) as { enabled?: boolean }).enabled).toBe(true);
-    expect(result.stderr).not.toContain("Ignoring enabled from project config");
+    expect((JSON.parse(result.stdout) as { disabled_tools: string[] }).disabled_tools).toHaveLength(
+      23,
+    );
   });
 
   test("logs and skips malformed JSONC", () => {
@@ -304,7 +329,7 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout)).toEqual({});
+    expect(JSON.parse(result.stdout)).toEqual(RESOLVED_DEFAULTS);
     expect(result.stderr).toContain(
       `[aft-plugin] Error loading config from ${fixture.projectConfigPath}:`,
     );
@@ -374,8 +399,7 @@ describe("loadAftConfig", () => {
     writeFileSync(
       fixture.userConfigPath,
       `{
-        "search_index": true,
-        "semantic_search": true,
+        "indexes": { "trigram": true, "semantic": true },
         "formatter": {
           // typescript uses biome
           "typescript": "biome"
@@ -396,8 +420,7 @@ describe("loadAftConfig", () => {
 
     const loaded = JSON.parse(result.stdout);
     // The valid settings must survive rather than falling back to {} defaults.
-    expect(loaded.search_index).toBe(true);
-    expect(loaded.semantic_search).toBe(true);
+    expect(loaded.indexes).toEqual({ callgraph: true, semantic: true, trigram: true });
     expect(loaded.formatter).toEqual({ typescript: "biome" });
     expect(loaded.lsp?.servers?.["my-server"]?.binary).toBe("my-lsp");
     // No symbol-to-string crash should have been logged.
@@ -431,7 +454,7 @@ describe("loadAftConfig", () => {
       fixture.userConfigPath,
       JSON.stringify({
         format_on_edit: "yes please",
-        hoist_builtin_tools: false,
+        disabled_tools: ["aft_zoom"],
         formatter: { typescript: "biome" },
         checker: { typescript: 123 },
       }),
@@ -443,7 +466,8 @@ describe("loadAftConfig", () => {
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
-      hoist_builtin_tools: false,
+      ...RESOLVED_DEFAULTS,
+      disabled_tools: ["aft_zoom"],
       formatter: { typescript: "biome" },
     });
     expect(result.stderr).toContain("Config validation error in");
@@ -464,7 +488,6 @@ describe("loadAftConfig", () => {
       fixture.projectConfigPath,
       JSON.stringify({
         validate_on_edit: "full",
-        hoist_builtin_tools: true,
         formatter: { typescript: "prettier" },
         checker: { typescript: "tsc" },
       }),
@@ -476,9 +499,9 @@ describe("loadAftConfig", () => {
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
+      ...RESOLVED_DEFAULTS,
       format_on_edit: false,
       validate_on_edit: "full",
-      hoist_builtin_tools: true,
       formatter: { typescript: "prettier", python: "black" },
       checker: { python: "ruff", typescript: "tsc" },
     });
@@ -784,8 +807,8 @@ describe("loadAftConfig", () => {
     writeFileSync(
       fixture.userConfigPath,
       JSON.stringify({
-        experimental_search_index: true,
-        experimental_semantic_search: true,
+        experimental_search_index: false,
+        experimental_semantic_search: false,
         experimental_lsp_ty: true,
         experimental_bash_rewrite: true,
         experimental_bash_compress: true,
@@ -801,22 +824,24 @@ describe("loadAftConfig", () => {
     // Flat keys lift to nested experimental.bash, then graduation lifts the
     // bash block to top-level. lsp_ty stays under experimental.
     expect(JSON.parse(result.stdout)).toEqual({
-      search_index: true,
-      semantic_search: true,
+      ...RESOLVED_DEFAULTS,
+      indexes: { callgraph: true, semantic: false, trigram: false },
       bash: { rewrite: true, compress: true, background: true },
       experimental: { lsp_ty: true },
     });
+    // Retired index aliases translate in memory; only `aft doctor --fix`
+    // rewrites them. The other flat keys still relocate on disk.
     const migrated = readFileSync(fixture.userConfigPath, "utf-8");
-    expect(migrated).toContain('"search_index": true');
-    expect(migrated).not.toContain("experimental_search_index");
+    expect(migrated).toContain('"experimental_search_index": false');
+    expect(migrated).not.toContain('"search_index"');
     expect(result.stderr).toContain(
-      `Migrated config at ${fixture.userConfigPath}: removed experimental_search_index, experimental_semantic_search, experimental_lsp_ty, experimental_bash_rewrite, experimental_bash_compress, experimental_bash_background`,
+      `Migrated config at ${fixture.userConfigPath}: removed experimental_lsp_ty, experimental_bash_rewrite, experimental_bash_compress, experimental_bash_background`,
     );
   });
 
   test("migration is idempotent", () => {
     const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_bash_rewrite: true }));
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
 
     const first = runConfigLoader(fixture.projectDirectory, env);
@@ -824,7 +849,7 @@ describe("loadAftConfig", () => {
 
     expect(first.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
     expect(second.stderr).not.toContain(`Migrated config at ${fixture.userConfigPath}`);
-    expect(JSON.parse(second.stdout)).toEqual({ search_index: true });
+    expect(JSON.parse(second.stdout)).toEqual(JSON.parse(first.stdout));
   });
 
   test("migration preserves JSONC comments", () => {
@@ -860,7 +885,7 @@ describe("loadAftConfig", () => {
       [
         "{",
         "  // top comment",
-        '  "tool_surface": "all", // inline on retained key',
+        '  "format_on_edit": true, // inline on retained key',
         "  /* block comment */",
         '  "experimental_bash_rewrite": true,',
         '  "experimental_bash_compress": false  // inline on removed key',
@@ -886,7 +911,7 @@ describe("loadAftConfig", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
-      JSON.stringify({ experimental_search_index: true, experimental_semantic_search: true }),
+      JSON.stringify({ experimental_lsp_ty: true, experimental_bash_compress: true }),
     );
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -896,13 +921,13 @@ describe("loadAftConfig", () => {
 
     expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
     const migrated = readFileSync(fixture.userConfigPath, "utf-8");
-    expect(migrated).toContain("search_index");
-    expect(migrated).toContain("semantic_search");
+    expect(migrated).toContain("lsp_ty");
+    expect(migrated).not.toContain("experimental_bash_compress");
   });
 
   test("migrates project and user config independently", () => {
     const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_lsp_ty: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ experimental_bash_compress: true }));
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -913,14 +938,14 @@ describe("loadAftConfig", () => {
     // experimental_bash_compress lifts to nested experimental.bash.compress,
     // then graduates to top-level bash.compress with materialized siblings.
     expect(JSON.parse(result.stdout)).toMatchObject({
-      search_index: true,
+      experimental: { lsp_ty: true },
       bash: { compress: true, rewrite: false, background: false },
     });
     expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
     expect(result.stderr).toContain(`Migrated config at ${fixture.projectConfigPath}`);
   });
 
-  test("migration conflict keeps new value and removes old key", () => {
+  test("legacy index precedence: immediate legacy name beats the experimental alias", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -932,16 +957,15 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout)).toEqual({ search_index: false });
-    expect(readFileSync(fixture.userConfigPath, "utf-8")).not.toContain(
-      "experimental_search_index",
-    );
-    expect(result.stderr).toContain("Config migration conflict");
+    expect(JSON.parse(result.stdout).indexes.trigram).toBe(false);
+    // Ordinary loading never rewrites retired keys.
+    expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_search_index");
+    expect(result.stderr).toContain("superseded_legacy_config");
   });
 
   test("read-only migration warning does not fail load", () => {
     const fixture = createConfigFixture();
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_search_index: true }));
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_lsp_ty: true }));
     chmodSync(fixture.userConfigPath, 0o444);
 
     const result = runConfigLoader(fixture.projectDirectory, {
@@ -949,9 +973,12 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout)).toEqual({ search_index: true });
+    expect(JSON.parse(result.stdout)).toEqual({
+      ...RESOLVED_DEFAULTS,
+      experimental: { lsp_ty: true },
+    });
     if (result.stderr.includes("Config migration could not write")) {
-      expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_search_index");
+      expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_lsp_ty");
     }
   });
 
@@ -960,9 +987,22 @@ describe("loadAftConfig", () => {
   });
 
   test("OpenCode-only keys remain available to OpenCode", () => {
-    expect(AftConfigSchema.parse({ hoist_builtin_tools: false, auto_update: false })).toMatchObject(
-      { hoist_builtin_tools: false, auto_update: false },
-    );
+    expect(AftConfigSchema.parse({ disabled_tools: [], auto_update: false })).toMatchObject({
+      disabled_tools: [],
+      auto_update: false,
+    });
+    // Removed keys are gone from the canonical schema.
+    for (const removed of [
+      "tool_surface",
+      "hoist_builtin_tools",
+      "search_index",
+      "semantic_search",
+      "callgraph_store",
+      "gh_read",
+      "enabled",
+    ]) {
+      expect(AftConfigSchema.safeParse({ [removed]: true }).success).toBe(false);
+    }
   });
 
   test("loads semantic config block and propagates nested fields", () => {
@@ -987,6 +1027,7 @@ describe("loadAftConfig", () => {
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
+      ...RESOLVED_DEFAULTS,
       semantic: {
         backend: "openai_compatible",
         model: "text-embedding-3-small",
@@ -1026,6 +1067,7 @@ describe("loadAftConfig", () => {
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
+      ...RESOLVED_DEFAULTS,
       semantic: {
         backend: "ollama",
         base_url: "http://localhost:11434",
@@ -1054,6 +1096,7 @@ describe("loadAftConfig", () => {
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
+      ...RESOLVED_DEFAULTS,
       semantic: {
         model: "text-embedding-3-small",
       },
@@ -1153,7 +1196,7 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(JSON.parse(result.stdout)).toEqual({});
+    expect(JSON.parse(result.stdout)).toEqual(RESOLVED_DEFAULTS);
     expect(result.stderr).toContain("Partial config loaded — invalid sections skipped");
   });
 
@@ -1183,6 +1226,7 @@ describe("loadAftConfig", () => {
     });
 
     expect(JSON.parse(result.stdout)).toEqual({
+      ...RESOLVED_DEFAULTS,
       lsp: {
         servers: {
           tinymist: {

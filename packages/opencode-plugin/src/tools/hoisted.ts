@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { coerceBoolean, coerceStringArray, toolErrorFromResponse } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { resolveBashConfig, resolveGithubConfig } from "../config.js";
+import { resolveGithubConfig } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import { resolvePromptContext } from "../shared/last-assistant-model.js";
 import type { PluginContext } from "../types.js";
@@ -60,7 +60,7 @@ function readAttachments(data: Record<string, unknown>): ReadAttachment[] {
 const ISSUE_AND_PR_READ_DESCRIPTION =
   "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
 
-/** Reuse the user-tier gh_read description gate across every GitHub-capable tool. */
+/** Reuse the user-tier github.read description gate across every GitHub-capable tool. */
 export function whenGhReadEnabled(enabled: boolean, description: string): string {
   return enabled ? description : "";
 }
@@ -1314,14 +1314,15 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
 // ---------------------------------------------------------------------------
 
 /**
- * Returns hoisted tools keyed by opencode's built-in names.
- * Overrides: read, write, edit, apply_patch (always when hoisting is on).
+ * Returns AFT's host-slot tools keyed by the host's built-in names, plus the
+ * move/delete tools and the bash companions.
  *
- * Bash hoisting follows the resolved `bash` config. When bash is enabled, the
- * primary `bash` tool is registered. Background control tools (`bash_status`,
- * `bash_write`, `bash_watch`, and `bash_kill`) are registered only when
- * `bash.background` resolves true. With `bash.background: false`, foreground
- * bash runs to completion inline and no background surface is exposed.
+ * Every entry is always returned; `buildAftToolDefinitions` removes only the
+ * names listed in the resolved `disabled_tools`. The bash companions
+ * (`bash_status`, `bash_write`, `bash_watch`, `bash_kill`) are independent
+ * registrations: disabling `bash` does not remove them, and when the bash
+ * runtime gate (`bash.enabled`) is off every bash operation reports
+ * `bash_disabled` instead of disappearing.
  */
 export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const tools: Record<string, ToolDefinition> = {
@@ -1331,55 +1332,12 @@ export function hoistedTools(ctx: PluginContext): Record<string, ToolDefinition>
     apply_patch: createApplyPatchTool(ctx),
     aft_delete: createDeleteTool(ctx),
     aft_move: createMoveTool(ctx),
+    bash: createBashTool(ctx),
+    bash_status: createBashStatusTool(ctx),
+    bash_write: createBashWriteTool(ctx),
+    bash_watch: createBashWatchTool(ctx),
+    bash_kill: createBashKillTool(ctx),
   };
-
-  // Bash hoisting is gated by the single resolved bash config — see
-  // `resolveBashConfig` in config.ts for the precedence rules. `bash` itself
-  // registers whenever bash is enabled; the background control tools register
-  // only when `bash.background` is enabled.
-  const bashCfg = resolveBashConfig(ctx.config);
-  if (bashCfg.enabled) {
-    tools.bash = createBashTool(ctx);
-    if (bashCfg.background) {
-      tools.bash_status = createBashStatusTool(ctx);
-      tools.bash_write = createBashWriteTool(ctx);
-      tools.bash_watch = createBashWatchTool(ctx);
-      tools.bash_kill = createBashKillTool(ctx);
-    }
-  }
-
-  return prepareToolMap(tools, { hashlineEffective: ctx.hashlineEffective });
-}
-
-/**
- * Returns the same tools with aft_ prefix (for when hoisting is disabled).
- */
-export function aftPrefixedTools(ctx: PluginContext): Record<string, ToolDefinition> {
-  const aftEditTool = createEditTool(ctx, "aft_write");
-
-  const tools: Record<string, ToolDefinition> = {
-    aft_read: createReadTool(ctx),
-    aft_write: createWriteTool(ctx, "aft_edit"),
-    aft_edit: aftEditTool,
-    aft_apply_patch: createApplyPatchTool(ctx),
-    aft_delete: createDeleteTool(ctx),
-    aft_move: createMoveTool(ctx),
-  };
-
-  // Hoist-off mode: same gating as hoisted mode but with the aft_ prefix on
-  // the primary bash tool so it doesn't override OpenCode's native bash. The
-  // background control tools keep their unprefixed names because they refer to
-  // AFT-spawned task IDs that the native bash doesn't know about.
-  const bashCfg = resolveBashConfig(ctx.config);
-  if (bashCfg.enabled) {
-    tools.aft_bash = createBashTool(ctx);
-    if (bashCfg.background) {
-      tools.bash_status = createBashStatusTool(ctx);
-      tools.bash_write = createBashWriteTool(ctx);
-      tools.bash_watch = createBashWatchTool(ctx);
-      tools.bash_kill = createBashKillTool(ctx);
-    }
-  }
 
   return prepareToolMap(tools, { hashlineEffective: ctx.hashlineEffective });
 }

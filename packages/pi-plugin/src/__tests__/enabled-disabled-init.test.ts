@@ -30,12 +30,17 @@ afterEach(() => {
   mock.restore();
 });
 
-describe.serial("Pi enabled config toggle", () => {
-  test("disabled config registers nothing without resolving a binary or creating a bridge pool", async () => {
+describe.serial("Pi rejected config", () => {
+  test("rejected config registers nothing without resolving a binary or creating a bridge pool", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-pi-disabled-"));
     const projectDir = join(tempDir, "project");
     mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });
-    writeFileSync(join(projectDir, ".cortexkit", "aft.jsonc"), '{ "enabled": false }\n');
+    // The already-retired alias rejects the whole candidate load; there is no
+    // longer a config switch that disables AFT wholesale.
+    writeFileSync(
+      join(projectDir, ".cortexkit", "aft.jsonc"),
+      '{ "gh_read": { "enabled": true } }\n',
+    );
     previousCwd = process.cwd();
     process.chdir(projectDir);
     const loggedProjectDir = process.cwd();
@@ -70,6 +75,7 @@ describe.serial("Pi enabled config toggle", () => {
     expect(createPoolSpy).not.toHaveBeenCalled();
     await new Promise((resolve) => setTimeout(resolve, 600));
     const logText = existsSync(logFile) ? readFileSync(logFile, "utf8") : "";
-    expect(logText).toContain(`AFT disabled by config for ${loggedProjectDir}`);
+    expect(logText).toContain("removed_config_key:gh_read:use:github.read");
+    expect(loggedProjectDir).toBeTruthy();
   });
 });

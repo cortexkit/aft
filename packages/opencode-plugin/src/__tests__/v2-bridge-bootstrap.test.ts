@@ -90,7 +90,7 @@ describe.serial("OpenCode 2 boot resolves ONNX Runtime through the shared bootst
 
     const dependencies = {
       ...inertV2Surface,
-      loadConfig: () => ({ semantic_search: true }),
+      loadConfig: () => ({ indexes: { semantic: true }, disabled_tools: [] }),
       migrateConfigLocations: () => [],
       resolveVersion: () => "0.0.0-test",
       resolveBinary: async () => join(tempDir as string, "never-spawned-aft"),

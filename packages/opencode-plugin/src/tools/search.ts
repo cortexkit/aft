@@ -289,9 +289,8 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
     },
   };
 
-  const hoisting = ctx.config.hoist_builtin_tools !== false;
   return {
-    [hoisting ? "grep" : "aft_grep"]: grepTool,
-    [hoisting ? "glob" : "aft_glob"]: globTool,
+    grep: grepTool,
+    glob: globTool,
   };
 }

@@ -3,10 +3,13 @@ import { Effect } from "effect";
 
 import {
   applyToolSurfaceOverrides,
+  createProjectAcceptance,
   createSharedPoolOptions,
   defaultBridgeBootstrapDependencies,
   loadBootstrapConfig,
   prepareBridgeEnvironment,
+  reportHashlineDowngrade,
+  unknownDisabledToolsReporter,
 } from "../bridge-bootstrap.js";
 import { resolveBridgePoolTransportOptions } from "../config.js";
 import { debug, log, warn } from "../logger.js";
@@ -53,8 +56,9 @@ async function bootLocation(context, location, dependencies) {
   );
   const canonicalDirectory = location.project?.canonical ?? directory;
   const consumers = dependencies.toolConsumers(context);
-  const isProjectEnabled = (projectRoot) =>
-    projectRoot === directory ? true : dependencies.loadConfig(projectRoot).enabled !== false;
+  // Only a rejected configuration keeps AFT out of a project; there is no
+  // config switch that turns it off.
+  const isProjectEnabled = createProjectAcceptance(directory, dependencies);
   // getPool is only called on a version mismatch, after the pool exists.
   const pool = await dependencies.acquireBridge(canonicalDirectory, {
     harness: "opencode",
@@ -82,12 +86,14 @@ async function bootLocation(context, location, dependencies) {
     storageDir: environment.storageDir,
     isProjectEnabled,
   };
-  const tools = dependencies.buildToolMap(toolContext, config);
-  const { hashlineEditRegistered } = applyToolSurfaceOverrides(
-    pool,
+  const tools = dependencies.buildToolMap(
+    toolContext,
     config,
-    new Set(Object.keys(tools)),
+    unknownDisabledToolsReporter(notify),
   );
+  const registeredTools = new Set(Object.keys(tools));
+  const { hashlineEditRegistered } = applyToolSurfaceOverrides(pool, config, registeredTools);
+  reportHashlineDowngrade(config, registeredTools, notify);
   toolContext.hashlineEffective = hashlineEditRegistered;
   return { consumers, pool, tools };
 }

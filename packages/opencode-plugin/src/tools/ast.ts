@@ -177,11 +177,8 @@ export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
     },
   };
 
-  // When hoisting: register as ast_grep_search/ast_grep_replace (override oh-my-opencode's)
-  // When not hoisting: register as aft_ast_search/aft_ast_replace
-  const hoisting = ctx.config.hoist_builtin_tools !== false;
   return {
-    [hoisting ? "ast_grep_search" : "aft_ast_search"]: searchTool,
-    [hoisting ? "ast_grep_replace" : "aft_ast_replace"]: replaceTool,
+    ast_grep_search: searchTool,
+    ast_grep_replace: replaceTool,
   };
 }

@@ -50,15 +50,12 @@ function freshTerminal() {
 }
 
 describe("Pi aft_inspect surface", () => {
-  test("registers at recommended surface unless explicitly disabled", () => {
-    expect(__test__.resolveToolSurface({ tool_surface: "recommended" }).inspect).toBe(true);
-    expect(__test__.resolveToolSurface({ tool_surface: "minimal" }).inspect).toBe(false);
+  test("registers unless explicitly disabled (inspect.enabled is runtime-only)", () => {
+    expect(__test__.resolveToolSurface({ disabled_tools: [] }).inspect).toBe(true);
     expect(
-      __test__.resolveToolSurface({
-        tool_surface: "recommended",
-        disabled_tools: ["aft_inspect"],
-      }).inspect,
-    ).toBe(false);
+      __test__.resolveToolSurface({ disabled_tools: [], inspect: { enabled: false } }).inspect,
+    ).toBe(true);
+    expect(__test__.resolveToolSurface({ disabled_tools: ["aft_inspect"] }).inspect).toBe(false);
   });
 
   test("documents blocking-fresh results, scope narrowing, and the alert channel", () => {

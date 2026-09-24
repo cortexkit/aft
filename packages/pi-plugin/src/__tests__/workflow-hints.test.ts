@@ -9,9 +9,6 @@ import {
 
 describe("Pi hashline tag-source guidance", () => {
   const opts = {
-    toolSurface: "all" as const,
-    hoistBuiltins: true,
-    semanticEnabled: true,
     bashBackgroundEnabled: true,
     bashCompressionEnabled: true,
     absentTools: new Set<string>(),
@@ -35,11 +32,8 @@ describe("Pi hashline tag-source guidance", () => {
 });
 
 describe("Pi buildWorkflowHints", () => {
-  test("renders all four sections at tool_surface=all with bg + semantic", () => {
+  test("renders all four sections with every tool registered and bg enabled", () => {
     const out = buildWorkflowHints({
-      toolSurface: "all",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: true,
       bashCompressionEnabled: true,
       absentTools: new Set(),
@@ -87,9 +81,6 @@ describe("Pi buildWorkflowHints", () => {
 
   test("replaces zoom steering with read when zoom is disabled", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       absentTools: new Set(["aft_zoom"]),
@@ -103,9 +94,6 @@ describe("Pi buildWorkflowHints", () => {
 
   test("omits bash STOP steer when bash is absent", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: true,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       absentTools: new Set(["bash"]),
@@ -115,12 +103,9 @@ describe("Pi buildWorkflowHints", () => {
 
   test("steers to grep tool when aft_search is absent", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      absentTools: new Set(),
+      absentTools: new Set(["aft_search"]),
     });
     expect(out).toContain(
       "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead.",
@@ -129,9 +114,6 @@ describe("Pi buildWorkflowHints", () => {
 
   test("omits bg-bash section when background is disabled", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       absentTools: new Set(),
@@ -141,9 +123,6 @@ describe("Pi buildWorkflowHints", () => {
 
   test("shows pipe guidance only when compression is enabled", () => {
     const on = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: true,
       absentTools: new Set(),
@@ -155,9 +134,6 @@ describe("Pi buildWorkflowHints", () => {
     expect(on).not.toContain("compression is on,");
 
     const off = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       absentTools: new Set(),
@@ -166,23 +142,17 @@ describe("Pi buildWorkflowHints", () => {
     expect(off).not.toContain("`bun test | grep fail`");
   });
 
-  test("omits navigate at recommended surface", () => {
+  test("omits navigate when aft_callgraph is absent", () => {
     const out = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      absentTools: new Set(),
+      absentTools: new Set(["aft_callgraph"]),
     });
     expect(out).not.toContain("Use `aft_callgraph`");
   });
 
   test("inspect hint is gated by registered tool availability", () => {
     const registered = buildWorkflowHints({
-      toolSurface: "recommended",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
       absentTools: new Set(),
@@ -191,12 +161,9 @@ describe("Pi buildWorkflowHints", () => {
     expect(registered).toContain("aft_inspect");
 
     const minimal = buildWorkflowHints({
-      toolSurface: "minimal",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      absentTools: new Set(),
+      absentTools: new Set(["aft_inspect"]),
     });
     expect(minimal).not.toContain("**Codebase health & diagnostics**");
     expect(minimal).not.toContain("aft_inspect");
@@ -204,12 +171,19 @@ describe("Pi buildWorkflowHints", () => {
 
   test("returns null when all sections gated off by absentTools", () => {
     const out = buildWorkflowHints({
-      toolSurface: "minimal",
-      hoistBuiltins: true,
-      semanticEnabled: false,
       bashBackgroundEnabled: false,
       bashCompressionEnabled: false,
-      absentTools: new Set(["aft_outline", "aft_zoom"]),
+      absentTools: new Set([
+        "aft_outline",
+        "aft_zoom",
+        "aft_search",
+        "aft_callgraph",
+        "aft_inspect",
+        "grep",
+        "read",
+        "bash",
+        "bash_status",
+      ]),
     });
     // null proves the parallel-tool-call frame is never emitted on its own
     // (unshift runs only when sections already have content).
@@ -220,10 +194,9 @@ describe("Pi buildWorkflowHints", () => {
 describe("Pi buildHintsFromConfig", () => {
   test("emits hints by default and includes hoisted bash name", () => {
     const config: AftConfig = {
-      tool_surface: "recommended",
       experimental: { bash: { background: true } },
     };
-    const out = buildHintsFromConfig(config, new Set(), true);
+    const out = buildHintsFromConfig(config, new Set());
     expect(out).not.toBeNull();
     // Hoisted bash name (bash, not aft_bash) appears in the foreground-default
     // long-running guidance.
@@ -231,14 +204,9 @@ describe("Pi buildHintsFromConfig", () => {
     expect(out).toContain("**Codebase health & diagnostics**");
   });
 
-  test("uses prefixed file and bash names when hoisting is disabled", () => {
-    const config: AftConfig = {
-      tool_surface: "recommended",
-      hoist_builtin_tools: false,
-      bash: true,
-    };
-    const out = buildHintsFromConfig(config, new Set(), false);
-    expect(out).toContain("`aft_read({ path:");
-    expect(out).toContain("`aft_bash({ command, wait: true })`");
+  test("never names the removed prefixed host tools", () => {
+    const out = buildHintsFromConfig({ bash: true }, new Set());
+    expect(out).not.toContain("`aft_read");
+    expect(out).not.toContain("`aft_bash");
   });
 });

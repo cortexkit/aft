@@ -1696,12 +1696,11 @@ describe("bash tool adapter", () => {
 });
 
 /**
- * Verify that the primary `bash` tool can be registered without exposing the
- * background control surface. `registerBashTool` is called only after Pi's
- * outer bash-enabled gate passes; inside it, `bash.background` controls
- * `bash_status` / `bash_kill` / `bash_write` / `bash_watch` registration.
+ * Standalone `registerBashTool` registers the four background companions
+ * whatever the runtime bash settings are; registration is decided only by
+ * `disabled_tools`, and the engine reports runtime gates when called.
  */
-describe("registerBashTool gates background control tools", () => {
+describe("registerBashTool registers companions independently of runtime bash config", () => {
   function registerWithConfig(config: PluginContext["config"]) {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
@@ -1731,26 +1730,26 @@ describe("registerBashTool gates background control tools", () => {
     expectBackgroundControls(tools, true);
   });
 
-  test("bash.background=false → bash registered without background controls", () => {
+  test("bash.background=false → bash registered with independent companions", () => {
     const tools = registerWithConfig({ bash: { background: false } } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
+    expectBackgroundControls(tools, true);
   });
 
-  test("legacy rewrite=true only → bash registered without background controls", () => {
+  test("legacy rewrite=true only → bash registered with independent companions", () => {
     const tools = registerWithConfig({
       experimental: { bash: { rewrite: true } },
     } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
+    expectBackgroundControls(tools, true);
   });
 
-  test("legacy compress=true only → bash registered without background controls", () => {
+  test("legacy compress=true only → bash registered with independent companions", () => {
     const tools = registerWithConfig({
       experimental: { bash: { compress: true } },
     } as PluginContext["config"]);
     expect(tools.get("bash")).toBeDefined();
-    expectBackgroundControls(tools, false);
+    expectBackgroundControls(tools, true);
   });
 
   test("legacy background=true → full bash surface registered", () => {

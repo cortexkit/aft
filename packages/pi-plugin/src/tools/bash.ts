@@ -460,8 +460,8 @@ export function registerBashTool(
 ): void {
   const isPowerShell = shell === "powershell";
   const spawnHook = isPowerShell ? undefined : getBashSpawnHook(pi);
-  const readToolName = registeredName === "bash" ? "read" : "aft_read";
-  const grepToolName = registeredName === "bash" ? "grep" : "aft_grep";
+  const readToolName = "read";
+  const grepToolName = "grep";
   // Agent-facing wording: no internal vocabulary ("hoisted", "Rust handler",
   // "command rewriting") — describe what the tool does and what NOT to use it
   // for. The code-search prohibition steers to aft_search when registered,
@@ -696,24 +696,37 @@ export function registerBashTool(
   });
 
   // Standalone registration remains convenient for direct consumers. The
-  // production surface passes false and registers this family independently so
-  // it also works when the primary tool is named `aft_bash`.
+  // production surface passes false and registers each companion by name.
   if (registerCompanions) registerBashCompanionTools(pi, ctx);
 }
 
 /**
- * Register controls for AFT-owned background task IDs.
- *
- * These names deliberately do not follow the primary bash tool's prefix: Pi's
- * native bash cannot create or inspect AFT task IDs, so the controls do not
- * replace host-native behavior and must stay discoverable for `aft_bash`.
+ * Register controls for AFT-owned background task IDs. Each companion is an
+ * independent registration controlled only by its own name in
+ * `disabled_tools`; the bash runtime gate is enforced by the engine.
  */
-export function registerBashCompanionTools(pi: ExtensionAPI, ctx: PluginContext): void {
-  if (!resolveBashConfig(ctx.config).background) return;
-  pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
-  pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
-  pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
-  pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
+export function registerBashCompanionTools(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  enabled: {
+    bashStatus: boolean;
+    bashWatch: boolean;
+    bashWrite: boolean;
+    bashKill: boolean;
+  } = { bashStatus: true, bashWatch: true, bashWrite: true, bashKill: true },
+): void {
+  if (enabled.bashStatus) {
+    pi.registerTool<typeof BashStatusParams, BashStatusDetails>(createBashStatusTool(ctx));
+  }
+  if (enabled.bashWatch) {
+    pi.registerTool<typeof BashWatchParams, BashWatchDetails>(createBashWatchTool(ctx));
+  }
+  if (enabled.bashWrite) {
+    pi.registerTool<typeof BashWriteParams, BashWriteDetails>(createBashWriteTool(ctx));
+  }
+  if (enabled.bashKill) {
+    pi.registerTool<typeof BashTaskParams, BashKillDetails>(createBashKillTool(ctx));
+  }
 }
 
 /**

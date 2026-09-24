@@ -67,7 +67,7 @@ function makeHarness(models: ModelConfig[], ghReadEnabled = false) {
   const pluginContext = {
     pool: { getBridge: () => bridge },
     client,
-    config: { gh_read: { enabled: ghReadEnabled } },
+    config: { github: { read: ghReadEnabled } },
     storageDir: "/tmp/aft-vision-capability",
   } as unknown as PluginContext;
   const tool = createReadTool(pluginContext);

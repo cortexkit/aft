@@ -112,6 +112,8 @@ export {
   isBashTransportDeadError,
   toolErrorFromResponse,
 } from "./error-contract.js";
+// --- feature-based configuration policy (shared with crates/aft feature_config.rs) ---
+export * from "./feature-config.js";
 // --- compact UI formatting ---
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
@@ -145,6 +147,12 @@ export {
   resolveCortexKitStorageRoot,
   resolveLegacyStorageRoot,
 } from "./migration.js";
+export {
+  clearMigrationNotices,
+  deliverMigrationNoticeOnce,
+  type MigrationNoticeOptions,
+  migrationNoticeStorePath,
+} from "./migration-notices.js";
 // --- npm resolution (PATH-stripped GUI launch fallback) ---
 export type { NpmInvocation, ResolvedNpm } from "./npm-resolver.js";
 export {

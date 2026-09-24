@@ -241,23 +241,16 @@ function compactTerminalField(value: string | undefined, fallback: string): stri
 }
 
 export interface InspectToolConfig {
-  tool_surface?: "minimal" | "recommended" | "all";
   disabled_tools?: string[];
-  inspect?: {
-    enabled?: boolean;
-    diagnostics_timeout_ms?: number;
-    tier2_idle_minutes?: number;
-  };
 }
 
-export function inspectToolSurfaceEnabled(config: InspectToolConfig): boolean {
-  return (config.tool_surface ?? "recommended") !== "minimal" && config.inspect?.enabled !== false;
-}
-
+/**
+ * `aft_inspect` registers exactly when it is not disabled. `inspect.enabled:
+ * false` is a runtime gate (the engine answers `inspect_disabled`), not a
+ * registration predicate.
+ */
 export function shouldRegisterInspectTool(config: InspectToolConfig): boolean {
-  return (
-    inspectToolSurfaceEnabled(config) && !(config.disabled_tools ?? []).includes("aft_inspect")
-  );
+  return !(config.disabled_tools ?? []).includes("aft_inspect");
 }
 
 type TimerHandle = ReturnType<typeof setTimeout>;

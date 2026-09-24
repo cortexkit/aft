@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
-import { aftPrefixedTools } from "../tools/hoisted.js";
+import { hoistedTools } from "../tools/hoisted.js";
 import { formatZoomBatchResult, readingTools } from "../tools/reading.js";
 import { safetyTools } from "../tools/safety.js";
 import type { PluginContext } from "../types.js";
@@ -142,25 +142,25 @@ describe("Tool round-trips", () => {
     expect(batch.text).toContain('Symbol "Missing" not found: symbol not found');
   });
 
-  test("OpenCode-prefixed aft_edit rejects the retired mode/file form", async () => {
+  test("OpenCode edit rejects the retired mode/file form", async () => {
     createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
+    const tools = hoistedTools(createPluginContext(pool));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
     const filePath = resolve(tmpDir, "written.ts");
     await expect(
-      tools.aft_edit.execute(
+      tools.edit.execute(
         { mode: "write", file: filePath, content: "export const value = 1;\n" },
         sdkCtx,
       ),
-    ).rejects.toThrow("retired");
+    ).rejects.toThrow(/retired|Unrecognized keys/);
     expect(await readFile(filePath, "utf8").catch(() => "missing")).toBe("missing");
   });
 
   test("edit_symbol replaces a function and returns backup_id and syntax_valid", async () => {
     createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
+    const tools = hoistedTools(createPluginContext(pool));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -168,12 +168,12 @@ describe("Tool round-trips", () => {
     const original = 'export function hello(): string {\n  return "hi";\n}\n';
 
     // First write the file
-    await tools.aft_write.execute({ path: filePath, content: original }, sdkCtx);
+    await tools.write.execute({ path: filePath, content: original }, sdkCtx);
 
     // Now replace the symbol
     const newContent = 'export function hello(): string {\n  return "world";\n}\n';
     const resultStr = toolResultText(
-      await tools.aft_edit.execute(
+      await tools.edit.execute(
         {
           path: filePath,
           symbol: "hello",
@@ -193,7 +193,7 @@ describe("Tool round-trips", () => {
 
   test("undo restores the file after edit_symbol", async () => {
     createBridge();
-    const editTools = aftPrefixedTools(createPluginContext(pool));
+    const editTools = hoistedTools(createPluginContext(pool));
     const undoTools = safetyTools(createPluginContext(pool));
     tmpDir = await mkdtemp(resolve(PROJECT_CWD, "target", "aft-undo-test-"));
     sdkCtx = createMockSdkContext(tmpDir);
@@ -203,13 +203,13 @@ describe("Tool round-trips", () => {
       "export function greet(name: string): string {\n  return `Hello, ${name}!`;\n}\n";
 
     // Write original file
-    await editTools.aft_write.execute({ path: filePath, content: original }, sdkCtx);
+    await editTools.write.execute({ path: filePath, content: original }, sdkCtx);
 
     // Edit the symbol
     const replacement =
       "export function greet(name: string): string {\n  return `Goodbye, ${name}!`;\n}\n";
     const editResult = toolResultText(
-      await editTools.aft_edit.execute(
+      await editTools.edit.execute(
         {
           path: filePath,
           symbol: "greet",
@@ -247,7 +247,7 @@ describe("Tool round-trips", () => {
   // ---------------------------------------------------------------------
   test("edit rejects top-level startLine/endLine with a helpful pointer to edits[]", async () => {
     createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
+    const tools = hoistedTools(createPluginContext(pool));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -257,7 +257,7 @@ describe("Tool round-trips", () => {
 
     let err: Error | undefined;
     try {
-      await tools.aft_edit.execute(
+      await tools.edit.execute(
         // No `mode` field, so this hits the modern (non-back-compat) path.
         // startLine/endLine are not valid top-level params on edit.
         { filePath, startLine: 1, endLine: 1, content: "export const x = 2;\n" },
@@ -277,7 +277,7 @@ describe("Tool round-trips", () => {
 
   test("edit rejects content-only calls without an explicit edit mode", async () => {
     createBridge();
-    const tools = aftPrefixedTools(createPluginContext(pool));
+    const tools = hoistedTools(createPluginContext(pool));
     tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
@@ -287,7 +287,7 @@ describe("Tool round-trips", () => {
 
     let err: Error | undefined;
     try {
-      await tools.aft_edit.execute(
+      await tools.edit.execute(
         // `content` alone (no oldString, no symbol, no edits, no operations,
         // no legacy `mode: "write"`). Previously this silently overwrote the
         // file. Now it must fail instead of silently choosing a write mode.

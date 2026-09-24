@@ -87,26 +87,28 @@ describe("Pi Lane G plugin orchestration regressions", () => {
   });
 
   test("ONNX runtime is only prepared for fastembed semantic search", () => {
-    expect(__test__.shouldPrepareOnnxRuntime({ semantic_search: true })).toBe(true);
+    expect(__test__.shouldPrepareOnnxRuntime({ indexes: { semantic: true } })).toBe(true);
     expect(
       __test__.shouldPrepareOnnxRuntime({
-        semantic_search: true,
+        indexes: { semantic: true },
         semantic: { backend: "fastembed" },
       }),
     ).toBe(true);
     expect(
       __test__.shouldPrepareOnnxRuntime({
-        semantic_search: true,
+        indexes: { semantic: true },
         semantic: { backend: "openai_compatible" },
       }),
     ).toBe(false);
     expect(
       __test__.shouldPrepareOnnxRuntime({
-        semantic_search: true,
+        indexes: { semantic: true },
         semantic: { backend: "ollama" },
       }),
     ).toBe(false);
-    expect(__test__.shouldPrepareOnnxRuntime({ semantic_search: false })).toBe(false);
+    expect(__test__.shouldPrepareOnnxRuntime({ indexes: { semantic: false } })).toBe(false);
+    // Semantic defaults on when the switch is absent.
+    expect(__test__.shouldPrepareOnnxRuntime({})).toBe(true);
   });
 
   test("version mismatch handler downloads matching binary and hot-swaps pool", async () => {

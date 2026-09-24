@@ -327,7 +327,7 @@ function pluginContext(harness: E2EHarness): PluginContext {
       find: { symbols: async () => ({ data: [] }) },
     } as unknown as PluginContext["client"],
     config: {
-      hoist_builtin_tools: true,
+      disabled_tools: [],
       lsp: { diagnostics_on_edit: false },
     } as PluginContext["config"],
     storageDir: harness.path(".storage"),

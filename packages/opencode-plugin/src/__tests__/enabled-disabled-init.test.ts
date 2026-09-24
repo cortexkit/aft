@@ -27,16 +27,21 @@ afterEach(() => {
   mock.restore();
 });
 
-describe.serial("OpenCode enabled config toggle", () => {
+describe.serial("OpenCode rejected config", () => {
   // Explicit 30s budget: the poll below plus env-guard acquisition can exceed
   // bun's 5s default on a loaded CI runner.
-  test("worktree project config disables registration from a nested session directory", async () => {
+  test("a rejected worktree project config publishes no registrations from a nested session directory", async () => {
     tempDir = mkdtempSync(join(tmpdir(), "aft-opencode-disabled-"));
     const projectDir = join(tempDir, "project");
     const sessionDirectory = join(projectDir, "src", "nested");
     mkdirSync(sessionDirectory, { recursive: true });
     mkdirSync(join(projectDir, ".cortexkit"), { recursive: true });
-    writeFileSync(join(projectDir, ".cortexkit", "aft.jsonc"), '{ "enabled": false }\n');
+    // The already-retired alias rejects the whole candidate load; there is no
+    // longer a config switch that disables AFT wholesale.
+    writeFileSync(
+      join(projectDir, ".cortexkit", "aft.jsonc"),
+      '{ "gh_read": { "enabled": true } }\n',
+    );
     releaseEnv = await acquireEnv({
       // CI exports an ambient AFT_CACHE_DIR; it outranks XDG_CACHE_HOME in the
       // shared cache resolver, so clear it for the sandbox to apply.
@@ -49,12 +54,12 @@ describe.serial("OpenCode enabled config toggle", () => {
     // Assert the log CALL, not the log file: the logger buffers behind a
     // 500ms flush timer onto a file shared by every test in the process, so
     // file-content assertions are racy/pollutable in full-suite runs.
-    const logSpy = spyOn(logger, "log");
+    const errorSpy = spyOn(logger, "error");
     const findBinarySpy = spyOn(bridge, "findBinary").mockImplementation(async () => {
-      throw new Error("findBinary should not run when AFT is disabled");
+      throw new Error("findBinary should not run when the config is rejected");
     });
     const createPoolSpy = spyOn(bridge, "createAftTransportPool").mockImplementation(async () => {
-      throw new Error("createAftTransportPool should not run when AFT is disabled");
+      throw new Error("createAftTransportPool should not run when the config is rejected");
     });
 
     const plugin = await loadPlugin();
@@ -67,7 +72,9 @@ describe.serial("OpenCode enabled config toggle", () => {
     expect(surface.tool).toEqual({});
     expect(findBinarySpy).not.toHaveBeenCalled();
     expect(createPoolSpy).not.toHaveBeenCalled();
-    const logged = logSpy.mock.calls.map((call) => String(call[0]));
-    expect(logged).toContain(`AFT disabled by config for ${projectDir}`);
+    const logged = errorSpy.mock.calls.map((call) => String(call[0]));
+    expect(logged.some((line) => line.includes("removed_config_key:gh_read:use:github.read"))).toBe(
+      true,
+    );
   });
 });
