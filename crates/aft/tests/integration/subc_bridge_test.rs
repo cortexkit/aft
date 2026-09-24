@@ -2459,6 +2459,42 @@ fn subc_bridge_module_draining_closes_every_daemon_request_credit() {
     );
 }
 
+/// The root's executor gets a single reader slot, so one long read occupies it
+/// and every bash wait poll on that root queues behind the read.
+fn single_reader_executor_config() -> ExecutorConfig {
+    ExecutorConfig {
+        pool_size: 4,
+        read_cap: 1,
+        actor_cap: 3,
+        heavy_permits: 2,
+        drr_quantum: 1,
+    }
+}
+
+#[test]
+fn subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "subc_bridge_module_draining_answers_bash_wait_whose_poll_is_stuck",
+        Duration::from_secs(90),
+        drive_module_draining_answers_stuck_bash_wait_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+        single_reader_executor_config(),
+    );
+}
+
+#[test]
+fn subc_bridge_client_cancel_answers_held_bash_wait_and_keeps_command_running() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "subc_bridge_client_cancel_answers_held_bash_wait_and_keeps_command_running",
+        Duration::from_secs(90),
+        drive_client_cancel_answers_held_bash_wait_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+        bridge_executor_config(),
+    );
+}
+
 #[test]
 fn subc_bridge_completion_queued_before_drain_is_drained_after_resubscribe() {
     run_subc_bridge_test(
@@ -8060,6 +8096,227 @@ async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaem
         "late terminal frames with no open request: {:?}",
         ledger.unmatched_terminals
     );
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// Reproduces the restart drain whose held `wait: true` bash calls never sent
+/// their terminal frame: each wait detaches on its own poll, but that poll runs
+/// through the root's executor actor, and while other work fills the actor the
+/// poll never runs. The daemon's drain gave the module about two seconds.
+/// Every held wait must still be answered inside that budget, and the command
+/// must keep running as a background task that delivers its completion.
+async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    const WAIT_CHANNEL: u16 = 1;
+    // Channel 5 is reserved by the bridge dispatch for a failing configure.
+    const READ_CHANNEL: u16 = 6;
+    const WAIT_CORR: u64 = 1101;
+    const READ_CORR: u64 = 1102;
+    // The drain budget the daemon gave in the incident this reproduces.
+    const TERMINAL_BOUND: Duration = Duration::from_secs(2);
+
+    bind_route1(&mut stream, &root1).await;
+    send_route_bind_with_session(&mut stream, READ_CHANNEL, 60, &root1, "session-read").await;
+    expect_route_bind_ack(&mut stream, 60).await;
+
+    let started = root1.join("stuck-wait-started");
+    let done = root1.join("stuck-wait-done");
+    send_tool_call(
+        &mut stream,
+        WAIT_CHANNEL,
+        WAIT_CORR,
+        "bash",
+        json!({
+            "command": "printf s > stuck-wait-started; sleep 6; printf d > stuck-wait-done",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "timeout": 60_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    wait_for_file(&started, "stuck bash wait start marker").await;
+    // Let the call move from its spawn job into the foreground wait.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Occupy the root's only reader slot: the wait's next poll queues behind it.
+    send_tool_call(
+        &mut stream,
+        READ_CHANNEL,
+        READ_CORR,
+        "echo",
+        json!({ "case": "overlap" }),
+    )
+    .await;
+    state.wait_until("blocking read started", |inner| inner.overlap_started == 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let drain_started = Instant::now();
+    send_module_draining(&mut stream, Duration::from_secs(30)).await;
+    let deadline = drain_started + TERMINAL_BOUND;
+    let answer = loop {
+        let Some(frame) = read_any_frame_until(&mut stream, deadline, "stuck wait terminal").await
+        else {
+            panic!(
+                "the bash wait whose poll is queued behind a busy executor actor was still open {TERMINAL_BOUND:?} after module.draining"
+            );
+        };
+        match frame.header.ty {
+            FrameType::Push => {}
+            FrameType::Response if frame.header.corr == WAIT_CORR => break frame,
+            _ => panic!(
+                "unexpected frame while waiting for the stuck wait's terminal: {:?}",
+                frame.header
+            ),
+        }
+    };
+    eprintln!(
+        "module.draining answered the stuck bash wait in {:?}",
+        drain_started.elapsed()
+    );
+    assert!(!tool_result_is_error(&answer), "stuck wait errored");
+    let text = tool_result_text(&answer);
+    assert!(
+        text.contains("Detached because AFT is restarting"),
+        "stuck wait text: {text:?}"
+    );
+    let response = tool_response_json(&answer);
+    assert_eq!(response["status"], "running", "stuck wait: {response}");
+    let task_id = response["task_id"]
+        .as_str()
+        .expect("detached task id")
+        .to_string();
+
+    // The blocking read finishes normally once released.
+    state.release_overlap();
+    let read = read_frame_timeout(&mut stream, "blocking read response").await;
+    assert_eq!(read.header.ty, FrameType::Response);
+    assert_eq!(read.header.corr, READ_CORR);
+
+    // The command was detached, not killed, and its completion is delivered.
+    assert!(!done.exists(), "the command should still be running");
+    wait_for_file(&done, "detached bash completion sentinel").await;
+    drain_bg_completions_until(
+        &mut stream,
+        WAIT_CHANNEL,
+        1200,
+        std::slice::from_ref(&task_id),
+        250,
+        1199,
+    )
+    .await;
+
+    // The wait task's own late answer must not produce a second terminal.
+    let late_deadline = Instant::now() + Duration::from_millis(500);
+    while let Some(frame) = read_any_frame_until(&mut stream, late_deadline, "late frames").await {
+        assert!(
+            frame.header.corr != WAIT_CORR || frame.header.ty == FrameType::Push,
+            "second terminal for the answered bash wait: {:?}",
+            frame.header
+        );
+    }
+    send_connection_goodbye(&mut stream).await;
+}
+
+/// A held `wait: true` bash call whose client cancels it (the caller is gone)
+/// must be answered at once instead of staying open until its command exits,
+/// which for a long-running command held the request for over an hour. The
+/// command itself is not killed: it continues as a background task and its
+/// completion is still delivered.
+async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    const WAIT_CHANNEL: u16 = 1;
+    const WAIT_CORR: u64 = 1301;
+    const TERMINAL_BOUND: Duration = Duration::from_secs(2);
+
+    bind_route1(&mut stream, &root1).await;
+    let started = root1.join("cancel-wait-started");
+    let done = root1.join("cancel-wait-done");
+    send_tool_call(
+        &mut stream,
+        WAIT_CHANNEL,
+        WAIT_CORR,
+        "bash",
+        json!({
+            "command": "printf s > cancel-wait-started; sleep 5; printf d > cancel-wait-done",
+            "foreground_orchestrate": true,
+            "wait": true,
+            "timeout": 60_000,
+            "compressed": false,
+        }),
+    )
+    .await;
+    wait_for_file(&started, "cancelled bash wait start marker").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let cancelled_at = Instant::now();
+    send_bg_events_cancel(&mut stream, WAIT_CHANNEL, WAIT_CORR).await;
+    let deadline = cancelled_at + TERMINAL_BOUND;
+    let answer = loop {
+        let Some(frame) =
+            read_any_frame_until(&mut stream, deadline, "cancelled wait terminal").await
+        else {
+            panic!("the cancelled bash wait was still open {TERMINAL_BOUND:?} after the client's Cancel");
+        };
+        match frame.header.ty {
+            FrameType::Push => {}
+            FrameType::Error | FrameType::Response if frame.header.corr == WAIT_CORR => {
+                break frame
+            }
+            _ => panic!(
+                "unexpected frame while waiting for the cancelled wait's terminal: {:?}",
+                frame.header
+            ),
+        }
+    };
+    assert_eq!(
+        answer.header.ty,
+        FrameType::Error,
+        "a cancelled call is answered with the cancelled error"
+    );
+    let body = String::from_utf8_lossy(&answer.body).into_owned();
+    assert!(body.contains("cancelled"), "cancel answer body: {body}");
+    assert!(!done.exists(), "the command should still be running");
+
+    // The command ran to completion as a background task, and its completion
+    // is delivered to the session.
+    wait_for_file(&done, "cancelled wait's command completion sentinel").await;
+    let mut delivered = None;
+    for attempt in 0_u64..100 {
+        let corr = 1400 + attempt;
+        send_tool_call(&mut stream, WAIT_CHANNEL, corr, "bash_drain_completions", json!({}))
+            .await;
+        let frame = read_frame_timeout(&mut stream, "drain completions").await;
+        assert_eq!(
+            frame.header.corr, corr,
+            "unexpected frame after cancel: {:?}",
+            frame.header
+        );
+        let response = tool_response_json(&frame);
+        delivered = response["bg_completions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|completion| {
+                completion["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("cancel-wait-done"))
+            })
+            .cloned();
+        if delivered.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let delivered = delivered.expect("the cancelled wait's command never delivered a completion");
+    assert_eq!(delivered["exit_code"], 0, "completion: {delivered}");
     send_connection_goodbye(&mut stream).await;
 }
 

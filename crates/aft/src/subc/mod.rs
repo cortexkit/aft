@@ -3548,6 +3548,23 @@ where
 
             next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
 
+            // Held bash calls the loop answers itself: ones whose client
+            // cancelled them, and, once a drain's backstop is due, ones that
+            // have not detached on their own.
+            let bash_drain_due = drain_progress
+                .as_ref()
+                .is_some_and(|progress| Instant::now() >= progress.bash_backstop_at);
+            if let Err(error) = bash::answer_held_bash_calls_from_module_loop(
+                &writer_tx,
+                &routes,
+                &dispatch_path_metrics,
+                bash_drain_due,
+            )
+            .await
+            {
+                break Err(error);
+            }
+
             if let Some(progress) = drain_progress.as_mut() {
                 if !progress.quiesced_reported || !progress.deadline_reported {
                     let census = drain::held_request_census(
@@ -3930,6 +3947,23 @@ where
                         {
                             break Err(error);
                         }
+                        // A held bash call never passes through the active
+                        // tool calls above: its wait task holds it. The caller
+                        // is gone, so answer it now and let the command finish
+                        // as a background task instead of holding the request
+                        // (and the daemon's credit for it) until it exits.
+                        if dispatch_path_metrics.held_bash_calls.request_cancel(channel, corr) {
+                            if let Err(error) = bash::answer_held_bash_calls_from_module_loop(
+                                &writer_tx,
+                                &routes,
+                                &dispatch_path_metrics,
+                                false,
+                            )
+                            .await
+                            {
+                                break Err(error);
+                            }
+                        }
                     }
                     FrameType::Push if frame.header.channel == 0 => {
                         match serde_json::from_slice::<ModuleControlCommand>(&frame.body) {
@@ -3956,6 +3990,10 @@ where
                                     until,
                                     quiesced_reported: false,
                                     deadline_reported: false,
+                                    bash_backstop_at: drain::bash_drain_backstop_at(
+                                        Instant::now(),
+                                        until,
+                                    ),
                                 });
                                 let ended = match end_bg_subscriptions_for_drain(
                                     &writer_tx,

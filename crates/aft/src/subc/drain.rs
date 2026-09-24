@@ -15,7 +15,11 @@
 //!   response (`spawning`, `foreground` wait window, `block` to completion,
 //!   `wait` for `wait: true`). Detached into a background task, exactly as a
 //!   user-message detach does: the caller gets the task id and the task keeps
-//!   running. Never killed.
+//!   running. Never killed. Each call detaches itself on its next poll; one
+//!   still held when the backstop comes due (see [`bash_drain_backstop_at`])
+//!   is answered by the module loop directly, because that poll runs through
+//!   the root's executor actor and can sit queued behind other work there. A
+//!   client Cancel for a held bash call is answered the same way, at once.
 //! - `permission_ask`: an untrusted bash call waiting on the host's
 //!   elicitation answer. Answered at once with the retryable
 //!   `module_reloading` error; the command never ran, so a retry is safe.
@@ -39,6 +43,7 @@
 //! daemon keeps counting a request this census no longer shows.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicU8;
 
 use super::*;
 
@@ -123,29 +128,145 @@ impl BashHoldPhase {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Who sends a held bash call's terminal frame. Exactly one side may: the
+/// call's own wait task, or the module loop answering for it.
+const CLAIM_UNCLAIMED: u8 = 0;
+const CLAIM_WAIT_TASK: u8 = 1;
+const CLAIM_MODULE_LOOP: u8 = 2;
+
+/// Decides, exactly once, who answers one held bash call.
+///
+/// The wait task normally answers its own call after polling the command on the
+/// executor. The module loop answers instead when that answer cannot be relied
+/// on to arrive in time: a drain whose deadline is near, or a client Cancel
+/// (the caller is gone). Whichever side claims first owns the answer and the
+/// task's wait registration; the other side must neither send a frame nor touch
+/// that registration.
+#[derive(Default)]
+pub(super) struct BashCallClaim {
+    state: AtomicU8,
+    cancel_requested: AtomicBool,
+    changed: Notify,
+}
+
+impl BashCallClaim {
+    /// Claims the call for its wait task. True when the wait task owns the
+    /// answer (it just claimed it, or had already); false when the module loop
+    /// answered, in which case the wait task must stop without a frame.
+    pub(super) fn claim_for_wait_task(&self) -> bool {
+        match self.state.compare_exchange(
+            CLAIM_UNCLAIMED,
+            CLAIM_WAIT_TASK,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(current) => current == CLAIM_WAIT_TASK,
+        }
+    }
+
+    fn claim_for_module_loop(&self) -> bool {
+        let claimed = self
+            .state
+            .compare_exchange(
+                CLAIM_UNCLAIMED,
+                CLAIM_MODULE_LOOP,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        if claimed {
+            self.changed.notify_one();
+        }
+        claimed
+    }
+
+    pub(super) fn claimed_by_module_loop(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == CLAIM_MODULE_LOOP
+    }
+
+    fn request_cancel(&self) {
+        self.cancel_requested.store(true, Ordering::SeqCst);
+        self.changed.notify_one();
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::SeqCst)
+    }
+
+    /// Resolves after the module loop claimed the call. The wait task selects
+    /// on this so it stops even while it is parked on an executor poll that
+    /// may not run for a long time.
+    pub(super) async fn module_loop_claimed(&self) {
+        loop {
+            let notified = self.changed.notified();
+            if self.claimed_by_module_loop() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// What the module loop needs to answer a held bash call and hand its command
+/// to the background without the executor: the call's own wait loop runs every
+/// poll through the root's executor actor, and a busy or wedged actor would
+/// otherwise keep the call open for as long as it stays busy.
+#[derive(Clone)]
+pub(super) struct BashDetachTarget {
+    pub(super) task_id: String,
+    pub(super) session_id: String,
+    /// `wait: true`: the session's wait-mode registration is ended rather than
+    /// only the foreground-task registration.
+    pub(super) wait_mode: bool,
+    pub(super) registry: crate::bash_background::BgTaskRegistry,
+    pub(super) request_id: String,
+    pub(super) ver: u8,
+    pub(super) flags: Flags,
+    pub(super) format_context: crate::subc_format::FormatContext,
+}
+
+/// Why the module loop answered a held bash call itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BashLoopAnswer {
+    /// The drain deadline is near and the call had not detached on its own.
+    Drain,
+    /// The client cancelled the call.
+    Cancel,
+}
+
+#[derive(Clone)]
 struct HeldBashCall {
     since: Instant,
     phase: BashHoldPhase,
+    claim: Arc<BashCallClaim>,
+    /// Set once the call reaches its foreground wait; until then the module
+    /// loop cannot detach the command because it does not exist yet.
+    detach: Option<BashDetachTarget>,
 }
 
 /// Every bash call whose route request has not yet received a terminal frame.
 /// Entries are added when the call is submitted and removed when its completion
-/// reaches the module loop.
+/// reaches the module loop, or when the module loop answers the call itself.
 #[derive(Default)]
 pub(super) struct HeldBashCalls {
     calls: StdMutex<HashMap<(RouteChannel, u64), HeldBashCall>>,
 }
 
 impl HeldBashCalls {
-    pub(super) fn insert(&self, route: RouteChannel, corr: u64) {
+    /// Starts tracking a call and returns the claim its wait task must honour.
+    pub(super) fn insert(&self, route: RouteChannel, corr: u64) -> Arc<BashCallClaim> {
+        let claim = Arc::new(BashCallClaim::default());
         self.lock().insert(
             (route, corr),
             HeldBashCall {
                 since: Instant::now(),
                 phase: BashHoldPhase::Spawning,
+                claim: Arc::clone(&claim),
+                detach: None,
             },
         );
+        claim
     }
 
     pub(super) fn set_phase(&self, route: RouteChannel, corr: u64, phase: BashHoldPhase) {
@@ -154,12 +275,70 @@ impl HeldBashCalls {
         }
     }
 
+    pub(super) fn set_detach_target(
+        &self,
+        route: RouteChannel,
+        corr: u64,
+        target: BashDetachTarget,
+    ) {
+        if let Some(call) = self.lock().get_mut(&(route, corr)) {
+            call.detach = Some(target);
+        }
+    }
+
     pub(super) fn remove(&self, route: RouteChannel, corr: u64) {
         self.lock().remove(&(route, corr));
     }
 
-    fn snapshot(&self) -> Vec<HeldBashCall> {
-        self.lock().values().copied().collect()
+    /// Records a client Cancel for a held call. Returns false when no bash
+    /// call is held under that id.
+    pub(super) fn request_cancel(&self, route: RouteChannel, corr: u64) -> bool {
+        match self.lock().get(&(route, corr)) {
+            Some(call) => {
+                call.claim.request_cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Claims, for the module loop, every held call it should answer now: each
+    /// call whose client cancelled it, and, when `drain_due`, each call in a
+    /// phase that detaches on drain. Only calls that already reached their
+    /// foreground wait qualify. Claimed calls stop being tracked here; the
+    /// caller owes each one its terminal frame.
+    pub(super) fn claim_for_module_loop(
+        &self,
+        drain_due: bool,
+    ) -> Vec<(RouteChannel, u64, BashDetachTarget, BashLoopAnswer)> {
+        let mut calls = self.lock();
+        let mut claimed = Vec::new();
+        for (&(route, corr), call) in calls.iter() {
+            let Some(target) = call.detach.as_ref() else {
+                continue;
+            };
+            let reason = if call.claim.cancel_requested() {
+                BashLoopAnswer::Cancel
+            } else if drain_due && call.phase.detaches_on_drain() {
+                BashLoopAnswer::Drain
+            } else {
+                continue;
+            };
+            if call.claim.claim_for_module_loop() {
+                claimed.push((route, corr, target.clone(), reason));
+            }
+        }
+        for (route, corr, _, _) in &claimed {
+            calls.remove(&(*route, *corr));
+        }
+        claimed
+    }
+
+    fn snapshot(&self) -> Vec<(Instant, BashHoldPhase)> {
+        self.lock()
+            .values()
+            .map(|call| (call.since, call.phase))
+            .collect()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(RouteChannel, u64), HeldBashCall>> {
@@ -313,12 +492,8 @@ pub(super) fn held_request_census(
             }
         }
     }
-    for call in metrics.held_bash_calls.snapshot() {
-        census.add_kind(
-            call.phase.label(),
-            age(call.since),
-            call.phase.detaches_on_drain(),
-        );
+    for (since, phase) in metrics.held_bash_calls.snapshot() {
+        census.add_kind(phase.label(), age(since), phase.detaches_on_drain());
     }
     for ask in pending_bash_asks.values() {
         census.add("permission_ask", age(ask.asked_at));
@@ -397,6 +572,24 @@ pub(super) struct DrainProgress {
     pub(super) until: Instant,
     pub(super) quiesced_reported: bool,
     pub(super) deadline_reported: bool,
+    /// From this instant the module loop answers every held bash call that has
+    /// not detached on its own (see [`bash_drain_backstop_at`]).
+    pub(super) bash_backstop_at: Instant,
+}
+
+/// Longest a drain waits for held bash calls to detach on their own before the
+/// module loop answers them itself. A call normally detaches on its next
+/// 100 ms poll, but that poll runs through the root's executor actor, and a
+/// busy actor can hold it past the whole drain deadline.
+pub(super) const BASH_DRAIN_BACKSTOP_MAX: Duration = Duration::from_millis(500);
+
+/// When the module loop starts answering held bash calls for a drain that began
+/// at `now` and ends at `until`: [`BASH_DRAIN_BACKSTOP_MAX`] after the notice,
+/// or a quarter of the way to the deadline when the drain is shorter, so the
+/// answers still land well inside it.
+pub(super) fn bash_drain_backstop_at(now: Instant, until: Instant) -> Instant {
+    let window = until.saturating_duration_since(now);
+    now + BASH_DRAIN_BACKSTOP_MAX.min(window / 4)
 }
 
 /// Response for a request answered early because the module is draining.
@@ -513,7 +706,7 @@ mod tests {
         calls.set_phase(route, 7, BashHoldPhase::Wait);
         let snapshot = calls.snapshot();
         assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].phase, BashHoldPhase::Wait);
+        assert_eq!(snapshot[0].1, BashHoldPhase::Wait);
         calls.remove(route, 7);
         assert!(calls.snapshot().is_empty());
     }

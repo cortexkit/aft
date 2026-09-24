@@ -70,6 +70,112 @@ enum BashPollControl {
     Done,
     Promote,
     Wait,
+    /// The module loop already answered the call; the poll changed nothing.
+    Abandoned,
+}
+
+/// Ends a poll job that found its call already answered by the module loop,
+/// without touching the task or its wait registration (the loop owns both).
+fn abandon_bash_poll(
+    request_id: String,
+    control_tx: &mut Option<oneshot::Sender<BashPollControl>>,
+) -> Response {
+    if let Some(tx) = control_tx.take() {
+        let _ = tx.send(BashPollControl::Abandoned);
+    }
+    Response::success(request_id, json!({ "subc_bash_step": "abandoned" }))
+}
+
+/// Ends the wait registration a foreground bash call holds for its task.
+fn release_wait_registration(
+    registry: &crate::bash_background::BgTaskRegistry,
+    session_id: &str,
+    task_id: &str,
+    wait_mode: bool,
+) {
+    if wait_mode {
+        registry.end_wait_mode_session(session_id, task_id);
+    } else {
+        registry.unregister_foreground_task(session_id, task_id);
+    }
+}
+
+/// Hands a held call's command to the background the way a drain detach does
+/// (the task keeps running and delivers its completion later), off the
+/// executor and off the module loop's thread: promotion writes task metadata.
+fn detach_held_bash_in_background(target: drain::BashDetachTarget) {
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
+            log::warn!(
+                "subc attach: could not hand bash task {} to the background after answering its call: {error}",
+                target.task_id
+            );
+        }
+        release_wait_registration(
+            &target.registry,
+            &target.session_id,
+            &target.task_id,
+            target.wait_mode,
+        );
+    });
+}
+
+/// Answers the held bash calls the module loop must answer itself (see
+/// [`drain::HeldBashCalls::claim_for_module_loop`]) and hands each command to
+/// the background. A drained call gets the same "detached" response its own
+/// wait loop would have sent; a cancelled call gets the `cancelled` error every
+/// other cancelled tool call gets. Returns how many calls were answered.
+pub(super) async fn answer_held_bash_calls_from_module_loop(
+    tx: &WriterSender,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    metrics: &DispatchPathMetrics,
+    drain_due: bool,
+) -> Result<usize, SubcError> {
+    let claimed = metrics.held_bash_calls.claim_for_module_loop(drain_due);
+    let answered = claimed.len();
+    for (route, corr, target, reason) in claimed {
+        log::info!(
+            "subc attach: answered held bash call {} on route {route} corr={corr} from the module loop (reason={reason:?}); task {} keeps running in the background",
+            target.request_id,
+            target.task_id
+        );
+        let frame = match (reason, routes.get(&route)) {
+            (_, None) => None,
+            (drain::BashLoopAnswer::Drain, Some(identity)) => {
+                let response = Response::success(
+                    &target.request_id,
+                    json!({
+                        "output": crate::commands::bash_orchestrate::format_module_drain_detach_message(&target.task_id),
+                        "task_id": target.task_id,
+                        "status": "running",
+                    }),
+                );
+                let result = bash_result_from_response(response, &target.format_context);
+                Some(build_tool_response_frame(
+                    target.ver,
+                    route,
+                    corr,
+                    target.flags,
+                    &result,
+                    identity.trust,
+                )?)
+            }
+            (drain::BashLoopAnswer::Cancel, Some(_)) => Some(build_error_frame(
+                target.ver,
+                route.channel,
+                route.epoch,
+                corr,
+                target.flags,
+                "cancelled",
+                "request cancelled",
+            )?),
+        };
+        detach_held_bash_in_background(target);
+        if let Some(frame) = frame {
+            send_reliable_writer_frame(tx, metrics, frame, "held bash answer").await?;
+        }
+    }
+    Ok(answered)
 }
 
 fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashTranslatedSettings {
@@ -254,7 +360,7 @@ pub(super) fn submit_deferred_bash(
     edit_slot_survives: Option<bool>,
     permissions_granted: Option<Vec<String>>,
 ) {
-    metrics.held_bash_calls.insert(route, corr);
+    let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
     let root_for_spawn = root.clone();
@@ -518,6 +624,7 @@ pub(super) fn submit_deferred_bash(
                     detach_on_user_message,
                     format_context,
                     cancel,
+                    claim,
                 )
                 .await;
             }
@@ -565,6 +672,7 @@ async fn run_deferred_bash_wait(
     detach_on_user_message: bool,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
+    claim: Arc<drain::BashCallClaim>,
 ) {
     let Some(wait_ctx) = executor.actor_context(&root) else {
         send_bash_deferred_completion(
@@ -583,13 +691,50 @@ async fn run_deferred_bash_wait(
         return;
     };
     let registry = wait_ctx.bash_background().clone();
+    // From here the module loop can answer this call and detach its command
+    // without this task, should the executor polls below stall.
+    metrics.held_bash_calls.set_detach_target(
+        route,
+        corr,
+        drain::BashDetachTarget {
+            task_id: task_id.clone(),
+            session_id: session_id.clone(),
+            wait_mode: detach_on_user_message,
+            registry: registry.clone(),
+            request_id: request_id.clone(),
+            ver,
+            flags,
+            format_context: format_context.clone(),
+        },
+    );
     loop {
         tokio::select! {
+            _ = claim.module_loop_claimed() => {
+                // The module loop sent the terminal frame and owns the task's
+                // registration; this completion only settles the accounting.
+                send_bash_deferred_completion(
+                    &completion_tx,
+                    &metrics,
+                    route,
+                    corr,
+                    flags,
+                    ver,
+                    root,
+                    request_id,
+                    None,
+                    false,
+                )
+                .await;
+                break;
+            }
             _ = cancel.cancelled() => {
-                if detach_on_user_message {
-                    registry.end_wait_mode_session(&session_id, &task_id);
-                } else {
-                    registry.unregister_foreground_task(&session_id, &task_id);
+                if claim.claim_for_wait_task() {
+                    release_wait_registration(
+                        &registry,
+                        &session_id,
+                        &task_id,
+                        detach_on_user_message,
+                    );
                 }
                 send_bash_deferred_completion(
                     &completion_tx,
@@ -637,6 +782,7 @@ async fn run_deferred_bash_wait(
                 let storage_for_poll = storage_dir.clone();
                 let project_root_for_poll = project_root.clone();
                 let format_context_for_poll = format_context.clone();
+                let claim_for_poll = Arc::clone(&claim);
                 let poll_rx = executor.submit_async(
                     root_for_poll,
                     Lane::PureRead,
@@ -656,6 +802,9 @@ async fn run_deferred_bash_wait(
                                 &storage_for_poll,
                                 0,
                             ) else {
+                                if !claim_for_poll.claim_for_wait_task() {
+                                    return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
+                                }
                                 if detach_on_user_message {
                                     ctx.bash_background().end_wait_mode_session(
                                         &session_for_poll,
@@ -682,6 +831,9 @@ async fn run_deferred_bash_wait(
                             };
 
                             if drain_detach_due && !snapshot.info.status.is_terminal() {
+                                if !claim_for_poll.claim_for_wait_task() {
+                                    return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
+                                }
                                 let response =
                                     crate::commands::bash_orchestrate::detach_bash_for_module_drain(
                                         ctx,
@@ -716,6 +868,9 @@ async fn run_deferred_bash_wait(
                                     .bash_background()
                                     .take_wait_mode_detach(&session_for_poll)
                             {
+                                if !claim_for_poll.claim_for_wait_task() {
+                                    return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
+                                }
                                 let response = crate::commands::bash_orchestrate::detach_wait_mode_bash(
                                     ctx,
                                     &task_id_for_poll,
@@ -744,6 +899,9 @@ async fn run_deferred_bash_wait(
                                 &request_id_for_poll,
                             ) {
                                 crate::commands::bash_orchestrate::BashStep::Done(response) => {
+                                    if !claim_for_poll.claim_for_wait_task() {
+                                        return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
+                                    }
                                     if detach_on_user_message {
                                         ctx.bash_background().end_wait_mode_session(
                                             &session_for_poll,
@@ -766,6 +924,9 @@ async fn run_deferred_bash_wait(
                                     )
                                 }
                                 crate::commands::bash_orchestrate::BashStep::Promote => {
+                                    if !claim_for_poll.claim_for_wait_task() {
+                                        return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
+                                    }
                                     if detach_on_user_message {
                                         ctx.bash_background().end_wait_mode_session(
                                             &session_for_poll,
@@ -798,7 +959,27 @@ async fn run_deferred_bash_wait(
                         })
                     }),
                 );
-                let poll_response = await_executor_response(poll_rx, request_id.clone()).await;
+                // The poll may sit queued behind other work on the root's actor;
+                // if the module loop answers the call meanwhile, stop waiting.
+                let poll_response = tokio::select! {
+                    response = await_executor_response(poll_rx, request_id.clone()) => response,
+                    _ = claim.module_loop_claimed() => {
+                        send_bash_deferred_completion(
+                            &completion_tx,
+                            &metrics,
+                            route,
+                            corr,
+                            flags,
+                            ver,
+                            root,
+                            request_id,
+                            None,
+                            false,
+                        )
+                        .await;
+                        break;
+                    }
+                };
                 let _ = send_counted_channel(
                     &poll_touch_tx,
                     &metrics.bash_poll_touch_queued,
@@ -819,6 +1000,9 @@ async fn run_deferred_bash_wait(
                             response: poll_response,
                         };
                         let fatal = response_is_fatal_panic(&result.response);
+                        // A poll job that never ran (its actor went away) claimed
+                        // nothing; the module loop may have answered meanwhile.
+                        let result = claim.claim_for_wait_task().then_some(result);
                         send_bash_deferred_completion(
                             &completion_tx,
                             &metrics,
@@ -828,8 +1012,24 @@ async fn run_deferred_bash_wait(
                             ver,
                             root,
                             request_id,
-                            Some(result),
+                            result,
                             fatal,
+                        )
+                        .await;
+                        break;
+                    }
+                    BashPollControl::Abandoned => {
+                        send_bash_deferred_completion(
+                            &completion_tx,
+                            &metrics,
+                            route,
+                            corr,
+                            flags,
+                            ver,
+                            root,
+                            request_id,
+                            None,
+                            false,
                         )
                         .await;
                         break;
