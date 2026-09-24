@@ -7938,6 +7938,20 @@ mod tests {
                 "Own-comment edit: body-only speech; the holder verifies authorship".to_string(),
             ),
         });
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v14 admin tier");
+        for tuple in ["pr edit", "label create"] {
+            admin.push(TupleDecl::Details {
+                tuple: tuple.to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: Some(
+                    "Operator label row: label-only pr edit and label create, audited".to_string(),
+                ),
+            });
+        }
         manifest
     }
 
@@ -8607,6 +8621,623 @@ mod tests {
             TEST_NOW,
             |_| panic!("v13 issue edit reached upstream gh under the bypass"),
         );
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
+    }
+
+    /// The flag sections of `gh pr edit --help` and `gh label create --help`,
+    /// captured verbatim from gh 2.97.0. The row tests read the flag set from
+    /// this text rather than from memory, so a flag gh lists is either
+    /// admitted by its row or refused by name.
+    const GH_PR_EDIT_HELP_FLAGS: &str = "\
+FLAGS
+      --add-assignee login      Add assigned users by their login. Use \"@me\" to assign yourself, or \"@copilot\" to assign Copilot.
+      --add-label name          Add labels by name
+      --add-project title       Add the pull request to projects by title
+      --add-reviewer login      Add or re-request reviewers by their login. Use \"@copilot\" to request review from Copilot.
+  -B, --base branch             Change the base branch for this pull request
+  -b, --body string             Set the new body.
+  -F, --body-file file          Read body text from file (use \"-\" to read from standard input)
+  -m, --milestone name          Edit the milestone the pull request belongs to by name
+      --remove-assignee login   Remove assigned users by their login. Use \"@me\" to unassign yourself, or \"@copilot\" to unassign Copilot.
+      --remove-label name       Remove labels by name
+      --remove-milestone        Remove the milestone association from the pull request
+      --remove-project title    Remove the pull request from projects by title
+      --remove-reviewer login   Remove reviewers by their login. Use \"@copilot\" to remove review request from Copilot.
+  -t, --title string            Set the new title.
+
+INHERITED FLAGS
+      --help                     Show help for command
+  -R, --repo [HOST/]OWNER/REPO   Select another repository using the [HOST/]OWNER/REPO format
+";
+    const GH_LABEL_CREATE_HELP_FLAGS: &str = "\
+FLAGS
+  -c, --color string         Color of the label
+  -d, --description string   Description of the label
+  -f, --force                Update the label color and description if label already exists
+
+INHERITED FLAGS
+      --help                     Show help for command
+  -R, --repo [HOST/]OWNER/REPO   Select another repository using the [HOST/]OWNER/REPO format
+";
+
+    /// One flag row of a captured help text: its spellings (short first when
+    /// present) and whether it takes a value.
+    fn help_flags(help: &str) -> Vec<(Vec<String>, bool)> {
+        help.lines()
+            .filter(|line| line.trim_start().starts_with('-'))
+            .map(|line| {
+                // The first column ends at the first run of two spaces.
+                let column = line.trim_start().split("  ").next().unwrap_or_default();
+                let words = column.split_whitespace().collect::<Vec<_>>();
+                let spellings = words
+                    .iter()
+                    .filter(|word| word.starts_with('-'))
+                    .map(|word| word.trim_end_matches(',').to_string())
+                    .collect::<Vec<_>>();
+                let takes_value = words.last().is_some_and(|word| !word.starts_with('-'));
+                (spellings, takes_value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captured_help_texts_parse_into_the_expected_flag_sets() {
+        let label_create = help_flags(GH_LABEL_CREATE_HELP_FLAGS);
+        assert_eq!(
+            label_create,
+            vec![
+                (vec!["-c".to_string(), "--color".to_string()], true),
+                (vec!["-d".to_string(), "--description".to_string()], true),
+                (vec!["-f".to_string(), "--force".to_string()], false),
+                (vec!["--help".to_string()], false),
+                (vec!["-R".to_string(), "--repo".to_string()], true),
+            ]
+        );
+        let pr_edit = help_flags(GH_PR_EDIT_HELP_FLAGS);
+        assert_eq!(pr_edit.len(), 16);
+        assert!(pr_edit.contains(&(vec!["--remove-milestone".to_string()], false)));
+        assert!(pr_edit.contains(&(vec!["-B".to_string(), "--base".to_string()], true)));
+    }
+
+    /// The operator label row's argv for a manifest-declared `pr edit`.
+    fn parse_pr_label_row(args: &[&str]) -> Result<OperatorLabelEdit, CanonicalizeError> {
+        let args = os_args(args);
+        assert!(
+            matches!(
+                classify(&args, &v14_manifest(), "macos"),
+                Classification::Admin { ref tuple } if tuple == "pr edit"
+            ),
+            "{args:?} must reach the declared pr edit row"
+        );
+        parse_operator_label_edit(&args, LabelTarget::PullRequest)
+    }
+
+    #[test]
+    fn v14_operator_pr_label_row_accepts_every_label_form() {
+        type Case<'a> = (
+            &'a [&'a str],
+            Option<&'a str>,
+            u64,
+            &'a [&'a str],
+            &'a [&'a str],
+        );
+        let aft = Some("cortexkit/aft");
+        let cases: &[Case] = &[
+            (
+                &["pr", "edit", "9", "--add-label", "trivial"],
+                None,
+                9,
+                &["trivial"],
+                &[],
+            ),
+            (
+                &["pr", "edit", "9", "--add-label=a,b"],
+                None,
+                9,
+                &["a", "b"],
+                &[],
+            ),
+            (
+                &["pr", "edit", "9", "--remove-label", "wip"],
+                None,
+                9,
+                &[],
+                &["wip"],
+            ),
+            (
+                &["pr", "edit", "--add-label", "x", "9", "--remove-label=y"],
+                None,
+                9,
+                &["x"],
+                &["y"],
+            ),
+            (
+                &[
+                    "pr",
+                    "edit",
+                    "9",
+                    "--add-label",
+                    "trivial",
+                    "-R",
+                    "CortexKit/AFT",
+                ],
+                aft,
+                9,
+                &["trivial"],
+                &[],
+            ),
+            (
+                &[
+                    "--repo=cortexkit/aft",
+                    "pr",
+                    "edit",
+                    "9",
+                    "--add-label",
+                    "trivial",
+                ],
+                aft,
+                9,
+                &["trivial"],
+                &[],
+            ),
+            (
+                &[
+                    "pr",
+                    "edit",
+                    "https://github.com/CortexKit/aft/pull/9/",
+                    "--add-label",
+                    "trivial",
+                    "--repo",
+                    "cortexkit/aft",
+                ],
+                aft,
+                9,
+                &["trivial"],
+                &[],
+            ),
+        ];
+        for (argv, repository, number, added, removed) in cases {
+            let edit = parse_pr_label_row(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} must be accepted: {}", error.text));
+            assert_eq!(
+                edit,
+                OperatorLabelEdit {
+                    repository: repository.map(str::to_string),
+                    target: LabelTarget::PullRequest,
+                    number: *number,
+                    labels_added: added.iter().map(|label| label.to_string()).collect(),
+                    labels_removed: removed.iter().map(|label| label.to_string()).collect(),
+                },
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn v14_operator_pr_label_row_refuses_every_other_flag_by_name_even_beside_a_label() {
+        // Every flag `gh pr edit --help` lists except the two label flags and
+        // --repo, plus flags gh does not have for this verb at all.
+        let admitted = ["--add-label", "--remove-label", "--repo", "-R"];
+        let mut forbidden = help_flags(GH_PR_EDIT_HELP_FLAGS)
+            .into_iter()
+            .flat_map(|(spellings, _)| spellings)
+            .filter(|flag| !admitted.contains(&flag.as_str()))
+            .collect::<Vec<_>>();
+        forbidden.extend(["--label", "--add-labels", "--frobnicate"].map(str::to_string));
+        assert!(forbidden.len() >= 20, "{forbidden:?}");
+        for flag in &forbidden {
+            let flag = flag.as_str();
+            let inline = format!("{flag}=value");
+            let mut spellings = vec![
+                vec!["pr", "edit", "9", flag, "value"],
+                vec!["pr", "edit", "9", inline.as_str()],
+                vec!["pr", "edit", "9", "--add-label", "trivial", flag, "value"],
+                vec!["pr", "edit", "9", flag, "value", "--remove-label=trivial"],
+                vec!["pr", "edit", "9", "--add-label=trivial", inline.as_str()],
+            ];
+            // pflag also takes a short flag's value attached: `-bvalue`.
+            let attached = format!("{flag}value");
+            if !flag.starts_with("--") {
+                spellings.push(vec![
+                    "pr",
+                    "edit",
+                    "9",
+                    "--add-label=trivial",
+                    attached.as_str(),
+                ]);
+            }
+            for argv in spellings {
+                let error = parse_pr_label_row(&argv)
+                    .expect_err(&format!("{argv:?} must refuse: only labels are admitted"));
+                assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{argv:?}");
+                assert!(
+                    error.text.starts_with(&format!("{flag}: ")),
+                    "{argv:?}: the refusal must name {flag}: {}",
+                    error.text
+                );
+                assert!(
+                    !error.text.contains("value"),
+                    "{argv:?}: the refusal must not echo the flag's value: {}",
+                    error.text
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v14_operator_pr_label_row_needs_exactly_one_pr_and_at_least_one_label_flag() {
+        let error = parse_pr_label_row(&["pr", "edit", "9", "10", "--add-label", "trivial"])
+            .expect_err("a second positional must refuse");
+        assert!(error.text.starts_with("10: "), "{}", error.text);
+        for (argv, named) in [
+            (
+                vec!["pr", "edit", "--add-label", "trivial"],
+                "no pull request number or URL",
+            ),
+            (vec!["pr", "edit", "9"], "no --add-label or --remove-label"),
+            // gh would resolve a branch name to a pull request; the audit line
+            // must record a number, so the row refuses it.
+            (
+                vec!["pr", "edit", "feature/x", "--add-label", "trivial"],
+                "feature/x: ",
+            ),
+            (
+                vec![
+                    "pr",
+                    "edit",
+                    "https://github.com/o/r/issues/9",
+                    "--add-label",
+                    "trivial",
+                ],
+                "https://github.com/o/r/issues/9: ",
+            ),
+            (
+                vec![
+                    "pr",
+                    "edit",
+                    "https://github.com/o/r/pull/9",
+                    "--add-label",
+                    "trivial",
+                    "-R",
+                    "other/repo",
+                ],
+                "names o/r but --repo names other/repo",
+            ),
+        ] {
+            let error = parse_pr_label_row(&argv).expect_err(&format!("{argv:?} must refuse"));
+            assert!(error.text.contains(named), "{argv:?}: {}", error.text);
+        }
+    }
+
+    #[test]
+    fn v14_operator_pr_label_row_audits_before_upstream_runs_and_v13_stays_unclassified() {
+        use std::cell::Cell;
+
+        let _env_lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().expect("create label row state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = v14_manifest();
+        manifest
+            .validate()
+            .expect("valid v14 manifest with operator rows");
+        assert!(is_reviewed_operator_row_admin_tuple(14, "pr edit"));
+        assert!(!is_reviewed_operator_row_admin_tuple(13, "pr edit"));
+        let rung = RungDetermination::r3(TEST_NOW, 14, &test_rung_provenance()).record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+        let args = os_args(&[
+            "pr",
+            "edit",
+            "9",
+            "--add-label",
+            "trivial",
+            "--remove-label=needs-design",
+            "-R",
+            "CortexKit/AFT",
+        ]);
+        let dispatch = |args: &[OsString], manifest: &Manifest, upstream: &dyn Fn() -> i32| {
+            dispatch_r3(
+                args,
+                classify(args, manifest, "macos"),
+                manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |_| upstream(),
+            )
+        };
+
+        // Without the bypass `pr edit` refuses exactly as an undeclared verb
+        // did before v14: no audit, no upstream.
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+            let status = dispatch(&args, &manifest, &|| {
+                panic!("pr edit reached upstream gh without the bypass")
+            });
+            assert_eq!(status, REFUSAL_EXIT_STATUS);
+            assert!(!paths.bypass_audit.exists());
+        }
+
+        let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+        let delegated = Cell::new(0);
+        let status = dispatch(&args, &manifest, &|| {
+            // Stand-in for upstream gh: the audit line must already be on disk.
+            let (records, error) = read_bypass_audit(&paths);
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(
+                records.expect("audit records before upstream gh runs"),
+                vec![json!({
+                    "as_of_unix_secs": TEST_NOW,
+                    "tuple": "pr edit",
+                    "repository": "cortexkit/aft",
+                    "pr_number": 9,
+                    "labels_added": ["trivial"],
+                    "labels_removed": ["needs-design"],
+                })]
+            );
+            delegated.set(delegated.get() + 1);
+            73
+        });
+        assert_eq!(status, 73);
+        assert_eq!(delegated.get(), 1);
+
+        // A label edit carrying a title refuses before the audit or upstream.
+        let with_title = os_args(&["pr", "edit", "9", "--add-label", "trivial", "-t", "x"]);
+        let status = dispatch(&with_title, &manifest, &|| {
+            panic!("a non-label pr edit reached upstream gh under the bypass")
+        });
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
+
+        // Under the deployed v13 manifest the row does not exist.
+        let v13 = v13_manifest();
+        assert!(matches!(
+            classify(&args, &v13, "macos"),
+            Classification::Unclassified
+        ));
+        let status = dispatch(&args, &v13, &|| {
+            panic!("v13 pr edit reached upstream gh under the bypass")
+        });
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
+    }
+
+    fn parse_label_create_row(args: &[&str]) -> Result<OperatorLabelCreate, CanonicalizeError> {
+        let args = os_args(args);
+        assert!(
+            matches!(
+                classify(&args, &v14_manifest(), "macos"),
+                Classification::Admin { ref tuple } if tuple == "label create"
+            ),
+            "{args:?} must reach the declared label create row"
+        );
+        parse_operator_label_create(&args)
+    }
+
+    #[test]
+    fn v14_operator_label_create_row_admits_every_flag_gh_lists() {
+        // Each flag from the captured help, in every spelling, beside a name.
+        for (spellings, takes_value) in help_flags(GH_LABEL_CREATE_HELP_FLAGS) {
+            // --help only prints usage; it is not part of creating a label.
+            if spellings == ["--help"] {
+                continue;
+            }
+            for spelling in &spellings {
+                let spelling = spelling.as_str();
+                let inline = format!("{spelling}=0E8A16");
+                let argvs = if takes_value {
+                    vec![
+                        vec!["label", "create", "design-approved", spelling, "0E8A16"],
+                        vec!["label", "create", "design-approved", inline.as_str()],
+                    ]
+                } else {
+                    vec![vec!["label", "create", "design-approved", spelling]]
+                };
+                for argv in argvs {
+                    parse_label_create_row(&argv).unwrap_or_else(|error| {
+                        panic!("{argv:?} must be accepted: {}", error.text)
+                    });
+                }
+            }
+        }
+
+        let create = parse_label_create_row(&[
+            "-R",
+            "CortexKit/AFT",
+            "label",
+            "create",
+            "design-approved",
+            "--color",
+            "0E8A16",
+            "-d",
+            "Design gate passed",
+            "-f",
+        ])
+        .expect("full label create");
+        assert_eq!(
+            create,
+            OperatorLabelCreate {
+                repository: Some("cortexkit/aft".to_string()),
+                label: "design-approved".to_string(),
+                color: Some("0E8A16".to_string()),
+            }
+        );
+        let create = parse_label_create_row(&["label", "create", "trivial"]).expect("name only");
+        assert_eq!(create.color, None);
+        assert_eq!(create.repository, None);
+    }
+
+    #[test]
+    fn v14_operator_label_create_row_refuses_every_other_flag_and_a_second_name() {
+        // Flags from sibling label verbs, output flags, and a flag gh does
+        // not have: none is part of creating one label.
+        for flag in [
+            "--name",
+            "--new-name",
+            "--yes",
+            "--confirm",
+            "--json",
+            "--web",
+            "--label",
+            "--frobnicate",
+            "-x",
+        ] {
+            let inline = format!("{flag}=value");
+            for argv in [
+                vec!["label", "create", "bug", flag, "value"],
+                vec!["label", "create", "bug", inline.as_str()],
+                vec!["label", "create", "bug", "--color", "E99695", flag, "value"],
+                vec!["label", "create", "bug", "-f", inline.as_str()],
+            ] {
+                let error =
+                    parse_label_create_row(&argv).expect_err(&format!("{argv:?} must refuse"));
+                assert_eq!(error.code, RefusalCode::UnsupportedFlag, "{argv:?}");
+                assert!(
+                    error.text.starts_with(&format!("{flag}: ")),
+                    "{argv:?}: the refusal must name {flag}: {}",
+                    error.text
+                );
+                assert!(!error.text.contains("value"), "{argv:?}: {}", error.text);
+            }
+        }
+        for (argv, named) in [
+            (
+                vec!["label", "create", "bug", "urgent"],
+                "urgent: a second positional",
+            ),
+            (
+                vec!["label", "create", "bug", "-c", "E99695", "urgent"],
+                "urgent: ",
+            ),
+            (
+                vec!["label", "create", "--color", "E99695"],
+                "no label name",
+            ),
+            (
+                vec!["label", "create", "bug", "--color"],
+                "--color: requires a value",
+            ),
+            (
+                vec!["label", "create", "bug", "-c", "E99695", "--color=000000"],
+                "--color: given more than once",
+            ),
+            (
+                vec!["label", "create", "bug", "-R", "a/b", "--repo", "a/b"],
+                "--repo: given more than once",
+            ),
+        ] {
+            let error = parse_label_create_row(&argv).expect_err(&format!("{argv:?} must refuse"));
+            assert!(error.text.contains(named), "{argv:?}: {}", error.text);
+        }
+    }
+
+    #[test]
+    fn v14_operator_label_create_row_audits_before_upstream_runs_and_v13_stays_unclassified() {
+        use std::cell::Cell;
+
+        let _env_lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().expect("create label row state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = v14_manifest();
+        assert!(is_reviewed_operator_row_admin_tuple(14, "label create"));
+        assert!(!is_reviewed_operator_row_admin_tuple(13, "label create"));
+        assert!(!is_reviewed_operator_row_admin_tuple(14, "label delete"));
+        assert!(!is_reviewed_operator_row_admin_tuple(14, "label edit"));
+        let rung = RungDetermination::r3(TEST_NOW, 14, &test_rung_provenance()).record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+        let args = os_args(&[
+            "label",
+            "create",
+            "design-approved",
+            "--color=0E8A16",
+            "--description",
+            "Design gate passed",
+            "--repo",
+            "CortexKit/AFT",
+        ]);
+        let dispatch = |args: &[OsString], manifest: &Manifest, upstream: &dyn Fn() -> i32| {
+            dispatch_r3(
+                args,
+                classify(args, manifest, "macos"),
+                manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |_| upstream(),
+            )
+        };
+
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+            let status = dispatch(&args, &manifest, &|| {
+                panic!("label create reached upstream gh without the bypass")
+            });
+            assert_eq!(status, REFUSAL_EXIT_STATUS);
+            assert!(!paths.bypass_audit.exists());
+        }
+
+        let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+        let delegated = Cell::new(0);
+        let status = dispatch(&args, &manifest, &|| {
+            // Stand-in for upstream gh: the audit line must already be on disk.
+            let (records, error) = read_bypass_audit(&paths);
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(
+                records.expect("audit records before upstream gh runs"),
+                vec![json!({
+                    "as_of_unix_secs": TEST_NOW,
+                    "tuple": "label create",
+                    "repository": "cortexkit/aft",
+                    "label": "design-approved",
+                    "color": "0E8A16",
+                })]
+            );
+            delegated.set(delegated.get() + 1);
+            73
+        });
+        assert_eq!(status, 73);
+        assert_eq!(delegated.get(), 1);
+
+        // An extra flag refuses before the audit or upstream.
+        let extra = os_args(&["label", "create", "bug", "--frobnicate"]);
+        let status = dispatch(&extra, &manifest, &|| {
+            panic!("a label create outside the row reached upstream gh")
+        });
+        assert_eq!(status, REFUSAL_EXIT_STATUS);
+        assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
+
+        // Deletion and edits stay undeclared even under the bypass.
+        for other in [
+            os_args(&["label", "delete", "bug", "--yes"]),
+            os_args(&["label", "edit", "bug", "--color", "000000"]),
+        ] {
+            assert!(matches!(
+                classify(&other, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+            let status = dispatch(&other, &manifest, &|| {
+                panic!("{other:?} reached upstream gh under the bypass")
+            });
+            assert_eq!(status, REFUSAL_EXIT_STATUS);
+        }
+
+        // Under the deployed v13 manifest the row does not exist.
+        let v13 = v13_manifest();
+        assert!(matches!(
+            classify(&args, &v13, "macos"),
+            Classification::Unclassified
+        ));
+        let status = dispatch(&args, &v13, &|| {
+            panic!("v13 label create reached upstream gh under the bypass")
+        });
         assert_eq!(status, REFUSAL_EXIT_STATUS);
         assert_eq!(read_bypass_audit(&paths).0.expect("audit").len(), 1);
     }
