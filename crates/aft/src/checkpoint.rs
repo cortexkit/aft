@@ -721,16 +721,19 @@ impl CheckpointStore {
             return;
         };
         #[cfg(unix)]
+        let started = std::time::Instant::now();
+        #[cfg(unix)]
         match crate::backup::tighten_store_permissions(
             &checkpoints_dir,
             crate::backup::PERMISSION_TIGHTEN_BUDGET,
         ) {
             Ok(Some(report)) => crate::slog_info!(
-                "tightened durable checkpoint permissions under {}: examined={} tightened={} complete={}",
+                "tightened durable checkpoint permissions under {}: examined={} tightened={} complete={} elapsed_ms={}",
                 checkpoints_dir.display(),
                 report.examined,
                 report.tightened,
-                report.complete
+                report.complete,
+                started.elapsed().as_millis()
             ),
             Ok(None) => {}
             Err(error) => crate::slog_warn!(

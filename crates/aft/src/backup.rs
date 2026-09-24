@@ -627,13 +627,16 @@ impl BackupStore {
             return;
         };
         #[cfg(unix)]
+        let started = std::time::Instant::now();
+        #[cfg(unix)]
         match tighten_store_permissions(&backups_dir, PERMISSION_TIGHTEN_BUDGET) {
             Ok(Some(report)) => crate::slog_info!(
-                "tightened undo backup permissions under {}: examined={} tightened={} complete={}",
+                "tightened undo backup permissions under {}: examined={} tightened={} complete={} elapsed_ms={}",
                 backups_dir.display(),
                 report.examined,
                 report.tightened,
-                report.complete
+                report.complete,
+                started.elapsed().as_millis()
             ),
             Ok(None) => {}
             Err(error) => crate::slog_warn!(
@@ -4153,9 +4156,11 @@ fn fsync_dir(_path: &Path) -> std::io::Result<()> {
 }
 
 /// Maximum directory entries one tightening pass examines. The pass runs inside
-/// per-process backup maintenance, so a very large store is tightened across
-/// several processes instead of stalling the first undo-capable operation.
-pub(crate) const PERMISSION_TIGHTEN_BUDGET: usize = 4096;
+/// per-process backup maintenance, on the first undo-capable request, so a very
+/// large store is tightened across several processes instead of stalling that
+/// request. Loose entries left behind meanwhile still expire with the store's
+/// normal session retention.
+pub(crate) const PERMISSION_TIGHTEN_BUDGET: usize = 1024;
 const PERMISSION_PROGRESS_VERSION: u64 = 1;
 
 /// Outcome of one bounded permission-tightening pass over a store directory.
@@ -4334,29 +4339,23 @@ impl TightenWalk {
         Ok(true)
     }
 
-    /// Sets `mode` on `path` if it differs. The path is opened with
-    /// `O_NOFOLLOW` and changed through that handle, so a symlink swapped in
-    /// after the directory listing is refused instead of followed. Failures
-    /// (entry removed, unreadable) are skipped: this is best-effort repair.
+    /// Sets `mode` on `path` if it differs. The entry is checked with `lstat`
+    /// (never following a symlink) and changed with a path-based `chmod`, which
+    /// avoids opening every file: opens are far slower than stats on hosts with
+    /// file-access scanning, and this runs on the first undo-capable request.
+    /// Swapping a symlink in between the two calls needs write access to the
+    /// store directory, which only its owner has, so the gap crosses no
+    /// privilege boundary. Failures (entry removed, not permitted) are
+    /// skipped: this is best-effort repair.
     fn tighten(&mut self, path: &Path, mode: u32) {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-        else {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
             return;
         };
-        let Ok(metadata) = file.metadata() else {
-            return;
-        };
-        if metadata.permissions().mode() & 0o777 == mode {
+        if metadata.file_type().is_symlink() || metadata.permissions().mode() & 0o777 == mode {
             return;
         }
-        if file
-            .set_permissions(std::fs::Permissions::from_mode(mode))
-            .is_ok()
-        {
+        if std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).is_ok() {
             self.report.tightened += 1;
         }
     }
