@@ -34,8 +34,15 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import {
+  isTrustedCachedBinary,
+  recordBinaryIdentity,
+  removeBinaryIdentitySidecar,
+  writeBinaryIdentitySidecar,
+} from "./binary-identity.js";
 import { getAftBinaryCacheDir } from "./cache-paths.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
+import { parseAftVersionOutput, readBinaryVersionOffThread } from "./version-probe.js";
 
 const REPO = "cortexkit/aft";
 const DOWNLOAD_TIMEOUT_MS = 300_000;
@@ -51,8 +58,10 @@ const DOWNLOAD_LOCK_TIMEOUT_MS = DOWNLOAD_LOCK_STALE_MS + 30_000;
  * `--version`. Returns the bare version (e.g. `"0.22.1"`) without the
  * leading `v` or the `aft` prefix, or `null` if the invocation fails.
  *
- * Shared by the downloader and resolver so both cache hot-paths validate the
- * binary itself instead of trusting directory names.
+ * BLOCKING: the calling thread waits in `posix_spawn` until the child is
+ * loaded, which for a cold binary under memory pressure has taken close to a
+ * minute. Only command-line tools may call this. Plugin hosts must use the
+ * identity sidecar (`isTrustedCachedBinary`) or `readBinaryVersionOffThread`.
  */
 export function readBinaryVersion(binaryPath: string): string | null {
   try {
@@ -61,18 +70,12 @@ export function readBinaryVersion(binaryPath: string): string | null {
       stdio: ["pipe", "pipe", "pipe"],
       // macOS assesses an executable once per inode, and a just-downloaded
       // binary is always a new one. That first exec has been measured at
-      // seconds — occasionally far worse under memory pressure — so a
-      // five-second cap would report a perfectly good binary as unreadable
-      // and trigger a needless re-download. Later execs of the same inode
-      // return in milliseconds, so this budget is only ever paid once.
+      // seconds — far worse under memory pressure — so a five-second cap
+      // would report a perfectly good binary as unreadable and trigger a
+      // needless re-download.
       timeout: 60_000,
     });
-    const stdoutVersion = result.stdout?.trim();
-    const stderrVersion = result.stderr?.trim();
-    const rawVersion = stdoutVersion || stderrVersion;
-    if (!rawVersion) return null;
-    // `aft --version` outputs "aft 0.9.0" — extract just the version number
-    return rawVersion.replace(/^aft\s+/, "");
+    return parseAftVersionOutput(result.stdout ?? "", result.stderr ?? "");
   } catch {
     return null;
   }
@@ -82,10 +85,22 @@ function expectedVersionFromTag(tag: string): string {
   return tag.startsWith("v") ? tag.slice(1) : tag;
 }
 
-function isExpectedCachedBinary(binaryPath: string, tag: string): boolean {
+/**
+ * Decide whether the cached binary at `binaryPath` is the release `tag`
+ * without executing it on the calling thread. A matching identity sidecar is
+ * enough. An entry without one (written before sidecars existed) or whose
+ * sidecar no longer matches the file is asked for its version on a worker
+ * thread; when that confirms the version, a fresh sidecar is recorded in the
+ * background so later lookups are stat-only.
+ */
+async function isExpectedCachedBinary(binaryPath: string, tag: string): Promise<boolean> {
   const expected = expectedVersionFromTag(tag);
-  const actual = readBinaryVersion(binaryPath);
-  if (actual === expected) return true;
+  if (isTrustedCachedBinary(binaryPath, expected)) return true;
+  const actual = await readBinaryVersionOffThread(binaryPath);
+  if (actual === expected) {
+    void recordBinaryIdentity(binaryPath, expected);
+    return true;
+  }
   warn(
     `Cached binary at ${binaryPath} reports ${actual ?? "no version"}, expected ${expected}; refreshing cache entry`,
   );
@@ -153,7 +168,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
   // Already cached for this version. Probe the binary itself before trusting
   // the cache directory name; stale hot-swap entries can otherwise shadow a
   // freshly requested compatible version forever.
-  if (existsSync(binaryPath) && isExpectedCachedBinary(binaryPath, tag)) {
+  if (existsSync(binaryPath) && (await isExpectedCachedBinary(binaryPath, tag))) {
     return binaryPath;
   }
 
@@ -213,7 +228,7 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     // Another process may have completed the same version while we waited.
     // Re-probe here too because a stale owner might have left a mismatched
     // binary in the versioned directory before this process acquired the lock.
-    if (existsSync(binaryPath) && isExpectedCachedBinary(binaryPath, tag)) {
+    if (existsSync(binaryPath) && (await isExpectedCachedBinary(binaryPath, tag))) {
       return binaryPath;
     }
 
@@ -298,6 +313,9 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     }
     log(`Checksum verified (SHA-256: ${actualHash.slice(0, 16)}...)`);
 
+    // Drop the old entry's sidecar first so no reader pairs it with the new
+    // bytes; the stat check would reject that pairing anyway.
+    removeBinaryIdentitySidecar(binaryPath);
     // Atomic rename (POSIX) or copy (Windows — renameSync fails with EEXIST
     // when target exists). On Windows, copyFileSync overwrites the target;
     // if it fails the original binary at binaryPath is preserved.
@@ -306,6 +324,16 @@ export async function downloadBinary(version?: string): Promise<string | null> {
     } else {
       chmodSync(tmpPath, 0o755);
       renameSync(tmpPath, binaryPath);
+    }
+    // The bytes matched the release checksum for `tag`, so the version is
+    // known without running the binary. Recorded only once the binary is in
+    // its final place, so the sidecar describes that exact file.
+    try {
+      writeBinaryIdentitySidecar(binaryPath, tag, actualHash);
+    } catch (err) {
+      warn(
+        `Could not record identity for ${binaryPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     // Binary was replaced successfully. Clean up the temp file best-effort;
@@ -373,7 +401,7 @@ export async function ensureBinary(version?: string): Promise<string | null> {
       // Do NOT fall back to legacy flat cache — it may contain a different version,
       // causing an infinite spawn-check-replace loop.
       const versionCached = getCachedBinaryPath(tag);
-      if (versionCached && isExpectedCachedBinary(versionCached, tag)) {
+      if (versionCached && (await isExpectedCachedBinary(versionCached, tag))) {
         log(`Found cached binary for ${tag}: ${versionCached}`);
         return versionCached;
       }

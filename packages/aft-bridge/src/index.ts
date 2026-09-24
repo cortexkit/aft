@@ -33,6 +33,14 @@ export {
   runBashHostFallback,
 } from "./bash-host-fallback.js";
 export { resolveBashKillTimeout } from "./bash-timeout.js";
+// --- binary identity (no-exec cache trust) ---
+export type { BinaryIdentity, BinaryIdentityCheck } from "./binary-identity.js";
+export {
+  checkBinaryIdentity,
+  identitySidecarPath,
+  isTrustedCachedBinary,
+  readBinaryIdentity,
+} from "./binary-identity.js";
 export type {
   BashCompletedPayload,
   BashLongRunningPayload,
@@ -253,6 +261,7 @@ export {
   type AftTransportFactoryOptions,
   createAftTransportPool,
 } from "./transport-factory.js";
+export { readBinaryVersionOffThread } from "./version-probe.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---
 export type {
   RustZoomBatchEntry,

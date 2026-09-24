@@ -16,7 +16,9 @@ import {
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { isTrustedCachedBinary, readBinaryIdentity } from "../binary-identity.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
+import { __setOffThreadVersionProbeForTests } from "../version-probe.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
 const shellFixtureSkipReason =
@@ -92,6 +94,41 @@ describe("downloadBinary hardened transport", () => {
     expect(
       readdirSync(join(tmpDir, "aft", "bin", "v1.2.3")).filter((name) => name.includes(".tmp")),
     ).toEqual([]);
+    // The checksum-verified download records its identity once in place, so
+    // later lookups trust it with a stat instead of running it.
+    expect(isTrustedCachedBinary(expectedPath, "1.2.3")).toBe(true);
+    expect(readBinaryIdentity(expectedPath)?.sha256).toBe(sha256);
+  });
+
+  test("a cached download with a matching sidecar is reused without probing its version", async () => {
+    const { ensureBinary, getBinaryName } = await import(
+      `../downloader.js?sidecar-reuse-${Date.now()}`
+    );
+    const assetName = currentAssetName();
+    const payload = Buffer.from("release bytes 1.2.6");
+    const sha256 = createHash("sha256").update(payload).digest("hex");
+    let binaryFetches = 0;
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("checksums.sha256")) {
+        return new Response(`${sha256}  ${assetName}\n`, { status: 200 });
+      }
+      binaryFetches += 1;
+      return new Response(payload, { status: 200 });
+    }) as typeof fetch;
+    const probes: string[] = [];
+    __setOffThreadVersionProbeForTests(async (path) => {
+      probes.push(path);
+      return null;
+    });
+    try {
+      const expectedPath = join(tmpDir, "aft", "bin", "v1.2.6", getBinaryName());
+      await expect(ensureBinary("v1.2.6")).resolves.toBe(expectedPath);
+      await expect(ensureBinary("1.2.6")).resolves.toBe(expectedPath);
+      expect(binaryFetches).toBe(1);
+      expect(probes).toEqual([]);
+    } finally {
+      __setOffThreadVersionProbeForTests(null);
+    }
   });
 
   test("sweeps stale partial download artifacts after acquiring the lock", async () => {
