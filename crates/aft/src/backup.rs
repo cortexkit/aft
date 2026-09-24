@@ -1971,7 +1971,7 @@ impl BackupStore {
         let Some(session_dir) = self.session_dir(session) else {
             return;
         };
-        if let Err(e) = std::fs::create_dir_all(&session_dir) {
+        if let Err(e) = create_private_dir_all(&session_dir) {
             crate::slog_warn!("failed to create session dir: {}", e);
             return;
         }
@@ -1983,7 +1983,7 @@ impl BackupStore {
         });
         if let Ok(s) = serde_json::to_string_pretty(&json) {
             let tmp = session_dir.join("session.json.tmp");
-            if std::fs::write(&tmp, s).is_ok() {
+            if write_private_file(&tmp, s.as_bytes()).is_ok() {
                 let _ = std::fs::rename(&tmp, marker);
             }
         }
@@ -2002,7 +2002,7 @@ impl BackupStore {
             return;
         }
         if let Some(parent) = harness_backups.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
+            if let Err(error) = create_private_dir_all(parent) {
                 crate::slog_warn!(
                     "failed to create harness backup dir {}: {}",
                     parent.display(),
@@ -2027,7 +2027,7 @@ impl BackupStore {
                     harness_backups.display(),
                     error
                 );
-                if std::fs::create_dir_all(&harness_backups).is_err() {
+                if create_private_dir_all(&harness_backups).is_err() {
                     return;
                 }
                 if let Ok(entries) = std::fs::read_dir(&root_backups) {
@@ -2118,7 +2118,7 @@ impl BackupStore {
             }
             // This is a legacy flat-layout path-hash directory. Move it under
             // the default session namespace.
-            if let Err(e) = std::fs::create_dir_all(&default_session_dir) {
+            if let Err(e) = create_private_dir_all(&default_session_dir) {
                 crate::slog_warn!("failed to create default session dir: {}", e);
                 return;
             }
@@ -2163,7 +2163,7 @@ impl BackupStore {
                 "last_accessed": current_timestamp(),
             });
             if let Ok(s) = serde_json::to_string_pretty(&json) {
-                let _ = std::fs::write(&marker, s);
+                let _ = write_private_file(&marker, s.as_bytes());
             }
         }
     }
@@ -2201,7 +2201,7 @@ impl BackupStore {
         }
         if let Ok(s) = serde_json::to_string_pretty(&parsed) {
             let tmp = meta_path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &s).is_ok() {
+            if write_private_file(&tmp, s.as_bytes()).is_ok() {
                 let _ = std::fs::rename(&tmp, meta_path);
             }
         }
@@ -2447,7 +2447,7 @@ impl BackupStore {
         };
         self.record_disk_io_for_tests();
         let lock_dir = session_dir.join(".locks");
-        std::fs::create_dir_all(&lock_dir).map_err(|error| AftError::IoError {
+        create_private_dir_all(&lock_dir).map_err(|error| AftError::IoError {
             path: lock_dir.display().to_string(),
             message: error.to_string(),
         })?;
@@ -2856,7 +2856,7 @@ impl BackupStore {
             return Ok(());
         };
 
-        std::fs::create_dir_all(&session_dir).map_err(|error| AftError::IoError {
+        create_private_dir_all(&session_dir).map_err(|error| AftError::IoError {
             path: session_dir.display().to_string(),
             message: error.to_string(),
         })?;
@@ -2864,7 +2864,7 @@ impl BackupStore {
 
         let hash = Self::path_hash(key);
         let dir = session_dir.join(&hash);
-        std::fs::create_dir_all(&dir).map_err(|error| AftError::IoError {
+        create_private_dir_all(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
         })?;
@@ -4023,6 +4023,58 @@ fn trim_stack_to_depth(stack: &mut Vec<BackupEntry>, max_depth: usize) {
     drop(stack.drain(..overflow));
 }
 
+/// Unix mode for every file the backup store writes. Backups hold copies of
+/// user files (including secrets such as credential files), so they must never
+/// be readable by other users regardless of the source file's own mode or of
+/// the permissions on the configurable storage directory above the store.
+const PRIVATE_FILE_MODE: u32 = 0o600;
+/// Unix mode for every directory the backup store creates.
+const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Creates `path` and any missing ancestors as owner-only directories (0700 on
+/// Unix). The mode is applied at creation, so a directory never exists with
+/// wider permissions. Directories that already exist are left untouched here;
+/// `tighten_store_permissions` repairs stores written by older versions.
+/// Use this for backup-store directories only, never for directories that hold
+/// restored user files.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_DIR_MODE)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Writes `content` to `path` (creating or truncating it) with owner-only
+/// permissions (0600 on Unix). A new file is created with that mode; a file
+/// left over from an earlier run keeps its old mode bits on open, so it is
+/// tightened through the open handle before any new content is written.
+fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(PRIVATE_FILE_MODE);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file.metadata()?.permissions().mode() & 0o777 != PRIVATE_FILE_MODE {
+            file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+        }
+    }
+    file.write_all(content)
+}
+
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std::io::Result<()> {
     let tmp_name = format!(
         ".{}.{}.{}.tmp",
@@ -4033,10 +4085,17 @@ fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std:
     let tmp_path = dir.join(tmp_name);
     let final_path = dir.join(final_name);
     {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp_path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Owner-only from the moment the file exists: backup content is a copy
+        // of a user file and may be a secret even when stored under a
+        // world-readable storage directory.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(PRIVATE_FILE_MODE);
+        }
+        let mut file = options.open(&tmp_path)?;
         file.write_all(content)?;
         file.sync_all()?;
     }
@@ -6038,6 +6097,88 @@ mod tests {
         assert_eq!(
             disabled.skipped_reason_for_operation(DEFAULT_SESSION_ID, "disabled-op", Some(&path)),
             Some(BackupSkippedReason::Disabled)
+        );
+    }
+
+    /// Every entry under `root` (including `root` itself) as `(path, mode, is_dir)`,
+    /// using `symlink_metadata` so symlinks are reported rather than followed.
+    #[cfg(unix)]
+    fn store_modes(root: &Path) -> Vec<(PathBuf, u32, bool)> {
+        let mut out = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            let is_dir = metadata.is_dir();
+            out.push((path.clone(), metadata.permissions().mode() & 0o777, is_dir));
+            if is_dir {
+                for entry in fs::read_dir(&path).unwrap() {
+                    pending.push(entry.unwrap().path());
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_backups_are_owner_only_and_restore_keeps_source_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        // A world-readable storage directory: the store must not rely on its
+        // parent for confidentiality.
+        let storage = temp.path().join("storage");
+        fs::create_dir(&storage).unwrap();
+        fs::set_permissions(&storage, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let secret = temp.path().join("auth.json");
+        fs::write(&secret, "secret-token").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let public = temp.path().join("readme.txt");
+        fs::write(&public, "public text").unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir(storage.clone(), 72);
+        store.snapshot(DEFAULT_SESSION_ID, &secret, "secret").unwrap();
+        store.snapshot(DEFAULT_SESSION_ID, &public, "public").unwrap();
+
+        let backups = storage.join("backups");
+        let modes = store_modes(&backups);
+        let content_files = modes
+            .iter()
+            .filter(|(path, _, is_dir)| {
+                !is_dir && path.extension().and_then(|ext| ext.to_str()) == Some("bak")
+            })
+            .count();
+        assert_eq!(content_files, 2, "expected one content file per source");
+        assert!(modes
+            .iter()
+            .any(|(path, _, _)| path.file_name().and_then(|n| n.to_str()) == Some("meta.json")));
+        for (path, mode, is_dir) in &modes {
+            let expected = if *is_dir { 0o700 } else { 0o600 };
+            assert_eq!(
+                *mode,
+                expected,
+                "{} has mode {:o}, expected {:o}",
+                path.display(),
+                mode,
+                expected
+            );
+        }
+
+        // Restore still puts the recorded source mode back on each file.
+        fs::write(&secret, "changed").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+        store.restore_latest(DEFAULT_SESSION_ID, &secret).unwrap();
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "secret-token");
+        assert_eq!(
+            fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::write(&public, "changed").unwrap();
+        store.restore_latest(DEFAULT_SESSION_ID, &public).unwrap();
+        assert_eq!(
+            fs::metadata(&public).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 
