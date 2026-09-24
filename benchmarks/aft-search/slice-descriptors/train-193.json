@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "bash-task-store-354-355",
+    "tsconfig-bare-extends-353",
+    "restart-bind-storm",
+    "test-hermeticity-350-351"
+  ],
+  "note": "The only ranking-fence file touched is crates/aft/src/lib.rs, which gains a test-only module declaration for the gate hermeticity check. No ranking, fusion, lane or truncation code changed, so the rows should be byte-equal to the reference."
+}
