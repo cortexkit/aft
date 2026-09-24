@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "backup-permissions-346",
+    "relief-telemetry-344",
+    "subc-stall-watchdog"
+  ],
+  "note": "The only ranking-fence file touched is crates/aft/src/subc_tool_schemas.json, regenerated because the aft_delete description gained one sentence about undo retention. No search tool schema, ranking, fusion or lane code changed, so the rows should be byte-equal to the reference."
+}
