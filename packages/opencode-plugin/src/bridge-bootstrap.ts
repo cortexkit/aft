@@ -69,6 +69,12 @@ export type BootstrapNotify = (message: string) => void;
  */
 export interface BridgeBootstrapDependencies {
   loadConfig(directory: string): AftConfig;
+  /**
+   * Deliver the migration notices recorded by the most recent `loadConfig`
+   * call, once per notice identity. Optional so a substituted `loadConfig`
+   * does not deliver notices left over from a real load.
+   */
+  deliverLoadNotices?(notify: BootstrapNotify): void;
   /** Moves legacy config files into the CortexKit layout; returns user-facing warnings. */
   migrateConfigLocations(directory: string): string[];
   resolveBinary(version: string): Promise<string>;
@@ -259,6 +265,7 @@ function startLspAutoInstall(
 
 export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   loadConfig: loadAftConfig,
+  deliverLoadNotices: (notify) => deliverConfigLoadNotices(notify, getConfigLoadNotices()),
   migrateConfigLocations: (directory) =>
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   resolveBinary: resolveBinaryWithWarmup,
@@ -309,7 +316,7 @@ export function loadBootstrapConfig(
   // Reload: migration may have moved the file the first read came from.
   const config = loadConfigOrNull(directory, notify, dependencies);
   if (config === null) return null;
-  deliverConfigLoadNotices(notify, getConfigLoadNotices());
+  dependencies.deliverLoadNotices?.(notify);
   return config;
 }
 
