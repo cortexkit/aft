@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "checkpoint-lock-scope-342",
+    "architecture-structure-rewrite"
+  ],
+  "note": "No ranking-fence file changed. The train keeps the checkpoint lock scope directory on release (#342) and rewrites ARCHITECTURE.md and STRUCTURE.md as short maps."
+}
