@@ -233,12 +233,25 @@ impl SqliteMemorySnapshot {
     }
 }
 
+/// What `retained_slack_bytes` / `allocator_slack_bytes` measure, shown next to
+/// the number wherever it is reported so nobody reads it as resident memory.
+pub const ALLOCATOR_SLACK_LABEL: &str = "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory";
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AllocatorMemorySnapshot {
     pub status: &'static str,
     pub bytes_in_use: Option<u64>,
     pub size_allocated: Option<u64>,
+    /// Address-space slack: `size_allocated - bytes_in_use`. This is NOT
+    /// resident memory. Both allocators hand free pages back to the OS without
+    /// shrinking `size_allocated` (glibc `malloc_trim` uses
+    /// `madvise(MADV_DONTNEED)` inside the heap mapping; macOS libmalloc
+    /// `madvise`s free pages inside its regions), and neither exposes whether a
+    /// free chunk is still resident. Slack can therefore exceed RSS.
     pub retained_slack_bytes: Option<u64>,
+    /// Always `ALLOCATOR_SLACK_LABEL`; serialized so status readers see what
+    /// `retained_slack_bytes` means.
+    pub retained_slack_label: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_estimated: Option<&'static str>,
 }
@@ -251,6 +264,7 @@ impl AllocatorMemorySnapshot {
             bytes_in_use: Some(bytes_in_use),
             size_allocated: Some(size_allocated),
             retained_slack_bytes: Some(size_allocated.saturating_sub(bytes_in_use)),
+            retained_slack_label: ALLOCATOR_SLACK_LABEL,
             not_estimated: None,
         }
     }
@@ -265,6 +279,7 @@ impl AllocatorMemorySnapshot {
             bytes_in_use: None,
             size_allocated: None,
             retained_slack_bytes: None,
+            retained_slack_label: ALLOCATOR_SLACK_LABEL,
             not_estimated: Some(reason),
         }
     }
@@ -310,13 +325,121 @@ pub struct ProcessMemorySnapshot {
     pub not_estimated_subsystems: usize,
 }
 
+/// Source label for `AllocatorPressureRelief::allocator_accounting_bytes` on
+/// Linux: the drop in glibc `mallinfo2().arena + hblkhd`. `malloc_trim(0)`
+/// returns free pages inside the heap with `madvise(MADV_DONTNEED)` without
+/// shrinking `arena`, so this reads near zero even when RSS falls by GiB.
+pub const RELIEF_ACCOUNTING_SOURCE_GLIBC: &str = "glibc_mallinfo2_size_allocated_drop";
+/// Source label for `AllocatorPressureRelief::allocator_accounting_bytes` on
+/// macOS: the byte count `malloc_zone_pressure_relief` returns, i.e. what
+/// libmalloc says it handed back. It is the allocator's own claim, not a
+/// measurement of resident memory.
+pub const RELIEF_ACCOUNTING_SOURCE_MACOS: &str = "malloc_zone_pressure_relief_return";
+
+/// Resident-memory readings taken on each side of a relief pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResidentReading {
+    pub rss_bytes: Option<u64>,
+    /// macOS only; `None` elsewhere.
+    pub phys_footprint_bytes: Option<u64>,
+}
+
+impl ResidentReading {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    fn read() -> Self {
+        Self {
+            rss_bytes: process_rss_bytes(),
+            phys_footprint_bytes: process_phys_footprint_bytes(),
+        }
+    }
+}
+
+/// What one allocator relief pass observed. There is deliberately no single
+/// "released" number: the allocator's accounting and the process's resident
+/// memory measure different things and disagree in practice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocatorPressureRelief {
-    pub bytes_released: u64,
+    /// Bytes the allocator's own accounting says the pass returned. What it
+    /// measures depends on the platform; see `allocator_accounting_source`.
+    pub allocator_accounting_bytes: u64,
+    /// `RELIEF_ACCOUNTING_SOURCE_GLIBC` or `RELIEF_ACCOUNTING_SOURCE_MACOS`.
+    pub allocator_accounting_source: &'static str,
+    /// Observed RSS drop across the pass (`rss_before - rss_after`, floored at
+    /// zero). `None` when either reading is unavailable. Other threads can
+    /// allocate or free during the pass, so this is an observation of the
+    /// process, not an exact attribution to the allocator.
+    pub rss_drop_bytes: Option<u64>,
+    /// Observed physical-footprint drop across the pass (macOS only). macOS
+    /// relief marks pages reusable, which lowers the footprint right away but
+    /// can leave them counted in RSS until the kernel reclaims them, so on
+    /// macOS this is the better observable than `rss_drop_bytes`.
+    pub phys_footprint_drop_bytes: Option<u64>,
     pub rss_before_bytes: Option<u64>,
     pub rss_after_bytes: Option<u64>,
+    pub phys_footprint_before_bytes: Option<u64>,
+    pub phys_footprint_after_bytes: Option<u64>,
     pub allocator_before: AllocatorMemorySnapshot,
     pub allocator_after: AllocatorMemorySnapshot,
+}
+
+impl AllocatorPressureRelief {
+    /// Assemble a relief record from the readings around the pass. The
+    /// resident drops come only from the resident readings; the allocator
+    /// figure comes only from the allocator. Keeping them apart is the point.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    fn from_observations(
+        allocator_accounting_bytes: u64,
+        allocator_accounting_source: &'static str,
+        resident_before: ResidentReading,
+        resident_after: ResidentReading,
+        allocator_before: AllocatorMemorySnapshot,
+        allocator_after: AllocatorMemorySnapshot,
+    ) -> Self {
+        let drop = |before: Option<u64>, after: Option<u64>| {
+            before
+                .zip(after)
+                .map(|(before, after)| before.saturating_sub(after))
+        };
+        Self {
+            allocator_accounting_bytes,
+            allocator_accounting_source,
+            rss_drop_bytes: drop(resident_before.rss_bytes, resident_after.rss_bytes),
+            phys_footprint_drop_bytes: drop(
+                resident_before.phys_footprint_bytes,
+                resident_after.phys_footprint_bytes,
+            ),
+            rss_before_bytes: resident_before.rss_bytes,
+            rss_after_bytes: resident_after.rss_bytes,
+            phys_footprint_before_bytes: resident_before.phys_footprint_bytes,
+            phys_footprint_after_bytes: resident_after.phys_footprint_bytes,
+            allocator_before,
+            allocator_after,
+        }
+    }
+
+    /// Linux form: the allocator figure is the drop in `size_allocated`
+    /// (glibc `arena + hblkhd`) between the two allocator snapshots.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn from_size_allocated_drop(
+        resident_before: ResidentReading,
+        resident_after: ResidentReading,
+        allocator_before: AllocatorMemorySnapshot,
+        allocator_after: AllocatorMemorySnapshot,
+    ) -> Self {
+        let accounting = allocator_before
+            .size_allocated
+            .zip(allocator_after.size_allocated)
+            .map(|(before, after)| before.saturating_sub(after))
+            .unwrap_or(0);
+        Self::from_observations(
+            accounting,
+            RELIEF_ACCOUNTING_SOURCE_GLIBC,
+            resident_before,
+            resident_after,
+            allocator_before,
+            allocator_after,
+        )
+    }
 }
 
 impl ProcessMemorySnapshot {
@@ -816,8 +939,12 @@ unsafe extern "C" {
     fn malloc_zone_pressure_relief(zone: *mut libc::malloc_zone_t, goal: usize) -> usize;
 }
 
-/// Allocator slack (mapped-but-unused arena bytes) above which opportunistic
-/// pressure relief is worth the zone-lock contention it briefly causes.
+/// Address-space allocator slack above which opportunistic pressure relief is
+/// worth the zone-lock contention it briefly causes. Slack includes free pages
+/// the allocator already returned to the OS (it cannot tell which free pages
+/// are resident), so it stays above this line after a successful pass and the
+/// pass repeats at `ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL`. That is intended: a
+/// repeat pass is cheap and returns whatever has been freed since the last one.
 pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Minimum spacing between opportunistic relief passes so a workload that
@@ -871,8 +998,14 @@ static LAST_ALLOCATOR_SLACK_SAMPLE_AT_MS: std::sync::atomic::AtomicU64 =
 static LAST_ALLOCATOR_SLACK_RELIEF_AT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(UNSAMPLED_AT_MS);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-static LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES: std::sync::atomic::AtomicU64 =
+static LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_SLACK_RELIEF_RSS_DROP_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(UNKNOWN_ALLOCATOR_SLACK);
 
 #[cfg(test)]
 static ALLOCATOR_SNAPSHOT_THREADS: std::sync::Mutex<Vec<String>> =
@@ -1003,6 +1136,7 @@ pub fn cached_allocator_observation() -> Option<(AllocatorMemorySnapshot, u64)> 
                         bytes_in_use: Some(bytes_in_use),
                         size_allocated: Some(size_allocated),
                         retained_slack_bytes: Some(retained_slack),
+                        retained_slack_label: ALLOCATOR_SLACK_LABEL,
                         not_estimated: None,
                     }
                 }
@@ -1102,12 +1236,32 @@ fn reserve_relief(now_ms: u64) -> Option<u64> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn log_allocator_relief(relief: AllocatorPressureRelief) {
     log::info!(
-        "allocator slack relief: released={} allocator_slack_bytes_before={:?} allocator_slack_bytes_after={:?} rss_bytes_before={:?} rss_bytes_after={:?}",
-        relief.bytes_released,
-        relief.allocator_before.retained_slack_bytes,
-        relief.allocator_after.retained_slack_bytes,
+        "allocator slack relief: allocator_accounting_bytes={} allocator_accounting_source={} rss_drop_bytes={:?} phys_footprint_drop_bytes={:?} rss_bytes_before={:?} rss_bytes_after={:?} address_space_slack_bytes_before={:?} address_space_slack_bytes_after={:?}",
+        relief.allocator_accounting_bytes,
+        relief.allocator_accounting_source,
+        relief.rss_drop_bytes,
+        relief.phys_footprint_drop_bytes,
         relief.rss_before_bytes,
         relief.rss_after_bytes,
+        relief.allocator_before.retained_slack_bytes,
+        relief.allocator_after.retained_slack_bytes,
+    );
+}
+
+/// Record the latest periodic relief pass for the memory census.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn record_last_allocator_relief(relief: &AllocatorPressureRelief) {
+    let ordering = std::sync::atomic::Ordering::Release;
+    LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES.store(relief.allocator_accounting_bytes, ordering);
+    LAST_ALLOCATOR_SLACK_RELIEF_RSS_DROP_BYTES.store(
+        relief.rss_drop_bytes.unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
+        ordering,
+    );
+    LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES.store(
+        relief
+            .phys_footprint_drop_bytes
+            .unwrap_or(UNKNOWN_ALLOCATOR_SLACK),
+        ordering,
     );
 }
 
@@ -1123,14 +1277,64 @@ pub fn last_allocator_relief_at_ms() -> Option<u64> {
     }
 }
 
-pub fn last_allocator_relief_freed_bytes() -> u64 {
+/// Allocator-accounting figure from the latest periodic relief pass; see
+/// `allocator_relief_accounting_source` for what it measures on this platform.
+pub fn last_allocator_relief_accounting_bytes() -> u64 {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        return LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES.load(std::sync::atomic::Ordering::Acquire);
+        return LAST_ALLOCATOR_SLACK_RELIEF_ACCOUNTING_BYTES
+            .load(std::sync::atomic::Ordering::Acquire);
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         0
+    }
+}
+
+/// Observed RSS drop across the latest periodic relief pass, if one ran and
+/// both RSS readings were available.
+pub fn last_allocator_relief_rss_drop_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let value =
+            LAST_ALLOCATOR_SLACK_RELIEF_RSS_DROP_BYTES.load(std::sync::atomic::Ordering::Acquire);
+        return (value != UNKNOWN_ALLOCATOR_SLACK).then_some(value);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Observed physical-footprint drop across the latest periodic relief pass
+/// (macOS only).
+pub fn last_allocator_relief_phys_footprint_drop_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let value = LAST_ALLOCATOR_SLACK_RELIEF_FOOTPRINT_DROP_BYTES
+            .load(std::sync::atomic::Ordering::Acquire);
+        return (value != UNKNOWN_ALLOCATOR_SLACK).then_some(value);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// What `last_allocator_relief_accounting_bytes` measures on this platform,
+/// or `None` where no relief pass exists.
+pub fn allocator_relief_accounting_source() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(RELIEF_ACCOUNTING_SOURCE_MACOS)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(RELIEF_ACCOUNTING_SOURCE_GLIBC)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
     }
 }
 
@@ -1180,8 +1384,7 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
                         &relief.allocator_after,
                         allocator_slack_elapsed_ms(std::time::Instant::now()),
                     );
-                    LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES
-                        .store(relief.bytes_released, std::sync::atomic::Ordering::Release);
+                    record_last_allocator_relief(&relief);
                     log_allocator_relief(relief);
                 }
             })
@@ -1208,8 +1411,7 @@ pub fn spawn_allocator_slack_relief_if_due(now: std::time::Instant) -> bool {
                 &relief.allocator_after,
                 allocator_slack_elapsed_ms(std::time::Instant::now()),
             );
-            LAST_ALLOCATOR_SLACK_RELIEF_FREED_BYTES
-                .store(relief.bytes_released, std::sync::atomic::Ordering::Release);
+            record_last_allocator_relief(&relief);
             log_allocator_relief(relief);
         })
         .is_ok();
@@ -1239,17 +1441,21 @@ pub fn spawn_allocator_slack_relief_if_due(_now: std::time::Instant) -> bool {
 fn relieve_allocator_pressure_from_snapshot(
     allocator_before: AllocatorMemorySnapshot,
 ) -> AllocatorPressureRelief {
-    let rss_before_bytes = process_rss_bytes();
-    let bytes_released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    let resident_before = ResidentReading::read();
+    // The return value is libmalloc's own count of bytes it handed back. It is
+    // reported as the allocator's claim; the footprint and RSS drops recorded
+    // alongside it are what the process was actually seen to give up.
+    let reported = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     let allocator_after = allocator_memory_snapshot();
-    let rss_after_bytes = process_rss_bytes();
-    AllocatorPressureRelief {
-        bytes_released: usize_to_u64(bytes_released),
-        rss_before_bytes,
-        rss_after_bytes,
+    let resident_after = ResidentReading::read();
+    AllocatorPressureRelief::from_observations(
+        usize_to_u64(reported),
+        RELIEF_ACCOUNTING_SOURCE_MACOS,
+        resident_before,
+        resident_after,
         allocator_before,
         allocator_after,
-    }
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1261,7 +1467,7 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
 fn relieve_allocator_pressure_from_snapshot(
     allocator_before: AllocatorMemorySnapshot,
 ) -> AllocatorPressureRelief {
-    let rss_before_bytes = process_rss_bytes();
+    let resident_before = ResidentReading::read();
     #[cfg(target_env = "gnu")]
     if let Some(malloc_trim) = resolved_malloc_trim() {
         // SAFETY: resolved_malloc_trim verifies the symbol and its C ABI
@@ -1269,19 +1475,13 @@ fn relieve_allocator_pressure_from_snapshot(
         unsafe { malloc_trim(0) };
     }
     let allocator_after = allocator_memory_snapshot();
-    let rss_after_bytes = process_rss_bytes();
-    let bytes_released = allocator_before
-        .size_allocated
-        .zip(allocator_after.size_allocated)
-        .map(|(before, after)| before.saturating_sub(after))
-        .unwrap_or(0);
-    AllocatorPressureRelief {
-        bytes_released,
-        rss_before_bytes,
-        rss_after_bytes,
+    let resident_after = ResidentReading::read();
+    AllocatorPressureRelief::from_size_allocated_drop(
+        resident_before,
+        resident_after,
         allocator_before,
         allocator_after,
-    }
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1485,6 +1685,127 @@ mod tests {
         }
     }
 
+    fn measured_allocator(bytes_in_use: u64, size_allocated: u64) -> AllocatorMemorySnapshot {
+        AllocatorMemorySnapshot {
+            status: "measured",
+            bytes_in_use: Some(bytes_in_use),
+            size_allocated: Some(size_allocated),
+            retained_slack_bytes: Some(size_allocated.saturating_sub(bytes_in_use)),
+            retained_slack_label: ALLOCATOR_SLACK_LABEL,
+            not_estimated: None,
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    /// The production case from a Linux daemon: `malloc_trim(0)` returned
+    /// 1.53 GiB through madvise, so RSS fell while glibc's `arena + hblkhd`
+    /// did not move. The record must carry both figures, each labelled.
+    #[test]
+    fn relief_reports_rss_drop_when_allocator_accounting_is_unchanged() {
+        let in_use = 2 * GIB;
+        let size_allocated = in_use + 7560 * MIB;
+        let before = ResidentReading {
+            rss_bytes: Some(6440 * MIB),
+            phys_footprint_bytes: None,
+        };
+        let after = ResidentReading {
+            rss_bytes: Some(4910 * MIB),
+            phys_footprint_bytes: None,
+        };
+        let relief = AllocatorPressureRelief::from_size_allocated_drop(
+            before,
+            after,
+            measured_allocator(in_use, size_allocated),
+            measured_allocator(in_use, size_allocated),
+        );
+        assert_eq!(relief.allocator_accounting_bytes, 0);
+        assert_eq!(
+            relief.allocator_accounting_source,
+            RELIEF_ACCOUNTING_SOURCE_GLIBC
+        );
+        assert_eq!(relief.rss_drop_bytes, Some(1530 * MIB));
+        assert_eq!(relief.rss_before_bytes, Some(6440 * MIB));
+        assert_eq!(relief.rss_after_bytes, Some(4910 * MIB));
+        assert_eq!(relief.phys_footprint_drop_bytes, None);
+        // Slack is unchanged even though memory went back to the OS: it is
+        // address space, not residency.
+        assert_eq!(
+            relief.allocator_before.retained_slack_bytes,
+            relief.allocator_after.retained_slack_bytes
+        );
+    }
+
+    #[test]
+    fn relief_keeps_allocator_accounting_and_resident_drops_independent() {
+        // Arena shrank by 64 MiB (sbrk trim) while RSS fell by 300 MiB.
+        let relief = AllocatorPressureRelief::from_size_allocated_drop(
+            ResidentReading {
+                rss_bytes: Some(1000 * MIB),
+                phys_footprint_bytes: None,
+            },
+            ResidentReading {
+                rss_bytes: Some(700 * MIB),
+                phys_footprint_bytes: None,
+            },
+            measured_allocator(100 * MIB, 500 * MIB),
+            measured_allocator(100 * MIB, 436 * MIB),
+        );
+        assert_eq!(relief.allocator_accounting_bytes, 64 * MIB);
+        assert_eq!(relief.rss_drop_bytes, Some(300 * MIB));
+
+        // RSS growth during the pass floors the drop at zero; a missing
+        // reading yields no drop rather than a guessed one.
+        let grew = AllocatorPressureRelief::from_size_allocated_drop(
+            ResidentReading {
+                rss_bytes: Some(700 * MIB),
+                phys_footprint_bytes: Some(500 * MIB),
+            },
+            ResidentReading {
+                rss_bytes: Some(900 * MIB),
+                phys_footprint_bytes: None,
+            },
+            measured_allocator(100 * MIB, 500 * MIB),
+            measured_allocator(100 * MIB, 500 * MIB),
+        );
+        assert_eq!(grew.rss_drop_bytes, Some(0));
+        assert_eq!(grew.phys_footprint_drop_bytes, None);
+    }
+
+    #[test]
+    fn macos_style_relief_reports_allocator_return_and_footprint_drop() {
+        let relief = AllocatorPressureRelief::from_observations(
+            40 * MIB,
+            RELIEF_ACCOUNTING_SOURCE_MACOS,
+            ResidentReading {
+                rss_bytes: Some(900 * MIB),
+                phys_footprint_bytes: Some(600 * MIB),
+            },
+            ResidentReading {
+                rss_bytes: Some(900 * MIB),
+                phys_footprint_bytes: Some(520 * MIB),
+            },
+            measured_allocator(100 * MIB, 500 * MIB),
+            measured_allocator(100 * MIB, 500 * MIB),
+        );
+        assert_eq!(relief.allocator_accounting_bytes, 40 * MIB);
+        assert_eq!(
+            relief.allocator_accounting_source,
+            RELIEF_ACCOUNTING_SOURCE_MACOS
+        );
+        assert_eq!(relief.rss_drop_bytes, Some(0));
+        assert_eq!(relief.phys_footprint_drop_bytes, Some(80 * MIB));
+    }
+
+    #[test]
+    fn allocator_snapshot_labels_slack_as_address_space() {
+        let value = serde_json::to_value(measured_allocator(1, 3)).unwrap();
+        assert_eq!(value["retained_slack_bytes"], 2);
+        assert_eq!(value["retained_slack_label"], ALLOCATOR_SLACK_LABEL);
+        assert!(ALLOCATOR_SLACK_LABEL.starts_with("address-space slack"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_allocator_pressure_relief_smoke() {
@@ -1536,16 +1857,19 @@ mod tests {
         let relief = relieve_allocator_pressure();
         let sqlite = SqliteMemorySnapshot::measure();
         eprintln!(
-            "warm-then-idle pressure relief: rss_before={:?} rss_after={:?} allocator_in_use_before={:?} allocator_in_use_after={:?} allocator_allocated_before={:?} allocator_allocated_after={:?} allocator_slack_before={:?} allocator_slack_after={:?} allocator_reported_released={} sqlite_used={} sqlite_highwater={}",
+            "warm-then-idle pressure relief: rss_before={:?} rss_after={:?} footprint_before={:?} footprint_after={:?} allocator_in_use_before={:?} allocator_in_use_after={:?} allocator_allocated_before={:?} allocator_allocated_after={:?} address_space_slack_before={:?} address_space_slack_after={:?} allocator_accounting={} ({}) sqlite_used={} sqlite_highwater={}",
             relief.rss_before_bytes,
             relief.rss_after_bytes,
+            relief.phys_footprint_before_bytes,
+            relief.phys_footprint_after_bytes,
             relief.allocator_before.bytes_in_use,
             relief.allocator_after.bytes_in_use,
             relief.allocator_before.size_allocated,
             relief.allocator_after.size_allocated,
             relief.allocator_before.retained_slack_bytes,
             relief.allocator_after.retained_slack_bytes,
-            relief.bytes_released,
+            relief.allocator_accounting_bytes,
+            relief.allocator_accounting_source,
             sqlite.memory_used_bytes,
             sqlite.memory_highwater_bytes,
         );

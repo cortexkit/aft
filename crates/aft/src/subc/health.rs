@@ -1187,6 +1187,12 @@ impl HealthRollupWorker {
     }
 }
 
+/// Tag for `allocator_slack_bytes` in the health rollup: the figure is
+/// allocator address space (mapped minus in-use), not resident memory. It kept
+/// its name for existing readers; the full meaning is
+/// `crate::memory::ALLOCATOR_SLACK_LABEL`, carried by status and the census.
+const ALLOCATOR_SLACK_KIND: &str = "address_space_not_resident";
+
 /// Build the compact memory rollup from pre-aggregated root counters. Rich
 /// subsystem detail is never constructed for roots omitted by the top-N cap.
 fn memory_rollup_metrics(
@@ -1196,6 +1202,7 @@ fn memory_rollup_metrics(
         return json!({
             "status": "busy",
             "allocator_slack_bytes": 0,
+            "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
             "allocator_slack_measured": false,
             "allocator_observation_age_ms": Value::Null,
         });
@@ -1226,8 +1233,13 @@ fn memory_rollup_metrics(
         // Zero means either measured zero slack or unavailable allocator counters;
         // the sibling boolean disambiguates "no slack" from "unmeasurable".
         "allocator_slack_bytes": snapshot.process.allocator.retained_slack_bytes.unwrap_or(0),
+        "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
         "allocator_slack_measured": snapshot.process.allocator_slack_measured,
         "allocator_observation_age_ms": snapshot.process.allocator_observation_age_ms,
+        // The latest periodic relief pass, as two labelled figures: the
+        // allocator's own accounting and the RSS drop the process showed.
+        "last_relief_allocator_accounting_bytes": crate::memory::last_allocator_relief_accounting_bytes(),
+        "last_relief_rss_drop_bytes": crate::memory::last_allocator_relief_rss_drop_bytes(),
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
@@ -2673,6 +2685,9 @@ mod tests {
         assert!(memory
             .get("allocator_slack_measured")
             .is_some_and(Value::is_boolean));
+        assert_eq!(memory["allocator_slack_kind"], ALLOCATOR_SLACK_KIND);
+        assert!(memory["last_relief_allocator_accounting_bytes"].is_u64());
+        assert!(memory.get("last_relief_rss_drop_bytes").is_some());
         if memory
             .get("allocator_slack_measured")
             .and_then(Value::as_bool)

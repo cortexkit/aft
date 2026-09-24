@@ -2095,7 +2095,7 @@ pub fn render_memory_census_human(value: &serde_json::Value) -> String {
     .unwrap();
     writeln!(
         &mut output,
-        "allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): {} MB",
+        "address-space slack (not resident memory; includes free pages already returned to the OS): {} MB",
         mb(process["allocator_slack_bytes"].as_u64().unwrap_or(0))
     )
     .unwrap();
@@ -2422,7 +2422,7 @@ mod tests {
             "roots": {}
         });
         let rendered = render_memory_census_human(&value);
-        assert!(rendered.contains("allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): 20.0 MB\n"));
+        assert!(rendered.contains("address-space slack (not resident memory; includes free pages already returned to the OS): 20.0 MB\n"));
         assert!(rendered
             .contains("process io: read 1.0 GB, written 2.0 GB (logical 3.0 GB) since spawn\n"));
     }

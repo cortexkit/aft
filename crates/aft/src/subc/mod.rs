@@ -1197,16 +1197,19 @@ fn optional_memory_label(bytes: Option<u64>) -> String {
 
 fn pressure_relief_label(relief: &crate::memory::AllocatorPressureRelief) -> String {
     format!(
-        "; allocator pressure relief: RSS {} -> {}, in-use {} -> {}, allocated {} -> {}, slack {} -> {}, allocator reported {:.1} MB released",
+        "; allocator pressure relief: RSS {} -> {} (dropped {}), phys footprint dropped {}, in-use {} -> {}, allocated {} -> {}, address-space slack {} -> {}, allocator accounting {:.1} MB ({})",
         optional_memory_label(relief.rss_before_bytes),
         optional_memory_label(relief.rss_after_bytes),
+        optional_memory_label(relief.rss_drop_bytes),
+        optional_memory_label(relief.phys_footprint_drop_bytes),
         optional_memory_label(relief.allocator_before.bytes_in_use),
         optional_memory_label(relief.allocator_after.bytes_in_use),
         optional_memory_label(relief.allocator_before.size_allocated),
         optional_memory_label(relief.allocator_after.size_allocated),
         optional_memory_label(relief.allocator_before.retained_slack_bytes),
         optional_memory_label(relief.allocator_after.retained_slack_bytes),
-        relief.bytes_released as f64 / (1024.0 * 1024.0),
+        relief.allocator_accounting_bytes as f64 / (1024.0 * 1024.0),
+        relief.allocator_accounting_source,
     )
 }
 
@@ -9854,12 +9857,18 @@ mod tests {
             bytes_in_use: Some(8 * 1024 * 1024),
             size_allocated: Some(12 * 1024 * 1024),
             retained_slack_bytes: Some(4 * 1024 * 1024),
+            retained_slack_label: crate::memory::ALLOCATOR_SLACK_LABEL,
             not_estimated: None,
         };
         let relief = crate::memory::AllocatorPressureRelief {
-            bytes_released: 3 * 1024 * 1024,
+            allocator_accounting_bytes: 3 * 1024 * 1024,
+            allocator_accounting_source: crate::memory::RELIEF_ACCOUNTING_SOURCE_GLIBC,
+            rss_drop_bytes: Some(3 * 1024 * 1024),
+            phys_footprint_drop_bytes: None,
             rss_before_bytes: Some(20 * 1024 * 1024),
             rss_after_bytes: Some(17 * 1024 * 1024),
+            phys_footprint_before_bytes: None,
+            phys_footprint_after_bytes: None,
             allocator_before: allocator.clone(),
             allocator_after: crate::memory::AllocatorMemorySnapshot {
                 size_allocated: Some(9 * 1024 * 1024),
@@ -9868,10 +9877,14 @@ mod tests {
             },
         };
         let message = pressure_relief_label(&relief);
-        assert!(message.contains("RSS 20.0 MB -> 17.0 MB"));
+        assert!(message.contains("RSS 20.0 MB -> 17.0 MB (dropped 3.0 MB)"));
+        assert!(message.contains("phys footprint dropped not estimated"));
         assert!(message.contains("allocated 12.0 MB -> 9.0 MB"));
-        assert!(message.contains("slack 4.0 MB -> 1.0 MB"));
-        assert!(message.contains("reported 3.0 MB released"));
+        assert!(message.contains("address-space slack 4.0 MB -> 1.0 MB"));
+        assert!(
+            message.contains("allocator accounting 3.0 MB (glibc_mallinfo2_size_allocated_drop)")
+        );
+        assert!(!message.contains("released"));
     }
 
     #[test]

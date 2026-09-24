@@ -313,7 +313,7 @@ fn profile_memory_renders_fake_management_surface_census() {
     assert!(stdout.contains("phys footprint: 64.0 MB\n"), "{stdout}");
     assert!(stdout.contains("rss: 48.0 MB\n"), "{stdout}");
     assert!(
-        stdout.contains("allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): 8.0 MB\n"),
+        stdout.contains("address-space slack (not resident memory; includes free pages already returned to the OS): 8.0 MB\n"),
         "{stdout}"
     );
     assert!(

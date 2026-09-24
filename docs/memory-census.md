@@ -53,12 +53,15 @@ The `data` payload is:
     "phys_footprint_bytes": null,
     "rss_bytes": 0,
     "allocator_slack_bytes": 0,
-    "allocator_slack_label": "reclaimable by relief",
+    "allocator_slack_label": "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory",
     "sqlite_bytes": 0,
     "total_attributed_bytes": 0,
     "unattributed_bytes": 0,
     "last_relief_at_ms": null,
-    "last_relief_freed_bytes": 0
+    "last_relief_allocator_accounting_bytes": 0,
+    "last_relief_allocator_accounting_source": "glibc_mallinfo2_size_allocated_drop",
+    "last_relief_rss_drop_bytes": null,
+    "last_relief_phys_footprint_drop_bytes": null
   }
 }
 ```
@@ -66,10 +69,42 @@ The `data` payload is:
 `roots` is never capped. `evictable_in_ms` is null while a root has a bound
 route, and otherwise is the configured root idle TTL minus its request age
 (clamped at zero). `evictable_bytes` is the artifact, symbol, and inspect data
-released by the idle reaper, not a second estimate. `allocator_slack_bytes` is
-an overlapping allocator envelope and is labelled as reclaimable by relief;
-`unattributed_bytes` is footprint (or RSS when footprint is unavailable) minus
-attributed bytes minus allocator slack.
+released by the idle reaper, not a second estimate.
+
+`allocator_slack_bytes` is address-space slack: allocator-mapped bytes minus
+bytes in use. It is not resident memory. Allocators return free pages to the OS
+without unmapping them (glibc `malloc_trim` uses `madvise(MADV_DONTNEED)`
+inside the heap; macOS libmalloc marks pages reusable), and neither says which
+free pages are still resident, so slack can exceed RSS. The same figure appears
+as `retained_slack_bytes` in status and as `allocator_slack_bytes` (tagged
+`allocator_slack_kind: "address_space_not_resident"`) in the health rollup.
+`unattributed_bytes` is footprint minus attributed bytes, or on platforms
+without a footprint (Linux) RSS minus attributed bytes minus allocator slack;
+because slack includes pages already returned, that RSS fallback can read low.
+
+The `last_relief_*` fields describe the latest periodic allocator relief pass.
+There is no single "freed" number because the two sides disagree:
+
+- `last_relief_allocator_accounting_bytes` is what the allocator's own
+  accounting says; `last_relief_allocator_accounting_source` names it. On Linux
+  (`glibc_mallinfo2_size_allocated_drop`) it is the drop in
+  `mallinfo2().arena + hblkhd`, which misses the pages `malloc_trim` returns
+  with madvise and so often reads near zero. On macOS
+  (`malloc_zone_pressure_relief_return`) it is the byte count
+  `malloc_zone_pressure_relief` returns.
+- `last_relief_rss_drop_bytes` is the observed RSS drop across the pass
+  (floored at zero; null before the first pass). On Linux this is the figure
+  that shows what the trim actually returned.
+- `last_relief_phys_footprint_drop_bytes` is the observed footprint drop
+  (macOS only). macOS relief lowers the footprint right away but can leave the
+  pages in RSS until the kernel reclaims them, so there it is the better
+  observable.
+
+The periodic relief pass triggers on at least 1 GiB of slack, at most once
+every five minutes. Because slack does not fall when pages are returned by
+madvise, a daemon that once crossed the line keeps running a pass every five
+minutes; that cadence is bounded and each pass returns what was freed since the
+last one, so the trigger was left as is.
 
 `aft profile --memory` renders this contract when supplied a daemon census. In
 standalone mode it reports that no shared process exists to attribute rather

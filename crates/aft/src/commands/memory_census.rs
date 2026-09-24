@@ -73,9 +73,11 @@ pub fn render_memory_census(
     let slack = process.allocator.retained_slack_bytes.unwrap_or(0);
     // Unattributed = what the process holds beyond the per-root attribution.
     // phys_footprint already excludes MADV_FREE allocator slack (that is why it
-    // is preferred), so slack is subtracted only on the RSS fallback, where it
-    // is still resident. Attribution is an estimate, so the remainder floors
-    // at zero rather than rendering a negative "unattributed" line.
+    // is preferred), so slack is subtracted only on the RSS fallback. On that
+    // fallback (Linux) slack is address space, not residency: it also counts
+    // free pages malloc_trim already returned, so subtracting it can
+    // understate the remainder. Attribution is an estimate, so the remainder
+    // floors at zero rather than rendering a negative "unattributed" line.
     let unattributed_bytes = match (process.phys_footprint_bytes, process.rss_bytes) {
         (Some(footprint), _) => Some(unattributed_from(
             footprint,
@@ -96,14 +98,20 @@ pub fn render_memory_census(
             "phys_footprint_bytes": process.phys_footprint_bytes,
             "rss_bytes": process.rss_bytes,
             "allocator_slack_bytes": slack,
-            "allocator_slack_label": "allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory)",
+            "allocator_slack_label": crate::memory::ALLOCATOR_SLACK_LABEL,
             "allocator_slack_measured": process.allocator_slack_measured,
             "allocator_observation_age_ms": process.allocator_observation_age_ms,
             "sqlite_bytes": process.sqlite.memory_used_bytes,
             "total_attributed_bytes": process.total_attributed_bytes,
             "unattributed_bytes": unattributed_bytes,
             "last_relief_at_ms": crate::memory::last_allocator_relief_at_ms(),
-            "last_relief_freed_bytes": crate::memory::last_allocator_relief_freed_bytes(),
+            // Two figures, not one "freed" number: what the allocator's own
+            // accounting says it returned (source names what that measures on
+            // this platform) and what the process was seen to give up.
+            "last_relief_allocator_accounting_bytes": crate::memory::last_allocator_relief_accounting_bytes(),
+            "last_relief_allocator_accounting_source": crate::memory::allocator_relief_accounting_source(),
+            "last_relief_rss_drop_bytes": crate::memory::last_allocator_relief_rss_drop_bytes(),
+            "last_relief_phys_footprint_drop_bytes": crate::memory::last_allocator_relief_phys_footprint_drop_bytes(),
             "dead_code_snapshots": {
                 "roots": dead_code_snapshots.roots,
                 "bytes": dead_code_snapshots.bytes,
@@ -256,8 +264,11 @@ mod tests {
         let value = render_memory_census(&snapshot, None);
         assert_eq!(
             value["process"]["allocator_slack_label"],
-            "allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory)"
+            crate::memory::ALLOCATOR_SLACK_LABEL
         );
+        assert!(value["process"].get("last_relief_freed_bytes").is_none());
+        assert!(value["process"]["last_relief_allocator_accounting_bytes"].is_u64());
+        assert!(value["process"].get("last_relief_rss_drop_bytes").is_some());
         for io in [&value["process_io"], &value["process"]["process_io"]] {
             assert!(io["available"].is_boolean());
             assert!(io["sampled_at_ms"].is_u64());
