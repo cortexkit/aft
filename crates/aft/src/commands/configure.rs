@@ -5345,6 +5345,23 @@ enum ConfigureMaintenanceStage {
 }
 
 impl ConfigureMaintenanceStage {
+    #[cfg(test)]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admission => "admission",
+            Self::SessionReplay => "session_replay",
+            Self::BashRuntime => "bash_runtime",
+            Self::ProjectRuntime => "project_runtime",
+            Self::Watcher => "watcher",
+            Self::ViewLoad => "view_load",
+            Self::StorageSweeps => "storage_sweeps",
+            Self::ProcessFlags => "process_flags",
+            Self::Callgraph => "callgraph",
+            Self::SemanticRelease => "semantic_release",
+            Self::Status => "status",
+        }
+    }
+
     /// Stages a request's correctness depends on. They run to completion before
     /// the first request after a configure is served: bash replay (a queued
     /// `bash_drain_completions` must see the previous process's tasks), the
@@ -5411,6 +5428,17 @@ impl ConfigureMaintenanceState {
 
     /// True when the next unit to run starts a job or continues one past its
     /// request-critical prefix, so stopping here leaves no prefix half done.
+    ///
+    /// Why the remaining stops are safe: stopping before a job's Admission
+    /// leaves the root exactly as it is between a bind ack and the tail's
+    /// first submission, which every bind already passes through. Past the
+    /// prefix, the standalone loop already lets requests (configures and edits
+    /// included) run between units. A writer that runs meanwhile either keeps
+    /// the configure generation (an equivalent rebind, an LSP-path update or
+    /// an edit, none of which touch what the remaining stages read) or
+    /// advances it, in which case `drop_superseded_parked_continuations`
+    /// discards the rest and the newer configure's own tail repeats every
+    /// root-scoped stage.
     fn can_step_aside(&self) -> bool {
         self.jobs.front().is_none_or(|continuation| {
             continuation.stage == ConfigureMaintenanceStage::Admission
@@ -5719,6 +5747,68 @@ fn run_configure_view_sweep(ctx: &AppContext) {
 }
 
 fn run_configure_maintenance_unit(
+    ctx: &AppContext,
+    continuation: &mut ConfigureMaintenanceContinuation,
+    detach_storage_sweeps: bool,
+) -> ConfigureMaintenanceUnitResult {
+    let stage = continuation.stage;
+    let result = run_configure_maintenance_unit_inner(ctx, continuation, detach_storage_sweeps);
+    record_configure_unit_for_test(&continuation.job, stage);
+    result
+}
+
+/// One finished configure-tail unit, as recorded for tests: the job's root and
+/// generation, the stage that ran, and when it finished.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigureUnitRecord {
+    pub(crate) root: PathBuf,
+    pub(crate) generation: u64,
+    pub(crate) stage: &'static str,
+    pub(crate) finished_at: std::time::Instant,
+}
+
+#[cfg(test)]
+fn configure_unit_records() -> &'static std::sync::Mutex<Vec<ConfigureUnitRecord>> {
+    static RECORDS: std::sync::OnceLock<std::sync::Mutex<Vec<ConfigureUnitRecord>>> =
+        std::sync::OnceLock::new();
+    RECORDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn record_configure_unit_for_test(job: &ConfigureMaintenanceJob, stage: ConfigureMaintenanceStage) {
+    configure_unit_records()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ConfigureUnitRecord {
+            root: job.canonical_cache_root.clone(),
+            generation: job.generation,
+            stage: stage.label(),
+            finished_at: std::time::Instant::now(),
+        });
+}
+
+#[cfg(not(test))]
+fn record_configure_unit_for_test(
+    _job: &ConfigureMaintenanceJob,
+    _stage: ConfigureMaintenanceStage,
+) {
+}
+
+/// Configure-tail units that ran for `root`, in order. Tests run in parallel,
+/// so every test reads only its own roots.
+#[cfg(test)]
+pub(crate) fn configure_unit_records_for_root(root: &Path) -> Vec<ConfigureUnitRecord> {
+    configure_unit_records()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|record| record.root == root)
+        .cloned()
+        .collect()
+}
+
+fn run_configure_maintenance_unit_inner(
     ctx: &AppContext,
     continuation: &mut ConfigureMaintenanceContinuation,
     detach_storage_sweeps: bool,
@@ -6863,6 +6953,88 @@ mod tests {
         }
         assert!(!ctx.configure_tail_has_work());
         assert!(ctx.take_parked_configure_tail().is_none());
+    }
+
+    /// A newer configure that lands while a tail is stepped aside replaces the
+    /// generation the parked work belongs to. The parked continuation's
+    /// remaining units must not run on resume; the newer configure's own tail
+    /// repeats every root-scoped stage.
+    #[test]
+    fn superseded_parked_tail_does_not_resume_after_a_newer_configure() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let canonical_root = fs::canonicalize(project.path()).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let configure = |max_file_size: u64| {
+            let response = handle_configure_for_test(
+                &configure_request_with_params(json!({
+                    "project_root": project.path(),
+                    "storage_dir": storage.path(),
+                    "harness": "opencode",
+                    "search_index_max_file_size": max_file_size,
+                    "config": [user_tier(json!({
+                        "search_index": false,
+                        "semantic_search": false,
+                        "callgraph_store": false
+                    }))]
+                })),
+                &ctx,
+            );
+            assert!(response.success, "{}", response.data);
+        };
+
+        configure(1_000_000);
+        let old_generation = ctx.configure_generation();
+        let waiting_writers = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        {
+            let _writer_waiting = crate::executor::install_actor_waiting_writers_for_test(
+                Arc::clone(&waiting_writers),
+            );
+            assert!(super::drain_deferred_configure_maintenance_yielding(&ctx));
+        }
+        let old_units_before = super::configure_unit_records_for_root(&canonical_root)
+            .into_iter()
+            .filter(|record| record.generation == old_generation)
+            .count();
+        assert!(old_units_before > 0, "the old tail ran its prefix");
+
+        // The waiting writer was a configure that changes the warm key.
+        configure(2_000_000);
+        let new_generation = ctx.configure_generation();
+        assert_ne!(new_generation, old_generation);
+
+        waiting_writers.store(0, std::sync::atomic::Ordering::Release);
+        {
+            let _no_writer = crate::executor::install_actor_waiting_writers_for_test(Arc::clone(
+                &waiting_writers,
+            ));
+            assert!(!super::drain_deferred_configure_maintenance_yielding(&ctx));
+        }
+        let records = super::configure_unit_records_for_root(&canonical_root);
+        let old_units_after = records
+            .iter()
+            .filter(|record| record.generation == old_generation)
+            .count();
+        assert_eq!(
+            old_units_after, old_units_before,
+            "superseded units ran after the newer configure: {records:?}"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.generation == new_generation && record.stage == "status"),
+            "the newer configure's tail runs to completion: {records:?}"
+        );
+        assert!(!ctx.configure_tail_has_work());
     }
 
     #[test]

@@ -112,12 +112,37 @@ const INITIAL_MAINTENANCE_DRAIN_KINDS: [MaintenanceDrainKind; 4] = [
 /// prewarm, storage sweeps, watcher start) running at once across every root.
 /// After a daemon restart every session rebinds within a few minutes; without
 /// a cap each root's tail started as soon as its bind acked and they all
-/// competed for CPU and disk together.
+/// competed for CPU and disk together. The executor already runs at most
+/// `maintenance_cap` maintenance jobs (6 on the default 8-worker pool); 4 keeps
+/// two of those slots for other roots' watcher, LSP and completion drains
+/// while a burst of tails drains.
 const CONFIGURE_TAIL_CONCURRENCY: usize = 4;
 /// Most configure tails a single maintenance tick (every 250 ms) may start, so
 /// a burst of binds is admitted a few roots at a time even while tails finish
 /// quickly.
-const CONFIGURE_TAIL_ADMISSIONS_PER_TICK: usize = 2;
+///
+/// Measured on a 40-root restart-shaped burst of real tails on small git roots
+/// (8-worker pool, `configure_tail_burst_measurement_*`, three runs each), the
+/// median time to the last root's watcher start was 3.4 s uncapped, 5.2 s at
+/// (4 concurrent, 4 per tick), 6.4 s at (6, 6) and 6.5 s at (4, 2). With small
+/// tails the per-tick limit sets a floor of `roots / per_tick` ticks, so 4 per
+/// tick halves the floor of 2 per tick at the same concurrency.
+const CONFIGURE_TAIL_ADMISSIONS_PER_TICK: usize = 4;
+
+/// Admission limits for configure tails; production always uses
+/// [`ConfigureTailLimits::PRODUCTION`].
+#[derive(Clone, Copy, Debug)]
+struct ConfigureTailLimits {
+    concurrency: usize,
+    admissions_per_tick: usize,
+}
+
+impl ConfigureTailLimits {
+    const PRODUCTION: Self = Self {
+        concurrency: CONFIGURE_TAIL_CONCURRENCY,
+        admissions_per_tick: CONFIGURE_TAIL_ADMISSIONS_PER_TICK,
+    };
+}
 #[cfg(test)]
 const INITIAL_MAINTENANCE_JOB_COUNT: usize = INITIAL_MAINTENANCE_DRAIN_KINDS.len();
 
@@ -1088,6 +1113,26 @@ fn due_maintenance_jobs(
     budget: usize,
     pending_bind_roots: &HashSet<ProjectRootId>,
 ) -> (Vec<(ProjectRootId, MaintenanceDrainKind)>, bool) {
+    due_maintenance_jobs_with_tail_limits(
+        live_roots,
+        executor,
+        bg_sub_by_session,
+        bg_wake_pending,
+        budget,
+        pending_bind_roots,
+        ConfigureTailLimits::PRODUCTION,
+    )
+}
+
+fn due_maintenance_jobs_with_tail_limits(
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    executor: Option<&Executor>,
+    bg_sub_by_session: &BgSubsBySession,
+    bg_wake_pending: &BgWakePending,
+    budget: usize,
+    pending_bind_roots: &HashSet<ProjectRootId>,
+    tail_limits: ConfigureTailLimits,
+) -> (Vec<(ProjectRootId, MaintenanceDrainKind)>, bool) {
     let mut jobs = Vec::new();
     let mut deferred = false;
     let mut tails_in_flight = live_roots
@@ -1189,8 +1234,8 @@ fn due_maintenance_jobs(
                 break;
             }
             if kind == MaintenanceDrainKind::ConfigureTail {
-                if tails_in_flight >= CONFIGURE_TAIL_CONCURRENCY
-                    || tails_admitted >= CONFIGURE_TAIL_ADMISSIONS_PER_TICK
+                if tails_in_flight >= tail_limits.concurrency
+                    || tails_admitted >= tail_limits.admissions_per_tick
                 {
                     // Hold only the tail; this root's other drains still run.
                     held_tail = true;
@@ -11087,5 +11132,204 @@ mod tests {
         assert_eq!(acks["count"], 1);
         assert_eq!(acks["slow_count"], 1, "{acks}");
         assert!(acks["worst_ms"].as_u64().is_some_and(|ms| ms >= 7_000));
+    }
+
+    /// Restart-shaped burst: 40 git roots configured together, then their
+    /// real configure tails driven through the executor by a 250 ms
+    /// maintenance tick, as the module loop does. Reports the time from the
+    /// burst to the last root's watcher start, the last tail's completion, and
+    /// the peak number of tails running together. A measurement, not a gate:
+    /// run `configure_tail_burst_measurement_capped` and `..._uncapped`
+    /// separately with `--ignored --nocapture`.
+    fn measure_configure_tail_burst(label: &str, tail_limits: ConfigureTailLimits) {
+        const ROOTS: usize = 40;
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let storage = tempfile::tempdir().unwrap();
+        let executor = Arc::new(Executor::new());
+        let mut dirs = Vec::new();
+        let mut roots = Vec::new();
+        let mut live_roots = HashMap::new();
+        for index in 0..ROOTS {
+            let dir = tempfile::tempdir().unwrap();
+            for file in 0..20 {
+                std::fs::write(
+                    dir.path().join(format!("module_{file}.rs")),
+                    format!("pub fn function_{file}() -> usize {{ {file} }}\n"),
+                )
+                .unwrap();
+            }
+            for args in [
+                &["init", "--quiet"][..],
+                &["add", "."][..],
+                &[
+                    "-c",
+                    "user.name=AFT Tests",
+                    "-c",
+                    "user.email=aft-tests@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ][..],
+            ] {
+                let mut command = std::process::Command::new("git");
+                crate::test_env::apply_hermetic_git_env(command.current_dir(dir.path()));
+                assert!(command.args(args).status().unwrap().success());
+            }
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                Config {
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    ..Config::default()
+                },
+            ));
+            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+            let request = serde_json::from_value::<RawRequest>(json!({
+                "id": format!("subc-bind-{index}"),
+                "command": "configure",
+                "project_root": dir.path(),
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "session_id": format!("burst-session-{index}"),
+                "config": [{
+                    "tier": "user",
+                    "source": "/u/aft.jsonc",
+                    "doc": json!({ "semantic_search": false }).to_string(),
+                }],
+            }))
+            .unwrap();
+            let response = crate::commands::configure::handle_configure(&request, &ctx);
+            assert!(response.success, "{}", response.data);
+            let mut meta = RootMeta::new(Instant::now());
+            meta.maintenance_pending = true;
+            meta.maintenance_queued_kinds.extend([
+                MaintenanceDrainKind::ConfigureTail,
+                MaintenanceDrainKind::CompletionDrains,
+            ]);
+            live_roots.insert(root.clone(), meta);
+            roots.push((root, ctx));
+            dirs.push(dir);
+        }
+
+        let (done_tx, done_rx) =
+            crossbeam_channel::unbounded::<(ProjectRootId, MaintenanceDrainKind, bool)>();
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(300);
+        let mut tails_running = 0usize;
+        let mut peak_tails = 0usize;
+        let watcher_started = |root: &ProjectRootId| {
+            crate::commands::configure::configure_unit_records_for_root(root.as_path())
+                .into_iter()
+                .find(|record| record.stage == "watcher")
+                .map(|record| record.finished_at)
+        };
+        loop {
+            while let Ok((root, kind, requeue)) = done_rx.try_recv() {
+                let meta = live_roots.get_mut(&root).unwrap();
+                if kind == MaintenanceDrainKind::ConfigureTail {
+                    meta.configure_tail_in_flight = false;
+                    tails_running -= 1;
+                }
+                note_maintenance_completion(meta, requeue.then_some(kind), false, false);
+            }
+            let tails_done = live_roots.values().all(|meta| {
+                !meta.configure_tail_in_flight
+                    && !meta
+                        .maintenance_queued_kinds
+                        .contains(&MaintenanceDrainKind::ConfigureTail)
+            });
+            if tails_done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{label}: burst did not finish");
+            let (due, _) = due_maintenance_jobs_with_tail_limits(
+                &mut live_roots,
+                Some(&executor),
+                &HashMap::new(),
+                &BgWakePending::new(),
+                MAINTENANCE_SUBMIT_BUDGET,
+                &HashSet::new(),
+                tail_limits,
+            );
+            for (root, kind) in due {
+                if kind != MaintenanceDrainKind::ConfigureTail {
+                    // Only the tail is measured; other drains settle at once.
+                    let _ = done_tx.send((root, kind, false));
+                    continue;
+                }
+                tails_running += 1;
+                peak_tails = peak_tails.max(tails_running);
+                let done = done_tx.clone();
+                let completion_root = root.clone();
+                drop(executor.submit_maintenance_async(
+                    root.clone(),
+                    Lane::MaintenanceCommit,
+                    format!(
+                        "subc-maintenance-drain-configure-tail-{}",
+                        root.as_path().display()
+                    ),
+                    Box::new(move |ctx| {
+                        let requeue =
+                            runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+                        let _ = done.send((completion_root, kind, requeue));
+                        Response::success("tail", json!({}))
+                    }),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        let tails_finished = started.elapsed();
+        let mut watcher_offsets = roots
+            .iter()
+            .map(|(root, _)| {
+                watcher_started(root)
+                    .map(|at| at.saturating_duration_since(started))
+                    .unwrap_or_else(|| panic!("{label}: no watcher start for {root:?}"))
+            })
+            .collect::<Vec<_>>();
+        watcher_offsets.sort();
+        let median = watcher_offsets[ROOTS / 2];
+        let last = *watcher_offsets.last().unwrap();
+        eprintln!(
+            "configure-tail burst [{label}] roots={ROOTS} pool={} limits={tail_limits:?}: \
+             last watcher start {last:?}, median watcher start {median:?}, \
+             all tails done {tails_finished:?}, peak concurrent tails {peak_tails}",
+            executor.pool_size()
+        );
+        assert_eq!(dirs.len(), ROOTS);
+    }
+
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn configure_tail_burst_measurement_capped() {
+        measure_configure_tail_burst("capped", ConfigureTailLimits::PRODUCTION);
+    }
+
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn configure_tail_burst_measurement_uncapped() {
+        measure_configure_tail_burst(
+            "uncapped",
+            ConfigureTailLimits {
+                concurrency: usize::MAX,
+                admissions_per_tick: usize::MAX,
+            },
+        );
+    }
+
+    /// Measure one limit pair, given as `AFT_TAIL_BURST_LIMITS=concurrency,per_tick`.
+    #[test]
+    #[ignore = "measurement: run with --ignored --nocapture"]
+    fn configure_tail_burst_measurement_from_env() {
+        let limits = std::env::var("AFT_TAIL_BURST_LIMITS").expect("AFT_TAIL_BURST_LIMITS");
+        let (concurrency, per_tick) = limits.split_once(',').expect("concurrency,per_tick");
+        measure_configure_tail_burst(
+            &limits,
+            ConfigureTailLimits {
+                concurrency: concurrency.trim().parse().unwrap(),
+                admissions_per_tick: per_tick.trim().parse().unwrap(),
+            },
+        );
     }
 }
