@@ -2795,6 +2795,8 @@ fn run_subc_mode_inner(
     let executor_for_loop = Arc::clone(&executor);
     let loop_result = runtime.block_on(async move {
         let shared_app = ctx.app();
+        // Stall captures land under `<storage>/diagnostics`.
+        let storage_dir = ctx.storage_dir();
         drop(ctx);
         let stream =
             connect_and_authenticate(connection_file_path, lifecycle_probe.as_ref()).await?;
@@ -2814,6 +2816,7 @@ fn run_subc_mode_inner(
             allow_native_passthrough,
             tool_response_body_limit,
             lifecycle_probe,
+            &storage_dir,
         )
         .await
     });
@@ -3290,6 +3293,7 @@ async fn run_module_loop<R, W>(
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
+    storage_dir: &Path,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -3344,7 +3348,7 @@ where
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
-    let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor);
+    let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor, storage_dir);
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
     let control_replies = readiness::PendingControlReplies::default();
@@ -4424,6 +4428,7 @@ where
 fn spawn_stall_watchdog(
     dispatch_path_metrics: &Arc<DispatchPathMetrics>,
     executor: &Executor,
+    storage_dir: &Path,
 ) -> Option<stall_watchdog::StallWatchdog> {
     let markers: Vec<Box<dyn stall_watchdog::LivenessMarker>> = vec![
         Box::new(stall_watchdog::FrameLoopMarker(Arc::clone(
@@ -4436,7 +4441,7 @@ fn spawn_stall_watchdog(
     match stall_watchdog::StallWatchdog::spawn(
         markers,
         Arc::clone(&dispatch_path_metrics.stall_stats),
-        stall_watchdog::StallWatchdogConfig::production(),
+        stall_watchdog::StallWatchdogConfig::production(storage_dir),
     ) {
         Ok(watchdog) => Some(watchdog),
         Err(error) => {

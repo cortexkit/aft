@@ -636,6 +636,7 @@ impl DispatchPathMetrics {
                 "stall_count": self.stall_stats.stall_count(),
                 "last_stall_duration_ms": self.stall_stats.last_stall_duration_ms(),
                 "active_stalls": self.stall_stats.active_stalls(),
+                "captures": self.stall_stats.captures(),
             },
             "pending_binds": {
                 "count": pending_binds.len(),
@@ -2501,6 +2502,20 @@ mod tests {
         assert!(decayed_metrics["roots"][0]
             .get("callgraph_repair_entries_60s")
             .is_none());
+    }
+
+    #[test]
+    fn health_report_exposes_stall_watchdog_counters() {
+        let executor = Executor::new();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let app = App::default_shared();
+
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let stall = &report.metrics.expect("health metrics")["dispatch_path"]["stall_watchdog"];
+        assert_eq!(stall["stall_count"].as_u64(), Some(0), "{stall}");
+        assert!(stall["last_stall_duration_ms"].is_null(), "{stall}");
+        assert_eq!(stall["active_stalls"].as_u64(), Some(0), "{stall}");
+        assert_eq!(stall["captures"].as_u64(), Some(0), "{stall}");
     }
 
     #[test]

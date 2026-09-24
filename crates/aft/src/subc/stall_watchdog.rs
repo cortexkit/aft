@@ -7,11 +7,13 @@
 //! lock or descheduled, and it can capture evidence while the stall is live.
 
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::health::DispatchPathMetrics;
 use crate::executor::DispatchLoopLiveness;
@@ -20,6 +22,12 @@ use crate::executor::DispatchLoopLiveness;
 pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
 /// How often the watchdog samples the markers.
 pub(super) const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+/// At most one evidence capture per this interval, however many stalls occur.
+pub(super) const CAPTURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+/// Capture files kept in the diagnostics directory; older ones are deleted.
+pub(super) const KEEP_CAPTURES: usize = 5;
+const CAPTURE_FILE_PREFIX: &str = "stall-";
+const CAPTURE_FILE_SUFFIX: &str = ".txt";
 
 /// Stall counters the health report reads. Written only by the watchdog.
 #[derive(Default)]
@@ -27,6 +35,7 @@ pub(super) struct StallStats {
     stall_count: AtomicU64,
     last_stall_duration_ms: AtomicU64,
     active_stalls: AtomicUsize,
+    captures: AtomicU64,
 }
 
 impl StallStats {
@@ -45,22 +54,115 @@ impl StallStats {
     pub(super) fn active_stalls(&self) -> usize {
         self.active_stalls.load(Ordering::Relaxed)
     }
+
+    /// Evidence captures attempted (spawned or written), successful or not.
+    pub(super) fn captures(&self) -> u64 {
+        self.captures.load(Ordering::Relaxed)
+    }
 }
 
 /// Where watchdog lines go. Production writes to the daemon log; tests record.
 pub(super) type StallLogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// What a capture produced.
+pub(super) enum CaptureStarted {
+    /// A profiler child is writing the file; the watchdog reaps it later.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Spawned(Child),
+    /// The evidence was written synchronously.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+    Written,
+    /// This platform has no capture; only the log line records the stall.
+    #[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+    Unsupported,
+}
+
+/// Captures stack evidence of the process while it is stalled. Must not take
+/// any lock or need the executor or the async runtime: those are what stall.
+pub(super) trait StallCapture: Send + Sync {
+    fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted>;
+}
+
+/// macOS: a 3-second `sample` of this process. Linux: every thread's
+/// `/proc` stat line and kernel wait channel. Elsewhere: nothing.
+pub(super) struct PlatformCapture;
+
+impl StallCapture for PlatformCapture {
+    #[cfg(target_os = "macos")]
+    fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+        // `-mayDie` keeps `sample` from failing if the daemon exits mid-sample.
+        std::process::Command::new("/usr/bin/sample")
+            .arg(pid.to_string())
+            .arg("3")
+            .arg("-mayDie")
+            .arg("-file")
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(CaptureStarted::Spawned)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture(&self, _pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+        std::fs::write(path, linux_thread_states()?)?;
+        Ok(CaptureStarted::Written)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn capture(&self, _pid: u32, _path: &Path) -> io::Result<CaptureStarted> {
+        Ok(CaptureStarted::Unsupported)
+    }
+}
+
+/// One block per thread: its stat line (state, CPU times) and the kernel
+/// function it is waiting in, which names the lock or I/O a blocked thread
+/// sits on.
+#[cfg(target_os = "linux")]
+fn linux_thread_states() -> io::Result<String> {
+    let mut tasks = std::fs::read_dir("/proc/self/task")?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect::<Vec<_>>();
+    tasks.sort();
+    let mut out = String::new();
+    for task in tasks {
+        let read = |name: &str| {
+            std::fs::read_to_string(task.join(name))
+                .unwrap_or_else(|error| format!("<unreadable: {error}>"))
+        };
+        out.push_str(&format!(
+            "task {}\nstat: {}\nwchan: {}\n\n",
+            task.display(),
+            read("stat").trim_end(),
+            read("wchan").trim_end(),
+        ));
+    }
+    Ok(out)
+}
+
 pub(super) struct StallWatchdogConfig {
     pub(super) tick: Duration,
     pub(super) threshold: Duration,
+    pub(super) capture_cooldown: Duration,
+    pub(super) keep_captures: usize,
+    /// `<storage>/diagnostics`.
+    pub(super) diagnostics_dir: PathBuf,
+    pub(super) pid: u32,
+    pub(super) capture: Arc<dyn StallCapture>,
     pub(super) log: StallLogSink,
 }
 
 impl StallWatchdogConfig {
-    pub(super) fn production() -> Self {
+    pub(super) fn production(storage_dir: &Path) -> Self {
         Self {
             tick: WATCHDOG_TICK,
             threshold: STALL_THRESHOLD,
+            capture_cooldown: CAPTURE_COOLDOWN,
+            keep_captures: KEEP_CAPTURES,
+            diagnostics_dir: storage_dir.join("diagnostics"),
+            pid: std::process::id(),
+            capture: Arc::new(PlatformCapture),
             log: Arc::new(|line| log::warn!("{line}")),
         }
     }
@@ -114,12 +216,16 @@ fn run_watchdog(
 ) {
     let mut detector = StallDetector::new(config.threshold, markers.len());
     let mut expected_wake = Instant::now() + config.tick;
+    let mut last_capture_at: Option<Instant> = None;
+    let mut capture_children: Vec<Child> = Vec::new();
     loop {
         match stop_rx.recv_timeout(config.tick) {
             Err(RecvTimeoutError::Timeout) => {}
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
         let now = Instant::now();
+        // Reap finished profiler children so they do not linger as zombies.
+        capture_children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         // If the watchdog itself woke far later than it asked to, the whole
         // process (not one loop) was not running; the log lines carry this so
         // a stall can be told apart from process-wide descheduling.
@@ -133,8 +239,20 @@ fn run_watchdog(
                 Some(StallTransition::Began { stalled_for, .. }) => {
                     stats.stall_count.fetch_add(1, Ordering::Relaxed);
                     stats.active_stalls.fetch_add(1, Ordering::Relaxed);
+                    // Capture before logging: the log sink takes the logger's
+                    // lock, and a wedged logger may be the very stall.
+                    let in_cooldown = last_capture_at.is_some_and(|at| {
+                        now.saturating_duration_since(at) < config.capture_cooldown
+                    });
+                    let capture = if in_cooldown {
+                        "skipped (cooldown)".to_string()
+                    } else {
+                        last_capture_at = Some(now);
+                        stats.captures.fetch_add(1, Ordering::Relaxed);
+                        start_capture(&config, &mut capture_children)
+                    };
                     (config.log)(&format!(
-                        "stall watchdog: stall detected marker={} stalled_for_ms={} watchdog_wake_late_ms={}",
+                        "stall watchdog: stall detected marker={} stalled_for_ms={} watchdog_wake_late_ms={} capture={capture}",
                         marker.name(),
                         stalled_for.as_millis(),
                         wake_late.as_millis(),
@@ -154,6 +272,69 @@ fn run_watchdog(
                 }
             }
         }
+    }
+}
+
+/// Starts one capture and describes the outcome for the log line.
+fn start_capture(config: &StallWatchdogConfig, children: &mut Vec<Child>) -> String {
+    let path = config.diagnostics_dir.join(capture_file_name(
+        SystemTime::now(),
+        config.pid,
+    ));
+    if let Err(error) = std::fs::create_dir_all(&config.diagnostics_dir) {
+        return format!("failed ({}: {error})", config.diagnostics_dir.display());
+    }
+    // Make room first so the new file is one of the newest `keep_captures`.
+    prune_captures(
+        &config.diagnostics_dir,
+        config.keep_captures.saturating_sub(1),
+    );
+    match config.capture.capture(config.pid, &path) {
+        Ok(CaptureStarted::Spawned(child)) => {
+            children.push(child);
+            path.display().to_string()
+        }
+        Ok(CaptureStarted::Written) => path.display().to_string(),
+        Ok(CaptureStarted::Unsupported) => "unsupported on this platform".to_string(),
+        Err(error) => format!("failed ({}: {error})", path.display()),
+    }
+}
+
+/// `stall-<UTC yyyymmddThhmmssZ>-<pid>.txt`. The timestamp leads so names sort
+/// oldest to newest.
+fn capture_file_name(at: SystemTime, pid: u32) -> String {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX);
+    let (year, month, day) = crate::subc_format::civil_from_days(days);
+    let of_day = seconds % 86_400;
+    format!(
+        "{CAPTURE_FILE_PREFIX}{year:04}{month:02}{day:02}T{:02}{:02}{:02}Z-{pid}{CAPTURE_FILE_SUFFIX}",
+        of_day / 3600,
+        (of_day % 3600) / 60,
+        of_day % 60,
+    )
+}
+
+/// Deletes all but the newest `keep` capture files in `dir`.
+fn prune_captures(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut captures = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(CAPTURE_FILE_PREFIX) && name.ends_with(CAPTURE_FILE_SUFFIX)
+        })
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    captures.sort();
+    let excess = captures.len().saturating_sub(keep);
+    for path in captures.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -320,10 +501,38 @@ mod tests {
         }
     }
 
-    fn test_config(log: &RecordedLog) -> StallWatchdogConfig {
+    /// Records capture requests instead of running a profiler.
+    #[derive(Default)]
+    struct RecordingCapture(Mutex<Vec<(u32, PathBuf)>>);
+
+    impl StallCapture for RecordingCapture {
+        fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+            self.0.lock().unwrap().push((pid, path.to_path_buf()));
+            Ok(CaptureStarted::Written)
+        }
+    }
+
+    impl RecordingCapture {
+        fn calls(&self) -> Vec<(u32, PathBuf)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    const TEST_PID: u32 = 4242;
+
+    fn test_config(
+        log: &RecordedLog,
+        capture: &Arc<RecordingCapture>,
+        diagnostics_dir: &Path,
+    ) -> StallWatchdogConfig {
         StallWatchdogConfig {
             tick: TEST_TICK,
             threshold: TEST_THRESHOLD,
+            capture_cooldown: CAPTURE_COOLDOWN,
+            keep_captures: KEEP_CAPTURES,
+            diagnostics_dir: diagnostics_dir.to_path_buf(),
+            pid: TEST_PID,
+            capture: Arc::clone(capture) as Arc<dyn StallCapture>,
             log: log.sink(),
         }
     }
@@ -347,14 +556,17 @@ mod tests {
     }
 
     #[test]
-    fn held_dispatch_loop_is_reported_once_with_its_marker_and_end() {
+    fn held_dispatch_loop_is_captured_once_and_logged_with_its_marker_and_end() {
         let executor = crate::executor::Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
         let log = RecordedLog::default();
+        let capture = Arc::new(RecordingCapture::default());
+        let storage = tempfile::tempdir().expect("storage dir");
+        let diagnostics = storage.path().join("diagnostics");
         let watchdog = StallWatchdog::spawn(
             daemon_markers(&metrics, &executor),
             Arc::clone(&metrics.stall_stats),
-            test_config(&log),
+            test_config(&log, &capture, &diagnostics),
         )
         .expect("spawn watchdog");
 
@@ -366,31 +578,86 @@ mod tests {
         release_tx.send(()).expect("release hold");
         holder.join().expect("hold thread");
         wait_until("stall end", || metrics.stall_stats.active_stalls() == 0);
+
+        // A second stall inside the cooldown is logged but not captured.
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = executor.hold_dispatch_loop_for_test(release_rx);
+        wait_until("second stall", || metrics.stall_stats.stall_count() == 2);
+        release_tx.send(()).expect("release second hold");
+        holder.join().expect("second hold thread");
+        wait_until("second stall end", || {
+            metrics.stall_stats.active_stalls() == 0
+        });
         watchdog.stop_and_join();
+
+        let calls = capture.calls();
+        assert_eq!(calls.len(), 1, "exactly one capture attempted: {calls:?}");
+        let (pid, path) = &calls[0];
+        assert_eq!(*pid, TEST_PID);
+        assert_eq!(path.parent(), Some(diagnostics.as_path()));
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            file_name.starts_with("stall-") && file_name.ends_with(&format!("-{TEST_PID}.txt")),
+            "{file_name}"
+        );
+        assert_eq!(metrics.stall_stats.captures(), 1);
 
         let lines = log.lines();
         let detected = lines
             .iter()
             .filter(|line| line.contains("stall detected"))
             .collect::<Vec<_>>();
-        assert_eq!(detected.len(), 1, "exactly one detection: {lines:?}");
+        assert_eq!(detected.len(), 2, "one line per stall: {lines:?}");
         assert!(
-            detected[0].contains("marker=executor_dispatch_loop"),
+            detected[0].contains("marker=executor_dispatch_loop")
+                && detected[0].contains("stalled_for_ms=")
+                && detected[0].contains(&format!("capture={}", path.display())),
+            "{lines:?}"
+        );
+        assert!(
+            detected[1].contains("marker=executor_dispatch_loop")
+                && detected[1].contains("capture=skipped (cooldown)"),
             "{lines:?}"
         );
         let ended = lines
             .iter()
-            .filter(|line| line.contains("stall ended marker=executor_dispatch_loop"))
+            .filter(|line| line.contains("stall ended marker=executor_dispatch_loop total_ms="))
             .count();
-        assert_eq!(ended, 1, "{lines:?}");
-        assert_eq!(metrics.stall_stats.stall_count(), 1);
+        assert_eq!(ended, 2, "{lines:?}");
+        assert_eq!(metrics.stall_stats.stall_count(), 2);
+        assert!(metrics.stall_stats.last_stall_duration_ms().is_some());
+    }
+
+    #[test]
+    fn first_stall_duration_covers_the_whole_hold() {
+        let executor = crate::executor::Executor::new();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let log = RecordedLog::default();
+        let capture = Arc::new(RecordingCapture::default());
+        let storage = tempfile::tempdir().expect("storage dir");
+        let watchdog = StallWatchdog::spawn(
+            daemon_markers(&metrics, &executor),
+            Arc::clone(&metrics.stall_stats),
+            test_config(&log, &capture, &storage.path().join("diagnostics")),
+        )
+        .expect("spawn watchdog");
+
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let holder = executor.hold_dispatch_loop_for_test(release_rx);
+        wait_until("stall detection", || metrics.stall_stats.stall_count() > 0);
+        thread::sleep(TEST_THRESHOLD * 3);
+        release_tx.send(()).expect("release hold");
+        holder.join().expect("hold thread");
+        wait_until("stall end", || metrics.stall_stats.active_stalls() == 0);
+        watchdog.stop_and_join();
+
         let last = metrics
             .stall_stats
             .last_stall_duration_ms()
             .expect("finished stall duration");
         assert!(
-            last >= u64::try_from((TEST_THRESHOLD * 3).as_millis()).unwrap(),
-            "stall lasted at least the hold: {last}ms"
+            last >= u64::try_from((TEST_THRESHOLD * 4).as_millis()).unwrap(),
+            "threshold plus three more thresholds of hold: {last}ms"
         );
     }
 
@@ -399,10 +666,12 @@ mod tests {
         let executor = crate::executor::Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
         let log = RecordedLog::default();
+        let capture = Arc::new(RecordingCapture::default());
+        let storage = tempfile::tempdir().expect("storage dir");
         let watchdog = StallWatchdog::spawn(
             daemon_markers(&metrics, &executor),
             Arc::clone(&metrics.stall_stats),
-            test_config(&log),
+            test_config(&log, &capture, &storage.path().join("diagnostics")),
         )
         .expect("spawn watchdog");
 
@@ -417,7 +686,78 @@ mod tests {
             "the idle loop really went unprogressed past the threshold"
         );
         assert_eq!(log.lines(), Vec::<String>::new());
+        assert_eq!(capture.calls(), Vec::new());
         assert_eq!(metrics.stall_stats.stall_count(), 0);
+    }
+
+    #[test]
+    fn capture_file_names_sort_by_utc_time() {
+        // 2026-09-24T12:01:55Z
+        let at = UNIX_EPOCH + Duration::from_secs(1_790_251_315);
+        assert_eq!(
+            capture_file_name(at, 36755),
+            "stall-20260924T120155Z-36755.txt"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_only_the_newest_capture_files() {
+        let dir = tempfile::tempdir().expect("diagnostics dir");
+        for second in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("stall-20260924T12000{second}Z-1.txt")),
+                "x",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("unrelated.txt"), "keep").unwrap();
+
+        prune_captures(dir.path(), KEEP_CAPTURES - 1);
+
+        let mut left = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "stall-20260924T120004Z-1.txt",
+                "stall-20260924T120005Z-1.txt",
+                "stall-20260924T120006Z-1.txt",
+                "stall-20260924T120007Z-1.txt",
+                "unrelated.txt",
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "runs /usr/bin/sample against the test process for about 3 seconds"]
+    fn macos_platform_capture_writes_a_sample_file() {
+        let dir = tempfile::tempdir().expect("diagnostics dir");
+        let path = dir.path().join("stall-test.txt");
+        let started = PlatformCapture
+            .capture(std::process::id(), &path)
+            .expect("spawn sample");
+        let CaptureStarted::Spawned(mut child) = started else {
+            panic!("macOS capture spawns sample");
+        };
+        assert!(child.wait().expect("wait sample").success());
+        assert!(std::fs::metadata(&path).expect("sample file").len() > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_platform_capture_writes_every_thread_state() {
+        let dir = tempfile::tempdir().expect("diagnostics dir");
+        let path = dir.path().join("stall-test.txt");
+        assert!(matches!(
+            PlatformCapture.capture(std::process::id(), &path),
+            Ok(CaptureStarted::Written)
+        ));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("stat: ") && text.contains("wchan: "), "{text}");
     }
 
     fn secs(value: u64) -> Duration {
