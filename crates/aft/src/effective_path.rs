@@ -138,6 +138,12 @@ pub fn effective_path() -> &'static OsStr {
         .as_os_str()
 }
 
+/// Where the probed login-shell PATH is cached between processes.
+#[cfg(unix)]
+pub(crate) fn effective_path_cache_path() -> PathBuf {
+    crate::bash_background::storage_dir(None).join("effective-path.json")
+}
+
 #[cfg(unix)]
 pub fn effective_path() -> &'static OsStr {
     // Test seam: integration tests construct exact PATHs (e.g. to simulate a
@@ -167,7 +173,7 @@ pub fn effective_path() -> &'static OsStr {
     // Use the normal process-state resolver. It is available before the app is
     // constructed, so no early XDG-only fallback can split this cache from AFT's
     // configured storage root.
-    let cache_path = crate::bash_background::storage_dir(None).join("effective-path.json");
+    let cache_path = effective_path_cache_path();
     let candidates = login_shell_candidates();
 
     let (login_path, source, shell) = read_effective_path_cache(&cache_path)

@@ -475,8 +475,9 @@ fn resolve_model_files() -> Result<(PathBuf, PathBuf), String> {
 
 /// fastembed read `FASTEMBED_CACHE_DIR`; the bridge/warmup set it to
 /// `<storage>/semantic/models`. Keep the same env + default so existing
-/// downloads are reused.
-fn embedding_cache_dir() -> Result<PathBuf, String> {
+/// downloads are reused; an absolute `XDG_CACHE_HOME` outranks the `~/.cache`
+/// default.
+pub(crate) fn embedding_cache_dir() -> Result<PathBuf, String> {
     embedding_cache_dir_from(
         |name| crate::environment::non_empty_os_var(name),
         std::env::home_dir().as_deref(),
@@ -491,6 +492,15 @@ fn embedding_cache_dir_from(
     let non_empty = |name| lookup(name).filter(|value| !value.is_empty());
     if let Some(dir) = non_empty("FASTEMBED_CACHE_DIR") {
         return Some(PathBuf::from(dir));
+    }
+    // An absolute XDG_CACHE_HOME is the user's declared cache home, so a
+    // redirected environment (a test gate, a sandbox) never reaches into the
+    // real `~/.cache`. A relative value is ignored, per the XDG spec.
+    if let Some(dir) = non_empty("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Some(dir.join("fastembed"));
     }
     non_empty("HOME")
         .or_else(|| non_empty("USERPROFILE"))
@@ -574,6 +584,42 @@ mod tests {
             Some(std::path::PathBuf::from("/profile/.cache/fastembed"))
         );
         assert_eq!(embedding_cache_dir_from(|_| None, None), None);
+    }
+
+    #[test]
+    fn absolute_xdg_cache_home_outranks_home_and_a_relative_one_is_ignored() {
+        let xdg = if cfg!(windows) {
+            "C:\\xdg-cache"
+        } else {
+            "/xdg-cache"
+        };
+        let lookup = |xdg_value: &'static str| {
+            move |name: &str| match name {
+                "XDG_CACHE_HOME" => Some(std::ffi::OsString::from(xdg_value)),
+                "HOME" => Some(std::ffi::OsString::from("/home/user")),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            embedding_cache_dir_from(lookup(xdg), None),
+            Some(std::path::Path::new(xdg).join("fastembed"))
+        );
+        assert_eq!(
+            embedding_cache_dir_from(lookup("relative-cache"), None),
+            Some(std::path::PathBuf::from("/home/user/.cache/fastembed"))
+        );
+        assert_eq!(
+            embedding_cache_dir_from(
+                |name| match name {
+                    "FASTEMBED_CACHE_DIR" => Some(std::ffi::OsString::from("/models")),
+                    "XDG_CACHE_HOME" => Some(std::ffi::OsString::from(xdg)),
+                    _ => None,
+                },
+                None,
+            ),
+            Some(std::path::PathBuf::from("/models")),
+            "an explicit FASTEMBED_CACHE_DIR still wins"
+        );
     }
 
     fn minilm_like_tokenizer_json() -> Vec<u8> {

@@ -845,6 +845,20 @@ impl StatePaths {
     }
 }
 
+/// The gh-shim state files this process's environment resolves to, for the
+/// test-gate check that none of them lands in the operator's real state home.
+#[cfg(test)]
+pub(crate) fn process_state_files_for_test() -> Vec<PathBuf> {
+    let paths = StatePaths::from_process();
+    vec![
+        paths.rung,
+        paths.seam_state,
+        paths.last_probe,
+        paths.last_valid_manifest,
+        paths.root,
+    ]
+}
+
 fn write_last_probe_silently(paths: &StatePaths, probe: &LastProbeReport) {
     let Ok(bytes) = serde_json::to_vec(probe) else {
         return;
@@ -1923,11 +1937,8 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
         }
     }
 
-    let home = crate::environment::non_empty_os_var("HOME")
-        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
-        .map(PathBuf::from);
     for raw_pattern in &detectors.wrapper_config_dirs {
-        let pattern = expand_home_pattern(raw_pattern, home.as_deref());
+        let pattern = wrapper_config_dir_pattern_from_process(raw_pattern);
         let paths = if pattern.contains(['*', '?', '[', '{']) {
             // Never let an ambient home-directory glob cross a mount: a vanished
             // child ReadDir can panic in Drop after closedir reports ENXIO.
@@ -1961,7 +1972,29 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
         .then(|| format!("path:{}", configured.display()))
 }
 
-fn expand_home_pattern(pattern: &str, home: Option<&Path>) -> String {
+/// Expand a manifest `wrapper_config_dirs` pattern against the process env.
+pub(crate) fn wrapper_config_dir_pattern_from_process(pattern: &str) -> String {
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
+        .map(PathBuf::from);
+    let xdg_config_home =
+        crate::environment::non_empty_os_var("XDG_CONFIG_HOME").map(PathBuf::from);
+    expand_home_pattern(pattern, home.as_deref(), xdg_config_home.as_deref())
+}
+
+/// `~/.config/` in a manifest pattern names the user config home, so it
+/// follows an absolute `XDG_CONFIG_HOME` the same way the user-tier
+/// `aft.jsonc` lookup does; any other `~/` prefix expands against HOME.
+fn expand_home_pattern(
+    pattern: &str,
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+) -> String {
+    if let Some(suffix) = pattern.strip_prefix("~/.config/") {
+        if let Some(config_home) = xdg_config_home.filter(|path| path.is_absolute()) {
+            return config_home.join(suffix).to_string_lossy().into_owned();
+        }
+    }
     pattern
         .strip_prefix("~/")
         .and_then(|suffix| home.map(|home| home.join(suffix).to_string_lossy().into_owned()))
@@ -5971,6 +6004,38 @@ mod tests {
         assert_eq!(
             resolve_real_gh_in_path(&image, &path, Some(&shims)),
             Some(real)
+        );
+    }
+
+    #[test]
+    fn wrapper_config_dir_patterns_follow_an_absolute_xdg_config_home() {
+        let home = Path::new("/home/user");
+        let xdg = if cfg!(windows) {
+            PathBuf::from("C:\\xdg-config")
+        } else {
+            PathBuf::from("/xdg-config")
+        };
+        assert_eq!(
+            expand_home_pattern("~/.config/gh-alfonso-*/", Some(home), Some(&xdg)),
+            xdg.join("gh-alfonso-*/").to_string_lossy()
+        );
+        assert_eq!(
+            expand_home_pattern(
+                "~/.config/gh-alfonso-*/",
+                Some(home),
+                Some(Path::new("rel"))
+            ),
+            home.join(".config/gh-alfonso-*/").to_string_lossy(),
+            "a relative XDG_CONFIG_HOME is ignored"
+        );
+        assert_eq!(
+            expand_home_pattern("~/.config/gh-alfonso-*/", Some(home), None),
+            home.join(".config/gh-alfonso-*/").to_string_lossy()
+        );
+        assert_eq!(
+            expand_home_pattern("~/.gh-wrapper", Some(home), Some(&xdg)),
+            home.join(".gh-wrapper").to_string_lossy(),
+            "only the ~/.config/ prefix follows XDG_CONFIG_HOME"
         );
     }
 

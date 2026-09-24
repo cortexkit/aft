@@ -120,12 +120,15 @@ pub(crate) fn apply_hermetic_git_env(command: &mut Command) -> &mut Command {
 }
 
 /// Hold hermetic git-config env vars for the current test thread.
+///
+/// Fields drop in declaration order, so `_lock` is last: the env vars must be
+/// restored before another test can take the lock and observe them.
 #[allow(dead_code)]
 pub(crate) struct HermeticGitEnvGuard {
-    _lock: ProcessEnvLockGuard,
     _global: ScopedEnvVar,
     _system: ScopedEnvVar,
     _config_count: ScopedEnvVar,
+    _lock: ProcessEnvLockGuard,
 }
 
 /// Install hermetic git-config env vars for in-process git executions during a
@@ -150,10 +153,12 @@ pub(crate) fn hermetic_git_env_guard() -> HermeticGitEnvGuard {
 /// Keep in-process gh-shim tests away from the operator's state directory.
 /// The shared lock is held for the complete lifetime of the override because
 /// libtest runs these tests concurrently with other env-sensitive modules.
+/// As above, `_lock` is declared last so the override is gone before the lock
+/// is released.
 pub(crate) struct GhShimStateGuard {
-    _lock: ProcessEnvLockGuard,
     _state: ScopedEnvVar,
     _temp: tempfile::TempDir,
+    _lock: ProcessEnvLockGuard,
 }
 
 pub(crate) fn gh_shim_state_guard() -> GhShimStateGuard {

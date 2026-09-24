@@ -163,6 +163,8 @@ pub mod windows_path;
 pub mod windows_shell;
 
 #[cfg(test)]
+mod gate_hermeticity_tests;
+#[cfg(test)]
 pub(crate) mod test_allocations;
 #[cfg(test)]
 pub(crate) mod test_env;

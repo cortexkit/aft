@@ -6,6 +6,13 @@ set -euo pipefail
 # real shared store. Gates always run with default resolution.
 unset AFT_STORAGE_DIR
 
+# Names this process tree as the Rust test gate. It is exported apart from the
+# home isolation below on purpose: the in-suite hermeticity check
+# (`gate_resolves_every_user_config_and_state_path_under_the_gate_homes`)
+# treats "inside the gate but the isolation marker is missing" as a failure,
+# so deleting the isolation block must not also delete this signal.
+export AFT_RUST_TEST_GATE=1
+
 # Run the entire gate at reduced scheduling priority so saturated test
 # windows cannot starve the supervised ck-* modules into missing health
 # probes (three health-kills on 2026-08-08 traced to gate-window load).
@@ -31,8 +38,40 @@ cd "$repo_root"
 # operator's real data root. Keep the whole gate hermetic, including test binaries
 # that launch child AFT processes without the shared integration helper.
 unset AFT_CACHE_DIR
-export XDG_DATA_HOME="${AFT_GATE_XDG_DATA_HOME:-${CARGO_TARGET_DIR:-$PWD/target}/aft-gate-data-home}"
-mkdir -p "$XDG_DATA_HOME"
+# Every XDG base directory gets a per-gate home, not just the data home: the
+# `aft` processes the tests spawn otherwise read the operator's user config
+# (`$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, which can carry connection files,
+# embedding endpoints, format and LSP settings) and read and rewrite the live
+# gh-shim state (`$XDG_STATE_HOME/cortexkit/aft/gh-shim/rung-cache.json`).
+# HOME itself is deliberately left alone: cargo, rustup and nextest resolve
+# their toolchains from it, and git resolves the committer identity the
+# fixture repos need from `~/.gitconfig`. AFT's own config, state, cache and
+# storage resolvers consult these XDG variables before falling back to HOME.
+gate_home_root="${AFT_GATE_HOME_ROOT:-${CARGO_TARGET_DIR:-$PWD/target}/aft-gate-home}"
+# Git Bash on Windows spells paths as /d/a/...; native Windows code does not
+# treat that as absolute, and several resolvers skip non-absolute XDG values.
+# Hand the test processes the drive-letter form instead.
+if command -v cygpath >/dev/null 2>&1; then
+  gate_home_root="$(cygpath -m "$gate_home_root")"
+fi
+export XDG_DATA_HOME="$gate_home_root/data"
+export XDG_CONFIG_HOME="$gate_home_root/config"
+export XDG_STATE_HOME="$gate_home_root/state"
+export XDG_CACHE_HOME="$gate_home_root/cache"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+# The in-suite hermeticity check asserts every resolved config, state, cache
+# and storage path lies under this root.
+export AFT_GATE_HERMETIC_HOME_ROOT="$gate_home_root"
+
+# aft's agent shells inject command-scope git config (core.hooksPath pointing
+# at the live managed hook dispatchers) and a co-author trailer. A gate started
+# from such a shell would pass both to every fixture `git` a test runs, so the
+# operator's live hooks would run against test repos and fixture commits would
+# carry the trailer. Drop the whole injected block, like AFT_STORAGE_DIR above.
+unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS AFT_GIT_CO_AUTHOR
+while IFS= read -r injected_git_config_var; do
+  unset "$injected_git_config_var"
+done < <(compgen -e | grep -E '^GIT_CONFIG_(KEY|VALUE)_[0-9]+$' || true)
 
 runner="${AFT_RUST_TEST_RUNNER:-nextest}"
 unit_runner="${AFT_UNIT_TEST_RUNNER:-cargo}"
