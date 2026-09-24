@@ -495,7 +495,9 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
       background: true,
     });
     const taskId = String(spawned.task_id);
-    await waitForFileText(join(h.tempDir, "bg-marker.txt"), "bg-done", 5_000);
+    // A loaded Windows runner can take several seconds to start a background
+    // task, so the wait and the test's own timeout leave room for that.
+    await waitForFileText(join(h.tempDir, "bg-marker.txt"), "bg-done", 30_000);
 
     const result = await callPluginBash(bash, h, { command: "echo foreground" });
 
@@ -503,7 +505,7 @@ maybeDescribe("e2e bash command (OpenCode adapter + bridge + Rust)", () => {
     expect(result.output).not.toContain("Background tasks completed:");
     expect(result.output).not.toContain(taskId);
     expect(result.output).not.toContain("bg-done");
-  });
+  }, 60_000);
 
   test("permission ask round-trip invokes OpenCode ctx.ask", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness({ bash_permissions: true });

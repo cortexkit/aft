@@ -26,6 +26,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -230,8 +231,16 @@ describe("findBinarySync versioned cache validation", () => {
     const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
     writeBinaryIdentitySidecar(binaryPath, "1.2.3", "0".repeat(64));
     // Another writer swaps different bytes in: the sidecar no longer matches.
+    // The fixtures are the same size, and on Linux the recreated file can
+    // reuse the inode and land in the same coarse timestamp tick, which would
+    // make the swap invisible to a stat comparison. Real cache writers replace
+    // by temp file and rename, so they always change the inode; here the
+    // replacement's mtime is moved explicitly so the test exercises the
+    // mismatch path instead of depending on filesystem timing.
     rmSync(binaryPath);
     writeCachedVersion("v1.2.3", "9.9.9");
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(binaryPath, later, later);
     __setEnsureBinaryForTests(async () => "/downloaded/aft");
 
     expect(findBinarySync("1.2.3")).toBeNull();
