@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "unbound-root-delta-356"
+  ],
+  "note": "Idle-root teardown persist and reap census; no ranking-fence file touched."
+}
