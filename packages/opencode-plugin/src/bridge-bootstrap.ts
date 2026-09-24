@@ -78,7 +78,8 @@ export interface BridgeBootstrapDependencies {
   /** Moves legacy config files into the CortexKit layout; returns user-facing warnings. */
   migrateConfigLocations(directory: string): string[];
   resolveBinary(version: string): Promise<string>;
-  ensureStorageMigrated(binaryPath: string): Promise<void>;
+  /** `binaryPath` is null when the subc daemon owns the binary; migration then resolves one only if it has work. */
+  ensureStorageMigrated(binaryPath: string | null): Promise<void>;
   resolveStorageRoot(): string;
   buildConfigureParams(
     directory: string,
@@ -105,14 +106,23 @@ export interface BridgeBootstrapDependencies {
 }
 
 /**
- * Probe the versioned cache synchronously so a missing or mismatched entry can
- * start its download before the rest of startup runs. The resolver and the
+ * Resolve the binary without ever executing one on the host thread.
+ *
+ * `findBinarySync` only accepts binaries whose identity is known without
+ * running them (a versioned-cache entry with a matching identity sidecar, or
+ * the npm platform package by its manifest version). When that misses, a
+ * download starts in the background right away while `findBinary` checks the
+ * remaining candidates on a worker thread. The resolver and the
  * first-tool-call path share ensureBinary's in-process promise; its filesystem
  * lock also coordinates a second host process without duplicate fetches.
+ *
+ * An explicit `AFT_BINARY_PATH` goes straight to `findBinary`, which verifies
+ * its version off-thread and fails closed on a mismatch.
  */
 async function resolveBinaryWithWarmup(version: string): Promise<string> {
-  const cached = findBinarySync(version);
-  if (cached) return cached;
+  if (process.env.AFT_BINARY_PATH?.trim()) return findBinary(version);
+  const trusted = findBinarySync(version);
+  if (trusted) return trusted;
   void ensureBinary(version).then(
     (path) => {
       if (path) log(`Background binary warmup ready at ${path}`);
@@ -270,7 +280,11 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   resolveBinary: resolveBinaryWithWarmup,
   ensureStorageMigrated: (binaryPath) =>
-    ensureStorageMigrated({ harness: "opencode", binaryPath, logger: bridgeLogger }),
+    ensureStorageMigrated({
+      harness: "opencode",
+      binaryPath: binaryPath ?? undefined,
+      logger: bridgeLogger,
+    }),
   resolveStorageRoot: resolveCortexKitStorageRoot,
   buildConfigureParams: buildConfigTierConfigureParams,
   ensureOnnxRuntime: ensureOnnxRuntimeOncePerProcess,
@@ -363,7 +377,11 @@ export interface BridgeEnvironmentOptions {
 
 export interface BridgeEnvironment {
   storageDir: string;
-  binaryPath: string;
+  /**
+   * Resolved `aft` binary for the standalone bridge, or null when the config
+   * selects the subc daemon (which runs its own binary).
+   */
+  binaryPath: string | null;
   /** Flat configure overrides to construct the transport pool with. */
   configOverrides: Record<string, unknown>;
   /** Pending ONNX Runtime directory, or null when semantic search does not need it. */
@@ -381,7 +399,11 @@ export async function prepareBridgeEnvironment(
   dependencies: BridgeBootstrapDependencies = defaultBridgeBootstrapDependencies,
 ): Promise<BridgeEnvironment> {
   const { config, notify } = options;
-  const binaryPath = await dependencies.resolveBinary(options.pluginVersion);
+  // With a subc connection file the daemon runs the binary and the plugin
+  // never spawns one (the transport factory fails loud instead of falling back
+  // to a standalone bridge), so resolving a local binary would be wasted work.
+  const usesSubc = Boolean(config.subc?.connection_file?.trim());
+  const binaryPath = usesSubc ? null : await dependencies.resolveBinary(options.pluginVersion);
   // Must complete before anything reads or writes the storage root.
   await dependencies.ensureStorageMigrated(binaryPath);
 

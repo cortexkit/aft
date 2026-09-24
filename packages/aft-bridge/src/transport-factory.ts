@@ -34,8 +34,12 @@ import type { AftTransportPool } from "./transport.js";
 export interface AftTransportFactoryOptions {
   /** Harness identity ("opencode" | "pi"). Carried in every subc BindIdentity. */
   harness: string;
-  /** Standalone path: resolved `aft` binary. */
-  binaryPath: string;
+  /**
+   * Standalone path: resolved `aft` binary. Null when `subcConnectionFile` is
+   * set: the subc daemon runs its own binary, so the plugin does not resolve
+   * one. A null path with no subc connection is a caller bug and throws.
+   */
+  binaryPath: string | null;
   /** Standalone path: pool/bridge options (callbacks, timeouts, project loader). */
   poolOptions: PoolOptions;
   /** Standalone path: global configure overrides baked into every bridge. */
@@ -209,6 +213,9 @@ async function createConcreteAftTransportPool(
       onBgEventsNudgeRef: opts.onBgEventsNudgeRef,
       lifecycleDemandCheck: opts.subcLifecycleDemandCheck ?? ((root) => existsSync(root)),
     });
+  }
+  if (opts.binaryPath === null) {
+    throw new Error("the standalone AFT bridge needs a resolved aft binary, but none was provided");
   }
   return new BridgePool(opts.binaryPath, opts.poolOptions, opts.configOverrides);
 }
