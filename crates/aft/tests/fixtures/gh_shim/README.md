@@ -92,9 +92,9 @@ in `crates/aft/src/gh_shim.rs`.
 
 ## Untouched wire fixtures
 
-The wire-schema goldens (`gh-route-request-v1-golden.json`,
-`gh-route-result-v1-golden.json`), `holder-responses-v1.json`,
+The wire-schema golden `gh-route-result-v1-golden.json`, `holder-responses-v1.json`,
 `classification-v1.json`, `mechanical-r3-v1.json`,
 `governed-regressions-v1.json`, and `self-report-v1.json` describe the
 holder-facing wire and classification contract; the envelope v2 change does
-not touch them.
+not touch them. The request bytes the shim actually sends are captured, with a
+drift test, in `docs/investigations/gh-shim-wire-goldens/requests/`.

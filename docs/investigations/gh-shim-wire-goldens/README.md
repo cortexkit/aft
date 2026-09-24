@@ -119,10 +119,9 @@ example `operation`, `gh_route_schema`, `action`, ...), because this build of
 AFT gets `serde_json`'s `preserve_order` feature through a dependency
 (`oxc_resolver`). That order is a side effect of Cargo feature unification,
 not a declared contract: a facade should parse the JSON and not rely on key
-order. The older fixture
-`crates/aft/tests/fixtures/gh_shim/gh-route-request-v1-golden.json` shows
-keys sorted alphabetically in `serialized_json` and `manifest_version: 1`;
-that file is not what this build sends, and no test reads it.
+order. An older request fixture with alphabetically sorted keys and
+`manifest_version: 1` did not match what the shim sends and no test read it;
+it was deleted in favour of the captures in `requests/`.
 
 ## Outcomes and exits
 
