@@ -3746,6 +3746,7 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
         && !ctx.shared_artifacts_read_only()
         && ctx.semantic_refresh_sender().is_none();
     let semantic_missing = semantic_enabled
+        && !local_semantic_runtime_known_unavailable(ctx)
         && semantic_not_building
         && semantic_receiver_missing
         && (semantic_index_missing || semantic_refresh_missing);
@@ -3754,6 +3755,29 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
         search: search_missing,
         semantic: semantic_missing,
     }
+}
+
+/// True when the local embedding backend already failed in this runtime
+/// because no ONNX Runtime can be loaded. The runtime a process can load is
+/// fixed for its lifetime, so scheduling another build would fail the same way;
+/// the semantic index stays unavailable with a named cause instead of retrying
+/// on every equivalent reconfigure. A configure that changes the semantic
+/// settings resets the status and gets one fresh attempt.
+fn local_semantic_runtime_known_unavailable(ctx: &AppContext) -> bool {
+    if !matches!(
+        ctx.config().semantic.backend,
+        crate::config::SemanticBackend::Fastembed
+    ) {
+        return false;
+    }
+    matches!(
+        &*ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        SemanticIndexStatus::Failed(message)
+            if crate::semantic_index::is_onnx_runtime_unavailable(message)
+    )
 }
 
 type ArtifactLoadStarts = (
@@ -10540,6 +10564,233 @@ mod tests {
             callgraph_started < semantic_started,
             "configure must admit callgraph before semantic: {events:#?}"
         );
+    }
+
+    /// Configure `root` with the given user tier and drain until no index
+    /// build is in flight, returning the captured index log events.
+    fn configure_and_settle_indexes(
+        ctx: &AppContext,
+        root: &Path,
+        storage: &Path,
+        user: Value,
+    ) -> Vec<String> {
+        let req = configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(user)],
+        }));
+        let (_, events) = crate::logging::capture_index_events(|| {
+            let response = handle_configure_for_test(&req, ctx);
+            assert!(response.success, "configure failed: {response:?}");
+            super::drain_deferred_configure_maintenance(ctx);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                crate::runtime_drain::drain_search_index_events(ctx);
+                crate::runtime_drain::drain_callgraph_store_events(ctx);
+                crate::runtime_drain::drain_semantic_index_events(ctx);
+                let search_done = ctx.search_index_rx().read().unwrap().is_none();
+                let callgraph_done = ctx.callgraph_store_rx().lock().is_none();
+                let semantic_done = ctx.semantic_index_rx().lock().is_none();
+                if search_done && callgraph_done && semantic_done {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "configure index builds did not settle"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        events
+    }
+
+    fn index_build_started(events: &[String], plane: &str) -> bool {
+        events.iter().any(|line| {
+            line.contains("kind=build_started") && line.contains(&format!("plane={plane}"))
+        })
+    }
+
+    fn lifecycle_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        std::fs::write(
+            root.path().join("lib.rs"),
+            "pub fn entry() { leaf(); }\npub fn leaf() {}\n",
+        )
+        .unwrap();
+        (root, storage)
+    }
+
+    #[test]
+    fn missing_local_onnx_runtime_reports_a_named_cause_without_rescheduling() {
+        use crate::feature_status::{
+            cause, local_semantic_platform_supported, observed_index_status, IndexEffective,
+            IndexPlane,
+        };
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.indexes.semantic = true;
+            config.semantic.backend = crate::config::SemanticBackend::Fastembed;
+        });
+        // Nothing observed yet: enabled but not observed.
+        assert!(super::missing_artifact_loads(&ctx).semantic);
+        let observed = observed_index_status(&ctx, IndexPlane::Semantic);
+        assert_eq!(observed.effective, IndexEffective::Unavailable);
+        assert_eq!(
+            observed.unavailable_reason.as_deref(),
+            Some(cause::RUNTIME_NOT_OBSERVED)
+        );
+
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Failed(format!(
+                "{} dlopen('libonnxruntime.so') failed",
+                crate::semantic_index::ONNX_RUNTIME_MISSING_PREFIX
+            ));
+        // The configured value stays true; the lane is unavailable with a
+        // named cause and no further build is scheduled.
+        assert!(ctx.config().indexes.semantic);
+        assert!(!super::missing_artifact_loads(&ctx).semantic);
+        let observed = observed_index_status(&ctx, IndexPlane::Semantic);
+        assert_eq!(observed.effective, IndexEffective::Unavailable);
+        let expected = if local_semantic_platform_supported() {
+            cause::ONNX_RUNTIME_UNAVAILABLE
+        } else {
+            cause::SEMANTIC_PLATFORM_UNSUPPORTED
+        };
+        assert_eq!(observed.unavailable_reason.as_deref(), Some(expected));
+
+        // Another backend is not held back by a local-runtime failure.
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+        });
+        assert!(super::missing_artifact_loads(&ctx).semantic);
+
+        // A resolved-off index is off regardless of backend support.
+        ctx.update_config(|config| {
+            config.indexes.semantic = false;
+            config.semantic.backend = crate::config::SemanticBackend::Fastembed;
+        });
+        assert_eq!(
+            observed_index_status(&ctx, IndexPlane::Semantic),
+            crate::feature_status::IndexObservation::off()
+        );
+    }
+
+    #[test]
+    fn every_enabled_index_starts_even_with_every_consumer_tool_disabled() {
+        use crate::feature_status::{observed_index_status, IndexEffective, IndexPlane};
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (root, storage) = lifecycle_fixture();
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let ctx = Arc::new(test_context());
+        ctx.isolate_cold_build_limiter_for_test(2);
+        // Index lifecycle is independent of registration: disabling every
+        // consumer of the three indexes must not keep any of them from building.
+        let events = configure_and_settle_indexes(
+            &ctx,
+            root.path(),
+            storage.path(),
+            json!({
+                "indexes": { "trigram": true, "semantic": true, "callgraph": true },
+                "disabled_tools": [
+                    "aft_callgraph", "aft_inspect", "aft_search", "aft_zoom", "glob", "grep"
+                ],
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "counting-test-embedding",
+                    "base_url": server.base_url.clone(),
+                    "timeout_ms": 5_000,
+                    "max_batch_size": 64,
+                    "max_files": 1_000
+                }
+            }),
+        );
+        for plane in ["search", "callgraph", "semantic"] {
+            assert!(
+                index_build_started(&events, plane),
+                "{plane} must start with its consumers disabled: {events:#?}"
+            );
+        }
+        for plane in IndexPlane::ALL {
+            assert_eq!(
+                observed_index_status(&ctx, plane).effective,
+                IndexEffective::Ready,
+                "{plane:?} must be ready after its build settles"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_indexes_never_start_and_are_retired_on_reconfigure() {
+        use crate::feature_status::{observed_index_status, IndexObservation, IndexPlane};
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let (root, storage) = lifecycle_fixture();
+        let ctx = Arc::new(test_context());
+        ctx.isolate_cold_build_limiter_for_test(2);
+
+        // First bind with trigram and callgraph on, so there is something
+        // running to retire.
+        let events = configure_and_settle_indexes(
+            &ctx,
+            root.path(),
+            storage.path(),
+            json!({ "indexes": { "trigram": true, "semantic": false, "callgraph": true } }),
+        );
+        assert!(index_build_started(&events, "search"), "{events:#?}");
+        assert!(index_build_started(&events, "callgraph"), "{events:#?}");
+        assert!(ctx.search_index().read().unwrap().is_some());
+        assert!(ctx.callgraph_store().read().unwrap().is_some());
+
+        // Turning every index off retires what was running and starts nothing.
+        let events = configure_and_settle_indexes(
+            &ctx,
+            root.path(),
+            storage.path(),
+            json!({ "indexes": { "trigram": false, "semantic": false, "callgraph": false } }),
+        );
+        assert!(ctx.search_index().read().unwrap().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+        assert!(ctx.semantic_index().read().unwrap().is_none());
+        for plane in IndexPlane::ALL {
+            assert_eq!(observed_index_status(&ctx, plane), IndexObservation::off());
+        }
+
+        // A callgraph query against the disabled index refuses without
+        // starting a build.
+        let (response, query_events) = crate::logging::capture_index_events(|| {
+            let navigation = RawRequest {
+                id: "off-callers".to_string(),
+                command: "callers".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params: json!({"file": root.path().join("lib.rs"), "symbol": "leaf"}),
+            };
+            crate::commands::callers::handle_callers(&navigation, &ctx)
+        });
+        assert!(!response.success);
+        assert_eq!(response.data["code"], json!("callgraph_off"));
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+        let all_events = events
+            .iter()
+            .chain(query_events.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        for plane in ["search", "callgraph", "semantic"] {
+            assert!(
+                !index_build_started(&all_events, plane),
+                "disabled {plane} index must never start: {all_events:#?}"
+            );
+        }
     }
 
     #[test]
