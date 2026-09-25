@@ -3556,7 +3556,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             ctx.retire_callgraph_store_rx();
-            if previous_project_root.as_ref() == Some(&root_path) {
+            // Only a callgraph writer can fulfil a force token. A read-only
+            // root (linked worktree, borrowed index family) follows the
+            // owner's published store; a token here would never be fulfilled
+            // and would keep every later callgraph query Unavailable.
+            if previous_project_root.as_ref() == Some(&root_path) && ctx.callgraph_writer() {
                 ctx.mark_callgraph_store_force_rebuild();
             }
         }
@@ -11782,6 +11786,95 @@ mod tests {
         assert!(handle_configure_for_test(&enabled, &ctx).success);
         assert_eq!(ctx.configure_generation(), enabled_generation + 1);
         assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 3);
+    }
+
+    /// Writes `packages/pkg-a/package.json` under `root` with `contents`. The
+    /// callgraph build key fingerprints these manifests by length and mtime,
+    /// so changing the length is enough to make a reconfigure non-equivalent.
+    fn write_workspace_manifest(root: &std::path::Path, contents: &str) {
+        std::fs::create_dir_all(root.join("packages/pkg-a")).unwrap();
+        std::fs::write(root.join("packages/pkg-a/package.json"), contents).unwrap();
+    }
+
+    fn callgraph_only_configure_request(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+    ) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": true
+            }))]
+        }))
+    }
+
+    #[test]
+    fn writer_reconfigure_after_manifest_change_mints_callgraph_force_token() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        write_workspace_manifest(root.path(), "{}");
+        let ctx = test_context();
+        let request = callgraph_only_configure_request(root.path(), storage.path());
+
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert!(ctx.callgraph_writer(), "a main checkout owns its callgraph");
+        assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+
+        write_workspace_manifest(root.path(), "{\"version\":\"2\"}");
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert!(
+            ctx.pending_callgraph_store_force_token().is_some(),
+            "a package.json change on a writer root forces a full callgraph rebuild"
+        );
+    }
+
+    #[test]
+    fn read_only_worktree_reconfigure_never_mints_unfulfillable_callgraph_force_token() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let main = temp.path().join("main");
+        init_git_fixture(&main);
+        let worktree = temp.path().join("worktree");
+        let mut worktree_command = Command::new("git");
+        assert!(
+            crate::test_env::apply_hermetic_git_env(worktree_command.arg("-C").arg(&main))
+                .args(["worktree", "add", "--detach", "--quiet"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .status()
+                .unwrap()
+                .success()
+        );
+        write_workspace_manifest(&worktree, "{}");
+        let ctx = test_context();
+        let request = callgraph_only_configure_request(&worktree, &storage);
+
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert!(
+            !ctx.callgraph_writer(),
+            "a linked worktree borrows the owner's callgraph read-only"
+        );
+
+        write_workspace_manifest(&worktree, "{\"version\":\"2\"}");
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token(),
+            None,
+            "a read-only root cannot fulfil a force token, so reconfigure must not mint one"
+        );
     }
 
     #[test]
