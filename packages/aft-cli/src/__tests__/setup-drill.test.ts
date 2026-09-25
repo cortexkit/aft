@@ -595,12 +595,12 @@ describe("the feature list cursor", () => {
     process.env.FORCE_COLOR = "1";
     const label = (state: Parameters<typeof renderRowLines>[1]) =>
       renderRowLines(row, state, false, 80)[0] as string;
-    const dimmed = /\x1b\[2mgrep/;
+    const dimmed = "\u001b[2mgrep";
     try {
-      expect(label("active-selected")).not.toMatch(dimmed);
-      expect(label("active")).not.toMatch(dimmed);
-      expect(label("selected")).toMatch(dimmed);
-      expect(label("inactive")).toMatch(dimmed);
+      expect(label("active-selected")).not.toContain(dimmed);
+      expect(label("active")).not.toContain(dimmed);
+      expect(label("selected")).toContain(dimmed);
+      expect(label("inactive")).toContain(dimmed);
     } finally {
       if (savedForceColor === undefined) delete process.env.FORCE_COLOR;
       else process.env.FORCE_COLOR = savedForceColor;
