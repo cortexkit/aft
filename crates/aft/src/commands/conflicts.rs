@@ -28,6 +28,9 @@ fn git_toplevel(base_path: &Path) -> Result<PathBuf, String> {
     } else {
         base_path
     };
+    if !crate::developer_tools::git_usable() {
+        return Err(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
+    }
     let output = crate::effective_path::new_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(working_dir)

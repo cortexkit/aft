@@ -1916,7 +1916,10 @@ fn repository_key_from_origin(project_root: &Path) -> Option<String> {
 }
 
 fn origin_remote(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
+    if !crate::developer_tools::git_usable() {
+        return None;
+    }
+    let output = crate::effective_path::new_command("git")
         .current_dir(cwd)
         .args(["remote", "get-url", "origin"])
         .output()

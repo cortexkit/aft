@@ -72,6 +72,7 @@ pub mod config_fix;
 pub mod config_resolve;
 pub mod context;
 pub mod db;
+pub mod developer_tools;
 pub mod edit;
 pub mod effective_path;
 #[doc(hidden)]

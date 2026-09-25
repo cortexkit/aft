@@ -1343,7 +1343,8 @@ fn detect_worktree_bridge(ctx: &AppContext, project_root: &Path) -> (bool, Optio
         }
         (git_marker_is_file, None)
     };
-    if configure_cancellation_requested() {
+    // Without runnable git this is the same answer a failed probe gives.
+    if configure_cancellation_requested() || !crate::developer_tools::git_usable() {
         return fail_closed_topology();
     }
     #[cfg(test)]

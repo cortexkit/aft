@@ -8,11 +8,13 @@
 use std::path::{Path, PathBuf};
 
 /// Resolve `binary` on the process `PATH` (PATHEXT-aware on Windows via `which`).
+/// An Apple developer-tools launcher on a Mac without the tools counts as not
+/// found, because running it opens the install dialog.
 pub(crate) fn resolve_on_path(binary: &str) -> Option<PathBuf> {
-    if let Ok(path) = which::which(binary) {
-        return Some(path);
-    }
-    find_on_path_manual(binary)
+    which::which(binary)
+        .ok()
+        .or_else(|| find_on_path_manual(binary))
+        .filter(|path| !crate::developer_tools::is_unusable_launcher(path))
 }
 
 /// Walk `PATH` left-to-right without spawning a subprocess.

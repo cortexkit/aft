@@ -1576,7 +1576,13 @@ fn resolve_git_policy(project_root: &Path) -> Result<GitPolicy, String> {
 
 #[cfg(unix)]
 fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf, String> {
-    let configured = Command::new("git")
+    // Without runnable git nothing can read core.hooksPath, and nothing can
+    // run a hook either; deny the default hooks directory, which is what an
+    // unset core.hooksPath resolves to.
+    if !crate::developer_tools::git_usable() {
+        return canonicalize_policy_path(common_dir.join("hooks"), "Git hooks");
+    }
+    let configured = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(project_root)
         .args(["config", "--path", "core.hooksPath"])
@@ -1600,7 +1606,7 @@ fn resolve_hooks_path(project_root: &Path, common_dir: &Path) -> Result<PathBuf,
                 project_root.display()
             ));
         }
-        let resolved = Command::new("git")
+        let resolved = crate::effective_path::new_command("git")
             .arg("-C")
             .arg(project_root)
             .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])

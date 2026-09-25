@@ -778,7 +778,13 @@ fn same_file_path(path: &Path, target: &Path) -> bool {
 pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasError> {
     #[cfg(test)]
     HEAD_TREE_ENTRY_CALLS.with(|calls| calls.set(calls.get() + 1));
-    let output = Command::new("git")
+    if !crate::developer_tools::git_usable() {
+        return Err(AliasError::Git {
+            command: "ls-tree -r -z HEAD",
+            stderr: crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_owned(),
+        });
+    }
+    let output = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(repo_root)
         .args(["ls-tree", "-r", "-z", "HEAD"])
@@ -913,7 +919,7 @@ fn git_filter_attributes(
     }
     let started_at = Instant::now();
     let output = run_command_with_input(
-        Command::new("git").arg("-C").arg(repo_root).args([
+        crate::effective_path::new_command("git").arg("-C").arg(repo_root).args([
             "check-attr",
             "--cached",
             "-z",

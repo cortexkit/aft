@@ -15,8 +15,10 @@
 //! `/var/db/xcode_select_link` symlink) is used; with no selection the
 //! defaults are `/Applications/Xcode.app/Contents/Developer` and then
 //! `/Library/Developer/CommandLineTools`. `xcode-select -p` reports that same
-//! state and is safe, but reading the filesystem answers the question without
-//! spawning anything at all, so that is what this module does.
+//! state and is safe (with no tools it prints an error and exits non-zero,
+//! without the dialog). Reading those directories answers the common case
+//! without spawning anything, so this module does that first and asks
+//! `xcode-select -p` only when no known directory holds the tools.
 //!
 //! The decision is made once per process. Only a launcher is ever refused: a
 //! user whose PATH finds a real git first (Homebrew, MacPorts, Nix) keeps
@@ -98,7 +100,9 @@ impl Detector {
         // Only look at the developer directories when a launcher could matter;
         // on other platforms the answer is irrelevant.
         let developer_tools_present = override_tools.unwrap_or_else(|| {
-            launcher_dirs.is_empty() || macos_developer_tools_present(DeveloperDirProbe::system())
+            launcher_dirs.is_empty()
+                || macos_developer_tools_present(DeveloperDirProbe::system())
+                || xcode_select_reports_developer_dir()
         });
         Self {
             launcher_dirs,
@@ -207,6 +211,27 @@ pub fn macos_developer_tools_present(probe: DeveloperDirProbe) -> bool {
         }
     }
     probe.defaults.iter().any(|dir| is_developer_dir(dir))
+}
+
+/// Second opinion for a Mac where none of the known directories hold the
+/// tools: Xcode may live under another name (say `Xcode-beta.app`) that the
+/// launcher still finds. `xcode-select -p` answers from the same lookup and,
+/// unlike the launchers, only prints an error and exits non-zero when nothing
+/// is installed; it never opens the install dialog. It runs at most once per
+/// process, and only on a Mac that looks like it has no tools.
+fn xcode_select_reports_developer_dir() -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    std::process::Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && is_developer_dir(Path::new(String::from_utf8_lossy(&output.stdout).trim()))
+        })
 }
 
 fn process_detector() -> &'static Detector {

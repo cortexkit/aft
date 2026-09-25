@@ -397,6 +397,9 @@ fn insert_file_entry(
 }
 
 fn git_name_status(repo_root: &Path, base_sha: &str, tip_sha: &str) -> Option<Vec<GitFileChange>> {
+    if !crate::developer_tools::git_usable() {
+        return None;
+    }
     let range = format!("{base_sha}..{tip_sha}");
     let output = crate::effective_path::new_command("git")
         .arg("-C")
@@ -471,6 +474,9 @@ fn parse_name_status(output: &[u8]) -> Vec<GitFileChange> {
 }
 
 fn read_git_blob(repo_root: &Path, sha: &str, path_bytes: &[u8]) -> Option<Vec<u8>> {
+    if !crate::developer_tools::git_usable() {
+        return None;
+    }
     let object = git_object_spec(sha, path_bytes);
     let output = crate::effective_path::new_command("git")
         .arg("-C")

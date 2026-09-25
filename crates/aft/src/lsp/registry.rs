@@ -39,8 +39,12 @@ pub fn resolve_lsp_binary(
         }
     }
 
-    // 3. PATH fallback
-    which::which(binary).ok()
+    // 3. PATH fallback. An Apple developer-tools launcher (clangd,
+    // sourcekit-lsp, ... in /usr/bin) on a Mac without the tools counts as
+    // not installed: running it would open the install dialog.
+    which::which(binary)
+        .ok()
+        .filter(|path| !crate::developer_tools::is_unusable_launcher(path))
 }
 
 /// Resolve a server binary, adding nested Python workspace lookup before the
@@ -298,7 +302,8 @@ impl ServerDef {
 
     /// Check if the server binary is available on PATH.
     pub fn is_available(&self) -> bool {
-        which::which(&self.binary).is_ok()
+        which::which(&self.binary)
+            .is_ok_and(|path| !crate::developer_tools::is_unusable_launcher(&path))
     }
 }
 

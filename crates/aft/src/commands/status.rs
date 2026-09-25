@@ -310,7 +310,13 @@ impl AppContext {
         // subsystems are auto-disabled in that mode; the plugin / TUI sidebar
         // surface the reason so users know why and can decide whether to open a
         // project subdirectory. Empty list = full-featured mode.
-        let degraded_reasons = self.degraded_reasons();
+        let mut degraded_reasons = self.degraded_reasons();
+        // Git being off is a machine-wide, per-process fact rather than a
+        // property of this root, so it is added here instead of being
+        // recorded by configure. Status renderers print each reason as-is.
+        if !crate::developer_tools::git_usable() {
+            degraded_reasons.push(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
+        }
         let degraded = !degraded_reasons.is_empty();
         let artifact_owner = self
             .artifact_owner_status()
@@ -397,6 +403,7 @@ impl AppContext {
             "artifact_owner": artifact_owner,
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
+            "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,
                 "validate_on_edit": config.validate_on_edit.as_deref().unwrap_or("off"),

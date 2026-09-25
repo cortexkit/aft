@@ -391,6 +391,9 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 }
 
 fn git_toplevel(base_dir: &Path) -> Result<PathBuf, String> {
+    if !crate::developer_tools::git_usable() {
+        return Err("not_a_git_root".to_string());
+    }
     let output = crate::effective_path::new_command("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(base_dir)

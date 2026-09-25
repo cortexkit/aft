@@ -6,7 +6,6 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
@@ -309,7 +308,10 @@ fn unicode_path(path: &Path) -> Result<String, ScopedKeyError> {
 }
 
 fn find_git_toplevel(path: &Path) -> Result<Option<PathBuf>, ScopedKeyError> {
-    let output = Command::new("git")
+    if !crate::developer_tools::git_usable() {
+        return Ok(None);
+    }
+    let output = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--show-toplevel"])
@@ -345,6 +347,7 @@ fn find_git_toplevel(path: &Path) -> Result<Option<PathBuf>, ScopedKeyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn scoped_v1_has_domain_separation_and_stable_bytes() {

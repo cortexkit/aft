@@ -6088,6 +6088,12 @@ fn canonicalize_root_commit_output(stdout: &[u8]) -> RootCommitProbe {
 }
 
 fn git_root_commit_once_real(project_root: &Path) -> RootCommitProbe {
+    // Without runnable git, answer the way a non-git directory does: a
+    // deterministic NotARepo, so the caller takes the path-identity fallback
+    // and never retries.
+    if !crate::developer_tools::git_usable() {
+        return RootCommitProbe::NotARepo;
+    }
     let output = match crate::effective_path::new_command("git")
         .arg("-C")
         .arg(project_root)
@@ -6792,6 +6798,9 @@ fn remaining_bytes<R: Seek>(reader: &mut R, total_len: usize) -> Option<usize> {
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+    if !crate::developer_tools::git_usable() {
+        return None;
+    }
     let mut child = crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
@@ -6829,6 +6838,9 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: &str) -> bool {
+    if !crate::developer_tools::git_usable() {
+        return false;
+    }
     let diff_range = format!("{}..{}", from, to);
     let output = match crate::effective_path::new_command("git")
         .arg("-C")
