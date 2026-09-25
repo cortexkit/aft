@@ -95,6 +95,11 @@ class FakeClient implements SubcClientLike {
   routeOpenError: Error | null = null;
   /** Returns an error while the mock daemon is refusing every route reopen. */
   routeOpenFailure: (() => Error | null) | null = null;
+  /**
+   * Channel-0 round trip the pool uses as a liveness probe. Left undefined by
+   * default so a test opts into a probe outcome explicitly.
+   */
+  catalogList?: (moduleId?: string) => Promise<unknown>;
   /** Simulates subc-client's one ingress dispatcher shared by all subscriptions. */
   private readonly ingress = new EventEmitter();
 
@@ -669,7 +674,10 @@ describe("SubcTransport Rd reconnect", () => {
     expect(clock.scheduledDelays).toEqual([100, 200]);
   });
 
-  test("outcome-unknown request failures still surface without an in-place retry", async () => {
+  test("outcome-unknown request failures surface without an in-place retry and keep the shared client", async () => {
+    // outcome_unknown is the verdict on one call (its deadline can pass while
+    // the socket is healthy), so it fails that call and route only. Closing the
+    // shared client would tear down every other session's routes with it.
     const outcomeUnknown = new SubcCallError(
       "outcome_unknown",
       "connection dropped after the request was queued",
@@ -685,7 +693,8 @@ describe("SubcTransport Rd reconnect", () => {
     ).rejects.toBe(outcomeUnknown);
     expect(client.routeOpens.length).toBe(1);
     expect(client.requests.length).toBe(1);
-    expect(client.closed).toBe(1);
+    expect(client.closed).toBe(0);
+    expect(client.closedRoutes).toEqual([1]);
   });
 
   test("a not-queued write failure (transient, not_sent-equivalent) drops the client", async () => {
@@ -1282,7 +1291,7 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
     expect(madeClients).toBe(2); // dead client dropped on the routeOpen failure
   });
 
-  test("half-open backstop: 3 consecutive non-transient throws force a reconnect", async () => {
+  test("half-open backstop: 3 consecutive non-transient throws plus an unanswered liveness probe force a reconnect", async () => {
     let madeClients = 0;
     let calls = 0;
     const pool = new SubcTransportPool({
@@ -1290,23 +1299,58 @@ describe("SubcTransportPool route lifecycle (B-#3/#4/#5)", () => {
       harness: "opencode",
       connect: async () => {
         madeClients += 1;
-        return new FakeClient(async () => {
+        const client = new FakeClient(async () => {
           calls += 1;
           if (calls <= 3) throw new SubcError("timed out");
           return envelope({ id: "r", success: true, text: "recovered" });
         });
+        // A half-open socket answers nothing, the probe included.
+        client.catalogList = () => new Promise(() => undefined);
+        return client;
       },
+      livenessProbeTimeoutMs: 5,
     });
     const t = pool.getBridge(TEST_PROJECT_ROOT);
 
-    // Three non-transient timeouts: client kept for the first two, dropped on the third.
+    // Three non-transient timeouts only start the probe; the client is dropped
+    // once the probe's window passes with no reply.
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
     expect(madeClients).toBe(1); // not yet reconnected mid-run
+    await new Promise((resolve) => setTimeout(resolve, 20));
     const res = await t.toolCall("s", "edit", {});
     expect(res.text).toBe("recovered");
-    expect(madeClients).toBe(2); // 3rd failure tripped the reconnect
+    expect(madeClients).toBe(2); // the silent probe tripped the reconnect
+  });
+
+  test("half-open backstop: a probe that fails with socket death drops the client at once", async () => {
+    let madeClients = 0;
+    let calls = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        const client = new FakeClient(async () => {
+          calls += 1;
+          if (calls <= 3) throw new SubcError("timed out");
+          return envelope({ id: "r", success: true, text: "recovered" });
+        });
+        client.catalogList = async () => {
+          throw new SocketClosedError("subc socket closed");
+        };
+        return client;
+      },
+    });
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    }
+    await tick();
+    const res = await t.toolCall("s", "edit", {});
+    expect(res.text).toBe("recovered");
+    expect(madeClients).toBe(2);
   });
 
   test("a success between failures resets the half-open counter", async () => {
@@ -1942,6 +1986,273 @@ describe("subc AbortSignal transport", () => {
     expect(client.requests).toHaveLength(0);
     expect(client.closedRoutes).toEqual([1]);
 
+    await pool.shutdown();
+  });
+});
+
+describe("SubcTransportPool shared connection vs per-route failures", () => {
+  let previousLogger: Logger | undefined;
+  let logs: string[];
+
+  beforeEach(() => {
+    previousLogger = getActiveLogger();
+    logs = [];
+    setActiveLogger({
+      log: (message) => logs.push(message),
+      warn: (message) => logs.push(message),
+      error: (message) => logs.push(message),
+    });
+  });
+
+  afterEach(() => {
+    setActiveLogger(previousLogger as Logger);
+  });
+
+  /** A pool whose factory mints a fresh client per connect, with bg streams enabled. */
+  function sharedPool(
+    onRequest: (clientIndex: number, calls: number) => Promise<unknown>,
+    configure: (client: FakeClient) => void = () => undefined,
+    livenessProbeTimeoutMs?: number,
+  ): { pool: SubcTransportPool; clients: FakeClient[] } {
+    const clients: FakeClient[] = [];
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        const index = clients.length + 1;
+        let calls = 0;
+        const client = new FakeClient(async () => {
+          calls += 1;
+          return onRequest(index, calls);
+        });
+        configure(client);
+        clients.push(client);
+        return client;
+      },
+      onBgEventsNudge: () => undefined,
+      bgBackoffSleep: async () => undefined,
+      livenessProbeTimeoutMs,
+    });
+    return { pool, clients };
+  }
+
+  const liveReply = async (clientIndex: number): Promise<unknown> =>
+    envelope({ id: "r", success: true, text: `client-${clientIndex}` });
+
+  test.each([
+    [
+      "outcome_unknown (managed deadline, no drop observed)",
+      () =>
+        new SubcCallError(
+          "outcome_unknown",
+          "managed call deadline exceeded after request bytes were queued to the local socket; no terminal response was observed; outcome unknown",
+          "deadline_exceeded_no_drop_observed",
+        ),
+    ],
+    [
+      "not_sent (route closed during open)",
+      () =>
+        new SubcCallError(
+          "not_sent",
+          "route was closed before route.open completed",
+          "route_closed",
+        ),
+    ],
+    [
+      "raw route.open deadline",
+      () =>
+        new SubcError(
+          "request on local_port=50123 channel 0 corr 9 timed out after 30000ms",
+          "request_deadline",
+        ),
+    ],
+    [
+      "route.bind cap refusal",
+      () =>
+        new SubcError(
+          "module_id 'aft' already has 16 route.bind relays in flight; retry after one settles",
+          "route_bind_capacity",
+        ),
+    ],
+  ])("a %s on one session's route.open leaves every other route and bg stream on the shared client", async (_name, makeError) => {
+    const { pool, clients } = sharedPool(liveReply);
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    await transport.toolCall("holder-a", "read", {});
+    await transport.toolCall("holder-b", "read", {});
+    await tick();
+    const client = clients[0]!;
+    expect(client.subscriptions).toHaveLength(2);
+    const opensBefore = client.routeOpens.length;
+
+    const slowOpen = makeError();
+    client.routeOpenError = slowOpen;
+    await expect(transport.toolCall("slow", "read", {})).rejects.toBe(slowOpen);
+    await tick();
+    await tick();
+
+    // No reconnect: the shared client and both held bg streams are untouched.
+    expect(clients).toHaveLength(1);
+    expect(client.closed).toBe(0);
+    expect(client.subscriptions).toHaveLength(2);
+    expect(client.subscriptions.map((sub) => sub.unsubscribed)).toEqual([0, 0]);
+    expect(logs.some((line) => line.includes("dropping shared client"))).toBe(false);
+
+    // The holders keep their cached routes (only the slow session's attempt was added).
+    await transport.toolCall("holder-a", "read", {});
+    await transport.toolCall("holder-b", "read", {});
+    expect(client.routeOpens.length).toBe(opensBefore + 1);
+
+    // The slow session retries on its own, on the same client.
+    const retried = await transport.toolCall("slow", "read", {});
+    expect(retried.text).toBe("client-1");
+    expect(clients).toHaveLength(1);
+    await pool.shutdown();
+  });
+
+  test("per-call timeouts across sessions keep the shared client when the liveness probe answers", async () => {
+    let probes = 0;
+    const { pool, clients } = sharedPool(
+      async (clientIndex, calls) => {
+        // Call 1 (holder) succeeds; calls 2-4 (three different sessions) time out.
+        if (calls >= 2 && calls <= 4) {
+          throw new SubcError(
+            `request on channel ${calls} corr 1 timed out after 5000ms`,
+            "request_deadline",
+          );
+        }
+        return liveReply(clientIndex);
+      },
+      (client) => {
+        client.catalogList = async () => {
+          probes += 1;
+          return [];
+        };
+      },
+    );
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    await transport.toolCall("holder", "read", {});
+    await tick();
+    for (const session of ["slow-1", "slow-2", "slow-3"]) {
+      await expect(transport.toolCall(session, "read", {})).rejects.toBeInstanceOf(SubcError);
+    }
+    await tick();
+    await tick();
+
+    expect(probes).toBe(1);
+    expect(clients).toHaveLength(1);
+    expect(clients[0]?.closed).toBe(0);
+    expect(clients[0]?.subscriptions.map((sub) => sub.unsubscribed)).toEqual([0]);
+    expect(logs).toContain(
+      "subc pool: keeping shared client after 3 consecutive unanswered calls; last request failed with SubcError/request_deadline; the connection answered",
+    );
+    const result = await transport.toolCall("slow-1", "read", {});
+    expect(result.text).toBe("client-1");
+    expect(clients).toHaveLength(1);
+    await pool.shutdown();
+  });
+
+  test("a real socket death drops the client, logs the cause, and reconnects every session", async () => {
+    let socketDead = false;
+    const { pool, clients } = sharedPool(async (clientIndex) => {
+      if (clientIndex === 1 && socketDead) {
+        throw new SocketClosedError("subc socket closed: read ECONNRESET");
+      }
+      return liveReply(clientIndex);
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    await transport.toolCall("sess-a", "read", {});
+    await transport.toolCall("sess-b", "read", {});
+    await tick();
+    expect(clients[0]?.subscriptions).toHaveLength(2);
+
+    socketDead = true;
+    await expect(transport.toolCall("sess-a", "read", {})).rejects.toBeInstanceOf(
+      SocketClosedError,
+    );
+    await tick();
+    await tick();
+
+    expect(clients[0]?.closed).toBe(1);
+    expect(clients).toHaveLength(2);
+    // Both sessions' bg streams resubscribed on the replacement client.
+    expect(clients[1]?.subscriptions).toHaveLength(2);
+    const [dropLine, ...otherDrops] = logs.filter((line) =>
+      line.includes("dropping shared client"),
+    );
+    expect(otherDrops).toEqual([]);
+    expect(dropLine).toBe(
+      'subc pool: dropping shared client cause=SocketClosedError trigger=request session=sess-a route=1@1 sessions=2 routes=4 message="subc socket closed: read ECONNRESET"',
+    );
+
+    // Session b had a route on the dead client; its next call opens one on the new client.
+    const opensOnNew = clients[1]?.routeOpens.length ?? 0;
+    const result = await transport.toolCall("sess-b", "read", {});
+    expect(result.text).toBe("client-2");
+    expect(clients[1]?.routeOpens.length).toBe(opensOnNew + 1);
+    await pool.shutdown();
+  });
+
+  test("a silent liveness probe after a run of unanswered calls drops the client and names the probe", async () => {
+    const { pool, clients } = sharedPool(
+      async (clientIndex, calls) => {
+        if (clientIndex === 1 && calls <= 3) {
+          throw new SubcError(
+            "request on channel 1 corr 1 timed out after 5000ms",
+            "request_deadline",
+          );
+        }
+        return liveReply(clientIndex);
+      },
+      (client) => {
+        client.catalogList = () => new Promise(() => undefined);
+      },
+      5,
+    );
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(transport.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    }
+    expect(clients[0]?.closed).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(clients[0]?.closed).toBe(1);
+    expect(logs.filter((line) => line.includes("dropping shared client"))).toEqual([
+      'subc pool: dropping shared client cause=SubcLivenessProbeTimeoutError/liveness_probe_timeout trigger=liveness probe session=s route=3@3 sessions=0 routes=0 after 3 consecutive unanswered calls; last request failed with SubcError/request_deadline message="no reply to a channel-0 catalog.list probe within 5ms"',
+    ]);
+    const result = await transport.toolCall("s", "edit", {});
+    expect(result.text).toBe("client-2");
+    await pool.shutdown();
+  });
+
+  test("a reply on the connection during the probe window outweighs a probe that timed out", async () => {
+    const { pool, clients } = sharedPool(
+      async (clientIndex, calls) => {
+        if (clientIndex === 1 && calls >= 2 && calls <= 4) {
+          throw new SubcError(
+            "request on channel 1 corr 1 timed out after 5000ms",
+            "request_deadline",
+          );
+        }
+        return liveReply(clientIndex);
+      },
+      (client) => {
+        // The probe queues behind other channel-0 work and misses its window.
+        client.catalogList = () => new Promise(() => undefined);
+      },
+      15,
+    );
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    await transport.toolCall("holder", "read", {});
+    for (const session of ["slow-1", "slow-2", "slow-3"]) {
+      await expect(transport.toolCall(session, "read", {})).rejects.toBeInstanceOf(SubcError);
+    }
+    // Another session's call is answered while the probe is still waiting.
+    await transport.toolCall("holder", "read", {});
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    expect(clients).toHaveLength(1);
+    expect(clients[0]?.closed).toBe(0);
+    expect(logs.some((line) => line.includes("dropping shared client"))).toBe(false);
     await pool.shutdown();
   });
 });

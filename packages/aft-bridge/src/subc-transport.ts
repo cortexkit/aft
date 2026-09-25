@@ -33,7 +33,7 @@ import {
   SubcError,
 } from "@cortexkit/subc-client";
 
-import { log } from "./active-logger.js";
+import { log, warn } from "./active-logger.js";
 import type { StatusSnapshot } from "./bridge.js";
 import { isRouteOpenReloadWindowError, isRouteRequestReloadRefusal } from "./error-contract.js";
 import {
@@ -70,8 +70,91 @@ export function isSubcClientClosedError(error: unknown): error is SubcError {
   return error instanceof SubcError && error.message === "client closed";
 }
 
-function isConsumerReconnectRequired(error: unknown): boolean {
+/**
+ * True only when an error is evidence that the shared socket itself is dead, so
+ * every route on it is gone and the client must be replaced.
+ *
+ * subc-client's `isConsumerReconnectTransient` answers a different question
+ * ("may a managed call reconnect and retry?") and also accepts a managed
+ * `SubcCallError` of kind `not_sent` / `outcome_unknown`. Those kinds are the
+ * verdict on ONE call: a call whose deadline passed while the socket stayed up
+ * is `outcome_unknown` too. So a `SubcCallError` counts as socket death only when
+ * the error it wraps does. Everything else defers to the client's classifier,
+ * whose remaining members are all socket-level: the socket closed or reset, a
+ * write that could not complete, a handshake/auth failure while reconnecting,
+ * ECONN and EPIPE errno codes. The client's own "client closed" rejection means
+ * the connection has already been torn down locally.
+ */
+export function isSocketDeathError(error: unknown, depth = 0): boolean {
+  if (error instanceof SubcCallError) {
+    const cause = error.cause;
+    return depth < 4 && cause !== undefined && cause !== error
+      ? isSocketDeathError(cause, depth + 1)
+      : false;
+  }
   return isConsumerReconnectTransient(error) || isSubcClientClosedError(error);
+}
+
+/**
+ * A call that never got an answer on a socket that may still be alive: the
+ * client's own request deadline (raw `request`/`routeOpen` reject with code
+ * `request_deadline`) or a managed verdict of `not_sent` / `outcome_unknown`
+ * that is not backed by socket death. Several of these in a row are grounds to
+ * check the connection, never to close it on their own.
+ */
+function isUnansweredCallError(error: unknown): boolean {
+  if (isSocketDeathError(error)) return false;
+  if (error instanceof SubcCallError) return error.kind !== "terminal";
+  return error instanceof SubcError && error.code === REQUEST_DEADLINE_CODE;
+}
+
+/**
+ * A rejection that the daemon itself sent back (a coded wire Error frame, such as
+ * a refused route.open), which proves the socket still carries replies. The
+ * client's local deadline marker is also a code, so it is excluded.
+ */
+function isDaemonAnswerError(error: unknown): boolean {
+  return (
+    error instanceof SubcError &&
+    typeof error.code === "string" &&
+    error.code !== REQUEST_DEADLINE_CODE &&
+    !isSubcClientClosedError(error)
+  );
+}
+
+/** Short `Class/kind/code` label for a drop log line. */
+function describeFailure(error: unknown): string {
+  if (!(error instanceof Error)) return `non-error:${String(error)}`;
+  const className =
+    error.name && error.name !== "Error" ? error.name : (error.constructor?.name ?? "Error");
+  const parts = [className];
+  if (error instanceof SubcCallError) parts.push(error.kind);
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "string" && code.length > 0) parts.push(code);
+  return parts.join("/");
+}
+
+/** Why the pool is replacing its shared client; rendered as one log line. */
+interface ClientDropCause {
+  readonly error: unknown;
+  /** The operation that surfaced the error: `request`, `route.open`, `bg_events stream`, … */
+  readonly trigger: string;
+  readonly session?: string;
+  readonly route?: string;
+  readonly detail?: string;
+}
+
+function routeLabel(route: RouteHandle | null | undefined): string | undefined {
+  return route ? `${route.channel}@${route.epoch}` : undefined;
+}
+
+/** The liveness probe saw no reply on the shared connection within its window. */
+export class SubcLivenessProbeTimeoutError extends Error {
+  readonly code = "liveness_probe_timeout" as const;
+  constructor(windowMs: number) {
+    super(`no reply to a channel-0 catalog.list probe within ${windowMs}ms`);
+    this.name = "SubcLivenessProbeTimeoutError";
+  }
 }
 
 /** A held-open event subscription — the slice of subc-client's Subscription we use. */
@@ -100,6 +183,12 @@ export interface SubcClientLike {
     onEvent: (event: Uint8Array) => void,
   ): SubcSubscriptionLike;
   closeRouteChannel(route: RouteHandle, opts?: { drain?: boolean }): Promise<void>;
+  /**
+   * A channel-0 control round trip on the same connection. The pool uses it as a
+   * liveness probe before treating a run of unanswered calls as a dead socket.
+   * Optional so a test double can model a client that offers no probe.
+   */
+  catalogList?(moduleId?: string): Promise<unknown>;
   /** Cumulative frames discarded because their route epoch did not match the client's current handle. */
   readonly droppedIngressFrames?: number;
   close(): void;
@@ -109,14 +198,28 @@ export interface SubcClientLike {
 const AFT_MODULE_ID = "aft";
 
 /**
- * A run of consecutive NON-transient transport throws (timeout / route GOODBYE)
- * on the SAME client is presumed a dead half-open connection (local writes
- * succeed, no response ever arrives), so the client is dropped after this many.
- * A single throw does not drop the client (a slow tool can legitimately time out
- * once); the counter resets on any successful request. Tool-level errors never
- * count — they return `success:false`, they do not throw. (Audit B-#4.)
+ * A run of consecutive per-call failures that got no answer (timeout / route
+ * GOODBYE / refusal) on the SAME client raises the suspicion of a dead half-open
+ * connection: local writes succeed, no response ever arrives. The run alone never
+ * closes the client, because the calls may belong to different sessions that are
+ * each merely slow. It starts a liveness probe on the same connection, and the
+ * client is dropped only if that probe also goes unanswered. The counter resets
+ * on any successful request. Tool-level errors never count: they return
+ * `success:false`, they do not throw. (Audit B-#4.)
  */
 const MAX_CONSECUTIVE_TRANSPORT_FAILURES = 3;
+
+/**
+ * How long the liveness probe waits for its reply. subc-client documents that
+ * the daemon handles a connection's channel-0 frames in order and can hold one
+ * route.open for its whole bind relay (about 12s in production), so the probe
+ * may queue behind a legitimate bind. A shorter window would convict a busy but
+ * healthy connection.
+ */
+const LIVENESS_PROBE_TIMEOUT_MS = 15_000;
+
+/** Code subc-client puts on a raw request or route.open that hit its own deadline. */
+const REQUEST_DEADLINE_CODE = "request_deadline";
 
 /** Every transport reconnect waits at least one event-loop turn and caps repeated failures. */
 const RECONNECT_RETRY_FLOOR_MS = 100;
@@ -215,6 +318,8 @@ export interface SubcTransportPoolOptions {
   routeRetrySleep?: (ms: number) => Promise<void>;
   /** Test-only polling interval for detecting frames silently discarded with a stale route epoch. */
   bgDispatchProbeIntervalMs?: number;
+  /** Test seam: how long the shared-connection liveness probe waits for its reply. */
+  livenessProbeTimeoutMs?: number;
   /** Optional lifecycle registry used for root tracking; omit it to retain legacy behavior. */
   lifecycleRegistry?: LifecycleRegistry;
   /** Configuration-shaped alias used by construction sites that group lifecycle seams. */
@@ -363,6 +468,8 @@ class BgSubscription {
   private stopped = false;
   /** The live subscription handle, read by stop() to wake the loop's `await closed`. */
   private current: SubcSubscriptionLike | null = null;
+  /** Client carrying the live subscription route, counted when that client is dropped. */
+  private attached: SubcClientLike | null = null;
   private readonly loop: Promise<void>;
   private readonly lifecycleLogState = new Map<
     string,
@@ -373,7 +480,7 @@ class BgSubscription {
   constructor(
     private readonly identity: BindIdentity,
     private readonly acquireClient: () => Promise<SubcClientLike>,
-    private readonly dropClient: (client: SubcClientLike) => void,
+    private readonly dropClient: (client: SubcClientLike, cause: ClientDropCause) => void,
     private readonly consumerIdentity: ConsumerIdentity | null | undefined,
     private readonly onNudge: () => void,
     private readonly sleep: (ms: number) => Promise<void>,
@@ -383,8 +490,20 @@ class BgSubscription {
     private readonly dispatchProbeIntervalMs: number,
     readonly nudgeRef?: BgNudgeRef,
     private readonly isCurrent: () => boolean = () => true,
+    /** Reports a reply seen on the client, which proves its socket still delivers. */
+    private readonly noteClientAlive: (client: SubcClientLike) => void = () => undefined,
+    /** Reports a call on the client that got no answer; enough in a row start a liveness probe. */
+    private readonly noteUnansweredCall: (
+      client: SubcClientLike,
+      cause: ClientDropCause,
+    ) => void = () => undefined,
   ) {
     this.loop = this.run();
+  }
+
+  /** The client whose route currently carries this subscription, if any. */
+  get attachedClient(): SubcClientLike | null {
+    return this.attached;
   }
 
   async stop(): Promise<void> {
@@ -528,7 +647,21 @@ class BgSubscription {
           this.onDormant();
           return;
         }
-        if (isConsumerReconnectRequired(err)) this.dropClient(client);
+        if (isSocketDeathError(err)) {
+          this.dropClient(client, {
+            error: err,
+            trigger: "bg_events route.open",
+            session: this.identity.session,
+          });
+        } else if (isDaemonAnswerError(err)) {
+          this.noteClientAlive(client);
+        } else if (isUnansweredCallError(err)) {
+          this.noteUnansweredCall(client, {
+            error: err,
+            trigger: "bg_events route.open",
+            session: this.identity.session,
+          });
+        }
         if (!reconnecting) beginReconnect();
         this.info(
           "reconnect-error",
@@ -543,6 +676,7 @@ class BgSubscription {
         if (reconnecting) giveUp(this.stopped ? "stopped" : "stale-session");
         return;
       }
+      this.noteClientAlive(client);
 
       const subscribedAt = Date.now();
       const routeId = this.routeId(route);
@@ -557,6 +691,7 @@ class BgSubscription {
             return;
           }
           this.recordNudgeReceipt(routeId);
+          this.noteClientAlive(client);
           if (!this.isCurrent()) {
             this.info(
               "nudge-stale-carrier",
@@ -566,6 +701,7 @@ class BgSubscription {
           this.onNudge();
         });
         this.current = sub;
+        this.attached = client;
         stopDispatchProbe = this.startDispatchProbe(client, routeId);
         this.info("subscription-open", `subscription open channel=${routeId}`);
         if (reconnecting) {
@@ -602,12 +738,20 @@ class BgSubscription {
           giveUp("stopped");
           return;
         }
-        if (isConsumerReconnectRequired(err)) this.dropClient(client);
+        if (isSocketDeathError(err)) {
+          this.dropClient(client, {
+            error: err,
+            trigger: "bg_events stream",
+            session: this.identity.session,
+            route: routeId,
+          });
+        }
         if (Date.now() - subscribedAt >= BG_STABLE_MS) backoffAttempt = 0;
         beginReconnect();
       } finally {
         stopDispatchProbe();
         this.current = null;
+        this.attached = null;
         safeCloseRoute(client, route);
       }
       await this.backoff(backoffAttempt++);
@@ -930,6 +1074,7 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly bgBackoffSleep: (ms: number) => Promise<void>;
   private readonly routeRetrySleep: (ms: number) => Promise<void>;
   private readonly bgDispatchProbeIntervalMs: number;
+  private readonly livenessProbeTimeoutMs: number;
   private readonly lifecycleDemandCheck?: (
     root: CanonicalRootPath,
     poolId: ConcretePoolId,
@@ -960,8 +1105,15 @@ export class SubcTransportPool implements AftTransportPool {
   private readonly rootIndex = new Map<CanonicalRootPath, Set<IdentityKey>>();
   /** Roots whose route binds must stay dormant until their directories return. */
   private readonly dormantRoots = new Map<CanonicalRootPath, SubcError>();
-  /** Consecutive non-transient failures on the current pool-local client. */
+  /** Consecutive unanswered calls on the current pool-local client. */
   private transportFailures = 0;
+  /** The in-flight liveness probe of the current client; at most one runs at a time. */
+  private livenessProbe: Promise<void> | null = null;
+  /**
+   * Bumped whenever the current client delivers any reply. A liveness probe that
+   * times out while this moved has been outrun by other traffic, not by a dead socket.
+   */
+  private clientLivenessMark = 0;
   /** Concrete per-root facades, including their captured root generation. */
   private readonly transports = new Map<CanonicalRootPath, SubcTransport>();
   private readonly generationRejections = new Set<string>();
@@ -988,6 +1140,7 @@ export class SubcTransportPool implements AftTransportPool {
       options.routeRetrySleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.bgDispatchProbeIntervalMs =
       options.bgDispatchProbeIntervalMs ?? BG_DISPATCH_PROBE_INTERVAL_MS;
+    this.livenessProbeTimeoutMs = options.livenessProbeTimeoutMs ?? LIVENESS_PROBE_TIMEOUT_MS;
     const lifecycle = options.lifecycle;
     const demandCheck =
       options.lifecycleDemandCheck ?? options.demandCheck ?? lifecycle?.demandCheck;
@@ -1562,12 +1715,23 @@ export class SubcTransportPool implements AftTransportPool {
         } catch (error) {
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           if (error instanceof RouteTornDownError) throw error;
-          if (
-            isConsumerReconnectRequired(error) &&
-            this.isCurrentSession(key, record) &&
-            this.client === client
-          ) {
-            this.dropClient(client);
+          const ownsClient = this.isCurrentSession(key, record) && this.client === client;
+          if (ownsClient && isSocketDeathError(error)) {
+            this.dropClient(client, {
+              error,
+              trigger: "route.open",
+              session: identity.session,
+            });
+          } else if (isDaemonAnswerError(error)) {
+            // A refusal (cap reached, target unavailable, ...) fails this route
+            // only, and proves the shared socket still delivers replies.
+            this.noteClientAlive(client);
+          } else if (ownsClient && isUnansweredCallError(error)) {
+            this.noteUnansweredCall(client, {
+              error,
+              trigger: "route.open",
+              session: identity.session,
+            });
           }
           throw error;
         }
@@ -1611,26 +1775,32 @@ export class SubcTransportPool implements AftTransportPool {
       };
 
       const handleRequestFailure = (error: unknown, entry: RouteEntry): void => {
+        const aborted = error instanceof Error && error.name === "AbortError";
+        const ownsClient =
+          this.isCurrentSession(key, record) &&
+          this.client === client &&
+          !this.isReapInduced(record);
+        if (!aborted && ownsClient && isSocketDeathError(error)) {
+          // Dropped before the route is cleared so the drop log counts it.
+          this.dropClient(client, {
+            error,
+            trigger: "request",
+            session: identity.session,
+            route: routeLabel(entry.handle),
+          });
+        }
         clearRouteEntry(entry);
-        if (error instanceof Error && error.name === "AbortError") return;
-        if (
-          !this.isCurrentSession(key, record) ||
-          this.client !== client ||
-          this.isReapInduced(record)
-        )
-          return;
-        if (isConsumerReconnectRequired(error)) {
-          this.transportFailures = 0;
-          this.dropClient(client);
-          return;
-        }
-        if (
-          !isRouteProvenAbsentError(error) &&
-          ++this.transportFailures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES
-        ) {
-          this.transportFailures = 0;
-          this.dropClient(client);
-        }
+        if (aborted || !ownsClient || this.client !== client) return;
+        if (isRouteProvenAbsentError(error)) return;
+        // Anything else is this call's own outcome: a timeout, a GOODBYE, a
+        // refusal, or a managed not_sent/outcome_unknown verdict. It fails this
+        // call and route only; a run of them just checks the connection.
+        this.noteUnansweredCall(client, {
+          error,
+          trigger: "request",
+          session: identity.session,
+          route: routeLabel(entry.handle),
+        });
       };
 
       const requestOnRoute = async (route: RouteHandle, entry: RouteEntry): Promise<unknown> => {
@@ -1661,6 +1831,7 @@ export class SubcTransportPool implements AftTransportPool {
           }
           this.assertGeneration(record.canonicalRoot, record.generation, "request_completion");
           if (this.client === client) this.transportFailures = 0;
+          this.noteClientAlive(client);
           this.ensureBgSubscription(identity, record);
           return reply;
         } finally {
@@ -1824,6 +1995,7 @@ export class SubcTransportPool implements AftTransportPool {
         }
         entry.handle = route;
         entry.opening = null;
+        this.noteClientAlive(client);
         return route;
       })
       .catch((error) => {
@@ -1906,7 +2078,7 @@ export class SubcTransportPool implements AftTransportPool {
     sub = new BgSubscription(
       identity,
       () => this.ensureClient(),
-      (client) => this.dropClient(client),
+      (client, cause) => this.dropClient(client, cause),
       this.consumerIdentity,
       onNudge,
       this.bgBackoffSleep,
@@ -1922,6 +2094,8 @@ export class SubcTransportPool implements AftTransportPool {
       () =>
         this.isCurrentSession(record.identityKey, record) &&
         this.isCurrentLiveGeneration(record.canonicalRoot, record.generation),
+      (client) => this.noteClientAlive(client),
+      (client, cause) => this.noteUnansweredCall(client, cause),
     );
     record.bgSub = sub;
     if (!this.rootCanAttach(record.canonicalRoot)) {
@@ -1933,9 +2107,30 @@ export class SubcTransportPool implements AftTransportPool {
   /**
    * Invalidate only routes owned by a dead client. Sessions remain indexed so a
    * replacement client can reconnect the same identity and its bg subscription.
+   *
+   * Only socket death reaches here (see {@link isSocketDeathError}), or a run of
+   * unanswered calls that a liveness probe then confirmed. Every drop takes all
+   * sessions' routes down with it, so each one logs its cause and its reach.
    */
-  private dropClient(client: SubcClientLike): void {
+  private dropClient(client: SubcClientLike, cause: ClientDropCause): void {
     if (this.client !== client) return;
+    let sessions = 0;
+    let routes = 0;
+    for (const record of this.sessions.values()) {
+      const toolRoute = record.routeEntry?.client === client ? 1 : 0;
+      const bgRoute = record.bgSub?.attachedClient === client ? 1 : 0;
+      if (toolRoute + bgRoute > 0) sessions += 1;
+      routes += toolRoute + bgRoute;
+    }
+    const message = cause.error instanceof Error ? cause.error.message : String(cause.error);
+    warn(
+      `subc pool: dropping shared client cause=${describeFailure(cause.error)} trigger=${cause.trigger}` +
+        (cause.session ? ` session=${cause.session}` : "") +
+        (cause.route ? ` route=${cause.route}` : "") +
+        ` sessions=${sessions} routes=${routes}` +
+        (cause.detail ? ` ${cause.detail}` : "") +
+        ` message=${JSON.stringify(message)}`,
+    );
     this.client = null;
     for (const record of this.sessions.values()) {
       const entry = record.routeEntry;
@@ -1950,6 +2145,81 @@ export class SubcTransportPool implements AftTransportPool {
     } catch {
       // A dead socket is already released by the peer.
     }
+  }
+
+  /** Record that the current client delivered a reply, which proves its socket is alive. */
+  private noteClientAlive(client: SubcClientLike): void {
+    if (this.client === client) this.clientLivenessMark += 1;
+  }
+
+  /**
+   * Count a call on `client` that failed without proving the socket dead. After
+   * MAX_CONSECUTIVE_TRANSPORT_FAILURES in a row the connection is checked with a
+   * liveness probe; the count alone never closes it.
+   */
+  private noteUnansweredCall(client: SubcClientLike, cause: ClientDropCause): void {
+    if (this.client !== client) return;
+    if (++this.transportFailures < MAX_CONSECUTIVE_TRANSPORT_FAILURES) return;
+    this.transportFailures = 0;
+    this.probeClientLiveness(client, cause);
+  }
+
+  /**
+   * Decide whether a connection that stopped answering calls is dead. A channel-0
+   * catalog.list round trip is sent on the same connection; the client is dropped
+   * only when that probe fails with socket death, or goes unanswered for the
+   * probe window while no other reply arrived on the connection either. Any
+   * reply, including a refusal, keeps the client.
+   */
+  private probeClientLiveness(client: SubcClientLike, suspicion: ClientDropCause): void {
+    if (this.livenessProbe || this.client !== client) return;
+    const suspicionText = `after ${MAX_CONSECUTIVE_TRANSPORT_FAILURES} consecutive unanswered calls; last ${suspicion.trigger} failed with ${describeFailure(suspicion.error)}`;
+    if (typeof client.catalogList !== "function") {
+      log(`subc pool: keeping shared client ${suspicionText}; the client offers no liveness probe`);
+      return;
+    }
+    const mark = this.clientLivenessMark;
+    const windowMs = this.livenessProbeTimeoutMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), windowMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    const probe = (async (): Promise<void> => {
+      let deathEvidence: unknown = null;
+      try {
+        const reply = Promise.resolve().then(() => client.catalogList?.(AFT_MODULE_ID));
+        const outcome = await Promise.race([reply.then(() => "answered" as const), timedOut]);
+        if (outcome === "timeout") deathEvidence = new SubcLivenessProbeTimeoutError(windowMs);
+      } catch (error) {
+        // Only socket death or the probe's own deadline convicts. Any other
+        // rejection came back over the connection, which is proof it works.
+        if (
+          isSocketDeathError(error) ||
+          (error instanceof SubcError && error.code === REQUEST_DEADLINE_CODE)
+        ) {
+          deathEvidence = error;
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+      if (this.client !== client) return;
+      if (deathEvidence !== null && this.clientLivenessMark === mark) {
+        this.dropClient(client, {
+          error: deathEvidence,
+          trigger: "liveness probe",
+          session: suspicion.session,
+          route: suspicion.route,
+          detail: suspicionText,
+        });
+        return;
+      }
+      this.transportFailures = 0;
+      log(`subc pool: keeping shared client ${suspicionText}; the connection answered`);
+    })().finally(() => {
+      if (this.livenessProbe === probe) this.livenessProbe = null;
+    });
+    this.livenessProbe = probe;
   }
 
   /** Synchronous concrete-facade eviction used by the registry coordinator. */
