@@ -1104,6 +1104,7 @@ impl BgTaskRegistry {
         // (a grandchild that exits on its own within 300 ms is not the class
         // being reported), then a longer settle for the row bash_status shows.
         let registry = self.clone();
+        let outer_task = task;
         let task = Arc::clone(task);
         std::thread::Builder::new()
             .name(format!("aft-bg-descendants-{}", task.task_id))
@@ -1125,7 +1126,12 @@ impl BgTaskRegistry {
                     let _ = registry.sample_task_process_group(&task);
                 }
             })
-            .map_err(|error| format!("failed to start descendant sampler: {error}"))?;
+            .map_err(|error| {
+                // The sampler thread would have finished the transition and
+                // released the handles; without it, release them here.
+                release_terminal_io_handles(outer_task);
+                format!("failed to start descendant sampler: {error}")
+            })?;
         Ok(())
     }
 
@@ -1178,6 +1184,7 @@ impl BgTaskRegistry {
             emit_frame,
             cache.as_ref(),
         );
+        release_terminal_io_handles(task);
         Ok(())
     }
 
@@ -4960,6 +4967,11 @@ impl BgTaskRegistry {
         let mut kill_signaled = false;
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_reached = 0;
+        // Declared before the state lock below, so it runs after that lock is
+        // released on every exit, including a failed persist that returns
+        // early after the task was already marked terminal and would
+        // otherwise never reach `post_terminal_transition`.
+        let _release_handles = ReleaseIoHandlesOnExit(&task);
 
         {
             let mut db = DeferredDbWrites::new(self, &task);
@@ -7056,6 +7068,47 @@ impl BgTask {
     }
 }
 
+/// Closes a finished task's pre-opened I/O handles: the pinned session, task,
+/// `io` and `control` directories plus the stdout, stderr, exit and
+/// sandbox-unavailable files (8 descriptors for a piped task).
+///
+/// The daemon keeps them only so it can write the exit or kill marker through
+/// the original O_EXCL handle while the child may still be running. Once the
+/// task is terminal and its child slot is empty, nothing writes through them
+/// again: the child wrote its own output through inherited copies, every
+/// daemon-side write goes through `TaskIoHandles::write` (which syncs before
+/// returning), and all later readers open the task's paths. Holding them any
+/// longer only leaks descriptors for as long as the process lives. Both later
+/// users of `io_handles` (`reap_child` and the piped kill path) fall back to
+/// path-based writes when the handles are gone.
+///
+/// The handles are taken under the state lock and closed after it is released.
+fn release_terminal_io_handles(task: &BgTask) {
+    let handles = match task.state.lock() {
+        Ok(mut state)
+            if state.metadata.status.is_terminal()
+                && matches!(
+                    state.runtime,
+                    TaskRuntime::Piped(None) | TaskRuntime::Pty(None)
+                ) =>
+        {
+            state.io_handles.take()
+        }
+        _ => None,
+    };
+    drop(handles);
+}
+
+/// Calls [`release_terminal_io_handles`] when dropped, for functions with
+/// early returns. It does nothing for a task that is not terminal.
+struct ReleaseIoHandlesOnExit<'a>(&'a BgTask);
+
+impl Drop for ReleaseIoHandlesOnExit<'_> {
+    fn drop(&mut self) {
+        release_terminal_io_handles(self.0);
+    }
+}
+
 /// Reap an exited direct child handle, then clear the slot.
 ///
 /// Dropping a [`std::process::Child`] does NOT `wait()` on the underlying OS
@@ -8943,6 +8996,211 @@ mod tests {
         registry.cleanup_finished(Duration::ZERO);
 
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
+    }
+
+    /// Foreground bash calls (the common case) spawn with
+    /// `notify_on_completion: false`, register as foreground tasks, poll
+    /// `status` with a zero preview until terminal, and return the result
+    /// inline without draining or acking anything. Retention must still
+    /// remove them from memory.
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_finished_removes_foreground_shaped_tasks_after_retention() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, _db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-foreground-retention";
+        let mut task_ids = Vec::new();
+        for _ in 0..3 {
+            let task_id = registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    QUICK_SUCCESS_COMMAND,
+                    session.to_string(),
+                    project.path().to_path_buf(),
+                    HashMap::new(),
+                    Some(Duration::from_secs(30)),
+                    storage.path().to_path_buf(),
+                    10,
+                    false,
+                    true,
+                    Some(project.path().to_path_buf()),
+                )
+                .unwrap();
+            registry.register_foreground_task(session, &task_id);
+            let started = Instant::now();
+            loop {
+                let snapshot = registry
+                    .status(
+                        &task_id,
+                        session,
+                        Some(project.path()),
+                        Some(storage.path()),
+                        0,
+                    )
+                    .expect("foreground task visible to status");
+                if snapshot.info.status.is_terminal() {
+                    break;
+                }
+                assert!(started.elapsed() < CHILD_EXIT_LIVENESS_BOUND);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            registry.unregister_foreground_task(session, &task_id);
+            task_ids.push(task_id);
+        }
+
+        registry.cleanup_finished(Duration::from_secs(3600));
+        assert_eq!(registry.inner.tasks.lock().unwrap().len(), 3);
+        registry.cleanup_finished(Duration::ZERO);
+        let tasks = registry.inner.tasks.lock().unwrap();
+        let retained: Vec<&String> = task_ids.iter().filter(|id| tasks.contains_key(*id)).collect();
+        assert!(
+            retained.is_empty(),
+            "foreground tasks outlived retention: {retained:?}"
+        );
+    }
+
+    /// Path of an open descriptor of this process, read from the kernel.
+    #[cfg(target_os = "linux")]
+    fn descriptor_path(fd: i32) -> Option<PathBuf> {
+        fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+
+    /// Path of an open descriptor of this process, read from the kernel.
+    #[cfg(target_os = "macos")]
+    fn descriptor_path(fd: i32) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated,
+        // into the buffer; a closed or reused descriptor only returns -1.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return None;
+        }
+        let len = buf.iter().position(|byte| *byte == 0)?;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+    }
+
+    /// Counts this process's real open descriptors (files and directories)
+    /// whose path lies under `root`, by walking the kernel's descriptor table.
+    /// Other tests running in parallel use their own temp directories, so
+    /// they never land under `root`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_descriptors_under(root: &Path) -> usize {
+        let fd_dir = if Path::new("/proc/self/fd").is_dir() {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let fds: Vec<i32> = fs::read_dir(fd_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect();
+        fds.into_iter()
+            .filter(|fd| descriptor_path(*fd).is_some_and(|path| path.starts_with(root)))
+            .count()
+    }
+
+    /// Finished tasks close their pre-opened output handles: the descriptors
+    /// the process holds under the session's task directory return to the
+    /// baseline instead of growing by about 8 per task until the process
+    /// exits. Covers tasks that exit on their own, a killed task and a PTY
+    /// task.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn finished_tasks_release_their_io_descriptors() {
+        const QUICK_TASKS: usize = 6;
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = "ses-descriptor-release";
+        let session_dir = fs::canonicalize(storage.path()).unwrap().join(
+            session_tasks_dir(storage.path(), session)
+                .strip_prefix(storage.path())
+                .unwrap(),
+        );
+        let baseline = open_descriptors_under(&session_dir);
+        let spawn = |command: &str| {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    command,
+                    session.to_string(),
+                    project.path().to_path_buf(),
+                    HashMap::new(),
+                    Some(Duration::from_secs(30)),
+                    storage.path().to_path_buf(),
+                    QUICK_TASKS * 2,
+                    false,
+                    false,
+                    Some(project.path().to_path_buf()),
+                )
+                .unwrap()
+        };
+
+        let mut task_ids: Vec<String> = (0..QUICK_TASKS)
+            .map(|_| spawn(QUICK_SUCCESS_COMMAND))
+            .collect();
+        let killed = spawn(LONG_RUNNING_COMMAND);
+        let pty = registry
+            .spawn_pty(
+                SpawnPlan::Unsandboxed,
+                "printf pty-done",
+                session.to_string(),
+                project.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                QUICK_TASKS * 2,
+                false,
+                false,
+                Some(project.path().to_path_buf()),
+                24,
+                80,
+            )
+            .unwrap();
+        let running = open_descriptors_under(&session_dir);
+        assert!(
+            running > baseline,
+            "the counter must see live task handles (baseline {baseline}, running {running})"
+        );
+        let snapshot = registry
+            .kill_with_status(&killed, session, BgTaskStatus::Killed)
+            .unwrap();
+        assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+        task_ids.push(killed);
+        task_ids.push(pty);
+        for task_id in &task_ids {
+            wait_for_terminal_snapshot(
+                &registry,
+                task_id,
+                session,
+                project.path(),
+                storage.path(),
+            );
+        }
+
+        // The watchdog thread may be finishing a transition that a status
+        // poll already reported terminal; give it a moment to close up.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut open = open_descriptors_under(&session_dir);
+        while open > baseline && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            open = open_descriptors_under(&session_dir);
+        }
+        assert_eq!(
+            open,
+            baseline,
+            "{} finished tasks still hold {} descriptors under {}",
+            task_ids.len(),
+            open - baseline,
+            session_dir.display()
+        );
+        assert_eq!(
+            registry.inner.tasks.lock().unwrap().len(),
+            task_ids.len(),
+            "releasing handles must not drop the tasks themselves"
+        );
     }
 
     /// Verify that the live watchdog path (reap_child) gives an exited
