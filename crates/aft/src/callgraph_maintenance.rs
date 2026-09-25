@@ -10,7 +10,7 @@
 //! files go through the ordinary incremental refresh.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::callgraph_store::{CallGraphStore, DiskReconcileReport};
@@ -25,6 +25,36 @@ pub(crate) const RECONCILE_MAX_EXAMINED_FILES: usize = 200_000;
 /// the stored corpus is answered with a rebuild: refreshing most of a corpus
 /// file by file writes more than building it once.
 const RECONCILE_REBUILD_MIN_CHANGED: usize = 1_000;
+
+/// Refreshes the store must apply before it answers queries as current: a
+/// reconcile after lost watcher events, or the importers of a manifest whose
+/// resolution fields changed. Each is represented by a guard that the refresh
+/// batch keeps alive until the worker has settled it.
+#[derive(Debug, Default)]
+pub(crate) struct CallgraphCatchUp {
+    outstanding: AtomicUsize,
+}
+
+impl CallgraphCatchUp {
+    pub(crate) fn begin(self: &Arc<Self>) -> Arc<CallgraphCatchUpGuard> {
+        self.outstanding.fetch_add(1, Ordering::SeqCst);
+        Arc::new(CallgraphCatchUpGuard(Arc::clone(self)))
+    }
+
+    pub(crate) fn outstanding(&self) -> bool {
+        self.outstanding.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// Marks one catch-up outstanding until dropped.
+#[derive(Debug)]
+pub(crate) struct CallgraphCatchUpGuard(Arc<CallgraphCatchUp>);
+
+impl Drop for CallgraphCatchUpGuard {
+    fn drop(&mut self) {
+        self.0.outstanding.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// A pending forced rebuild: a monotonically increasing request counter, the
 /// highest request a published build has satisfied, and the reason given by

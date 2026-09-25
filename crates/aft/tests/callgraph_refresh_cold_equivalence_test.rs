@@ -1183,3 +1183,103 @@ fn tsconfig_paths_change_refreshes_bare_importers() {
         vec!["lib/x.ts".to_string()]
     );
 }
+
+/// Renaming a package moves the imports of both its old and its new name. The
+/// importer of the new name had nothing to resolve to before the rename, so
+/// only its stored specifier (not a stored edge) can find it.
+#[test]
+fn workspace_package_rename_refreshes_importers_of_the_new_name() {
+    let cold = assert_refresh_matches_cold(
+        "workspace package rename",
+        &[
+            (
+                "package.json",
+                "{\"private\":true,\"workspaces\":[\"packages/*\"]}\n",
+            ),
+            ("packages/pkg/package.json", "{\"name\":\"@scope/old\"}\n"),
+            (
+                "packages/pkg/src/index.ts",
+                "export function target(): string { return 'ok'; }\n",
+            ),
+            ("packages/app/package.json", "{\"name\":\"app\"}\n"),
+            (
+                "packages/app/src/main.ts",
+                "import { target } from '@scope/new';\nexport function run(): string { return target(); }\n",
+            ),
+        ],
+        &[&[("packages/pkg/package.json", Some("{\"name\":\"@scope/new\"}\n"))]],
+    );
+    assert_eq!(
+        edges_to(&cold, "target")
+            .into_iter()
+            .map(|target| target.0)
+            .collect::<Vec<_>>(),
+        vec!["packages/pkg/src/index.ts".to_string()]
+    );
+}
+
+const OUTSIDE_WORKSPACE: &[(&str, &str)] = &[
+    ("tools/lib/package.json", "{\"name\":\"@s/lib\"}\n"),
+    (
+        "tools/lib/src/index.ts",
+        "export function helper(): number { return 1; }\n",
+    ),
+    ("packages/app/package.json", "{\"name\":\"app\"}\n"),
+    (
+        "packages/app/src/main.ts",
+        "import { helper } from '@s/lib';\nexport function run(): number { return helper(); }\n",
+    ),
+];
+
+fn with_files<'a>(extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut files = OUTSIDE_WORKSPACE.to_vec();
+    files.extend_from_slice(extra);
+    files
+}
+
+/// Widening the `workspaces` globs makes `tools/lib` a member, so `@s/lib`
+/// starts resolving for an importer that never touched a changed file.
+#[test]
+fn workspaces_glob_change_refreshes_bare_importers() {
+    let cold = assert_refresh_matches_cold(
+        "workspaces glob change",
+        &with_files(&[(
+            "package.json",
+            "{\"private\":true,\"workspaces\":[\"packages/*\"]}\n",
+        )]),
+        &[&[(
+            "package.json",
+            Some("{\"private\":true,\"workspaces\":[\"packages/*\",\"tools/*\"]}\n"),
+        )]],
+    );
+    assert_eq!(
+        edges_to(&cold, "helper")
+            .into_iter()
+            .map(|target| target.0)
+            .collect::<Vec<_>>(),
+        vec!["tools/lib/src/index.ts".to_string()]
+    );
+}
+
+/// The same membership change made through `pnpm-workspace.yaml`.
+#[test]
+fn pnpm_workspace_change_refreshes_bare_importers() {
+    let cold = assert_refresh_matches_cold(
+        "pnpm workspace change",
+        &with_files(&[
+            ("package.json", "{\"private\":true}\n"),
+            ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
+        ]),
+        &[&[(
+            "pnpm-workspace.yaml",
+            Some("packages:\n  - packages/*\n  - tools/*\n"),
+        )]],
+    );
+    assert_eq!(
+        edges_to(&cold, "helper")
+            .into_iter()
+            .map(|target| target.0)
+            .collect::<Vec<_>>(),
+        vec!["tools/lib/src/index.ts".to_string()]
+    );
+}

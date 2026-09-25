@@ -2484,6 +2484,8 @@ pub struct AppContext {
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
     callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
+    /// Refreshes the store must apply before it answers queries again.
+    callgraph_catch_up: Arc<crate::callgraph_maintenance::CallgraphCatchUp>,
     /// Resolution fields of the watched workspace manifests at the last
     /// configure, with the root they were read under.
     workspace_resolution_manifests:
@@ -2990,6 +2992,7 @@ impl AppContext {
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
             callgraph_reconcile: Arc::default(),
+            callgraph_catch_up: Arc::default(),
             workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),
             callgraph_store_rx_generation: AtomicU64::new(0),
@@ -5230,6 +5233,12 @@ impl AppContext {
         self.callgraph_store.as_ref()
     }
 
+    /// Whether a refresh the store must apply before answering as current is
+    /// still outstanding.
+    pub(crate) fn callgraph_catch_up_outstanding(&self) -> bool {
+        self.callgraph_catch_up.outstanding()
+    }
+
     /// Record the workspace manifests' resolution fields read by this
     /// configure and return the manifests whose fields changed since the
     /// previous configure of the same root. A first configure, or one for a
@@ -5357,6 +5366,13 @@ impl AppContext {
         let Some(reason) = self.callgraph_reconcile.begin() else {
             return false;
         };
+        // Until the reconcile's refresh settles, the store may miss edits the
+        // watcher never reported; queries answer `Building` meanwhile. The
+        // guard travels with the refresh batch, or is dropped with the job
+        // when there is nothing to refresh.
+        let catch_up = self.callgraph_catch_up.begin();
+        let enqueue_refresh: Box<dyn FnOnce(Vec<PathBuf>) + Send> =
+            Box::new(move |paths| enqueue_refresh(paths, Some(catch_up)));
         let job = crate::callgraph_maintenance::CallgraphReconcileJob {
             reason,
             callgraph_dir: self.callgraph_store_dir(),
@@ -5390,7 +5406,9 @@ impl AppContext {
         &self,
         project_root: PathBuf,
         generation: u64,
-    ) -> Option<Box<dyn FnOnce(Vec<PathBuf>) + Send>> {
+    ) -> Option<
+        Box<dyn FnOnce(Vec<PathBuf>, Option<crate::callgraph_store::RefreshKeepalive>) + Send>,
+    > {
         if self.configure_generation() != generation {
             return None;
         }
@@ -5408,7 +5426,7 @@ impl AppContext {
             Arc::clone(&self.heavy_root_work_allowed),
         )
         .with_matcher(Arc::clone(&self.gitignore));
-        Some(Box::new(move |paths| {
+        Some(Box::new(move |paths, keepalive| {
             crate::callgraph_store::enqueue_callgraph_store_refresh_fenced_with_state(
                 callgraph_dir,
                 project_root,
@@ -5416,6 +5434,7 @@ impl AppContext {
                 pending,
                 refresh_state,
                 ticket,
+                keepalive,
             );
         }))
     }
@@ -5708,6 +5727,19 @@ impl AppContext {
         // it so the open path below reopens via the pointer. Cheap pointer read.
         self.revalidate_callgraph_store_generation();
         self.start_pending_callgraph_reconcile();
+        // A refresh this store must apply before it is current (a reconcile
+        // after lost events, or importers of a changed manifest) is still
+        // running: wait within the caller's window, then report `Building`
+        // rather than answer from the store as it was before.
+        if self.callgraph_catch_up.outstanding() {
+            let deadline = Instant::now() + wait;
+            while self.callgraph_catch_up.outstanding() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5).min(wait));
+            }
+            if self.callgraph_catch_up.outstanding() {
+                return CallgraphStoreAccess::Building;
+            }
+        }
         let force_token = self.callgraph_force_token_for_build();
         if force_token.is_none() {
             if let Some(store) = {
@@ -6311,6 +6343,31 @@ impl AppContext {
     where
         I: IntoIterator<Item = PathBuf>,
     {
+        self.enqueue_callgraph_store_refresh_with_keepalive(paths, generation, None)
+    }
+
+    /// Enqueue a refresh the store must apply before it answers queries again:
+    /// until the batch settles, `callgraph_store_for_ops` reports `Building`
+    /// instead of serving the store as if it were current. Used when a
+    /// configure finds that module resolution changed.
+    pub(crate) fn enqueue_callgraph_store_refresh_before_queries(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> bool {
+        let generation = self.configure_generation();
+        let guard: crate::callgraph_store::RefreshKeepalive = self.callgraph_catch_up.begin();
+        self.enqueue_callgraph_store_refresh_with_keepalive(paths, generation, Some(guard))
+    }
+
+    fn enqueue_callgraph_store_refresh_with_keepalive<I>(
+        &self,
+        paths: I,
+        generation: u64,
+        keepalive: Option<crate::callgraph_store::RefreshKeepalive>,
+    ) -> bool
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
         let paths = paths.into_iter().collect::<Vec<_>>();
         if paths.is_empty() {
             return true;
@@ -6352,6 +6409,7 @@ impl AppContext {
                 )
                 .with_matcher(Arc::clone(&self.gitignore)),
                 ticket,
+                keepalive,
             )
         })
         .unwrap_or(false)

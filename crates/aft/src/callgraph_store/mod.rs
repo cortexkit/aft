@@ -1499,7 +1499,14 @@ struct RefreshBatch {
     pending_sinks: Vec<PendingCallGraphStorePaths>,
     refresh_states: Vec<CallgraphRefreshState>,
     ticket: Option<CallgraphRefreshTicket>,
+    /// Held until the worker is done with this batch (applied, failed or
+    /// deferred), then dropped with it. Callers use it to learn when a refresh
+    /// they depend on has settled.
+    keepalive: Vec<RefreshKeepalive>,
 }
+
+/// An opaque value a refresh batch keeps alive until it settles.
+pub(crate) type RefreshKeepalive = Arc<dyn std::any::Any + Send + Sync>;
 
 impl RefreshBatch {
     fn path_is_ignored(&self, path: &Path) -> bool {
@@ -1569,6 +1576,7 @@ impl RefreshBatch {
                 Arc::clone(sink),
                 self.refresh_states.clone(),
                 self.ticket.clone(),
+                None,
             );
         }
     }
@@ -1696,6 +1704,7 @@ impl RefreshWorker {
         pending_sink: PendingCallGraphStorePaths,
         refresh_states: Vec<CallgraphRefreshState>,
         ticket: Option<CallgraphRefreshTicket>,
+        keepalive: Option<RefreshKeepalive>,
     ) -> bool {
         let mut queue = self
             .shared
@@ -1708,6 +1717,7 @@ impl RefreshWorker {
         }
         if let Some(batch) = queue.queued.get_mut(&root) {
             batch.merge(paths, pending_sink, refresh_states, ticket);
+            batch.keepalive.extend(keepalive);
         } else {
             queue.order.push_back(root.clone());
             queue.queued.insert(
@@ -1718,6 +1728,7 @@ impl RefreshWorker {
                     pending_sinks: vec![pending_sink],
                     refresh_states,
                     ticket,
+                    keepalive: keepalive.into_iter().collect(),
                 },
             );
         }
@@ -1785,6 +1796,7 @@ pub fn enqueue_callgraph_store_refresh(
         pending_sink,
         Vec::new(),
         None,
+        None,
     )
 }
 
@@ -1803,6 +1815,7 @@ pub(crate) fn enqueue_callgraph_store_refresh_fenced(
         pending_sink,
         Vec::new(),
         Some(ticket),
+        None,
     )
 }
 
@@ -1813,6 +1826,7 @@ pub(crate) fn enqueue_callgraph_store_refresh_fenced_with_state(
     pending_sink: PendingCallGraphStorePaths,
     refresh_state: CallgraphRefreshState,
     ticket: CallgraphRefreshTicket,
+    keepalive: Option<RefreshKeepalive>,
 ) -> bool {
     enqueue_callgraph_store_refresh_inner(
         callgraph_dir,
@@ -1821,6 +1835,7 @@ pub(crate) fn enqueue_callgraph_store_refresh_fenced_with_state(
         pending_sink,
         vec![refresh_state],
         Some(ticket),
+        keepalive,
     )
 }
 
@@ -1831,6 +1846,7 @@ fn enqueue_callgraph_store_refresh_inner(
     pending_sink: PendingCallGraphStorePaths,
     refresh_states: Vec<CallgraphRefreshState>,
     ticket: Option<CallgraphRefreshTicket>,
+    keepalive: Option<RefreshKeepalive>,
 ) -> bool {
     if paths.is_empty() {
         return true;
@@ -1851,6 +1867,7 @@ fn enqueue_callgraph_store_refresh_inner(
         pending_sink,
         refresh_states,
         ticket,
+        keepalive,
     )
 }
 
@@ -18319,6 +18336,7 @@ mod refresh_worker_tests {
             Arc::clone(&pending),
             refresh_state,
             ticket,
+            None,
         );
         assert!(flush_callgraph_store_refreshes_with_budget(
             Duration::from_secs(5)
@@ -18376,6 +18394,7 @@ mod refresh_worker_tests {
             Arc::clone(&pending),
             refresh_state,
             ticket,
+            None,
         );
         held_rx
             .recv_timeout(Duration::from_secs(12))

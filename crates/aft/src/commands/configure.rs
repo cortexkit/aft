@@ -1555,7 +1555,7 @@ fn refresh_changed_workspace_manifests(
         "workspace manifest resolution fields changed in {} file(s); refreshing their importers in the callgraph store",
         changed.len()
     );
-    ctx.enqueue_callgraph_store_refresh(changed);
+    ctx.enqueue_callgraph_store_refresh_before_queries(changed);
 }
 
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
@@ -12032,10 +12032,25 @@ mod tests {
 
         assert!(handle_configure_for_test(&request, &ctx).success);
         assert!(ctx.callgraph_writer(), "a main checkout owns its callgraph");
+        ctx.ensure_callgraph_store()
+            .expect("build the callgraph store")
+            .expect("a writer root builds its store on demand");
+        assert!(
+            matches!(
+                ctx.callgraph_store_for_ops(),
+                crate::context::CallgraphStoreAccess::Ready(_)
+            ),
+            "the published store answers before the manifest changes"
+        );
 
         write_workspace_manifest(
             root.path(),
             r#"{"name":"@ws/pkg-a","exports":{".":"./b.ts"}}"#,
+        );
+        // Hold the refresh worker once it has taken the batch, so the query
+        // below runs while the importers are not yet re-resolved.
+        let (held, release) = crate::callgraph_store::install_callgraph_refresh_worker_test_gate(
+            canonical_root.clone(),
         );
         assert!(handle_configure_for_test(&request, &ctx).success);
         assert_eq!(
@@ -12043,17 +12058,36 @@ mod tests {
             None,
             "an exports change must refresh importers, not force a rebuild"
         );
+        held.recv_timeout(Duration::from_secs(10))
+            .expect("the changed manifest never reached the callgraph refresh");
         let manifest = canonical_root.join("packages/pkg-a/package.json");
+        assert!(
+            crate::callgraph_store::callgraph_refresh_worker_test_paths(&canonical_root)
+                .contains(&manifest)
+        );
+        assert!(
+            matches!(
+                ctx.callgraph_store_for_ops(),
+                crate::context::CallgraphStoreAccess::Building
+            ),
+            "a query during the refresh must not be answered from the pre-refresh store"
+        );
+        release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !crate::callgraph_store::callgraph_refresh_worker_test_paths(&canonical_root)
-            .contains(&manifest)
-        {
+        while ctx.callgraph_catch_up_outstanding() {
             assert!(
                 Instant::now() < deadline,
-                "the changed manifest never reached the callgraph refresh"
+                "the settled refresh must release queries"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            matches!(
+                ctx.callgraph_store_for_ops(),
+                crate::context::CallgraphStoreAccess::Ready(_)
+            ),
+            "once the refresh settles the store answers again"
+        );
         crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(&canonical_root);
     }
 
