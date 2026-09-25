@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -164,6 +164,12 @@ pub fn claim_or_open_read_only(
                 ) {
                     Ok(claim) => return Ok(claim),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    // The orphaned-manifest sweep removes empty key
+                    // directories; recreate it and try again.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        fs::create_dir_all(&manifest_dir)?;
+                        continue;
+                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -393,11 +399,67 @@ impl ArtifactOwnerLease {
         if now.saturating_sub(self.last_heartbeat_ms) < heartbeat_interval_ms() {
             return Ok(false);
         }
+        let previous = self.manifest.clone();
         self.manifest.heartbeat_at_ms = now;
-        atomic_write_manifest(&self.path, &self.manifest)?;
+        if let Err(error) = heartbeat_manifest(&self.path, &previous, &self.manifest) {
+            self.manifest = previous;
+            return Err(error);
+        }
         self.last_heartbeat_ms = now;
         Ok(true)
     }
+}
+
+/// Write a heartbeat into the owner manifest.
+///
+/// Durability: the heartbeat only has to be visible to other processes, so it
+/// never fsyncs the file or its directory. After a crash the manifest simply
+/// carries an older heartbeat and looks stale sooner, which the ownership
+/// rules already handle. Claiming or reclaiming ownership still goes through
+/// the fsyncing `create_owner_manifest` / `atomic_write_manifest`.
+///
+/// When the file still holds exactly the manifest this lease last wrote, the
+/// new bytes have the same length (only timestamp digits change), so they are
+/// written in place: no new inode per beat and no moment where the file is
+/// missing or short. Anything else (the file is gone, was rewritten by another
+/// claim, or the length would change) falls back to the previous behaviour of
+/// replacing the file through a temp-file rename, minus the fsyncs.
+fn heartbeat_manifest(
+    path: &Path,
+    previous: &ArtifactOwnerManifest,
+    next: &ArtifactOwnerManifest,
+) -> io::Result<()> {
+    let next_bytes = manifest_bytes(next)?;
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(mut file) => {
+            let mut current = Vec::new();
+            file.read_to_end(&mut current)?;
+            let unchanged = serde_json::from_slice::<ArtifactOwnerManifest>(&current)
+                .is_ok_and(|on_disk| on_disk == *previous);
+            if unchanged && current.len() == next_bytes.len() {
+                file.seek(SeekFrom::Start(0))?;
+                return write_manifest_bytes(&mut file, &next_bytes);
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    replace_manifest_unsynced(path, &next_bytes)
+}
+
+fn replace_manifest_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = temp_path(path);
+    let write_result = (|| -> io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
+        write_manifest_bytes(&mut file, bytes)?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    write_result
 }
 
 /// Human-facing note for a read-only borrow of another checkout's index family.
@@ -415,8 +477,9 @@ fn create_owner_manifest(
 ) -> io::Result<ArtifactOwnerClaim> {
     let manifest = new_manifest(project_scope_key, checkout_path, git_common_dir);
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
     write_manifest_to_file(&mut file, &manifest)?;
-    file.sync_all()?;
+    fs_lock::sync_lease_file(&file)?;
     sync_parent(path);
     Ok(owner_claim(path, project_key, manifest))
 }
@@ -506,8 +569,11 @@ enum ReadManifestError {
     Malformed,
 }
 
+/// Parse an owner manifest. An empty or partial file (for example one left by
+/// a crash after an unsynced heartbeat rename) is `Malformed`: the claim path
+/// removes it and claims afresh, it never reads as a live owner.
 fn read_manifest(path: &Path) -> Result<ArtifactOwnerManifest, ReadManifestError> {
-    let bytes = fs::read(path).map_err(|error| {
+    let bytes = fs_lock::read_lease_settled(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             ReadManifestError::NotFound
         } else {
@@ -521,8 +587,9 @@ fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::R
     let tmp = temp_path(path);
     let write_result = (|| -> io::Result<()> {
         let mut file = File::create(&tmp)?;
+        fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
         write_manifest_to_file(&mut file, manifest)?;
-        file.sync_all()?;
+        fs_lock::sync_lease_file(&file)?;
         fs::rename(&tmp, path)?;
         sync_parent(path);
         Ok(())
@@ -533,9 +600,20 @@ fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::R
     write_result
 }
 
+fn manifest_bytes(manifest: &ArtifactOwnerManifest) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 fn write_manifest_to_file(file: &mut File, manifest: &ArtifactOwnerManifest) -> io::Result<()> {
-    serde_json::to_writer(&mut *file, manifest).map_err(io::Error::other)?;
-    file.write_all(b"\n")
+    write_manifest_bytes(file, &manifest_bytes(manifest)?)
+}
+
+fn write_manifest_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    fs_lock::io_ledger::record(|ledger| ledger.bytes_written += bytes.len() as u64);
+    Ok(())
 }
 
 fn temp_path(path: &Path) -> PathBuf {
@@ -553,17 +631,87 @@ fn resolve_manifest_dir(
 ) -> PathBuf {
     // Ownership manifests must use the same root as indexes and leases. Resolve
     // the environment override here instead of maintaining a cache-only branch.
-    crate::bash_background::storage_dir(storage_dir)
-        .join("artifact-owners")
-        .join(project_key)
+    owner_manifests_root(&crate::bash_background::storage_dir(storage_dir)).join(project_key)
+}
+
+fn owner_manifests_root(storage_root: &Path) -> PathBuf {
+    storage_root.join("artifact-owners")
+}
+
+/// Directory entries under `artifact-owners/` examined per sweep. The limit is
+/// applied to the directory iterator itself, so a storage root with thousands
+/// of project keys costs at most this many entries (and manifest reads) per
+/// pass; entries removed by one pass make room for the next.
+const OWNER_REAP_SCAN_LIMIT: usize = 512;
+
+/// A manifest must also have gone this long without a heartbeat before it is
+/// reaped. A live owner rewrites the heartbeat every few seconds, so this only
+/// keeps a manifest whose checkout was deleted moments ago (and whose owner may
+/// still be shutting down) out of the sweep.
+const OWNER_REAP_MIN_HEARTBEAT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Remove owner manifests whose checkout no longer exists.
+///
+/// Every project key gets an `artifact-owners/<key>/owner.json`, and nothing
+/// else removes them, so without this sweep the directory grows by one entry
+/// for every checkout ever opened. Returns the number of manifests removed.
+pub(crate) fn sweep_orphaned_owner_manifests(storage_root: &Path) -> usize {
+    sweep_orphaned_owner_manifests_with_limit(storage_root, OWNER_REAP_SCAN_LIMIT, now_ms())
+}
+
+fn sweep_orphaned_owner_manifests_with_limit(
+    storage_root: &Path,
+    scan_limit: usize,
+    now: u64,
+) -> usize {
+    let root = owner_manifests_root(storage_root);
+    let Ok(entries) = fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.take(scan_limit) {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let dir = entry.path();
+        let path = dir.join("owner.json");
+        match read_manifest(&path) {
+            Ok(manifest) if owner_manifest_is_orphaned(&manifest, now) => {
+                // Re-checks the owner identity right before unlinking, so a
+                // claim that replaced the manifest meanwhile is left alone.
+                if matches!(reclaim_manifest_if_unchanged(&path, &manifest), Ok(true)) {
+                    removed += 1;
+                    // Only succeeds once the directory is empty; a claim that
+                    // races this recreates the directory before writing.
+                    let _ = fs::remove_dir(&dir);
+                }
+            }
+            _ => {}
+        }
+    }
+    if removed > 0 {
+        crate::slog_info!(
+            "artifact owner cleanup: removed {} manifests for checkouts that no longer exist",
+            removed
+        );
+    }
+    removed
+}
+
+/// A manifest is orphaned when its checkout is definitely gone (a failed
+/// existence check, such as a permission error, does not count) and its
+/// heartbeat is older than `OWNER_REAP_MIN_HEARTBEAT_AGE_MS`.
+fn owner_manifest_is_orphaned(manifest: &ArtifactOwnerManifest, now: u64) -> bool {
+    !manifest.checkout_path.is_empty()
+        && matches!(Path::new(&manifest.checkout_path).try_exists(), Ok(false))
+        && now.saturating_sub(manifest.heartbeat_at_ms) > OWNER_REAP_MIN_HEARTBEAT_AGE_MS
 }
 
 fn sync_parent(path: &Path) {
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
+    fs_lock::sync_parent(path);
 }
 
 fn heartbeat_interval_ms() -> u64 {
@@ -865,6 +1013,224 @@ mod tests {
             );
             baseline = current;
         }
+    }
+
+    fn claim_owner(storage_dir: &Path, root: &Path, key: &str) -> ArtifactOwnerLease {
+        fs::create_dir_all(root).unwrap();
+        claim_or_open_read_only(Some(storage_dir), root, key, key, false, None)
+            .unwrap()
+            .lease
+            .expect("owner lease")
+    }
+
+    #[cfg(unix)]
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).unwrap().ino()
+    }
+
+    /// Sixty seconds of owner-manifest heartbeats on several leases must not
+    /// fsync anything or create a new file per beat. Totals are printed so the
+    /// cost can be compared across changes.
+    #[test]
+    fn heartbeat_ledger_for_sixty_seconds_has_no_fsync_and_no_new_inodes() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        const LEASES: usize = 8;
+        let beats = (60_000 / fs_lock::HEARTBEAT_INTERVAL_MS) as usize;
+        let mut leases = (0..LEASES)
+            .map(|index| {
+                let key = format!("key-{index}");
+                claim_owner(temp.path(), &temp.path().join(&key), &key)
+            })
+            .collect::<Vec<_>>();
+        #[cfg(unix)]
+        let inodes_before = leases.iter().map(|l| inode(&l.path)).collect::<Vec<_>>();
+        let file_bytes: u64 = leases
+            .iter()
+            .map(|lease| fs::metadata(&lease.path).unwrap().len())
+            .sum();
+
+        let _ = fs_lock::io_ledger::take();
+        for _ in 0..beats {
+            for lease in &mut leases {
+                lease.last_heartbeat_ms = 0;
+                assert!(lease.try_heartbeat_if_due().unwrap());
+            }
+        }
+        let ledger = fs_lock::io_ledger::take();
+        eprintln!(
+            "artifact owner heartbeat ledger: leases={LEASES} beats_per_lease={beats} {ledger:?}"
+        );
+
+        assert_eq!(
+            ledger.file_syncs, 0,
+            "heartbeats must not fsync the manifest"
+        );
+        assert_eq!(
+            ledger.dir_syncs, 0,
+            "heartbeats must not fsync the directory"
+        );
+        assert_eq!(ledger.new_files, 0, "heartbeats must rewrite in place");
+        assert_eq!(ledger.bytes_written, file_bytes * beats as u64);
+        #[cfg(unix)]
+        assert_eq!(
+            leases.iter().map(|l| inode(&l.path)).collect::<Vec<_>>(),
+            inodes_before
+        );
+        for lease in &leases {
+            assert_eq!(read_manifest(&lease.path).unwrap(), lease.manifest);
+        }
+    }
+
+    /// Claiming, re-claiming and reclaiming an owner manifest keep full
+    /// durability.
+    #[test]
+    fn owner_claim_and_reclaim_still_fsync() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+
+        let _ = fs_lock::io_ledger::take();
+        let lease = claim_owner(temp.path(), &root, "key");
+        let created = fs_lock::io_ledger::take();
+        assert_eq!(
+            (created.file_syncs, created.dir_syncs, created.new_files),
+            (1, 1, 1),
+            "first claim: {created:?}"
+        );
+
+        let _ = claim_owner(temp.path(), &root, "key");
+        let reclaimed = fs_lock::io_ledger::take();
+        assert_eq!(
+            (
+                reclaimed.file_syncs,
+                reclaimed.dir_syncs,
+                reclaimed.new_files
+            ),
+            (1, 1, 1),
+            "same-checkout re-claim: {reclaimed:?}"
+        );
+
+        let current = read_manifest(&lease.path).unwrap();
+        assert!(reclaim_manifest_if_unchanged(&lease.path, &current).unwrap());
+        let removed = fs_lock::io_ledger::take();
+        assert_eq!(removed.dir_syncs, 1, "dead-owner removal: {removed:?}");
+    }
+
+    /// A crash after an unsynced heartbeat rename can leave a zero-length
+    /// manifest. The claim path must treat it as stale and claim ownership.
+    #[test]
+    fn zero_length_manifest_is_treated_as_stale() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let path = resolve_manifest_dir(Some(temp.path()), &root, "key").join("owner.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"").unwrap();
+        assert!(matches!(
+            read_manifest(&path),
+            Err(ReadManifestError::Malformed)
+        ));
+
+        let claim =
+            claim_or_open_read_only(Some(temp.path()), &root, "key", "scope", false, None).unwrap();
+        assert_eq!(claim.status.mode, ArtifactOwnerMode::Owner);
+        assert_eq!(read_manifest(&path).unwrap().project_scope_key, "scope");
+    }
+
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    fn write_owner_manifest_for_reap(
+        storage: &Path,
+        key: &str,
+        checkout: &Path,
+        heartbeat_at_ms: u64,
+    ) -> PathBuf {
+        let path = owner_manifests_root(storage).join(key).join("owner.json");
+        write_synthetic_manifest_at_path_for_test(
+            &path,
+            checkout,
+            key,
+            std::process::id(),
+            heartbeat_at_ms,
+            None,
+        );
+        path
+    }
+
+    #[test]
+    fn owner_reap_removes_only_manifests_whose_checkout_is_gone() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let live_checkout = temp.path().join("live");
+        fs::create_dir_all(&live_checkout).unwrap();
+        let gone_checkout = temp.path().join("gone");
+        let now = now_ms();
+        let old = now - 2 * DAY_MS;
+
+        let gone = write_owner_manifest_for_reap(&storage, "gone", &gone_checkout, old);
+        let live = write_owner_manifest_for_reap(&storage, "live", &live_checkout, old);
+        let recent = write_owner_manifest_for_reap(&storage, "recent", &gone_checkout, now - 1_000);
+        let malformed = owner_manifests_root(&storage)
+            .join("malformed")
+            .join("owner.json");
+        fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+        fs::write(&malformed, b"").unwrap();
+
+        let removed = sweep_orphaned_owner_manifests_with_limit(&storage, 100, now);
+
+        assert_eq!(removed, 1);
+        assert!(
+            !gone.exists(),
+            "manifest for a deleted checkout must be reaped"
+        );
+        assert!(
+            !gone.parent().unwrap().exists(),
+            "the emptied key directory must be removed"
+        );
+        assert!(live.exists(), "manifest for an existing checkout must stay");
+        assert!(recent.exists(), "recently heartbeated manifest must stay");
+        assert!(
+            malformed.exists(),
+            "unparseable manifest must be left alone"
+        );
+    }
+
+    #[test]
+    fn owner_reap_is_bounded_by_the_scan_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let gone_checkout = temp.path().join("gone");
+        let now = now_ms();
+        for index in 0..5 {
+            write_owner_manifest_for_reap(
+                &storage,
+                &format!("gone-{index}"),
+                &gone_checkout,
+                now - 2 * DAY_MS,
+            );
+        }
+
+        assert_eq!(
+            sweep_orphaned_owner_manifests_with_limit(&storage, 2, now),
+            2
+        );
+        assert_eq!(
+            sweep_orphaned_owner_manifests_with_limit(&storage, 2, now),
+            2
+        );
+        assert_eq!(
+            sweep_orphaned_owner_manifests_with_limit(&storage, 2, now),
+            1
+        );
+        assert_eq!(
+            fs::read_dir(owner_manifests_root(&storage))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -237,7 +237,7 @@ impl Drop for LockGuard {
         //   1. Drop signals shutdown, ack times out under CI load.
         //   2. Drop calls `remove_lock_if_owned` → file removed.
         //   3. Another caller acquires the lock → writes its metadata.
-        //   4. Our heartbeat (still alive, mid-`atomic_write_lock_metadata`
+        //   4. Our heartbeat (still alive, mid-rewrite
         //      from before shutdown was checked) overwrites the new
         //      owner's file with our stale metadata. heartbeat_once's
         //      ownership check happens BEFORE the write, so it can race
@@ -674,22 +674,49 @@ fn log_transient_heartbeat_failure(
     }
 }
 
+/// Refresh `heartbeat_at_ms` in a lease this guard owns.
+///
+/// Durability: a heartbeat only has to be visible to other processes, so this
+/// path never fsyncs the file or its directory. If the machine crashes before
+/// the page cache is written back, the lease on disk just carries an older
+/// heartbeat and looks stale sooner, which the stale-lease rules already
+/// handle. Creating and reclaiming a lease still fsync (see
+/// `create_lock_file_atomically` and the reclaim token), because those decide
+/// who owns the lock.
+///
+/// The rewrite happens in place on the handle whose contents were just checked
+/// for ownership: no new inode per beat, and no window in which the path is
+/// missing (which other code reads as `LockGone`). Serialization is
+/// deterministic, so only the digits of `heartbeat_at_ms` differ and the file
+/// keeps its length; overwriting the same length from offset zero never leaves
+/// a truncated or zero-length file. If the length would change (the timestamp
+/// gained a digit), fall back to an unsynced temp-file rename, which still
+/// replaces the path atomically.
 fn heartbeat_once(path: &Path, owner: &LockMetadata) -> Result<(), HeartbeatError> {
-    let mut metadata = match read_lock_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(ReadLockError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(HeartbeatError::LockGone);
         }
-        Err(ReadLockError::Io(error)) => return Err(HeartbeatError::Io(error)),
-        Err(ReadLockError::Malformed(error)) => return Err(HeartbeatError::Malformed(error)),
+        Err(error) => return Err(HeartbeatError::Io(error)),
     };
+    let mut current = Vec::new();
+    file.read_to_end(&mut current).map_err(HeartbeatError::Io)?;
+    let mut metadata: LockMetadata =
+        serde_json::from_slice(&current).map_err(HeartbeatError::Malformed)?;
 
     if !lock_identity_matches(&metadata, owner) {
         return Err(HeartbeatError::NotOwner);
     }
 
     metadata.heartbeat_at_ms = now_ms();
-    atomic_write_lock_metadata(path, &metadata).map_err(HeartbeatError::Io)
+    let next = lock_metadata_bytes(&metadata).map_err(HeartbeatError::Io)?;
+    if next.len() == current.len() {
+        file.seek(SeekFrom::Start(0)).map_err(HeartbeatError::Io)?;
+        return write_lock_bytes(&mut file, &next).map_err(HeartbeatError::Io);
+    }
+    drop(file);
+    replace_lock_bytes_unsynced(path, &next).map_err(HeartbeatError::Io)
 }
 
 #[derive(Debug)]
@@ -706,8 +733,31 @@ enum ReadLockError {
     Malformed(serde_json::Error),
 }
 
+/// Read a lease file, re-reading until two consecutive reads agree.
+///
+/// Heartbeats overwrite lease files in place, and a read that overlaps such a
+/// write is not guaranteed to be atomic on every filesystem: it could mix old
+/// and new digits of the timestamp. The contents are otherwise identical, so a
+/// mixed read still parses, but the timestamp could look older than either
+/// write. Two identical reads in a row rule that out. The retry is bounded;
+/// after it the last read is returned as-is.
+pub(crate) fn read_lease_settled(path: &Path) -> io::Result<Vec<u8>> {
+    let mut previous = fs::read(path)?;
+    for _ in 0..3 {
+        let next = fs::read(path)?;
+        if next == previous {
+            return Ok(next);
+        }
+        previous = next;
+    }
+    Ok(previous)
+}
+
+/// Parse a lease. An empty or partial file (for example one left by a crash
+/// after an unsynced rename) is `Malformed`, which acquirers treat as a stale
+/// lease to remove, never as a live owner.
 fn read_lock_metadata(path: &Path) -> Result<LockMetadata, ReadLockError> {
-    let bytes = fs::read(path).map_err(ReadLockError::Io)?;
+    let bytes = read_lease_settled(path).map_err(ReadLockError::Io)?;
     serde_json::from_slice(&bytes).map_err(ReadLockError::Malformed)
 }
 
@@ -715,22 +765,37 @@ fn read_lock_metadata(path: &Path) -> Result<LockMetadata, ReadLockError> {
 fn open_new_lock_file(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    io_ledger::record(|ledger| ledger.new_files += 1);
+    Ok(file)
 }
 
 #[cfg(not(unix))]
 fn open_new_lock_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    io_ledger::record(|ledger| ledger.new_files += 1);
+    Ok(file)
+}
+
+fn lock_metadata_bytes(metadata: &LockMetadata) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(metadata).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_lock_bytes(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes)?;
+    io_ledger::record(|ledger| ledger.bytes_written += bytes.len() as u64);
+    Ok(())
 }
 
 fn write_lock_metadata_to_file(file: &mut File, metadata: &LockMetadata) -> io::Result<()> {
-    serde_json::to_writer(&mut *file, metadata).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()
+    write_lock_bytes(file, &lock_metadata_bytes(metadata)?)?;
+    sync_lease_file(file)
 }
 
 fn create_lock_file_atomically(path: &Path, metadata: &LockMetadata) -> io::Result<()> {
@@ -749,16 +814,17 @@ fn create_lock_file_atomically(path: &Path, metadata: &LockMetadata) -> io::Resu
     result
 }
 
-fn atomic_write_lock_metadata(path: &Path, metadata: &LockMetadata) -> io::Result<()> {
+/// Replace a lease's contents through a temp file and an atomic rename,
+/// without fsync. Only the heartbeat uses this, and only when the in-place
+/// rewrite cannot keep the file length; see `heartbeat_once` for why a
+/// heartbeat needs no durability.
+fn replace_lock_bytes_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp_path = temp_path_for_lock(path);
     let write_result = (|| {
         let mut file = open_new_lock_file(&tmp_path)?;
-        write_lock_metadata_to_file(&mut file, metadata)?;
+        write_lock_bytes(&mut file, bytes)?;
         drop(file);
-
-        rename_over(&tmp_path, path)?;
-        sync_parent(path);
-        Ok(())
+        rename_over(&tmp_path, path)
     })();
 
     if write_result.is_err() {
@@ -1316,8 +1382,55 @@ fn sleep_until_retry(deadline: Option<Instant>, poll_interval_ms: u64) -> Result
 pub(crate) fn sync_parent(path: &Path) {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
+            io_ledger::record(|ledger| ledger.dir_syncs += 1);
             let _ = dir.sync_all();
         }
+    }
+}
+
+/// `File::sync_all` for lease files, counted by the test I/O ledger.
+pub(crate) fn sync_lease_file(file: &File) -> io::Result<()> {
+    io_ledger::record(|ledger| ledger.file_syncs += 1);
+    file.sync_all()
+}
+
+/// Per-thread counters of the durable I/O that lease code performs: file
+/// fsyncs, directory fsyncs, newly created files (new inodes) and payload
+/// bytes. Tests read them to prove which paths sync and how much a heartbeat
+/// writes; outside tests every call compiles to nothing. The counters are
+/// thread-local so tests running in parallel do not see each other's I/O.
+pub(crate) mod io_ledger {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) struct IoLedger {
+        pub(crate) file_syncs: u64,
+        pub(crate) dir_syncs: u64,
+        pub(crate) new_files: u64,
+        pub(crate) bytes_written: u64,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LEDGER: std::cell::Cell<IoLedger> = std::cell::Cell::new(IoLedger::default());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record(update: impl FnOnce(&mut IoLedger)) {
+        LEDGER.with(|cell| {
+            let mut ledger = cell.get();
+            update(&mut ledger);
+            cell.set(ledger);
+        });
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) fn record(_update: impl FnOnce(&mut IoLedger)) {}
+
+    /// Return this thread's counters and reset them to zero.
+    #[cfg(test)]
+    pub(crate) fn take() -> IoLedger {
+        LEDGER.with(|cell| cell.replace(IoLedger::default()))
     }
 }
 
@@ -1878,6 +1991,165 @@ mod tests {
         );
     }
 
+    /// Number of lease files and beats per lease that model sixty seconds of
+    /// heartbeats at the production interval.
+    const LEDGER_LEASES: usize = 8;
+    const LEDGER_BEATS_PER_LEASE: usize = (60_000 / HEARTBEAT_INTERVAL_MS) as usize;
+
+    fn create_owned_lock(path: &Path) -> LockMetadata {
+        let metadata = current_process_metadata();
+        create_lock_file_atomically(path, &metadata).expect("create lock");
+        metadata
+    }
+
+    #[cfg(unix)]
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).expect("lock metadata").ino()
+    }
+
+    /// Sixty seconds of heartbeats on several leases must not fsync anything
+    /// and must not create a new file per beat. The ledger totals are printed
+    /// so the cost can be compared across changes.
+    #[test]
+    fn heartbeat_ledger_for_sixty_seconds_has_no_fsync_and_no_new_inodes() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let leases = (0..LEDGER_LEASES)
+            .map(|index| {
+                let path = dir.path().join(format!("writer-{index}.lease"));
+                let owner = create_owned_lock(&path);
+                (path, owner)
+            })
+            .collect::<Vec<_>>();
+        #[cfg(unix)]
+        let inodes_before = leases
+            .iter()
+            .map(|(path, _)| inode(path))
+            .collect::<Vec<_>>();
+        let file_bytes: u64 = leases
+            .iter()
+            .map(|(path, _)| fs::metadata(path).expect("lock size").len())
+            .sum();
+
+        let _ = io_ledger::take();
+        for _ in 0..LEDGER_BEATS_PER_LEASE {
+            for (path, owner) in &leases {
+                heartbeat_once(path, owner).expect("heartbeat");
+            }
+        }
+        let ledger = io_ledger::take();
+        eprintln!(
+            "fs_lock heartbeat ledger: leases={LEDGER_LEASES} beats_per_lease={LEDGER_BEATS_PER_LEASE} {ledger:?}"
+        );
+
+        assert_eq!(ledger.file_syncs, 0, "heartbeats must not fsync the lease");
+        assert_eq!(
+            ledger.dir_syncs, 0,
+            "heartbeats must not fsync the directory"
+        );
+        assert_eq!(ledger.new_files, 0, "heartbeats must rewrite in place");
+        assert_eq!(
+            ledger.bytes_written,
+            file_bytes * LEDGER_BEATS_PER_LEASE as u64,
+            "each beat rewrites exactly one lease's bytes"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            leases
+                .iter()
+                .map(|(path, _)| inode(path))
+                .collect::<Vec<_>>(),
+            inodes_before,
+            "heartbeats must keep the lease inode"
+        );
+        for (path, owner) in &leases {
+            let current = read_lock_metadata(path).expect("read lease");
+            assert!(lock_identity_matches(&current, owner));
+            assert!(current.heartbeat_at_ms >= owner.heartbeat_at_ms);
+        }
+    }
+
+    /// Creating a lease and reclaiming a dead owner's lease keep full
+    /// durability: the lease file and its directory entry are fsynced before
+    /// the new owner proceeds.
+    #[test]
+    fn lease_create_and_reclaim_still_fsync() {
+        let (_dir, path) = test_lock_path();
+        let _ = io_ledger::take();
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(2)), test_config())
+            .expect("create lease");
+        let created = io_ledger::take();
+        drop(guard);
+        assert_eq!(
+            (created.file_syncs, created.dir_syncs, created.new_files),
+            (1, 1, 1),
+            "lease creation must fsync the file and the directory: {created:?}"
+        );
+
+        let dead = synthetic_metadata(999_999_999, current_hostname(), now_ms());
+        write_synthetic_lock(&path, &dead);
+        let _ = io_ledger::take();
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(2)), test_config())
+            .expect("reclaim dead lease");
+        let reclaimed = io_ledger::take();
+        drop(guard);
+        // The first create attempt writes and fsyncs its temp file before the
+        // hard link finds the dead lease (file). Then the reclaim token create
+        // (file + directory), token release (directory), and the new lease
+        // (file + directory).
+        assert_eq!(
+            (
+                reclaimed.file_syncs,
+                reclaimed.dir_syncs,
+                reclaimed.new_files
+            ),
+            (3, 3, 3),
+            "lease reclaim must keep its fsyncs: {reclaimed:?}"
+        );
+    }
+
+    /// A crash after an unsynced rename can leave a zero-length lease. Readers
+    /// must treat it as stale: acquisition removes it and takes the lock, the
+    /// owner's heartbeat reports a transient malformed read, and nothing panics.
+    #[test]
+    fn zero_length_lease_is_treated_as_stale() {
+        let (_dir, path) = test_lock_path();
+        fs::write(&path, b"").expect("write empty lease");
+        let owner = current_process_metadata();
+        assert!(matches!(
+            heartbeat_once(&path, &owner),
+            Err(HeartbeatError::Malformed(_))
+        ));
+        assert!(!heartbeat_error_is_terminal(&HeartbeatError::Malformed(
+            serde_json::from_slice::<LockMetadata>(b"").unwrap_err()
+        )));
+
+        let guard = acquire_with_config(&path, Some(Duration::from_secs(2)), test_config())
+            .expect("empty lease must be reclaimed");
+        assert!(guard.verify_writer_epoch().expect("verify new owner"));
+    }
+
+    /// When the new timestamp would change the file length, the heartbeat
+    /// falls back to an atomic rename, still without fsync.
+    #[test]
+    fn heartbeat_length_change_falls_back_to_unsynced_rename() {
+        let (_dir, path) = test_lock_path();
+        let mut owner = current_process_metadata();
+        owner.heartbeat_at_ms = 7;
+        create_lock_file_atomically(&path, &owner).expect("create lock");
+
+        let _ = io_ledger::take();
+        heartbeat_once(&path, &owner).expect("heartbeat");
+        let ledger = io_ledger::take();
+        assert_eq!((ledger.file_syncs, ledger.dir_syncs), (0, 0), "{ledger:?}");
+        assert_eq!(ledger.new_files, 1, "{ledger:?}");
+        let current = read_lock_metadata(&path).expect("read lease");
+        assert!(lock_identity_matches(&current, &owner));
+        assert!(current.heartbeat_at_ms > 7);
+        let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "temp file must not be left behind");
+    }
+
     #[test]
     fn heartbeat_updates_lockfile_timestamp() {
         let (_dir, path) = test_lock_path();
@@ -2377,7 +2649,11 @@ mod tests {
         let sentinel = now_ms().saturating_sub(1_000_000);
         let mut restored = owner.clone();
         restored.heartbeat_at_ms = sentinel;
-        atomic_write_lock_metadata(&path, &restored).expect("atomically restore lock metadata");
+        replace_lock_bytes_unsynced(
+            &path,
+            &lock_metadata_bytes(&restored).expect("serialize restored metadata"),
+        )
+        .expect("atomically restore lock metadata");
 
         // If the heartbeat thread is still alive (the fix), it will overwrite
         // heartbeat_at_ms with a current value. Poll for that recovery.
