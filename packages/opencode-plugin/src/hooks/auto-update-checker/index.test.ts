@@ -374,6 +374,56 @@ describe("auto-update-checker/index", () => {
     });
   });
 
+  // The drill log showed "Update available (latest): 0.58.0 → 0.57.2": the
+  // installed release was ahead of the dist-tag and the checker offered the
+  // older one. Neither case may toast, prepare, or install anything.
+  for (const [label, installed, latest] of [
+    ["installed is newer than latest", "0.58.0", "0.57.2"],
+    ["installed equals latest", "0.58.0", "0.58.0"],
+    ["installed release is newer than a latest prerelease", "0.58.0", "0.58.0-beta.1"],
+  ] as const) {
+    test(`offers no update when ${label}`, async () => {
+      checkerMocks.findPluginEntry.mockImplementation(() => ({
+        entry: "@cortexkit/aft-opencode@latest",
+        pinnedVersion: null,
+        isPinned: false,
+        configPath: "/config/opencode.jsonc",
+      }));
+      checkerMocks.getCachedVersion.mockImplementation(() => installed);
+      checkerMocks.getLatestVersion.mockImplementation(async () => latest);
+      const { createAutoUpdateCheckerHook } = await freshIndexImport();
+      const { ctx, showToast } = createCtx();
+
+      createAutoUpdateCheckerHook(ctx as Parameters<typeof createAutoUpdateCheckerHook>[0], {
+        showStartupToast: false,
+        storageDir: testStorageDir,
+        initDelayMs: 0,
+      });
+      await waitForCalls(checkerMocks.getLatestVersion);
+      await waitForCalls(logMock);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      const logged = logMock.mock.calls.map((call) => String((call as unknown[])[0]));
+      expect(logged.some((line) => line.includes("Already on latest version"))).toBe(true);
+      expect(logged.some((line) => line.includes("Update available"))).toBe(false);
+      expect(showToast).not.toHaveBeenCalled();
+      expect(cacheMocks.preparePackageUpdate).not.toHaveBeenCalled();
+      expect(cacheMocks.runNpmInstallSafe).not.toHaveBeenCalled();
+    });
+  }
+
+  test("isNewerVersion orders by semver with prerelease", async () => {
+    const { isNewerVersion } = await freshIndexImport();
+    expect(isNewerVersion("0.57.2", "0.58.0")).toBe(false);
+    expect(isNewerVersion("0.58.0", "0.58.0")).toBe(false);
+    expect(isNewerVersion("0.58.1", "0.58.0")).toBe(true);
+    expect(isNewerVersion("0.10.0", "0.9.9")).toBe(true);
+    expect(isNewerVersion("0.58.0", "0.58.0-beta.2")).toBe(true);
+    expect(isNewerVersion("0.58.0-beta.2", "0.58.0")).toBe(false);
+    expect(isNewerVersion("0.58.0-beta.10", "0.58.0-beta.2")).toBe(true);
+    expect(isNewerVersion("not-a-version", "0.58.0")).toBe(false);
+  });
+
   test("shows install failure toast without telling users to restart", async () => {
     checkerMocks.findPluginEntry.mockImplementation(() => ({
       entry: "@cortexkit/aft-opencode@latest",

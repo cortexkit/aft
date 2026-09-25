@@ -36,6 +36,7 @@ import {
   findBinary,
   findBinarySync,
   getManualInstallHint,
+  getOnnxRuntimeInstallFailure,
   isOrtAutoDownloadSupported,
   type PoolOptions,
   resolveCortexKitStorageRoot,
@@ -103,6 +104,12 @@ export interface BridgeBootstrapDependencies {
     paths: readonly string[],
   ): Promise<void>;
   isOrtAutoDownloadSupported(): boolean;
+  /**
+   * Why the last managed ONNX Runtime install in this process failed, or
+   * null. Read only after `ensureOnnxRuntime` resolved null on a platform that
+   * supports auto-download, to tell the user why semantic search is off.
+   */
+  onnxInstallFailure?(): string | null;
 }
 
 /**
@@ -136,10 +143,10 @@ async function resolveBinaryWithWarmup(version: string): Promise<string> {
 
 /**
  * One ONNX Runtime resolution per storage directory per process. An OpenCode 2
- * host boots one plugin runtime per Location, and a second concurrent
- * `ensureOnnxRuntime` call loses the install lock and returns null ("install
- * already in progress"), which would leave that Location without a runtime.
- * A null result is not cached, so a later boot can retry.
+ * host boots one plugin runtime per Location; concurrent installs are already
+ * coalesced inside `ensureOnnxRuntime`, and caching the successful result here
+ * spares every later Location a re-hash of the ~35 MB library. A null result
+ * is not cached, so a later boot can retry.
  */
 const onnxResolutions = new Map<string, Promise<string | null>>();
 
@@ -158,6 +165,11 @@ function ensureOnnxRuntimeOncePerProcess(storageDir: string): Promise<string | n
   );
   onnxResolutions.set(storageDir, resolution);
   return resolution;
+}
+
+/** The user-facing notice for a failed managed ONNX Runtime install. */
+export function onnxInstallFailureMessage(reason: string): string {
+  return `Semantic search is unavailable: ONNX Runtime could not be installed (${reason}).\nRetry with: npx @cortexkit/aft doctor --fix`;
 }
 
 /** Auto-install failures must never block plugin startup. */
@@ -291,6 +303,7 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   startLspAutoInstall,
   pushLspPaths: pushLspPathsAfterAutoInstall,
   isOrtAutoDownloadSupported,
+  onnxInstallFailure: getOnnxRuntimeInstallFailure,
 };
 
 /**
@@ -460,6 +473,11 @@ export async function prepareBridgeEnvironment(
         } else if (!dependencies.isOrtAutoDownloadSupported()) {
           log(`ONNX Runtime auto-download not supported on ${process.platform}/${process.arch}.`);
           notify(`Semantic search requires ONNX Runtime.\nInstall: ${getManualInstallHint()}`);
+        } else {
+          // The install failed. The reason is otherwise only in the plugin
+          // log, and the sidebar can only say the runtime is missing.
+          const reason = dependencies.onnxInstallFailure?.();
+          if (reason) notify(onnxInstallFailureMessage(reason));
         }
       });
       lspCompletion?.then((updatedPaths) => {

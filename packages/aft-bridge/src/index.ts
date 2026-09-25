@@ -183,6 +183,7 @@ export {
   cleanupOnnxRuntime,
   ensureOnnxRuntime,
   getManualInstallHint,
+  getOnnxRuntimeInstallFailure,
   isOrtAutoDownloadSupported,
 } from "./onnx-runtime.js";
 export {

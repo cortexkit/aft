@@ -41,6 +41,7 @@ import {
   findBinarySync,
   formatDroppedKeyWarnings,
   getManualInstallHint,
+  getOnnxRuntimeInstallFailure,
   isHomeDirectoryRoot,
   resolveCortexKitStorageRoot,
   resolveIndexes,
@@ -813,9 +814,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           pool.setConfigureOverride("_ort_dylib_dir", ortDylibDir);
           log(`ONNX Runtime ready at ${ortDylibDir}; new bridges will load semantic backend.`);
         } else {
-          warn(
-            `ONNX Runtime unavailable. Semantic search will be disabled. Install manually: ${getManualInstallHint()}`,
-          );
+          const reason = getOnnxRuntimeInstallFailure();
+          if (reason) {
+            // The managed install failed. Say so in the UI, not only the log.
+            warn(`ONNX Runtime unavailable: ${reason}. Semantic search will be disabled.`);
+            deliverConfigMigrationWarnings([
+              `Semantic search is unavailable: ONNX Runtime could not be installed (${reason}).\nRetry with: npx @cortexkit/aft doctor --fix`,
+            ]);
+          } else {
+            warn(
+              `ONNX Runtime unavailable. Semantic search will be disabled. Install manually: ${getManualInstallHint()}`,
+            );
+          }
         }
       },
       (err) => {

@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
-import { isNpmAvailable, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
+import { compareSemver, isNpmAvailable, repairRootScopedStorageFile } from "@cortexkit/aft-bridge";
 import type { PluginInput } from "@opencode-ai/plugin";
 
 import { log, warn } from "../../logger.js";
@@ -311,6 +311,20 @@ function writeCheckTimestamp(file: string): void {
   renameSync(tmp, file);
 }
 
+/**
+ * True only when `candidate` is strictly newer than `installed` by semver.
+ * A version string that does not parse as semver is never treated as newer,
+ * so a malformed registry answer cannot trigger an install.
+ */
+export function isNewerVersion(candidate: string, installed: string): boolean {
+  const semver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+  const strip = (version: string) => version.trim().replace(/^v/, "").split("+", 1)[0];
+  const a = strip(candidate);
+  const b = strip(installed);
+  if (!semver.test(a) || !semver.test(b)) return false;
+  return compareSemver(a, b) > 0;
+}
+
 async function runStartupCheck(
   ctx: PluginInput,
   options: ResolvedAutoUpdateCheckerOptions,
@@ -378,8 +392,14 @@ async function runBackgroundUpdateCheck(
     return;
   }
 
-  if (currentVersion === latestVersion) {
-    log(`[auto-update-checker] Already on latest version for channel: ${channel}`);
+  // Compare as semver, prerelease included. An installed version at or above
+  // the channel's dist-tag (a fresh release before the tag moves, or a
+  // prerelease build) is current: offering the tagged version would be a
+  // downgrade.
+  if (!isNewerVersion(latestVersion, currentVersion)) {
+    log(
+      `[auto-update-checker] Already on latest version for channel: ${channel} (installed ${currentVersion}, ${channel} ${latestVersion})`,
+    );
     return;
   }
 

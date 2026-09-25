@@ -31,7 +31,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -81,6 +81,12 @@ const ONNX_INSTALLED_META_FILE = ".aft-onnx-installed";
 // blocked for a very long time after closing OpenCode mid-download (issue
 // reports of "blackscreen on launch then ONNX broken").
 const STALE_LOCK_MS = 5 * 60 * 1000;
+// How long a caller waits for another install (in this process or another
+// one) to finish before giving up. The lock turns reclaimable after
+// STALE_LOCK_MS, so this leaves room for one stale-lock recovery plus a full
+// download of our own.
+const LOCK_WAIT_MS = 2 * STALE_LOCK_MS;
+const LOCK_POLL_MS = 1000;
 
 /** Map (process.platform, process.arch) → ONNX Runtime asset name + library filename */
 interface OrtPlatformInfo {
@@ -184,6 +190,25 @@ export async function ensureOnnxRuntime(storageDir: string): Promise<string | nu
 }
 
 /**
+ * Why the most recent managed install attempt in this process failed, or null
+ * when the last attempt succeeded or none has failed. Hosts read it after
+ * {@link ensureOnnxRuntime} returns null so the user is told that semantic
+ * search is unavailable and why, not only the log.
+ */
+let lastInstallFailure: string | null = null;
+
+export function getOnnxRuntimeInstallFailure(): string | null {
+  return lastInstallFailure;
+}
+
+/**
+ * One resolution per storage directory at a time in this module instance.
+ * Concurrent callers share the same promise instead of racing for the install
+ * lock. Settled resolutions are dropped so a later call re-checks the disk.
+ */
+const inflightResolutions = new Map<string, Promise<string | null>>();
+
+/**
  * Test seams for {@link resolveOnnxRuntime}. Production passes none: the
  * platform table, the standard system locations, and the real download.
  */
@@ -191,17 +216,30 @@ interface OnnxRuntimeResolutionSeams {
   platformInfo?: OrtPlatformInfo | null;
   systemSearchPaths?: string[];
   download?: (info: OrtPlatformInfo, targetDir: string) => Promise<string | null>;
+  /** Archive URL for the real download path; tests point it at a local server. */
+  archiveUrl?: string;
+  /** How often a caller waiting on another install re-checks the lock. */
+  lockPollMs?: number;
 }
 
-async function resolveOnnxRuntime(
+function resolveOnnxRuntime(
   storageDir: string,
   seams: OnnxRuntimeResolutionSeams,
 ): Promise<string | null> {
-  const info = seams.platformInfo !== undefined ? seams.platformInfo : getPlatformInfo();
+  const existing = inflightResolutions.get(storageDir);
+  if (existing) return existing;
+  const resolution = resolveOnnxRuntimeUncoalesced(storageDir, seams).finally(() => {
+    inflightResolutions.delete(storageDir);
+  });
+  inflightResolutions.set(storageDir, resolution);
+  return resolution;
+}
 
-  // 1. Cached location with TOFU.
-  const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
-  const libName = info?.libName ?? "libonnxruntime.dylib";
+/**
+ * The cached managed runtime for this version, or null when there is none or
+ * it fails TOFU verification.
+ */
+function findCachedOnnxRuntime(ortVersionDir: string, libName: string): string | null {
   // Keep the version root separate from the resolved library directory. The
   // root owns cleanup, downloads, and TOFU metadata; the resolved dir only
   // feeds the return value / ORT_DYLIB_PATH and may be `<version>/lib` for
@@ -243,6 +281,20 @@ async function resolveOnnxRuntime(
       return resolvedOrtDir;
     }
   }
+  return null;
+}
+
+async function resolveOnnxRuntimeUncoalesced(
+  storageDir: string,
+  seams: OnnxRuntimeResolutionSeams,
+): Promise<string | null> {
+  const info = seams.platformInfo !== undefined ? seams.platformInfo : getPlatformInfo();
+
+  // 1. Cached location with TOFU.
+  const ortVersionDir = join(storageDir, "onnxruntime", ORT_VERSION);
+  const libName = info?.libName ?? "libonnxruntime.dylib";
+  const cached = findCachedOnnxRuntime(ortVersionDir, libName);
+  if (cached) return cached;
 
   // 2. System locations.
   const systemPath = findSystemOnnxRuntime(info?.libName, seams.systemSearchPaths);
@@ -259,37 +311,63 @@ async function resolveOnnxRuntime(
     return null;
   }
 
-  // Serialize concurrent installs.
+  // Serialize installs across processes.
   //
-  // Two AFT plugin instances starting at the same time would otherwise both
-  // download and extract into overlapping temp dirs and clobber each other.
-  // The lock is held for the full install duration via the manual try/finally
-  // below (we don't reuse withInstallLock from lsp-cache because that helper
-  // is keyed on lspPackageDir, while ONNX lives in storageDir).
+  // Several plugin starts can ask for the runtime at once: OpenCode may load
+  // the plugin more than once per process in module graphs that share no
+  // state, and two OpenCode windows can start together. Exactly one of them
+  // installs while holding the lock file; the others wait for it and then use
+  // the runtime it published, instead of giving up with no runtime. (We don't
+  // reuse withInstallLock from lsp-cache because that helper is keyed on
+  // lspPackageDir, while ONNX lives in storageDir.)
   const onnxBaseDir = join(storageDir, "onnxruntime");
   mkdirSync(onnxBaseDir, { recursive: true });
   const lockPath = join(onnxBaseDir, ONNX_LOCK_FILE);
 
-  // Recover from SIGKILL'd previous attempts before acquiring the lock.
-  // When the host process is killed mid-download (user closes OpenCode while
-  // ONNX is still downloading), the staging dir at `${ortVersionDir}.tmp.<pid>.<ts>`
-  // and a half-populated `ortVersionDir` can survive without a meta file. The
-  // existing TOFU branch above already handles a tampered-but-complete
-  // install, but this branch covers the "abandoned, incomplete" case where
-  // the lib file isn't present (we wouldn't be here otherwise). Sweep them
-  // out so the next download starts from a clean slate.
-  cleanupAbandonedStagingDirs(onnxBaseDir);
-
-  if (!acquireLock(lockPath)) {
-    warn(
-      `ONNX Runtime install already in progress in another process (lock: ${lockPath}). Skipping.`,
-    );
-    return null;
+  const pollMs = seams.lockPollMs ?? LOCK_POLL_MS;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let announcedWait = false;
+  while (!acquireLock(lockPath)) {
+    if (!announcedWait) {
+      log(`ONNX Runtime install already in progress (lock: ${lockPath}); waiting for it.`);
+      announcedWait = true;
+    }
+    if (Date.now() > deadline) {
+      lastInstallFailure = `timed out waiting for another ONNX Runtime install to finish (lock: ${lockPath})`;
+      warn(`ONNX Runtime unavailable: ${lastInstallFailure}`);
+      return null;
+    }
+    await new Promise((done) => setTimeout(done, pollMs));
+    const published = findCachedOnnxRuntime(ortVersionDir, libName);
+    if (published) {
+      lastInstallFailure = null;
+      return published;
+    }
   }
 
   try {
+    // Another holder may have finished between our cache check and taking
+    // the lock; use its runtime rather than downloading again.
+    const published = findCachedOnnxRuntime(ortVersionDir, libName);
+    if (published) {
+      lastInstallFailure = null;
+      return published;
+    }
+
+    // Recover from SIGKILL'd previous attempts. When the host process is
+    // killed mid-download (user closes OpenCode while ONNX is still
+    // downloading), a staging dir at `${ortVersionDir}.tmp.<pid>.<id>` and a
+    // half-populated `ortVersionDir` without a meta file can survive. The
+    // sweep runs only while holding the lock, so it can never remove the
+    // staging dir of an install that is still running.
+    cleanupAbandonedStagingDirs(onnxBaseDir);
     cleanupIncompleteTargetIfUnowned(ortVersionDir);
-    return await (seams.download ?? downloadOnnxRuntime)(info, ortVersionDir);
+    const installed = await (
+      seams.download ?? ((i, dir) => downloadOnnxRuntime(i, dir, seams.archiveUrl))
+    )(info, ortVersionDir);
+    if (installed) lastInstallFailure = null;
+    else lastInstallFailure ??= "ONNX Runtime install failed (see the AFT plugin log)";
+    return installed;
   } finally {
     releaseLock(lockPath);
   }
@@ -814,20 +892,29 @@ function validateExtractedTree(stagingRoot: string): void {
 async function downloadOnnxRuntime(
   info: OrtPlatformInfo,
   targetDir: string,
+  archiveUrl?: string,
 ): Promise<string | null> {
-  const url = `https://github.com/${ORT_REPO}/releases/download/v${ORT_VERSION}/${info.assetName}.${info.archiveType === "tgz" ? "tgz" : "zip"}`;
+  const url =
+    archiveUrl ??
+    `https://github.com/${ORT_REPO}/releases/download/v${ORT_VERSION}/${info.assetName}.${info.archiveType === "tgz" ? "tgz" : "zip"}`;
 
   log(`Downloading ONNX Runtime v${ORT_VERSION} for ${process.platform}/${process.arch}...`);
 
   // Keep every unverified byte under the version-scoped staging directory.
   // The managed target is not touched until extraction and library validation
   // have completed, so a failed repair cannot erase a working older runtime.
-  const tmpDir = `${targetDir}.tmp.${process.pid}.${Date.now().toString(36)}`;
+  // The pid stays the second-to-last dot segment so the abandoned-attempt
+  // sweep can tell whether the owner is alive. The last segment adds random
+  // bytes so two attempts in one process (separate module instances loaded in
+  // the same millisecond) can never share a staging dir.
+  const tmpDir = `${targetDir}.tmp.${process.pid}.${Date.now().toString(36)}${randomBytes(4).toString("hex")}`;
   const extractionRoot = join(tmpDir, "extract");
   const stagedInstallDir = join(tmpDir, "install");
 
   try {
     mkdirSync(extractionRoot, { recursive: true });
+    // copyOnnxLibraries writes into this directory and does not create it.
+    mkdirSync(stagedInstallDir, { recursive: true });
     const archivePath = join(tmpDir, `onnxruntime.${info.archiveType}`);
 
     // Download with a streaming size cap.
@@ -905,6 +992,7 @@ async function downloadOnnxRuntime(
     return targetDir;
   } catch (err) {
     error(`Failed to download ONNX Runtime: ${err}`);
+    lastInstallFailure = `ONNX Runtime download failed: ${err instanceof Error ? err.message : String(err)}`;
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {
