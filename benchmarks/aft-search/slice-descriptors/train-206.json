@@ -6,7 +6,10 @@
     "harness-goldens"
   ],
   "slices": [
-    "watcher-reseed-reservations"
+    "watcher-reseed-reservations",
+    "rust-macro-body-symbols",
+    "opencode2-harness-probe-busy-timeout",
+    "prefrontal-search-rows"
   ],
-  "note": "Watcher exclusion re-seed keeps build-output and dependency folders after an overflow. No ranking-fence file touched."
+  "note": "Watcher re-seed keeps build-output folders; Rust items inside macro bodies become symbols (parser.rs, outside the ranking fence); OpenCode 2 harness probe waits on a busy database; report-only prefrontal search rows outside the gate. No ranking-fence file touched."
 }
