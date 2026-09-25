@@ -51,9 +51,56 @@ const NOTIFY_FILTER: u32 = FILE_NOTIFY_CHANGE_FILE_NAME
     | FILE_NOTIFY_CHANGE_CREATION
     | FILE_NOTIFY_CHANGE_SECURITY;
 
+/// Owned I/O completion port handle, closed exactly once when the last owner
+/// drops it.
+///
+/// Both the watcher and its completion thread hold an `Arc` to the port. The
+/// completion thread can exit on its own (the event receiver went away, or a
+/// read failed) while the watcher is still alive, and the watcher's `Drop`
+/// then posts a shutdown packet to the port. If the thread closed the raw
+/// handle on exit, that post would target a stale handle value that Windows
+/// may already have handed to an unrelated completion port, such as the one
+/// backing a tokio runtime's I/O driver. mio reports a packet with a null
+/// OVERLAPPED as an event whose token is the completion key, and tokio turns
+/// that token into a pointer; with the shutdown key (`usize::MAX`) this is a
+/// dereference of address 0xffff_ffff_ffff_ffff and aborts the process.
+/// Shared ownership guarantees the handle stays open for as long as anyone
+/// can still post to it.
+struct CompletionPort {
+    handle: HANDLE,
+}
+
+// The completion port is a kernel object designed for concurrent use from
+// multiple threads; the wrapper only closes it once, on final drop.
+unsafe impl Send for CompletionPort {}
+unsafe impl Sync for CompletionPort {}
+
+impl CompletionPort {
+    fn create() -> notify::Result<Arc<Self>> {
+        let handle = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
+        if handle.is_null() {
+            Err(last_notify_error())
+        } else {
+            Ok(Arc::new(Self { handle }))
+        }
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+impl Drop for CompletionPort {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
 pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
-    completion_port: usize,
+    completion_port: Arc<CompletionPort>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -74,8 +121,8 @@ impl ProjectWatcher {
         let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(observed_generation, Vec::new(), Vec::new());
 
-        let completion_port = create_completion_port()?;
-        let completion_port_address = completion_port as usize;
+        let completion_port = CompletionPort::create()?;
+        let thread_port = Arc::clone(&completion_port);
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_counters = Arc::clone(&counters);
@@ -87,9 +134,8 @@ impl ProjectWatcher {
             .name("aft-windows-rdcw".to_string())
             .spawn(move || {
                 pause_backend_start_for_test(&thread_shutdown);
-                let port = completion_port_address as HANDLE;
                 let result = run_completion_loop(
-                    port,
+                    thread_port.raw(),
                     root,
                     extra_watch_paths,
                     tx,
@@ -103,23 +149,19 @@ impl ProjectWatcher {
                 if let Err(error) = result {
                     crate::slog_warn!("Windows watcher stopped: {error}");
                 }
-                unsafe {
-                    CloseHandle(port);
-                }
+                // Deliberately not closing the port here: the watcher may
+                // still post its shutdown packet to it. The handle closes
+                // when the last `Arc<CompletionPort>` drops.
+                drop(thread_port);
             }) {
             Ok(join) => join,
-            Err(error) => {
-                unsafe {
-                    CloseHandle(completion_port);
-                }
-                return Err(notify::Error::io(error));
-            }
+            Err(error) => return Err(notify::Error::io(error)),
         };
 
         match start_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 shutdown,
-                completion_port: completion_port_address,
+                completion_port,
                 join: Some(join),
             }),
             Ok(Err(error)) => {
@@ -139,9 +181,12 @@ impl ProjectWatcher {
 impl Drop for ProjectWatcher {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        // `self.completion_port` keeps the handle open, so this post reaches
+        // this watcher's own port even if the completion thread already
+        // exited.
         unsafe {
             PostQueuedCompletionStatus(
-                self.completion_port as HANDLE,
+                self.completion_port.raw(),
                 0,
                 SHUTDOWN_COMPLETION_KEY,
                 ptr::null(),
@@ -600,16 +645,6 @@ fn buffer_overflow_event(root: &Path) -> Event {
         .add_path(root.to_path_buf())
 }
 
-fn create_completion_port() -> notify::Result<HANDLE> {
-    let completion_port =
-        unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
-    if completion_port.is_null() {
-        Err(last_notify_error())
-    } else {
-        Ok(completion_port)
-    }
-}
-
 fn last_notify_error() -> notify::Error {
     notify::Error::io(io::Error::last_os_error())
 }
@@ -861,5 +896,73 @@ mod tests {
         assert_eq!(counters.backend_exclusions().matcher_generation, 2);
         drop(watcher);
         create_thread.join().unwrap();
+    }
+
+    /// The completion thread exits by itself once its event receiver is gone.
+    /// The watcher is still alive at that point and will post its shutdown
+    /// packet on drop, so the port handle must still be open and still be
+    /// this watcher's port. A thread that closes the handle on exit fails the
+    /// handle-information assertion here instead of letting `Drop` post into
+    /// whatever object reused the handle value.
+    #[test]
+    fn completion_port_outlives_a_self_terminated_completion_thread() {
+        use windows_sys::Win32::Foundation::GetHandleInformation;
+
+        let _lock = native_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            canonical_root,
+            Vec::new(),
+            tx,
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(1)),
+        )
+        .expect("watcher startup");
+
+        // With the receiver gone, the next delivered event makes the
+        // completion loop stop and the thread return.
+        drop(rx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut index = 0usize;
+        while !watcher.join.as_ref().unwrap().is_finished() && Instant::now() < deadline {
+            std::fs::write(root.path().join(format!("exit-{index}.tmp")), b"x").unwrap();
+            index += 1;
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            watcher.join.as_ref().unwrap().is_finished(),
+            "completion thread should stop once its receiver is dropped"
+        );
+
+        let port = watcher.completion_port.raw();
+        let mut flags = 0u32;
+        assert_ne!(
+            unsafe { GetHandleInformation(port, &mut flags) },
+            0,
+            "completion port was closed while the watcher can still post to it"
+        );
+
+        // Round-trip a packet to prove the handle still names this port.
+        const PROBE_KEY: usize = 0x5eed;
+        assert_ne!(
+            unsafe { PostQueuedCompletionStatus(port, 0, PROBE_KEY, ptr::null()) },
+            0
+        );
+        let mut bytes = 0u32;
+        let mut key = 0usize;
+        let mut overlapped = ptr::null_mut();
+        let dequeued =
+            unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut overlapped, 1000) };
+        assert_ne!(
+            dequeued, 0,
+            "probe packet should be dequeued from the same port"
+        );
+        assert_eq!(key, PROBE_KEY);
+        assert!(overlapped.is_null());
+
+        assert_eq!(Arc::strong_count(&watcher.completion_port), 1);
+        drop(watcher);
     }
 }
