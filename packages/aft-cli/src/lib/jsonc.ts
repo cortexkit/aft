@@ -110,11 +110,11 @@ export function ensureAftSchemaUrl(
   // `assign` copies every remaining key after it together with its comments
   // (and the file's leading/trailing comments), so nothing the user wrote is
   // lost. A plain spread would drop those comment associations.
-  const { $schema: _previous, ...rest } = value;
-  void _previous;
-  const reordered = assignJsonc({ $schema: AFT_SCHEMA_URL } as Record<string, unknown>, value, [
-    ...Object.keys(rest),
-  ]);
+  const reordered = assignJsonc(
+    { $schema: AFT_SCHEMA_URL } as Record<string, unknown>,
+    value,
+    Object.keys(value).filter((key) => key !== "$schema"),
+  );
   copyNonPropertyComments(value, reordered);
   writeJsoncFile(path, reordered, format === "none" ? "json" : format);
 

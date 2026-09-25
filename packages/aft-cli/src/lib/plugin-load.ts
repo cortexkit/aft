@@ -17,11 +17,12 @@ import { CLI } from "./cli.js";
  *
  * `doctor` used to read the config only for display, so a config the plugin
  * refuses (and a plugin that therefore registers no tools) still reported
- * "registered, healthy". This mirrors the plugin's startup checks that abort
- * the load: a user/project file that does not parse, retired keys the policy
- * rejects, and a `subc.connection_file` that points at no file. It also
- * derives the effective semantic backend, which decides whether ONNX Runtime
- * is needed at all.
+ * "registered, healthy". This mirrors the plugin's startup config checks:
+ * retired keys the policy rejects and a `subc.connection_file` that points at
+ * no file stop AFT outright; a file that does not parse is ignored whole, so
+ * AFT runs on defaults and none of the user's settings apply. It also derives
+ * the effective semantic backend, which decides whether ONNX Runtime is
+ * needed at all.
  */
 
 export type PluginLoadBlockerCode =
@@ -38,6 +39,11 @@ export interface PluginLoadBlocker {
   remediation: string;
   /** True when `doctor --fix` repairs it (the retired-key migration). */
   fixable: boolean;
+  /**
+   * True when AFT registers no tools at all because of it. False for a file
+   * that does not parse: the plugin still starts, on default settings.
+   */
+  stopsLoad: boolean;
 }
 
 export interface PluginLoadEvaluation {
@@ -122,6 +128,7 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
         message: `AFT config ${path} does not parse (${error}); the plugin ignores the whole file and runs on defaults.`,
         remediation: `Fix the JSON/JSONC syntax in ${path}, then restart the host.`,
         fixable: false,
+        stopsLoad: false,
       });
       continue;
     }
@@ -129,14 +136,17 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
     const translated = structuredClone(value);
     const translation = translateConfigDocument(translated, phase, tier);
     if (translation.errors.length > 0) {
+      const removed = translation.errors
+        .map((code) => code.replace(/^removed_config_key:([^:]+):use:(.+)$/, "$1 → $2"))
+        .join(", ");
+      const scope = tier === "project" ? " in this project" : "";
       blockers.push({
         code: "config_rejected",
         path,
-        message: `The plugin refuses to start with ${path}: it uses removed keys (${translation.errors
-          .map((code) => code.replace(/^removed_config_key:([^:]+):use:(.+)$/, "$1 → $2"))
-          .join(", ")}), so no AFT tools are registered.`,
+        message: `The plugin refuses to start with ${path}: it uses removed keys (${removed}), so no AFT tools are registered${scope}.`,
         remediation: `Run \`${CLI} doctor --fix\` to migrate the file, then restart the host.`,
         fixable: true,
+        stopsLoad: true,
       });
     }
     loaded[tier] = withHarness(translated, input.harness);
@@ -154,6 +164,7 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
         message: `The plugin refuses to start: subc.connection_file is set to "${raw}" but ${resolved} does not exist, so no AFT tools are registered.`,
         remediation: `Start the Subconscious daemon that writes ${resolved}, or remove the "subc" block (or its "connection_file" key) from ${input.userConfigPath} to use AFT on its own. doctor --fix does not edit this setting.`,
         fixable: false,
+        stopsLoad: true,
       });
     }
   }

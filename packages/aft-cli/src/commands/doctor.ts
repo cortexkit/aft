@@ -282,8 +282,10 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
           logPath: opencodeHarness.logFile.path,
           pluginCachePath: opencodeHarness.pluginCache.path,
           cachedPluginVersion: opencodeHarness.pluginCache.cached,
-          // The entry doctor --fix writes. OpenCode 1 also accepts `@latest`
-          // or any exact version the user chose, and --fix leaves those alone.
+          // The entry doctor --fix writes on every host generation. On
+          // OpenCode 1, `@latest` or another exact version also loads, so the
+          // report does not call it a problem; --fix still pins it, and its
+          // plan says so.
           expectedPluginEntry: opencodeAdapter.pluginEntryWithVersion,
           acceptExplicitPluginVersion: hostDetection.status === "v1",
         })
@@ -357,7 +359,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
     }
-    const blockers = h.pluginLoad?.blockers ?? [];
+    const blockers = (h.pluginLoad?.blockers ?? []).filter((blocker) => blocker.stopsLoad);
     if (h.pluginRegistered && blockers.length > 0) {
       // Registered is not loaded: the plugin aborts at startup on these, and
       // the host then runs with no AFT tools. The issues list below has the fix.
@@ -1068,6 +1070,16 @@ function userAftConfigPath(report: DiagnosticReport): string {
   return report.harnesses[0]?.configPaths.aftConfig ?? resolveCortexKitUserConfigPath();
 }
 
+/** Size, mtime and inode of a file, to tell whether it was replaced; null when unreadable. */
+function fileIdentity(path: string): string | null {
+  try {
+    const stat = statSync(path);
+    return `${stat.size}:${stat.mtimeMs}:${stat.ino}`;
+  } catch {
+    return null;
+  }
+}
+
 export function shouldSkipDoctorFixConfirmation(argv: string[]): boolean {
   if (argv.includes("--yes") || argv.includes("-y")) return true;
   if (argv.includes("--ci")) return true;
@@ -1195,6 +1207,7 @@ async function runFixFlow(
       skipped.push("aft binary download (declined because the installed plugin would not use it)");
     } else {
       const cached = cachedBinaryFor(report.cliVersion);
+      const cachedBefore = cached ? fileIdentity(cached) : null;
       log.info(
         cached
           ? `Checking the cached AFT binary at ${cached}…`
@@ -1202,13 +1215,20 @@ async function runFixFlow(
       );
       const obtained = await obtainAftBinary(report.cliVersion, downloadBinaryFn);
       if (obtained.ok) {
+        // The downloader replaces a cached file that turns out to be the
+        // wrong version in place, so the same path alone does not mean
+        // nothing was downloaded; the file must also be unchanged.
+        const reused =
+          obtained.path === cached &&
+          cachedBefore !== null &&
+          cachedBefore === fileIdentity(obtained.path);
         log.success(
-          obtained.path === cached
+          reused
             ? `The cached AFT binary at ${obtained.path} is v${report.cliVersion}; nothing to download.`
             : `AFT binary installed at ${obtained.path}`,
         );
-        binaryDownloaded = obtained.path !== cached;
-        binaryVerified = obtained.path === cached;
+        binaryDownloaded = !reused;
+        binaryVerified = reused;
       } else {
         log.error(`AFT binary download failed: ${obtained.message}`);
         binaryDownloadError = obtained.message;

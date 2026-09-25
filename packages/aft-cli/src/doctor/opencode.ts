@@ -153,12 +153,14 @@ function pluginManifest(entry: string | null, cachePath: string): PluginManifest
  * entry --fix writes, so the report and the fix always agree.
  */
 export function pinProblem(entry: string, pinned: string): string {
-  const version = pinned.slice(pinned.lastIndexOf("@") + 1);
+  const tag = entry === AFT_OPENCODE_PACKAGE ? null : entry.slice(entry.lastIndexOf("@") + 1);
   const current =
-    entry === AFT_OPENCODE_PACKAGE
-      ? "has no version"
-      : `is ${entry.slice(entry.lastIndexOf("@") + 1)}`;
-  return `the plugin entry ${entry} ${current}; run \`${CLI} doctor --fix\` to pin it to ${pinned}, the version this CLI and its binary belong to, so the plugin only changes version when you update AFT (v${version})`;
+    tag === null
+      ? "has no version, so OpenCode may load any release of the plugin"
+      : tag === "latest"
+        ? "follows the newest release, which can differ from this CLI and its binary"
+        : `asks for version ${tag}, not the version of this CLI and its binary`;
+  return `the plugin entry ${entry} ${current}; run \`${CLI} doctor --fix\` to pin it to ${pinned}`;
 }
 
 function latestLoggedLoadPath(logPath: string): OpenCodeLoadPath | null {

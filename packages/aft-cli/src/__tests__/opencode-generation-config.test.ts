@@ -850,9 +850,9 @@ describe("OpenCode doctor generation and load path", () => {
     const output = lines.join("\n");
     expect(code).toBe(1);
     expect(output).toContain(
-      // Reworded for users: the line now names the exact entry doctor --fix
-      // writes and why, instead of "is not the required exact pin".
-      `the plugin entry ${AFT_OPENCODE_PACKAGE}@latest is latest; run \`npx @cortexkit/aft doctor --fix\` to pin it to ${pinnedPluginEntry(getSelfVersion())}`,
+      // Reworded for users: the line names why the entry is a problem and the
+      // exact entry doctor --fix writes, instead of "is not the required exact pin".
+      `the plugin entry ${AFT_OPENCODE_PACKAGE}@latest follows the newest release, which can differ from this CLI and its binary; run \`npx @cortexkit/aft doctor --fix\` to pin it to ${pinnedPluginEntry(getSelfVersion())}`,
     );
   });
 

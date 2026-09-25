@@ -237,6 +237,11 @@ describe("D1: doctor reports every condition that stops the plugin loading", () 
     expect(parse[0]?.severity).toBe("high");
     expect(parse[0]?.message).toContain(userConfig);
     expect(parse[0]?.remediation).toContain(`Fix the JSON/JSONC syntax in ${userConfig}`);
+    // The plugin still starts on defaults, so doctor must not claim it will not load.
+    expect(parse[0]?.message).toContain("runs on defaults");
+    const { text } = await plainDoctor();
+    expect(text).toContain("[HIGH] OpenCode: AFT config");
+    expect(text).not.toContain("it will not load");
   });
 });
 
@@ -381,6 +386,25 @@ describe("D3: a binary already in the versioned cache", () => {
     expect(text).toContain(`The cached AFT binary at ${cached} is ${tag}; nothing to download.`);
   });
 
+  test("a cached binary the downloader replaced is reported as installed, not reused", async () => {
+    writeUserConfig({ $schema: AFT_SCHEMA_URL });
+    const tag = `v${getSelfVersion()}`;
+    const dir = join(process.env.AFT_CACHE_DIR as string, "bin", tag);
+    const cached = join(dir, "aft");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(cached, "#!/bin/sh\n", { mode: 0o755 });
+    const text = await doctorFix(
+      null,
+      () => ({ ok: true, stdout: '{"files":[]}', stderr: "", status: 0 }),
+      async () => {
+        writeFileSync(cached, "#!/bin/sh\necho replaced\n", { mode: 0o755 });
+        return cached;
+      },
+    );
+    expect(text).toContain(`AFT binary installed at ${cached}`);
+    expect(text).not.toContain("nothing to download");
+  });
+
   test("with no cached binary the plan says it will download, and where", async () => {
     writeUserConfig({ $schema: AFT_SCHEMA_URL });
     const text = await doctorFix(
@@ -436,6 +460,7 @@ describe("D5: the pin message and doctor --fix agree", () => {
     const problems = problemsFor(AFT_OPENCODE_PACKAGE, v1());
     expect(problems).toHaveLength(1);
     expect(problems[0]).toContain(`pin it to ${pinned}`);
+    expect(problems[0]).toContain("has no version");
     expect(problems[0]).not.toContain("@latest");
     const config: Record<string, unknown> = { plugin: [AFT_OPENCODE_PACKAGE] };
     ensurePinnedPluginConfig(config, getSelfVersion(), () => false, "v1");

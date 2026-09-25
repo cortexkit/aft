@@ -452,8 +452,10 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
       });
     }
 
-    // Conditions that stop the plugin from loading at all. They are HIGH: the
-    // host starts, but the model gets no AFT tools and nothing else says why.
+    // Config conditions that stop AFT at startup (rejected keys, a missing
+    // subc connection file) or make it ignore the user's file (a parse error).
+    // They are HIGH: the host starts either way, and nothing else says why AFT
+    // is missing or ignoring its settings.
     for (const blocker of h.pluginLoad?.blockers ?? []) {
       issues.push({
         code: blocker.code,

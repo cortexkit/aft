@@ -101,7 +101,7 @@ export function previewConfigMigration(targets: ConfigMigrationTarget[]): Config
     const translation = translateConfigDocument(translated, "window", target.tier);
     const retiredGithub =
       Object.hasOwn(raw, "gh_read") || (isRecord(raw.gh_shim) && "enabled" in raw.gh_shim);
-    if (!translation.legacyInput && !retiredGithub) continue;
+    if (!translation.legacyInput && translation.errors.length === 0 && !retiredGithub) continue;
     const changes = diffConfig(raw, translated);
     // Keys the policy rejects outright are not translated, so the diff above
     // cannot show them; name the replacement the migration moves them to.
