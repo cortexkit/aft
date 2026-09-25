@@ -63,10 +63,21 @@ fn standalone_status_bar_trails_text_on_change_and_not_on_unchanged_result() {
     assert!(bar.ends_with("| D1 U1 C0 | T1]"), "unexpected bar {bar:?}");
 
     let text = read(&mut aft, "read-unchanged", &file);
-    assert!(
-        !text.contains("[AFT "),
-        "an unchanged result must not repeat the bar: {text:?}"
-    );
+    // The contract is that the bar is emitted only when it changes. On Windows the
+    // watcher can deliver a late event for the fixture write, which marks the
+    // Tier-2 counts stale (`~D1`) between the two calls; that is a real change
+    // and may be shown. Repeating the identical bar is what must never happen.
+    if let Some(next) = trailing_bar(&text) {
+        assert_ne!(
+            next, bar,
+            "an unchanged result must not repeat the bar: {text:?}"
+        );
+    } else {
+        assert!(
+            !text.contains("[AFT "),
+            "a bar may only trail the text: {text:?}"
+        );
+    }
 
     std::fs::write(
         &file,
