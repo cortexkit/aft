@@ -3981,6 +3981,8 @@ impl AppContext {
     }
 
     pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
+        #[cfg(test)]
+        record_configure_bind_effect_for_test(&root, &session_id, ConfigureBindEffect::Session);
         self.configured_session_roots
             .lock()
             .insert((root, session_id))
@@ -4136,6 +4138,12 @@ impl AppContext {
         if jobs.len() >= crate::executor::MAINTENANCE_QUEUE_CAP {
             return Err(job);
         }
+        #[cfg(test)]
+        record_configure_bind_effect_for_test(
+            &job.canonical_cache_root,
+            &job.session_id,
+            ConfigureBindEffect::Maintenance,
+        );
         jobs.push_back(job);
         Ok(())
     }
@@ -8776,6 +8784,51 @@ impl AppContext {
             crate::memory::MemorySnapshot::new_uncapped(roots_status, roots)
         }
     }
+}
+
+/// Which configure side effect a test counts per (root, session).
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ConfigureBindEffect {
+    Session,
+    Maintenance,
+}
+
+#[cfg(test)]
+fn configure_bind_effects(
+) -> &'static parking_lot::Mutex<BTreeMap<(PathBuf, String), (usize, usize)>> {
+    static EFFECTS: std::sync::OnceLock<
+        parking_lot::Mutex<BTreeMap<(PathBuf, String), (usize, usize)>>,
+    > = std::sync::OnceLock::new();
+    EFFECTS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn record_configure_bind_effect_for_test(
+    root: &Path,
+    session_id: &str,
+    effect: ConfigureBindEffect,
+) {
+    let mut effects = configure_bind_effects().lock();
+    let counts = effects
+        .entry((root.to_path_buf(), session_id.to_string()))
+        .or_default();
+    match effect {
+        ConfigureBindEffect::Session => counts.0 += 1,
+        ConfigureBindEffect::Maintenance => counts.1 += 1,
+    }
+}
+
+/// How many times configure recorded `session_id` as bound to `root`, and how
+/// many configure maintenance jobs it queued for that pair. Tests use roots of
+/// their own, so parallel tests do not share entries.
+#[cfg(test)]
+pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> (usize, usize) {
+    configure_bind_effects()
+        .lock()
+        .get(&(root.to_path_buf(), session_id.to_string()))
+        .copied()
+        .unwrap_or((0, 0))
 }
 
 #[cfg(test)]

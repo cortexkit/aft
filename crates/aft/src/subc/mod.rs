@@ -12339,6 +12339,110 @@ mod tests {
         );
     }
 
+    /// Real configures on two roots, each with its real configure tail held in
+    /// the yielding drain: root B's equivalent rebind is answered beside its
+    /// tail, while root A's harness change is deferred, waits as a queued
+    /// exclusive writer, and runs again only once A's tail yields. Neither
+    /// bind's discarded or repeated work registers its session or queues
+    /// maintenance twice, and each bind is answered exactly once.
+    #[test]
+    fn real_configure_rerun_waits_for_the_yielding_tail_and_applies_effects_once() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let generation_a = held_a.ctx.configure_generation();
+
+        let mut rebind_a = held_a.submit_bind(held_a.bind_request(1, "pi"));
+        let mut rebind_b = held_b.submit_bind(held_b.bind_request(1, "opencode"));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let answered_b = loop {
+            if let Ok(response) = rebind_b.try_recv() {
+                break Some(response);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let queued_a = wait_for_bind_blockers(
+            &executor,
+            &held_a.root,
+            "subc-bind-herd-1",
+            Duration::from_secs(5),
+            queued_for_exclusive_rerun,
+        );
+        let a_answered_while_held = rebind_a.try_recv().ok();
+        let a_was_answered_while_held = a_answered_while_held.is_some();
+        let a_effects_while_held = crate::context::configure_bind_effects_for_test(
+            &held_a.canonical_root,
+            "herd-session-1",
+        );
+        let a_generation_while_held = held_a.ctx.configure_generation();
+
+        // Let A's tail finish its held stage: it sees the queued writer and
+        // yields, and the deferred bind then runs exclusively.
+        let tail_a = {
+            if let Some(release) = held_a.release.take() {
+                let _ = release.send(());
+            }
+            held_a
+                .tail
+                .take()
+                .expect("tail A")
+                .blocking_recv()
+                .expect("tail A completion")
+        };
+        let response_a = match a_answered_while_held {
+            Some(response) => response,
+            None => rebind_a.blocking_recv().expect("bind A completion"),
+        };
+        held_b.release_tail();
+
+        assert!(
+            !a_was_answered_while_held,
+            "root A's harness change was answered while its tail held the root"
+        );
+        let queued_a = queued_a.expect("root A's bind waits as a queued exclusive writer");
+        assert!(
+            queued_a
+                .configure_phase_timings
+                .as_deref()
+                .is_some_and(|phases| phases.contains("requeued_exclusive=")),
+            "{:?}",
+            queued_a.configure_phase_timings
+        );
+        assert_eq!(
+            a_effects_while_held,
+            (0, 0),
+            "the deferred run changed nothing"
+        );
+        assert_eq!(a_generation_while_held, generation_a);
+        assert_eq!(
+            tail_a.data["requeue"], true,
+            "tail A yielded to the waiting bind: {}",
+            tail_a.data
+        );
+        assert!(response_a.success, "{}", response_a.data);
+        assert!(held_a.ctx.configure_generation() > generation_a);
+        let answered_b = answered_b.expect("root B's rebind is answered beside its tail");
+        assert!(answered_b.success, "{}", answered_b.data);
+
+        // Each completion is a oneshot that resolved above, so each bind got
+        // exactly one terminal response.
+        for held in [&held_a, &held_b] {
+            assert_eq!(
+                crate::context::configure_bind_effects_for_test(
+                    &held.canonical_root,
+                    "herd-session-1"
+                ),
+                (1, 1),
+                "one session registration and one maintenance job per bind"
+            );
+        }
+    }
+
     /// A root whose routes all detached is quiesced, and a configure tail
     /// that was already running cancels every configure job it finds queued
     /// at its next unit. A rebind that arrives meanwhile must not be acked
