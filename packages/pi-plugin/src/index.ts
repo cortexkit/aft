@@ -63,12 +63,9 @@ import { registerStatusCommand } from "./commands/aft-status.js";
 import {
   type AftConfig,
   buildConfigTierConfigureParams,
-  ConfigRejectedError,
   deliverConfigLoadNotices,
   formatConfigParseFailureMessage,
   getConfigLoadErrors,
-  loadAftConfig,
-  migrateAftConfigLocations,
   resolveBridgePoolTransportOptions,
 } from "./config.js";
 import { bridgeLogger, error, flushLogs, log, warn } from "./logger.js";
@@ -99,6 +96,7 @@ import {
   signalBashWaitDetachForProject,
   stripUserMessageDetachKeyword,
 } from "./bash-wait-detach.js";
+import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { recordActiveExtensionApi } from "./harness.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
@@ -409,29 +407,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   };
 
   const projectRoot = process.cwd();
-  // Load the AFT config before any binary, storage or index work. A rejected
-  // configuration (a retired key after its migration window, or an already
-  // retired GitHub alias) publishes no AFT registrations at all.
-  const loadOrReject = (): AftConfig | null => {
-    try {
-      return loadAftConfig(projectRoot);
-    } catch (err) {
-      if (!(err instanceof ConfigRejectedError)) throw err;
-      error(err.message);
-      deliverConfigMigrationWarnings([err.message]);
-      return null;
-    }
-  };
-  if (loadOrReject() === null) return;
-
-  deliverConfigMigrationWarnings(
-    migrateAftConfigLocations(projectRoot, bridgeLogger).flatMap((result) => result.warnings),
+  // Load the AFT config before any binary, storage or index work. An unusable
+  // configuration (a retired key after its migration window, an already
+  // retired GitHub alias, a file that does not parse, a missing subc
+  // connection file) still loads the extension, in the config error state:
+  // the tools register but every call fails with the error and its fix.
+  const bootstrap = await resolvePiBootstrapConfig(projectRoot, (message) =>
+    deliverConfigMigrationWarnings([message]),
   );
-
-  // Load config (user + project).
-  const loadedConfig = loadOrReject();
-  if (loadedConfig === null) return;
-  const config = loadedConfig;
+  if (!bootstrap.ok) {
+    registerPiConfigErrorState(pi, bootstrap.config, bootstrap.message);
+    return;
+  }
+  const config = bootstrap.config;
   enqueueConfigParseWarnings(projectRoot, getConfigLoadErrors());
   deliverConfigLoadNotices((message) => deliverConfigMigrationWarnings([message]));
   const unknownDisabled = unknownDisabledTools(config.disabled_tools ?? []);

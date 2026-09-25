@@ -87,6 +87,19 @@ export {
   isEmptyParam,
 } from "./coerce.js";
 export { LONG_RUNNING_COMMAND_TIMEOUT_MS, timeoutForCommand } from "./command-timeouts.js";
+// --- config error state (a plugin that loads but fails every tool call) ---
+export {
+  AftConfigError,
+  CONFIG_ERROR_RESTART_NOTE,
+  type ConfigErrorCode,
+  ConfigErrorTransportPool,
+  configErrorStatusSnapshot,
+  formatConfigErrorMessage,
+  formatConfigErrorStatusLine,
+  formatConfigParseErrorMessage,
+  formatSubcConnectionMissingMessage,
+  resolveSubcConnectionFilePath,
+} from "./config-error.js";
 // --- shared harness config keys ---
 export {
   OPENCODE_ONLY_KEYS,
@@ -130,19 +143,6 @@ export * from "./feature-config.js";
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
 export { stripJsoncSymbols } from "./jsonc.js";
-// --- config error state (a plugin that loads but fails every tool call) ---
-export {
-  AftConfigError,
-  CONFIG_ERROR_RESTART_NOTE,
-  type ConfigErrorCode,
-  ConfigErrorTransportPool,
-  configErrorStatusSnapshot,
-  formatConfigErrorMessage,
-  formatConfigErrorStatusLine,
-  formatConfigParseErrorMessage,
-  formatSubcConnectionMissingMessage,
-  resolveSubcConnectionFilePath,
-} from "./config-error.js";
 // --- per-Location process-global transport ownership ---
 export type {
   AcquireBridgeDependencies,

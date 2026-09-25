@@ -64,7 +64,10 @@ describe("bootstrap configuration", () => {
   });
 
   test("a missing subc connection file yields the config error state with the loaded surface", async () => {
-    const config = { disabled_tools: ["aft_move"], subc: { connection_file: "/nope" } } as AftConfig;
+    const config = {
+      disabled_tools: ["aft_move"],
+      subc: { connection_file: "/nope" },
+    } as AftConfig;
     const result = await resolveBootstrapConfig("/p", () => {}, {
       ...dependencies(() => config),
       subcConnectionFileError: async (file) => (file ? `missing ${file}` : null),

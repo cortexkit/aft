@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import {
-  ConfigRejectedError,
   type ConfigErrorCode,
+  ConfigRejectedError,
   formatConfigErrorMessage,
   formatConfigParseErrorMessage,
   formatSubcConnectionMissingMessage,

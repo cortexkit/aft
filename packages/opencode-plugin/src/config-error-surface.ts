@@ -11,10 +11,7 @@ import type { AftConfig } from "./config.js";
 import { buildAftToolDefinitions, openCodeHashlineEffective } from "./tool-registration.js";
 import type { PluginContext } from "./types.js";
 
-type ToolMapBuilder = (
-  ctx: PluginContext,
-  config: AftConfig,
-) => Record<string, ToolDefinition>;
+type ToolMapBuilder = (ctx: PluginContext, config: AftConfig) => Record<string, ToolDefinition>;
 
 /**
  * Replace every tool's `execute` with one that throws `message`. A thrown

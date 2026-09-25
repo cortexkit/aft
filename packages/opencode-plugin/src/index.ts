@@ -45,13 +45,13 @@ import {
   resolvedIndexes,
   resolveOpenCodeRegistrationRoot,
 } from "./config.js";
+import { buildConfigErrorToolMap } from "./config-error-surface.js";
 import {
   drainPendingConfigParseWarnings,
   enqueueConfigParseWarnings,
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
 } from "./configure-warnings.js";
-import { buildConfigErrorToolMap } from "./config-error-surface.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls } from "./lsp-auto-install.js";

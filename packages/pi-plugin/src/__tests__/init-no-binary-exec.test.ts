@@ -132,6 +132,9 @@ describe.serial.skipIf(process.platform === "win32")(
     });
 
     test("subc mode resolves no local binary at all", async () => {
+      // The connection file must exist: a missing one is the config error
+      // state, which never reaches the transport choice.
+      writeFileSync(join(tempDir, "subc-connection.json"), "{}");
       writeUserConfig({
         lsp: { auto_install: false },
         semantic_search: false,
