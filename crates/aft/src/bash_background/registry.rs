@@ -366,6 +366,18 @@ pub(crate) struct RegistryInner {
     wait_detach_sessions: Mutex<HashSet<String>>,
     active_wait_sessions: Mutex<HashMap<String, usize>>,
     wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
+    /// Finished tasks dropped from `tasks` by `evict_finished`, keyed by task
+    /// id. Their disk bundles stay until the longer `cleanup_finished`
+    /// retention, so this keeps each bundle's path and the moment the task
+    /// was first seen terminal; `cleanup_finished` deletes the bundle on the
+    /// same schedule it would have used had the task stayed in memory.
+    evicted_bundles: Mutex<HashMap<String, EvictedTaskBundle>>,
+}
+
+/// A task evicted from memory whose disk bundle is still retained.
+struct EvictedTaskBundle {
+    paths: TaskPaths,
+    terminal_at: Instant,
 }
 
 pub(crate) struct BgTask {
@@ -637,6 +649,7 @@ impl BgTaskRegistry {
                 wait_detach_sessions: Mutex::new(HashSet::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
+                evicted_bundles: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1178,6 +1191,7 @@ impl BgTaskRegistry {
             emit_frame,
             cache.as_ref(),
         );
+        release_terminal_io_handles(task);
         Ok(())
     }
 
@@ -4101,10 +4115,35 @@ impl BgTaskRegistry {
             .map(|_| ())
     }
 
+    /// Deletes the disk bundles of delivered terminal tasks that finished more
+    /// than `older_than` ago, and drops any of them still held in memory.
+    ///
+    /// A task's age counts from when it was first seen terminal, including
+    /// tasks `evict_finished` already dropped from memory: those are tracked in
+    /// `evicted_bundles` and deleted here on the same schedule, even if a later
+    /// status call reloaded one into memory in the meantime.
     pub fn cleanup_finished(&self, older_than: Duration) {
         let cutoff = Instant::now().checked_sub(older_than);
-        let removable_paths: Vec<(String, TaskPaths)> =
+        let expired = |terminal_at: Option<Instant>| match (terminal_at, cutoff) {
+            (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let evicted_terminal_at: HashMap<String, Instant> = self
+            .inner
+            .evicted_bundles
+            .lock()
+            .map(|evicted| {
+                evicted
+                    .iter()
+                    .map(|(task_id, bundle)| (task_id.clone(), bundle.terminal_at))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut resident_ids = HashSet::new();
+        let mut removable_paths: Vec<(String, TaskPaths)> =
             if let Ok(mut tasks) = self.inner.tasks.lock() {
+                resident_ids.extend(tasks.keys().cloned());
                 let removable = tasks
                     .iter()
                     .filter_map(|(task_id, task)| {
@@ -4121,12 +4160,11 @@ impl BgTaskRegistry {
                         }
 
                         let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at);
-                        let expired = match (terminal_at, cutoff) {
-                            (Some(terminal_at), Some(cutoff)) => terminal_at <= cutoff,
-                            (Some(_), None) => true,
-                            (None, _) => false,
+                        let terminal_at = match (terminal_at, evicted_terminal_at.get(task_id)) {
+                            (Some(resident), Some(evicted)) => Some(resident.min(*evicted)),
+                            (resident, evicted) => resident.or(evicted.copied()),
                         };
-                        expired.then(|| task_id.clone())
+                        expired(terminal_at).then(|| task_id.clone())
                     })
                     .collect::<Vec<_>>();
 
@@ -4142,6 +4180,26 @@ impl BgTaskRegistry {
                 Vec::new()
             };
 
+        if let Ok(mut evicted) = self.inner.evicted_bundles.lock() {
+            for (task_id, _) in &removable_paths {
+                evicted.remove(task_id);
+            }
+            // A task reloaded into memory is judged above with its resident
+            // state; only bundles no resident task owns are retired here.
+            let expired_evicted: Vec<String> = evicted
+                .iter()
+                .filter(|(task_id, bundle)| {
+                    !resident_ids.contains(*task_id) && expired(Some(bundle.terminal_at))
+                })
+                .map(|(task_id, _)| task_id.clone())
+                .collect();
+            for task_id in expired_evicted {
+                if let Some(bundle) = evicted.remove(&task_id) {
+                    removable_paths.push((task_id, bundle.paths));
+                }
+            }
+        }
+
         for (task_id, paths) in removable_paths {
             match delete_task_bundle(&paths) {
                 Ok(()) => log::debug!("deleted persisted background task bundle {task_id}"),
@@ -4150,6 +4208,118 @@ impl BgTaskRegistry {
                 ),
             }
         }
+    }
+
+    /// Drops finished tasks from the in-memory map once nothing needs them
+    /// there, so a long-lived process does not keep every task it ever ran.
+    ///
+    /// A task is evicted when it is terminal, its completion was delivered (or
+    /// never wanted: `mark_terminal` records a no-notify task as delivered),
+    /// it has been terminal for at least `older_than`, no completion for it is
+    /// still queued, no foreground wait is registered on it, and it has no
+    /// pattern-watch state. Its disk bundle and aft.db row are left in place:
+    /// `status` and `kill` reload an evicted task from them on demand (the
+    /// session replay and `status_relaxed_task` fallbacks), and
+    /// `cleanup_finished` still deletes the bundle when the longer retention
+    /// runs out. Returns the number of tasks evicted.
+    pub fn evict_finished(&self, older_than: Duration) -> usize {
+        let cutoff = Instant::now().checked_sub(older_than);
+        let evictable = |task: &BgTask| -> Option<Instant> {
+            let delivered_terminal = task
+                .state
+                .lock()
+                .map(|state| {
+                    state.metadata.status.is_terminal() && state.metadata.completion_delivered
+                })
+                .unwrap_or(false);
+            if !delivered_terminal {
+                return None;
+            }
+            let terminal_at = task.terminal_at.lock().ok().and_then(|at| *at)?;
+            match cutoff {
+                Some(cutoff) if terminal_at > cutoff => None,
+                _ => Some(terminal_at),
+            }
+        };
+
+        let candidates: Vec<String> = match self.inner.tasks.lock() {
+            Ok(tasks) => tasks
+                .iter()
+                .filter(|(_, task)| evictable(task).is_some())
+                .map(|(task_id, _)| task_id.clone())
+                .collect(),
+            Err(_) => return 0,
+        };
+        if candidates.is_empty() {
+            return 0;
+        }
+
+        let queued: HashSet<String> = self
+            .inner
+            .completions
+            .lock()
+            .map(|completions| {
+                completions
+                    .iter()
+                    .map(|completion| completion.task_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let waited: HashSet<String> = self
+            .inner
+            .wait_registered_tasks
+            .lock()
+            .map(|sessions| sessions.values().flatten().cloned().collect())
+            .unwrap_or_default();
+        let candidates: Vec<String> = candidates
+            .into_iter()
+            .filter(|task_id| {
+                let (controlled, matched) = self.task_watch_state(task_id);
+                !queued.contains(task_id)
+                    && !waited.contains(task_id)
+                    && !controlled
+                    && !matched
+                    && self.active_watch_count(task_id) == 0
+            })
+            .collect();
+
+        // Re-check under the map lock: a task can change between the scan and
+        // here (a promote clears `completion_delivered`).
+        let evicted: Vec<(Arc<BgTask>, Instant)> = match self.inner.tasks.lock() {
+            Ok(mut tasks) => candidates
+                .into_iter()
+                .filter_map(|task_id| {
+                    let terminal_at = evictable(tasks.get(&task_id)?)?;
+                    tasks.remove(&task_id).map(|task| (task, terminal_at))
+                })
+                .collect(),
+            Err(_) => return 0,
+        };
+        if evicted.is_empty() {
+            return 0;
+        }
+
+        if let Ok(mut bundles) = self.inner.evicted_bundles.lock() {
+            for (task, terminal_at) in &evicted {
+                bundles
+                    .entry(task.task_id.clone())
+                    .and_modify(|bundle| bundle.terminal_at = bundle.terminal_at.min(*terminal_at))
+                    .or_insert_with(|| EvictedTaskBundle {
+                        paths: task.paths.clone(),
+                        terminal_at: *terminal_at,
+                    });
+            }
+        }
+        if let Ok(mut causes) = self.inner.completion_pass_cause.lock() {
+            for (task, _) in &evicted {
+                causes.remove(&task.task_id);
+            }
+        }
+        let count = evicted.len();
+        // Dropped here, outside every registry lock: the last reference closes
+        // any handles the task still held.
+        drop(evicted);
+        count
     }
 
     pub fn drain_completions(&self) -> Vec<BgCompletion> {
@@ -7056,6 +7226,37 @@ impl BgTask {
     }
 }
 
+/// Closes a finished task's pre-opened I/O handles: the pinned session, task,
+/// `io` and `control` directories plus the stdout, stderr, exit and
+/// sandbox-unavailable files (8 descriptors for a piped task).
+///
+/// The daemon keeps them only so it can write the exit or kill marker through
+/// the original O_EXCL handle while the child may still be running. Once the
+/// task is terminal and its child slot is empty, nothing writes through them
+/// again: the child wrote its own output through inherited copies, every
+/// daemon-side write goes through `TaskIoHandles::write` (which syncs before
+/// returning), and all later readers open the task's paths. Holding them any
+/// longer only leaks descriptors for as long as the process lives. Both later
+/// users of `io_handles` (`reap_child` and the piped kill path) fall back to
+/// path-based writes when the handles are gone.
+///
+/// The handles are taken under the state lock and closed after it is released.
+fn release_terminal_io_handles(task: &BgTask) {
+    let handles = match task.state.lock() {
+        Ok(mut state)
+            if state.metadata.status.is_terminal()
+                && matches!(
+                    state.runtime,
+                    TaskRuntime::Piped(None) | TaskRuntime::Pty(None)
+                ) =>
+        {
+            state.io_handles.take()
+        }
+        _ => None,
+    };
+    drop(handles);
+}
+
 /// Reap an exited direct child handle, then clear the slot.
 ///
 /// Dropping a [`std::process::Child`] does NOT `wait()` on the underlying OS
@@ -8945,6 +9146,238 @@ mod tests {
         assert!(registry.inner.tasks.lock().unwrap().contains_key(&task_id));
     }
 
+    /// Path of an open descriptor of this process, read from the kernel.
+    #[cfg(target_os = "linux")]
+    fn descriptor_path(fd: i32) -> Option<PathBuf> {
+        fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+    }
+
+    /// Path of an open descriptor of this process, read from the kernel.
+    #[cfg(target_os = "macos")]
+    fn descriptor_path(fd: i32) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL-terminated,
+        // into the buffer; a closed or reused descriptor only returns -1.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return None;
+        }
+        let len = buf.iter().position(|byte| *byte == 0)?;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+    }
+
+    /// Counts this process's real open descriptors (files and directories)
+    /// whose path lies under `root`, by walking the kernel's descriptor table.
+    /// Other tests running in parallel use their own temp directories, so
+    /// they never land under `root`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn open_descriptors_under(root: &Path) -> usize {
+        let fd_dir = if Path::new("/proc/self/fd").is_dir() {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let fds: Vec<i32> = fs::read_dir(fd_dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect();
+        fds.into_iter()
+            .filter(|fd| descriptor_path(*fd).is_some_and(|path| path.starts_with(root)))
+            .count()
+    }
+
+    /// Finished tasks close their pre-opened output handles: the descriptors
+    /// the process holds under the session's task directory return to the
+    /// baseline instead of growing by about 8 per task until the process
+    /// exits.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn finished_tasks_release_their_io_descriptors() {
+        const TASKS: usize = 6;
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let session = "ses-descriptor-release";
+        let session_dir = fs::canonicalize(storage.path()).unwrap().join(
+            session_tasks_dir(storage.path(), session)
+                .strip_prefix(storage.path())
+                .unwrap(),
+        );
+        let baseline = open_descriptors_under(&session_dir);
+
+        let task_ids: Vec<String> = (0..TASKS)
+            .map(|_| {
+                registry
+                    .spawn(
+                        SpawnPlan::Unsandboxed,
+                        QUICK_SUCCESS_COMMAND,
+                        session.to_string(),
+                        project.path().to_path_buf(),
+                        HashMap::new(),
+                        Some(Duration::from_secs(30)),
+                        storage.path().to_path_buf(),
+                        TASKS * 2,
+                        false,
+                        false,
+                        Some(project.path().to_path_buf()),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        for task_id in &task_ids {
+            wait_for_terminal_snapshot(
+                &registry,
+                task_id,
+                session,
+                project.path(),
+                storage.path(),
+            );
+        }
+
+        // The watchdog thread may be finishing a transition that a status
+        // poll already reported terminal; give it a moment to close up.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut open = open_descriptors_under(&session_dir);
+        while open > baseline && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            open = open_descriptors_under(&session_dir);
+        }
+        assert_eq!(
+            open, baseline,
+            "{TASKS} finished tasks still hold {} descriptors under {}",
+            open - baseline,
+            session_dir.display()
+        );
+        assert_eq!(
+            registry.inner.tasks.lock().unwrap().len(),
+            TASKS,
+            "releasing handles must not drop the tasks themselves"
+        );
+    }
+
+    /// An evicted task is answered from its persisted record with exactly the
+    /// snapshot a caller saw while it was resident, and its bundle is still
+    /// deleted on the normal retention schedule.
+    #[cfg(unix)]
+    #[test]
+    fn evicted_task_answers_status_identically() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, _db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-evict-status";
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "printf 'evicted output\\n'; printf 'to stderr\\n' >&2; exit 3",
+                session.to_string(),
+                project.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+        wait_for_terminal_snapshot(&registry, &task_id, session, project.path(), storage.path());
+        let status = |registry: &BgTaskRegistry| {
+            registry
+                .status(
+                    &task_id,
+                    session,
+                    Some(project.path()),
+                    Some(storage.path()),
+                    RUNNING_OUTPUT_PREVIEW_BYTES,
+                )
+                .map(|snapshot| serde_json::to_value(snapshot).unwrap())
+        };
+
+        assert_eq!(
+            registry.evict_finished(Duration::ZERO),
+            0,
+            "an undelivered completion keeps the task resident"
+        );
+        assert_eq!(registry.drain_completions_for_session(Some(session)).len(), 1);
+        assert_eq!(
+            registry.ack_completions_for_session(Some(session), std::slice::from_ref(&task_id)),
+            vec![task_id.clone()]
+        );
+        let before = status(&registry).expect("resident terminal status");
+        assert_eq!(before["status"], "failed");
+        assert_eq!(before["exit_code"], 3);
+        assert!(before["output_preview"]
+            .as_str()
+            .unwrap()
+            .contains("evicted output"));
+        let paths = registry.task_for_test(&task_id).unwrap().paths.clone();
+
+        assert_eq!(registry.evict_finished(Duration::from_secs(3600)), 0);
+        assert_eq!(registry.evict_finished(Duration::ZERO), 1);
+        assert!(registry.task_for_test(&task_id).is_none());
+        assert!(paths.json.exists(), "eviction keeps the persisted bundle");
+
+        let after = status(&registry).expect("evicted task must still answer status");
+        assert_eq!(after, before);
+
+        // The status call reloaded the task; retention still counts from when
+        // it first finished and removes the bundle and the resident copy.
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(!paths.json.exists(), "retention must still delete the bundle");
+        assert!(registry.task_for_test(&task_id).is_none());
+        assert!(registry.inner.evicted_bundles.lock().unwrap().is_empty());
+    }
+
+    /// Retention deletes the bundle of a task that was evicted and never
+    /// reloaded.
+    #[test]
+    fn cleanup_finished_deletes_bundles_of_evicted_tasks() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "printf output", "stdout\n", "", false);
+        task.set_completion_delivered(true, &registry).unwrap();
+        let paths = task.paths.clone();
+        drop(task);
+
+        assert_eq!(registry.evict_finished(Duration::ZERO), 1);
+        assert!(registry.task_for_test(&task_id).is_none());
+        registry.cleanup_finished(Duration::from_secs(3600));
+        assert!(paths.json.exists(), "bundle kept until retention expires");
+
+        registry.cleanup_finished(Duration::ZERO);
+        assert!(!paths.json.exists());
+        assert!(registry.inner.evicted_bundles.lock().unwrap().is_empty());
+    }
+
+    /// A task with pattern-watch state stays resident even when delivered.
+    #[test]
+    fn evict_finished_keeps_watched_tasks() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, "printf output", "stdout\n", "", false);
+        task.set_completion_delivered(true, &registry).unwrap();
+        // Registered straight into the watch table: `register_watch` on an
+        // already-terminal task scans and retires the watch immediately, so it
+        // cannot leave the live-watch state this guard is about.
+        registry
+            .inner
+            .watch_registry
+            .lock()
+            .unwrap()
+            .register(
+                task_id.clone(),
+                crate::bash_background::watches::WatchPattern::Substring("never".to_string()),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(registry.evict_finished(Duration::ZERO), 0);
+        assert!(registry.task_for_test(&task_id).is_some());
+    }
+
     /// Verify that the live watchdog path (reap_child) gives an exited
     /// child one watchdog pass for its exit marker to land, then marks the
     /// task Failed if the next pass still sees no marker.
@@ -10027,6 +10460,21 @@ mod tests {
         assert!(!format!("{row:?}").contains(&ticket));
         let leaks = files_containing(storage.path(), ticket.as_bytes());
         assert!(leaks.is_empty(), "ticket persisted in {leaks:?}");
+
+        // Evicting the finished task and reloading it from its persisted
+        // record must not bring the ticket back.
+        registry.drain_completions_for_session(Some(session));
+        registry.ack_completions_for_session(Some(session), std::slice::from_ref(&task_id));
+        assert_eq!(registry.evict_finished(Duration::ZERO), 1);
+        wait_for_terminal_snapshot(
+            &registry,
+            &task_id,
+            session,
+            project.path(),
+            storage.path(),
+        );
+        assert_eq!(crate::gh_shim_ticket::redeem(&ticket), None);
+        assert_eq!(crate::gh_shim_ticket::live_count_for_task(&task_id), 0);
     }
 
     fn pattern_match_frames(frames: &Mutex<Vec<PushFrame>>) -> Vec<BashPatternMatchFrame> {
