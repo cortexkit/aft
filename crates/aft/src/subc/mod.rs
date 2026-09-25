@@ -12348,7 +12348,16 @@ mod tests {
     #[test]
     fn real_configure_rerun_waits_for_the_yielding_tail_and_applies_effects_once() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let executor = Arc::new(Executor::new());
+        // Two tails hold two maintenance workers at once, so the pool must not
+        // follow the host's core count: a 3-core CI runner gets a default pool
+        // of 2 with one maintenance slot, and root B's tail would never start.
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 4,
+            read_cap: 2,
+            actor_cap: 2,
+            heavy_permits: 2,
+            drr_quantum: 1,
+        }));
         let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
         let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
         let generation_a = held_a.ctx.configure_generation();
