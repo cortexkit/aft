@@ -43,6 +43,9 @@ mod crash_diagnostics;
 mod cuda_test;
 mod db_migration_race_test;
 mod db_read_fallback_test;
+// Stands in shell scripts for Apple's developer-tools launcher.
+#[cfg(unix)]
+mod developer_tools_git_test;
 // The durable-restart matrix SIGKILLs a child publisher at each failpoint; the
 // kill primitive and the parked-child protocol are POSIX-only.
 #[cfg(unix)]
