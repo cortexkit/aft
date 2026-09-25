@@ -160,7 +160,10 @@ fn canonical_dirs(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// First executable `binary` on a PATH-style list, the one a spawn would run.

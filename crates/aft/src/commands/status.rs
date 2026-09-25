@@ -315,7 +315,8 @@ impl AppContext {
         // property of this root, so it is added here instead of being
         // recorded by configure. Status renderers print each reason as-is.
         if !crate::developer_tools::git_usable() {
-            degraded_reasons.push(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
+            degraded_reasons
+                .push(crate::developer_tools::MISSING_DEVELOPER_TOOLS_REASON.to_string());
         }
         let degraded = !degraded_reasons.is_empty();
         let artifact_owner = self

@@ -83,8 +83,7 @@ fn configure_never_runs_the_launcher_git_without_developer_tools() {
     let mut aft = spawn(&path, &launcher_dir);
     configure(&mut aft, &project);
     let grep = aft.send(
-        &json!({ "id": "grep", "command": "grep", "pattern": "main", "path": project })
-            .to_string(),
+        &json!({ "id": "grep", "command": "grep", "pattern": "main", "path": project }).to_string(),
     );
     assert_eq!(grep["success"], true, "grep failed: {grep:?}");
     let first = status(&mut aft);
@@ -146,8 +145,8 @@ fn a_real_git_earlier_on_path_is_still_used() {
             .success());
     }
 
-    let path = std::env::join_paths([homebrew.clone(), launcher_dir.clone(), "/bin".into()])
-        .unwrap();
+    let path =
+        std::env::join_paths([homebrew.clone(), launcher_dir.clone(), "/bin".into()]).unwrap();
     let mut aft = spawn(&path, &launcher_dir);
     configure(&mut aft, &project);
     let snapshot = status(&mut aft);
