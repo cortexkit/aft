@@ -791,6 +791,9 @@ if drifted="$(sibling_lock_drift_packages)"; then
   say "restored Cargo.lock: sibling path-dependency drift in $(printf '%s' "$drifted" | paste -sd, -) (an editor's cargo run without --locked; the committed lock is what CI tests)"
 fi
 if [ -n "$(git -C "$REPO" status --porcelain)" ]; then
+  # Name the paths: a tree that is dirty only for a moment (a tool writing
+  # into the checkout) is otherwise invisible by the time anyone looks.
+  git -C "$REPO" status --porcelain | head -20 >&2
   refuse "working tree is not clean (commit or stash before pushing a train)"
 fi
 
