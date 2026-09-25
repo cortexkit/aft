@@ -8,10 +8,6 @@ use super::registry::{BgTaskRegistry, WatchdogPassCause};
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const FINISHED_RETENTION: Duration = Duration::from_secs(60 * 60);
-/// How long a delivered finished task stays in the registry's memory. After
-/// this it is answered from its persisted record until `FINISHED_RETENTION`
-/// deletes the bundle, so a long-lived process holds only recent tasks.
-const FINISHED_MEMORY_RETENTION: Duration = Duration::from_secs(5 * 60);
 
 pub(crate) fn start(registry: BgTaskRegistry) {
     thread::spawn(move || {
@@ -27,7 +23,6 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                     WatchdogPassCause::Tick
                 }
                 recv(cleanup_ticker) -> _ => {
-                    registry.evict_finished(FINISHED_MEMORY_RETENTION);
                     registry.cleanup_finished(FINISHED_RETENTION);
                     continue;
                 }
