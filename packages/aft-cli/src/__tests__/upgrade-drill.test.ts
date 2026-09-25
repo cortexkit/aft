@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 /**
- * Regression tests for the upgrade drill: a 0.57-era user with an old config
+ * Regression tests for an upgrade: a 0.57-era user with an old config
  * and data upgraded to 0.58, then ran `doctor`, `doctor --fix` and `setup`.
  * Everything runs under a temporary HOME/XDG/AFT_CACHE_DIR and cwd so nothing
  * touches the operator's real config, cache or project.

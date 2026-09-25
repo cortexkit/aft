@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 /**
- * Regression tests for the clean-install setup drill: a config the user cannot
+ * Regression tests for a clean install: a config the user cannot
  * write, a machine with no binary yet, download failures, and the feature list
  * layout. Every test runs under a temporary HOME/XDG/AFT_CACHE_DIR so nothing
  * can reach the operator's real config, cache or binary.

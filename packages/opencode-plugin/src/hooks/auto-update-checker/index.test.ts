@@ -374,9 +374,9 @@ describe("auto-update-checker/index", () => {
     });
   });
 
-  // The drill log showed "Update available (latest): 0.58.0 → 0.57.2": the
-  // installed release was ahead of the dist-tag and the checker offered the
-  // older one. Neither case may toast, prepare, or install anything.
+  // A fresh release installed before the channel's dist-tag moves is ahead of
+  // "latest", and the checker used to offer the older version ("Update
+  // available: 0.58.0 → 0.57.2"). Neither case may toast, prepare, or install anything.
   for (const [label, installed, latest] of [
     ["installed is newer than latest", "0.58.0", "0.57.2"],
     ["installed equals latest", "0.58.0", "0.58.0"],

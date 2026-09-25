@@ -1,0 +1,19 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "developer-tools-git-gate",
+    "semantic-backend-unavailable-status",
+    "bind-shared-hold-requeue",
+    "config-error-state",
+    "setup-drill-fixes",
+    "onnx-install-staging-dir",
+    "bash-reply-timing-contract",
+    "callgraph-readonly-force-token"
+  ],
+  "note": "Fence files touched: lib.rs declares the new developer_tools module; search_index.rs skips its git probes when Apple's developer tools are missing, taking the existing non-git fallbacks; semantic_search/mod.rs changes only the text of the lexical-only fallback when the embedding backend is unreachable. No ranking, fusion, lane or truncation logic changed, and the parity fixture file is untouched, so ranked rows should be byte-equal to the reference."
+}
