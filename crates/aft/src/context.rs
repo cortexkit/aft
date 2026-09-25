@@ -10601,6 +10601,54 @@ mod callgraph_store_for_ops_tests {
         );
     }
 
+    /// A writer root can hold a pending force token and then lose its owner
+    /// lease. A read-only root can never run the forced build, so the token must
+    /// not keep every later callgraph query Unavailable: the root has to fall
+    /// back to the owner's published store.
+    #[test]
+    fn pending_force_token_on_root_that_becomes_read_only_recovers() {
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let root = std::fs::canonicalize(project.path()).expect("canonical root");
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").expect("write source");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                indexes: crate::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let (store, _stats) = crate::callgraph_store::CallGraphStore::cold_build_with_lease_chunked(
+            ctx.callgraph_store_dir(),
+            root.clone(),
+            &[source],
+            1,
+        )
+        .expect("publish the owner's callgraph store");
+        drop(store);
+
+        ctx.set_cache_writer_capabilities(true, true);
+        ctx.mark_callgraph_store_force_rebuild();
+        // The owner lease moves to another process: this root is now read-only.
+        ctx.set_cache_writer_capabilities(false, true);
+
+        assert!(
+            matches!(ctx.callgraph_store_for_ops(), CallgraphStoreAccess::Ready(_)),
+            "a read-only root must serve the published store instead of waiting on a rebuild it cannot run"
+        );
+        assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+    }
+
     #[test]
     fn watcher_gap_invalidation_marks_force_rebuild_for_writer_roots() {
         let project = TempDir::new().expect("project tempdir");

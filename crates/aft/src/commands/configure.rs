@@ -5860,7 +5860,14 @@ fn run_configure_maintenance_unit(
     let stage = continuation.stage;
     ctx.note_configure_tail_stage(Some(stage.label()));
     wait_on_configure_tail_stage_gate_for_test(&continuation.job.canonical_cache_root, stage);
-    let result = run_configure_maintenance_unit_inner(ctx, continuation, detach_storage_sweeps);
+    // Maintenance units run on whatever executor thread drains the tail, and
+    // that thread's log session is left over from its last request. Tag every
+    // line this unit logs with the session whose configure queued the job, so
+    // a callgraph rebuild is never attributed to an unrelated session.
+    let session = Some(continuation.job.session_id.clone());
+    let result = log_ctx::with_session(session, || {
+        run_configure_maintenance_unit_inner(ctx, continuation, detach_storage_sweeps)
+    });
     ctx.note_configure_tail_stage(None);
     record_configure_unit_for_test(&continuation.job, stage);
     result
@@ -11922,9 +11929,7 @@ mod tests {
         assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 3);
     }
 
-    /// Writes `packages/pkg-a/package.json` under `root` with `contents`. The
-    /// callgraph build key fingerprints these manifests by length and mtime,
-    /// so changing the length is enough to make a reconfigure non-equivalent.
+    /// Writes `packages/pkg-a/package.json` under `root` with `contents`.
     fn write_workspace_manifest(root: &std::path::Path, contents: &str) {
         std::fs::create_dir_all(root.join("packages/pkg-a")).unwrap();
         std::fs::write(root.join("packages/pkg-a/package.json"), contents).unwrap();
@@ -11946,8 +11951,11 @@ mod tests {
         }))
     }
 
+    /// A release bumps every package's `version`, and adding a dependency
+    /// rewrites `dependencies`. Neither is read by the module resolver, so the
+    /// reconfigure stays equivalent and keeps the callgraph store.
     #[test]
-    fn writer_reconfigure_after_manifest_change_mints_callgraph_force_token() {
+    fn writer_reconfigure_after_version_bump_keeps_callgraph_store() {
         let _artifact_guard = artifact_owner_test_lock();
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -11955,20 +11963,85 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(root.path());
-        write_workspace_manifest(root.path(), "{}");
+        write_workspace_manifest(
+            root.path(),
+            r#"{"name":"@ws/pkg-a","version":"1.0.0","main":"index.ts"}"#,
+        );
         let ctx = test_context();
         let request = callgraph_only_configure_request(root.path(), storage.path());
 
         assert!(handle_configure_for_test(&request, &ctx).success);
         assert!(ctx.callgraph_writer(), "a main checkout owns its callgraph");
         assert_eq!(ctx.pending_callgraph_store_force_token(), None);
+        let generation = ctx.configure_generation();
 
-        write_workspace_manifest(root.path(), "{\"version\":\"2\"}");
-        assert!(handle_configure_for_test(&request, &ctx).success);
-        assert!(
-            ctx.pending_callgraph_store_force_token().is_some(),
-            "a package.json change on a writer root forces a full callgraph rebuild"
+        write_workspace_manifest(
+            root.path(),
+            r#"{"name":"@ws/pkg-a","version":"1.0.1","main":"index.ts","dependencies":{"left-pad":"^1.3.0"}}"#,
         );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert_eq!(
+            ctx.configure_generation(),
+            generation,
+            "a version bump must leave the configure equivalent"
+        );
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token(),
+            None,
+            "a version bump must not force a callgraph rebuild"
+        );
+    }
+
+    /// An `exports` change does move module resolution, but only for the files
+    /// that import the package. The reconfigure hands the changed manifest to
+    /// the incremental refresh instead of forcing a rebuild.
+    #[test]
+    fn writer_reconfigure_after_exports_change_refreshes_manifest_instead_of_rebuilding() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        write_workspace_manifest(
+            root.path(),
+            r#"{"name":"@ws/pkg-a","exports":{".":"./a.ts"}}"#,
+        );
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        crate::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            canonical_root.clone(),
+            Duration::ZERO,
+            false,
+        );
+        let ctx = test_context();
+        let request = callgraph_only_configure_request(root.path(), storage.path());
+
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert!(ctx.callgraph_writer(), "a main checkout owns its callgraph");
+
+        write_workspace_manifest(
+            root.path(),
+            r#"{"name":"@ws/pkg-a","exports":{".":"./b.ts"}}"#,
+        );
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token(),
+            None,
+            "an exports change must refresh importers, not force a rebuild"
+        );
+        let manifest = canonical_root.join("packages/pkg-a/package.json");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !crate::callgraph_store::callgraph_refresh_worker_test_paths(&canonical_root)
+            .contains(&manifest)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the changed manifest never reached the callgraph refresh"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        crate::callgraph_store::clear_callgraph_refresh_worker_test_seam(&canonical_root);
     }
 
     #[test]
@@ -12002,8 +12075,15 @@ mod tests {
             "a linked worktree borrows the owner's callgraph read-only"
         );
 
-        write_workspace_manifest(&worktree, "{\"version\":\"2\"}");
-        assert!(handle_configure_for_test(&request, &ctx).success);
+        // A different storage directory is a different callgraph store, so the
+        // reconfigure is not equivalent for the callgraph lane.
+        let moved_storage = temp.path().join("moved-storage");
+        let moved = callgraph_only_configure_request(&worktree, &moved_storage);
+        assert!(handle_configure_for_test(&moved, &ctx).success);
+        assert!(
+            !ctx.callgraph_writer(),
+            "the worktree still borrows its owner's callgraph read-only"
+        );
         assert_eq!(
             ctx.pending_callgraph_store_force_token(),
             None,

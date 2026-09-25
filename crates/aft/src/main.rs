@@ -4002,6 +4002,147 @@ mod watcher_filter_tests {
         // The next callgraph op will see the force flag and background-build.
     }
 
+    /// Lost watcher events on a tree where three files changed must refresh
+    /// exactly those three files and leave the same edges a cold build of the
+    /// tree produces, without forcing a rebuild of the whole store.
+    #[test]
+    fn watcher_overflow_refreshes_exactly_the_edited_files() {
+        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                30
+            )),
+            "a prior callgraph refresh worker should fully stop before this test"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let write = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        write("util.ts", "export function helper() { return 1; }\n");
+        write("extra.ts", "export function extra() { return 2; }\n");
+        write(
+            "a.ts",
+            "import { helper } from \"./util\";\nexport function a() { return helper(); }\n",
+        );
+        write(
+            "b.ts",
+            "import { a } from \"./a\";\nexport function b() { return a(); }\n",
+        );
+        write("c.ts", "export function c() { return 3; }\n");
+        write(
+            "d.ts",
+            "import { c } from \"./c\";\nexport function d() { return c(); }\n",
+        );
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(tmp.path().join("storage")),
+                indexes: aft::config::IndexesConfig {
+                    trigram: false,
+                    semantic: false,
+                    callgraph: true,
+                },
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        aft::root_cache::configure_artifact_access(
+            &root,
+            &aft::search_index::artifact_cache_key(&root),
+            false,
+        );
+        ctx.rebuild_gitignore();
+        let resident = ctx
+            .ensure_callgraph_store()
+            .expect("ensure callgraph store")
+            .expect("callgraph store should build on demand");
+        drop(resident);
+
+        // Three edits the watcher never reported: one changes a call target,
+        // one keeps its size but changes its bytes, and one is a new file.
+        let edited = [
+            write(
+                "a.ts",
+                "import { extra } from \"./extra\";\nexport function a() { return extra(); }\n",
+            ),
+            write("c.ts", "export function c() { return 4; }\n"),
+            write(
+                "e.ts",
+                "import { d } from \"./d\";\nexport function e() { return d(); }\n",
+            ),
+        ];
+        let expected_paths = edited
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::ZERO,
+            false,
+        );
+
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
+            .unwrap();
+        drain_watcher_events(&ctx);
+
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token_for_test(),
+            None,
+            "lost watcher events must be reconciled, not answered with a full rebuild"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0 == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reconcile never handed its changed paths to the refresh"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                20
+            )),
+            "the reconcile refresh should finish"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_paths(&root),
+            expected_paths,
+            "the reconcile must refresh exactly the files that differ from the store"
+        );
+        assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
+        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
+
+        let refreshed = aft::callgraph_store::CallGraphStore::open_readonly(
+            ctx.callgraph_store_dir(),
+            root.clone(),
+        )
+        .expect("open refreshed store")
+        .expect("published store")
+        .edge_snapshot()
+        .expect("refreshed edges");
+        let cold_store = aft::callgraph_store::CallGraphStore::open(
+            tmp.path().join("cold-store"),
+            root.clone(),
+        )
+        .expect("open cold store");
+        let files: Vec<_> = aft::callgraph::walk_project_files(&root).collect();
+        cold_store.cold_build(&files).expect("cold build");
+        let cold = cold_store.edge_snapshot().expect("cold edges");
+        assert_eq!(refreshed, cold, "reconciled edges must equal a cold build");
+    }
+
     #[test]
     fn watcher_large_batch_refreshes_every_index_incrementally() {
         let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()

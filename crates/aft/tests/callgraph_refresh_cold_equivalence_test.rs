@@ -926,3 +926,85 @@ fn rust_edit_resolves_through_stored_module_parents_and_inline_modules() {
         cold.edges
     );
 }
+
+const EXPORTS_WORKSPACE: &[(&str, &str)] = &[
+    (
+        "package.json",
+        "{\"name\":\"root\",\"private\":true,\"workspaces\":[\"packages/*\"]}\n",
+    ),
+    (
+        "packages/core/package.json",
+        "{\"name\":\"@s/core\",\"version\":\"1.0.0\",\"exports\":{\".\":\"./src/a.ts\"}}\n",
+    ),
+    ("packages/core/src/a.ts", "export function run() { return 1; }\n"),
+    ("packages/core/src/b.ts", "export function run() { return 2; }\n"),
+    (
+        "packages/app/package.json",
+        "{\"name\":\"@s/app\",\"main\":\"src/index.ts\"}\n",
+    ),
+    ("packages/app/src/index.ts", "export * from \"@s/core\";\n"),
+    (
+        "packages/app/src/main.ts",
+        "import { run } from \"./index\";\nexport function main() { run(); }\n",
+    ),
+    (
+        "packages/app/src/direct.ts",
+        "import { run } from \"@s/core\";\nexport function direct() { run(); }\n",
+    ),
+    (
+        "packages/app/src/local.ts",
+        "import { main } from \"./main\";\nexport function local() { main(); }\n",
+    ),
+];
+
+/// A release bumps `version` and adding a dependency rewrites `dependencies`;
+/// the resolver reads neither. An `exports` change moves what `@s/core`
+/// resolves to, for the file importing it directly and for the barrel that
+/// re-exports it (and so for the barrel's own importers). Refreshing only the
+/// changed manifest must leave the graph a cold build of the new tree has.
+#[test]
+fn workspace_exports_change_refreshes_package_importers() {
+    let project = tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    let stores = tempdir().unwrap();
+    for (rel, content) in EXPORTS_WORKSPACE {
+        write_file(&root, rel, content);
+    }
+    let store =
+        CallGraphStore::open(stores.path().join("incremental"), root.to_path_buf()).unwrap();
+    let files: Vec<PathBuf> = walk_project_files(&root).collect();
+    store.cold_build(&files).unwrap();
+    assert!(
+        edges_to(&snapshot(&store), "run")
+            .iter()
+            .all(|edge| edge.0 == "packages/core/src/a.ts"),
+        "fixture must start resolved to the first export target"
+    );
+
+    let manifest = write_file(
+        &root,
+        "packages/core/package.json",
+        "{\"name\":\"@s/core\",\"version\":\"1.0.1\",\"exports\":{\".\":\"./src/a.ts\"},\"dependencies\":{\"left-pad\":\"^1.3.0\"}}\n",
+    );
+    store.refresh_files(&[manifest]).unwrap();
+
+    let manifest = write_file(
+        &root,
+        "packages/core/package.json",
+        "{\"name\":\"@s/core\",\"version\":\"1.0.1\",\"exports\":{\".\":\"./src/b.ts\"},\"dependencies\":{\"left-pad\":\"^1.3.0\"}}\n",
+    );
+    store.refresh_files(&[manifest]).unwrap();
+    let refreshed = snapshot(&store);
+    drop(store);
+
+    let cold = cold_snapshot(&root, &stores.path().join("cold"));
+    assert_same_graph("workspace exports change", &refreshed, &cold);
+    let targets = edges_to(&cold, "run");
+    assert!(!targets.is_empty(), "{:#?}", cold.edges);
+    assert!(
+        targets
+            .iter()
+            .all(|target| target.0 == "packages/core/src/b.ts"),
+        "{targets:#?}"
+    );
+}
