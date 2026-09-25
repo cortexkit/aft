@@ -3152,9 +3152,102 @@ fn split_rust_use_items(inner: &str) -> Vec<&str> {
     items
 }
 
+thread_local! {
+    // Macro bodies are parsed with included ranges; keeping that parser apart
+    // from the shared per-language parsers means a leftover range restriction
+    // can never leak into an ordinary whole-file parse.
+    static RUST_MACRO_BODY_PARSER: RefCell<Option<Parser>> = const { RefCell::new(None) };
+}
+
 /// Extract symbols from Rust source without compiling a tree-sitter query.
 /// Handles: free functions, struct, enum, trait (as Interface), impl methods with scope chains.
+///
+/// tree-sitter parses the body of a `macro_rules!` arm and of an item-position
+/// macro invocation as an opaque token tree, so items written there would be
+/// invisible. Code bases that group whole runtimes of methods inside macro
+/// bodies depend on seeing them, so each such body is parsed again on its own
+/// and contributes its items when, and only when, it parses cleanly as Rust.
 fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    let mut macro_bodies = Vec::new();
+    extract_rs_symbols_from_root(source, *root, &mut symbols, &mut macro_bodies);
+
+    // Bodies found inside a macro body are queued on the same worklist rather
+    // than handled by recursion, so deeply nested macros cannot exhaust the
+    // call stack.
+    let mut found_macro_symbols = false;
+    while let Some(body) = macro_bodies.pop() {
+        let Some(tree) = parse_rust_macro_body(source, body) else {
+            continue;
+        };
+        let before = symbols.len();
+        extract_rs_symbols_from_root(source, tree.root_node(), &mut symbols, &mut macro_bodies);
+        found_macro_symbols |= symbols.len() > before;
+    }
+
+    if found_macro_symbols {
+        // Macro bodies are visited after the rest of the file; restore source
+        // order so outlines read top to bottom.
+        symbols.sort_by_key(|symbol| (symbol.range.start_line, symbol.range.start_col));
+    }
+    dedup_symbols(&mut symbols);
+    Ok(symbols)
+}
+
+/// The byte span strictly inside a token tree's delimiters, or `None` when the
+/// tree holds nothing but whitespace.
+fn rust_token_tree_interior(source: &str, token_tree: &Node) -> Option<tree_sitter::Range> {
+    let open = token_tree.child(0)?;
+    let last = u32::try_from(token_tree.child_count().checked_sub(1)?).ok()?;
+    let close = token_tree.child(last)?;
+    if open.id() == close.id() || !matches!(open.kind(), "{" | "(" | "[") {
+        return None;
+    }
+    let start_byte = open.end_byte();
+    let end_byte = close.start_byte();
+    if source.get(start_byte..end_byte)?.trim().is_empty() {
+        return None;
+    }
+    Some(tree_sitter::Range {
+        start_byte,
+        end_byte,
+        start_point: open.end_position(),
+        end_point: close.start_position(),
+    })
+}
+
+/// Parse one macro body as Rust items. The parse is restricted to the body's
+/// byte range of the original source, so it costs only the body's size and
+/// every node position already refers to the original file; line ranges and
+/// symbol text need no remapping. A body that does not parse cleanly (for
+/// example a template using `$(...)*` repetitions) yields `None` and
+/// contributes nothing.
+fn parse_rust_macro_body(source: &str, body: tree_sitter::Range) -> Option<Tree> {
+    RUST_MACRO_BODY_PARSER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            let mut parser = Parser::new();
+            parser.set_language(&grammar_for(LangId::Rust)).ok()?;
+            *slot = Some(parser);
+        }
+        let parser = slot.as_mut()?;
+        parser.set_included_ranges(&[body]).ok()?;
+        let tree = parser.parse(source, None)?;
+        if tree.root_node().has_error() {
+            return None;
+        }
+        Some(tree)
+    })
+}
+
+/// Walk one Rust syntax tree, appending its symbols and queueing the bodies of
+/// item-position macros for a separate parse.
+fn extract_rs_symbols_from_root(
+    source: &str,
+    root: Node<'_>,
+    symbols: &mut Vec<Symbol>,
+    macro_bodies: &mut Vec<tree_sitter::Range>,
+) {
     let lang = LangId::Rust;
     let is_pub = |node: &Node| -> bool {
         let mut child_cursor = node.walk();
@@ -3171,10 +3264,21 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
         false
     };
 
-    let item_symbol = |node: Node<'_>, kind: SymbolKind| -> Option<Symbol> {
+    // Inside a `macro_rules!` template an item may be named by a metavariable
+    // such as `$name`. That is a placeholder filled in per invocation, not a
+    // symbol anyone can look up, so such items are left out.
+    let symbol_name = |node: &Node<'_>| -> Option<String> {
         let name_node = node.child_by_field_name("name")?;
+        if name_node.kind() == "metavariable" {
+            return None;
+        }
+        Some(node_text(source, &name_node).to_string())
+    };
+
+    let item_symbol = |node: Node<'_>, kind: SymbolKind| -> Option<Symbol> {
+        let name = symbol_name(&node)?;
         Some(Symbol {
-            name: node_text(source, &name_node).to_string(),
+            name,
             kind,
             range: node_range_with_decorators(&node, source, lang),
             signature: Some(extract_signature(source, &node)),
@@ -3184,10 +3288,41 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
         })
     };
 
-    let mut symbols = Vec::new();
-    let mut pending = vec![*root];
+    let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         match node.kind() {
+            "macro_definition" => {
+                let mut rule_cursor = node.walk();
+                for rule in node.children(&mut rule_cursor) {
+                    if rule.kind() != "macro_rule" {
+                        continue;
+                    }
+                    if let Some(body) = rule
+                        .child_by_field_name("right")
+                        .and_then(|right| rust_token_tree_interior(source, &right))
+                    {
+                        macro_bodies.push(body);
+                    }
+                }
+            }
+            // Only invocations in item position can expand to items. Skipping
+            // the ones inside function bodies (`println!`, `vec!`, ...) keeps
+            // the extra parsing proportional to item-level macros.
+            "macro_invocation"
+                if node.parent().is_some_and(|parent| {
+                    matches!(parent.kind(), "source_file" | "declaration_list")
+                }) =>
+            {
+                let body = node
+                    .child_by_field_name("macro")
+                    .and_then(|name| name.next_sibling())
+                    .and_then(|bang| bang.next_sibling())
+                    .filter(|tree| tree.kind() == "token_tree")
+                    .and_then(|tree| rust_token_tree_interior(source, &tree));
+                if let Some(body) = body {
+                    macro_bodies.push(body);
+                }
+            }
             "function_item" => {
                 let declaration_list_owner = node
                     .parent()
@@ -3198,10 +3333,10 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
                     .is_some_and(|owner| owner.kind() != "mod_item");
 
                 if !in_non_module_declaration_list {
-                    if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(name) = symbol_name(&node) {
                         let scope_chain = rust_mod_scope_chain(&node, source);
                         symbols.push(Symbol {
-                            name: node_text(source, &name_node).to_string(),
+                            name,
                             kind: SymbolKind::Function,
                             range: node_range_with_decorators(&node, source, lang),
                             signature: Some(extract_signature(source, &node)),
@@ -3259,10 +3394,9 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
                                 loop {
                                     let method = method_cursor.node();
                                     if method.kind() == "function_item" {
-                                        if let Some(name_node) = method.child_by_field_name("name")
-                                        {
+                                        if let Some(name) = symbol_name(&method) {
                                             symbols.push(Symbol {
-                                                name: node_text(source, &name_node).to_string(),
+                                                name,
                                                 kind: SymbolKind::Method,
                                                 range: node_range_with_decorators(
                                                     &method, source, lang,
@@ -3309,9 +3443,6 @@ fn extract_rs_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError
         }
         pending.extend(children.into_iter().rev());
     }
-
-    dedup_symbols(&mut symbols);
-    Ok(symbols)
 }
 
 /// Extract symbols from Go source.
@@ -9990,6 +10121,218 @@ const helpers = {
                 s.name,
                 s.range
             );
+        }
+    }
+
+    /// Source text of the whole lines a symbol's range covers.
+    fn symbol_lines<'a>(source: &'a str, symbol: &Symbol) -> Vec<&'a str> {
+        source
+            .lines()
+            .skip(symbol.range.start_line as usize)
+            .take((symbol.range.end_line - symbol.range.start_line + 1) as usize)
+            .collect()
+    }
+
+    fn only_symbol<'a>(symbols: &'a [Symbol], name: &str) -> &'a Symbol {
+        let matches: Vec<&Symbol> = symbols.iter().filter(|s| s.name == name).collect();
+        assert_eq!(matches.len(), 1, "expected one `{name}` in {symbols:#?}");
+        matches[0]
+    }
+
+    /// Shaped like a runtime split across `macro_rules!` definitions whose
+    /// single `() => { ... }` arm holds concrete methods and items, expanded
+    /// elsewhere by an empty invocation.
+    const RUST_MACRO_RUNTIME_SOURCE: &str = r#"//! Runtime declarations owned by one domain.
+
+macro_rules! domain_runtime_methods {
+    () => {
+/// Stable ingress port.
+    pub fn domain_ingress(
+        &self,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.domain_record(session_id)
+    }
+
+    fn domain_record(&self, session_id: &str) -> Result<(), String> {
+        let _ = session_id;
+        Ok(())
+    }
+    };
+}
+
+macro_rules! domain_runtime_items {
+    () => {
+const DOMAIN_LIMIT: u32 = 40;
+
+#[derive(Debug)]
+pub enum DomainTerminal {
+    Completed,
+}
+
+pub fn domain_limit() -> u32 { DOMAIN_LIMIT }
+    };
+}
+
+pub fn outside_macros() {}
+"#;
+
+    #[test]
+    fn rs_macro_rules_definition_bodies_contribute_their_items() {
+        let source = RUST_MACRO_RUNTIME_SOURCE;
+        let symbols = symbols_from_source(source, LangId::Rust);
+
+        let ingress = only_symbol(&symbols, "domain_ingress");
+        assert_eq!(ingress.kind, SymbolKind::Function);
+        assert!(ingress.exported);
+        assert_eq!(
+            symbol_lines(source, ingress),
+            [
+                "/// Stable ingress port.",
+                "    pub fn domain_ingress(",
+                "        &self,",
+                "        session_id: &str,",
+                "    ) -> Result<(), String> {",
+                "        self.domain_record(session_id)",
+                "    }",
+            ]
+        );
+
+        let record = only_symbol(&symbols, "domain_record");
+        assert!(!record.exported);
+        assert_eq!((record.range.start_line, record.range.end_line), (12, 15));
+
+        let terminal = only_symbol(&symbols, "DomainTerminal");
+        assert_eq!(terminal.kind, SymbolKind::Enum);
+        assert_eq!(
+            (terminal.range.start_line, terminal.range.end_line),
+            (23, 26),
+            "the derive attribute belongs to the enum's range"
+        );
+        assert_eq!(
+            symbol_lines(source, only_symbol(&symbols, "domain_limit")),
+            ["pub fn domain_limit() -> u32 { DOMAIN_LIMIT }"]
+        );
+        only_symbol(&symbols, "outside_macros");
+
+        let order: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "domain_ingress",
+                "domain_record",
+                "DomainTerminal",
+                "domain_limit",
+                "outside_macros"
+            ],
+            "symbols stay in source order"
+        );
+    }
+
+    #[test]
+    fn rs_item_position_macro_invocation_contributes_its_items() {
+        let source = r#"declare_handlers! {
+    pub fn handle_open(path: &str) -> bool {
+        !path.is_empty()
+    }
+
+    pub struct HandlerState;
+}
+
+impl Service {
+    service_methods! { fn service_tick(&self) {} }
+}
+
+fn body_macros_are_not_items() {
+    helper! { fn not_an_item() {} }
+}
+"#;
+        let symbols = symbols_from_source(source, LangId::Rust);
+
+        assert_eq!(
+            symbol_lines(source, only_symbol(&symbols, "handle_open")),
+            [
+                "    pub fn handle_open(path: &str) -> bool {",
+                "        !path.is_empty()",
+                "    }",
+            ]
+        );
+        assert_eq!(
+            only_symbol(&symbols, "HandlerState").kind,
+            SymbolKind::Struct
+        );
+        let tick = only_symbol(&symbols, "service_tick");
+        assert_eq!(tick.range.start_line, 9);
+        assert_eq!(
+            tick.range.start_col, 23,
+            "columns map back to the original line"
+        );
+        assert!(
+            symbols.iter().all(|s| s.name != "not_an_item"),
+            "macros inside function bodies are not item positions: {symbols:#?}"
+        );
+    }
+
+    #[test]
+    fn rs_macro_template_items_named_by_metavariables_are_skipped() {
+        let source = r#"macro_rules! make_getter {
+    ($name:ident, $ty:ty) => {
+        pub fn $name(&self) -> $ty { self.value }
+
+        pub fn fixed_name_helper() -> $ty { Default::default() }
+    };
+}
+"#;
+        let symbols = symbols_from_source(source, LangId::Rust);
+
+        assert!(
+            symbols.iter().all(|s| !s.name.starts_with('$')),
+            "metavariable names are placeholders, not symbols: {symbols:#?}"
+        );
+        assert_eq!(
+            symbol_lines(source, only_symbol(&symbols, "fixed_name_helper")),
+            ["        pub fn fixed_name_helper() -> $ty { Default::default() }"]
+        );
+    }
+
+    #[test]
+    fn rs_unparseable_macro_body_leaves_outline_unchanged() {
+        let base = "pub struct Kept;\n\npub fn kept_function() {}\n";
+        let with_bad_macros = format!(
+            "{base}\nweird! {{ fn hidden_good() {{}} fn broken( ) -> }}\n\nmacro_rules! repeated {{\n    ($($name:ident),*) => {{ $(fn $name() {{}})* }};\n}}\n"
+        );
+
+        let base_symbols = symbols_from_source(base, LangId::Rust);
+        let symbols = symbols_from_source(&with_bad_macros, LangId::Rust);
+        assert_eq!(
+            rust_symbol_fingerprint(&symbols),
+            rust_symbol_fingerprint(&base_symbols),
+            "a body that does not parse contributes nothing, not even its good items"
+        );
+    }
+
+    #[test]
+    fn rs_nested_macro_bodies_survive_deep_nesting_on_a_small_stack() {
+        const DEPTH: usize = 300;
+        let mut source = String::new();
+        for level in 0..DEPTH {
+            source.push_str(&format!("wrap{level}! {{\nfn level_{level}() {{}}\n"));
+        }
+        for _ in 0..DEPTH {
+            source.push_str("}\n");
+        }
+
+        let symbols = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || symbols_from_source(&source, LangId::Rust))
+            .unwrap()
+            .join()
+            .expect("nested macro bodies must not overflow the stack");
+
+        assert_eq!(symbols.len(), DEPTH);
+        for (level, symbol) in symbols.iter().enumerate() {
+            assert_eq!(symbol.name, format!("level_{level}"));
+            assert_eq!(symbol.range.start_line as usize, level * 2 + 1);
         }
     }
 

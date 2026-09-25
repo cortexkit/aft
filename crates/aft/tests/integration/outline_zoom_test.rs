@@ -864,6 +864,90 @@ impl Widget {
 }
 
 #[test]
+fn outline_and_zoom_see_functions_inside_macro_bodies() {
+    // Shaped like a runtime whose methods live in a `macro_rules!` arm that an
+    // empty invocation elsewhere expands, plus an item-position invocation.
+    let source = r#"macro_rules! domain_runtime_methods {
+    () => {
+/// Stable ingress port.
+    pub fn domain_ingress(
+        &self,
+        session_id: &str,
+    ) -> Result<(), String> {
+        self.domain_record(session_id)
+    }
+
+    fn domain_record(&self, session_id: &str) -> Result<(), String> {
+        let _ = session_id;
+        Ok(())
+    }
+    };
+}
+
+declare_handlers! {
+    pub fn handle_open(path: &str) -> bool {
+        !path.is_empty()
+    }
+}
+
+pub fn outside_macros() {}
+"#;
+    let dir = TempDir::new().unwrap();
+    let file = write_file(dir.path(), "runtime.rs", source);
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let outline = send(
+        &mut aft,
+        json!({"id": "outline-macro-bodies", "command": "outline", "file": file}),
+    );
+    assert_eq!(outline["success"], true, "outline: {outline:?}");
+    let text = outline["text"].as_str().expect("outline text");
+    for expected in [
+        "domain_ingress",
+        "domain_record",
+        "handle_open",
+        "outside_macros",
+    ] {
+        assert!(
+            text.contains(expected),
+            "outline should list {expected}: {text}"
+        );
+    }
+
+    for (symbol, expected) in [
+        (
+            "domain_ingress",
+            "/// Stable ingress port.\n    pub fn domain_ingress(\n        &self,\n        session_id: &str,\n    ) -> Result<(), String> {\n        self.domain_record(session_id)\n    }",
+        ),
+        (
+            "domain_record",
+            "    fn domain_record(&self, session_id: &str) -> Result<(), String> {\n        let _ = session_id;\n        Ok(())\n    }",
+        ),
+        (
+            "handle_open",
+            "    pub fn handle_open(path: &str) -> bool {\n        !path.is_empty()\n    }",
+        ),
+    ] {
+        let resp = send(
+            &mut aft,
+            json!({"id": format!("zoom-{symbol}"), "command": "zoom", "file": file, "symbol": symbol}),
+        );
+        assert_eq!(resp["success"], true, "zoom {symbol}: {resp:?}");
+        assert_eq!(resp["name"], symbol);
+        let content = resp["content"].as_str().expect("zoom content");
+        assert_eq!(
+            content.trim_end_matches('\n'),
+            expected,
+            "zoom {symbol} should return its exact source"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn zoom_symbol_not_found_returns_error() {
     let dir = TempDir::new().unwrap();
     let file = write_file(
