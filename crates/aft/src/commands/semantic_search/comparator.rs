@@ -102,12 +102,27 @@ pub struct RankedTuple {
 /// (4) E2 window, narrower window first
 /// (5) exact-form hit over any variant hit
 /// (6) non-generated over generated
+///
+/// Within each of (1)-(4), when both candidates carry the same evidence kind,
+/// a source file sorts before a data file before the kind's own strength
+/// measure is compared. Data documents (captured results, schemas, census
+/// tables) repeat a phrase or identifier many times without defining it, so
+/// their occurrence count or matched span is not stronger evidence than a
+/// single hit in source. The demotion never crosses kinds: a data file with a
+/// verbatim hit still ranks above a source file with only a token window.
 pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Ordering {
     // (1) Definition hit: true > false
     let a_def = a.evidence.kind == EvidenceKind::Definition;
     let b_def = b.evidence.kind == EvidenceKind::Definition;
     match b_def.cmp(&a_def) {
-        Ordering::Equal => {}
+        Ordering::Equal => {
+            if a_def && b_def {
+                match source_before_data(a, b) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
+            }
+        }
         ord => return ord,
     }
 
@@ -117,6 +132,10 @@ pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Orderi
     match b_e1.cmp(&a_e1) {
         Ordering::Equal => {
             if a_e1 && b_e1 {
+                match source_before_data(a, b) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
                 match b.evidence.occurrences.cmp(&a.evidence.occurrences) {
                     Ordering::Equal => {}
                     ord => return ord,
@@ -132,6 +151,10 @@ pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Orderi
     match b_anchored.cmp(&a_anchored) {
         Ordering::Equal => {
             if a_anchored && b_anchored {
+                match source_before_data(a, b) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
                 // (3a) larger matched-run character total
                 match b.evidence.matched_span.cmp(&a.evidence.matched_span) {
                     Ordering::Equal => {}
@@ -154,6 +177,10 @@ pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Orderi
     match b_e2.cmp(&a_e2) {
         Ordering::Equal => {
             if a_e2 && b_e2 {
+                match source_before_data(a, b) {
+                    Ordering::Equal => {}
+                    ord => return ord,
+                }
                 match a.evidence.window_lines.cmp(&b.evidence.window_lines) {
                     Ordering::Equal => {}
                     ord => return ord,
@@ -171,6 +198,11 @@ pub fn compare_fields_1_to_6(a: &CandidateResult, b: &CandidateResult) -> Orderi
 
     // (6) non-generated over generated: false > true
     a.evidence.generated.cmp(&b.evidence.generated)
+}
+
+/// Source file (`data_file == false`) before data file.
+fn source_before_data(a: &CandidateResult, b: &CandidateResult) -> Ordering {
+    a.evidence.data_file.cmp(&b.evidence.data_file)
 }
 
 /// Compare score-free tail fields (9)-(11):
@@ -420,5 +452,78 @@ mod tests {
 
         assert_eq!(r3_cmp(&file_level, &symbol_level), Ordering::Less);
         assert_eq!(r3_cmp(&symbol_level, &file_level), Ordering::Greater);
+    }
+
+    fn exact_candidate(
+        path: &str,
+        mut evidence: EvidenceDescriptor,
+        data: bool,
+    ) -> CandidateResult {
+        evidence.data_file = data;
+        CandidateResult::new_exact(PathBuf::from(path), None, evidence)
+    }
+
+    #[test]
+    fn source_verbatim_hit_outranks_data_file_with_more_occurrences() {
+        // A census JSON quoting the phrase twice sorts after a source file that
+        // contains it once, even though its path also sorts first.
+        let data = exact_candidate(
+            "a/census.json",
+            EvidenceDescriptor::for_e1(2, true, false),
+            true,
+        );
+        let source = exact_candidate(
+            "z/configure.rs",
+            EvidenceDescriptor::for_e1(1, true, false),
+            false,
+        );
+        let mut results = vec![data.clone(), source.clone()];
+        sort_r3(&mut results);
+        assert_eq!(results, vec![source, data]);
+    }
+
+    #[test]
+    fn source_before_data_applies_within_every_exact_kind() {
+        let pairs = [
+            (
+                EvidenceDescriptor::for_definition(true, false),
+                EvidenceDescriptor::for_definition(true, false),
+            ),
+            (
+                EvidenceDescriptor::for_anchored(30, 0, true, false),
+                EvidenceDescriptor::for_anchored(10, 9, true, false),
+            ),
+            (
+                EvidenceDescriptor::for_e2(1, true, false),
+                EvidenceDescriptor::for_e2(9, true, false),
+            ),
+        ];
+        for (stronger, weaker) in pairs {
+            let data = exact_candidate("a.json", stronger, true);
+            let source = exact_candidate("b.rs", weaker, false);
+            assert_eq!(
+                r3_cmp(&source, &data),
+                Ordering::Less,
+                "{:?}",
+                source.evidence.kind
+            );
+        }
+    }
+
+    #[test]
+    fn data_demotion_never_crosses_evidence_kinds() {
+        // A verbatim hit in a data file is still stronger evidence than a
+        // token window in source.
+        let data_e1 = exact_candidate("a.json", EvidenceDescriptor::for_e1(1, true, false), true);
+        let source_e2 = exact_candidate("b.rs", EvidenceDescriptor::for_e2(1, true, false), false);
+        assert_eq!(r3_cmp(&data_e1, &source_e2), Ordering::Less);
+    }
+
+    #[test]
+    fn source_file_descriptor_serializes_without_data_flag() {
+        let json = serde_json::to_value(EvidenceDescriptor::for_e1(1, true, false)).unwrap();
+        assert!(json.get("data_file").is_none());
+        let parsed: EvidenceDescriptor = serde_json::from_value(json).unwrap();
+        assert!(!parsed.data_file);
     }
 }

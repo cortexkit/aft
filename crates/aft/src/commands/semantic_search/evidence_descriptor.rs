@@ -39,6 +39,12 @@ pub struct EvidenceDescriptor {
     pub window_lines: Option<usize>,
     pub exact_form: bool,
     pub generated: bool,
+    /// The file is a structured data document (see `data_file`), not source.
+    /// Within one exact evidence kind a source file sorts before a data file.
+    /// Omitted from serialized descriptors when false, so descriptors of
+    /// source files keep their existing form.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub data_file: bool,
 }
 
 impl EvidenceDescriptor {
@@ -54,6 +60,7 @@ impl EvidenceDescriptor {
             window_lines: None,
             exact_form,
             generated,
+            data_file: false,
         }
     }
 
@@ -68,6 +75,7 @@ impl EvidenceDescriptor {
             window_lines: None,
             exact_form,
             generated,
+            data_file: false,
         }
     }
 
@@ -82,6 +90,7 @@ impl EvidenceDescriptor {
             window_lines: None,
             exact_form,
             generated,
+            data_file: false,
         }
     }
 
@@ -103,6 +112,7 @@ impl EvidenceDescriptor {
             window_lines: None,
             exact_form,
             generated,
+            data_file: false,
         }
     }
 
@@ -117,6 +127,7 @@ impl EvidenceDescriptor {
             window_lines: Some(window_lines),
             exact_form,
             generated,
+            data_file: false,
         }
     }
 

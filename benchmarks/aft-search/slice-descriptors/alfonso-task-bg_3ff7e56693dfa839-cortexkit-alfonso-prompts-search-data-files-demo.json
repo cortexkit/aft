@@ -1,0 +1,13 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "phrase_present_not_surfaced",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/src/commands/semantic_search/comparator.rs",
+    "crates/aft/src/commands/semantic_search/data_file.rs",
+    "crates/aft/tests/integration/aft_search_contract_test.rs"
+  ],
+  "slices": [
+    "data-file-demotion"
+  ]
+}

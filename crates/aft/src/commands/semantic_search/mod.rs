@@ -2,6 +2,7 @@ pub mod anchored_lane;
 pub mod blocks;
 pub mod comparator;
 pub mod confidence;
+pub mod data_file;
 pub mod evidence_descriptor;
 pub mod exact_lane;
 pub mod extensions;
@@ -2850,6 +2851,7 @@ fn run_engine_ranking(
             .or_insert((candidate.evidence.exact_form, candidate.evidence.generated));
     }
 
+    let mut data_files = data_file::DataFileClassifier::new(query);
     let mut lanes = Vec::new();
     for execution in executions {
         let candidates = execution
@@ -2858,12 +2860,16 @@ fn run_engine_ranking(
             .map(|candidate| {
                 let is_test = path_is_hidden_test_file(&candidate.path, project_root);
                 match candidate.evidence.tier {
-                    EvidenceTier::Exact => LaneCandidate::exact(
-                        candidate.path,
-                        candidate.symbol_range,
-                        candidate.evidence,
-                        is_test,
-                    ),
+                    EvidenceTier::Exact => {
+                        let mut evidence = candidate.evidence;
+                        evidence.data_file = data_files.demote(&candidate.path);
+                        LaneCandidate::exact(
+                            candidate.path,
+                            candidate.symbol_range,
+                            evidence,
+                            is_test,
+                        )
+                    }
                     EvidenceTier::NonExact => {
                         let (exact_form, generated) = canonical_descriptors
                             .get(&(candidate.path.clone(), candidate.symbol_range))
@@ -2881,7 +2887,15 @@ fn run_engine_ranking(
                     }
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Exact-tier candidates carry the data flag into the comparator; in a
+        // scored lane the flag has no comparator field, so data candidates are
+        // demoted by lane position instead, which lowers their fusion score.
+        let candidates = if execution.kind.is_scored() {
+            data_file::demote_data_candidates(candidates, |path| data_files.demote(path))
+        } else {
+            candidates
+        };
         lanes.push(
             CanonicalLane::new(execution.kind, candidates).map_err(|error| error.to_string())?,
         );

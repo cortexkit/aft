@@ -1163,6 +1163,85 @@ fn natural_language_exact_phrase_marks_rank_one_lexical_fallback() {
         .contains("src/tool/browser.rs:1 [exact]"));
 }
 
+/// A census-style JSON document that quotes a phrase twice, next to the one
+/// source file that emits it.
+fn project_with_phrase_in_source_and_data() -> (tempfile::TempDir, Vec<(std::path::PathBuf, String)>)
+{
+    let project = tempfile::tempdir().expect("create project dir");
+    let source = project.path().join("src/configure.rs");
+    let data = project.path().join("benchmarks/census_episodes.json");
+    std::fs::create_dir_all(source.parent().expect("source parent")).expect("create source dir");
+    std::fs::create_dir_all(data.parent().expect("data parent")).expect("create data dir");
+    let source_text =
+        "pub fn verify_tool(tool: &str) {\n    warn!(\"configured tool {} was not found on PATH\", tool);\n}\n"
+            .to_string();
+    let body = "x".repeat(300);
+    let data_text = format!(
+        "{{\n  \"query\": \"was not found on PATH\",\n  \"file_content\": \"{body} was not found on PATH\"\n}}\n"
+    );
+    std::fs::write(&source, &source_text).expect("write source");
+    std::fs::write(&data, &data_text).expect("write data");
+    (project, vec![(data, data_text), (source, source_text)])
+}
+
+fn ranked_files(response: &Value) -> Vec<String> {
+    response["results"]
+        .as_array()
+        .expect("results array")
+        .iter()
+        .map(|result| {
+            result["file"]
+                .as_str()
+                .expect("result file")
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
+#[test]
+fn quoted_phrase_ranks_source_above_data_file_that_repeats_it() {
+    let (project, entries) = project_with_phrase_in_source_and_data();
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("\"was not found on PATH\"", None, 5),
+        &ctx,
+    ));
+    let files = ranked_files(&response);
+    assert!(files[0].ends_with("src/configure.rs"), "ranked: {files:?}");
+    // Demoted, not hidden: the data file is still in the list.
+    assert!(
+        files
+            .iter()
+            .any(|file| file.ends_with("benchmarks/census_episodes.json")),
+        "ranked: {files:?}"
+    );
+}
+
+#[test]
+fn query_naming_the_data_file_keeps_it_first() {
+    let (project, entries) = project_with_phrase_in_source_and_data();
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k("\"was not found on PATH\" json", None, 5),
+        &ctx,
+    ));
+    let files = ranked_files(&response);
+    assert!(
+        files[0].ends_with("benchmarks/census_episodes.json"),
+        "ranked: {files:?}"
+    );
+}
+
 #[test]
 fn hybrid_failed_semantic_uses_lexical_only_fallback() {
     let (project, source_file, source) = project_with_needle();
