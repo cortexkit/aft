@@ -297,7 +297,13 @@ pub(crate) fn prepare_terminal_prune_observed(
         .candidates
         .into_iter()
         .filter(|candidate| {
+            // A task some registry still holds may have a row snapshot queued
+            // behind the aft.db mutex, which would re-insert a pruned row.
             !is_registered_in_process(&candidate.task_id)
+                && !crate::bash_background::registry::task_db_write_order_is_live(
+                    &candidate.session_id,
+                    &candidate.task_id,
+                )
                 && !candidate_process_is_alive(candidate)
                 && task_layout_is_gone(plan.storage_root.as_deref(), candidate)
         })
