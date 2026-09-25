@@ -13,6 +13,24 @@ import {
  */
 export { formatSemanticIndexStatus, type SemanticIndexStatusKind, semanticIndexStatusKind };
 
+/**
+ * The status label for a snapshot's semantic index, including the backend URL
+ * and reason when the embedding backend is unavailable. Every surface that
+ * shows the semantic status goes through this so none of them can drop the
+ * reason and fall back to a bare word.
+ */
+export function formatSemanticIndexLabel(
+  semantic: Pick<
+    AftStatusSnapshot["semantic_index"],
+    "status" | "stage" | "error" | "reason" | "backend_url"
+  >,
+): string {
+  return formatSemanticIndexStatus(semantic.status, semantic.stage, semantic.error, {
+    reason: semantic.reason,
+    backendUrl: semantic.backend_url,
+  });
+}
+
 export interface StatusCompressionAggregate {
   events: number;
   original_tokens: number;
@@ -72,6 +90,10 @@ export interface AftStatusSnapshot {
     entries: number | null;
     dimension: number | null;
     error?: string | null;
+    /** Engine's reason when `status === "backend_unavailable"`. */
+    reason?: string | null;
+    /** Configured remote embedding backend URL, when there is one. */
+    backend_url?: string | null;
   };
   disk: {
     storage_dir: string | null;
@@ -271,6 +293,8 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
       error: readNullableString(semanticIndex.error),
+      reason: readNullableString(semanticIndex.reason),
+      backend_url: readNullableString(semanticIndex.backend_url),
     },
     disk: {
       storage_dir: readNullableString(disk.storage_dir),
@@ -321,7 +345,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}`,
+    `- status: ${formatSemanticIndexLabel(status.semantic_index)}`,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {
@@ -424,7 +448,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}\``,
+    `- **Status:** \`${formatSemanticIndexLabel(status.semantic_index)}\``,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {

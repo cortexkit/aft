@@ -197,6 +197,7 @@ describe("semantic cost notice", () => {
   test("applies only to an effectively-on default local backend and is delivered once", () => {
     const base = {
       userConfigPath: "/cfg/aft.jsonc",
+      configFileLoaded: true,
       semanticEffective: true,
       semanticInputSupplied: false,
       semanticBackend: undefined,
@@ -204,6 +205,9 @@ describe("semantic cost notice", () => {
     expect(semanticCostNotice({ ...base, semanticEffective: false })).toBeNull();
     expect(semanticCostNotice({ ...base, semanticInputSupplied: true })).toBeNull();
     expect(semanticCostNotice({ ...base, semanticBackend: "ollama" })).toBeNull();
+    // A fresh install has no config file that could have relied on the old
+    // default, so there is nothing to migrate and nothing to announce.
+    expect(semanticCostNotice({ ...base, configFileLoaded: false })).toBeNull();
     const notice = semanticCostNotice({ ...base, semanticBackend: "fastembed" });
     expect(notice?.message).toBe(SEMANTIC_COST_NOTICE);
 

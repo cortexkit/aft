@@ -14,6 +14,8 @@ import {
   isTrustedCachedBinary,
   recordBinaryIdentity,
   removeBinaryIdentitySidecar,
+  sha256File,
+  writeBinaryIdentitySidecar,
 } from "./binary-identity.js";
 import { getAftBinaryCacheDir } from "./cache-paths.js";
 import { ensureBinary, readBinaryVersion } from "./downloader.js";
@@ -93,6 +95,12 @@ async function copyIntoCache(
     if (process.platform !== "win32") {
       await fsPromises.chmod(tmpPath, 0o755);
     }
+    // Hash the private temp copy, which nothing else can touch, before it is
+    // renamed into place. Hashing the final path afterwards raced a second
+    // copy replacing it (another resolve, or another process, sees the entry
+    // without a sidecar and copies again), so on first start the identity was
+    // discarded as "changed while it was being hashed" and never recorded.
+    const sha256 = await sha256File(tmpPath);
     removeBinaryIdentitySidecar(cachedPath);
     // Best-effort replace — unlink first on Windows where rename fails if target exists
     if (process.platform === "win32") {
@@ -100,9 +108,15 @@ async function copyIntoCache(
     }
     await fsPromises.rename(tmpPath, cachedPath);
     log(`Copied npm binary to versioned cache: ${cachedPath}`);
-    // The sidecar needs a hash of the bytes; until it is written the entry is
-    // untrusted, so other processes copy again rather than run it unverified.
-    void recordBinaryIdentity(cachedPath, version);
+    // A rename keeps the file's size, mtime and inode, so the stamp taken now
+    // describes the bytes that were just hashed.
+    try {
+      writeBinaryIdentitySidecar(cachedPath, version, sha256);
+    } catch (err) {
+      warn(
+        `Could not record identity for ${cachedPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return cachedPath;
   } catch (err) {
     await fsPromises.unlink(tmpPath).catch(() => {});

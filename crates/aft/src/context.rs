@@ -1518,6 +1518,35 @@ pub(crate) struct EmbeddingBackendHealthSnapshot {
     pub(crate) next_retry_ms: Option<u64>,
 }
 
+/// The refresh circuit only trips once an index exists and later refreshes
+/// fail. A first build against an unreachable backend never gets that far: it
+/// parks in a retry loop that records its outage per project root instead.
+/// Every status surface reads backend health through this fold so a cold build
+/// that cannot reach its backend reports `backend_unavailable` with the real
+/// reason rather than an endless "loading"/"rebuilding".
+fn with_cold_build_backend_health(
+    mut snapshot: EmbeddingBackendHealthSnapshot,
+    root: Option<&Path>,
+) -> EmbeddingBackendHealthSnapshot {
+    let Some(build) = root.and_then(crate::semantic_index::embedding_backend_build_health) else {
+        return snapshot;
+    };
+    let build_is_older = snapshot
+        .since_ms
+        .is_none_or(|since| build.since_ms <= since);
+    if snapshot.available || build_is_older {
+        snapshot.last_error = Some(build.last_error);
+        snapshot.next_retry_ms = Some(build.next_retry_ms);
+    }
+    snapshot.since_ms = Some(
+        snapshot
+            .since_ms
+            .map_or(build.since_ms, |since| since.min(build.since_ms)),
+    );
+    snapshot.available = false;
+    snapshot
+}
+
 #[derive(Debug, Clone)]
 struct SemanticBackendOutage {
     last_error: String,
@@ -6857,6 +6886,20 @@ impl AppContext {
             return;
         };
         let categories = Self::automatic_tier2_refresh_categories(&snapshot);
+        // The status bar's TODO count is a Tier-1 category that otherwise only
+        // an explicit aft_inspect computes, which left `T?` on the bar for a
+        // whole session in which nobody ran one. Refresh it on the same cadence
+        // as the Tier-2 counts; its completion is drained with theirs. Linked
+        // worktrees skip automatic scans for Tier-2 and do the same here.
+        if manager.automatic_tier2_refresh_enabled() {
+            if let Err(error) = manager.submit_background(
+                snapshot.clone(),
+                InspectCategory::Todos,
+                crate::inspect::JobScope::for_project(snapshot.project_root.clone()),
+            ) {
+                crate::slog_info!("todos refresh not scheduled: {}", error);
+            }
+        }
         let submission =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
         if !submission.deferred_categories.is_empty() {
@@ -7352,7 +7395,7 @@ impl AppContext {
             .backend_outage
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match outage.as_ref() {
+        let snapshot = match outage.as_ref() {
             Some(outage) => EmbeddingBackendHealthSnapshot {
                 available: false,
                 last_error: Some(outage.last_error.clone()),
@@ -7363,7 +7406,10 @@ impl AppContext {
                 available: true,
                 ..EmbeddingBackendHealthSnapshot::default()
             },
-        }
+        };
+        drop(outage);
+        let root = self.canonical_cache_root_opt();
+        with_cold_build_backend_health(snapshot, root.as_deref())
     }
 
     pub(crate) fn try_semantic_backend_health_snapshot(
@@ -7374,7 +7420,7 @@ impl AppContext {
             .backend_outage
             .try_read()
             .ok()?;
-        Some(match outage.as_ref() {
+        let snapshot = match outage.as_ref() {
             Some(outage) => EmbeddingBackendHealthSnapshot {
                 available: false,
                 last_error: Some(outage.last_error.clone()),
@@ -7385,7 +7431,10 @@ impl AppContext {
                 available: true,
                 ..EmbeddingBackendHealthSnapshot::default()
             },
-        })
+        };
+        drop(outage);
+        let root = self.canonical_cache_root.try_lock()?.clone();
+        Some(with_cold_build_backend_health(snapshot, root.as_deref()))
     }
 
     pub fn record_semantic_refresh_transient_failure(
@@ -8535,10 +8584,13 @@ impl AppContext {
 
     /// Count active LSP server instances.
     pub fn lsp_server_count(&self) -> usize {
-        self.lsp_manager
-            .try_lock()
-            .map(|lsp| lsp.server_count())
-            .unwrap_or(0)
+        self.lsp_server_count_if_available().unwrap_or(0)
+    }
+
+    /// Running language-server count, or `None` when the manager is busy and
+    /// the count cannot be read without waiting.
+    pub(crate) fn lsp_server_count_if_available(&self) -> Option<usize> {
+        self.lsp_manager.try_lock().map(|lsp| lsp.server_count())
     }
 
     /// Symbol cache statistics from the language provider.

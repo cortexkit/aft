@@ -10,6 +10,7 @@ import {
   registerNotificationSink,
   registerStatusChangeSink,
 } from "../shared/rpc-notifications";
+import { NOT_STARTED_STATUS_TEXT } from "../shared/status";
 import { type AftIndexProgress, AftRpc, type AftRpcSession } from "./contract";
 
 type RpcRegistration = {
@@ -115,8 +116,7 @@ function placeholderStatus(): Record<string, unknown> {
     success: true,
     status: "not_initialized",
     cache_role: "not_initialized",
-    message:
-      "AFT bridge is now spawned lazily; status will be populated after the first tool call.",
+    message: NOT_STARTED_STATUS_TEXT,
   };
 }
 

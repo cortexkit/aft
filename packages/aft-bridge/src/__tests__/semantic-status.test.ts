@@ -62,6 +62,19 @@ describe("formatSemanticIndexStatus", () => {
     expect(formatSemanticIndexStatus("ready", null)).toBe("ready");
   });
 
+  test("an unreachable backend carries its URL and the engine's reason", () => {
+    expect(
+      formatSemanticIndexStatus("backend_unavailable", null, null, {
+        reason: "connection refused",
+        backendUrl: "http://localhost:1234/v1",
+      }),
+    ).toBe("backend unavailable (http://localhost:1234/v1): connection refused");
+    // A local backend has no URL; the reason still reaches the reader.
+    expect(
+      formatSemanticIndexStatus("backend_unavailable", null, null, { reason: "model load failed" }),
+    ).toBe("backend unavailable: model load failed");
+  });
+
   test("classifies every status word the daemon can emit", () => {
     const unrenderable = daemonSemanticStatusWords().filter(
       (word) => semanticIndexStatusKind(word) === "unrecognized",

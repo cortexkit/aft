@@ -1652,6 +1652,29 @@ impl InspectManager {
         )
     }
 
+    /// Latest project-wide TODO count, or `None` when no project-scoped todos
+    /// scan has completed yet. Todos is a Tier-1 category whose result lives in
+    /// the cache's in-memory aggregates rather than the Tier-2 table, so
+    /// [`Self::latest_tier2_counts`] cannot see it.
+    pub fn latest_project_todos_count(
+        &self,
+        inspect_dir: PathBuf,
+        project_root: PathBuf,
+    ) -> Option<usize> {
+        let key = JobKey::for_category_scope(
+            InspectCategory::Todos,
+            &JobScope::for_project(project_root.clone()),
+        );
+        let cache = self.cache_for_paths(inspect_dir, project_root).ok()?;
+        cache
+            .get_aggregated(&key)
+            .ok()
+            .flatten()?
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count as usize)
+    }
+
     /// Whether the latest persisted dead_code aggregate reported
     /// `callgraph_available:false` — i.e. dead_code was suppressed because the
     /// callgraph store was not ready when it scanned. Health uses this to avoid
@@ -5933,6 +5956,55 @@ mod guard_tests {
             manager.latest_tier2_counts(inspect_dir, project_root).0,
             None,
             "callgraph_unavailable dead_code must stay suppressed"
+        );
+    }
+
+    /// The status bar's TODO count comes from a background todos scan. Its
+    /// result must be readable through the same lookup the completion drain
+    /// uses; before that lookup existed the drain passed no todos value at
+    /// all and the bar showed `T?` for as long as nobody ran aft_inspect.
+    #[test]
+    fn background_todos_scan_is_visible_to_the_status_bar_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(
+            root.join("lib.ts"),
+            "// TODO: first\nexport const a = 1;\n// FIXME: second\n",
+        )
+        .unwrap();
+        let snapshot = tier1_snapshot(&root);
+        let inspect_dir = snapshot.inspect_dir.clone();
+        let manager = InspectManager::new();
+
+        assert_eq!(
+            manager.latest_project_todos_count(inspect_dir.clone(), root.clone()),
+            None,
+            "no todos scan has run yet"
+        );
+
+        manager
+            .submit_background(
+                snapshot,
+                InspectCategory::Todos,
+                JobScope::for_project(root.clone()),
+            )
+            .expect("schedule todos scan");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut drained = 0;
+        while drained == 0 && Instant::now() < deadline {
+            drained = manager.drain_completions();
+            if drained == 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(drained > 0, "todos scan did not complete");
+
+        let count = manager
+            .latest_project_todos_count(inspect_dir, root)
+            .expect("todos count after the background scan");
+        assert!(
+            count >= 1,
+            "expected the fixture's TODO markers, got {count}"
         );
     }
 

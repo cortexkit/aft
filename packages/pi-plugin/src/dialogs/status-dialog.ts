@@ -30,7 +30,7 @@ import {
   coerceAftStatus,
   formatBytes,
   formatCacheRoleLabel,
-  formatSemanticIndexStatus,
+  formatSemanticIndexLabel,
   formatSemanticRefreshing,
   type StatusCompression,
   type StatusCompressionAggregate,
@@ -221,11 +221,7 @@ function renderInner(
   right.push(
     kv(
       "status",
-      colorStatus(
-        s.semantic_index.status,
-        theme,
-        formatSemanticIndexStatus(s.semantic_index.status, s.semantic_index.stage),
-      ),
+      colorStatus(s.semantic_index.status, theme, formatSemanticIndexLabel(s.semantic_index)),
       theme,
     ),
   );

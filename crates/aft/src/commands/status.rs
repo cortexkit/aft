@@ -122,6 +122,7 @@ impl AppContext {
                 "since_ms": embedding_backend.since_ms,
                 "next_retry_ms": embedding_backend.next_retry_ms,
                 "backend": config.semantic_backend_label(),
+                "backend_url": config.semantic.base_url.as_deref(),
                 "model": config.semantic.model.as_str(),
             })
         } else {
@@ -348,9 +349,24 @@ impl AppContext {
         // while the callgraph store is unavailable). `status_bar` stays null in
         // that case for consumers that need the full set; renderers use this
         // field to show what is known instead of claiming startup forever.
+        // Errors and warnings only exist once a language server has reported.
+        // With no server running (all disabled, none installed, or no file
+        // touched that one serves) nothing will ever report, and a bare null
+        // reads as "still loading" forever. `diagnostics` says which case it is:
+        // `no_language_server` when nothing can produce the counts, null while
+        // a running server has not reported yet or the counts are present.
+        let diagnostics_state = if status_bar_values.errors.is_none()
+            && status_bar_values.warnings.is_none()
+            && self.lsp_server_count_if_available() == Some(0)
+        {
+            serde_json::json!("no_language_server")
+        } else {
+            serde_json::Value::Null
+        };
         let status_bar_values = serde_json::json!({
             "errors": status_bar_values.errors,
             "warnings": status_bar_values.warnings,
+            "diagnostics": diagnostics_state,
             "dead_code": status_bar_values.dead_code,
             "unused_exports": status_bar_values.unused_exports,
             "duplicates": status_bar_values.duplicates,
@@ -726,6 +742,7 @@ mod tests {
             serde_json::json!({
                 "errors": null,
                 "warnings": null,
+                "diagnostics": "no_language_server",
                 "dead_code": null,
                 "unused_exports": 2,
                 "duplicates": 1,
@@ -733,5 +750,20 @@ mod tests {
                 "tier2_stale": false,
             })
         );
+    }
+
+    /// Without a running language server nothing will ever report errors or
+    /// warnings. The status must say so rather than leave both null, which
+    /// every renderer shows as a count that is still on its way.
+    #[test]
+    fn status_bar_values_name_missing_language_server_instead_of_pending() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.update_status_bar_tier2(Some(1), Some(1), Some(0), Some(0), false);
+        let response = handle_status(&request(), &ctx);
+
+        let values = &response.data["status_bar_values"];
+        assert!(values["errors"].is_null());
+        assert!(values["warnings"].is_null());
+        assert_eq!(values["diagnostics"], "no_language_server");
     }
 }

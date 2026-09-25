@@ -146,12 +146,26 @@ describe("semantic default-on cost notice", () => {
   const costNotices = () =>
     getConfigLoadNotices().filter((notice) => notice.message === SEMANTIC_COST_NOTICE);
 
-  test("is queued when semantic is on only by default", () => {
-    for (const user of [undefined, {}, { indexes: { trigram: false } }]) {
+  test("is queued when an existing config relies on the old default", () => {
+    for (const user of [{}, { indexes: { trigram: false } }]) {
       loadWithUserConfig(user);
       expect(costNotices()).toHaveLength(1);
       expect(costNotices()[0]?.configPath).toBe(join(root, "xdg", "cortexkit", "aft.jsonc"));
     }
+  });
+
+  // A fresh install has no config that ever relied on the old default: either
+  // there is no file yet, or setup just wrote one with explicit indexes.
+  // Neither is a migration, so neither gets the migration notice.
+  test("is not queued on a fresh install", () => {
+    loadWithUserConfig(undefined);
+    expect(costNotices()).toHaveLength(0);
+    loadWithUserConfig({
+      disabled_tools: ["aft_delete", "aft_move"],
+      indexes: { trigram: true, semantic: true, callgraph: true },
+      github: { write: false, read: false },
+    });
+    expect(costNotices()).toHaveLength(0);
   });
 
   test("is not queued when the user configured semantic or chose another backend", () => {
