@@ -373,6 +373,79 @@ pub(crate) struct BgTask {
     pub(crate) last_reminder_at: Mutex<Option<Instant>>,
     pub(crate) terminal_at: Mutex<Option<Instant>>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// Orders this task's aft.db row writes, which happen after `state` is
+    /// released; see [`DeferredDbWrites`].
+    db_write_order: DbWriteOrder,
+}
+
+/// Sequencing for a task's aft.db mirror.
+///
+/// The JSON metadata is written while `BgTask::state` is held, so the file
+/// always ends at the newest state. The matching aft.db upsert waits on the
+/// process-wide aft.db mutex, which can be contended for seconds, so it runs
+/// after `state` is released. Two such writes can then reach the database out
+/// of order. Each write takes a sequence number while `state` is still held
+/// (so the numbers follow the JSON write order), and a write whose number is
+/// not newer than the last one written is dropped: an older snapshot never
+/// replaces a newer row, such as a running row landing over the completed
+/// one.
+#[derive(Default)]
+struct DbWriteOrder {
+    captured: AtomicU64,
+    written: Mutex<u64>,
+}
+
+/// A task's aft.db row captured under its state lock, written after it.
+struct PendingDbWrite {
+    seq: u64,
+    metadata: PersistedTask,
+}
+
+/// Collects the aft.db write for metadata persisted while a task's state lock
+/// is held and performs it when dropped.
+///
+/// Declare it before taking the lock: locals drop in reverse order, so the
+/// lock guard is released first and the database write runs after it, on
+/// every exit path including early `?` returns. Only the newest captured
+/// metadata is kept, because an older one would be dropped by the ordering
+/// check anyway.
+struct DeferredDbWrites<'a> {
+    registry: &'a BgTaskRegistry,
+    task: &'a BgTask,
+    pending: Option<PendingDbWrite>,
+}
+
+impl<'a> DeferredDbWrites<'a> {
+    fn new(registry: &'a BgTaskRegistry, task: &'a BgTask) -> Self {
+        Self {
+            registry,
+            task,
+            pending: None,
+        }
+    }
+
+    /// Must be called with the task's state lock held, right after the JSON
+    /// write it mirrors, so the sequence number follows the JSON write order.
+    fn capture(&mut self, metadata: &PersistedTask) {
+        let seq = self
+            .task
+            .db_write_order
+            .captured
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        self.pending = Some(PendingDbWrite {
+            seq,
+            metadata: metadata.clone(),
+        });
+    }
+}
+
+impl Drop for DeferredDbWrites<'_> {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.registry.flush_db_write(self.task, pending);
+        }
+    }
 }
 
 pub(crate) enum TaskRuntime {
@@ -955,11 +1028,12 @@ impl BgTaskRegistry {
             .ok()
             .and_then(|state| state.metadata.pgid)?;
         let sample = live_process_group_members(pgid);
+        let mut db = DeferredDbWrites::new(self, task);
         if let Ok(mut state) = task.state.lock() {
             state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
             state.metadata.live_descendants_omitted =
                 sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
-            if let Err(error) = self.persist_task(&task.paths, &state.metadata) {
+            if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
                 crate::slog_warn!(
                     "failed to persist live descendants for {}: {error}",
                     task.task_id
@@ -1003,18 +1077,54 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    fn update_task_metadata<F>(
+    /// [`Self::persist_task`] for a caller holding `task.state`: writes the
+    /// JSON now and leaves the aft.db write to `db`, which runs it once the
+    /// lock is released. Every metadata write for a task that is already in
+    /// the registry goes through here or [`Self::update_task_metadata_locked`].
+    fn persist_task_locked(
         &self,
-        paths: &TaskPaths,
+        task: &BgTask,
+        metadata: &PersistedTask,
+        db: &mut DeferredDbWrites<'_>,
+    ) -> std::io::Result<()> {
+        let layout = resolve_task_layout(&task.paths.session_dir, &task.paths.task_id)?;
+        write_task_at(&layout, metadata)?;
+        db.capture(metadata);
+        Ok(())
+    }
+
+    /// Reads, updates and rewrites the task's JSON metadata for a caller
+    /// holding `task.state`; the aft.db write is deferred like
+    /// [`Self::persist_task_locked`]'s.
+    fn update_task_metadata_locked<F>(
+        &self,
+        task: &BgTask,
+        db: &mut DeferredDbWrites<'_>,
         update: F,
     ) -> std::io::Result<PersistedTask>
     where
         F: FnOnce(&mut PersistedTask),
     {
-        let task = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
-        let metadata = update_task_at(&task, update)?;
-        self.dual_write_task(paths, &metadata);
+        let layout = resolve_task_layout(&task.paths.session_dir, &task.paths.task_id)?;
+        let metadata = update_task_at(&layout, update)?;
+        db.capture(&metadata);
         Ok(metadata)
+    }
+
+    /// Writes a deferred aft.db row unless a newer one for the task already
+    /// landed. Runs without `task.state` held; the task's `written` mutex only
+    /// serializes the task's own database writes.
+    fn flush_db_write(&self, task: &BgTask, pending: PendingDbWrite) {
+        let mut written = task
+            .db_write_order
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.seq <= *written {
+            return;
+        }
+        self.dual_write_task(&task.paths, &pending.metadata);
+        *written = pending.seq;
     }
 
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
@@ -1525,15 +1635,15 @@ impl BgTaskRegistry {
         let task = self.task_for_session(task_id, session_id).ok_or_else(|| {
             "background task not found while recording scanner report".to_string()
         })?;
-        let metadata = {
-            let mut state = task
-                .state
-                .lock()
-                .map_err(|_| "background task lock poisoned".to_string())?;
-            state.metadata.scanner_report = scanner_report;
-            state.metadata.clone()
-        };
-        self.persist_task(&task.paths, &metadata)
+        let mut db = DeferredDbWrites::new(self, &task);
+        let mut state = task
+            .state
+            .lock()
+            .map_err(|_| "background task lock poisoned".to_string())?;
+        state.metadata.scanner_report = scanner_report;
+        // Written under the lock so a later terminal write cannot be
+        // overwritten on disk by this older snapshot.
+        self.persist_task_locked(&task, &state.metadata, &mut db)
             .map_err(|error| format!("failed to persist scanner report: {error}"))
     }
 
@@ -1743,6 +1853,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            db_write_order: DbWriteOrder::default(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -1936,6 +2047,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            db_write_order: DbWriteOrder::default(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
@@ -2086,6 +2198,7 @@ impl BgTaskRegistry {
             started: Instant::now(),
             last_reminder_at: Mutex::new(None),
             terminal_at: Mutex::new(None),
+            db_write_order: DbWriteOrder::default(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -2347,6 +2460,9 @@ impl BgTaskRegistry {
                 if let Ok(mut state) = task.state.lock() {
                     state.metadata.completion_delivered = true;
                 }
+                // A row write captured earlier may still be waiting on the
+                // aft.db mutex; it must not re-insert the row deleted here.
+                let _fence = task.fence_pending_db_writes();
                 self.retire_already_reaped_orphaned_completion(&task.session_id, &task.task_id);
             }
             Err(error) => {
@@ -3721,12 +3837,13 @@ impl BgTaskRegistry {
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         let terminal_after_promote = {
+            let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
                 .state
                 .lock()
                 .map_err(|_| "background task lock poisoned".to_string())?;
             let updated = self
-                .update_task_metadata(&task.paths, |metadata| {
+                .update_task_metadata_locked(&task, &mut db, |metadata| {
                     metadata.notify_on_completion = true;
                     metadata.completion_delivered = false;
                 })
@@ -4209,6 +4326,7 @@ impl BgTaskRegistry {
     pub(crate) fn reap_child(&self, task: &Arc<BgTask>) {
         let mut needs_completion = false;
         {
+            let mut db = DeferredDbWrites::new(self, task);
             let Ok(mut state) = task.state.lock() else {
                 return;
             };
@@ -4237,7 +4355,7 @@ impl BgTaskRegistry {
                                 .is_some_and(|pid| !is_process_alive(pid));
                         if child_known_dead {
                             needs_completion =
-                                self.fail_without_exit_marker_if_needed(task, &mut state);
+                                self.fail_without_exit_marker_if_needed(task, &mut state, &mut db);
                         }
                     }
                 }
@@ -4260,6 +4378,7 @@ impl BgTaskRegistry {
         &self,
         task: &Arc<BgTask>,
         state: &mut BgTaskState,
+        db: &mut DeferredDbWrites<'_>,
     ) -> bool {
         if state.metadata.status.is_terminal() {
             return false;
@@ -4268,7 +4387,7 @@ impl BgTaskRegistry {
             return false;
         }
         let child_exit_observed = state.child_exit_observed;
-        let updated = self.update_task_metadata(&task.paths, |metadata| {
+        let updated = self.update_task_metadata_locked(task, db, |metadata| {
             let (status, reason) = if child_exit_observed {
                 (
                     BgTaskStatus::Failed,
@@ -4324,6 +4443,7 @@ impl BgTaskRegistry {
             started,
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
             terminal_at: Mutex::new(metadata.status.is_terminal().then(Instant::now)),
+            db_write_order: DbWriteOrder::default(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: if mode == BgMode::Pty {
@@ -4595,6 +4715,7 @@ impl BgTaskRegistry {
         let mut kill_reached = 0;
 
         {
+            let mut db = DeferredDbWrites::new(self, &task);
             let mut state = task
                 .state
                 .lock()
@@ -4620,7 +4741,7 @@ impl BgTaskRegistry {
                             sample.as_ref().map(|(members, _)| members.clone());
                         state.metadata.live_descendants_omitted =
                             sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
-                        self.persist_task(&task.paths, &state.metadata)
+                        self.persist_task_locked(&task, &state.metadata, &mut db)
                             .map_err(|error| {
                                 format!("failed to persist post-kill descendant sample: {error}")
                             })?;
@@ -4643,7 +4764,7 @@ impl BgTaskRegistry {
                     TaskRuntime::Pty(runtime) => *runtime = None,
                 }
                 state.detached = true;
-                self.persist_task(&task.paths, &state.metadata)
+                self.persist_task_locked(&task, &state.metadata, &mut db)
                     .map_err(|e| format!("failed to persist terminal state: {e}"))?;
                 terminalized = true;
             } else {
@@ -4655,7 +4776,7 @@ impl BgTaskRegistry {
                     state.metadata.status_reason = reason.clone();
                 }
                 if !was_already_killing || reason.is_some() {
-                    self.persist_task(&task.paths, &state.metadata)
+                    self.persist_task_locked(&task, &state.metadata, &mut db)
                         .map_err(|e| format!("failed to persist killing state: {e}"))?;
                 }
 
@@ -4727,7 +4848,7 @@ impl BgTaskRegistry {
 
                         state.pending_terminal_override = None;
                         task.mark_terminal_now();
-                        self.persist_task(&task.paths, &state.metadata)
+                        self.persist_task_locked(&task, &state.metadata, &mut db)
                             .map_err(|e| format!("failed to persist killed state: {e}"))?;
                         terminalized = true;
                     }
@@ -4782,7 +4903,7 @@ impl BgTaskRegistry {
                         *runtime = None;
                     }
                     state.detached = true;
-                    self.persist_task(&task.paths, &state.metadata)
+                    self.persist_task_locked(&task, &state.metadata, &mut db)
                         .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
                     terminalized = true;
                 }
@@ -4806,6 +4927,12 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         let mut pty_reader_done = None;
         {
+            // The aft.db mirror of the terminal row is written when this
+            // scope ends, after the state lock is released: the aft.db mutex
+            // is shared process-wide, and waiting on it here kept every
+            // reader of this task's state (the subc frame loop included)
+            // blocked behind unrelated database work.
+            let mut db = DeferredDbWrites::new(self, task);
             let mut state = task
                 .state
                 .lock()
@@ -4819,7 +4946,7 @@ impl BgTaskRegistry {
             let is_pty = state.metadata.mode == BgMode::Pty;
             let reason = reason.or_else(|| state.metadata.status_reason.clone());
             let updated = self
-                .update_task_metadata(&task.paths, |metadata| {
+                .update_task_metadata_locked(task, &mut db, |metadata| {
                     let new_metadata = if is_pty && marker == ExitMarker::Killed {
                         let mut metadata = metadata.clone();
                         let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
@@ -6623,6 +6750,20 @@ impl BgTask {
             .unwrap_or(false)
     }
 
+    /// Marks every aft.db row write captured so far as superseded and holds
+    /// the task's write-order lock until the returned guard drops, so a
+    /// caller can delete the task's row without a queued older write putting
+    /// it back.
+    fn fence_pending_db_writes(&self) -> std::sync::MutexGuard<'_, u64> {
+        let mut written = self
+            .db_write_order
+            .written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *written = (*written).max(self.db_write_order.captured.load(Ordering::SeqCst));
+        written
+    }
+
     fn mark_terminal_now(&self) {
         if let Ok(mut terminal_at) = self.terminal_at.lock() {
             if terminal_at.is_none() {
@@ -6636,11 +6777,12 @@ impl BgTask {
         delivered: bool,
         registry: &BgTaskRegistry,
     ) -> std::io::Result<()> {
+        let mut db = DeferredDbWrites::new(registry, self);
         let mut state = self
             .state
             .lock()
             .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
-        let updated = registry.update_task_metadata(&self.paths, |metadata| {
+        let updated = registry.update_task_metadata_locked(self, &mut db, |metadata| {
             metadata.completion_delivered = delivered;
         })?;
         state.metadata = updated;
@@ -8974,6 +9116,145 @@ mod tests {
             "issue #91 regression: child {zombie_pid} left as <defunct> zombie \
              after the exit-marker terminal transition"
         );
+    }
+
+    /// The terminal transition writes the task's JSON and mirrors it into
+    /// aft.db. The aft.db mutex is shared by the whole process and can be
+    /// contended for seconds (a restart's replay herd held it for 25 s), so
+    /// the finalize must not wait for it while holding the task's state lock:
+    /// every reader of that state, the subc frame loop included, would wait
+    /// too. The database row must still end at the terminal state.
+    #[cfg(unix)]
+    #[test]
+    fn finalize_releases_task_state_while_aft_db_mutex_is_held() {
+        use std::sync::atomic::Ordering;
+
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                QUICK_SUCCESS_COMMAND,
+                "session".to_string(),
+                storage.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.path().to_path_buf()),
+            )
+            .unwrap();
+        // Stop the watchdog so only the explicit poll_task call below can
+        // run the terminal transition.
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(550));
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let started = Instant::now();
+        while !task.paths.exit.exists() {
+            assert!(started.elapsed() < CHILD_EXIT_LIVENESS_BOUND);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.status = BgTaskStatus::Running;
+            state.metadata.status_reason = None;
+            state.metadata.exit_code = None;
+            state.metadata.finished_at = None;
+            state.metadata.duration_ms = None;
+            state.terminal_output_cache = None;
+            write_task(&task.paths.json, &state.metadata).expect("persist Running");
+        }
+        *task.terminal_at.lock().unwrap() = None;
+
+        let db_guard = db.lock().unwrap();
+        let finalizer = {
+            let registry = registry.clone();
+            let task = Arc::clone(&task);
+            std::thread::spawn(move || registry.poll_task(&task))
+        };
+
+        // The JSON write lands before the database write is attempted.
+        let json_by = Instant::now() + Duration::from_secs(10);
+        while !read_task(&task.paths.json)
+            .map(|metadata| metadata.status.is_terminal())
+            .unwrap_or(false)
+        {
+            assert!(Instant::now() < json_by, "finalize never wrote the terminal JSON");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let state_by = Instant::now() + Duration::from_millis(1_000);
+        let status = loop {
+            if let Ok(state) = task.state.try_lock() {
+                break state.metadata.status.clone();
+            }
+            assert!(
+                Instant::now() < state_by,
+                "finalize kept the task state locked while waiting on the aft.db mutex"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(status.is_terminal(), "state must be terminal: {status:?}");
+
+        drop(db_guard);
+        finalizer.join().unwrap().unwrap();
+        let row = crate::db::bash_tasks::get_bash_task(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            &task_id,
+        )
+        .unwrap()
+        .expect("bash_tasks row");
+        assert_eq!(row.status, "completed", "the deferred row write must land");
+    }
+
+    /// A deferred aft.db write that reaches the database after a newer one
+    /// for the same task must be dropped, not replace the newer row.
+    #[cfg(unix)]
+    #[test]
+    fn deferred_db_write_never_replaces_a_newer_row() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.path().to_path_buf()),
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let running = task.state.lock().unwrap().metadata.clone();
+        let mut completed = running.clone();
+        completed.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+
+        // Capture order is running then completed; flush order is reversed.
+        let mut older = DeferredDbWrites::new(&registry, &task);
+        older.capture(&running);
+        let mut newer = DeferredDbWrites::new(&registry, &task);
+        newer.capture(&completed);
+        drop(newer);
+        drop(older);
+
+        let row = crate::db::bash_tasks::get_bash_task(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            &task_id,
+        )
+        .unwrap()
+        .expect("bash_tasks row");
+        assert_eq!(row.status, "completed");
+        let _ = registry.kill(&task_id, "session");
     }
 
     /// Companion to the above for the kill path: when a kill observes an
