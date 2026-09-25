@@ -3411,6 +3411,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/__tests__/enabled-disabled-init.test.ts",
+      "token": "filePath",
+      "location": "file-level",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/opencode-plugin/src/__tests__/hoisted-tools.test.ts",
       "token": "filePath",
       "location": "file-level",
