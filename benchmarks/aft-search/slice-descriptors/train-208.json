@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "opencode2-harness-cached-test-executables"
+  ],
+  "note": "OpenCode 2 harness unit tests reuse fake executables from a content-addressed cache. Test harness only; no ranking-fence file touched."
+}
