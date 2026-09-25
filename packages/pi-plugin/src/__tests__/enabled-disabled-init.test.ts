@@ -152,7 +152,10 @@ describe.serial("Pi config error state", () => {
 
   test("a config file that does not parse registers the default surface and fails every call", async () => {
     const layout = await sandbox();
-    writeFileSync(join(layout.projectDir, ".cortexkit", "aft.jsonc"), '{ "edit_mode": "hashline"\n');
+    writeFileSync(
+      join(layout.projectDir, ".cortexkit", "aft.jsonc"),
+      '{ "edit_mode": "hashline"\n',
+    );
 
     const { tools } = await bootInErrorState();
 
