@@ -366,6 +366,22 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
     })
 }
 
+/// [`watcher_path_is_ignored`] for a path known to be a directory.
+///
+/// Directory-only rules (`tmp/`) match only when the matcher is told the path
+/// is a directory, and a directory that was deleted after its events arrived
+/// no longer answers `is_dir()`. Overflow attribution walks the ancestors of
+/// event paths, which are directories by construction, so it states that
+/// instead of asking the filesystem.
+fn watcher_directory_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
+    matcher.is_some_and(|matcher| {
+        let canonical = std::fs::canonicalize(path).ok();
+        let path = canonical.as_deref().unwrap_or(path);
+        path.starts_with(matcher.path())
+            && matcher.matched_path_or_any_parents(path, true).is_ignore()
+    })
+}
+
 /// True when `path` is an in-tree ignore rule file that the current matcher
 /// already excludes, either directly or through an ignored parent directory.
 /// Only in-tree rule files can satisfy this; the global excludes file and
@@ -673,16 +689,20 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
 ///
 /// 1. A checkout's `.git` directory owns slot zero; linked worktrees use a
 ///    `.git` file and do not seed that path.
-/// 2. When no candidate has observed event volume, one representative of
+/// 2. Once an overflow has recorded event volume, directories with observed
+///    volume rank next, heaviest first, ahead of every unobserved candidate.
+///    Observed volume is the only direct evidence of which directory fills
+///    the kernel queue; an unobserved `node_modules` copy is only a guess.
+/// 3. When no candidate has observed event volume, one representative of
 ///    every enabled ecosystem name ranks before a second copy of any name.
 ///    This fallback breadth keeps one workspace ecosystem from spending the
 ///    whole kernel budget on sibling directories. An absent representative is
 ///    deliberate: watcher backends accept absent exclusions, which begin
 ///    covering the path if a build creates it later.
-/// 3. Representatives follow ecosystem priority. On an exact-path backend the
+/// 4. Representatives follow ecosystem priority. On an exact-path backend the
 ///    representative is the largest existing copy; on a subtree backend it is
 ///    the shallowest copy because that path covers its descendants.
-/// 4. Remaining candidates preserve the ordinary storm ranking: directories
+/// 5. Remaining candidates preserve the ordinary storm ranking: directories
 ///    that exist before names that do not, then ecosystem names, observed
 ///    directories, and ignored boundaries in their source-specific order.
 ///
@@ -1029,13 +1049,29 @@ fn derive_exclusion_plan(
         .map(|index| candidates[index].relative.clone())
         .collect::<BTreeSet<_>>();
 
+    // The repository's own `.git` keeps slot zero whatever else is known. Every
+    // other `.git` is skipped by the walk, so the relative path names it alone.
+    let is_root_git = |candidate: &Candidate| candidate.relative == Path::new(".git");
+    // After an overflow the recorded event volume decides. Ranking a measured
+    // directory behind every unobserved ecosystem copy would let a monorepo's
+    // existing `node_modules` copies fill all the slots, leaving the directory
+    // that actually overflowed the queue watched on the next seed.
+    let observed_count = |candidate: &Candidate| {
+        if has_observed_candidates && candidate.source == WatcherExclusionSource::Observed {
+            candidate.observed_count
+        } else {
+            0
+        }
+    };
     candidates.sort_by(|left, right| {
         let left_is_representative =
             !has_observed_candidates && ecosystem_representatives.contains(&left.relative);
         let right_is_representative =
             !has_observed_candidates && ecosystem_representatives.contains(&right.relative);
-        right_is_representative
-            .cmp(&left_is_representative)
+        is_root_git(right)
+            .cmp(&is_root_git(left))
+            .then_with(|| observed_count(right).cmp(&observed_count(left)))
+            .then_with(|| right_is_representative.cmp(&left_is_representative))
             .then_with(|| {
                 if left_is_representative && right_is_representative {
                     left.ecosystem_priority.cmp(&right.ecosystem_priority)
@@ -1460,13 +1496,29 @@ impl WatcherFilterThread {
         for (path, _) in &self.recent_paths {
             let mut relative = PathBuf::new();
             let mut absolute = self.config.project_root.clone();
-            for component in path.components() {
-                let Component::Normal(name) = component else {
-                    continue;
-                };
+            let names = path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for (index, name) in names.iter().enumerate() {
                 relative.push(name);
                 absolute.push(name);
-                if absolute == root_git || watcher_path_is_ignored(matcher.as_deref(), &absolute) {
+                // Every component above the event's own path is a directory,
+                // whether or not it still exists. The event's own path counts
+                // only when it is a directory: an exclusion is a directory, so
+                // a count recorded against an ignored file (`.cortexkit/alfonso/
+                // notes.md` under a `dir/*` rule) can never match a candidate
+                // and only takes a place in the capped observation list.
+                let is_leaf = index + 1 == names.len();
+                if is_leaf && !absolute.is_dir() {
+                    break;
+                }
+                if absolute == root_git
+                    || watcher_directory_is_ignored(matcher.as_deref(), &absolute)
+                {
                     *counts
                         .entry(relative.to_string_lossy().into_owned())
                         .or_default() += 1;
@@ -1827,20 +1879,14 @@ mod tests {
 
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
-        let observed = exclusions
+        // `.git` keeps slot zero; the measured directory takes the next slot,
+        // ahead of every ecosystem name that produced no recorded events.
+        assert_eq!(exclusions[0].path(), canonical_root.join(".git"));
+        assert_eq!(exclusions[1].path(), hot);
+        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Observed);
+        assert!(exclusions[2..]
             .iter()
-            .position(|exclusion| exclusion.path() == hot)
-            .expect("observed nested prefix is selected");
-        assert!(exclusions[..observed]
-            .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
-        assert_eq!(
-            exclusions[observed].source(),
-            WatcherExclusionSource::Observed
-        );
-        assert!(exclusions[observed + 1..]
-            .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Gitignore));
+            .all(|exclusion| exclusion.source() != WatcherExclusionSource::Observed));
     }
 
     #[test]
@@ -1899,20 +1945,14 @@ mod tests {
         );
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
-        let observed = exclusions
+        // `.git` keeps slot zero; the measured directory takes the next slot,
+        // ahead of every ecosystem name that produced no recorded events.
+        assert_eq!(exclusions[0].path(), canonical_root.join(".git"));
+        assert_eq!(exclusions[1].path(), hot);
+        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Observed);
+        assert!(exclusions[2..]
             .iter()
-            .position(|exclusion| exclusion.path() == hot)
-            .expect("observed nested prefix is selected");
-        assert!(exclusions[..observed]
-            .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
-        assert_eq!(
-            exclusions[observed].source(),
-            WatcherExclusionSource::Observed
-        );
-        assert!(exclusions[observed + 1..]
-            .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Gitignore));
+            .all(|exclusion| exclusion.source() != WatcherExclusionSource::Observed));
     }
 
     #[test]
@@ -2394,6 +2434,147 @@ mod tests {
         );
         crate::context::watcher_counters_for_root(&canonical_root)
             .set_observed_exclusion_prefixes(Vec::new());
+    }
+
+    /// The shape of a repository that keeps one agent-tooling directory
+    /// visible while ignoring what it holds: `.cortexkit/alfonso` itself is
+    /// re-included, its children are ignored, and one child is re-included
+    /// again because CI reads it. The parent can never be excluded, so after
+    /// an overflow the volume has to land on the ignored children that wrote
+    /// it, and those children have to outrank the `node_modules` copies that
+    /// were already sitting in every slot while the flood went unwatched.
+    #[test]
+    fn overflow_under_a_reincluded_directory_excludes_its_flooding_ignored_child() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "node_modules\ntarget/\n.cortexkit/*\n!.cortexkit/alfonso/\n.cortexkit/alfonso/*\n!.cortexkit/alfonso/release-notes/\n",
+        )
+        .unwrap();
+        // Enough existing ecosystem directories to fill every slot on their
+        // own, as the node_modules copies of a JS monorepo do.
+        for existing in [
+            "target",
+            "node_modules",
+            "packages/plugin/node_modules",
+            "packages/pi-plugin/node_modules",
+            "packages/cli/node_modules",
+            "packages/dashboard/node_modules",
+            "packages/docs/node_modules",
+            "packages/e2e-tests/node_modules",
+            ".cortexkit/alfonso/prompts",
+            ".cortexkit/alfonso/athena",
+            ".cortexkit/alfonso/audits",
+            ".cortexkit/alfonso/release-notes",
+        ] {
+            std::fs::create_dir_all(root.path().join(existing)).unwrap();
+        }
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let alfonso = canonical_root.join(".cortexkit/alfonso");
+        // Ignored files directly under the re-included directory: they are
+        // ignored, but no directory exclusion can ever name them.
+        for index in 0..40 {
+            std::fs::write(alfonso.join(format!("ledger-{index}.md")), "").unwrap();
+        }
+        let matcher = shared_matcher(&canonical_root);
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let generation = Arc::new(AtomicU64::new(1));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let config = WatcherFilterConfig::new(canonical_root.clone(), None);
+        let mut filter = WatcherFilterThread::new(
+            config,
+            Arc::clone(&matcher),
+            generation,
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+
+        let mut burst = Vec::new();
+        burst.extend((0..200).map(|index| alfonso.join(format!("prompts/run-{index}.md"))));
+        burst.extend((0..80).map(|index| alfonso.join(format!("athena/panel-{index}.json"))));
+        burst.extend((0..40).map(|index| alfonso.join(format!("release-notes/v{index}.md"))));
+        // Repeated writes to ignored top-level files. Recorded per file, each
+        // would take an entry in the capped observation list that no
+        // directory exclusion can ever use.
+        for _ in 0..3 {
+            burst.extend((0..40).map(|index| alfonso.join(format!("ledger-{index}.md"))));
+        }
+        for path in burst {
+            raw_tx
+                .send(Ok(
+                    notify::Event::new(EventKind::Create(CreateKind::File)).add_path(path)
+                ))
+                .unwrap();
+        }
+        raw_tx
+            .send(Ok(
+                notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
+            ))
+            .unwrap();
+        assert_eq!(
+            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+
+        // Volume is recorded against the ignored children that can be
+        // excluded, never against an ignored file or a re-included path.
+        assert_eq!(
+            counters.observed_exclusion_prefixes(),
+            vec![
+                crate::context::WatcherOverflowPrefix {
+                    prefix: ".cortexkit/alfonso/prompts".to_string(),
+                    count: 200,
+                },
+                crate::context::WatcherOverflowPrefix {
+                    prefix: ".cortexkit/alfonso/athena".to_string(),
+                    count: 80,
+                },
+            ]
+        );
+
+        // Pin exact-path coverage: it is the coverage under which every
+        // node_modules copy needs its own slot and the slots run out.
+        let selected = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::ExactPath,
+        )
+        .selected;
+        let paths = watcher_exclusion_paths(&selected);
+        assert_eq!(
+            paths[..3],
+            [
+                canonical_root.join(".git"),
+                alfonso.join("prompts"),
+                alfonso.join("athena"),
+            ],
+            "the ignored children that flooded must follow .git, heaviest first: {paths:?}"
+        );
+        assert!(selected[1..3]
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Observed));
+        for never in [
+            alfonso.join("release-notes"),
+            alfonso.clone(),
+            canonical_root.join(".cortexkit"),
+        ] {
+            assert!(
+                !paths.contains(&never),
+                "{} holds un-ignored paths and must never be excluded: {paths:?}",
+                never.display()
+            );
+        }
+        counters.set_observed_exclusion_prefixes(Vec::new());
     }
 
     #[test]
