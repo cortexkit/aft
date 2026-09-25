@@ -1208,7 +1208,7 @@ mod tests {
         let created = fs_lock::io_ledger::take();
         assert_eq!(
             (created.file_syncs, created.dir_syncs, created.new_files),
-            (1, 1, 1),
+            (1, dir_syncs_per_create(), 1),
             "first claim: {created:?}"
         );
 
@@ -1220,14 +1220,29 @@ mod tests {
                 reclaimed.dir_syncs,
                 reclaimed.new_files
             ),
-            (1, 1, 1),
+            (1, dir_syncs_per_create(), 1),
             "same-checkout re-claim: {reclaimed:?}"
         );
 
         let current = read_manifest(&lease.path).unwrap();
         assert!(reclaim_manifest_if_unchanged(&lease.path, &current).unwrap());
         let removed = fs_lock::io_ledger::take();
-        assert_eq!(removed.dir_syncs, 1, "dead-owner removal: {removed:?}");
+        assert_eq!(
+            removed.dir_syncs,
+            dir_syncs_per_create(),
+            "dead-owner removal: {removed:?}"
+        );
+    }
+
+    /// Directory fsyncs recorded per directory-entry change. Windows cannot open
+    /// a directory as a file to sync it, so the parent sync is a no-op there and
+    /// records nothing.
+    fn dir_syncs_per_create() -> u64 {
+        if cfg!(windows) {
+            0
+        } else {
+            1
+        }
     }
 
     /// A crash after an unsynced heartbeat rename can leave a zero-length

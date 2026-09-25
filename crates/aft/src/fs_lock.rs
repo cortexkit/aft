@@ -2082,7 +2082,7 @@ mod tests {
         drop(guard);
         assert_eq!(
             (created.file_syncs, created.dir_syncs, created.new_files),
-            (1, 1, 1),
+            (1, DIR_SYNCS_PER_CREATE, 1),
             "lease creation must fsync the file and the directory: {created:?}"
         );
 
@@ -2103,10 +2103,15 @@ mod tests {
                 reclaimed.dir_syncs,
                 reclaimed.new_files
             ),
-            (3, 3, 3),
+            (3, 3 * DIR_SYNCS_PER_CREATE, 3),
             "lease reclaim must keep its fsyncs: {reclaimed:?}"
         );
     }
+
+    /// Directory fsyncs recorded per directory-entry change. Windows cannot open
+    /// a directory as a file to sync it, so `sync_parent` is a no-op there and
+    /// records nothing; NTFS journals the entry itself.
+    const DIR_SYNCS_PER_CREATE: u64 = if cfg!(windows) { 0 } else { 1 };
 
     /// A crash after an unsynced rename can leave a zero-length lease. Readers
     /// must treat it as stale: acquisition removes it and takes the lock, the
