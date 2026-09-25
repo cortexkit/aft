@@ -5235,6 +5235,7 @@ impl AppContext {
 
     /// Whether a refresh the store must apply before answering as current is
     /// still outstanding.
+    #[cfg(test)]
     pub(crate) fn callgraph_catch_up_outstanding(&self) -> bool {
         self.callgraph_catch_up.outstanding()
     }
