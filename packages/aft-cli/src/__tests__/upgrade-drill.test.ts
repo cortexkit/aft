@@ -189,7 +189,7 @@ async function plainDoctor(): Promise<{ code: number; text: string }> {
   return { code, text: output.join("") };
 }
 
-describe("D1: doctor reports every condition that stops the plugin loading", () => {
+describe("doctor reports every condition that stops the plugin loading", () => {
   test("a subc.connection_file that points at nothing is HIGH, with what to remove", async () => {
     writeUserConfig({ subc: { connection_file: "~/.local/share/cortexkit/run/subc.json" } });
     const { code, text } = await plainDoctor();
@@ -319,7 +319,7 @@ async function doctorFix(
   return output.join("");
 }
 
-describe("D2: the config migration is planned and its changes are reported", () => {
+describe("the config migration is planned and its changes are reported", () => {
   test("lists the migration with its changes, then prints what changed", async () => {
     writeUserConfig({
       $schema: AFT_SCHEMA_URL,
@@ -368,7 +368,7 @@ describe("D2: the config migration is planned and its changes are reported", () 
   });
 });
 
-describe("D3: a binary already in the versioned cache", () => {
+describe("a binary already in the versioned cache", () => {
   test("is planned as a check, not a download, and never reported as not found", async () => {
     writeUserConfig({ $schema: AFT_SCHEMA_URL });
     const tag = `v${getSelfVersion()}`;
@@ -418,7 +418,7 @@ describe("D3: a binary already in the versioned cache", () => {
   });
 });
 
-describe("D4: ONNX Runtime is required only for the local semantic backend", () => {
+describe("ONNX Runtime is required only for the local semantic backend", () => {
   test("a remote embedding backend does not need ONNX, even with the old semantic_search key", async () => {
     const harness = await harnessFor({
       semantic_search: true,
@@ -438,7 +438,7 @@ describe("D4: ONNX Runtime is required only for the local semantic backend", () 
   });
 });
 
-describe("D5: the pin message and doctor --fix agree", () => {
+describe("the pin message and doctor --fix agree", () => {
   const pinned = pinnedPluginEntry(getSelfVersion());
 
   function problemsFor(entry: string, detection: OpenCodeHostDetection): string[] {
@@ -486,7 +486,7 @@ describe("D5: the pin message and doctor --fix agree", () => {
   });
 });
 
-describe("D8: $schema goes first in an existing aft.jsonc", () => {
+describe("$schema goes first in an existing aft.jsonc", () => {
   test("inserted as the first key, with the user's comments and keys kept", () => {
     const text = [
       "// my AFT settings",
