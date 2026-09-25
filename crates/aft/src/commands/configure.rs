@@ -2549,11 +2549,10 @@ fn slow_configure_prefix_line(total: Duration, phases: &str) -> String {
 /// the executor to run the bind again as an exclusive writer and returns the
 /// response the caller must return at once (the executor discards it). The
 /// worker is handed back rather than waiting for the tail.
-fn defer_to_exclusive_configure(ctx: &AppContext, req_id: &str) -> Option<Response> {
+fn defer_to_exclusive_configure(req_id: &str) -> Option<Response> {
     if !crate::executor::request_exclusive_rerun() {
         return None;
     }
-    ctx.begin_configure_ack_phase("rerun_as_exclusive");
     Some(Response::error(
         req_id,
         "configure_needs_exclusive",
@@ -2941,7 +2940,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         if session_already_bound && only_lsp_process_state_changed(&previous_config, &next_config) {
             // Publishes a new config, so readers must not overlap it.
-            if let Some(deferred) = defer_to_exclusive_configure(ctx, &req.id) {
+            if let Some(deferred) = defer_to_exclusive_configure(&req.id) {
                 return deferred;
             }
             if let Some(token) = crate::executor::current_job_cancellation() {
@@ -3102,7 +3101,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         // the root cannot quiesce again while the bind is pending, so the
         // check cannot go stale before the seal below.
         if ctx.subc_unbound_quiesced() {
-            if let Some(deferred) = defer_to_exclusive_configure(ctx, &req.id) {
+            if let Some(deferred) = defer_to_exclusive_configure(&req.id) {
                 return deferred;
             }
         }
@@ -3206,7 +3205,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Everything below re-establishes the root (a new generation, config,
     // runtime, and artifact loads), so it runs with exclusive use of the actor.
-    if let Some(deferred) = defer_to_exclusive_configure(ctx, &req.id) {
+    if let Some(deferred) = defer_to_exclusive_configure(&req.id) {
         return deferred;
     }
     if let Some(cancelled) = configure_cancelled(&req.id) {

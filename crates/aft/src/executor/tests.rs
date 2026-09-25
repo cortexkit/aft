@@ -3419,6 +3419,91 @@ fn bind_needing_exclusive_use_is_rerun_after_a_polling_tail_steps_aside() {
     );
 }
 
+/// A cancel can land in the handoff window: the worker has put a requeued
+/// bind's token back to pending, but the scheduler has not queued the job yet,
+/// so `cancel_job` finds nothing to remove and only signals the token. The
+/// scheduler must settle that bind as cancelled when it takes the requeue,
+/// not queue cancelled writer demand behind the tail still holding the actor.
+#[test]
+fn bind_cancelled_during_the_requeue_handoff_is_settled_without_queuing() {
+    let executor = Arc::new(test_executor(4, 2, 2, 2));
+    let (_dir, root) = test_root("bind-requeue-handoff-cancel");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (_epoch, waiting_writers, _detached) = actor_epoch_and_demand(&executor, &root);
+
+    let (tail_started_tx, tail_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_tail_tx, release_tail_rx) = crossbeam_channel::bounded::<()>(1);
+    let tail = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "subc-maintenance-drain-configure-tail-handoff".to_string(),
+        Box::new(move |_| {
+            tail_started_tx.send(()).expect("signal tail start");
+            let _ = release_tail_rx.recv_timeout(Duration::from_secs(30));
+            ok("tail")
+        }),
+    );
+    tail_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("tail starts");
+
+    let (token_tx, token_rx) = crossbeam_channel::bounded::<JobCancellation>(1);
+    let (cancelled_tx, cancelled_rx) = crossbeam_channel::bounded::<JobCancelOutcome>(1);
+    {
+        let executor = Arc::clone(&executor);
+        let root = root.clone();
+        set_requeue_handoff_hook_for_test("subc-bind-handoff", move || {
+            let token = token_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("bind token");
+            let _ = cancelled_tx.send(executor.cancel_job(&root, &token));
+        });
+    }
+    let (mut bind, token) = submit_repeatable_bind(&executor, &root, "subc-bind-handoff", |_| {
+        if request_exclusive_rerun() {
+            return Response::error("subc-bind-handoff", "configure_needs_exclusive", "rerun");
+        }
+        ok("subc-bind-handoff")
+    });
+    token_tx.send(token).expect("hand the token to the hook");
+    let cancel = cancelled_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the hook ran in the handoff window");
+
+    // The tail still holds the actor: only settlement at requeue answers now.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let response = loop {
+        if let Ok(response) = bind.try_recv() {
+            break Some(response);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(2));
+    };
+    let demand_while_tail_held = waiting_writers.load(Ordering::Acquire);
+    let _ = release_tail_tx.send(());
+    assert!(recv_async(tail, "handoff tail").success);
+    let response = match response {
+        Some(response) => response,
+        None => {
+            let late = recv_async(bind, "late handoff bind");
+            panic!(
+                "the cancelled bind was answered only after the tail let go \
+                 (writer demand while held: {demand_while_tail_held}): {:?}",
+                late.data
+            );
+        }
+    };
+
+    assert_eq!(cancel, JobCancelOutcome::RunningSignalled);
+    assert_eq!(response.data["code"], "request_cancelled");
+    assert_eq!(
+        demand_while_tail_held, 0,
+        "no cancelled writer demand queued"
+    );
+}
+
 /// A bind sent back for exclusive use waits in the actor's queue, not on a
 /// worker: every worker but the tail's stays idle, it counts as a waiting
 /// writer, its diagnostics say why it waits, and cancelling it removes it
@@ -3478,6 +3563,14 @@ fn requeued_bind_waits_off_worker_names_its_blockers_and_cancels_cleanly() {
     assert!(recv_async(tail, "cancel tail").success);
 
     let snapshot = snapshot.expect("the bind is queued again for exclusive use");
+    assert!(
+        snapshot
+            .configure_phase_timings
+            .as_deref()
+            .is_some_and(|phases| phases.contains("requeued_exclusive=")),
+        "{:?}",
+        snapshot.configure_phase_timings
+    );
     assert!(
         snapshot
             .blockers

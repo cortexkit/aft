@@ -2837,7 +2837,26 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
 
     if let Some(queued) = requeue {
         match state.actors.get_mut(&root_id) {
+            // A cancel that landed after the worker returned the token to
+            // pending, but before this event, found the job neither queued
+            // nor able to observe it. Settle it here, under the scheduler
+            // lock that `cancel_job` also takes, instead of queuing cancelled
+            // writer demand behind whatever holds the actor.
+            _ if queued
+                .cancellation
+                .as_ref()
+                .is_some_and(JobCancellation::cancel_requested_before_commit) =>
+            {
+                queued.completion.send(Response::error(
+                    queued.request_id,
+                    "request_cancelled",
+                    "request cancelled before execution",
+                ));
+            }
             Some(actor) if !actor.fatal => {
+                // Pending-bind diagnostics read the configure phases; name the
+                // wait instead of leaving the phase the discarded run reached.
+                actor.ctx.begin_configure_ack_phase("requeued_exclusive");
                 actor.interactive.push_front_job(Lane::Mutating, queued);
                 actor.sync_waiting_writers();
             }
@@ -3356,6 +3375,7 @@ fn requeue_as_exclusive(run_job: &mut RunJob) -> Result<QueuedJob, Response> {
     {
         return Err(cancelled());
     }
+    requeue_handoff_hook_for_test(&run_job.request_id);
     let rerun = run_job
         .rerun
         .clone()
@@ -3377,6 +3397,45 @@ fn requeue_as_exclusive(run_job: &mut RunJob) -> Result<QueuedJob, Response> {
         force_exclusive: true,
     })
 }
+
+/// Test hook: a job's request id and a callback run on the worker right after
+/// a requeued bind's token went back to pending, before the scheduler sees
+/// the requeue.
+#[cfg(test)]
+type RequeueHandoffHook = (String, Box<dyn FnOnce() + Send>);
+
+#[cfg(test)]
+static REQUEUE_HANDOFF_HOOK: Mutex<Option<RequeueHandoffHook>> = Mutex::new(None);
+
+/// Run `hook` on the worker between returning `request_id`'s token to pending
+/// and handing the requeue to the scheduler.
+#[cfg(test)]
+pub(crate) fn set_requeue_handoff_hook_for_test(
+    request_id: &str,
+    hook: impl FnOnce() + Send + 'static,
+) {
+    *REQUEUE_HANDOFF_HOOK.lock() = Some((request_id.to_string(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn requeue_handoff_hook_for_test(request_id: &str) {
+    let hook = {
+        let mut slot = REQUEUE_HANDOFF_HOOK.lock();
+        match slot.take() {
+            Some((id, hook)) if id == request_id => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn requeue_handoff_hook_for_test(_request_id: &str) {}
 
 /// How one dispatched job ended on its worker.
 enum LaneRun {
