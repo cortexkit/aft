@@ -2578,6 +2578,9 @@ pub struct AppContext {
     /// without superseding a valid callgraph build.
     callgraph_build_key: parking_lot::Mutex<Option<String>>,
     configure_phase_timing: parking_lot::Mutex<ConfigurePhaseTiming>,
+    /// The configure-tail stage running on this root and when it started, or
+    /// `None` between units. Read by the pending-bind diagnostics.
+    configure_tail_stage: parking_lot::Mutex<Option<(&'static str, Instant)>>,
     configured_session_roots: parking_lot::Mutex<BTreeSet<(PathBuf, String)>>,
     hashline_bindings: crate::hashline::integration::BindingRegistry,
     configure_maintenance_jobs: parking_lot::Mutex<VecDeque<ConfigureMaintenanceJob>>,
@@ -3049,6 +3052,7 @@ impl AppContext {
             configure_warm_state: parking_lot::Mutex::new(ConfigureWarmState::default()),
             callgraph_build_key: parking_lot::Mutex::new(None),
             configure_phase_timing: parking_lot::Mutex::new(ConfigurePhaseTiming::default()),
+            configure_tail_stage: parking_lot::Mutex::new(None),
             configured_session_roots: parking_lot::Mutex::new(BTreeSet::new()),
             hashline_bindings: crate::hashline::integration::BindingRegistry::new(),
             configure_maintenance_jobs: parking_lot::Mutex::new(VecDeque::new()),
@@ -4439,6 +4443,22 @@ impl AppContext {
             timing.started_at.elapsed().as_millis()
         ));
         parts.join(",")
+    }
+
+    /// Record the configure-tail stage that starts now, or `None` once the
+    /// unit has finished.
+    pub(crate) fn note_configure_tail_stage(&self, stage: Option<&'static str>) {
+        *self.configure_tail_stage.lock() = stage.map(|stage| (stage, Instant::now()));
+    }
+
+    /// `stage=<name>,elapsed_ms=<ms>` for the configure-tail unit running now.
+    pub(crate) fn configure_tail_stage_snapshot(&self) -> Option<String> {
+        self.configure_tail_stage.lock().map(|(stage, started_at)| {
+            format!(
+                "stage={stage},elapsed_ms={}",
+                started_at.elapsed().as_millis()
+            )
+        })
     }
 
     pub fn advance_semantic_fingerprint_generation(&self) -> u64 {

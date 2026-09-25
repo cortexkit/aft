@@ -11873,6 +11873,291 @@ mod tests {
         assert_eq!(dirs.len(), ROOTS);
     }
 
+    /// A small committed git root whose first route bind has configured it,
+    /// with that bind's configure tail running on the executor and held at
+    /// the start of one stage, standing in for a stage that runs long on a
+    /// large root.
+    struct HeldConfigureTail {
+        executor: Arc<Executor>,
+        root: ProjectRootId,
+        canonical_root: PathBuf,
+        ctx: Arc<AppContext>,
+        dir: tempfile::TempDir,
+        storage: tempfile::TempDir,
+        release: Option<crossbeam_channel::Sender<()>>,
+        tail: Option<tokio::sync::oneshot::Receiver<Response>>,
+        _gate: crate::commands::configure::ConfigureTailStageGateGuard,
+        _git_env: crate::test_env::HermeticGitEnvGuard,
+    }
+
+    impl HeldConfigureTail {
+        fn start(held_stage: &'static str) -> Self {
+            let git_env = crate::test_env::hermetic_git_env_guard();
+            let storage = tempfile::tempdir().unwrap();
+            let executor = Arc::new(Executor::new());
+            let dir = tempfile::tempdir().unwrap();
+            for file in 0..20 {
+                std::fs::write(
+                    dir.path().join(format!("module_{file}.rs")),
+                    format!("pub fn function_{file}() -> usize {{ {file} }}\n"),
+                )
+                .unwrap();
+            }
+            for args in [
+                &["init", "--quiet"][..],
+                &["add", "."][..],
+                &[
+                    "-c",
+                    "user.name=AFT Tests",
+                    "-c",
+                    "user.email=aft-tests@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ][..],
+            ] {
+                let mut command = std::process::Command::new("git");
+                crate::test_env::apply_hermetic_git_env(command.current_dir(dir.path()));
+                assert!(command.args(args).status().unwrap().success());
+            }
+            let root = ProjectRootId::from_path(dir.path()).unwrap();
+            let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+            let ctx = Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                Config {
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    ..Config::default()
+                },
+            ));
+            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+            let (gate, tail_held, release) =
+                crate::commands::configure::gate_configure_tail_stage_for_test(
+                    canonical_root.clone(),
+                    held_stage,
+                );
+            let mut fixture = Self {
+                executor,
+                root,
+                canonical_root,
+                ctx,
+                dir,
+                storage,
+                release: Some(release),
+                tail: None,
+                _gate: gate,
+                _git_env: git_env,
+            };
+
+            // The first session's bind configures the cold root and queues
+            // its tail.
+            let first = fixture.bind_request(0, "opencode");
+            let first = fixture.executor.submit(
+                fixture.root.clone(),
+                Lane::Mutating,
+                first.id.clone(),
+                Box::new(move |ctx| crate::commands::configure::handle_configure(&first, ctx)),
+            );
+            let first = first
+                .recv_timeout(Duration::from_secs(30))
+                .expect("first bind completes");
+            assert!(first.success, "{}", first.data);
+
+            fixture.tail = Some(fixture.executor.submit_maintenance_async(
+                fixture.root.clone(),
+                Lane::MaintenanceCommit,
+                format!(
+                    "subc-maintenance-drain-configure-tail-{}",
+                    fixture.root.as_path().display()
+                ),
+                Box::new(|ctx| {
+                    let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+                    Response::success("tail", json!({ "requeue": requeue }))
+                }),
+            ));
+            tail_held
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the tail reaches the held stage");
+            fixture
+        }
+
+        fn bind_request(&self, index: usize, harness: &str) -> RawRequest {
+            serde_json::from_value::<RawRequest>(json!({
+                "id": format!("subc-bind-herd-{index}"),
+                "command": "configure",
+                "project_root": self.dir.path(),
+                "storage_dir": self.storage.path(),
+                "harness": harness,
+                "session_id": format!("herd-session-{index}"),
+                "config": [{
+                    "tier": "user",
+                    "source": "/u/aft.jsonc",
+                    "doc": json!({ "semantic_search": false }).to_string(),
+                }],
+            }))
+            .unwrap()
+        }
+
+        /// Submit a route bind the way the module loop does.
+        fn submit_bind(&self, request: RawRequest) -> tokio::sync::oneshot::Receiver<Response> {
+            self.executor.submit_async(
+                self.root.clone(),
+                Lane::Mutating,
+                request.id.clone(),
+                Box::new(move |ctx| crate::commands::configure::handle_configure(&request, ctx)),
+            )
+        }
+
+        /// Let the tail go, wait for it, and drain whatever it left queued.
+        fn release_tail(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(tail) = self.tail.take() {
+                let tail = tail.blocking_recv().expect("tail completion");
+                assert!(tail.success);
+            }
+        }
+    }
+
+    impl Drop for HeldConfigureTail {
+        fn drop(&mut self) {
+            // A failed assertion must not leave the tail parked on its gate.
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    /// After a daemon restart every session of a root rebinds at once, while
+    /// that root's first configure tail runs one long unit that cannot step
+    /// aside (a view or artifact load on a large root). The herd rebinds with
+    /// an unchanged configuration, so each bind must be answered beside the
+    /// held tail, far inside the daemon's 12 s relay limit, and none of them
+    /// may redo the root's configure work.
+    #[test]
+    fn same_root_rebind_herd_is_acked_while_the_configure_tail_is_held_in_a_slow_stage() {
+        const BINDS: usize = 16;
+        const ACK_BOUND: Duration = Duration::from_secs(2);
+        let mut fixture = HeldConfigureTail::start("view_load");
+        let generation = fixture.ctx.configure_generation();
+
+        let started = Instant::now();
+        let mut binds = (1..=BINDS)
+            .map(|index| {
+                let bind = fixture.submit_bind(fixture.bind_request(index, "opencode"));
+                (index, Some(bind))
+            })
+            .collect::<Vec<_>>();
+        let mut acked = Vec::new();
+        let deadline = started + ACK_BOUND;
+        while acked.len() < BINDS && Instant::now() < deadline {
+            for (index, slot) in &mut binds {
+                let Some(bind) = slot.as_mut() else {
+                    continue;
+                };
+                if let Ok(response) = bind.try_recv() {
+                    assert!(response.success, "bind {index}: {}", response.data);
+                    acked.push((*index, started.elapsed()));
+                    *slot = None;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let blockers = fixture
+            .executor
+            .try_bind_blocker_snapshot(&fixture.root, "subc-bind-herd-1")
+            .map(|snapshot| snapshot.blockers);
+
+        fixture.release_tail();
+        for (index, slot) in binds {
+            if let Some(bind) = slot {
+                let response = bind.blocking_recv().expect("bind completion");
+                assert!(response.success, "bind {index}: {}", response.data);
+            }
+        }
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+
+        assert_eq!(
+            acked.len(),
+            BINDS,
+            "only {} of {BINDS} same-root rebinds were acked within {ACK_BOUND:?} while the \
+             tail was held in view_load: acked={acked:?} blockers={blockers:?}",
+            acked.len()
+        );
+        // None of the herd re-ran the root's configure: the generation is the
+        // first bind's, and the root-scoped tail stages ran exactly once.
+        assert_eq!(fixture.ctx.configure_generation(), generation);
+        let records =
+            crate::commands::configure::configure_unit_records_for_root(&fixture.canonical_root);
+        for stage in ["project_runtime", "watcher", "view_load", "callgraph"] {
+            assert_eq!(
+                records
+                    .iter()
+                    .filter(|record| record.stage == stage)
+                    .count(),
+                1,
+                "{stage} ran more than once: {records:?}"
+            );
+        }
+        for index in 0..=BINDS {
+            assert!(
+                fixture.ctx.has_configure_session_binding(
+                    &fixture.canonical_root,
+                    &format!("herd-session-{index}")
+                ),
+                "session {index} is bound"
+            );
+        }
+    }
+
+    /// A bind that changes the root's configuration (here its harness) must
+    /// not re-establish the root beside a running tail of the previous
+    /// configuration: it waits for exclusive use of the actor, says so in the
+    /// pending-bind diagnostics, and reconfigures once the tail lets go.
+    #[test]
+    fn config_changing_bind_waits_for_the_held_tail_before_reconfiguring() {
+        let mut fixture = HeldConfigureTail::start("view_load");
+        let generation = fixture.ctx.configure_generation();
+
+        let request = fixture.bind_request(1, "pi");
+        let request_id = request.id.clone();
+        let mut bind = fixture.submit_bind(request);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let blockers = loop {
+            if let Some(snapshot) = fixture
+                .executor
+                .try_bind_blocker_snapshot(&fixture.root, &request_id)
+                .filter(|snapshot| {
+                    snapshot
+                        .blockers
+                        .iter()
+                        .any(|blocker| blocker == "waiting_for_exclusive_gate")
+                })
+            {
+                break Some(snapshot.blockers);
+            }
+            if bind.try_recv().is_ok() || Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        let reconfigured_while_held = fixture.ctx.configure_generation() != generation;
+
+        fixture.release_tail();
+        let blockers = blockers.expect("the bind waits for exclusive use while the tail is held");
+        assert!(!reconfigured_while_held);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("configure_tail_stage(stage=view_load,")),
+            "{blockers:?}"
+        );
+        let response = bind.blocking_recv().expect("bind completion");
+        assert!(response.success, "{}", response.data);
+        assert!(fixture.ctx.configure_generation() > generation);
+    }
+
     #[test]
     #[ignore = "measurement: run with --ignored --nocapture"]
     fn configure_tail_burst_measurement_capped() {

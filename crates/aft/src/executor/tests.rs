@@ -2616,6 +2616,22 @@ fn heavy_init_completion_and_following_read_do_not_wait_on_maintenance_epoch() {
         "read-after-finalized-search".to_string(),
         Box::new(|_| ok("read-after-finalized-search")),
     );
+    // The first bind starts beside the maintenance job with a shared hold,
+    // which leaves the read free to run. Once the read has finished, the bind
+    // needs the actor exclusively, so it waits as the actor's running writer.
+    // The second bind stays queued behind it; its census is what this test
+    // reads.
+    let (upgrade_tx, upgrade_rx) = crossbeam_channel::bounded::<()>(1);
+    let upgrading_bind = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "subc-bind-upgrading-after-finalized-search".to_string(),
+        Box::new(move |_| {
+            let _ = upgrade_rx.recv_timeout(Duration::from_secs(5));
+            ensure_exclusive_actor_gate();
+            ok("subc-bind-upgrading-after-finalized-search")
+        }),
+    );
     let bind = executor.submit(
         root.clone(),
         Lane::Mutating,
@@ -2625,6 +2641,7 @@ fn heavy_init_completion_and_following_read_do_not_wait_on_maintenance_epoch() {
 
     let heavy_result = heavy.recv_timeout(Duration::from_secs(1));
     let read_result = read.recv_timeout(Duration::from_secs(1));
+    let _ = upgrade_tx.send(());
     let snapshot_deadline = Instant::now() + Duration::from_secs(1);
     let snapshot = loop {
         if let Some(snapshot) = executor
@@ -2666,6 +2683,9 @@ fn heavy_init_completion_and_following_read_do_not_wait_on_maintenance_epoch() {
         snapshot.blockers
     );
     assert!(recv_async(maintenance, "maintenance completion").success);
+    upgrading_bind
+        .recv_timeout(Duration::from_secs(1))
+        .expect("upgrading bind runs after the real maintenance reader exits");
     bind.recv_timeout(Duration::from_secs(1))
         .expect("bind runs after the real maintenance reader exits");
 }
@@ -3155,13 +3175,13 @@ fn bind_storm_reaches_ack_while_maintenance_and_interactive_saturate_the_pool() 
     assert_eq!(dirs.len(), BUSY_ROOTS + BIND_ROOTS);
 }
 
-/// A same-root configure tail holds the actor's epoch read gate, so a bind for
-/// that root cannot start until the tail lets go. A tail that polls
-/// `current_actor_writer_waiting` between its steps must see the queued bind
-/// and return, so the bind starts within one step rather than after the
-/// whole tail.
+/// A same-root configure tail holds the actor's epoch read gate. A bind that
+/// must change the root upgrades to exclusive use of the actor, and a tail
+/// that polls `current_actor_writer_waiting` between its steps must see that
+/// waiting bind and return, so the bind runs within one step rather than
+/// after the whole tail.
 #[test]
-fn same_root_maintenance_tail_observes_a_queued_bind_and_lets_it_run() {
+fn same_root_maintenance_tail_steps_aside_for_a_bind_that_needs_the_actor_exclusively() {
     let executor = test_executor(4, 2, 2, 2);
     let (_dir, root) = test_root("tail-steps-aside");
     assert!(executor.register_actor(root.clone(), test_ctx()));
@@ -3196,7 +3216,14 @@ fn same_root_maintenance_tail_observes_a_queued_bind_and_lets_it_run() {
         root,
         Lane::Mutating,
         "subc-bind-same-root".to_string(),
-        Box::new(move |_| ok(format!("{}", submitted_at.elapsed().as_millis()))),
+        Box::new(move |_| {
+            // A configure that changes the root takes the actor exclusively
+            // before its first change.
+            let waited = ensure_exclusive_actor_gate();
+            assert!(waited.is_some(), "the bind started beside the tail");
+            assert!(!current_bind_gate_is_shared());
+            ok(format!("{}", submitted_at.elapsed().as_millis()))
+        }),
     );
     let bind_response = recv_async(bind, "same-root bind");
     let waited = submitted_at.elapsed();
@@ -3214,6 +3241,155 @@ fn same_root_maintenance_tail_observes_a_queued_bind_and_lets_it_run() {
     assert!(
         !current_actor_writer_waiting(),
         "off a worker thread no actor is observed"
+    );
+}
+
+/// After a daemon restart every session of a root rebinds while that root's
+/// configure tail runs one long unit that cannot step aside (artifact and view
+/// loads on a large root). A rebind of an unchanged root only reads the
+/// published configuration and records its session, so each of the herd must
+/// be answered beside the running tail, not after it.
+#[test]
+fn bind_herd_is_answered_beside_a_same_root_tail_stuck_in_one_long_step() {
+    const BINDS: usize = 16;
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("bind-herd-beside-tail");
+    let ctx = test_ctx();
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+    let (tail_started_tx, tail_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_tail_tx, release_tail_rx) = crossbeam_channel::bounded::<()>(1);
+    let tail = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "subc-maintenance-drain-configure-tail-herd".to_string(),
+        Box::new(move |ctx| {
+            ctx.note_configure_tail_stage(Some("view_load"));
+            tail_started_tx.send(()).expect("signal tail start");
+            // One unit that never polls for waiting writers.
+            let _ = release_tail_rx.recv_timeout(Duration::from_secs(30));
+            ctx.note_configure_tail_stage(None);
+            ok("tail")
+        }),
+    );
+    tail_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("tail starts");
+
+    let submitted_at = Instant::now();
+    let binds = (0..BINDS)
+        .map(|index| {
+            executor.submit_async(
+                root.clone(),
+                Lane::Mutating,
+                format!("subc-bind-herd-{index}"),
+                Box::new(move |_| {
+                    assert!(current_bind_gate_is_shared());
+                    ok(format!("subc-bind-herd-{index}"))
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (answered_tx, answered_rx) = crossbeam_channel::unbounded::<Duration>();
+    let waiters = binds
+        .into_iter()
+        .map(|bind| {
+            let answered = answered_tx.clone();
+            thread::spawn(move || {
+                if let Ok(response) = bind.blocking_recv() {
+                    assert!(response.success);
+                    let _ = answered.send(submitted_at.elapsed());
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + BIND_STORM_ACK_BOUND;
+    let mut latencies = Vec::new();
+    while latencies.len() < BINDS {
+        match answered_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(latency) => latencies.push(latency),
+            Err(_) => break,
+        }
+    }
+    let answered_beside_tail = latencies.len();
+
+    let _ = release_tail_tx.send(());
+    assert!(recv_async(tail, "herd tail").success);
+    for waiter in waiters {
+        waiter.join().expect("bind waiter");
+    }
+    assert_eq!(
+        answered_beside_tail, BINDS,
+        "only {answered_beside_tail} of {BINDS} same-root binds were answered within \
+         {BIND_STORM_ACK_BOUND:?} while the tail held one long step: {latencies:?}"
+    );
+}
+
+/// A bind that must change the root waits for exclusive use of the actor, and
+/// the pending-bind diagnostics name both that wait and the configure-tail
+/// stage holding it up.
+#[test]
+fn upgrading_bind_blockers_name_the_exclusive_wait_and_the_tail_stage() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("bind-upgrade-blockers");
+    let ctx = test_ctx();
+    assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+
+    let (tail_started_tx, tail_started_rx) = crossbeam_channel::bounded::<()>(1);
+    let (release_tail_tx, release_tail_rx) = crossbeam_channel::bounded::<()>(1);
+    let tail = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "subc-maintenance-drain-configure-tail-upgrade".to_string(),
+        Box::new(move |ctx| {
+            ctx.note_configure_tail_stage(Some("view_load"));
+            tail_started_tx.send(()).expect("signal tail start");
+            let _ = release_tail_rx.recv_timeout(Duration::from_secs(30));
+            ctx.note_configure_tail_stage(None);
+            ok("tail")
+        }),
+    );
+    tail_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("tail starts");
+
+    let bind = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "subc-bind-upgrade".to_string(),
+        Box::new(move |_| {
+            ensure_exclusive_actor_gate();
+            ok("subc-bind-upgrade")
+        }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let snapshot = loop {
+        if let Some(snapshot) = executor
+            .try_bind_blocker_snapshot(&root, "subc-bind-upgrade")
+            .filter(|snapshot| {
+                snapshot
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker == "waiting_for_exclusive_gate")
+            })
+        {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "bind never waited to upgrade");
+        thread::sleep(Duration::from_millis(5));
+    };
+    let _ = release_tail_tx.send(());
+    assert!(recv_async(bind, "upgrading bind").success);
+    assert!(recv_async(tail, "upgrade tail").success);
+
+    assert_eq!(snapshot.configure_state, "running");
+    assert!(
+        snapshot
+            .blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("configure_tail_stage(stage=view_load,elapsed_ms=")),
+        "{:?}",
+        snapshot.blockers
     );
 }
 

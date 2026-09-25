@@ -2540,6 +2540,27 @@ fn slow_configure_prefix_line(total: Duration, phases: &str) -> String {
     )
 }
 
+/// Route binds start beside a running configure tail or reads with only a
+/// shared hold on the actor (see `crate::executor::ensure_exclusive_actor_gate`).
+/// The equivalent-rebind fast paths need nothing more: they compare the bind
+/// against the configuration already published, which the tail never changes,
+/// and record the session in state behind its own locks. Any path that changes
+/// the root calls this first and waits until the tail and readers let go.
+fn acquire_exclusive_configure_gate(ctx: &AppContext) {
+    if !crate::executor::current_bind_gate_is_shared() {
+        return;
+    }
+    ctx.begin_configure_ack_phase("exclusive_gate");
+    if let Some(waited) = crate::executor::ensure_exclusive_actor_gate() {
+        if waited >= Duration::from_secs(1) {
+            slog_info!(
+                "configure waited {}ms for exclusive use of the root",
+                waited.as_millis()
+            );
+        }
+    }
+}
+
 fn log_slow_configure_prefix(ctx: &AppContext, started_at: Instant) {
     const SLOW_PREFIX: Duration = Duration::from_secs(1);
     let total = started_at.elapsed();
@@ -2919,6 +2940,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
         if session_already_bound && only_lsp_process_state_changed(&previous_config, &next_config) {
+            // Publishes a new config, so readers must not overlap it.
+            acquire_exclusive_configure_gate(ctx);
             if let Some(token) = crate::executor::current_job_cancellation() {
                 if !token.try_seal_committed() {
                     return Response::error(
@@ -3176,6 +3199,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                     .collect::<Vec<_>>(),
             }),
         );
+    }
+
+    // Everything below re-establishes the root (a new generation, config,
+    // runtime, and artifact loads), so it runs with exclusive use of the actor.
+    acquire_exclusive_configure_gate(ctx);
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
     }
 
     if search_disabled_for_home {
@@ -5397,7 +5427,6 @@ enum ConfigureMaintenanceStage {
 }
 
 impl ConfigureMaintenanceStage {
-    #[cfg(test)]
     fn label(self) -> &'static str {
         match self {
             Self::Admission => "admission",
@@ -5804,10 +5833,90 @@ fn run_configure_maintenance_unit(
     detach_storage_sweeps: bool,
 ) -> ConfigureMaintenanceUnitResult {
     let stage = continuation.stage;
+    ctx.note_configure_tail_stage(Some(stage.label()));
+    wait_on_configure_tail_stage_gate_for_test(&continuation.job.canonical_cache_root, stage);
     let result = run_configure_maintenance_unit_inner(ctx, continuation, detach_storage_sweeps);
+    ctx.note_configure_tail_stage(None);
     record_configure_unit_for_test(&continuation.job, stage);
     result
 }
+
+/// A test hook that holds one root's configure tail at the start of one stage,
+/// standing in for a stage that runs long on a large root.
+#[cfg(test)]
+struct ConfigureTailStageGate {
+    root: PathBuf,
+    stage: &'static str,
+    reached: crossbeam_channel::Sender<()>,
+    release: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+fn configure_tail_stage_gates() -> &'static std::sync::Mutex<Vec<ConfigureTailStageGate>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<Vec<ConfigureTailStageGate>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Removes its root's stage gate when dropped.
+#[cfg(test)]
+pub(crate) struct ConfigureTailStageGateGuard {
+    root: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for ConfigureTailStageGateGuard {
+    fn drop(&mut self) {
+        configure_tail_stage_gates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|gate| gate.root != self.root);
+    }
+}
+
+/// Hold the configure tail of `root` (its canonical path) when it reaches
+/// `stage`, a [`ConfigureMaintenanceStage`] label such as `"view_load"`. The
+/// first receiver fires once the tail is held; a send on the returned sender
+/// lets it continue.
+#[cfg(test)]
+pub(crate) fn gate_configure_tail_stage_for_test(
+    root: PathBuf,
+    stage: &'static str,
+) -> (
+    ConfigureTailStageGateGuard,
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    configure_tail_stage_gates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ConfigureTailStageGate {
+            root: root.clone(),
+            stage,
+            reached: reached_tx,
+            release: release_rx,
+        });
+    (ConfigureTailStageGateGuard { root }, reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaintenanceStage) {
+    let gate = configure_tail_stage_gates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|gate| gate.root == root && gate.stage == stage.label())
+        .map(|gate| (gate.reached.clone(), gate.release.clone()));
+    if let Some((reached, release)) = gate {
+        let _ = reached.try_send(());
+        let _ = release.recv_timeout(Duration::from_secs(60));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_configure_tail_stage_gate_for_test(_root: &Path, _stage: ConfigureMaintenanceStage) {}
 
 /// One finished configure-tail unit, as recorded for tests: the job's root and
 /// generation, the stage that ran, and when it finished.

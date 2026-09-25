@@ -366,14 +366,75 @@ const BIND_ACK_SLOW_THRESHOLD: Duration = Duration::from_secs(5);
 /// Upper bound on retained samples; a restart storm is a few hundred binds.
 const BIND_ACK_MAX_SAMPLES: usize = 4096;
 
+/// Upper bounds, in milliseconds, of the bind-ack latency histogram buckets.
+/// One more bucket holds everything slower than the last bound. The bounds are
+/// dense around the daemon's 12 s relay limit and the 5 s slow threshold.
+const BIND_ACK_BUCKET_BOUNDS_MS: [u64; 16] = [
+    10, 25, 50, 100, 250, 500, 1_000, 2_000, 3_000, 5_000, 8_000, 10_000, 12_000, 20_000, 30_000,
+    60_000,
+];
+
+/// Fixed-bucket latency histogram. Percentiles are reported as the upper bound
+/// of the bucket the percentile falls in (the observed worst for the overflow
+/// bucket), so recording costs one array increment and reporting never sorts.
+#[derive(Debug, Default, Clone)]
+struct LatencyHistogram {
+    counts: [u64; BIND_ACK_BUCKET_BOUNDS_MS.len() + 1],
+    total: u64,
+}
+
+impl LatencyHistogram {
+    fn record(&mut self, latency: Duration) {
+        let latency_ms = duration_millis_u64(latency);
+        let bucket = BIND_ACK_BUCKET_BOUNDS_MS
+            .iter()
+            .position(|bound| latency_ms <= *bound)
+            .unwrap_or(BIND_ACK_BUCKET_BOUNDS_MS.len());
+        self.counts[bucket] = self.counts[bucket].saturating_add(1);
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// The bucket bound at or below which `percent` of the recorded latencies
+    /// fall; `None` when nothing was recorded.
+    fn percentile_ms(&self, percent: u64, worst: Duration) -> Option<u64> {
+        if self.total == 0 {
+            return None;
+        }
+        // Nearest-rank: the smallest bucket holding at least this many samples.
+        let rank = (self.total.saturating_mul(percent)).div_ceil(100).max(1);
+        let mut seen = 0u64;
+        for (bucket, count) in self.counts.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= rank {
+                return Some(
+                    BIND_ACK_BUCKET_BOUNDS_MS
+                        .get(bucket)
+                        .copied()
+                        .unwrap_or_else(|| duration_millis_u64(worst)),
+                );
+            }
+        }
+        Some(duration_millis_u64(worst))
+    }
+
+    fn percentiles(&self, worst: Duration) -> Value {
+        json!({
+            "p50_ms": self.percentile_ms(50, worst),
+            "p90_ms": self.percentile_ms(90, worst),
+            "p99_ms": self.percentile_ms(99, worst),
+        })
+    }
+}
+
 /// Route-bind answer latencies over the last `BIND_ACK_WINDOW`, plus the
-/// worst latency since the process started.
+/// worst latency and a latency histogram since the process started.
 #[derive(Debug, Default)]
 struct BindAckLatencies {
     samples: std::collections::VecDeque<(Instant, Duration)>,
     worst_since_start: Duration,
     total: u64,
     slow_total: u64,
+    since_start: LatencyHistogram,
 }
 
 impl BindAckLatencies {
@@ -384,6 +445,7 @@ impl BindAckLatencies {
         }
         self.samples.push_back((now, latency));
         self.worst_since_start = self.worst_since_start.max(latency);
+        self.since_start.record(latency);
         self.total = self.total.saturating_add(1);
         if latency > BIND_ACK_SLOW_THRESHOLD {
             self.slow_total = self.slow_total.saturating_add(1);
@@ -412,6 +474,14 @@ impl BindAckLatencies {
             .iter()
             .map(|(_, latency)| duration_millis_u64(*latency))
             .max();
+        // The window's samples are already retained for the counts above, so
+        // its histogram is rebuilt here from them into the same buckets.
+        let mut window = LatencyHistogram::default();
+        let mut worst_in_window = Duration::ZERO;
+        for (_, latency) in &self.samples {
+            window.record(*latency);
+            worst_in_window = worst_in_window.max(*latency);
+        }
         json!({
             "window_s": BIND_ACK_WINDOW.as_secs(),
             "slow_threshold_ms": duration_millis_u64(BIND_ACK_SLOW_THRESHOLD),
@@ -422,6 +492,9 @@ impl BindAckLatencies {
                 .then(|| duration_millis_u64(self.worst_since_start)),
             "total": self.total,
             "slow_total": self.slow_total,
+            "percentiles": window.percentiles(worst_in_window),
+            "percentiles_since_start": self.since_start.percentiles(self.worst_since_start),
+            "percentile_bucket_bounds_ms": BIND_ACK_BUCKET_BOUNDS_MS,
         })
     }
 }
@@ -2004,6 +2077,13 @@ mod tests {
         assert_eq!(acks["slow_threshold_ms"], 5_000);
         assert_eq!(acks["worst_ms"], 26_500);
         assert_eq!(acks["worst_since_start_ms"], 26_500);
+        // Buckets: 40 -> 50, 900 -> 1000, 6100 -> 8000, 17800 -> 20000,
+        // 26500 -> 30000; nearest rank of p50 is the third sample.
+        assert_eq!(acks["percentiles"]["p50_ms"], 8_000, "{acks}");
+        assert_eq!(acks["percentiles"]["p90_ms"], 30_000, "{acks}");
+        assert_eq!(acks["percentiles"]["p99_ms"], 30_000, "{acks}");
+        assert_eq!(acks["percentiles_since_start"], acks["percentiles"]);
+        assert!(quiet_acks["percentiles"]["p50_ms"].is_null());
     }
 
     #[test]
@@ -2021,6 +2101,28 @@ mod tests {
         assert_eq!(snapshot["worst_since_start_ms"], 9_000);
         assert_eq!(snapshot["slow_total"], 1);
         assert_eq!(snapshot["total"], 3);
+        // The window forgot the 9 s ack; the since-start histogram did not.
+        assert_eq!(snapshot["percentiles"]["p99_ms"], 50);
+        assert_eq!(snapshot["percentiles_since_start"]["p50_ms"], 50);
+        assert_eq!(snapshot["percentiles_since_start"]["p99_ms"], 10_000);
+    }
+
+    #[test]
+    fn bind_ack_percentiles_report_the_worst_for_the_overflow_bucket() {
+        let mut acks = BindAckLatencies::default();
+        let now = Instant::now();
+        for _ in 0..98 {
+            acks.record(now, Duration::from_millis(3));
+        }
+        acks.record(now, Duration::from_millis(700));
+        acks.record(now, Duration::from_secs(90));
+        let snapshot = acks.snapshot(now);
+        assert_eq!(snapshot["percentiles"]["p50_ms"], 10);
+        assert_eq!(snapshot["percentiles"]["p90_ms"], 10);
+        assert_eq!(snapshot["percentiles"]["p99_ms"], 1_000);
+        acks.record(now, Duration::from_secs(90));
+        let snapshot = acks.snapshot(now);
+        assert_eq!(snapshot["percentiles"]["p99_ms"], 90_000);
     }
 
     fn refresh_until_root_count(

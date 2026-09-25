@@ -697,13 +697,47 @@ pub fn install_job_cancellation(token: JobCancellation) -> JobCancellationContex
     JobCancellationContextGuard::install(Some(token))
 }
 
+/// The writer demand of one actor as seen by a job running on it: interactive
+/// writers still queued, and admitted route binds waiting to turn their shared
+/// hold on the epoch gate into an exclusive one.
+#[derive(Clone)]
+struct ActorWriterDemand {
+    queued: Arc<AtomicUsize>,
+    upgrading: Option<Arc<BindGateDemand>>,
+}
+
+/// Route binds on one actor that started with a shared epoch hold and then
+/// asked for exclusive use (see [`ensure_exclusive_actor_gate`]).
+#[derive(Debug, Default)]
+struct BindGateDemand {
+    /// Counts each such bind from the moment it asks until it finishes. While
+    /// non-zero the scheduler admits no new reader, and running maintenance
+    /// sees a waiting writer.
+    exclusive: AtomicUsize,
+    /// The subset still waiting for readers and maintenance to let go; read
+    /// only by the pending-bind diagnostics.
+    waiting: AtomicUsize,
+}
+
+impl ActorWriterDemand {
+    fn waiting(&self) -> bool {
+        self.queued.load(Ordering::Acquire) > 0
+            || self
+                .upgrading
+                .as_ref()
+                .is_some_and(|upgrading| upgrading.exclusive.load(Ordering::Acquire) > 0)
+    }
+}
+
 thread_local! {
-    static CURRENT_ACTOR_WAITING_WRITERS: std::cell::RefCell<Option<Arc<AtomicUsize>>> =
+    static CURRENT_ACTOR_WAITING_WRITERS: std::cell::RefCell<Option<ActorWriterDemand>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// True when interactive mutating work (a route-bind configure or a tool
-/// edit) is queued on the actor whose job runs on this worker thread.
+/// edit) is queued on the actor whose job runs on this worker thread, or an
+/// admitted route bind is waiting for exclusive use of the actor (see
+/// [`ensure_exclusive_actor_gate`]).
 ///
 /// A long maintenance job holds its actor's epoch read gate, and a queued
 /// writer can only start once that gate is free. Maintenance that runs in
@@ -714,17 +748,17 @@ pub fn current_actor_writer_waiting() -> bool {
     CURRENT_ACTOR_WAITING_WRITERS.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_some_and(|waiting| waiting.load(Ordering::Acquire) > 0)
+            .is_some_and(ActorWriterDemand::waiting)
     })
 }
 
 pub(crate) struct ActorWaitingWritersGuard {
-    previous: Option<Arc<AtomicUsize>>,
+    previous: Option<ActorWriterDemand>,
 }
 
 impl ActorWaitingWritersGuard {
-    fn install(waiting: Arc<AtomicUsize>) -> Self {
-        let previous = CURRENT_ACTOR_WAITING_WRITERS.with(|slot| slot.replace(Some(waiting)));
+    fn install(demand: ActorWriterDemand) -> Self {
+        let previous = CURRENT_ACTOR_WAITING_WRITERS.with(|slot| slot.replace(Some(demand)));
         Self { previous }
     }
 }
@@ -743,7 +777,129 @@ impl Drop for ActorWaitingWritersGuard {
 pub(crate) fn install_actor_waiting_writers_for_test(
     waiting: Arc<AtomicUsize>,
 ) -> ActorWaitingWritersGuard {
-    ActorWaitingWritersGuard::install(waiting)
+    ActorWaitingWritersGuard::install(ActorWriterDemand {
+        queued: waiting,
+        upgrading: None,
+    })
+}
+
+type EpochReadGuard = parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>;
+type EpochWriteGuard = parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>;
+
+/// How a route bind admitted with a shared hold currently holds its actor's
+/// epoch gate. The guards are never read; holding them is the point.
+#[allow(dead_code)]
+enum BindGateHold {
+    Shared(EpochReadGuard),
+    Exclusive(EpochWriteGuard),
+}
+
+/// The epoch gate of a route bind that the scheduler admitted while a
+/// maintenance job still held the gate for reading.
+///
+/// Most route binds re-attach a session to a root whose configuration is
+/// unchanged. That rebind only reads the published configuration and records
+/// the session in state behind its own locks, so it is safe next to readers,
+/// and making it wait for exclusive use would park it behind a configure tail
+/// unit that can run for many seconds on a large root. Such a bind starts with
+/// a shared hold; a configure that turns out to change the root calls
+/// [`ensure_exclusive_actor_gate`] before its first change to actor state.
+struct SharedBindGate {
+    epoch: Arc<RwLock<()>>,
+    bind_gate_demand: Arc<BindGateDemand>,
+    hold: BindGateHold,
+}
+
+impl Drop for SharedBindGate {
+    fn drop(&mut self) {
+        if matches!(self.hold, BindGateHold::Exclusive(_)) {
+            self.bind_gate_demand
+                .exclusive
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+thread_local! {
+    static CURRENT_SHARED_BIND_GATE: std::cell::RefCell<Option<SharedBindGate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs a [`SharedBindGate`] for the bind running on this worker and
+/// releases whatever hold it ends with when dropped.
+struct SharedBindGateScope;
+
+impl SharedBindGateScope {
+    fn install(epoch: Arc<RwLock<()>>, bind_gate_demand: Arc<BindGateDemand>) -> Self {
+        let hold = BindGateHold::Shared(epoch.read_arc());
+        CURRENT_SHARED_BIND_GATE.with(|slot| {
+            let previous = slot.replace(Some(SharedBindGate {
+                epoch,
+                bind_gate_demand,
+                hold,
+            }));
+            debug_assert!(previous.is_none(), "nested shared bind gate");
+        });
+        Self
+    }
+}
+
+impl Drop for SharedBindGateScope {
+    fn drop(&mut self) {
+        let gate = CURRENT_SHARED_BIND_GATE.with(|slot| slot.borrow_mut().take());
+        drop(gate);
+    }
+}
+
+/// True while the job on this worker is a route bind that holds its actor's
+/// epoch gate only for reading.
+pub fn current_bind_gate_is_shared() -> bool {
+    CURRENT_SHARED_BIND_GATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|gate| matches!(gate.hold, BindGateHold::Shared(_)))
+    })
+}
+
+/// Give the route bind running on this worker exclusive use of its actor.
+///
+/// A no-op (returning `None`) for every job that already runs exclusively,
+/// off an executor worker, and in standalone mode. For a bind admitted with a
+/// shared hold it drops that hold, announces itself to running maintenance
+/// through [`current_actor_writer_waiting`] so a configure tail steps aside at
+/// its next step, and blocks until the readers and maintenance already
+/// holding the gate let go. From the moment it asks, the scheduler admits no
+/// new reader or writer for the actor. Returns how long the wait took.
+pub fn ensure_exclusive_actor_gate() -> Option<Duration> {
+    // Take the gate out of the slot so no RefCell borrow is held while this
+    // thread blocks on the lock.
+    let mut gate = CURRENT_SHARED_BIND_GATE.with(|slot| slot.borrow_mut().take())?;
+    let waited = if matches!(gate.hold, BindGateHold::Shared(_)) {
+        let started = Instant::now();
+        gate.bind_gate_demand
+            .exclusive
+            .fetch_add(1, Ordering::AcqRel);
+        // Release the shared hold before asking for the exclusive one: a
+        // thread waiting for the write side while it still reads would wait
+        // for itself.
+        let epoch = Arc::clone(&gate.epoch);
+        let bind_gate_demand = Arc::clone(&gate.bind_gate_demand);
+        drop(gate);
+        bind_gate_demand.waiting.fetch_add(1, Ordering::AcqRel);
+        let exclusive = epoch.write_arc();
+        bind_gate_demand.waiting.fetch_sub(1, Ordering::AcqRel);
+        // Dropping this gate releases the count taken above.
+        gate = SharedBindGate {
+            epoch,
+            bind_gate_demand,
+            hold: BindGateHold::Exclusive(exclusive),
+        };
+        Some(started.elapsed())
+    } else {
+        None
+    };
+    CURRENT_SHARED_BIND_GATE.with(|slot| *slot.borrow_mut() = Some(gate));
+    waited
 }
 
 #[derive(Debug, Clone)]
@@ -1773,6 +1929,19 @@ impl SchedulerState {
             }
         }
 
+        if let Some(actor) = actor {
+            if configure_state == "running"
+                && actor.bind_gate_demand.waiting.load(Ordering::Acquire) > 0
+            {
+                blockers.push("waiting_for_exclusive_gate".to_string());
+            }
+            // Name the configure-tail stage in progress on this root, so a
+            // bind held up by a long tail unit says which one.
+            if let Some(stage) = actor.ctx.configure_tail_stage_snapshot() {
+                blockers.push(format!("configure_tail_stage({stage})"));
+            }
+        }
+
         if self.idle_workers == 0 {
             let running: Vec<_> = self.running_jobs.values().collect();
             blockers.push(format!(
@@ -1867,6 +2036,9 @@ struct ActorState {
     lsp_inflight: bool,
     actor_total_inflight: usize,
     writer_inflight: bool,
+    /// The running writer is a route bind that started with a shared epoch
+    /// hold beside running maintenance (see `SharedBindGate`).
+    shared_bind_inflight: bool,
     maintenance_commit_inflight: bool,
     mutating_inflight: Option<RunningMutatingJob>,
     reader_admissions_while_promoted_writer_waited: u64,
@@ -1878,6 +2050,9 @@ struct ActorState {
     /// running jobs through [`current_actor_writer_waiting`]. Kept equal to
     /// `interactive.mutating.len()` by every method that changes that queue.
     waiting_writers: Arc<AtomicUsize>,
+    /// Route binds admitted with a shared epoch hold that have asked for
+    /// exclusive use of this actor (see [`ensure_exclusive_actor_gate`]).
+    bind_gate_demand: Arc<BindGateDemand>,
 }
 
 impl ActorState {
@@ -1889,6 +2064,7 @@ impl ActorState {
             lsp_inflight: false,
             actor_total_inflight: 0,
             writer_inflight: false,
+            shared_bind_inflight: false,
             maintenance_commit_inflight: false,
             mutating_inflight: None,
             reader_admissions_while_promoted_writer_waited: 0,
@@ -1897,6 +2073,7 @@ impl ActorState {
             maintenance: ClassQueues::new(),
             fatal: false,
             waiting_writers: Arc::new(AtomicUsize::new(0)),
+            bind_gate_demand: Arc::new(BindGateDemand::default()),
         }
     }
 
@@ -2386,6 +2563,12 @@ struct RunJob {
     /// The actor's queued-interactive-writer counter, exposed to the running
     /// job through [`current_actor_writer_waiting`].
     waiting_writers: Arc<AtomicUsize>,
+    /// The actor's binds that asked to upgrade a shared epoch hold, also
+    /// reported through [`current_actor_writer_waiting`].
+    bind_gate_demand: Arc<BindGateDemand>,
+    /// A route bind admitted while readers or maintenance held the epoch
+    /// gate: it starts with a shared hold (see [`SharedBindGate`]).
+    shared_bind_gate: bool,
 }
 
 struct JobCompletionOwnership;
@@ -2589,6 +2772,7 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
             Lane::HeavyInit => {}
             Lane::Mutating => {
                 actor.writer_inflight = false;
+                actor.shared_bind_inflight = false;
                 actor.mutating_inflight = None;
             }
             Lane::MaintenanceCommit => {
@@ -2902,7 +3086,18 @@ fn try_admit_actor(
     };
     let mut heavy_permit = None;
 
-    if actor.writer_inflight || actor.higher_priority_writer_barrier_blocks(job_class) {
+    // A bind that runs with a shared hold (see `SharedBindGate`) blocks other
+    // writers and maintenance like any running writer, but readers may keep
+    // coming until it asks for exclusive use of the actor.
+    let shared_bind_admits_lane = actor.shared_bind_inflight
+        && actor.bind_gate_demand.exclusive.load(Ordering::Acquire) == 0
+        && matches!(
+            lane,
+            Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit
+        );
+    if (actor.writer_inflight && !shared_bind_admits_lane)
+        || actor.higher_priority_writer_barrier_blocks(job_class)
+    {
         return None;
     }
 
@@ -2932,8 +3127,18 @@ fn try_admit_actor(
         }
         // A bind skips the per-actor interactive cap: HeavyInit jobs count
         // toward that cap without holding the epoch gate, and the writer only
-        // needs the gate itself to be free.
-        Lane::Mutating => !has_epoch_reader && (bind_pass || actor_has_interactive_capacity),
+        // needs the gate itself to be free. A bind also does not wait for a
+        // running maintenance job (typically a configure tail, whose single
+        // units can run for seconds on a large root) to release the gate: it
+        // starts beside it with a shared hold, which is all a rebind of an
+        // unchanged root needs, and upgrades only when its configure must
+        // change the root. Interactive readers are short and stop being
+        // admitted once a bind has waited `BIND_PROMOTION_AGE`, so a bind
+        // still waits for them as before.
+        Lane::Mutating => {
+            (bind_pass && actor.read_inflight == 0 && !actor.lsp_inflight)
+                || (!has_epoch_reader && actor_has_interactive_capacity)
+        }
         // This lane has separate global and per-actor bounds: maintenance_cap
         // reserves workers globally, and the boolean prevents same-actor
         // maintenance from stacking without consuming an interactive slot.
@@ -2943,6 +3148,7 @@ fn try_admit_actor(
     if !runnable {
         return None;
     }
+    let shared_bind_gate = bind_pass && has_epoch_reader;
 
     let promoted_writer_waiting = actor.oldest_queued_writer_at().is_some_and(|queued_at| {
         Instant::now().saturating_duration_since(queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
@@ -2983,6 +3189,7 @@ fn try_admit_actor(
         }
         Lane::Mutating => {
             actor.writer_inflight = true;
+            actor.shared_bind_inflight = shared_bind_gate;
             actor.actor_total_inflight += 1;
         }
         Lane::MaintenanceCommit => {
@@ -3006,6 +3213,8 @@ fn try_admit_actor(
         execution_started: Arc::new(AtomicBool::new(false)),
         completion_guard: None,
         waiting_writers: Arc::clone(&actor.waiting_writers),
+        bind_gate_demand: Arc::clone(&actor.bind_gate_demand),
+        shared_bind_gate,
     })
 }
 
@@ -3042,8 +3251,10 @@ fn run_lane_job(run_job: &mut RunJob) -> Response {
     let _actor_scope =
         view_publication::ActorScope::install(Arc::clone(&run_job.ctx), Arc::clone(&run_job.epoch));
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
-    let _waiting_writers_ctx =
-        ActorWaitingWritersGuard::install(Arc::clone(&run_job.waiting_writers));
+    let _waiting_writers_ctx = ActorWaitingWritersGuard::install(ActorWriterDemand {
+        queued: Arc::clone(&run_job.waiting_writers),
+        upgrading: Some(Arc::clone(&run_job.bind_gate_demand)),
+    });
     let missing_request_id = run_job.request_id.clone();
     let job = std::mem::replace(
         &mut run_job.job,
@@ -3096,6 +3307,13 @@ fn run_lane_job(run_job: &mut RunJob) -> Response {
         // constructs its response would delay completion behind maintenance and
         // park later readers behind an otherwise unnecessary writer.
         Lane::HeavyInit => run(job),
+        Lane::Mutating if run_job.shared_bind_gate => {
+            let _gate = SharedBindGateScope::install(
+                Arc::clone(&run_job.epoch),
+                Arc::clone(&run_job.bind_gate_demand),
+            );
+            run(job)
+        }
         Lane::Mutating => {
             let _epoch = run_job.epoch.write();
             run(job)
