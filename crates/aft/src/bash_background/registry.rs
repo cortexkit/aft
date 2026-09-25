@@ -327,6 +327,10 @@ pub(crate) struct RegistryInner {
     persisted_gc_started: AtomicBool,
     #[cfg(test)]
     persisted_gc_runs: AtomicU64,
+    /// aft.db recorded-process liveness queries issued, per-task or batched;
+    /// tests count what persisted-GC sweeps cost.
+    #[cfg(test)]
+    gc_db_liveness_queries: AtomicU64,
     /// Name of the thread the once-per-process persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
@@ -511,6 +515,8 @@ impl BgTaskRegistry {
                 persisted_gc_started: AtomicBool::new(false),
                 #[cfg(test)]
                 persisted_gc_runs: AtomicU64::new(0),
+                #[cfg(test)]
+                gc_db_liveness_queries: AtomicU64::new(0),
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
@@ -1234,6 +1240,8 @@ impl BgTaskRegistry {
         let Ok(conn) = pool.lock() else {
             return false;
         };
+        #[cfg(test)]
+        self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
         crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
             .map(|rows| {
                 rows.into_iter().any(|row| {
@@ -1246,6 +1254,37 @@ impl BgTaskRegistry {
                 })
             })
             .unwrap_or(false)
+    }
+
+    /// Which of `task_ids` have an aft.db row whose recorded process is still
+    /// alive, from one query. The liveness probes run after the aft.db mutex
+    /// is released.
+    fn db_live_process_task_ids(&self, task_ids: &[String]) -> HashSet<String> {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return HashSet::new();
+        };
+        let rows = {
+            let Ok(conn) = pool.lock() else {
+                return HashSet::new();
+            };
+            #[cfg(test)]
+            self.inner.gc_db_liveness_queries.fetch_add(1, Ordering::SeqCst);
+            // Same fallback as the per-task lookup: a failed query reads as
+            // no live row.
+            crate::db::bash_tasks::list_bash_task_process_ids(&conn, &harness, task_ids)
+                .unwrap_or_default()
+        };
+        rows.into_iter()
+            .filter(|row| {
+                let started_at = u64::try_from(row.started_at).unwrap_or_default();
+                row.pid
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .into_iter()
+                    .chain(row.pgid.and_then(|pid| u32::try_from(pid).ok()))
+                    .any(|pid| is_recorded_process_alive(pid, started_at))
+            })
+            .map(|row| row.task_id)
+            .collect()
     }
 
     fn db_harness_and_pool(&self) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
@@ -2311,6 +2350,9 @@ impl BgTaskRegistry {
 
     /// Thread name recorded by the last `maybe_gc_persisted` run, if any.
     /// Recorded as the run exits, so `Some` also means that run has finished.
+    /// A registry whose replay request was covered by another registry's
+    /// sweep of the same storage root (see [`Self::request_persisted_gc`])
+    /// records that sweep's thread when it finishes.
     #[doc(hidden)]
     pub fn persisted_gc_thread(&self) -> Option<String> {
         self.inner
@@ -2318,6 +2360,103 @@ impl BgTaskRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn record_persisted_gc_thread(&self, thread: String) {
+        *self
+            .inner
+            .persisted_gc_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(thread);
+    }
+
+    /// Asks for one persisted-task GC sweep of `storage_dir`, shared by every
+    /// registry in the process.
+    ///
+    /// Each project root has its own registry, and each registry's first
+    /// replay used to start its own sweep thread. The sweep walks the whole
+    /// shared storage root (every session of every project), so after a
+    /// daemon restart about ten registries swept the same tree at once, each
+    /// taking the process-wide aft.db mutex once per task; that herd held the
+    /// mutex for tens of seconds. Now at most one sweep per storage root runs
+    /// in the process: a request that arrives while one runs is covered by
+    /// it, and a request within [`PERSISTED_GC_COALESCE_WINDOW`] of a finished
+    /// sweep is covered by that one.
+    fn request_persisted_gc(&self, storage_dir: &Path) {
+        let harness = self.inner.db_harness.read().ok().and_then(|slot| slot.clone());
+        let key = (canonicalized_path(storage_dir), harness);
+        {
+            let mut slots = persisted_gc_slots()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = slots.entry(key.clone()).or_default();
+            if slot.running {
+                slot.covered_waiters.push(self.clone());
+                return;
+            }
+            if let Some((finished_at, thread)) = &slot.last_finished {
+                if finished_at.elapsed() < PERSISTED_GC_COALESCE_WINDOW {
+                    self.record_persisted_gc_thread(thread.clone());
+                    return;
+                }
+            }
+            slot.running = true;
+        }
+
+        /// Ends the sweep's slot on every exit path, a panicking sweep
+        /// included, so a later request can start a new one.
+        struct FinishSlot(Option<(PathBuf, Option<String>)>);
+        impl FinishSlot {
+            fn finish(&mut self) {
+                let Some(key) = self.0.take() else {
+                    return;
+                };
+                let thread = std::thread::current()
+                    .name()
+                    .unwrap_or("<unnamed>")
+                    .to_string();
+                let waiters = {
+                    let mut slots = persisted_gc_slots()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let slot = slots.entry(key).or_default();
+                    slot.running = false;
+                    slot.last_finished = Some((Instant::now(), thread.clone()));
+                    std::mem::take(&mut slot.covered_waiters)
+                };
+                for waiter in waiters {
+                    waiter.record_persisted_gc_thread(thread.clone());
+                }
+            }
+        }
+        impl Drop for FinishSlot {
+            fn drop(&mut self) {
+                self.finish();
+            }
+        }
+
+        let registry = self.clone();
+        let storage_dir = storage_dir.to_path_buf();
+        let slot_key = key.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aft-bash-task-gc".to_string())
+            .spawn(move || {
+                let mut finish = FinishSlot(Some(slot_key));
+                if let Err(error) = registry.maybe_gc_persisted(&storage_dir) {
+                    crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
+                }
+                finish.finish();
+            });
+        if let Err(error) = spawned {
+            crate::slog_warn!("failed to spawn persisted background task GC: {error}");
+            let mut slots = persisted_gc_slots()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(slot) = slots.get_mut(&key) {
+                slot.running = false;
+                slot.covered_waiters.clear();
+            }
+        }
     }
 
     pub fn replay_session_for_project(
@@ -2532,18 +2671,7 @@ impl BgTaskRegistry {
             // by the watchdog. Detaching it means it walks the same directories
             // this replay is rewriting, so the recovery guard above is what
             // keeps the two apart.
-            let registry = self.clone();
-            let storage_dir = storage_dir.to_path_buf();
-            let spawned = std::thread::Builder::new()
-                .name("aft-bash-task-gc".to_string())
-                .spawn(move || {
-                    if let Err(error) = registry.maybe_gc_persisted(&storage_dir) {
-                        crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
-                    }
-                });
-            if let Err(error) = spawned {
-                crate::slog_warn!("failed to spawn persisted background task GC: {error}");
-            }
+            self.request_persisted_gc(storage_dir);
         }
 
         let canonical_project = project_root.map(canonicalized_path);
@@ -3630,7 +3758,19 @@ impl BgTaskRegistry {
                     }
                     let _ = quarantine_invalid_entry(storage_dir, &session_dir, &entry);
                 }
-                for task_id in task_ids {
+                // Recorded-process rows for this session's tasks, read with one
+                // aft.db query the first time a task needs them rather than one
+                // query per task: the aft.db mutex is shared process-wide. The
+                // rows are at most one session's scan old when consulted, and
+                // a task written since then is inside the modification grace
+                // below and skipped anyway.
+                let mut session_live: Option<HashSet<String>> = None;
+                let mut live_in_db = |registry: &Self, task_id: &str| {
+                    session_live
+                        .get_or_insert_with(|| registry.db_live_process_task_ids(&task_ids))
+                        .contains(task_id)
+                };
+                for task_id in &task_ids {
                     let resolved = match resolve_task_layout(&session_dir, &task_id) {
                         Ok(task) => task,
                         // Uncertainty never quarantines: if the age probe itself
@@ -3656,7 +3796,7 @@ impl BgTaskRegistry {
                             if concurrently_replaced(&error) {
                                 continue;
                             }
-                            if self.db_has_live_process_for_task(&task_id) {
+                            if live_in_db(self, task_id) {
                                 crate::slog_warn!(
                                     "refusing to quarantine unresolved live background task {task_id} during GC: {error}"
                                 );
@@ -3682,7 +3822,7 @@ impl BgTaskRegistry {
                             if concurrently_replaced(&error) {
                                 continue;
                             }
-                            if self.db_has_live_process_for_task(&task_id) {
+                            if live_in_db(self, task_id) {
                                 crate::slog_warn!(
                                     "refusing to quarantine unreadable live background task {task_id} during GC: {error}"
                                 );
@@ -3703,7 +3843,7 @@ impl BgTaskRegistry {
                         continue;
                     }
                     if Self::persisted_task_process_is_alive(&metadata)
-                        || self.db_has_live_process_for_task(&task_id)
+                        || live_in_db(self, task_id)
                     {
                         crate::slog_warn!(
                             "refusing to delete terminal background task bundle {task_id}: recorded process is still alive"
@@ -6491,6 +6631,33 @@ fn concurrently_replaced(error: &std::io::Error) -> bool {
         && error
             .to_string()
             .contains(super::persistence::ARTIFACT_CONCURRENTLY_REPLACED)
+}
+
+/// A finished persisted-task sweep covers later requests for the same storage
+/// root for this long. A daemon restart replays every project root within a
+/// few minutes; one sweep is enough for all of them, and the next sweep comes
+/// with the next idle registry's first replay after the window.
+const PERSISTED_GC_COALESCE_WINDOW: Duration = Duration::from_secs(10 * 60);
+
+/// One storage root's persisted-task sweep state, shared by every registry in
+/// the process (see `BgTaskRegistry::request_persisted_gc`).
+#[derive(Default)]
+struct PersistedGcSlot {
+    running: bool,
+    /// Registries whose request arrived while the sweep ran; each records the
+    /// sweep's thread name when it finishes.
+    covered_waiters: Vec<BgTaskRegistry>,
+    /// When the last sweep finished, and the thread it ran on.
+    last_finished: Option<(Instant, String)>,
+}
+
+/// Keyed by canonical storage root and aft.db harness: the sweep deletes and
+/// probes rows under its registry's harness.
+type PersistedGcSlots = HashMap<(PathBuf, Option<String>), PersistedGcSlot>;
+
+fn persisted_gc_slots() -> &'static Mutex<PersistedGcSlots> {
+    static SLOTS: std::sync::OnceLock<Mutex<PersistedGcSlots>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn modified_within(path: &Path, grace: Duration) -> bool {
@@ -10022,6 +10189,130 @@ mod tests {
         );
 
         fs::write(&paths.json, running_json).unwrap();
+    }
+
+    /// A daemon restart replays every project root at once, and each root's
+    /// registry asks for a persisted-task GC of the one shared storage root.
+    /// One sweep must serve them all, and it must ask aft.db about recorded
+    /// processes once per session rather than once per task: every such
+    /// query takes the process-wide aft.db mutex.
+    #[cfg(unix)]
+    #[test]
+    fn restart_replay_of_many_registries_runs_one_batched_persisted_gc() {
+        const REGISTRIES: usize = 8;
+        const SESSIONS: usize = 6;
+        const TASKS_PER_SESSION: usize = 5;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.join("aft.db")).expect("open test DB"),
+        ));
+        let old = SystemTime::now()
+            .checked_sub(Duration::from_secs(25 * 60 * 60))
+            .unwrap();
+        let mut fixtures = Vec::new();
+        for session in 0..SESSIONS {
+            let session_id = format!("session-{session}");
+            for task in 0..TASKS_PER_SESSION {
+                let task_id = format!("bash-{:016x}", session * 100 + task);
+                let paths = task_paths(storage, &session_id, &task_id).unwrap();
+                let starting = PersistedTask::starting(
+                    task_id.clone(),
+                    session_id.clone(),
+                    "gc-herd-canary".to_string(),
+                    storage.to_path_buf(),
+                    Some(storage.to_path_buf()),
+                    None,
+                    true,
+                    false,
+                );
+                // Delivered and old enough to delete, with no process in the
+                // JSON; the aft.db row records a live one (this process, which
+                // the GC only probes), so every task reaches the database
+                // check and survives every sweep.
+                let mut terminal = starting.clone();
+                terminal.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                terminal.completion_delivered = true;
+                write_task(&paths.json, &terminal).unwrap();
+                fs::write(&paths.stdout, b"").unwrap();
+                fs::write(&paths.stderr, b"").unwrap();
+                filetime::set_file_mtime(&paths.json, filetime::FileTime::from_system_time(old))
+                    .unwrap();
+                let mut running = starting;
+                running.mark_running(std::process::id(), std::process::id() as i32);
+                crate::db::bash_tasks::upsert_bash_task(
+                    &db.lock().unwrap(),
+                    &running.to_bash_task_row("opencode", &paths).unwrap(),
+                )
+                .unwrap();
+                fixtures.push(paths);
+            }
+        }
+
+        let registries: Vec<BgTaskRegistry> = (0..REGISTRIES)
+            .map(|_| {
+                let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+                registry.set_harness(Harness::Opencode);
+                registry.set_db_pool(Arc::clone(&db));
+                registry
+            })
+            .collect();
+        let barrier = Arc::new(std::sync::Barrier::new(REGISTRIES));
+        let replays: Vec<_> = registries
+            .iter()
+            .enumerate()
+            .map(|(index, registry)| {
+                let registry = registry.clone();
+                let barrier = Arc::clone(&barrier);
+                let storage = storage.to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry
+                        .replay_session(&storage, &format!("replay-{index}"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for replay in replays {
+            replay.join().unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while registries
+            .iter()
+            .any(|registry| registry.persisted_gc_thread().is_none())
+        {
+            assert!(Instant::now() < deadline, "a replay's persisted GC never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let sweeps: u64 = registries
+            .iter()
+            .map(|registry| registry.inner.persisted_gc_runs.load(Ordering::SeqCst))
+            .sum();
+        let queries: u64 = registries
+            .iter()
+            .map(|registry| registry.inner.gc_db_liveness_queries.load(Ordering::SeqCst))
+            .sum();
+        eprintln!(
+            "restart replay of {REGISTRIES} registries over {SESSIONS} sessions x {TASKS_PER_SESSION} tasks: {sweeps} GC sweeps, {queries} aft.db liveness queries"
+        );
+        for registry in &registries {
+            assert_eq!(
+                registry.persisted_gc_thread().as_deref(),
+                Some("aft-bash-task-gc")
+            );
+            registry.shutdown();
+        }
+        assert!(
+            fixtures.iter().all(|paths| paths.json.exists()),
+            "GC deleted a task whose aft.db row records a live process"
+        );
+        assert_eq!(sweeps, 1, "one sweep must serve every registry");
+        assert_eq!(
+            queries, SESSIONS as u64,
+            "the sweep must ask aft.db once per session"
+        );
     }
 
     #[test]

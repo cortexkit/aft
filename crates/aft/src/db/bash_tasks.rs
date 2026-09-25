@@ -483,6 +483,56 @@ pub fn list_bash_tasks_by_id(
     rows
 }
 
+/// The recorded process identity of one `bash_tasks` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashTaskProcessIds {
+    pub task_id: String,
+    pub pid: Option<i64>,
+    pub pgid: Option<i64>,
+    pub started_at: i64,
+}
+
+/// SQLite's default host-parameter limit is 999 on older builds; stay under
+/// it with room for the harness parameter.
+const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
+
+/// Recorded pids for every row of `task_ids` under `harness`, in any session.
+///
+/// The persisted-task GC asks this once per session directory instead of
+/// once per task, so a sweep takes the shared aft.db mutex a handful of times
+/// rather than once for every task on the machine. Only rows with a recorded
+/// pid or pgid are returned.
+pub fn list_bash_task_process_ids(
+    conn: &Connection,
+    harness: &str,
+    task_ids: &[String],
+) -> rusqlite::Result<Vec<BashTaskProcessIds>> {
+    let mut found = Vec::new();
+    for chunk in task_ids.chunks(PROCESS_ID_LOOKUP_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT task_id, pid, pgid, started_at
+             FROM bash_tasks
+             WHERE harness = ? AND task_id IN ({placeholders})
+               AND (pid IS NOT NULL OR pgid IS NOT NULL)"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params = std::iter::once(harness).chain(chunk.iter().map(String::as_str));
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok(BashTaskProcessIds {
+                task_id: row.get(0)?,
+                pid: row.get(1)?,
+                pgid: row.get(2)?,
+                started_at: row.get(3)?,
+            })
+        })?;
+        for row in rows {
+            found.push(row?);
+        }
+    }
+    Ok(found)
+}
+
 pub fn list_replayable_bash_tasks_for_project(
     conn: &Connection,
     harness: &str,
