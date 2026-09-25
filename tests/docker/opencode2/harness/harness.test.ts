@@ -1,6 +1,19 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from 'node:url';
@@ -109,6 +122,48 @@ async function root(): Promise<string> {
   roots.push(path);
   return path;
 }
+
+// Fake executables live in one fixed cache shared by every run instead of in
+// the per-test temp directories. On macOS, Gatekeeper (syspolicyd) scans every
+// newly created executable the first time it runs, so writing fresh copies on
+// each run cost dozens of scans and a busy CPU core per `bun test`. A file's
+// directory is named by a hash of its bytes and mode, so a run reuses the copy
+// an earlier run left behind and an edited script gets a new path. Nothing
+// here deletes the cache: it holds a few tiny scripts.
+const CACHED_FILES = join(tmpdir(), "opencode2-harness-test-executables");
+
+async function cachedFile(content: string, executable: boolean): Promise<string> {
+  const digest = createHash("sha256")
+    .update(executable ? "executable\0" : "data\0")
+    .update(content)
+    .digest("hex")
+    // Short enough that a path to it still fits in a `#!` line on Linux.
+    .slice(0, 24);
+  const directory = join(CACHED_FILES, digest);
+  const path = join(directory, executable ? "executable" : "data");
+  const existing = await stat(path).catch(() => undefined);
+  if (
+    existing?.isFile() &&
+    (!executable || (existing.mode & 0o111) === 0o111) &&
+    (await readFile(path, "utf8")) === content
+  ) {
+    return path;
+  }
+  // Written under a unique name and renamed into place, so a concurrent run
+  // either sees no file or the whole file, never a half-written one.
+  await mkdir(directory, { recursive: true });
+  const pending = join(directory, `.pending-${process.pid}-${randomUUID()}`);
+  await writeFile(pending, content);
+  if (executable) await chmod(pending, 0o755);
+  await rename(pending, path);
+  return path;
+}
+
+function cachedExecutable(content: string): Promise<string> {
+  return cachedFile(content, true);
+}
+
+const CAPTURE_ARGUMENTS_SCRIPT = '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n';
 
 function call(overrides: Partial<ToolCallPlan> = {}): ToolCallPlan {
   return {
@@ -328,10 +383,8 @@ describe("scenario isolation and liveness", () => {
 
   test("the scenario client uses the provider contract model", async () => {
     const parent = await root();
-    const executable = join(parent, "capture-run-arguments");
+    const executable = await cachedExecutable(CAPTURE_ARGUMENTS_SCRIPT);
     const argumentsPath = join(parent, "arguments.txt");
-    await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n');
-    await chmod(executable, 0o755);
 
     const client = startScenarioClient({
       executable,
@@ -358,9 +411,7 @@ describe("scenario isolation and liveness", () => {
   describe("a host the caller is finished with is stopped, not waited out", () => {
     async function sleeper(): Promise<{ executable: string; cwd: string }> {
       const parent = await root();
-      const executable = join(parent, "never-ends");
-      await writeFile(executable, "#!/bin/sh\nsleep 30\n");
-      await chmod(executable, 0o755);
+      const executable = await cachedExecutable("#!/bin/sh\nsleep 30\n");
       return { executable, cwd: parent };
     }
 
@@ -501,10 +552,8 @@ describe("scenario isolation and liveness", () => {
 describe("shared-server controls", () => {
   test("control path interpolation resolves permission, session, and task ids", async () => {
     const parent = await root();
-    const executable = join(parent, "capture-api-arguments");
+    const executable = await cachedExecutable(CAPTURE_ARGUMENTS_SCRIPT);
     const argumentsPath = join(parent, "arguments.txt");
-    await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n');
-    await chmod(executable, 0o755);
     const handoff = { kind: "flag", name: "--server" } as const;
     const contract: HostCliContract = {
       schema_version: 1,
@@ -554,10 +603,8 @@ describe("shared-server controls", () => {
 
   test("a control body is passed on the flag the captured contract names", async () => {
     const parent = await root();
-    const executable = join(parent, "capture-body-arguments");
+    const executable = await cachedExecutable(CAPTURE_ARGUMENTS_SCRIPT);
     const argumentsPath = join(parent, "body-arguments.txt");
-    await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n');
-    await chmod(executable, 0o755);
     const handoff = { kind: "flag", name: "--server" } as const;
     const contract: HostCliContract = {
       schema_version: 1,
@@ -704,17 +751,24 @@ describe("the transport-dead stand-in", () => {
   // A stand-in for the real `aft`: a file that, if a shell ever reads it as a
   // script, leaves a marker in its working directory. The real binary's ELF
   // header did the same thing by accident, through a `>` byte in its first
-  // "line".
-  async function interpretableLiveBinary(directory: string): Promise<string> {
-    const live = join(directory, "aft-live");
-    await writeFile(live, "printf interpreted > interpreted-live-binary\n");
-    await chmod(live, 0o755);
-    return live;
+  // "line". The marker lands in whatever directory the shell runs in, so the
+  // file itself can sit in the shared cache.
+  function interpretableLiveBinary(): Promise<string> {
+    return cachedExecutable("printf interpreted > interpreted-live-binary\n");
+  }
+
+  // The swapped `aft` symlink stays in each test's own directory; only the
+  // stand-in and its body, which it points at, come from the shared cache.
+  // Their content is fixed once the body's path is, so both are reused.
+  async function makeStub(base: string) {
+    return makeTransportDeadStub(base, await interpretableLiveBinary(), ({ content, executable }) =>
+      cachedFile(content, executable),
+    );
   }
 
   test("accepts one request through the swapped path, then dies without answering", async () => {
     const base = await root();
-    const stub = await makeTransportDeadStub(base, await interpretableLiveBinary(base));
+    const stub = await makeStub(base);
     await pointTransportDeadStub(stub, true);
     const child = Bun.spawn([stub.executable], {
       cwd: base,
@@ -733,7 +787,7 @@ describe("the transport-dead stand-in", () => {
     const base = await root();
     const project = join(base, "project");
     await mkdir(project);
-    const stub = await makeTransportDeadStub(base, await interpretableLiveBinary(base));
+    const stub = await makeStub(base);
     await pointTransportDeadStub(stub, true);
 
     // This replays, step by step, what the kernel does when the bridge spawns
@@ -1304,8 +1358,17 @@ describe("producer-backed executable provenance", () => {
     );
     const sha = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repo }).stdout.toString().trim();
     const executable = join(repo, "aft");
-    await writeFile(executable, `#!/bin/sh\necho "aft test (${sha})"\n`);
-    await chmod(executable, 0o755);
+    // The provenance check looks for the sidecar next to the path it is given
+    // and never resolves symlinks, so a symlink in the fixture repository can
+    // stand for a shared cached script. The script reads the SHA from the
+    // repository it runs in (the check launches it there) rather than having a
+    // per-run SHA baked in, so its content, and therefore its path, is fixed.
+    // Tests below only rewrite the sidecar, never the executable, so nothing
+    // writes through the symlink into the shared copy.
+    await symlink(
+      await cachedExecutable('#!/bin/sh\necho "aft test ($(git rev-parse HEAD))"\n'),
+      executable,
+    );
     await writeFile(
       join(repo, "build-info.json"),
       `${JSON.stringify({
@@ -1614,23 +1677,20 @@ describe("permission scenarios reach the host's own rules", () => {
     const parent = await root();
     const stateRoot = join(parent, "xdg-state");
     const argumentsPath = join(parent, "serve-arguments.txt");
-    const executable = join(parent, "fake-opencode");
-    await writeFile(
-      executable,
+    const executable = await cachedExecutable(
       `#!/bin/sh\n` +
-        `printf '%s\\n' "$@" > ${JSON.stringify(argumentsPath)}\n` +
+        `printf '%s\\n' "$@" > "$ARGUMENTS_PATH"\n` +
         `mkdir -p "$XDG_STATE_HOME/opencode"\n` +
         `printf '%s' '{"id":"x","version":"2.0.11","url":"http://127.0.0.1:4242",` +
         `"pid":1,"password":"from-registration"}' > "$XDG_STATE_HOME/opencode/service.json"\n` +
         `echo "server listening on http://127.0.0.1:4242"\n` +
         `sleep 30\n`,
     );
-    await chmod(executable, 0o755);
 
     const server = await startSharedServer({
       executable,
       cwd: parent,
-      env: { ...process.env, XDG_STATE_HOME: stateRoot },
+      env: { ...process.env, XDG_STATE_HOME: stateRoot, ARGUMENTS_PATH: argumentsPath },
       processObserver: new ProcessObserver("registration-test"),
       stateRoot,
       timeoutMs: 10_000,
@@ -1651,12 +1711,9 @@ describe("permission scenarios reach the host's own rules", () => {
 
   test("a server that listens without registering is rejected", async () => {
     const parent = await root();
-    const executable = join(parent, "unregistered-opencode");
-    await writeFile(
-      executable,
+    const executable = await cachedExecutable(
       '#!/bin/sh\necho "server listening on http://127.0.0.1:4242"\nsleep 30\n',
     );
-    await chmod(executable, 0o755);
 
     await expectCode(
       () =>

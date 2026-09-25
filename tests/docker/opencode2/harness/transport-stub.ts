@@ -98,22 +98,52 @@ export function deadTransportStubSource(bodyPath: string): string {
 export async function makeTransportDeadStub(
   isolationRoot: string,
   nativeExecutable: string,
+  writeStandInFile?: StandInFileWriter,
 ): Promise<TransportDeadStub> {
   const stateRoot = resolve(isolationRoot, ".harness-state");
   await mkdir(stateRoot, { recursive: true });
+  const write = writeStandInFile ?? isolationRootWriter(stateRoot);
+  const deadBody = await write({
+    name: "aft-dead-body.sh",
+    content: DEAD_TRANSPORT_STUB_BODY,
+    executable: false,
+  });
+  const dead = await write({
+    name: "aft-dead",
+    content: deadTransportStubSource(deadBody),
+    executable: true,
+  });
   const stub: TransportDeadStub = {
     executable: join(stateRoot, "aft"),
     live: nativeExecutable,
-    dead: join(stateRoot, "aft-dead"),
-    deadBody: join(stateRoot, "aft-dead-body.sh"),
+    dead,
+    deadBody,
   };
-  await rm(stub.deadBody, { force: true });
-  await writeFile(stub.deadBody, DEAD_TRANSPORT_STUB_BODY);
-  await rm(stub.dead, { force: true });
-  await writeFile(stub.dead, deadTransportStubSource(stub.deadBody));
-  await chmod(stub.dead, 0o755);
   await pointTransportDeadStub(stub, false);
   return stub;
+}
+
+/**
+ * Writes one of the stand-in's files and returns the absolute path it now
+ * lives at. The swapped `aft` symlink always stays inside the isolation root;
+ * only the files it points at can live elsewhere. Unit tests pass a writer
+ * that reuses one fixed copy per content, because on macOS every newly
+ * created executable is scanned by Gatekeeper the first time it runs.
+ */
+export type StandInFileWriter = (file: {
+  name: string;
+  content: string;
+  executable: boolean;
+}) => Promise<string>;
+
+function isolationRootWriter(stateRoot: string): StandInFileWriter {
+  return async ({ name, content, executable }) => {
+    const path = join(stateRoot, name);
+    await rm(path, { force: true });
+    await writeFile(path, content);
+    if (executable) await chmod(path, 0o755);
+    return path;
+  };
 }
 
 /**
