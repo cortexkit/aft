@@ -12584,7 +12584,9 @@ mod tests {
             load_pending.push(crate::commands::configure::ignore_rules_load_pending(ctx));
         }
         drop(created_tx);
-        let created = created_rx.iter().take(contexts.len()).collect::<Vec<_>>();
+        let created = (0..contexts.len())
+            .map(|_| created_rx.recv().expect("one backend per rebound root"))
+            .collect::<Vec<_>>();
         assert_eq!(
             AppContext::ignore_walks_on_current_thread_for_test(),
             walks_before,

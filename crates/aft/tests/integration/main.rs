@@ -110,6 +110,7 @@ mod parser_audit_fixes_test;
 mod parser_test;
 mod pascal_test;
 mod pins_gc_test;
+mod powershell_refusal_test;
 mod preview_diff_test;
 mod profile_memory_test;
 mod protocol_test;
