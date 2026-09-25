@@ -6312,7 +6312,8 @@ fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
         Err(err) => slog_warn!("filesystem lock reclaim-token cleanup failed: {}", err),
     }
     crate::search_index::sweep_orphaned_index_dirs(storage_root);
-    crate::artifact_owner::sweep_orphaned_owner_manifests(storage_root);
+    // Throttled per storage root inside; most configure tails return at once.
+    let _ = crate::artifact_owner::sweep_orphaned_owner_manifests(storage_root);
     crate::search_index::sweep_transient_search_cache_dirs();
     let inspect_root = storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
     let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(storage_root);

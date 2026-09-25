@@ -126,13 +126,23 @@ pub fn claim_or_open_read_only(
                     .zip(git_common_dir.as_deref())
                     .is_some_and(|(existing, current)| existing == current);
                 if same_checkout || same_git_family {
-                    return write_owner_manifest(
+                    #[cfg(test)]
+                    run_before_owner_write_hook(&manifest_dir);
+                    match write_owner_manifest(
                         &path,
                         project_key,
                         project_scope_key,
                         &checkout_path,
                         git_common_dir.as_deref(),
-                    );
+                    ) {
+                        // The orphaned-manifest sweep removed the key
+                        // directory; recreate it and claim again.
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            fs::create_dir_all(&manifest_dir)?;
+                            continue;
+                        }
+                        result => return result,
+                    }
                 }
 
                 if manifest_owner_alive(&existing) {
@@ -155,6 +165,8 @@ pub fn claim_or_open_read_only(
                 }
             }
             Err(ReadManifestError::NotFound) => {
+                #[cfg(test)]
+                run_before_owner_write_hook(&manifest_dir);
                 match create_owner_manifest(
                     &path,
                     project_key,
@@ -638,11 +650,17 @@ fn owner_manifests_root(storage_root: &Path) -> PathBuf {
     storage_root.join("artifact-owners")
 }
 
-/// Directory entries under `artifact-owners/` examined per sweep. The limit is
-/// applied to the directory iterator itself, so a storage root with thousands
-/// of project keys costs at most this many entries (and manifest reads) per
-/// pass; entries removed by one pass make room for the next.
+/// Directory entries under `artifact-owners/` examined per pass. The limit is
+/// applied to the directory iterator itself (after skipping to the resume
+/// offset), so a storage root with thousands of project keys costs at most
+/// this many entries, and manifest reads, per pass.
 const OWNER_REAP_SCAN_LIMIT: usize = 512;
+
+/// A storage root is swept at most once per this interval per process. The
+/// sweep runs from every configure tail, and after a daemon restart dozens of
+/// roots configure at once; without the interval each of them would walk the
+/// same directory.
+const OWNER_REAP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// A manifest must also have gone this long without a heartbeat before it is
 /// reaped. A live owner rewrites the heartbeat every few seconds, so this only
@@ -650,26 +668,102 @@ const OWNER_REAP_SCAN_LIMIT: usize = 512;
 /// still be shutting down) out of the sweep.
 const OWNER_REAP_MIN_HEARTBEAT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// Per storage root: when the last pass was claimed, and the directory offset
+/// the next pass resumes from.
+#[derive(Debug, Default)]
+struct OwnerReapState {
+    last_run: Option<std::time::Instant>,
+    next_offset: usize,
+}
+
+static OWNER_REAP_STATE: OnceLock<Mutex<std::collections::HashMap<PathBuf, OwnerReapState>>> =
+    OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwnerReapSummary {
+    /// Directory entries taken from the iterator in this pass.
+    pub(crate) examined: usize,
+    /// Owner manifests removed in this pass.
+    pub(crate) removed: usize,
+    /// Offset the next pass skips to; 0 once a pass reached the end.
+    pub(crate) next_offset: usize,
+}
+
 /// Remove owner manifests whose checkout no longer exists.
 ///
 /// Every project key gets an `artifact-owners/<key>/owner.json`, and nothing
 /// else removes them, so without this sweep the directory grows by one entry
-/// for every checkout ever opened. Returns the number of manifests removed.
-pub(crate) fn sweep_orphaned_owner_manifests(storage_root: &Path) -> usize {
-    sweep_orphaned_owner_manifests_with_limit(storage_root, OWNER_REAP_SCAN_LIMIT, now_ms())
+/// for every checkout ever opened. Returns `None` when another caller already
+/// ran a pass for this storage root within `OWNER_REAP_INTERVAL`.
+pub(crate) fn sweep_orphaned_owner_manifests(storage_root: &Path) -> Option<OwnerReapSummary> {
+    sweep_orphaned_owner_manifests_throttled(
+        storage_root,
+        OWNER_REAP_SCAN_LIMIT,
+        OWNER_REAP_INTERVAL,
+        now_ms(),
+    )
 }
 
-fn sweep_orphaned_owner_manifests_with_limit(
+fn sweep_orphaned_owner_manifests_throttled(
     storage_root: &Path,
     scan_limit: usize,
+    interval: Duration,
     now: u64,
-) -> usize {
+) -> Option<OwnerReapSummary> {
+    let states = OWNER_REAP_STATE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    // Claim the pass and read the resume offset under one lock, so two
+    // configure tails for the same storage root cannot both run it.
+    let offset = {
+        let mut states = states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = states.entry(storage_root.to_path_buf()).or_default();
+        let started = std::time::Instant::now();
+        if state
+            .last_run
+            .is_some_and(|last_run| started.saturating_duration_since(last_run) < interval)
+        {
+            return None;
+        }
+        state.last_run = Some(started);
+        state.next_offset
+    };
+
+    let summary = reap_owner_manifests_pass(storage_root, offset, scan_limit, now);
+    if let Ok(mut states) = states.lock() {
+        if let Some(state) = states.get_mut(storage_root) {
+            state.next_offset = summary.next_offset;
+        }
+    }
+    crate::slog_info!(
+        "artifact owner cleanup: root={} examined={} removed={} next_offset={}",
+        owner_manifests_root(storage_root).display(),
+        summary.examined,
+        summary.removed,
+        summary.next_offset
+    );
+    Some(summary)
+}
+
+/// One bounded pass: skip `offset` directory entries, examine at most
+/// `scan_limit`, and report where the next pass should resume. A pass that
+/// reaches the end of the directory wraps the next offset to 0. Key
+/// directories removed in this pass are subtracted from the offset, because
+/// the entries after them move up by that many positions.
+fn reap_owner_manifests_pass(
+    storage_root: &Path,
+    offset: usize,
+    scan_limit: usize,
+    now: u64,
+) -> OwnerReapSummary {
     let root = owner_manifests_root(storage_root);
     let Ok(entries) = fs::read_dir(&root) else {
-        return 0;
+        return OwnerReapSummary::default();
     };
-    let mut removed = 0;
-    for entry in entries.take(scan_limit) {
+    let mut summary = OwnerReapSummary::default();
+    let mut removed_dirs = 0;
+    for entry in entries.skip(offset).take(scan_limit) {
+        summary.examined += 1;
         let Ok(entry) = entry else {
             continue;
         };
@@ -683,22 +777,23 @@ fn sweep_orphaned_owner_manifests_with_limit(
                 // Re-checks the owner identity right before unlinking, so a
                 // claim that replaced the manifest meanwhile is left alone.
                 if matches!(reclaim_manifest_if_unchanged(&path, &manifest), Ok(true)) {
-                    removed += 1;
-                    // Only succeeds once the directory is empty; a claim that
-                    // races this recreates the directory before writing.
-                    let _ = fs::remove_dir(&dir);
+                    summary.removed += 1;
+                    // Only succeeds once the directory is empty. A claim that
+                    // races this recreates the directory and retries.
+                    if fs::remove_dir(&dir).is_ok() {
+                        removed_dirs += 1;
+                    }
                 }
             }
             _ => {}
         }
     }
-    if removed > 0 {
-        crate::slog_info!(
-            "artifact owner cleanup: removed {} manifests for checkouts that no longer exist",
-            removed
-        );
-    }
-    removed
+    summary.next_offset = if summary.examined < scan_limit {
+        0
+    } else {
+        (offset + summary.examined).saturating_sub(removed_dirs)
+    };
+    summary
 }
 
 /// A manifest is orphaned when its checkout is definitely gone (a failed
@@ -815,6 +910,23 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(not(any(unix, windows)))]
 fn process_alive(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam run just before a claim writes the owner manifest, so a test
+    /// can remove the key directory at the exact point a concurrent sweep could.
+    static BEFORE_OWNER_WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_before_owner_write_hook(manifest_dir: &Path) {
+    BEFORE_OWNER_WRITE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(manifest_dir);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1160,6 +1272,19 @@ mod tests {
         path
     }
 
+    /// Runs unthrottled passes the way the throttled wrapper does, carrying the
+    /// resume offset between them.
+    fn reap_passes(storage: &Path, limit: usize, now: u64, passes: usize) -> Vec<OwnerReapSummary> {
+        let mut offset = 0;
+        (0..passes)
+            .map(|_| {
+                let summary = reap_owner_manifests_pass(storage, offset, limit, now);
+                offset = summary.next_offset;
+                summary
+            })
+            .collect()
+    }
+
     #[test]
     fn owner_reap_removes_only_manifests_whose_checkout_is_gone() {
         let temp = tempfile::tempdir().unwrap();
@@ -1179,9 +1304,16 @@ mod tests {
         fs::create_dir_all(malformed.parent().unwrap()).unwrap();
         fs::write(&malformed, b"").unwrap();
 
-        let removed = sweep_orphaned_owner_manifests_with_limit(&storage, 100, now);
+        let summary = reap_owner_manifests_pass(&storage, 0, 100, now);
 
-        assert_eq!(removed, 1);
+        assert_eq!(
+            summary,
+            OwnerReapSummary {
+                examined: 4,
+                removed: 1,
+                next_offset: 0
+            }
+        );
         assert!(
             !gone.exists(),
             "manifest for a deleted checkout must be reaped"
@@ -1213,17 +1345,14 @@ mod tests {
             );
         }
 
+        let passes = reap_passes(&storage, 2, now, 3);
         assert_eq!(
-            sweep_orphaned_owner_manifests_with_limit(&storage, 2, now),
-            2
+            passes.iter().map(|pass| pass.examined).collect::<Vec<_>>(),
+            vec![2, 2, 1]
         );
         assert_eq!(
-            sweep_orphaned_owner_manifests_with_limit(&storage, 2, now),
-            2
-        );
-        assert_eq!(
-            sweep_orphaned_owner_manifests_with_limit(&storage, 2, now),
-            1
+            passes.iter().map(|pass| pass.removed).collect::<Vec<_>>(),
+            vec![2, 2, 1]
         );
         assert_eq!(
             fs::read_dir(owner_manifests_root(&storage))
@@ -1231,6 +1360,180 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// More live entries than one pass can examine must not hide dead ones:
+    /// the resume offset carries the scan past them, so every dead manifest
+    /// is reaped within ceil(total / limit) + 1 passes, wherever the dead
+    /// entries fall in directory order.
+    #[test]
+    fn owner_reap_resumes_past_live_entries_until_every_dead_one_is_reaped() {
+        const LIMIT: usize = 4;
+        const TOTAL: usize = 13;
+        const DEAD: usize = 3;
+        let max_passes = TOTAL.div_ceil(LIMIT) + 1;
+        type PickDead = fn(&[PathBuf]) -> Vec<PathBuf>;
+        let placements: [(&str, PickDead); 3] = [
+            ("dead last", |order| order[order.len() - DEAD..].to_vec()),
+            ("dead first", |order| order[..DEAD].to_vec()),
+            ("dead scattered", |order| {
+                vec![
+                    order[0].clone(),
+                    order[order.len() / 2].clone(),
+                    order[order.len() - 1].clone(),
+                ]
+            }),
+        ];
+
+        for (placement, pick_dead) in placements {
+            let temp = tempfile::tempdir().unwrap();
+            let storage = temp.path().join("storage");
+            let live_checkout = temp.path().join("live");
+            fs::create_dir_all(&live_checkout).unwrap();
+            let gone_checkout = temp.path().join("gone");
+            let now = now_ms();
+            let old = now - 2 * DAY_MS;
+            for index in 0..TOTAL {
+                write_owner_manifest_for_reap(
+                    &storage,
+                    &format!("key-{index:02}"),
+                    &live_checkout,
+                    old,
+                );
+            }
+            // Choose the dead entries by the directory's own iteration order,
+            // which is what the sweep walks.
+            let order = fs::read_dir(owner_manifests_root(&storage))
+                .unwrap()
+                .map(|entry| entry.unwrap().path().join("owner.json"))
+                .collect::<Vec<_>>();
+            let dead = pick_dead(&order);
+            for path in &dead {
+                let key = path
+                    .parent()
+                    .unwrap()
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                write_owner_manifest_for_reap(&storage, key, &gone_checkout, old);
+            }
+
+            let passes = reap_passes(&storage, LIMIT, now, max_passes);
+            let removed: usize = passes.iter().map(|pass| pass.removed).sum();
+            assert_eq!(removed, DEAD, "{placement}: {passes:?}");
+            for path in &dead {
+                assert!(
+                    !path.exists(),
+                    "{placement}: {} survived {passes:?}",
+                    path.display()
+                );
+            }
+            assert!(
+                passes.iter().all(|pass| pass.examined <= LIMIT),
+                "{placement}: {passes:?}"
+            );
+            assert_eq!(
+                fs::read_dir(owner_manifests_root(&storage))
+                    .unwrap()
+                    .count(),
+                TOTAL - DEAD,
+                "{placement}: live manifests must stay"
+            );
+        }
+    }
+
+    /// A second call inside the interval examines nothing, even when there is
+    /// now something to reap, and concurrent callers claim exactly one pass.
+    #[test]
+    fn owner_reap_runs_at_most_once_per_interval_per_storage_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join("storage");
+        let gone_checkout = temp.path().join("gone");
+        let now = now_ms();
+        let interval = Duration::from_secs(3600);
+        let first =
+            write_owner_manifest_for_reap(&storage, "first", &gone_checkout, now - 2 * DAY_MS);
+
+        let summary = sweep_orphaned_owner_manifests_throttled(&storage, 512, interval, now)
+            .expect("first call runs a pass");
+        assert_eq!((summary.examined, summary.removed), (1, 1));
+        assert!(!first.exists());
+
+        let second =
+            write_owner_manifest_for_reap(&storage, "second", &gone_checkout, now - 2 * DAY_MS);
+        assert_eq!(
+            sweep_orphaned_owner_manifests_throttled(&storage, 512, interval, now),
+            None,
+            "a call inside the interval must not examine anything"
+        );
+        assert!(second.exists(), "the throttled call must not reap");
+
+        let other = temp.path().join("other-storage");
+        write_owner_manifest_for_reap(&other, "other", &gone_checkout, now - 2 * DAY_MS);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let ran = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let other = other.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    sweep_orphaned_owner_manifests_throttled(&other, 512, interval, now).is_some()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|ran| *ran)
+            .count();
+        assert_eq!(ran, 1, "concurrent callers must claim exactly one pass");
+    }
+
+    fn arm_remove_key_dir_once() {
+        let mut fired = false;
+        BEFORE_OWNER_WRITE_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |dir: &Path| {
+                if !fired {
+                    fired = true;
+                    fs::remove_dir_all(dir).unwrap();
+                }
+            }));
+        });
+    }
+
+    fn disarm_owner_write_hook() {
+        BEFORE_OWNER_WRITE_HOOK.with(|hook| *hook.borrow_mut() = None);
+    }
+
+    /// The sweep can remove a key directory between the claim creating it and
+    /// writing the first manifest; the claim recreates it and succeeds.
+    #[test]
+    fn first_claim_survives_the_reap_removing_its_key_directory() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        arm_remove_key_dir_once();
+        let lease = claim_owner(temp.path(), &root, "key");
+        disarm_owner_write_hook();
+        assert_eq!(read_manifest(&lease.path).unwrap(), lease.manifest);
+    }
+
+    /// Same race on a same-checkout re-claim, which rewrites the manifest
+    /// through a temp file in the key directory.
+    #[test]
+    fn reclaim_survives_the_reap_removing_its_key_directory() {
+        let _env_lock = crate::test_env::process_env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        claim_owner(temp.path(), &root, "key");
+        arm_remove_key_dir_once();
+        let result = claim_or_open_read_only(Some(temp.path()), &root, "key", "key", false, None);
+        disarm_owner_write_hook();
+        let lease = result
+            .expect("re-claim must recreate the key directory")
+            .lease
+            .unwrap();
+        assert_eq!(read_manifest(&lease.path).unwrap(), lease.manifest);
     }
 
     #[test]
