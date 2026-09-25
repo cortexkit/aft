@@ -27,9 +27,12 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { __onnxTest__, getOnnxRuntimeInstallFailure } from "../index.js";
+import * as bridge from "../index.js";
 
-const { resolveOnnxRuntime, ORT_VERSION } = __onnxTest__;
+const { resolveOnnxRuntime, ORT_VERSION } = bridge.__onnxTest__;
+
+/** Read through the namespace so a missing export fails only the tests that use it. */
+const getOnnxRuntimeInstallFailure = (): string | null => bridge.getOnnxRuntimeInstallFailure();
 
 const LIB_NAME = "libonnxruntime.so";
 const ASSET_NAME = `onnxruntime-fake-${ORT_VERSION}`;

@@ -150,6 +150,25 @@ describe("cleanupAbandonedOnnxAttempts", () => {
     expect(existsSync(ortDir)).toBe(false);
   });
 
+  test("copies libraries into a target directory that does not exist yet", () => {
+    // The installer stages into a fresh `<tmp>/install` directory that nothing
+    // else creates; copying into it used to fail with ENOENT on copyfile.
+    const extractedDir = join(workDir, "extracted-fresh-target");
+    const targetDir = join(workDir, "staging", "install");
+    mkdirSync(extractedDir, { recursive: true });
+    writeFileSync(join(extractedDir, "libonnxruntime.so"), "binary");
+
+    copyOnnxLibraries(
+      { assetName: "onnxruntime-test", libName: "libonnxruntime.so", archiveType: "tgz" },
+      extractedDir,
+      targetDir,
+      ["libonnxruntime.so"],
+      [],
+    );
+
+    expect(existsSync(join(targetDir, "libonnxruntime.so"))).toBe(true);
+  });
+
   test("required ONNX library copy failure removes partial target and throws", () => {
     const extractedDir = join(workDir, "extracted");
     const targetDir = join(workDir, "target");

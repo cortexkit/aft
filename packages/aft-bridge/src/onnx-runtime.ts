@@ -907,8 +907,6 @@ async function downloadOnnxRuntime(
 
   try {
     mkdirSync(extractionRoot, { recursive: true });
-    // copyOnnxLibraries writes into this directory and does not create it.
-    mkdirSync(stagedInstallDir, { recursive: true });
     const archivePath = join(tmpDir, `onnxruntime.${info.archiveType}`);
 
     // Download with a streaming size cap.
@@ -1035,6 +1033,11 @@ function copyOnnxLibraries(
   copyFile: typeof copyFileSync = copyFileSync,
 ): void {
   const requiredLibs = new Set([info.libName]);
+
+  // The installer passes a fresh staging directory that does not exist yet.
+  // Without this, every copy fails with ENOENT on the destination path and
+  // no managed install can ever succeed.
+  mkdirSync(targetDir, { recursive: true });
 
   // Copy real files first. Required library failures are fatal; optional extra
   // libraries stay best-effort so one unusual sidecar does not block install.
