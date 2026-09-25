@@ -359,11 +359,11 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
     }
-    const blockers = (h.pluginLoad?.blockers ?? []).filter((blocker) => blocker.stopsLoad);
+    const blockers = h.pluginLoad?.blockers ?? [];
     if (h.pluginRegistered && blockers.length > 0) {
-      // Registered is not loaded: the plugin aborts at startup on these, and
-      // the host then runs with no AFT tools. The issues list below has the fix.
-      log.error("  plugin registered: yes, but it will not load (see Issues found)");
+      // Registered and loaded, but in the config error state: the tools are
+      // there and every call fails. The issues list below has the fix.
+      log.error("  plugin registered: yes, but every AFT tool call fails (see Issues found)");
     } else {
       log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
     }

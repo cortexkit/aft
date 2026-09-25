@@ -452,10 +452,10 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
       });
     }
 
-    // Config conditions that stop AFT at startup (rejected keys, a missing
-    // subc connection file) or make it ignore the user's file (a parse error).
-    // They are HIGH: the host starts either way, and nothing else says why AFT
-    // is missing or ignoring its settings.
+    // Config conditions that put the plugin in its config error state
+    // (rejected keys, a file that does not parse, a missing subc connection
+    // file): the tools register but every call fails. They are HIGH: the host
+    // starts either way, and only a tool call would otherwise reveal them.
     for (const blocker of h.pluginLoad?.blockers ?? []) {
       issues.push({
         code: blocker.code,

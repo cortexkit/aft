@@ -1,11 +1,15 @@
 import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
 import {
+  ConfigRejectedError,
+  type ConfigErrorCode,
+  formatConfigErrorMessage,
+  formatConfigParseErrorMessage,
+  formatSubcConnectionMissingMessage,
   mergeIndexes,
   policyPhaseForVersion,
   type RawIndexesConfig,
   resolveCortexKitProjectConfigPath,
+  resolveSubcConnectionFilePath,
   translateConfigDocument,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";
@@ -16,34 +20,30 @@ import { CLI } from "./cli.js";
  * What the plugin will do with the AFT config it loads at startup.
  *
  * `doctor` used to read the config only for display, so a config the plugin
- * refuses (and a plugin that therefore registers no tools) still reported
- * "registered, healthy". This mirrors the plugin's startup config checks:
- * retired keys the policy rejects and a `subc.connection_file` that points at
- * no file stop AFT outright; a file that does not parse is ignored whole, so
- * AFT runs on defaults and none of the user's settings apply. It also derives
- * the effective semantic backend, which decides whether ONNX Runtime is
- * needed at all.
+ * cannot use still reported "registered, healthy". This mirrors the plugin's
+ * startup config checks: retired keys the policy rejects, a file that does not
+ * parse, and a `subc.connection_file` that points at no file. On any of them
+ * the plugin still loads and registers its tools, but in its config error
+ * state: every AFT tool call fails with the error. The text of that error
+ * comes from the same `@cortexkit/aft-bridge` helpers the plugins use, so
+ * doctor quotes exactly what the model sees. It also derives the effective
+ * semantic backend, which decides whether ONNX Runtime is needed at all.
  */
 
-export type PluginLoadBlockerCode =
-  | "config_parse_error"
-  | "config_rejected"
-  | "subc_connection_missing";
+export type PluginLoadBlockerCode = ConfigErrorCode;
 
 export interface PluginLoadBlocker {
   code: PluginLoadBlockerCode;
   /** The config file responsible. */
   path: string;
+  /** Doctor's description, quoting the error every AFT tool call returns. */
   message: string;
+  /** The exact text every AFT tool call fails with while this condition holds. */
+  toolCallError: string;
   /** Exactly what the user (or `doctor --fix`) does about it. */
   remediation: string;
   /** True when `doctor --fix` repairs it (the retired-key migration). */
   fixable: boolean;
-  /**
-   * True when AFT registers no tools at all because of it. False for a file
-   * that does not parse: the plugin still starts, on default settings.
-   */
-  stopsLoad: boolean;
 }
 
 export interface PluginLoadEvaluation {
@@ -77,11 +77,13 @@ function readConfig(path: string): { value: Json | null; error: string | null } 
 }
 
 /** Same resolution as the plugin's transport factory: `~` and relative paths are under home. */
-export function resolveSubcConnectionPath(raw: string, home: string = homedir()): string {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("~")) return join(home, trimmed.slice(1).replace(/^[/\\]/, ""));
-  if (isAbsolute(trimmed)) return trimmed;
-  return join(home, trimmed);
+export function resolveSubcConnectionPath(raw: string, home?: string): string {
+  return resolveSubcConnectionFilePath(raw, home);
+}
+
+/** Doctor's wording for a condition that puts the plugin in its config error state. */
+function failsEveryToolCall(toolCallError: string, scope = ""): string {
+  return `The plugin loads, but every AFT tool call${scope} fails with: ${toolCallError}`;
 }
 
 /** A block's own values, then its `harnesses.<harness>` override on top. */
@@ -122,13 +124,14 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
   for (const { path, tier } of tiers) {
     const { value, error } = readConfig(path);
     if (error) {
+      const toolCallError = formatConfigErrorMessage(formatConfigParseErrorMessage(path, error));
       blockers.push({
         code: "config_parse_error",
         path,
-        message: `AFT config ${path} does not parse (${error}); the plugin ignores the whole file and runs on defaults.`,
+        message: failsEveryToolCall(toolCallError),
+        toolCallError,
         remediation: `Fix the JSON/JSONC syntax in ${path}, then restart the host.`,
         fixable: false,
-        stopsLoad: false,
       });
       continue;
     }
@@ -140,13 +143,16 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
         .map((code) => code.replace(/^removed_config_key:([^:]+):use:(.+)$/, "$1 → $2"))
         .join(", ");
       const scope = tier === "project" ? " in this project" : "";
+      const toolCallError = formatConfigErrorMessage(
+        new ConfigRejectedError(translation.errors, path).message,
+      );
       blockers.push({
         code: "config_rejected",
         path,
-        message: `The plugin refuses to start with ${path}: it uses removed keys (${removed}), so no AFT tools are registered${scope}.`,
+        message: `${failsEveryToolCall(toolCallError, scope)} (removed keys: ${removed})`,
+        toolCallError,
         remediation: `Run \`${CLI} doctor --fix\` to migrate the file, then restart the host.`,
         fixable: true,
-        stopsLoad: true,
       });
     }
     loaded[tier] = withHarness(translated, input.harness);
@@ -158,13 +164,16 @@ export function evaluatePluginLoad(input: PluginLoadInput): PluginLoadEvaluation
   if (raw.length > 0) {
     const resolved = resolveSubcConnectionPath(raw, input.home);
     if (!existsSync(resolved)) {
+      const toolCallError = formatConfigErrorMessage(
+        formatSubcConnectionMissingMessage(raw, resolved),
+      );
       blockers.push({
         code: "subc_connection_missing",
         path: input.userConfigPath,
-        message: `The plugin refuses to start: subc.connection_file is set to "${raw}" but ${resolved} does not exist, so no AFT tools are registered.`,
-        remediation: `Start the Subconscious daemon that writes ${resolved}, or remove the "subc" block (or its "connection_file" key) from ${input.userConfigPath} to use AFT on its own. doctor --fix does not edit this setting.`,
+        message: failsEveryToolCall(toolCallError),
+        toolCallError,
+        remediation: `Start the Subconscious daemon that writes ${resolved}, or remove the "subc" block (or its "connection_file" key) from ${input.userConfigPath} to use AFT on its own, then restart the host. doctor --fix does not edit this setting.`,
         fixable: false,
-        stopsLoad: true,
       });
     }
   }

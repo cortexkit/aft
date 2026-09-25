@@ -189,13 +189,18 @@ async function plainDoctor(): Promise<{ code: number; text: string }> {
   return { code, text: output.join("") };
 }
 
-describe("doctor reports every condition that stops the plugin loading", () => {
+describe("doctor reports every condition that puts the plugin in its config error state", () => {
   test("a subc.connection_file that points at nothing is HIGH, with what to remove", async () => {
     writeUserConfig({ subc: { connection_file: "~/.local/share/cortexkit/run/subc.json" } });
     const { code, text } = await plainDoctor();
     expect(code).toBe(1);
-    expect(text).toContain("plugin registered: yes, but it will not load");
-    expect(text).toContain("[HIGH] OpenCode: The plugin refuses to start: subc.connection_file");
+    expect(text).toContain("plugin registered: yes, but every AFT tool call fails");
+    expect(text).toContain(
+      "[HIGH] OpenCode: The plugin loads, but every AFT tool call fails with: subc.connection_file",
+    );
+    // Doctor quotes the plugin's own error text, restart note included.
+    expect(text).toContain("no subc connection file exists there");
+    expect(text).toContain("restart the host");
     expect(text).toContain(
       `remove the "subc" block (or its "connection_file" key) from ${userConfig}`,
     );
@@ -210,11 +215,12 @@ describe("doctor reports every condition that stops the plugin loading", () => {
   });
 
   test("rejected retired keys are HIGH and planned for doctor --fix", async () => {
-    // gh_read is rejected at every version, so the plugin refuses the file.
+    // gh_read is rejected at every version, so the plugin cannot use the file.
     writeUserConfig({ gh_read: true });
     const { code, text } = await plainDoctor();
     expect(code).toBe(1);
-    expect(text).toContain("[HIGH] OpenCode: The plugin refuses to start with");
+    expect(text).toContain("[HIGH] OpenCode: The plugin loads, but every AFT tool call fails with");
+    expect(text).toContain("removed_config_key:gh_read:use:github.read");
     expect(text).toContain("gh_read → github.read");
     expect(text).toContain("doctor --fix` to migrate the file");
     const { buildDoctorFixPlan } = await import("../commands/doctor.js");
@@ -237,11 +243,13 @@ describe("doctor reports every condition that stops the plugin loading", () => {
     expect(parse[0]?.severity).toBe("high");
     expect(parse[0]?.message).toContain(userConfig);
     expect(parse[0]?.remediation).toContain(`Fix the JSON/JSONC syntax in ${userConfig}`);
-    // The plugin still starts on defaults, so doctor must not claim it will not load.
-    expect(parse[0]?.message).toContain("runs on defaults");
+    // The plugin no longer runs on defaults: it loads in the config error
+    // state, so doctor says every tool call fails instead.
+    expect(parse[0]?.message).toContain("every AFT tool call fails with");
+    expect(parse[0]?.message).toContain("failed to parse");
     const { text } = await plainDoctor();
-    expect(text).toContain("[HIGH] OpenCode: AFT config");
-    expect(text).not.toContain("it will not load");
+    expect(text).toContain("[HIGH] OpenCode: The plugin loads, but every AFT tool call fails");
+    expect(text).toContain("plugin registered: yes, but every AFT tool call fails");
   });
 });
 

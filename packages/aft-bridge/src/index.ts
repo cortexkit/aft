@@ -134,11 +134,14 @@ export { stripJsoncSymbols } from "./jsonc.js";
 export {
   AftConfigError,
   CONFIG_ERROR_RESTART_NOTE,
+  type ConfigErrorCode,
   ConfigErrorTransportPool,
   configErrorStatusSnapshot,
   formatConfigErrorMessage,
   formatConfigErrorStatusLine,
   formatConfigParseErrorMessage,
+  formatSubcConnectionMissingMessage,
+  resolveSubcConnectionFilePath,
 } from "./config-error.js";
 // --- per-Location process-global transport ownership ---
 export type {

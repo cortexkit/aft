@@ -13,6 +13,9 @@
  * no host tool is substituted, so the failure stays visible.
  */
 
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
+
 import type { BridgeToolCallRuntime } from "./pool.js";
 import type {
   AftProjectTransport,
@@ -37,10 +40,33 @@ export function formatConfigErrorMessage(detail: string): string {
 }
 
 /**
- * Error text for a config file that does not parse. Unlike the warning a
- * running plugin emits when it skips a broken file, this names no fallback:
- * at startup a broken file puts AFT in the config error state.
+ * Where a configured `subc.connection_file` points: `~` and relative paths are
+ * resolved against the home directory, never the project, because the file is
+ * a per-machine daemon endpoint. Shared by the transport factory and `doctor`.
  */
+export function resolveSubcConnectionFilePath(raw: string, home: string = homedir()): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("~")) return join(home, trimmed.slice(1).replace(/^[/\\]/, ""));
+  if (isAbsolute(trimmed)) return trimmed;
+  return join(home, trimmed);
+}
+
+/** The error for a configured subc connection file that does not exist, with its fix. */
+export function formatSubcConnectionMissingMessage(raw: string, resolved: string): string {
+  return (
+    `subc.connection_file is set to "${raw.trim()}" (resolved: ${resolved}) but no subc ` +
+    `connection file exists there. Start the Subconscious daemon, correct the path, ` +
+    `or remove subc.connection_file from your user config to use the standalone bridge.`
+  );
+}
+
+/**
+ * Every configuration condition that puts a plugin in the config error state,
+ * named the same way by the plugins and by `doctor`.
+ */
+export type ConfigErrorCode = "config_parse_error" | "config_rejected" | "subc_connection_missing";
+
+/** Error text for a config file that does not parse, as the plugins and `doctor` report it. */
 export function formatConfigParseErrorMessage(configPath: string, errorMessage: string): string {
   return (
     `AFT config at ${configPath} failed to parse: ${errorMessage}. ` +

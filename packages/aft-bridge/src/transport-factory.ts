@@ -14,11 +14,13 @@
  */
 
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
 
 import type { ConsumerIdentity } from "@cortexkit/subc-client";
 
+import {
+  formatSubcConnectionMissingMessage,
+  resolveSubcConnectionFilePath,
+} from "./config-error.js";
 import {
   type CanonicalRootPath,
   type ConcretePoolId,
@@ -88,14 +90,7 @@ export interface AftTransportFactoryOptions {
 // `subc-transport/src/connection_file.rs::discovery_candidates_with_environment`
 // and resolve `CONNECTION_FILE_NAME` and `PROD_CONNECTION_RELATIVE_PATH`.
 function resolveConnectionFilePath(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("~")) {
-    return join(homedir(), trimmed.slice(1).replace(/^[/\\]/, ""));
-  }
-  if (isAbsolute(trimmed)) return trimmed;
-  // A bare/relative path is resolved against home, not the project cwd — this is
-  // a per-machine daemon endpoint, never a project-relative artifact.
-  return join(homedir(), trimmed);
+  return resolveSubcConnectionFilePath(raw);
 }
 
 const SUBC_CLIENT_REAPER_PROCESS_KEY = "subc_client_reaper";
@@ -201,11 +196,7 @@ export async function subcConnectionFileError(
   if (!raw) return null;
   const connectionFile = resolveConnectionFilePath(raw);
   if (await SubcTransportPool.connectionAvailable(connectionFile)) return null;
-  return (
-    `subc.connection_file is set to "${raw}" (resolved: ${connectionFile}) but no subc ` +
-    `connection file exists there. Start the Subconscious daemon, correct the path, ` +
-    `or remove subc.connection_file from your user config to use the standalone bridge.`
-  );
+  return formatSubcConnectionMissingMessage(raw, connectionFile);
 }
 
 async function createConcreteAftTransportPool(
