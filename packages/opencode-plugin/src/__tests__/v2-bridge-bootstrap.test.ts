@@ -91,6 +91,10 @@ describe.serial("OpenCode 2 boot resolves ONNX Runtime through the shared bootst
     const dependencies = {
       ...inertV2Surface,
       loadConfig: () => ({ indexes: { semantic: true }, disabled_tools: [] }),
+      // The stubbed loadConfig never resets the real parse-failure registry, so
+      // a parse failure recorded by an earlier test file in this process would
+      // otherwise put this boot in the config error state.
+      configLoadErrors: () => [],
       migrateConfigLocations: () => [],
       resolveVersion: () => "0.0.0-test",
       resolveBinary: async () => join(tempDir as string, "never-spawned-aft"),
