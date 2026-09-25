@@ -23,7 +23,8 @@ use serde_json::{json, Value};
 /// Relay a governed bot write. Params: `{ticket, request_nonce, request}`.
 pub const BOT_REQUEST_OPERATION: &str = "gh_shim.bot_request";
 /// Relay plexus's repository-to-agent binding read for the shim's version
-/// check. Params: `{ticket, connection_id}`.
+/// check. Params: `{ticket, agent_id}`; the daemon derives plexus's handle
+/// connection id from the assertion it mints for that agent and session.
 pub const BINDINGS_READ_OPERATION: &str = "gh_shim.bindings_read";
 
 pub(crate) const PREFRONTAL_MODULE_ID: &str = "prefrontal-core";
@@ -248,7 +249,9 @@ pub async fn relay<T: RelayTransport>(
             redeemed.task_id.clone()
         };
         match call.operation {
-            BINDINGS_READ_OPERATION => bindings_read(transport, &redeemed, params).await,
+            BINDINGS_READ_OPERATION => {
+                bindings_read(transport, cache, &redeemed, params, call.now).await
+            }
             _ => bot_request(transport, cache, &redeemed, params, call.now).await,
         }
     };
@@ -266,17 +269,92 @@ pub async fn relay<T: RelayTransport>(
     reply
 }
 
+/// Obtain the assertion for this agent and session, minting one from
+/// prefrontal if none is cached or the cached one is near expiry.
+async fn obtain_token<T: RelayTransport>(
+    transport: &T,
+    cache: &TokenCache,
+    redeemed: &crate::gh_shim_ticket::Redeemed,
+    agent_id: &str,
+    now: u64,
+) -> Result<Value, RelayReply> {
+    let session = redeemed.session_id.as_str();
+    if let Some(token) = cache.fresh(agent_id, session, now) {
+        return Ok(token);
+    }
+    let body = json!({
+        "method": MINT_METHOD,
+        "params": {"agent_id": agent_id, "session": session},
+    });
+    let reply = transport
+        .prefrontal(&redeemed.project_root, session, body)
+        .await
+        .map_err(|error| transport_refusal("mint", error))?;
+    let Some(token) = reply
+        .get("result")
+        .and_then(|result| result.get("token"))
+        .filter(|token| token.is_object())
+        .cloned()
+    else {
+        return Err(RelayReply::refused(
+            "mint_reply_malformed",
+            "mint",
+            "prefrontal's assertion mint reply had no result.token",
+        ));
+    };
+    let exp = token
+        .get("claims")
+        .and_then(|claims| claims.get("exp"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    cache.store(agent_id, session, token.clone(), exp);
+    Ok(token)
+}
+
+/// Plexus names a GitHub handle connection after the App slug, the bot login
+/// without its `[bot]` suffix. The assertion prefrontal mints for the agent
+/// carries that login as `claims.handle`, so the connection id comes from it
+/// rather than from anything the shim sends.
+pub fn handle_connection_id(token: &Value) -> Result<String, String> {
+    let handle = token
+        .get("claims")
+        .and_then(|claims| claims.get("handle"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "the minted assertion carries no claims.handle".to_string())?;
+    let slug = handle
+        .strip_suffix("[bot]")
+        .filter(|slug| !slug.is_empty())
+        .ok_or_else(|| {
+            format!("the minted assertion's handle {handle:?} is not a GitHub App bot login (<slug>[bot])")
+        })?;
+    Ok(format!("github-handle-{slug}"))
+}
+
 async fn bindings_read<T: RelayTransport>(
     transport: &T,
+    cache: &TokenCache,
     redeemed: &crate::gh_shim_ticket::Redeemed,
     params: &Value,
+    now: u64,
 ) -> RelayReply {
-    let Some(connection_id) = params.get("connection_id").and_then(Value::as_str) else {
+    let Some(agent_id) = params
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .filter(|agent| !agent.is_empty())
+    else {
         return RelayReply::refused(
             "request_malformed",
             "request",
-            "bindings read needs a connection_id",
+            "bindings read needs an agent_id",
         );
+    };
+    let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
+        Ok(token) => token,
+        Err(refusal) => return refusal,
+    };
+    let connection_id = match handle_connection_id(&token) {
+        Ok(connection_id) => connection_id,
+        Err(message) => return RelayReply::refused("assertion_handle_malformed", "mint", message),
     };
     let body = json!({
         "name": "github",
@@ -324,40 +402,9 @@ async fn bot_request<T: RelayTransport>(
         );
     };
     let session = redeemed.session_id.as_str();
-    let token = match cache.fresh(agent_id, session, now) {
-        Some(token) => token,
-        None => {
-            let body = json!({
-                "method": MINT_METHOD,
-                "params": {"agent_id": agent_id, "session": session},
-            });
-            let reply = match transport
-                .prefrontal(&redeemed.project_root, session, body)
-                .await
-            {
-                Ok(reply) => reply,
-                Err(error) => return transport_refusal("mint", error),
-            };
-            let Some(token) = reply
-                .get("result")
-                .and_then(|result| result.get("token"))
-                .filter(|token| token.is_object())
-                .cloned()
-            else {
-                return RelayReply::refused(
-                    "mint_reply_malformed",
-                    "mint",
-                    "prefrontal's assertion mint reply had no result.token",
-                );
-            };
-            let exp = token
-                .get("claims")
-                .and_then(|claims| claims.get("exp"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            cache.store(agent_id, session, token.clone(), exp);
-            token
-        }
+    let token = match obtain_token(transport, cache, redeemed, agent_id, now).await {
+        Ok(token) => token,
+        Err(refusal) => return refusal,
     };
     let body = json!({
         "name": "github",

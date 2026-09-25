@@ -35,10 +35,15 @@ pub(super) const RELAY_UNSERVED_TEXT: &str = "the running AFT daemon does not se
 const RELAY_MODULE_ID: &str = "aft";
 /// Budget for connecting, listing the catalog and opening the route.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Budget for one relayed request (assertion mint, plexus, GitHub). A request
-/// that gets no reply within it is reported as an unknown outcome and never
-/// resent, the same contract the earlier `gh.route` path had.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Budget for one relayed request. It must cover a prefrontal mint, the plexus
+/// call and GitHub's write: a request with no reply inside it is reported as
+/// an unknown outcome and never resent, so a short budget on a loaded host
+/// would report writes that landed as failures.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Debug builds only: lets the binary-level tests shorten the request budget
+/// so a silent daemon does not cost them the full production wait.
+#[cfg(debug_assertions)]
+const REQUEST_TIMEOUT_TEST_ENV: &str = "AFT_GH_SHIM_RELAY_TIMEOUT_MS";
 /// Retries of a transient refusal, each reusing the same request nonce.
 const TRANSIENT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(10)];
 const BINDINGS_CHECK_FILE: &str = "relay-bindings-check.json";
@@ -49,6 +54,8 @@ pub(super) struct RelayContext {
     pub(super) connection_file: Option<PathBuf>,
     pub(super) ticket: Option<String>,
     pub(super) transient_delays: [Duration; 2],
+    /// Per-attempt budget for a relayed request.
+    pub(super) request_timeout: Duration,
 }
 
 impl RelayContext {
@@ -57,8 +64,21 @@ impl RelayContext {
             connection_file: super::configured_connection_file(),
             ticket: std::env::var(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV).ok(),
             transient_delays: TRANSIENT_RETRY_DELAYS,
+            request_timeout: request_timeout_from_process(),
         }
     }
+}
+
+fn request_timeout_from_process() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(millis) = std::env::var(REQUEST_TIMEOUT_TEST_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+    {
+        return Duration::from_millis(millis);
+    }
+    REQUEST_TIMEOUT
 }
 
 /// `aft` when the catalog shows it serving the relay operation. No other
@@ -359,21 +379,6 @@ fn clear_check(paths: &StatePaths) {
     let _ = std::fs::remove_file(paths.root.join(BINDINGS_CHECK_FILE));
 }
 
-/// The plexus connection that holds an agent's GitHub handle.
-pub(super) fn connection_id(agent_id: &str) -> String {
-    let slug: String = agent_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    format!("github-handle-{slug}")
-}
-
 fn render_bindings(bindings: &BTreeMap<String, String>) -> String {
     if bindings.is_empty() {
         return "(none)".to_string();
@@ -444,6 +449,7 @@ struct Exchange<'a> {
     route: &'a subc_client_rs::RouteHandle,
     ticket: &'a str,
     stage: &'a Mutex<ProbeStage>,
+    request_timeout: Duration,
 }
 
 impl Exchange<'_> {
@@ -452,7 +458,7 @@ impl Exchange<'_> {
         let bytes = serde_json::to_vec(body)
             .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
         let options = CallOptions {
-            timeout: REQUEST_TIMEOUT,
+            timeout: self.request_timeout,
             ..CallOptions::default()
         };
         let started = Instant::now();
@@ -467,7 +473,7 @@ impl Exchange<'_> {
                 ),
             }),
             Err(_) => Err(RouteOutcome::OutcomeUnknown {
-                elapsed_ms: started.elapsed().min(REQUEST_TIMEOUT).as_millis() as u64,
+                elapsed_ms: started.elapsed().min(self.request_timeout).as_millis() as u64,
             }),
         }
     }
@@ -481,7 +487,9 @@ impl Exchange<'_> {
     ) -> Result<BindingsCheck, RouteOutcome> {
         let body = json!({
             "op": BINDINGS_READ_OPERATION,
-            "params": {"ticket": self.ticket, "connection_id": connection_id(agent_id)},
+            // The daemon derives plexus's handle connection id from the
+            // assertion it mints for this agent and the ticket's session.
+            "params": {"ticket": self.ticket, "agent_id": agent_id},
         });
         let bytes = self.send(&body).await.map_err(|outcome| match outcome {
             // A read cannot have written anything, so an unanswered read is
@@ -752,6 +760,7 @@ pub(super) fn route(
                 route: &route,
                 ticket: &ticket,
                 stage: &stage,
+                request_timeout: relay.request_timeout,
             },
             paths,
             agent_binding,

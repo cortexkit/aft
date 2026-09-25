@@ -45,7 +45,7 @@ impl FakeTransport {
 
 fn token_with_exp(serial: u64, exp: u64) -> Value {
     json!({
-        "claims": {"agent_id": "agent-fixture", "exp": exp, "jti": format!("jti-{serial}")},
+        "claims": {"agent_id": "agent-fixture", "exp": exp, "jti": format!("jti-{serial}"), "handle": "aft-alfonso[bot]"},
         "signature_hex": format!("sig-secret-{serial}"),
         "generation": 1,
     })
@@ -508,7 +508,7 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
         &transport,
         &cache,
         BINDINGS_READ_OPERATION,
-        json!({"ticket": "ffffffffffffffffffffffffffffffff", "connection_id": "github-handle-a"}),
+        json!({"ticket": "ffffffffffffffffffffffffffffffff", "agent_id": "agent-fixture"}),
         NOW,
     );
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
@@ -517,25 +517,100 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
     let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-bindings", "call-b", "/p");
     let bindings = json!({
         "repo_binding_generation": 3,
-        "bindings": [{"repository": "org/repo", "app_handle_id": "h", "agent_id": "agent-fixture"}],
+        "bindings": [{"repository": "org/repo", "app_handle_id": "aft-alfonso", "agent_id": "agent-fixture"}],
     });
     transport.push_plexus(Ok(bindings.clone()));
     let (reply, _) = run(
         &transport,
         &cache,
         BINDINGS_READ_OPERATION,
-        json!({"ticket": live.value().unwrap(), "connection_id": "github-handle-agent-fixture"}),
+        json!({
+            "ticket": live.value().unwrap(),
+            "agent_id": "agent-fixture",
+            // A connection id from the caller is ignored; the daemon derives
+            // it from the assertion it minted.
+            "connection_id": "github-handle-someone-else",
+        }),
         NOW,
     );
     assert_eq!(reply, RelayReply::relayed(bindings));
+    let calls = transport.calls();
+    assert_eq!(calls[0].0, Target::Prefrontal);
     assert_eq!(
-        transport.calls()[0].2,
+        calls[0].2["params"],
+        json!({"agent_id": "agent-fixture", "session": "ses-bindings"})
+    );
+    assert_eq!(
+        calls[1].2,
         json!({
             "name": "github",
-            "arguments": {"op": "bindings.read", "connection_id": "github-handle-agent-fixture"},
+            "arguments": {"op": "bindings.read", "connection_id": "github-handle-aft-alfonso"},
         })
     );
-    assert_eq!(transport.count(Target::Prefrontal), 0);
+
+    // The minted token is cached, so the following bot write reuses it.
+    run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(live.value().unwrap(), "n"),
+        NOW,
+    );
+    assert_eq!(transport.count(Target::Prefrontal), 1);
+}
+
+#[test]
+fn handle_connection_id_comes_from_the_assertion_bot_login() {
+    assert_eq!(
+        handle_connection_id(&json!({"claims": {"handle": "aft-alfonso[bot]"}})),
+        Ok("github-handle-aft-alfonso".to_string())
+    );
+    for token in [
+        json!({"claims": {"handle": "aft-alfonso"}}),
+        json!({"claims": {"handle": "[bot]"}}),
+        json!({"claims": {}}),
+    ] {
+        assert!(handle_connection_id(&token).is_err(), "{token}");
+    }
+}
+
+#[test]
+fn bindings_read_fails_closed_on_a_malformed_handle_or_a_mint_refusal() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-bindings-bad", "call-bb", "/p");
+    let params = json!({"ticket": live.value().unwrap(), "agent_id": "agent-fixture"});
+
+    let transport = FakeTransport::default();
+    transport.push_prefrontal(Ok(json!({"result": {"token": {
+        "claims": {"agent_id": "agent-fixture", "exp": TOKEN_EXP, "handle": "aft-alfonso"},
+        "signature_hex": "sig-secret-x",
+        "generation": 1,
+    }}})));
+    let (reply, _) = run(
+        &transport,
+        &TokenCache::default(),
+        BINDINGS_READ_OPERATION,
+        params.clone(),
+        NOW,
+    );
+    assert!(!reply.ok);
+    assert_eq!(reply.data["refusal_code"], "assertion_handle_malformed");
+    assert_eq!(transport.count(Target::Plexus), 0);
+
+    let refused = FakeTransport::default();
+    refused.push_prefrontal(Err(TransportError::Refused {
+        code: "assertion_session_unknown".to_string(),
+        message: "not an agent session".to_string(),
+    }));
+    let (reply, _) = run(
+        &refused,
+        &TokenCache::default(),
+        BINDINGS_READ_OPERATION,
+        params,
+        NOW,
+    );
+    assert_eq!(reply.data["refusal_code"], "assertion_session_unknown");
+    assert_eq!(reply.data["stage"], "mint");
+    assert_eq!(refused.count(Target::Plexus), 0);
 }
 
 #[test]

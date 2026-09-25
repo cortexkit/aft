@@ -855,6 +855,9 @@ fn run_shim(verb: &Verb, reply: &HolderReply) -> Run {
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
         .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
+        // Debug-build seam: the silent-holder exchanges pin a 5000 ms
+        // outcome-unknown message instead of waiting the production 30 s.
+        .env("AFT_GH_SHIM_RELAY_TIMEOUT_MS", "5000")
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")

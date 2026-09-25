@@ -461,6 +461,9 @@ fn shim_command(
         // Stands in for the ticket the daemon gives an agent's command; the
         // fake daemons accept any ticket.
         .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
+        // Debug-build seam: keep the production 30 s relay budget out of the
+        // silent-daemon tests, which pin a 5000 ms outcome-unknown message.
+        .env("AFT_GH_SHIM_RELAY_TIMEOUT_MS", "5000")
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")

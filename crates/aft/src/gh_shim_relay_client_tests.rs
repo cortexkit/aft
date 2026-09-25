@@ -314,7 +314,6 @@ fn bindings_comparison_accepts_only_an_exact_match_and_shows_both_views() {
         error.contains("plexus: cortexkit/aft->alfonso-aft, cortexkit/plexus->alfonso-plexus"),
         "{error}"
     );
-    assert_eq!(connection_id("alfonso-aft"), "github-handle-alfonso-aft");
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +411,11 @@ impl FakeRelayDaemon {
                                                 Some("route.close") => json!({"op": "route.close"}),
                                                 _ if frame.header.channel == 42 => {
                                                     requests.lock().unwrap().push(body.clone());
-                                                    handler(&body)
+                                                    // A null reply means "stay silent".
+                                                    match handler(&body) {
+                                                        Value::Null => continue,
+                                                        reply => reply,
+                                                    }
                                                 }
                                                 _ => continue,
                                             };
@@ -611,6 +614,7 @@ fn dispatch_comment(harness: &Harness, ticket: Option<&str>, body: &str) -> (i32
             connection_file: Some(harness.connection_file.clone()),
             ticket: ticket.map(str::to_string),
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
+            request_timeout: Duration::from_secs(5),
         },
     );
     (status, upstream_reached)
@@ -664,10 +668,8 @@ fn a_live_ticket_relays_the_governed_envelope_and_prints_the_url() {
     let requests = harness.daemon.requests.lock().unwrap().clone();
     // The version check runs first at activation, then the write.
     assert_eq!(requests[0]["op"], BINDINGS_READ_OPERATION);
-    assert_eq!(
-        requests[0]["params"]["connection_id"],
-        "github-handle-alfonso-aft"
-    );
+    assert_eq!(requests[0]["params"]["agent_id"], "alfonso-aft");
+    assert!(requests[0]["params"].get("connection_id").is_none());
     let write = &requests[1];
     assert_eq!(write["op"], BOT_REQUEST_OPERATION);
     assert_eq!(write["params"]["ticket"], live.value().unwrap());
@@ -826,4 +828,68 @@ fn a_changed_binding_generation_triggers_a_new_check() {
         2,
         "a new generation is checked again"
     );
+}
+
+#[test]
+fn production_request_budget_is_thirty_seconds() {
+    assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(30));
+    if std::env::var_os(REQUEST_TIMEOUT_TEST_ENV).is_none() {
+        assert_eq!(
+            RelayContext::from_process().request_timeout,
+            REQUEST_TIMEOUT
+        );
+    }
+}
+
+/// A write that gets no reply within the per-attempt budget is an unknown
+/// outcome, reported with the budget that actually applied, and never resent.
+#[test]
+fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
+    let live = crate::gh_shim_ticket::ScopedTicket::issue("ses-silent", "call-s", "/p");
+    let handler: Handler = Arc::new(|body: &Value| {
+        if body["op"] == BINDINGS_READ_OPERATION {
+            return bindings_ok();
+        }
+        Value::Null
+    });
+    let harness = harness(handler);
+    let manifest = v12_manifest();
+    let args = comment_args("hi");
+    let classification = classify(&args, &manifest, "macos");
+    let rung = RungDetermination::r3(
+        TEST_NOW,
+        manifest.manifest_version,
+        &RungRecordProvenance {
+            image_path: "/opt/cortexkit/aft-gh-shim".to_string(),
+            version: "test".to_string(),
+            repo_key: "cortexkit/aft".to_string(),
+        },
+    )
+    .record;
+    let binding = AgentBinding {
+        repo: "cortexkit/aft".to_string(),
+        agent_id: "alfonso-aft".to_string(),
+    };
+    let status = dispatch_r3_with_relay(
+        &args,
+        classification,
+        &manifest,
+        &harness.paths,
+        &rung,
+        &binding,
+        TEST_NOW,
+        |_| panic!("reached upstream gh"),
+        &RelayContext {
+            connection_file: Some(harness.connection_file.clone()),
+            ticket: live.value().map(str::to_string),
+            transient_delays: [Duration::from_millis(1); 2],
+            request_timeout: Duration::from_millis(400),
+        },
+    );
+    assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
+    assert_eq!(harness.daemon.bot_requests().len(), 1, "never resent");
+    let probe = super::super::read_last_probe(&harness.paths).expect("last probe");
+    assert_eq!(probe.stage, "request");
+    assert_eq!(probe.elapsed_ms, 400);
+    assert!(super::super::outcome_unknown_text(probe.elapsed_ms).contains("within 400 ms"));
 }
