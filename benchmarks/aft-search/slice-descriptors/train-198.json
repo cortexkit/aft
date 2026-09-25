@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "watcher-git-only-seed",
+    "catalog-consumer-only-flags"
+  ],
+  "note": "The only ranking-fence file touched is the subc tool-schema artifact: three bash properties gain the x-aft-consumer-only marker. No search tool schema, ranking, fusion, lane or truncation code changed, so rows should be byte-equal to the reference."
+}
