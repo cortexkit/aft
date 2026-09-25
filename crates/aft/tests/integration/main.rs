@@ -17,6 +17,7 @@ mod bash_foreground_background_architecture_test;
 mod bash_orchestrate_test;
 mod bash_permissions_test;
 mod bash_pty_test;
+mod bash_reply_timing_contract_test;
 mod bash_rewrite_differential_test;
 mod bash_rewrite_test;
 mod bash_tasks_dual_write_test;
