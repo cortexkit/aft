@@ -39,7 +39,12 @@ import {
   observeThenRespond,
   toolResultForCall,
 } from "./mock-server.js";
-import { assertT6Trailer, projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
+import {
+  assertComparison,
+  assertT6Trailer,
+  projectText,
+  TRUNCATION_TRAILER_PATTERN,
+} from "./projection.js";
 import {
   assertPermissionPromptObserved,
   controlPlans,
@@ -2230,5 +2235,35 @@ describe("interrupted foreground task teardown", () => {
       stopped: true,
     };
     expect(callAbortedFailure("bash/T4/abort", termination)).toBeUndefined();
+  });
+});
+
+describe("comparing tool output that carries AFT's status bar", () => {
+  const exact = { mode: "exact", expected: "1: alpha\n2: beta\n" } as never;
+
+  test("a trailing status bar is timing, not part of the compared output", () => {
+    expect(() =>
+      assertComparison("1: alpha\n2: beta\n\n[AFT E? W? | ~D? U? C? | T0]", exact),
+    ).not.toThrow();
+    expect(() =>
+      assertComparison("1: alpha\n2: beta\n\n[AFT E0 W1 | D3 U4 C5 | T6]", exact),
+    ).not.toThrow();
+    // Output without a final newline gets a two-newline separator.
+    expect(() =>
+      assertComparison("done\n\n[AFT E? W? | D? U? C? | T0]", {
+        mode: "exact",
+        expected: "done",
+      } as never),
+    ).not.toThrow();
+  });
+
+  test("anything else still fails the exact comparison", () => {
+    expect(() => assertComparison("1: alpha\n2: gamma\n", exact)).toThrow(
+      /exact comparison failed/,
+    );
+    // Only a trailing bar is removed; a bar-like line inside the output counts.
+    expect(() =>
+      assertComparison("[AFT E? W? | D? U? C? | T0]\n\n1: alpha\n2: beta\n", exact),
+    ).toThrow(/exact comparison failed/);
   });
 });

@@ -143,19 +143,43 @@ export function assertT6Trailer(
   }
 }
 
+/**
+ * AFT appends its status bar (`[AFT E.. W.. | D.. U.. C.. | T..]`) to a tool
+ * result whenever the health counts change since the previous result, after one
+ * newline when the text already ends with one and after two otherwise
+ * (crates/aft/src/response_finalize.rs). When a count first resolves depends on
+ * background work (diagnostics, the TODO scan), so whether a given call carries
+ * the bar is timing, not behaviour. Comparisons judge the tool's own output.
+ */
+const STATUS_BAR = /\[AFT E\S* W\S* \| ~?D\S* U\S* C\S* \| T\S*\]$/;
+
+/**
+ * The texts `text` could have been before the finalizer appended its bar: the
+ * text itself when it carries no bar, else the one or two readings the
+ * separator allows (`x\n` + `\n` + bar and `x` + `\n\n` + bar look the same).
+ */
+export function withoutTrailingStatusBar(text: string): string[] {
+  const bar = STATUS_BAR.exec(text);
+  if (!bar) return [text];
+  const before = text.slice(0, bar.index);
+  if (!before.endsWith("\n\n")) return [text];
+  return [before.slice(0, -1), before.slice(0, -2)];
+}
+
 export function assertComparison(actual: string, comparison: ScenarioComparison): void {
+  const readings = withoutTrailingStatusBar(actual);
   if (comparison.mode === "exact") {
-    if (actual !== comparison.expected) {
+    if (!readings.includes(comparison.expected as string)) {
       throw new Error(
         `exact comparison failed\nexpected: ${JSON.stringify(comparison.expected)}\nactual: ${JSON.stringify(actual)}`,
       );
     }
     return;
   }
-  const actualShape = projectText(actual, comparison.rules);
-  if (JSON.stringify(actualShape) !== JSON.stringify(comparison.expected)) {
+  const shapes = readings.map((reading) => JSON.stringify(projectText(reading, comparison.rules)));
+  if (!shapes.includes(JSON.stringify(comparison.expected))) {
     throw new Error(
-      `shape comparison failed\nexpected: ${JSON.stringify(comparison.expected)}\nactual: ${JSON.stringify(actualShape)}`,
+      `shape comparison failed\nexpected: ${JSON.stringify(comparison.expected)}\nactual: ${shapes[0]}`,
     );
   }
 }
