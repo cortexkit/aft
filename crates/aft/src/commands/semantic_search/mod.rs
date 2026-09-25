@@ -3062,6 +3062,19 @@ fn handle_engine_only_search(
     extensions: &dyn extensions::SearchExtensions,
     plan: &extensions::LanePlan<'_>,
 ) -> Response {
+    // A semantic lane that is not serving because its backend cannot be
+    // reached must say so; describing it as "rebuilding" asks the reader to wait
+    // for a build that cannot make progress until the backend returns.
+    let backend_unavailable = if semantic_status == "ready" {
+        None
+    } else {
+        semantic_backend_unavailable_disclosure(ctx)
+    };
+    let semantic_status = if backend_unavailable.is_some() {
+        "backend_unavailable"
+    } else {
+        semantic_status
+    };
     if semantic_status != "ready" {
         warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
     }
@@ -3093,7 +3106,9 @@ fn handle_engine_only_search(
         snippets_incomplete,
         Some(ctx),
     );
-    if semantic_status == "building" {
+    if let Some(disclosure) = backend_unavailable.as_deref() {
+        text = format!("{disclosure}; lexical fallback results follow.\n\n{text}");
+    } else if semantic_status == "building" {
         let disclosure = if ctx.shared_artifacts_read_only() {
             BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
         } else {
@@ -3123,7 +3138,14 @@ fn handle_engine_only_search(
         "lexical_engine_capped".to_string(),
         serde_json::json!(ranked.engine_capped),
     );
-    if semantic_status == "building" {
+    if let Some(disclosure) = backend_unavailable.as_deref() {
+        extras.insert(
+            "note".to_string(),
+            serde_json::json!(format!(
+                "{disclosure}; results are lexical-only fallback results from the trigram index."
+            )),
+        );
+    } else if semantic_status == "building" {
         extras.insert(
             "note".to_string(),
             serde_json::json!(building_lexical_note(ctx.shared_artifacts_read_only())),
@@ -4743,6 +4765,35 @@ fn format_grep_lexical_unavailable_text(
     )
 }
 
+/// `Semantic backend unavailable (<url>): <reason>` when the configured
+/// embedding backend cannot be reached, or `None` while it is reachable. The
+/// wording matches the status surfaces (sidebar, `/aft-status`), which render
+/// the same outage as `backend unavailable (<url>): <reason>`, so a user can
+/// line the search reply up with what the sidebar shows.
+fn semantic_backend_unavailable_disclosure(ctx: &AppContext) -> Option<String> {
+    let backend = ctx.semantic_backend_health_snapshot();
+    if backend.available {
+        return None;
+    }
+    let url = ctx
+        .config()
+        .semantic
+        .base_url
+        .clone()
+        .filter(|url| !url.trim().is_empty());
+    let mut disclosure = "Semantic backend unavailable".to_string();
+    if let Some(url) = url {
+        disclosure.push_str(&format!(" ({url})"));
+    }
+    if let Some(reason) = backend
+        .last_error
+        .filter(|reason| !reason.trim().is_empty())
+    {
+        disclosure.push_str(&format!(": {reason}"));
+    }
+    Some(disclosure)
+}
+
 fn building_lexical_note(borrowed_loading_with_results: bool) -> &'static str {
     if borrowed_loading_with_results {
         BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
@@ -6142,6 +6193,78 @@ mod tests {
             }),
             "expected index-backed fallback result, got {results:?}"
         );
+    }
+
+    /// A first build against an unreachable embedding backend parks in its
+    /// retry loop with the index status still `Building`. The search reply used
+    /// to call that "rebuilding"; it must name the backend outage instead, with
+    /// the configured URL and the engine's reason.
+    #[test]
+    fn unreachable_backend_during_cold_build_is_disclosed_not_called_rebuilding() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        let source = "pub fn needle_symbol() -> bool { true }\n";
+        std::fs::write(&source_file, source).expect("write source file");
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                semantic: crate::config::SemanticBackendConfig {
+                    base_url: Some("http://localhost:1234/v1".to_string()),
+                    ..crate::config::SemanticBackendConfig::default()
+                },
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(project.path().to_path_buf());
+        let mut index = SearchIndex::new();
+        index.index_file(&source_file, source.as_bytes());
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "waiting_for_embedding_backend: connection refused".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        crate::semantic_index::record_embedding_backend_build_failure_for_test(
+            project.path(),
+            "connection refused",
+        );
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("needle_symbol", 5),
+            &ctx,
+        ));
+        let status = ctx.build_status_snapshot();
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["semantic_status"], "backend_unavailable");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with(
+                "Semantic backend unavailable (http://localhost:1234/v1): connection refused; lexical fallback results follow."
+            ),
+            "unexpected disclosure: {text}"
+        );
+        assert!(!text.contains("rebuilding"), "{text}");
+        assert!(response["note"]
+            .as_str()
+            .expect("note")
+            .starts_with("Semantic backend unavailable (http://localhost:1234/v1)"));
+
+        let semantic = &status["semantic_index"];
+        assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
+        assert_eq!(semantic["reason"], "connection refused");
+        assert_eq!(semantic["backend_url"], "http://localhost:1234/v1");
     }
 
     #[test]

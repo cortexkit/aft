@@ -578,8 +578,9 @@ export function applyToolSurfaceOverrides(
     // `edit_slot_survives` is write-once per pool. An OpenCode 2 host shares
     // one standalone pool between all Locations in the process, so every
     // Location after the first finds it already captured; the first value
-    // stays in force.
-    warn(`edit_slot_survives not updated: ${err instanceof Error ? err.message : String(err)}`);
+    // stays in force. That is expected on every start, so it is logged at
+    // info rather than raised as a warning.
+    log(`edit_slot_survives not updated: ${err instanceof Error ? err.message : String(err)}`);
   }
   pool.setConfigureOverride("aft_search_registered", aftSearchRegistered);
   return { hashlineEditRegistered, aftSearchRegistered };

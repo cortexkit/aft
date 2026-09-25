@@ -5,6 +5,22 @@ function count(value: number | undefined): string {
 }
 
 /**
+ * The errors/warnings part of the footer. With no language server running the
+ * counts will never arrive, so the footer says that instead of showing `E? W?`
+ * indefinitely.
+ */
+function diagnosticsPart(bar: StatusBar): string {
+  if (
+    bar.errors === undefined &&
+    bar.warnings === undefined &&
+    bar.diagnostics === "no_language_server"
+  ) {
+    return "no LSP";
+  }
+  return `E${count(bar.errors)} W${count(bar.warnings)}`;
+}
+
+/**
  * The V2 footer segment. "AFT starting…" is only true before the bridge has
  * delivered a real snapshot. After that the footer shows every health category
  * that has a value and `?` for any that does not, because a producer that is
@@ -16,7 +32,7 @@ export function formatAftStatusSegment(status: AftStatusSnapshot | null): string
   const bar: StatusBar = status.status_bar ?? status.status_bar_values ?? {};
   const stale = bar.tier2_stale ? "~" : "";
   return (
-    `AFT E${count(bar.errors)} W${count(bar.warnings)} | ` +
+    `AFT ${diagnosticsPart(bar)} | ` +
     `${stale}D${count(bar.dead_code)} U${count(bar.unused_exports)} ` +
     `C${count(bar.duplicates)} | T${count(bar.todos)}`
   );
@@ -33,7 +49,7 @@ function healthSummary(bar: StatusBar | undefined): string {
   if (!bar) return "health pending";
   const stale = bar.tier2_stale ? "~" : "";
   return (
-    `E${count(bar.errors)} W${count(bar.warnings)} ` +
+    `${diagnosticsPart(bar)} ` +
     `${stale}D${count(bar.dead_code)} U${count(bar.unused_exports)} ` +
     `C${count(bar.duplicates)} T${count(bar.todos)}`
   );

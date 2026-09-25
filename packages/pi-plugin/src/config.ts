@@ -2035,6 +2035,7 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   // ONNX Runtime download or index work starts.
   const costNotice = semanticCostNotice({
     userConfigPath,
+    configFileLoaded: existsSync(userConfigPath) || existsSync(projectConfigPath),
     semanticEffective: resolved.indexes?.semantic === true,
     semanticInputSupplied,
     semanticBackend: resolved.semantic?.backend,

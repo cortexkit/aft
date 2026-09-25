@@ -583,7 +583,7 @@ export function noticeDigest(projection: unknown): string {
  * default on. The text is fixed by the feature-config spec.
  */
 export const SEMANTIC_COST_NOTICE =
-  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run aft setup to change indexes.semantic; if legacy configuration is rejected, run aft doctor --fix first.";
+  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic; if legacy configuration is rejected, run npx @cortexkit/aft doctor --fix first.";
 
 /**
  * Identity of the semantic cost notice. It is a constant rather than a digest
@@ -620,17 +620,23 @@ export function suppliesSemanticIndexInput(
 }
 
 /**
- * The semantic cost notice for one load, or null when it does not apply. It
- * applies only when the semantic index is effectively on because of the new
- * default: no loaded tier supplied a semantic input, and no non-local
- * embedding backend is configured (a remote backend downloads nothing).
+ * The semantic cost notice for one load, or null when it does not apply. It is
+ * a migration notice: it applies only to an existing config file that relied
+ * on the old default, where the semantic index is now effectively on because
+ * of the new default. That means a config file was loaded, no loaded tier
+ * supplied a semantic input, and no non-local embedding backend is configured
+ * (a remote backend downloads nothing). A fresh install has no file that ever
+ * relied on the old default, so it gets no notice.
  */
 export function semanticCostNotice(options: {
   userConfigPath: string;
+  /** True when at least one config tier (user or project) had a file on disk. */
+  configFileLoaded: boolean;
   semanticEffective: boolean;
   semanticInputSupplied: boolean;
   semanticBackend: string | undefined;
 }): { configPath: string; digest: string; message: string } | null {
+  if (!options.configFileLoaded) return null;
   if (!options.semanticEffective || options.semanticInputSupplied) return null;
   if (options.semanticBackend !== undefined && options.semanticBackend !== "fastembed") return null;
   return {

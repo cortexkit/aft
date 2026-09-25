@@ -12,6 +12,31 @@ import {
  */
 export { formatSemanticIndexStatus, type SemanticIndexStatusKind, semanticIndexStatusKind };
 
+/**
+ * What the sidebar and status dialog show before AFT has started for this
+ * project. AFT starts on the first tool call, so until then there is nothing
+ * to report beyond that fact.
+ */
+export const NOT_STARTED_STATUS_TEXT = "Starts on the first tool call.";
+
+/**
+ * The status label for a snapshot's semantic index, including the backend URL
+ * and reason when the embedding backend is unavailable. Every surface that
+ * shows the semantic status goes through this so none of them can drop the
+ * reason and fall back to a bare word.
+ */
+export function formatSemanticIndexLabel(
+  semantic: Pick<
+    AftStatusSnapshot["semantic_index"],
+    "status" | "stage" | "error" | "reason" | "backend_url"
+  >,
+): string {
+  return formatSemanticIndexStatus(semantic.status, semantic.stage, semantic.error, {
+    reason: semantic.reason,
+    backendUrl: semantic.backend_url,
+  });
+}
+
 export interface StatusCompressionAggregate {
   events: number;
   original_tokens: number;
@@ -37,6 +62,12 @@ export interface StatusBar {
   duplicates?: number;
   todos?: number;
   tier2_stale?: boolean;
+  /**
+   * `"no_language_server"` when no language server is running, so errors and
+   * warnings will not arrive until one starts. Absent while the counts are
+   * present or a running server has not reported yet.
+   */
+  diagnostics?: "no_language_server";
 }
 
 export interface AftStatusSnapshot {
@@ -80,6 +111,10 @@ export interface AftStatusSnapshot {
     entries: number | null;
     dimension: number | null;
     error?: string | null;
+    /** Engine's reason when `status === "backend_unavailable"`. */
+    reason?: string | null;
+    /** Configured remote embedding backend URL, when there is one. */
+    backend_url?: string | null;
   };
   disk: {
     storage_dir: string | null;
@@ -179,13 +214,15 @@ function readStatusBar(value: unknown): StatusBar | undefined {
   const unusedExports = readOptionalNumber(bar.unused_exports);
   const duplicates = readOptionalNumber(bar.duplicates);
   const todos = readOptionalNumber(bar.todos);
+  const noLanguageServer = bar.diagnostics === "no_language_server";
   if (
     errors === null &&
     warnings === null &&
     deadCode === null &&
     unusedExports === null &&
     duplicates === null &&
-    todos === null
+    todos === null &&
+    !noLanguageServer
   ) {
     return undefined;
   }
@@ -197,6 +234,7 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     ...(duplicates !== null ? { duplicates } : {}),
     ...(todos !== null ? { todos } : {}),
     ...(bar.tier2_stale === true ? { tier2_stale: true } : {}),
+    ...(noLanguageServer ? { diagnostics: "no_language_server" as const } : {}),
   };
 }
 
@@ -297,6 +335,8 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
       entries: readOptionalNumber(semanticIndex.entries),
       dimension: readOptionalNumber(semanticIndex.dimension),
       error: readNullableString(semanticIndex.error),
+      reason: readNullableString(semanticIndex.reason),
+      backend_url: readNullableString(semanticIndex.backend_url),
     },
     disk: {
       storage_dir: readNullableString(disk.storage_dir),
@@ -356,7 +396,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}`,
+    `- status: ${formatSemanticIndexLabel(status.semantic_index)}`,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {
@@ -467,7 +507,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}\``,
+    `- **Status:** \`${formatSemanticIndexLabel(status.semantic_index)}\``,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {

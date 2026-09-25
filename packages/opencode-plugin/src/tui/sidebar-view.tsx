@@ -14,8 +14,9 @@
 import { createMemo, createSignal, onCleanup } from "solid-js";
 import {
   type AftStatusSnapshot,
-  formatSemanticIndexStatus,
+  formatSemanticIndexLabel,
   formatSemanticRefreshing,
+  NOT_STARTED_STATUS_TEXT,
   type StatusBar,
   type StatusCompression,
   semanticIndexStatusKind,
@@ -397,12 +398,15 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
     return {
       ...display,
       // The error is passed through so a capability failure (a missing ONNX
-      // Runtime) is named here instead of arriving as a bare status word.
-      label: formatSemanticIndexStatus(
-        rawStatus,
-        s()?.semantic_index?.stage,
-        s()?.semantic_index?.error,
-      ),
+      // Runtime) is named here instead of arriving as a bare status word, and
+      // an unreachable backend carries its URL and reason.
+      label: formatSemanticIndexLabel({
+        status: rawStatus,
+        stage: s()?.semantic_index?.stage,
+        error: s()?.semantic_index?.error,
+        reason: s()?.semantic_index?.reason,
+        backend_url: s()?.semantic_index?.backend_url,
+      }),
     };
   };
   const semanticRefreshing = () =>
@@ -501,10 +505,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
           rows so users understand why metrics are blank. */}
       {notInitialized() && (
         <box marginTop={1} width="100%">
-          <text fg={props.palette.textMuted}>
-            {s()!.message ||
-              "AFT bridge is now spawned lazily, information here will be populated after first tool call."}
-          </text>
+          <text fg={props.palette.textMuted}>{s()!.message || NOT_STARTED_STATUS_TEXT}</text>
         </box>
       )}
 

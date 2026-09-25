@@ -588,7 +588,13 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
             // claiming fresh would be premature. `None` counts preserve the
             // last-known value rather than fabricating a `0`.
             let stale = ctx.inspect_manager().tier2_any_in_flight();
-            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, None, stale);
+            // The inspect snapshot keys its project-scoped jobs by the
+            // normalized root, so look the todos result up under the same form.
+            let todos = ctx.inspect_manager().latest_project_todos_count(
+                inspect_dir.clone(),
+                crate::inspect::job::canonicalize_normalized(&project_root),
+            );
+            ctx.update_status_bar_tier2(dead_code, unused_exports, duplicates, todos, stale);
             // Health must distinguish "tier2 still building" from "tier2 complete
             // except dead_code, which is blocked on the callgraph store". Refresh
             // the flag from the same latest aggregate the counts came from so the

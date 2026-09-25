@@ -13,6 +13,7 @@ import {
   coerceAftStatus,
   formatBytes,
   formatCacheRoleLabel,
+  formatSemanticIndexLabel,
   formatSemanticIndexStatus,
   formatStatusDialogMessage,
   formatStatusMarkdown,
@@ -197,6 +198,21 @@ describe("semantic index status as this harness imports it", () => {
 
   test("a backend outage reads as words rather than a wire token", () => {
     expect(formatSemanticIndexStatus("backend_unavailable", null)).toBe("backend unavailable");
+  });
+
+  test("an unreachable backend names its URL and reason instead of loading", () => {
+    const status = coerceAftStatus({
+      semantic_index: {
+        status: "backend_unavailable",
+        reason: "connection refused",
+        backend_url: "http://localhost:1234/v1",
+      },
+    });
+    const expected = "backend unavailable (http://localhost:1234/v1): connection refused";
+
+    expect(formatSemanticIndexLabel(status.semantic_index)).toBe(expected);
+    expect(formatStatusDialogMessage(status)).toContain(`- status: ${expected}`);
+    expect(formatStatusMarkdown(status)).toContain(expected);
   });
 
   test("the status dialog names a missing runtime instead of a build stage", () => {

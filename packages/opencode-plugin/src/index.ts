@@ -76,7 +76,7 @@ import {
   verifySessionDirectory,
   warmSessionDirectory,
 } from "./shared/session-directory.js";
-import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
+import { coerceAftStatus, formatStatusMarkdown, NOT_STARTED_STATUS_TEXT } from "./shared/status.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
@@ -564,8 +564,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           success: true,
           status: "not_initialized",
           verified_directory: verifiedDir,
-          message:
-            "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
+          message: NOT_STARTED_STATUS_TEXT,
         };
       }
     }
@@ -578,8 +577,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
         success: true,
         status: "not_initialized",
         ...(verifiedDir ? { verified_directory: verifiedDir } : {}),
-        message:
-          "AFT bridge is now spawned lazily, information here will be populated after first tool call.",
+        message: NOT_STARTED_STATUS_TEXT,
       };
     }
     // The cached snapshot is session-aware: Rust computes

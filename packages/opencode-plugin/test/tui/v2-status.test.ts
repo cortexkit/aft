@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { AftStatusSnapshot } from "../../src/shared/status.js";
+import { type AftStatusSnapshot, coerceAftStatus } from "../../src/shared/status.js";
 import { formatAftStatusSegment, summarizeAftSidebar } from "../../src/tui/v2-status.js";
 
 function snapshot(): AftStatusSnapshot {
@@ -85,6 +85,27 @@ describe("V2 TUI status presentation", () => {
     const status = snapshot();
     status.status_bar = undefined;
     expect(formatAftStatusSegment(status)).toBe("AFT E? W? | D? U? C? | T?");
+  });
+
+  test("names a missing language server instead of leaving E and W pending", () => {
+    // The snapshot a 1-file project with no language server produces: Tier-2
+    // and todos counts resolved, errors and warnings never will.
+    const status = coerceAftStatus({
+      version: "0.58.0",
+      cache_role: "main",
+      status_bar: null,
+      status_bar_values: {
+        errors: null,
+        warnings: null,
+        diagnostics: "no_language_server",
+        dead_code: 1,
+        unused_exports: 1,
+        duplicates: 0,
+        todos: 0,
+        tier2_stale: false,
+      },
+    });
+    expect(formatAftStatusSegment(status)).toBe("AFT no LSP | D1 U1 C0 | T0");
   });
 
   test("summarizes only the status data needed by the V2 sidebar slot", () => {

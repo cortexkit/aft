@@ -99,14 +99,43 @@ function semanticFailureLabel(
   return SEMANTIC_FAILURE_LABELS[status] ?? null;
 }
 
+/**
+ * What the daemon reports alongside a `backend_unavailable` status: the
+ * engine's own reason (for example "connection refused") and the configured
+ * backend URL when the backend is remote.
+ */
+export interface SemanticBackendDetail {
+  reason?: string | null;
+  backendUrl?: string | null;
+}
+
+/**
+ * `backend unavailable (<url>): <reason>`. The daemon's search reply opens
+ * with the same words ("Semantic backend unavailable (<url>): <reason>"), so
+ * the sidebar, the status dialog and an aft_search result describe one outage
+ * in one vocabulary.
+ */
+function backendUnavailableLabel(detail?: SemanticBackendDetail): string {
+  const url = detail?.backendUrl?.trim();
+  const reason = detail?.reason?.trim();
+  let label = SEMANTIC_FAILURE_LABELS.backend_unavailable;
+  if (url) label += ` (${url})`;
+  if (reason) label += `: ${reason}`;
+  return label;
+}
+
 export function formatSemanticIndexStatus(
   status: string,
   stage?: string | null,
   error?: string | null,
+  backend?: SemanticBackendDetail,
 ): string {
   // A failure outranks any progress stage. Telling the reader the index is
   // rebuilding when the build cannot start asks them to wait for something that
   // will never finish.
+  if (status === "backend_unavailable" && !mentionsMissingOnnxRuntime(error, stage)) {
+    return backendUnavailableLabel(backend);
+  }
   const failure = semanticFailureLabel(status, stage, error);
   if (failure) return failure;
 

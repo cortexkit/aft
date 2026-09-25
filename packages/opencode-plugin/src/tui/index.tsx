@@ -11,8 +11,9 @@ import {
   coerceAftStatus,
   formatBytes,
   formatCacheRoleLabel,
-  formatSemanticIndexStatus,
+  formatSemanticIndexLabel,
   formatSemanticRefreshing,
+  NOT_STARTED_STATUS_TEXT,
 } from "../shared/status";
 import {
   createDebouncedStatusRefresh,
@@ -265,10 +266,7 @@ const StatusDialog = (props: StatusDialogProps) => {
           instead of an empty grid of zeros and "unknown" rows. */}
       {status()?.cache_role === "not_initialized" ? (
         <box width="100%" marginTop={1} justifyContent="center">
-          <text fg={t().textMuted}>
-            {status()!.message ||
-              "AFT bridge is now spawned lazily, information here will be populated after first tool call."}
-          </text>
+          <text fg={t().textMuted}>{status()!.message || NOT_STARTED_STATUS_TEXT}</text>
         </box>
       ) : null}
 
@@ -380,11 +378,7 @@ const StatusDialog = (props: StatusDialogProps) => {
             <R
               theme={t()}
               label="Status"
-              value={formatSemanticIndexStatus(
-                status()!.semantic_index.status,
-                status()!.semantic_index.stage,
-                status()!.semantic_index.error,
-              )}
+              value={formatSemanticIndexLabel(status()!.semantic_index)}
               tone={statusTone(status()!.semantic_index.status)}
             />
             {formatSemanticRefreshing(status()!.semantic_index.refreshing_count) ? (
