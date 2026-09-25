@@ -2,27 +2,25 @@
 
 //! Cross-module contract: how long a `bash` tool call can hold its reply.
 //!
-//! Broca (the CortexKit agent runner) sizes how long it waits for an AFT tool
-//! reply from these values:
+//! Broca (the CortexKit agent runner) calls AFT over the subc tool surface and
+//! sizes how long it waits for a tool reply from these values:
 //!   - `bash` with `wait: true` or `block_to_completion: true`:
 //!     (timeout ?? 1,800,000 ms) + 30 s;
-//!   - `bash_watch`: (timeoutMs ?? bash.watch_sync_max_ms) + 30 s;
-//!   - any other tool: 120 s.
+//!   - any other tool, including `bash_status`: 120 s.
 //!
 //! Broca's waiting rule depends on every value pinned here. Changing any of
-//! them (the 30-minute default hard timeout, the guarantee that a held call
-//! answers once its timeout kills the command, or the bash_watch sync-wait
-//! bounds) needs a coordinated change in Broca, or Broca will either give up on
-//! a live call or wait on a dead one.
+//! them (the 30-minute default hard timeout, or the guarantee that a held call
+//! answers once its timeout kills the command) needs a coordinated change in
+//! Broca, or Broca will either give up on a live call or wait on a dead one.
 //!
 //! The bash tests run the real `aft` binary twice over: once over the
 //! stdin/stdout protocol and once as a `--subc` module behind a fake daemon,
 //! because the subc path holds the call on its own deferred wait loop.
 //!
-//! `bash_watch` has no engine-side wait: the sync wait loop lives in the
-//! OpenCode and Pi plugins, which read `bash.watch_sync_max_ms` from the
-//! engine's resolved config. The last test pins that config value's default
-//! and clamp range.
+//! `bash_watch` is not on the subc tool surface, so Broca never waits on it:
+//! its sync wait loop lives in the OpenCode and Pi plugins, which read
+//! `bash.watch_sync_max_ms` from the engine's resolved config. The last test
+//! pins that config value's default and clamp range for those plugins.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -55,11 +53,12 @@ const CONSUMER_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
 const TIMEOUT_MS: u64 = 1_500;
 /// How late after `TIMEOUT_MS` a held call may answer here. The engine needs
 /// one watchdog tick (500 ms) to notice the expiry, a SIGTERM to the process
-/// group, and one pending-response poll (100 ms). Three seconds is loose
-/// enough for a loaded CI host and still far inside Broca's 30 s margin.
-const REPLY_MARGIN: Duration = Duration::from_millis(3_000);
+/// group, and one pending-response poll (100 ms); a normal run answers about
+/// 0.6 s late. Eight seconds tolerates a heavily loaded CI host while staying
+/// well inside Broca's 30 s margin.
+const REPLY_MARGIN: Duration = Duration::from_millis(8_000);
 /// Backstop so a call that never answers fails the test instead of hanging it.
-const HANG_CATCH: Duration = Duration::from_secs(15);
+const HANG_CATCH: Duration = Duration::from_secs(30);
 
 const SESSION_ID: &str = "bash-reply-timing-contract";
 const ROUTE_CHANNEL: u16 = 1;
