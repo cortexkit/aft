@@ -216,8 +216,6 @@ interface OnnxRuntimeResolutionSeams {
   platformInfo?: OrtPlatformInfo | null;
   systemSearchPaths?: string[];
   download?: (info: OrtPlatformInfo, targetDir: string) => Promise<string | null>;
-  /** Archive URL for the real download path; tests point it at a local server. */
-  archiveUrl?: string;
   /** How often a caller waiting on another install re-checks the lock. */
   lockPollMs?: number;
 }
@@ -362,9 +360,7 @@ async function resolveOnnxRuntimeUncoalesced(
     // staging dir of an install that is still running.
     cleanupAbandonedStagingDirs(onnxBaseDir);
     cleanupIncompleteTargetIfUnowned(ortVersionDir);
-    const installed = await (
-      seams.download ?? ((i, dir) => downloadOnnxRuntime(i, dir, seams.archiveUrl))
-    )(info, ortVersionDir);
+    const installed = await (seams.download ?? downloadOnnxRuntime)(info, ortVersionDir);
     if (installed) lastInstallFailure = null;
     else lastInstallFailure ??= "ONNX Runtime install failed (see the AFT plugin log)";
     return installed;
@@ -376,9 +372,10 @@ async function resolveOnnxRuntimeUncoalesced(
 /**
  * Sweep abandoned `*.tmp.<pid>.<ts>` staging directories left behind by
  * killed download attempts, and remove an empty/half-populated target dir
- * so the next download retries cleanly. Safe to call before lock acquisition
- * because we only delete dirs whose owning PID is dead (or, on Windows,
- * very old while the owner is still reported alive).
+ * so the next download retries cleanly. Only dirs whose owning PID is dead
+ * (or, on Windows, very old while the owner is still reported alive) are
+ * removed, and the installer calls this only while holding the install lock,
+ * so a staging dir that belongs to a running install is never touched.
  */
 function cleanupAbandonedStagingDirs(onnxBaseDir: string): void {
   // Sweep .tmp.* staging dirs whose pid is dead or are sufficiently old.
@@ -892,11 +889,8 @@ function validateExtractedTree(stagingRoot: string): void {
 async function downloadOnnxRuntime(
   info: OrtPlatformInfo,
   targetDir: string,
-  archiveUrl?: string,
 ): Promise<string | null> {
-  const url =
-    archiveUrl ??
-    `https://github.com/${ORT_REPO}/releases/download/v${ORT_VERSION}/${info.assetName}.${info.archiveType === "tgz" ? "tgz" : "zip"}`;
+  const url = `https://github.com/${ORT_REPO}/releases/download/v${ORT_VERSION}/${info.assetName}.${info.archiveType === "tgz" ? "tgz" : "zip"}`;
 
   log(`Downloading ONNX Runtime v${ORT_VERSION} for ${process.platform}/${process.arch}...`);
 

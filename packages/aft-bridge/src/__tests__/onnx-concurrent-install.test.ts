@@ -8,7 +8,8 @@
  * starts asks for the runtime. The install must happen once, each waiting
  * caller must end up with the installed runtime (not a "skipped" null), and
  * no attempt may break another. The archive is served from a local HTTP
- * server so the real download, extract, copy and publish path runs.
+ * server so the real download, extract, copy and publish path runs: `fetch`
+ * is wrapped to send the GitHub release URL to that server instead.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -38,6 +39,18 @@ let workDir: string;
 let server: Server;
 let archiveUrl: string;
 let requests = 0;
+const realFetch = globalThis.fetch;
+
+/** Send ONNX Runtime release downloads to `target`; pass everything else through. */
+function routeReleaseDownloadsTo(target: string): typeof fetch {
+  return ((input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url.startsWith("https://github.com/microsoft/onnxruntime/releases/download/")) {
+      return realFetch(target, init);
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+}
 
 function buildFakeArchive(dir: string): Buffer {
   const pkgRoot = join(dir, "pkg");
@@ -64,9 +77,11 @@ beforeEach(async () => {
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
   const { port } = server.address() as AddressInfo;
   archiveUrl = `http://127.0.0.1:${port}/archive.tgz`;
+  globalThis.fetch = routeReleaseDownloadsTo(archiveUrl);
 });
 
 afterEach(async () => {
+  globalThis.fetch = realFetch;
   await new Promise<void>((done) => server.close(() => done()));
   rmSync(workDir, { recursive: true, force: true });
 });
@@ -75,7 +90,6 @@ function seams() {
   return {
     platformInfo: PLATFORM_INFO,
     systemSearchPaths: [],
-    archiveUrl,
     lockPollMs: 50,
   };
 }
@@ -92,6 +106,13 @@ function expectInstalled(storageDir: string, result: string | null): void {
 function installInChildProcess(storageDir: string): Promise<string | null> {
   const modulePath = resolve(import.meta.dir, "../onnx-runtime.ts");
   const script = `
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      return url.startsWith("https://github.com/microsoft/onnxruntime/releases/download/")
+        ? realFetch(${JSON.stringify(archiveUrl)}, init)
+        : realFetch(input, init);
+    };
     const { __test__ } = await import(${JSON.stringify(modulePath)});
     const result = await __test__.resolveOnnxRuntime(${JSON.stringify(storageDir)}, ${JSON.stringify(seams())});
     process.stdout.write("RESULT=" + JSON.stringify(result) + "\\n");
@@ -119,6 +140,14 @@ function installInChildProcess(storageDir: string): Promise<string | null> {
 }
 
 describe("concurrent ONNX Runtime installs", () => {
+  test("a single install publishes the runtime", async () => {
+    const storageDir = join(workDir, "storage-single");
+    const result = await resolveOnnxRuntime(storageDir, seams());
+
+    expectInstalled(storageDir, result);
+    expect(requests).toBe(1);
+  });
+
   test("two installs in one process both get the runtime from a single download", async () => {
     const storageDir = join(workDir, "storage");
     const [first, second] = await Promise.all([
@@ -146,11 +175,9 @@ describe("concurrent ONNX Runtime installs", () => {
 
   test("a failed install reports why", async () => {
     const storageDir = join(workDir, "storage-failing");
-    const result = await resolveOnnxRuntime(storageDir, {
-      ...seams(),
-      // Port 1 has no listener, so the download itself fails.
-      archiveUrl: "http://127.0.0.1:1/archive.tgz",
-    });
+    // Port 1 has no listener, so the download itself fails.
+    globalThis.fetch = routeReleaseDownloadsTo("http://127.0.0.1:1/archive.tgz");
+    const result = await resolveOnnxRuntime(storageDir, seams());
 
     expect(result).toBeNull();
     expect(getOnnxRuntimeInstallFailure()).toContain("ONNX Runtime download failed");
