@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+  "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -9,8 +9,8 @@
       "profile_id": "REG-V049-OC-MIN",
       "harness": "opencode",
       "host_version": {
-        "value": "1.18.30",
-        "method": "opencode --version"
+        "value": null,
+        "method": "opencode --version (not available in capture environment)"
       },
       "capture_method": "production buildOpenCodeToolMap registration output plus system-transform workflow hint input",
       "production_cache_key": {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+      "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -192,8 +192,8 @@
       "profile_id": "REG-V049-OC-REC",
       "harness": "opencode",
       "host_version": {
-        "value": "1.18.30",
-        "method": "opencode --version"
+        "value": null,
+        "method": "opencode --version (not available in capture environment)"
       },
       "capture_method": "production buildOpenCodeToolMap registration output plus system-transform workflow hint input",
       "production_cache_key": {
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+      "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -1062,8 +1062,8 @@
       "profile_id": "REG-V049-OC-ALL",
       "harness": "opencode",
       "host_version": {
-        "value": "1.18.30",
-        "method": "opencode --version"
+        "value": null,
+        "method": "opencode --version (not available in capture environment)"
       },
       "capture_method": "production buildOpenCodeToolMap registration output plus system-transform workflow hint input",
       "production_cache_key": {
@@ -1071,7 +1071,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+      "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -2002,7 +2002,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+      "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2193,7 +2193,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+      "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -3172,7 +3172,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "36798e6afae9b66e2eddb3de7ec16b4213acbca1",
+      "source_commit": "8306585cd90122162178879d61bc14315b26c1e3",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
