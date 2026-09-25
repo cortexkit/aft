@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "subc-pool-drop-client", "stage-card-dsym"
+  ],
+  "note": "Plugin subc pool keeps the shared connection on per-route failures; stage-card dSYM fix. No ranking-fence file touched."
+}
