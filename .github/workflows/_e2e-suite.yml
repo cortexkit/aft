@@ -287,12 +287,27 @@ jobs:
             \( -name failure.json -o -name mock-exchanges.ndjson -o -name host-stream.ndjson -o -name host-stderr.log \) \
             -print | sort)
 
+      # The run directory holds about 200,000 small files (each scenario's
+      # isolated home, config and AFT storage). Uploading them one by one took
+      # 14-17 minutes and pushed a green matrix past the job timeout, so they
+      # are packed into a single archive first.
+      - name: Pack OpenCode 2 forensic artifacts
+        if: always()
+        run: |
+          run_dir="$AFT_E2E_ARTIFACT_ROOT/$AFT_E2E_RUN_ID"
+          if [ ! -d "$run_dir" ]; then
+            echo "No OpenCode 2 run directory was produced"
+            exit 0
+          fi
+          tar -C "$AFT_E2E_ARTIFACT_ROOT" -cf - "$AFT_E2E_RUN_ID" | zstd -T0 -3 -q -o "$RUNNER_TEMP/opencode2-forensics.tar.zst"
+          ls -la "$RUNNER_TEMP/opencode2-forensics.tar.zst"
+
       - name: Upload OpenCode 2 forensic artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-opencode2-forensics-${{ github.run_attempt }}
-          path: ${{ env.AFT_E2E_ARTIFACT_ROOT }}/${{ env.AFT_E2E_RUN_ID }}/
+          path: ${{ runner.temp }}/opencode2-forensics.tar.zst
           if-no-files-found: warn
           retention-days: 14
 
