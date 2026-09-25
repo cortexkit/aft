@@ -241,6 +241,12 @@ pub(crate) fn is_subc_credential_env_key(key: &str) -> bool {
 /// Apply request overrides to a non-PTY child and remove subc credentials from
 /// both the inherited process environment and explicit command overrides.
 pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<String, String>) {
+    // A ticket in this process's own environment belongs to whatever command
+    // started this process, never to the child. The child gets a ticket only
+    // when its request environment carries one issued for it.
+    if !environment.contains_key(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV) {
+        command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
+    }
     command.envs(environment);
 
     let mut credential_keys = std::env::vars_os()

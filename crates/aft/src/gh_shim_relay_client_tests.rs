@@ -292,22 +292,45 @@ fn daemon_and_plexus_refusals_decode_with_their_stage() {
 
 #[test]
 fn bindings_comparison_accepts_only_an_exact_match_and_shows_both_views() {
-    let manifest = BTreeMap::from([("cortexkit/aft".to_string(), "alfonso-aft".to_string())]);
-    let matching = json!({
+    let manifest = BTreeMap::from([
+        ("cortexkit/aft".to_string(), "alfonso-aft".to_string()),
+        ("cortexkit/commons".to_string(), "alfonso-subc".to_string()),
+    ]);
+    // plexus's real reply shape wraps the body in `result`; the manifest may
+    // govern repositories (commons) that plexus does not bind.
+    let matching = json!({"result": {
         "repo_binding_generation": 5,
         "bindings": [{"repository": "cortexkit/aft", "app_handle_id": "h", "agent_id": "alfonso-aft"}],
-    });
+    }});
     assert_eq!(compare_bindings(&manifest, &matching), Ok(5));
-    let extra = json!({
+    let bare = matching["result"].clone();
+    assert_eq!(compare_bindings(&manifest, &bare), Ok(5));
+    assert!(
+        compare_bindings(&manifest, &json!({"error": {"code": "connection_unknown"}}))
+            .unwrap_err()
+            .contains("connection_unknown")
+    );
+    let wrong_agent = json!({"result": {
+        "repo_binding_generation": 7,
+        "bindings": [{"repository": "cortexkit/aft", "app_handle_id": "h", "agent_id": "someone-else"}],
+    }});
+    assert!(compare_bindings(&manifest, &wrong_agent)
+        .unwrap_err()
+        .contains("for cortexkit/aft->someone-else"));
+    let extra = json!({"result": {
         "repo_binding_generation": 6,
         "bindings": [
             {"repository": "cortexkit/aft", "app_handle_id": "h", "agent_id": "alfonso-aft"},
             {"repository": "cortexkit/plexus", "app_handle_id": "p", "agent_id": "alfonso-plexus"},
         ],
-    });
+    }});
     let error = compare_bindings(&manifest, &extra).unwrap_err();
     assert!(
-        error.contains("manifest: cortexkit/aft->alfonso-aft"),
+        error.contains("for cortexkit/plexus->alfonso-plexus"),
+        "{error}"
+    );
+    assert!(
+        error.contains("manifest: cortexkit/aft->alfonso-aft, cortexkit/commons->alfonso-subc"),
         "{error}"
     );
     assert!(
@@ -497,10 +520,10 @@ fn v12_manifest() -> Manifest {
 }
 
 fn bindings_ok() -> Value {
-    json!({"op": BINDINGS_READ_OPERATION, "status": "ok", "data": {
+    json!({"op": BINDINGS_READ_OPERATION, "status": "ok", "data": {"result": {
         "repo_binding_generation": 1,
         "bindings": [{"repository": "cortexkit/aft", "app_handle_id": "h", "agent_id": "alfonso-aft"}],
-    }})
+    }}})
 }
 
 fn plexus_refused(code: &str) -> Value {

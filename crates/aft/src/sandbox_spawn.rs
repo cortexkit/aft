@@ -2665,7 +2665,10 @@ pub(crate) fn pty_command_for_plan(
         }
     } else {
         // Sandbox-disabled PTYs retain the historical full inheritance and add
-        // only request overrides.
+        // only request overrides. An inherited gh shim ticket is removed first:
+        // it belongs to whatever started this process, and the request map
+        // re-adds the child's own ticket when one was issued.
+        command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
         for (key, value) in env {
             command.env(key, value);
         }

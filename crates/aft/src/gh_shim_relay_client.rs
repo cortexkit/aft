@@ -397,6 +397,19 @@ pub(super) fn compare_bindings(
     manifest: &BTreeMap<String, String>,
     reply: &Value,
 ) -> Result<u64, String> {
+    // plexus answers bindings.read as `{"result": {...}}` or `{"error": {"code"}}`;
+    // accept the bare body too, so a reply without the wrapper still parses.
+    if let Some(code) = reply
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+    {
+        return Err(format!("plexus refused the bindings read: {code}"));
+    }
+    let reply = reply
+        .get("result")
+        .filter(|result| result.get("repo_binding_generation").is_some())
+        .unwrap_or(reply);
     let generation = reply
         .get("repo_binding_generation")
         .and_then(Value::as_u64)
@@ -419,11 +432,24 @@ pub(super) fn compare_bindings(
         .iter()
         .map(|(repository, agent)| (repository.to_ascii_lowercase(), agent.clone()))
         .collect();
-    if plexus == manifest_view {
+    // Every repository plexus binds must be governed by the manifest, bound to
+    // the same agent: a repository plexus binds but the manifest does not would
+    // otherwise reach upstream `gh` on operator credentials, and a disagreement
+    // on the agent means the two views describe different bots. The manifest
+    // may govern repositories plexus does not bind (plexus binds one repository
+    // per agent, the manifest can bind several); a write to one of those is
+    // refused by plexus as `repository_unbound`, which fails closed.
+    let disagreements = plexus
+        .iter()
+        .filter(|(repository, agent)| manifest_view.get(*repository) != Some(*agent))
+        .map(|(repository, agent)| (repository.clone(), agent.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if disagreements.is_empty() {
         return Ok(generation);
     }
     Err(format!(
-        "plexus's repository bindings (generation {generation}) do not match this shim's manifest; manifest: {}; plexus: {}; governed writes stay refused until they agree",
+        "plexus's repository bindings (generation {generation}) disagree with this shim's manifest for {}; manifest: {}; plexus: {}; governed writes stay refused until they agree",
+        render_bindings(&disagreements),
         render_bindings(&manifest_view),
         render_bindings(&plexus),
     ))
