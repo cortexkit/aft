@@ -28,7 +28,7 @@ import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js"
 import type { NativeResult, PlanFeature, SetupPlan } from "../lib/feature-plan.js";
 import { describePermissionProblem, type PermissionFacts } from "../lib/fs-errors.js";
 import { getSelfVersion } from "../lib/self-version.js";
-import { type FeatureRow, promptFeatureList } from "../setup/feature-list.js";
+import { type FeatureRow, promptFeatureList, renderRowLines } from "../setup/feature-list.js";
 import { runFeatureWizard, type WizardIO } from "../setup/feature-wizard.js";
 import type { OpenCodeHostDetection } from "../setup/host-generation.js";
 
@@ -584,6 +584,32 @@ async function firstFrame(columns: number): Promise<string> {
   const plain = frame.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
   return plain.slice(0, plain.indexOf("Enter: confirm") + "Enter: confirm".length);
 }
+
+describe("the feature list cursor", () => {
+  // Unselected rows keep their descriptions while the cursor moves (checked
+  // in a real 80x24 PTY); what moves is the one full-brightness label.
+  test("only the focused row's label is at full brightness, checked or not", () => {
+    const row = { value: "grep", label: "grep", description: "Fast search." };
+    // styleText drops styling when stdout is not a terminal; force it on.
+    const savedForceColor = process.env.FORCE_COLOR;
+    process.env.FORCE_COLOR = "1";
+    const label = (state: Parameters<typeof renderRowLines>[1]) =>
+      renderRowLines(row, state, false, 80)[0] as string;
+    const dimmed = /\x1b\[2mgrep/;
+    try {
+      expect(label("active-selected")).not.toMatch(dimmed);
+      expect(label("active")).not.toMatch(dimmed);
+      expect(label("selected")).toMatch(dimmed);
+      expect(label("inactive")).toMatch(dimmed);
+    } finally {
+      if (savedForceColor === undefined) delete process.env.FORCE_COLOR;
+      else process.env.FORCE_COLOR = savedForceColor;
+    }
+    for (const state of ["active", "selected", "active-selected", "inactive"] as const) {
+      expect(renderRowLines(row, state, false, 80)).toHaveLength(2);
+    }
+  });
+});
 
 describe("U6-U8: the feature list at 80 and 120 columns", () => {
   test("80 columns: name and description only, wrapped inside the tree", async () => {

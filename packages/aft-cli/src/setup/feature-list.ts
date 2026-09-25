@@ -88,7 +88,10 @@ export function renderRowLines(
   const branch = dim(last ? S_BAR_END : S_BAR);
   const continuation = last ? " " : dim(S_BAR);
   const focused = state === "active" || state === "active-selected";
-  const label = focused ? row.label : state === "inactive" ? dim(row.label) : row.label;
+  // Only the focused row's label is at full brightness, as in clack's own
+  // lists; the checkbox colour shows checked or not. A checked row drawn at
+  // full brightness would hide the cursor whenever it sits on a checked row.
+  const label = focused ? row.label : dim(row.label);
   const lines = [`${branch} ${checkbox(state)} ${label}`];
   const width = Math.max(MIN_TEXT_WIDTH, columns - TEXT_INDENT - 1);
   for (const text of wrapWords(row.description, width)) {
