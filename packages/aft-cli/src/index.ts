@@ -31,6 +31,9 @@ function printHelp(): void {
     "    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch, retired config keys)",
   );
   console.log("    doctor --reconfigure  Rerun the feature wizard");
+  console.log(
+    "    --verbose        Also print AFT's internal log lines (always kept in aft-cli.log)",
+  );
   console.log("    doctor --clear   Select caches to clear with an interactive prompt");
   console.log("    doctor --issue   Collect diagnostics and open a GitHub issue");
   console.log(
@@ -99,4 +102,22 @@ async function main(): Promise<number> {
   return command ? 1 : 0;
 }
 
-main().then((code) => process.exit(code));
+/**
+ * Last line of defence for setup and doctor: an unexpected error prints one
+ * readable line (with the owner and fix command for a permission error)
+ * instead of a Node stack trace. `--verbose` keeps the stack for debugging.
+ */
+async function reportFatal(error: unknown): Promise<number> {
+  const { formatFsError } = await import("./lib/fs-errors.js");
+  const { log, outro } = await import("./lib/prompts.js");
+  log.error(formatFsError(error));
+  if (args.includes("--verbose") && error instanceof Error && error.stack) {
+    process.stderr.write(`${error.stack}\n`);
+  }
+  outro(`${CLI} ${command ?? ""} stopped — see the error above.`.replace(/\s+/g, " "));
+  return 1;
+}
+
+main()
+  .catch(reportFatal)
+  .then((code) => process.exit(code));

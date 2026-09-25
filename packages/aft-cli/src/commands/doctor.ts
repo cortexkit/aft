@@ -26,6 +26,7 @@ import type { HarnessAdapter } from "../adapters/types.js";
 import { diagnoseOpenCodeLoad } from "../doctor/opencode.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
+import { type BinaryDownloader, obtainAftBinary } from "../lib/binary-install.js";
 import { findAftBinary, missingAftBinaryMessage, probeAftBinary } from "../lib/binary-probe.js";
 import { buildRecentAftToolFailuresSectionFromLog } from "../lib/bridge-tool-failures.js";
 import {
@@ -34,6 +35,7 @@ import {
   resetBuildBreakerSuspension,
 } from "../lib/build-breaker.js";
 import { CLI } from "../lib/cli.js";
+import { installCliLogger } from "../lib/cli-logger.js";
 import {
   collectDiagnosticIssues,
   collectDiagnostics,
@@ -49,7 +51,9 @@ import {
   type NativeRunner,
   runConfigFix,
   runNative,
+  withCliCommands,
 } from "../lib/feature-plan.js";
+import { formatFsError } from "../lib/fs-errors.js";
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
@@ -75,7 +79,11 @@ import {
   renderFeatureStatus,
   runFeatureSetup,
 } from "../setup/feature-wizard.js";
-import { formatHostGenerations, type OpenCodeHostDetection } from "../setup/host-generation.js";
+import {
+  describeOpenCodeHost,
+  formatHostGenerations,
+  type OpenCodeHostDetection,
+} from "../setup/host-generation.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
@@ -115,6 +123,8 @@ export interface DoctorOptions {
   runNative?: NativeRunner;
   /** Overrides for the reconfigure wizard's prompts. */
   features?: FeatureSetupDeps;
+  /** Binary downloader for --fix (tests stub it). */
+  downloadBinary?: BinaryDownloader;
 }
 
 function openCodeAdapter(adapters: HarnessAdapter[]): HarnessAdapter | undefined {
@@ -199,7 +209,7 @@ export function buildDoctorProfileArgs(argv: string[]): string[] {
 export function runDoctorProfile(argv: string[]): number {
   const binary = findAftBinary();
   if (!binary) {
-    console.error(missingAftBinaryMessage("aft doctor --profile"));
+    console.error(missingAftBinaryMessage(`${CLI} doctor --profile`));
     return 1;
   }
   const result = spawnSync(binary, buildDoctorProfileArgs(argv), {
@@ -217,6 +227,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   if (options.issue) {
     return runIssueFlow(options.argv);
   }
+  installCliLogger({ verbose: options.argv.includes("--verbose") });
   intro(`${CLI} doctor`);
 
   if (options.reconfigure) {
@@ -234,6 +245,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       options.collectDiagnostics,
       options.applyOnnxFix,
       options.runNative,
+      options.downloadBinary,
     );
   }
 
@@ -713,7 +725,7 @@ export function clearOldBinaries(): BinaryCacheClearResult {
       result.bytesReclaimed += bytes;
       log.success(`Binary cache: cleared ${dir} (reclaimed ${formatBytes(bytes)})`);
     } catch (err) {
-      const message = (err as Error).message ?? "unknown error";
+      const message = formatFsError(err, dir);
       log.error(`Binary cache: failed to remove ${dir}: ${message}`);
       result.errors.push({ path: dir, error: message });
     }
@@ -909,9 +921,10 @@ function applySchemaFixes(targets: SchemaFixTarget[]): { changed: number; errors
     } catch (error) {
       errors += 1;
       log.warn(
-        `${target.adapter.displayName}: could not set $schema on ${target.aftConfig}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `${target.adapter.displayName}: could not set $schema on ${target.aftConfig}: ${formatFsError(
+          error,
+          target.aftConfig,
+        )}`,
       );
     }
   }
@@ -1035,7 +1048,8 @@ async function confirmDoctorFixPlan(
 ): Promise<boolean> {
   if (plan.length === 0) return true;
   if (shouldSkipDoctorFixConfirmation(argv)) return true;
-  return confirm("Apply the planned doctor --fix changes?", false);
+  // The user already asked for fixes by running --fix, so the default is Yes.
+  return confirm("Apply these changes?", true);
 }
 
 function logUnmatchedBinaryCandidates(expectedVersion: string): void {
@@ -1063,6 +1077,7 @@ async function runFixFlow(
   collect: typeof collectDiagnostics = collectDiagnostics,
   applyOnnxFix: typeof runOnnxFix = runOnnxFix,
   runNativeFn: NativeRunner = runNative,
+  downloadBinaryFn?: BinaryDownloader,
 ): Promise<number> {
   const adapters = await resolveAdapters(argv, {
     allowMulti: false,
@@ -1089,7 +1104,7 @@ async function runFixFlow(
       "OpenCode: host generation is unavailable; applying only generation-independent exact-pin config fixes.",
     );
   } else if (hostDetection) {
-    log.info(`OpenCode: host generation ${formatHostGenerations(hostDetection)}`);
+    log.info(`Found ${describeOpenCodeHost(hostDetection)}.`);
   }
 
   log.info("Running diagnostics to identify auto-fixable issues…");
@@ -1139,29 +1154,14 @@ async function runFixFlow(
       binaryDownloadSkipped = true;
       skipped.push("aft binary download (declined because the installed plugin would not use it)");
     } else {
-      log.info("AFT binary not found. Downloading…");
-      try {
-        // Literal specifier so the bundle inlines aft-bridge instead of
-        // resolving the installed package at runtime (whose dist chain loads
-        // subc-client's TypeScript entry, which Node cannot load).
-        const { ensureBinary } = (await import("@cortexkit/aft-bridge")) as {
-          ensureBinary: (version?: string) => Promise<string | null>;
-        };
-        const path = await ensureBinary(`v${report.cliVersion}`);
-        if (path) {
-          log.success(`AFT binary installed at ${path}`);
-          binaryDownloaded = true;
-        } else {
-          log.error(
-            "AFT binary download failed — no matching release asset on GitHub. " +
-              "Try opening any AFT-enabled session to trigger plugin-side download instead.",
-          );
-          binaryDownloadError = "no matching release asset";
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        log.error(`AFT binary download failed: ${message}`);
-        binaryDownloadError = message;
+      log.info(`Downloading the AFT binary v${report.cliVersion}…`);
+      const obtained = await obtainAftBinary(report.cliVersion, downloadBinaryFn);
+      if (obtained.ok) {
+        log.success(`AFT binary installed at ${obtained.path}`);
+        binaryDownloaded = true;
+      } else {
+        log.error(`AFT binary download failed: ${obtained.message}`);
+        binaryDownloadError = obtained.message;
       }
     }
   }
@@ -1171,7 +1171,7 @@ async function runFixFlow(
 
   // Rewrite retired config keys to their canonical replacements. This is the
   // only path allowed to repair configuration that ordinary loading rejects.
-  const configSummary = applyConfigMigration(runNativeFn);
+  const configSummary = applyConfigMigration(runNativeFn, binaryDownloadError !== null);
 
   const applied: string[] = [];
   if (pluginEntrySummary.changed > 0) applied.push("plugin registration");
@@ -1263,11 +1263,31 @@ function logFeatureStatus(argv: string[], run: NativeRunner = runNative): boolea
   return false;
 }
 
-/** Run the config migration and log each file's outcome. */
-function applyConfigMigration(run: NativeRunner): { changed: number; errors: number } {
+/**
+ * Run the config migration and log each file's outcome.
+ *
+ * The migration runs inside the native binary. Without one it cannot check
+ * the configuration at all, which is not a migration failure: on a fresh
+ * install there is usually nothing to migrate. That case is reported as a
+ * skipped check, once, and never tells the user to rerun `doctor --fix`
+ * (the command they are running). When the binary download already failed
+ * in this run, that error is the one to act on and this stays quiet.
+ */
+function applyConfigMigration(
+  run: NativeRunner,
+  binaryDownloadFailed = false,
+): { changed: number; errors: number } {
   const result = runConfigFix(run);
   if (!result.ok) {
-    log.error(`AFT config migration failed: ${result.error}`);
+    if (result.missingBinary) {
+      if (!binaryDownloadFailed) {
+        log.warn(
+          "Config migration check skipped: it runs inside the AFT binary, which is not installed.",
+        );
+      }
+      return { changed: 0, errors: 0 };
+    }
+    log.error(`AFT config migration failed: ${withCliCommands(result.error)}`);
     return { changed: 0, errors: 1 };
   }
   let changed = 0;
@@ -1365,9 +1385,10 @@ function ensureStorageDirsForRegisteredPlugins(adapters: HarnessAdapter[]): {
   const summary = { created: 0, errors: 0 };
 
   for (const adapter of adapters) {
+    let storageDir: string | undefined;
     try {
       if (!adapter.isInstalled() || !adapter.hasPluginEntry()) continue;
-      const storageDir = adapter.getStorageDir();
+      storageDir = adapter.getStorageDir();
       if (existsSync(storageDir)) continue;
       mkdirSync(storageDir, { recursive: true });
       summary.created += 1;
@@ -1375,7 +1396,7 @@ function ensureStorageDirsForRegisteredPlugins(adapters: HarnessAdapter[]): {
     } catch (err) {
       summary.errors += 1;
       log.error(
-        `${adapter.displayName}: failed to create AFT storage directory: ${err instanceof Error ? err.message : String(err)}`,
+        `${adapter.displayName}: failed to create AFT storage directory: ${formatFsError(err, storageDir)}`,
       );
     }
   }
@@ -1409,7 +1430,11 @@ async function clearPluginCache(
     return { action: "not_found", bytes: 0 };
   }
   if (result.action === "error") {
-    log.error(`${adapter.displayName}: cache clear failed: ${result.error ?? "unknown"}`);
+    log.error(
+      `${adapter.displayName}: cache clear failed: ${
+        result.error ? formatFsError(new Error(result.error), result.path) : "unknown"
+      }`,
+    );
     return { action: "error", bytes: 0 };
   }
 
@@ -1425,7 +1450,9 @@ function reportLspCacheClear(cleanup: ClearResult): void {
     );
   }
   for (const err of cleanup.errors) {
-    log.error(`LSP install cache: failed to remove ${err.path}: ${err.error}`);
+    log.error(
+      `LSP install cache: failed to remove ${err.path}: ${formatFsError(new Error(err.error), err.path)}`,
+    );
   }
 }
 

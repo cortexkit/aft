@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { findAftBinary, missingAftBinaryMessage } from "../lib/binary-probe.js";
+import { CLI } from "../lib/cli.js";
 
 /**
  * Run the native finite snapshot command. The npm CLI deliberately forwards no
@@ -9,7 +10,7 @@ import { findAftBinary, missingAftBinaryMessage } from "../lib/binary-probe.js";
 export function runIndex(argv: string[]): number {
   const binary = findAftBinary();
   if (!binary) {
-    console.error(missingAftBinaryMessage("aft index"));
+    console.error(missingAftBinaryMessage(`${CLI} index`));
     return 1;
   }
 

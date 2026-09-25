@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { compareSemver, isNativeExecutable } from "@cortexkit/aft-bridge";
+import { CLI } from "./cli.js";
 import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
 
 async function loadPluginVersion(): Promise<string> {
@@ -239,7 +240,7 @@ function cacheLocation(preferredVersion?: string): BinarySearchLocation {
   const cacheDir = getAftBinaryCacheDir();
   const binaryName = getAftBinaryName();
   const label = "binary cache";
-  const installedHere = "`aft doctor --fix` installs here";
+  const installedHere = `\`${CLI} doctor --fix\` installs here`;
 
   if (preferredVersion) {
     const tag = preferredVersion.startsWith("v") ? preferredVersion : `v${preferredVersion}`;
@@ -366,7 +367,7 @@ export function missingAftBinaryMessage(command: string, preferredVersion?: stri
   return [
     `${command} requires a native AFT binary and none was found. Searched:`,
     ...describeAftBinarySearch(preferredVersion).map((line) => `  - ${line}`),
-    "`aft doctor --fix` installs into the binary cache directory named above; if it already reported success, that line is the directory this command searched — AFT_CACHE_DIR and XDG_CACHE_HOME change it.",
+    `\`${CLI} doctor --fix\` installs into the binary cache directory named above; if it already reported success, that line is the directory this command searched — AFT_CACHE_DIR and XDG_CACHE_HOME change it.`,
   ].join("\n");
 }
 

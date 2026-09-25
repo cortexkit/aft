@@ -162,23 +162,84 @@ describe("feature wizard rendering", () => {
     });
   });
 
-  test("with write checked the read prompt is replaced by a locked notice", async () => {
+  test("GitHub read is asked first; write is offered only once read is on", async () => {
     const plan = fixturePlan();
     const asked: string[] = [];
-    const told: string[] = [];
     const io: WizardIO = {
       selectRows: async (_message, _options, initial) => initial,
       confirm: async (message) => {
         asked.push(message);
-        return message.startsWith("github.write");
+        return true;
       },
-      info: (message) => told.push(message),
+      info: () => {},
       note: () => {},
     };
-    const answers = await runFeatureWizard(plan, io);
-    expect(asked).toEqual(["github.write: github.write description"]);
-    expect(told.some((line) => line.includes("locked"))).toBe(true);
+    const answers = await runFeatureWizard(plan, io, () => "ready");
+    expect(asked).toHaveLength(2);
+    expect(asked[0]).toContain("read GitHub issues and pull requests");
+    expect(asked[0]).not.toContain("issue://");
+    expect(asked[1]).toBe("github.write: github.write description");
+    // Write implies read, so an unedited implied read stays out of the file.
+    expect(answers.selections["github.write"]).toBe(true);
     expect("github.read" in answers.selections).toBe(false);
+  });
+
+  test("declining GitHub read skips the write question and saves both off", async () => {
+    const plan = fixturePlan({ "github.write": { proposed: true, configured: true } });
+    const asked: string[] = [];
+    const io: WizardIO = {
+      selectRows: async (_message, _options, initial) => initial,
+      confirm: async (message) => {
+        asked.push(message);
+        return false;
+      },
+      info: () => {},
+      note: () => {},
+    };
+    const answers = await runFeatureWizard(plan, io, () => "ready");
+    expect(asked).toHaveLength(1);
+    expect(answers.selections["github.write"]).toBe(false);
+    expect(answers.selections["github.read"]).toBe(false);
+  });
+
+  test("enabling GitHub read warns once when gh is missing or signed out, and never blocks", async () => {
+    for (const [status, needle] of [
+      ["missing", "not on PATH"],
+      ["signed_out", "gh auth login"],
+    ] as const) {
+      const warned: string[] = [];
+      let checks = 0;
+      const io: WizardIO = {
+        selectRows: async (_message, _options, initial) => initial,
+        confirm: async (message) => message.includes("read GitHub"),
+        info: () => {},
+        warn: (message) => warned.push(message),
+        note: () => {},
+      };
+      const answers = await runFeatureWizard(fixturePlan(), io, () => {
+        checks += 1;
+        return status;
+      });
+      expect(checks).toBe(1);
+      expect(warned).toHaveLength(1);
+      expect(warned[0]).toContain(needle);
+      expect(answers.selections["github.read"]).toBe(true);
+    }
+  });
+
+  test("no GitHub CLI check runs when GitHub read is declined", async () => {
+    let checks = 0;
+    const io: WizardIO = {
+      selectRows: async (_message, _options, initial) => initial,
+      confirm: async () => false,
+      info: () => {},
+      note: () => {},
+    };
+    await runFeatureWizard(fixturePlan(), io, () => {
+      checks += 1;
+      return "missing";
+    });
+    expect(checks).toBe(0);
   });
 
   test("doctor lines carry configured/effective/source, the reason and the cause", () => {

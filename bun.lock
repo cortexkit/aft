@@ -37,8 +37,9 @@
         "aft": "dist/index.js",
       },
       "dependencies": {
+        "@clack/core": "^1.4.2",
         "@clack/prompts": "^1.6.0",
-        "@cortexkit/aft-bridge": "0.57.1",
+        "@cortexkit/aft-bridge": "0.57.2",
         "comment-json": "^4.6.2",
       },
       "devDependencies": {

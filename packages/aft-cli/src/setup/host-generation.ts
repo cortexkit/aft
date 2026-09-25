@@ -434,6 +434,18 @@ export function detectOpenCodeHostGeneration(
   };
 }
 
+/**
+ * The detected host as a user would name it ("OpenCode 1"), for setup and
+ * `doctor --fix` progress lines. "Generation V1" is internal vocabulary; the
+ * doctor report keeps {@link formatHostGenerations} for support diagnostics.
+ */
+export function describeOpenCodeHost(detection: OpenCodeHostDetection): string {
+  if (detection.status === "ambiguous") return "both OpenCode 1 and OpenCode 2";
+  if (detection.status === "v1") return "OpenCode 1";
+  if (detection.status === "v2") return "OpenCode 2";
+  return "an OpenCode install of unknown version";
+}
+
 export function formatHostGenerations(detection: OpenCodeHostDetection): string {
   if (detection.status === "ambiguous") return "ambiguous (V1, V2)";
   if (detection.status === "v1") return "V1";

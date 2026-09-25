@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { findAftBinary } from "./binary-probe.js";
+import { CLI } from "./cli.js";
 
 /**
  * Types and invocation helpers for the feature plan owned by the native
@@ -48,19 +49,33 @@ export interface NativeResult {
   stdout: string;
   stderr: string;
   status: number | null;
+  /** True when no native binary was found, so nothing ran at all. */
+  missingBinary?: boolean;
 }
+
+/** Why a native command could not run when no binary is installed. */
+export const MISSING_BINARY_MESSAGE = "the AFT binary is not installed";
 
 export type NativeRunner = (args: string[], input?: string) => NativeResult;
 
 /** Run the native binary with `args`, capturing output. */
 export function runNative(args: string[], input?: string): NativeResult {
-  const binary = findAftBinary();
+  return runNativeBinary(findAftBinary(), args, input);
+}
+
+/** A runner pinned to one binary, for a caller that just installed it. */
+export function nativeRunnerFor(binary: string): NativeRunner {
+  return (args, input) => runNativeBinary(binary, args, input);
+}
+
+function runNativeBinary(binary: string | null, args: string[], input?: string): NativeResult {
   if (!binary) {
     return {
       ok: false,
       stdout: "",
-      stderr: "the aft binary was not found; run `aft doctor --fix` to install it",
+      stderr: `${MISSING_BINARY_MESSAGE}; run \`${CLI} doctor --fix\` to install it`,
       status: null,
+      missingBinary: true,
     };
   }
   const result = spawnSync(binary, args, {
@@ -102,7 +117,18 @@ export type PlanLoad =
       error: string;
       /** The binary refused the configuration itself (it needs `aft doctor --fix`). */
       configRejected: boolean;
+      /** No binary was installed, so no plan could be produced. */
+      missingBinary?: boolean;
     };
+
+/**
+ * The native binary names its own commands as `aft doctor --fix` / `aft setup`,
+ * but a user running this CLI through npx has no `aft` on PATH. Rewrite those
+ * suggestions to the command they can actually run.
+ */
+export function withCliCommands(text: string): string {
+  return text.replace(/(^|[^\w/@-])aft (doctor|setup)\b/g, `$1${CLI} $2`);
+}
 
 /** Load and validate the plan. Unknown plan versions are refused. */
 export function loadFeaturePlan(harness: string | null, run: NativeRunner = runNative): PlanLoad {
@@ -111,8 +137,9 @@ export function loadFeaturePlan(harness: string | null, run: NativeRunner = runN
     const error = result.stderr.trim() || "aft setup --plan failed";
     return {
       ok: false,
-      error,
+      error: withCliCommands(error),
       configRejected: result.status === 1 && error.includes("aft doctor --fix"),
+      missingBinary: result.missingBinary === true,
     };
   }
   let parsed: unknown;
@@ -164,7 +191,9 @@ export interface ConfigFixFile {
   error: string | null;
 }
 
-export type ConfigFixRun = { ok: true; files: ConfigFixFile[] } | { ok: false; error: string };
+export type ConfigFixRun =
+  | { ok: true; files: ConfigFixFile[] }
+  | { ok: false; error: string; missingBinary: boolean };
 
 /**
  * Run the configuration migration (`aft fix-config`). Per-file outcomes are
@@ -179,5 +208,9 @@ export function runConfigFix(run: NativeRunner = runNative): ConfigFixRun {
   } catch {
     // Fall through: an older binary without the command prints usage instead.
   }
-  return { ok: false, error: result.stderr.trim() || "aft fix-config failed" };
+  return {
+    ok: false,
+    error: result.stderr.trim() || "aft fix-config failed",
+    missingBinary: result.missingBinary === true,
+  };
 }

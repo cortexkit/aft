@@ -26,9 +26,9 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { ensureOnnxRuntime } from "@cortexkit/aft-bridge";
-
 import type { HarnessAdapter } from "../adapters/types.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "./diagnostics.js";
+import { formatFsError } from "./fs-errors.js";
 import { dirSize, formatBytes } from "./fs-util.js";
 import { confirm, log, note } from "./prompts.js";
 
@@ -260,7 +260,7 @@ export async function runOnnxFix(
         `${candidate.harness.displayName}: ONNX Runtime installed at ${replacement.installedPath}`,
       );
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = formatFsError(err, candidate.storageOnnxDir);
       log.error(`${candidate.harness.displayName}: ONNX Runtime download failed: ${message}`);
       result.errors.push({ path: candidate.storageOnnxDir, error: message });
     }

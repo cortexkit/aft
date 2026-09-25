@@ -9,6 +9,7 @@ import {
   resolveCortexKitUserConfigPath,
 } from "@cortexkit/aft-bridge";
 
+import { formatFsError } from "../lib/fs-errors.js";
 import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
 import { getCortexKitStorageRoot } from "../lib/paths.js";
@@ -338,7 +339,10 @@ export class OpenCodeAdapter implements HarnessAdapter {
     const generation = this.configGeneration();
     const key = openCodePluginKey(generation);
     if (format === "none") {
-      writeJsoncFile(configPath, { [key]: [PLUGIN_ENTRY] }, "json");
+      const failed = this.tryWrite(configPath, () =>
+        writeJsoncFile(configPath, { [key]: [PLUGIN_ENTRY] }, "json"),
+      );
+      if (failed) return failed;
       return {
         ok: true,
         action: "added",
@@ -372,13 +376,28 @@ export class OpenCodeAdapter implements HarnessAdapter {
       };
     }
 
-    writeJsoncFile(configPath, value, format);
+    const failed = this.tryWrite(configPath, () => writeJsoncFile(configPath, value, format));
+    if (failed) return failed;
     return {
       ok: true,
       action: update.action,
       message: `${update.action === "added" ? "Added" : "Updated"} ${PLUGIN_ENTRY} under \`${update.key}\` in ${configPath} (${label})`,
       configPath,
     };
+  }
+
+  /**
+   * Run a config write, turning a filesystem failure into an error result.
+   * A host installed with `sudo npm i -g` can leave its config directory owned
+   * by root; setup and doctor must report that with the fix, not crash.
+   */
+  private tryWrite(configPath: string, write: () => void): PluginEntryResult | null {
+    try {
+      write();
+      return null;
+    } catch (error) {
+      return { ok: false, action: "error", message: formatFsError(error, configPath), configPath };
+    }
   }
 
   private configEntryNeedsUpdate(

@@ -550,7 +550,9 @@ describe("exact OpenCode config pins", () => {
         expect(existsSync(tuiPath)).toBe(false);
       }
       expect(adapter.hasPluginEntry()).toBe(true);
-      expect(lines.join("\n")).toContain(`host generation ${generation === "v1" ? "V1" : "V2"}`);
+      // Setup names the host the way a user does ("OpenCode 1"), not by the
+      // internal generation label the doctor report uses.
+      expect(lines.join("\n")).toContain(`Found OpenCode ${generation === "v1" ? "1" : "2"}.`);
 
       // Idempotence covers whichever files this generation actually owns: on
       // V2 the TUI config is deliberately absent, and re-running setup must

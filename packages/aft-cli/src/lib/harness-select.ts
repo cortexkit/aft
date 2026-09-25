@@ -56,7 +56,7 @@ export async function resolveAdaptersForCommand(
   }
 
   if (installed.length === 1) {
-    log.info(`Detected ${installed[0].displayName} — using it for ${options.verb}.`);
+    log.info(`Detected ${installed[0].displayName}.`);
     return installed;
   }
 

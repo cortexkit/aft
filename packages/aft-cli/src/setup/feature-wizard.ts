@@ -1,4 +1,6 @@
-import { groupMultiselect, isCancel } from "@clack/prompts";
+import { spawnSync } from "node:child_process";
+import { resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
+import { CLI } from "../lib/cli.js";
 import {
   explicitHarness,
   loadFeaturePlan,
@@ -8,9 +10,12 @@ import {
   SETUP_PLAN_VERSION,
   type SetupAnswers,
   type SetupPlan,
+  withCliCommands,
   writeFeatureAnswers,
 } from "../lib/feature-plan.js";
+import { formatFsError, isPermissionError, tildePath } from "../lib/fs-errors.js";
 import { confirm, log, note } from "../lib/prompts.js";
+import { type FeatureRow, promptFeatureList } from "./feature-list.js";
 
 /**
  * The feature wizard: a thin renderer of the binary's setup plan.
@@ -107,12 +112,6 @@ export function buildAnswers(
   return { plan_version: SETUP_PLAN_VERSION, selections: answers };
 }
 
-/** Current-state suffix for a row, straight from the plan. */
-export function describeState(feature: PlanFeature): string {
-  const cause = feature.unavailable_reason ? `: ${feature.unavailable_reason}` : "";
-  return `now ${feature.effective}${cause}`;
-}
-
 /**
  * Explanations shown before the checkboxes: every row's cost note, the move
  * and delete safety notes, and why a proposed value differs from the saved one.
@@ -138,77 +137,107 @@ export function explanationLines(plan: SetupPlan): string[] {
 export interface WizardIO {
   selectRows(
     message: string,
-    options: Record<string, { value: string; label: string; hint: string }[]>,
+    options: Record<string, FeatureRow[]>,
     initial: string[],
   ): Promise<string[]>;
   confirm(message: string, initial: boolean): Promise<boolean>;
   info(message: string): void;
+  warn?(message: string): void;
   note(message: string, title: string): void;
 }
 
 const clackIO: WizardIO = {
-  async selectRows(message, options, initial) {
-    const result = await groupMultiselect<string>({
-      message,
-      options,
-      initialValues: initial,
-      required: false,
-    });
-    if (isCancel(result)) {
+  selectRows: (message, options, initial) =>
+    promptFeatureList(message, options, initial, () => {
       log.warn("Cancelled.");
       process.exit(0);
-    }
-    return result as string[];
-  },
+    }),
   confirm: (message, initial) => confirm(message, initial),
   info: (message) => log.info(message),
+  warn: (message) => log.warn(message),
   note: (message, title) => note(message, title),
 };
+
+/**
+ * The checklist rows: each feature's name and its description, nothing else.
+ * Runtime state ("ready", "unavailable: <code>") describes the machine at this
+ * moment, not the choice being made, and on a fresh install every index reads
+ * as unavailable; doctor reports it instead.
+ */
+export function featureListGroups(plan: SetupPlan): Record<string, FeatureRow[]> {
+  const groups: Record<string, FeatureRow[]> = {};
+  for (const [group, rows] of groupRows(plan)) {
+    groups[group] = rows.map((feature) => ({
+      value: feature.id,
+      label: feature.label,
+      description: feature.description.trim() || feature.label,
+    }));
+  }
+  return groups;
+}
+
+/** GitHub read, described by what it lets the agent do rather than the URI schemes it serves. */
+const GITHUB_READ_PROMPT =
+  "Let the agent read GitHub issues and pull requests? (uses the GitHub CLI, gh, signed in to your account)";
+
+export type GhStatus = "ready" | "missing" | "signed_out";
+
+/** Whether `gh` is on PATH and signed in. Called at most once per wizard run. */
+export function checkGhStatus(): GhStatus {
+  const version = spawnSync("gh", ["--version"], { stdio: "ignore", timeout: 5_000 });
+  if (version.error || version.status !== 0) return "missing";
+  const auth = spawnSync("gh", ["auth", "status"], { stdio: "ignore", timeout: 10_000 });
+  return !auth.error && auth.status === 0 ? "ready" : "signed_out";
+}
+
+function ghWarning(status: GhStatus): string | null {
+  if (status === "missing") {
+    return "GitHub read needs the GitHub CLI (gh), which is not on PATH. Install it from https://cli.github.com and run `gh auth login`; until then the agent cannot read issues or pull requests.";
+  }
+  if (status === "signed_out") {
+    return "GitHub read needs the GitHub CLI signed in, and `gh auth status` reports no signed-in account. Run `gh auth login`; until then the agent cannot read issues or pull requests.";
+  }
+  return null;
+}
 
 /** Render the plan and collect the user's choices. */
 export async function runFeatureWizard(
   plan: SetupPlan,
   io: WizardIO = clackIO,
+  checkGh: () => GhStatus = checkGhStatus,
 ): Promise<SetupAnswers> {
   const explanations = explanationLines(plan);
   if (explanations.length > 0) io.note(explanations.join("\n"), "About these features");
 
-  const options: Record<string, { value: string; label: string; hint: string }[]> = {};
-  for (const [group, rows] of groupRows(plan)) {
-    options[group] = rows.map((feature) => ({
-      value: feature.id,
-      label: feature.label,
-      hint: `${feature.description} (${describeState(feature)})`,
-    }));
-  }
   const initial = Object.entries(initialSelections(plan))
     .filter(([, on]) => on)
     .map(([id]) => id);
   const picked = new Set(
-    await io.selectRows("Choose the AFT features to enable", options, initial),
+    await io.selectRows("Choose the AFT features to enable", featureListGroups(plan), initial),
   );
   const selections: Record<string, boolean> = {};
   for (const feature of checkboxRows(plan)) selections[feature.id] = picked.has(feature.id);
 
+  // Read is asked first: it is the base capability, and write builds on it.
+  // Declining read therefore also turns write off, since write implies read.
   let github = initialGithubChoice(plan);
   const write = plan.features.find((feature) => feature.id === GITHUB_WRITE);
   const read = plan.features.find((feature) => feature.id === GITHUB_READ);
-  if (write) {
-    github = setGithubWrite(
-      github,
-      await io.confirm(`${write.label}: ${write.description}`, github.write),
-    );
-  }
-  if (read) {
-    const display = githubReadDisplay(github);
-    if (display.locked) {
-      io.info(`${read.label}: on (locked while ${write?.label ?? GITHUB_WRITE} is on)`);
-    } else {
-      github = setGithubRead(
+  let wantRead = githubReadDisplay(github).checked;
+  if (read) wantRead = await io.confirm(GITHUB_READ_PROMPT, wantRead);
+  if (!wantRead) {
+    github = setGithubRead(setGithubWrite(github, false), false);
+  } else {
+    if (write) {
+      github = setGithubWrite(
         github,
-        await io.confirm(`${read.label}: ${read.description}`, display.checked),
+        await io.confirm(`${write.label}: ${write.description}`, github.write),
       );
     }
+    // With write off, read stands on its own and must be saved as chosen.
+    if (!github.write) github = setGithubRead(github, true);
+    const warning = ghWarning(checkGh());
+    if (warning) (io.warn ?? io.info)(warning);
   }
   return buildAnswers(plan, selections, github);
 }
@@ -216,6 +245,8 @@ export async function runFeatureWizard(
 export interface FeatureSetupDeps {
   run?: NativeRunner;
   io?: WizardIO;
+  /** GitHub CLI check for the GitHub read warning (tests stub it). */
+  checkGh?: () => GhStatus;
   interactive?: boolean;
   stdout?: (text: string) => void;
   stderr?: (text: string) => void;
@@ -271,8 +302,10 @@ export async function runFeatureSetup(
     return result.ok ? 0 : (result.status ?? 1);
   }
 
-  if (!(deps.interactive ?? Boolean(process.stdin.isTTY))) {
-    log.info("Feature choices unchanged: rerun in a terminal, or pass --yes or --answers <file>.");
+  if (!featureWizardIsInteractive(deps)) {
+    log.info(
+      `Feature choices unchanged: rerun \`${CLI} setup\` in a terminal, or pass --yes or --answers <file>.`,
+    );
     return 0;
   }
   const loaded = loadFeaturePlan(harness, run);
@@ -280,15 +313,43 @@ export async function runFeatureSetup(
     log.error(loaded.error);
     return 1;
   }
-  if (loaded.warnings) log.warn(loaded.warnings);
-  const answers = await runFeatureWizard(loaded.plan, deps.io);
+  if (loaded.warnings) log.warn(withCliCommands(loaded.warnings));
+  const answers = await runFeatureWizard(loaded.plan, deps.io, deps.checkGh);
   const written = writeFeatureAnswers(answers, harness, true, run);
   if (!written.ok) {
-    log.error(written.stderr.trim() || "aft setup --answers failed");
+    log.error(describeNativeFailure(written.stderr) || "aft setup --answers failed");
     return written.status ?? 1;
   }
-  log.success("Saved feature choices to the user AFT config.");
+  log.success(`Saved feature choices to ${tildePath(writtenPath(written.stdout))}.`);
   return 0;
+}
+
+/** Whether the default (no-flag) feature step will prompt, so it needs the binary. */
+export function featureWizardIsInteractive(deps: FeatureSetupDeps = {}): boolean {
+  return deps.interactive ?? Boolean(process.stdin.isTTY);
+}
+
+/** The file the binary reports writing (`{"written": path}`), or the default user config path. */
+function writtenPath(stdout: string): string {
+  try {
+    const parsed = JSON.parse(stdout) as { written?: unknown };
+    if (typeof parsed.written === "string" && parsed.written.length > 0) return parsed.written;
+  } catch {
+    // An older binary printed nothing parseable; fall back to the default location.
+  }
+  return resolveCortexKitUserConfigPath();
+}
+
+/**
+ * A native failure as one line for the setup screen: a permission error names
+ * the owner and the fix, and the binary's own `aft …` suggestions become the
+ * npx command the user can run.
+ */
+function describeNativeFailure(stderr: string): string {
+  const text = stderr.trim();
+  if (!text) return "";
+  const permission = text.split("\n").find((line) => isPermissionError(line));
+  return permission ? formatFsError(new Error(permission)) : withCliCommands(text);
 }
 
 /** Doctor lines for every plan row, straight from the plan. */
