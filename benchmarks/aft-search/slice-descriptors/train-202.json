@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "gh-shim-bindings-check",
+    "gh-shim-ticket-inheritance",
+    "release-notes-0.58"
+  ],
+  "note": "gh shim version check reads plexus's wrapped bindings reply and accepts a manifest that governs more repositories; children no longer inherit a gh shim ticket; release notes. No ranking-fence file touched."
+}
