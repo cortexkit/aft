@@ -2077,7 +2077,9 @@ mod tests {
 
     #[test]
     fn ecosystem_manifest_gates_seed_only_when_the_root_marker_exists() {
-        let cases: [(&str, &[&str]); 8] = [
+        let cases: [(&str, &[&str]); 10] = [
+            ("Cargo.toml", &["target"]),
+            ("package.json", &["node_modules"]),
             ("build.gradle", &[".gradle"]),
             ("build.gradle.kts", &[".gradle"]),
             ("settings.gradle", &[".gradle"]),

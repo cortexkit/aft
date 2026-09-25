@@ -802,7 +802,11 @@ mod tests {
     fn fresh_root_node_modules_burst_has_no_overflow_or_rescan() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".gitignore"), "node_modules/\n").unwrap();
+        // A fresh JS checkout has a package manifest before its first install.
+        // An absent node_modules is seeded only when that marker is present.
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        assert!(!canonical_root.join("node_modules").exists());
         let excluded = canonical_root.join("node_modules");
         let mut builder = GitignoreBuilder::new(&canonical_root);
         builder.add(root.path().join(".gitignore"));
