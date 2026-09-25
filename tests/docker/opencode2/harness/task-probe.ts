@@ -22,6 +22,10 @@ export class AftTaskProbe implements TaskProbe {
     if (!existsSync(this.databasePath)) return [];
     const database = new Database(this.databasePath, { readonly: true, strict: true });
     try {
+      // AFT writes this database while the probe reads it. Without a busy
+      // timeout a read that lands during one of those writes fails at once
+      // with "database is locked" instead of waiting for the write to finish.
+      database.exec("PRAGMA busy_timeout = 5000");
       const table = database
         .query<{ name: string }, []>(
           "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bash_tasks'",

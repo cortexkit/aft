@@ -1514,5 +1514,8 @@ main().catch((error) => {
   if (error instanceof HarnessError && error.code === "contract_uncaptured") {
     console.error(`HarnessError details: ${JSON.stringify(error.details)}`);
   }
-  process.exitCode = 1;
+  // Exit now rather than setting an exit code: hosts, mock servers and watchers
+  // from scenarios still in flight keep the event loop alive, so a harness
+  // error would otherwise hang until the CI job's timeout kills it.
+  process.exit(1);
 });
