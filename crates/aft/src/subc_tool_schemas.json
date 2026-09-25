@@ -62,18 +62,21 @@
       },
       "foreground_orchestrate": {
         "type": "boolean",
-        "description": "Consumer-set flag enabling server-side foreground orchestration."
+        "description": "Consumer-set flag enabling server-side foreground orchestration.",
+        "x-aft-consumer-only": true
       },
       "block_to_completion": {
         "type": "boolean",
-        "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting."
+        "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
+        "x-aft-consumer-only": true
       },
       "shell": {
         "type": "string",
         "enum": [
           "powershell"
         ],
-        "description": "Consumer-set shell selector for Pi's PowerShell tool."
+        "description": "Consumer-set shell selector for Pi's PowerShell tool.",
+        "x-aft-consumer-only": true
       }
     },
     "required": [
@@ -138,18 +141,21 @@
       },
       "foreground_orchestrate": {
         "type": "boolean",
-        "description": "Consumer-set flag enabling server-side foreground orchestration."
+        "description": "Consumer-set flag enabling server-side foreground orchestration.",
+        "x-aft-consumer-only": true
       },
       "block_to_completion": {
         "type": "boolean",
-        "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting."
+        "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
+        "x-aft-consumer-only": true
       },
       "shell": {
         "type": "string",
         "enum": [
           "powershell"
         ],
-        "description": "Consumer-set shell selector for Pi's PowerShell tool."
+        "description": "Consumer-set shell selector for Pi's PowerShell tool.",
+        "x-aft-consumer-only": true
       }
     },
     "required": [

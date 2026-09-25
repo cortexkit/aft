@@ -3909,9 +3909,29 @@ async fn drive_bash_promotion_daemon(input: FakeDaemonInput) {
 }
 
 async fn drive_bash_block_to_completion_daemon(input: FakeDaemonInput) {
-    let FakeDaemonSession {
-        mut stream, root1, ..
-    } = open_fake_daemon_session(input).await;
+    let (
+        FakeDaemonSession {
+            mut stream, root1, ..
+        },
+        hello,
+    ) = open_fake_daemon_session_with_hello(input).await;
+    // The plugins' orchestration flags are consumer-only: the catalog served in
+    // HELLO must not advertise them, yet the call below that sets them must
+    // still be honoured.
+    let manifest = serde_json::to_value(&hello.manifest).expect("serialize manifest");
+    let bash_schema = manifest["provides"][0]["tools"]
+        .as_array()
+        .expect("manifest tools")
+        .iter()
+        .find(|tool| tool["name"] == "bash")
+        .expect("bash tool in HELLO manifest")["schema"]
+        .clone();
+    for flag in ["foreground_orchestrate", "block_to_completion", "shell"] {
+        assert!(
+            bash_schema["properties"].get(flag).is_none(),
+            "HELLO manifest leaked consumer-only bash.{flag}: {bash_schema:#}"
+        );
+    }
     bind_route1(&mut stream, &root1).await;
     send_tool_call(
         &mut stream,
@@ -10344,9 +10364,17 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
     ))
     .expect("embedded subc tool schemas should be a JSON object")
     .len();
+    // The powershell tool is advertised only where pwsh resolves, so a host
+    // without it serves one tool fewer than the embedded schema artifact.
+    let pwsh_available = which::which("pwsh").is_ok();
+    assert_eq!(
+        tools.iter().any(|tool| tool.name == "powershell"),
+        pwsh_available,
+        "powershell must be advertised exactly when pwsh is on PATH"
+    );
     assert_eq!(
         tools.len(),
-        schema_count,
+        schema_count - usize::from(!pwsh_available),
         "manifest tool count must match embedded schema key count"
     );
     for tool in tools {

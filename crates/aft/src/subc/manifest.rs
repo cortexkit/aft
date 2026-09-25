@@ -198,13 +198,53 @@ static SUBC_TOOL_SCHEMAS: LazyLock<serde_json::Map<String, Value>> = LazyLock::n
         .unwrap_or_else(|e| panic!("subc_tool_schemas.json: {e}"))
 });
 
+/// JSON Schema extension key the generator
+/// (`packages/opencode-plugin/src/subc-tool-schemas.ts`) puts on a property
+/// that AFT's own plugins set and the model never should. The marker lives on
+/// the property itself, so the generator is the only place that decides which
+/// properties are consumer-only; the manifest strips every marked property
+/// before serving, and the runtime still reads the values when a plugin sends
+/// them.
+const CONSUMER_ONLY_MARKER: &str = "x-aft-consumer-only";
+
+fn is_consumer_only(property: &Value) -> bool {
+    property.get(CONSUMER_ONLY_MARKER).and_then(Value::as_bool) == Some(true)
+}
+
+/// Removes consumer-only properties (and their `required` entries) from a
+/// tool schema so a consumer handing the catalog straight to a model does not
+/// invite the model to set them.
+fn strip_consumer_only_properties(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let mut removed = Vec::new();
+    if let Some(Value::Object(properties)) = object.get_mut("properties") {
+        properties.retain(|name, property| {
+            let keep = !is_consumer_only(property);
+            if !keep {
+                removed.push(name.clone());
+            }
+            keep
+        });
+    }
+    if let Some(Value::Array(required)) = object.get_mut("required") {
+        required.retain(|name| {
+            name.as_str()
+                .is_none_or(|name| !removed.iter().any(|removed| removed == name))
+        });
+    }
+}
+
 fn tool_schema(name: &str) -> Value {
-    SUBC_TOOL_SCHEMAS.get(name).cloned().unwrap_or_else(|| {
+    let mut schema = SUBC_TOOL_SCHEMAS.get(name).cloned().unwrap_or_else(|| {
         log::warn!(
             "subc build_manifest: missing embedded schema for tool {name:?}; using placeholder"
         );
         json!({ "type": "object" })
-    })
+    });
+    strip_consumer_only_properties(&mut schema);
+    schema
 }
 
 fn tool_description(name: &str) -> Option<String> {
@@ -220,6 +260,17 @@ fn tool_description(name: &str) -> Option<String> {
 /// schedules concurrent calls itself; the gateway runs AFT directly without a
 /// sandbox. The manifest lists every tool an agent can call over subc.
 pub(super) fn build_manifest() -> ModuleManifest {
+    build_manifest_for_host(crate::bash_background::powershell_available())
+}
+
+/// Builds the manifest for a host where PowerShell is or is not runnable.
+///
+/// The `powershell` tool is advertised only when `pwsh` resolves, checked when
+/// the catalog is served rather than baked into the generated schema artifact:
+/// a model shown a tool that cannot run on the host will call it and fail. A
+/// call that arrives anyway (the tool stays routable) is refused with an error
+/// naming the fix rather than silently run under bash.
+pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManifest {
     let tool = |name: &str, execution_mode: ExecutionMode| Tool {
         name: name.to_string(),
         description: tool_description(name),
@@ -254,10 +305,14 @@ pub(super) fn build_manifest() -> ModuleManifest {
         .ready(false)
         .provides(vec![
             ProviderRole::ToolProvider {
-                tools: vec![
-                    tool("status", ExecutionMode::Pure),
-                    tool("bash", ExecutionMode::Mutating),
-                    tool("powershell", ExecutionMode::Mutating),
+                tools: [
+                    Some(tool("status", ExecutionMode::Pure)),
+                    Some(tool("bash", ExecutionMode::Mutating)),
+                    powershell_available.then(|| tool("powershell", ExecutionMode::Mutating)),
+                ]
+                .into_iter()
+                .flatten()
+                .chain([
                     tool("read", ExecutionMode::Pure),
                     tool("write", ExecutionMode::Mutating),
                     tool("edit", ExecutionMode::Mutating),
@@ -276,7 +331,8 @@ pub(super) fn build_manifest() -> ModuleManifest {
                     tool("move", ExecutionMode::Mutating),
                     tool("import", ExecutionMode::Mutating),
                     tool("safety", ExecutionMode::Mutating),
-                ],
+                ])
+                .collect(),
                 identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
                 concurrency: Concurrency::ModuleManaged,
                 emits_push: true,
@@ -391,7 +447,7 @@ mod tests {
 
     #[test]
     fn build_manifest_serves_embedded_tool_schemas() {
-        let manifest = build_manifest();
+        let manifest = build_manifest_for_host(true);
         let tools = match manifest.provides.first() {
             Some(ProviderRole::ToolProvider { tools, .. }) => tools,
             _ => panic!("expected ToolProvider"),
@@ -457,7 +513,7 @@ mod tests {
 
     #[test]
     fn build_manifest_declares_management_queries_outside_agent_tools() {
-        let manifest = build_manifest();
+        let manifest = build_manifest_for_host(true);
         let tools = manifest
             .provides
             .iter()
@@ -531,7 +587,7 @@ mod tests {
             "CORE_TOOLS must exactly match embedded schema keys"
         );
 
-        let manifest = build_manifest();
+        let manifest = build_manifest_for_host(true);
         let tools = match manifest.provides.first() {
             Some(ProviderRole::ToolProvider { tools, .. }) => tools,
             _ => panic!("expected ToolProvider"),
@@ -571,7 +627,7 @@ mod tests {
 
     #[test]
     fn build_manifest_classifies_execution_mode_by_observable_effect() {
-        let manifest = build_manifest();
+        let manifest = build_manifest_for_host(true);
         let tools = match manifest.provides.first() {
             Some(ProviderRole::ToolProvider { tools, .. }) => tools,
             _ => panic!("expected ToolProvider"),
@@ -626,7 +682,8 @@ mod tests {
     /// Both are checked against their sources before being replaced, so the
     /// snapshot still pins everything else AFT puts on the wire.
     fn normalized_manifest_json() -> Value {
-        let mut manifest = serde_json::to_value(build_manifest()).expect("serialize manifest");
+        let mut manifest =
+            serde_json::to_value(build_manifest_for_host(true)).expect("serialize manifest");
         assert_eq!(manifest["module_version"], json!(env!("CARGO_PKG_VERSION")));
         manifest["module_version"] = json!("<CARGO_PKG_VERSION>");
         let tools = manifest["provides"][0]["tools"]
@@ -746,5 +803,177 @@ mod tests {
         assert_eq!(command_lane("hashline_preflight"), Lane::PureRead);
         assert_eq!(command_lane("bash_drain_completions"), Lane::PureRead);
         assert_eq!(command_lane("bash_ack_completions"), Lane::Mutating);
+    }
+
+    /// Every property name the generator marked consumer-only, per tool, read
+    /// from the raw embedded artifact before any stripping.
+    fn marked_consumer_only_properties() -> Vec<(String, String)> {
+        let mut marked = Vec::new();
+        for (tool, schema) in SUBC_TOOL_SCHEMAS.iter() {
+            if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+                for (name, property) in properties {
+                    if is_consumer_only(property) {
+                        marked.push((tool.clone(), name.clone()));
+                    }
+                }
+            }
+        }
+        marked
+    }
+
+    /// Collects every `properties` entry at any depth of a served schema.
+    fn collect_properties<'a>(schema: &'a Value, out: &mut Vec<(&'a str, &'a Value)>) {
+        match schema {
+            Value::Object(object) => {
+                if let Some(Value::Object(properties)) = object.get("properties") {
+                    for (name, property) in properties {
+                        out.push((name.as_str(), property));
+                    }
+                }
+                for value in object.values() {
+                    collect_properties(value, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_properties(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn served_catalog_carries_no_consumer_only_property() {
+        let marked = marked_consumer_only_properties();
+        // Guards against a vacuous pass: the plugins' bash flags must still be
+        // marked in the artifact, or there would be nothing to strip.
+        for expected in ["foreground_orchestrate", "block_to_completion", "shell"] {
+            assert!(
+                marked
+                    .iter()
+                    .any(|(tool, name)| tool == "bash" && name == expected),
+                "bash.{expected} must carry {CONSUMER_ONLY_MARKER} in subc_tool_schemas.json"
+            );
+        }
+
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let tools = match manifest.provides.first() {
+                Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+                _ => panic!("expected ToolProvider"),
+            };
+            for tool in tools {
+                let mut properties = Vec::new();
+                collect_properties(&tool.schema, &mut properties);
+                for (name, property) in properties {
+                    assert!(
+                        !is_consumer_only(property),
+                        "{}.{name} is marked consumer-only but is served to consumers",
+                        tool.name
+                    );
+                    assert!(
+                        !marked
+                            .iter()
+                            .any(|(marked_tool, marked_name)| marked_tool == &tool.name
+                                && marked_name == name),
+                        "{}.{name} is consumer-only but is served to consumers",
+                        tool.name
+                    );
+                    // Backstop for a consumer flag added without the marker:
+                    // the generator describes these as "Consumer-set".
+                    assert!(
+                        !property
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .is_some_and(|description| description.contains("Consumer-set")),
+                        "{}.{name} describes itself as consumer-set but is served to consumers",
+                        tool.name
+                    );
+                }
+                let required = tool
+                    .schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for (marked_tool, marked_name) in &marked {
+                    assert!(
+                        !(marked_tool == &tool.name
+                            && required.iter().any(|name| name == marked_name.as_str())),
+                        "{}.{marked_name} is consumer-only but still listed as required",
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_is_advertised_only_where_pwsh_can_run() {
+        let names = |powershell_available: bool| -> Vec<String> {
+            match build_manifest_for_host(powershell_available)
+                .provides
+                .first()
+            {
+                Some(ProviderRole::ToolProvider { tools, .. }) => {
+                    tools.iter().map(|tool| tool.name.clone()).collect()
+                }
+                _ => panic!("expected ToolProvider"),
+            }
+        };
+        let without = names(false);
+        assert!(
+            !without.iter().any(|name| name == "powershell"),
+            "a host without pwsh must not advertise the powershell tool: {without:?}"
+        );
+        assert!(without.iter().any(|name| name == "bash"));
+        assert_eq!(without.len(), CORE_TOOLS.len() - 1);
+
+        let with = names(true);
+        assert!(with.iter().any(|name| name == "powershell"));
+        assert_eq!(with.len(), CORE_TOOLS.len());
+
+        // Hiding the tool does not unroute it: a stray call still reaches the
+        // executor, which refuses it with an install-or-use-bash error.
+        assert!(is_subc_agent_core_tool("powershell"));
+
+        // The served default follows the host's real pwsh lookup.
+        let served = match build_manifest().provides.first() {
+            Some(ProviderRole::ToolProvider { tools, .. }) => {
+                tools.iter().any(|tool| tool.name == "powershell")
+            }
+            _ => panic!("expected ToolProvider"),
+        };
+        assert_eq!(served, crate::bash_background::powershell_available());
+    }
+
+    #[test]
+    fn consumer_only_bash_flags_still_reach_the_runtime() {
+        // Our plugins send these flags explicitly; stripping them from the
+        // served schema must not stop translation from carrying them through.
+        let translated = crate::subc_translate::subc_translate_owned(
+            "bash",
+            json!({
+                "command": "echo hi",
+                "foreground_orchestrate": false,
+                "block_to_completion": true,
+                "shell": "powershell",
+            }),
+            std::path::Path::new("/project"),
+        )
+        .expect("bash with consumer flags must translate");
+        assert_eq!(translated.command, "bash");
+        assert_eq!(translated.args["foreground_orchestrate"], json!(false));
+        assert_eq!(translated.args["block_to_completion"], json!(true));
+        assert_eq!(translated.args["shell"], json!("powershell"));
+
+        let bash_properties = tool_schema("bash");
+        let bash_properties = bash_properties["properties"]
+            .as_object()
+            .expect("bash properties");
+        for flag in ["foreground_orchestrate", "block_to_completion", "shell"] {
+            assert!(!bash_properties.contains_key(flag), "bash.{flag} leaked");
+        }
     }
 }

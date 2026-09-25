@@ -84,6 +84,19 @@ export function makeSubcSchemaStubCtx(): PluginContext {
   };
 }
 
+/**
+ * JSON Schema extension key marking a property that AFT's own plugins set and
+ * a model never should. This marker is the single record of which properties
+ * are consumer-only: the Rust manifest (`crates/aft/src/subc/manifest.rs`)
+ * strips every marked property before it serves the catalog to subc
+ * consumers, and the runtime still honours the value when a plugin sends it.
+ */
+export const CONSUMER_ONLY_MARKER = "x-aft-consumer-only";
+
+function consumerOnly(property: Record<string, unknown>): Record<string, unknown> {
+  return { ...property, [CONSUMER_ONLY_MARKER]: true };
+}
+
 function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
   const wrapped = z.object(def.args);
   const jsonSchema = z.toJSONSchema(wrapped, { io: "input" }) as Record<string, unknown>;
@@ -146,20 +159,22 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
 
   const bashSchema = argsToJsonSchema(bash);
   const bashProperties = (bashSchema.properties ??= {}) as Record<string, unknown>;
-  bashProperties.foreground_orchestrate = {
+  bashProperties.foreground_orchestrate = consumerOnly({
     type: "boolean",
     description: "Consumer-set flag enabling server-side foreground orchestration.",
-  };
-  bashProperties.block_to_completion = {
+  });
+  bashProperties.block_to_completion = consumerOnly({
     type: "boolean",
     description:
       "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
-  };
-  bashProperties.shell = {
+  });
+  bashProperties.shell = consumerOnly({
     type: "string",
     enum: ["powershell"],
     description: "Consumer-set shell selector for Pi's PowerShell tool.",
-  };
+  });
+  // The powershell entry is always generated; whether it is advertised is
+  // decided per host when the Rust manifest is served (only where pwsh runs).
   const powershellSchema = {
     ...bashSchema,
     description:

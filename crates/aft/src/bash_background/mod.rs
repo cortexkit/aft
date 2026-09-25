@@ -64,10 +64,22 @@ fn resolve_powershell_path_with(
     let candidate = "pwsh.exe";
     #[cfg(not(windows))]
     let candidate = "pwsh";
+    // The command is refused rather than handed to bash: a script written for
+    // PowerShell rarely means the same thing under bash, so running it anyway
+    // would be worse than a clear refusal. The message names both ways out.
     lookup(candidate).ok_or_else(|| {
-        "PowerShell (pwsh) is not installed or is not on PATH. Install PowerShell 7+: https://aka.ms/powershell"
+        "PowerShell (pwsh) is not installed or is not on PATH, so this command was not run. \
+         Rewrite it in bash syntax and call the bash tool without `shell: \"powershell\"`, \
+         or install PowerShell 7+: https://aka.ms/powershell"
             .to_string()
     })
+}
+
+/// Whether a PowerShell command could run on this host right now: the same
+/// `pwsh` lookup the executor performs before spawning. The subc manifest uses
+/// it to advertise the `powershell` tool only where it can actually run.
+pub(crate) fn powershell_available() -> bool {
+    resolve_powershell_path_with(|candidate| which::which(candidate).ok()).is_ok()
 }
 
 pub(crate) fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf, String> {
@@ -784,6 +796,8 @@ mod storage_root_tests {
         let error = super::resolve_powershell_path_with(|_| None).expect_err("pwsh is absent");
         assert!(error.contains("PowerShell (pwsh) is not installed"));
         assert!(error.contains("https://aka.ms/powershell"));
+        // The refusal must name the no-install fix too, not only installation.
+        assert!(error.contains("bash tool without `shell: \"powershell\"`"));
     }
 
     #[test]
