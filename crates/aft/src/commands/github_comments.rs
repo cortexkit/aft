@@ -404,7 +404,11 @@ pub(crate) fn run_governed_gh(
     let mut environment: HashMap<String, String> = std::env::vars().collect();
     // This `gh` run speaks for the requesting session. Its ticket is revoked
     // when this function returns, whether or not the shim used it.
-    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(req.session(), &req.id);
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(
+        req.session(),
+        &req.id,
+        &working_directory.display().to_string(),
+    );
     crate::agent_child_env::inject(
         &config,
         &ctx.storage_dir(),

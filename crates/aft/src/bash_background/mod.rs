@@ -193,7 +193,14 @@ pub fn spawn(
     // The ticket lets this command's `gh` shim relay bot writes for the
     // session that spawned it. Dropping it on any early return revokes it; a
     // spawned task's terminal transition revokes it after `bind_task`.
-    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue(session_id);
+    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue(
+        session_id,
+        &project_root
+            .as_deref()
+            .unwrap_or(&workdir)
+            .display()
+            .to_string(),
+    );
     if let Err(error) = crate::agent_child_env::inject(
         config.as_ref(),
         &child_storage_root,

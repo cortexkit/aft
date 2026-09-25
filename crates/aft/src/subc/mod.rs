@@ -3620,6 +3620,9 @@ where
     let (reliable_tx, mut reliable_rx) = mpsc::unbounded_channel::<PushEnvelope>();
     let (fleet_status_client, fleet_status_task) =
         spawn_fleet_status_dial(connection_file_path, 64);
+    // Serves the gh shim's bot-write relay on management routes; it dials
+    // prefrontal and plexus over its own connection, off the frame loop.
+    let gh_relay = crate::gh_shim_relay::GhRelay::new(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
         reliable_tx,
@@ -4042,7 +4045,21 @@ where
                     }
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
-                        let result = if management_routes.contains(&route) {
+                        let result = if management_routes.contains(&route)
+                            && gh_relay_operation(&frame).is_some()
+                        {
+                            // Management routes are bound only for first-party
+                            // principals (see the RouteBind arm), so the route
+                            // being here is the admission fact passed on.
+                            spawn_gh_relay(
+                                &writer_tx,
+                                &frame,
+                                &gh_relay,
+                                &dispatch_path_metrics,
+                                true,
+                            );
+                            Ok(())
+                        } else if management_routes.contains(&route) {
                             handle_management_request(
                                 &writer_tx,
                                 &frame,
@@ -5993,6 +6010,81 @@ fn memory_census_with_lifecycle(
         }
     }
     census
+}
+
+/// The gh shim relay operation a management request names, if any.
+fn gh_relay_operation(frame: &Frame) -> Option<String> {
+    serde_json::from_slice::<Value>(&frame.body)
+        .ok()?
+        .get("op")
+        .and_then(Value::as_str)
+        .filter(|operation| crate::gh_shim_relay::is_relay_operation(operation))
+        .map(str::to_string)
+}
+
+/// Run a gh shim relay request on its own task. The relay makes two network
+/// calls (prefrontal, then plexus); running them here keeps the subc frame
+/// loop free, and the relay holds no lock across them.
+fn spawn_gh_relay(
+    tx: &WriterSender,
+    frame: &Frame,
+    relay: &Arc<crate::gh_shim_relay::GhRelay>,
+    metrics: &Arc<DispatchPathMetrics>,
+    first_party: bool,
+) {
+    let tx = tx.clone();
+    let frame = frame.clone();
+    let relay = Arc::clone(relay);
+    let metrics = Arc::clone(metrics);
+    tokio::spawn(async move {
+        let decoded = serde_json::from_slice::<Value>(&frame.body).unwrap_or(Value::Null);
+        let operation = decoded
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let params = decoded.get("params").cloned().unwrap_or_else(|| json!({}));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let reply = crate::gh_shim_relay::relay(
+            &relay.transport,
+            &relay.cache,
+            crate::gh_shim_relay::RelayCall {
+                operation: &operation,
+                params: &params,
+                first_party,
+                now,
+            },
+            &|line| log::info!("{line}"),
+        )
+        .await;
+        let body = json!({
+            "op": operation,
+            "status": if reply.ok { "ok" } else { "error" },
+            "data": reply.data,
+        });
+        let Ok(body) = serde_json::to_vec(&body) else {
+            return;
+        };
+        let Ok(response) = Frame::build_with_version(
+            frame.header.ver,
+            FrameType::Response,
+            frame.header.flags,
+            frame.header.channel,
+            frame.header.epoch,
+            frame.header.corr,
+            body,
+        ) else {
+            return;
+        };
+        if let Err(error) =
+            send_reliable_writer_frame(&tx, &metrics, response, "gh shim relay response").await
+        {
+            log::warn!("gh_shim relay: could not queue the reply: {error}");
+        }
+    });
 }
 
 async fn send_management_response(

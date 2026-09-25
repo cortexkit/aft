@@ -10534,6 +10534,43 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         Some("root_not_bound")
     );
 
+    // The gh shim relay is served on the management route, and a ticket the
+    // daemon never issued is refused there without any outbound call.
+    send_management_request(
+        &mut stream,
+        2,
+        35,
+        json!({
+            "op": "gh_shim.bot_request",
+            "params": {
+                "ticket": "0123456789abcdef0123456789abcdef",
+                "request_nonce": "nonce-bridge",
+                "session": "typed-head-session",
+                "request": {"action": "issue comment", "metadata": {"agent_id": "a"}},
+            }
+        }),
+    )
+    .await;
+    let relay = read_management_response(&mut stream, 2, 35, "gh_shim.bot_request").await;
+    assert_eq!(relay.get("status").and_then(Value::as_str), Some("error"));
+    assert_eq!(
+        relay.pointer("/data/refusal_code").and_then(Value::as_str),
+        Some("ticket_unknown")
+    );
+
+    // A federated front is untrusted even as a direct principal, so it can
+    // never open the management route the relay is served on.
+    send_management_route_bind_with_harness(
+        &mut stream,
+        4,
+        41,
+        &root2,
+        "fed:facade",
+        Some(Principal::Direct),
+    )
+    .await;
+    expect_route_bind_error(&mut stream, 41, "route_refused").await;
+
     send_tool_call(&mut stream, 2, 32, "status", json!({})).await;
     expect_error_frame(&mut stream, 2, 32, "unknown_management_op").await;
 
@@ -11099,6 +11136,25 @@ async fn send_management_route_bind(
     identity_root: &std::path::Path,
     principal: Option<Principal>,
 ) {
+    send_management_route_bind_with_harness(
+        stream,
+        route_channel,
+        corr,
+        identity_root,
+        "prefrontal",
+        principal,
+    )
+    .await;
+}
+
+async fn send_management_route_bind_with_harness(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    identity_root: &std::path::Path,
+    harness: &str,
+    principal: Option<Principal>,
+) {
     send_control_request(
         stream,
         corr,
@@ -11110,7 +11166,7 @@ async fn send_management_route_bind(
             },
             identity: BindIdentity::new(
                 identity_root.to_path_buf(),
-                "prefrontal".to_string(),
+                harness.to_string(),
                 "management-route-must-not-register-session".to_string(),
             ),
             principal,

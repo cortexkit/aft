@@ -27,12 +27,16 @@ pub struct Redeemed {
     /// Background task id, or the id of the tool call that ran `gh` directly.
     /// Empty while a background task is still being spawned.
     pub task_id: String,
+    /// Project the command ran for; used only to label the daemon's own
+    /// routes to prefrontal and plexus, never to choose who speaks.
+    pub project_root: String,
 }
 
 struct Entry {
     ticket: [u8; TICKET_BYTES],
     session_id: String,
     task_id: String,
+    project_root: String,
 }
 
 static REGISTRY: LazyLock<Mutex<Vec<Entry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -75,7 +79,7 @@ fn constant_time_eq(left: &[u8; TICKET_BYTES], right: &[u8; TICKET_BYTES]) -> bo
     difference == 0
 }
 
-fn insert(session_id: &str, task_id: &str) -> Option<String> {
+fn insert(session_id: &str, task_id: &str, project_root: &str) -> Option<String> {
     if !session_can_hold_ticket(session_id) {
         return None;
     }
@@ -88,6 +92,7 @@ fn insert(session_id: &str, task_id: &str) -> Option<String> {
         ticket,
         session_id: session_id.to_string(),
         task_id: task_id.to_string(),
+        project_root: project_root.to_string(),
     });
     Some(encoded)
 }
@@ -103,6 +108,7 @@ pub fn redeem(ticket: &str) -> Option<Redeemed> {
             found = Some(Redeemed {
                 session_id: entry.session_id.clone(),
                 task_id: entry.task_id.clone(),
+                project_root: entry.project_root.clone(),
             });
         }
     }
@@ -144,9 +150,9 @@ pub struct PendingTicket {
 impl PendingTicket {
     /// Issue a ticket for `session_id`, or none for a session that is absent
     /// or the shared default namespace.
-    pub fn issue(session_id: &str) -> Self {
+    pub fn issue(session_id: &str, project_root: &str) -> Self {
         Self {
-            ticket: insert(session_id, ""),
+            ticket: insert(session_id, "", project_root),
         }
     }
 
@@ -188,9 +194,9 @@ pub struct ScopedTicket {
 }
 
 impl ScopedTicket {
-    pub fn issue(session_id: &str, call_id: &str) -> Self {
+    pub fn issue(session_id: &str, call_id: &str, project_root: &str) -> Self {
         Self {
-            ticket: insert(session_id, call_id),
+            ticket: insert(session_id, call_id, project_root),
         }
     }
 
@@ -213,8 +219,8 @@ mod tests {
 
     #[test]
     fn tickets_are_128_bit_hex_and_unique() {
-        let first = ScopedTicket::issue("ses-ticket-unique", "call-a");
-        let second = ScopedTicket::issue("ses-ticket-unique", "call-b");
+        let first = ScopedTicket::issue("ses-ticket-unique", "call-a", "/p");
+        let second = ScopedTicket::issue("ses-ticket-unique", "call-b", "/p");
         let first_value = first.value().unwrap();
         assert_eq!(first_value.len(), 32);
         assert!(first_value.chars().all(|c| c.is_ascii_hexdigit()));
@@ -223,22 +229,23 @@ mod tests {
 
     #[test]
     fn default_and_empty_sessions_get_no_ticket() {
-        assert!(PendingTicket::issue(crate::protocol::DEFAULT_SESSION_ID)
+        assert!(PendingTicket::issue(crate::protocol::DEFAULT_SESSION_ID, "/p")
             .value()
             .is_none());
-        assert!(PendingTicket::issue("").value().is_none());
-        assert!(ScopedTicket::issue("  ", "call").value().is_none());
+        assert!(PendingTicket::issue("", "/p").value().is_none());
+        assert!(ScopedTicket::issue("  ", "call", "/p").value().is_none());
     }
 
     #[test]
     fn redeem_returns_the_issuing_session_and_task() {
-        let pending = PendingTicket::issue("ses-redeem");
+        let pending = PendingTicket::issue("ses-redeem", "/p");
         let value = pending.value().unwrap().to_string();
         assert_eq!(
             redeem(&value),
             Some(Redeemed {
                 session_id: "ses-redeem".to_string(),
                 task_id: String::new(),
+                project_root: "/p".to_string(),
             })
         );
         pending.bind_task("task-redeem");
@@ -249,7 +256,7 @@ mod tests {
 
     #[test]
     fn fabricated_and_malformed_tickets_do_not_redeem() {
-        let _live = ScopedTicket::issue("ses-fabricated", "call");
+        let _live = ScopedTicket::issue("ses-fabricated", "call", "/p");
         assert_eq!(redeem("00000000000000000000000000000000"), None);
         assert_eq!(redeem("ses-fabricated"), None);
         assert_eq!(redeem(""), None);
@@ -258,7 +265,7 @@ mod tests {
 
     #[test]
     fn dropping_an_unbound_pending_ticket_revokes_it() {
-        let pending = PendingTicket::issue("ses-drop");
+        let pending = PendingTicket::issue("ses-drop", "/p");
         let value = pending.value().unwrap().to_string();
         drop(pending);
         assert_eq!(redeem(&value), None);
@@ -267,7 +274,7 @@ mod tests {
     #[test]
     fn scoped_ticket_dies_with_its_scope() {
         let value = {
-            let scoped = ScopedTicket::issue("ses-scoped", "call-scoped");
+            let scoped = ScopedTicket::issue("ses-scoped", "call-scoped", "/p");
             let value = scoped.value().unwrap().to_string();
             assert!(redeem(&value).is_some());
             value

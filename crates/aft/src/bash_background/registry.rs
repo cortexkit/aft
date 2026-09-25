@@ -9959,7 +9959,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
         let session = "ses-ticket-lifecycle";
-        let pending = crate::gh_shim_ticket::PendingTicket::issue(session);
+        let pending = crate::gh_shim_ticket::PendingTicket::issue(session, "/project");
         let ticket = pending.value().unwrap().to_string();
         let env = HashMap::from([(
             crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),
@@ -9991,6 +9991,7 @@ mod tests {
             Some(crate::gh_shim_ticket::Redeemed {
                 session_id: session.to_string(),
                 task_id: task_id.clone(),
+                project_root: "/project".to_string(),
             }),
             "a running task's ticket redeems to its own session"
         );

@@ -358,6 +358,19 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                         kind: ManagementOperationKind::Query,
                         description: None,
                     },
+                    // The gh shim's bot-write relay. It is plumbing, not an agent
+                    // tool: the caller's per-command ticket is its only
+                    // authority (see `crate::gh_shim_relay`).
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::BOT_REQUEST_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Mutate,
+                        description: None,
+                    },
+                    ManagementOperation {
+                        name: crate::gh_shim_relay::BINDINGS_READ_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    },
                 ],
                 config_schema: json!({
                     "type": "object",
@@ -547,6 +560,14 @@ mod tests {
                 ),
                 (
                     crate::commands::writes_census::WRITES_CENSUS_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
+                (
+                    crate::gh_shim_relay::BOT_REQUEST_OPERATION,
+                    &ManagementOperationKind::Mutate,
+                ),
+                (
+                    crate::gh_shim_relay::BINDINGS_READ_OPERATION,
                     &ManagementOperationKind::Query,
                 ),
             ]
@@ -741,6 +762,16 @@ mod tests {
             management.insert("concurrency".to_string(), json!("module_managed")),
             None
         );
+        // The snapshot predates the gh shim relay operations, so they are
+        // appended to its management operation list here.
+        management
+            .get_mut("operations")
+            .and_then(Value::as_array_mut)
+            .expect("management operations")
+            .extend([
+                json!({"name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate"}),
+                json!({"name": crate::gh_shim_relay::BINDINGS_READ_OPERATION, "kind": "query"}),
+            ]);
         // AFT registers not-ready and flips itself ready after warm-up (see
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");

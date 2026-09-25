@@ -1,0 +1,55 @@
+{
+  "caller_principal": "reserved:prefrontal-core",
+  "refusal": {
+    "repo_binding_generation": 1,
+    "result": {
+      "refusal_code": "assertion_absent",
+      "status": "refused"
+    }
+  },
+  "request": {
+    "assertion": {
+      "claims": {
+        "agent_id": "agent-fixture",
+        "binding_generation": 1,
+        "exp": 1700003600,
+        "handle": "app-fixture[bot]",
+        "iat": 1700000000,
+        "installation_id": 42,
+        "jti": "fixture-jti",
+        "scope": [
+          "github.speech"
+        ],
+        "surface": "github",
+        "v": 1
+      },
+      "generation": 1,
+      "signature_hex": "1929ff02dd6e511a8347b1cc3409a881384b66aba45f809cd7638c22f5180d3688fb40e810684d60a458cfe0c1e1d408417e1f64e1ac04c7204ed723a9af2d0c"
+    },
+    "request": {
+      "action": "issue reaction",
+      "body": {
+        "reaction": "eyes"
+      },
+      "gh_route_schema": 1,
+      "manifest_version": 14,
+      "metadata": {
+        "agent_id": "agent-fixture",
+        "pid": 6092
+      },
+      "operation": "gh.route",
+      "repository": "org/repo",
+      "rung_as_of_unix_secs": 1790209659,
+      "target": {
+        "number": "42"
+      }
+    },
+    "request_nonce": "seen-marker-nonce"
+  },
+  "success": {
+    "repo_binding_generation": 1,
+    "result": {
+      "status": "completed"
+    }
+  }
+}
