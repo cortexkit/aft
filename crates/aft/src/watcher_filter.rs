@@ -693,6 +693,16 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
 ///    volume rank next, heaviest first, ahead of every unobserved candidate.
 ///    Observed volume is the only direct evidence of which directory fills
 ///    the kernel queue; an unobserved `node_modules` copy is only a guess.
+///    Ranking is not admission, though: one existing representative of each
+///    enabled ecosystem keeps a reserved slot, because the next build or
+///    install writes into it. When the budget cannot hold every observed
+///    directory and every such representative, observed directories get the
+///    larger half of the slots after `.git` and representatives the rest.
+///    Volume is recorded against the highest ignored ancestor of each event
+///    (see `observed_exclusion_prefixes`), so a flood spread over sibling
+///    folders of one ignored directory costs a single slot; siblings under a
+///    directory that is not itself ignored cannot collapse, since excluding
+///    that parent would hide files it tracks.
 /// 3. When no candidate has observed event volume, one representative of
 ///    every enabled ecosystem name ranks before a second copy of any name.
 ///    This fallback breadth keeps one workspace ecosystem from spending the
@@ -1044,6 +1054,18 @@ fn derive_exclusion_plan(
             })
             .or_insert(candidate_index);
     }
+    // Representatives that exist on disk hold build output or dependencies
+    // right now, so the next build or install writes into them. After an
+    // overflow these keep a slot even though they produced no recorded
+    // events: evicting them for a busy folder would trade the overflow that
+    // just happened for the one the next `cargo build` or `bun install` causes.
+    // `.git` is ecosystem priority zero but has its own fixed slot.
+    let existing_representatives = ecosystem_representatives
+        .values()
+        .map(|index| &candidates[*index])
+        .filter(|candidate| candidate.exists && candidate.relative != Path::new(".git"))
+        .map(|candidate| candidate.relative.clone())
+        .collect::<BTreeSet<_>>();
     let ecosystem_representatives = ecosystem_representatives
         .into_values()
         .map(|index| candidates[index].relative.clone())
@@ -1101,10 +1123,62 @@ fn derive_exclusion_plan(
             })
     });
 
+    // Slot budget after an overflow. The sort above puts observed folders
+    // first, and admitted in that order a flood spread over many folders
+    // would take every slot and push out the existing build-output and
+    // dependency folders. Each kind therefore gets a reservation:
+    //
+    // - existing ecosystem representatives (one per ecosystem name, never a
+    //   second copy) and observed folders each keep the slots they need while
+    //   the budget holds both;
+    // - when it cannot, observed folders get the larger half of the slots
+    //   after `.git` (they are the measured cause of the overflow that just
+    //   happened) and ecosystem representatives get the rest in ecosystem
+    //   priority order, so neither kind can take every slot;
+    // - a slot one kind does not need goes to the other, and everything else
+    //   (absent seeds, second copies, plain ignored boundaries) fills what is
+    //   left in rank order.
+    //
+    // Without observed volume the ranking alone already places every
+    // representative first, so no reservation is applied and a fresh seed is
+    // unchanged.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SlotKind {
+        RootGit,
+        ExistingEcosystem,
+        Observed,
+        Other,
+    }
+    let slot_kind = |candidate: &Candidate| {
+        if is_root_git(candidate) {
+            SlotKind::RootGit
+        } else if has_observed_candidates && existing_representatives.contains(&candidate.relative)
+        {
+            SlotKind::ExistingEcosystem
+        } else if candidate.source == WatcherExclusionSource::Observed {
+            SlotKind::Observed
+        } else {
+            SlotKind::Other
+        }
+    };
     let limit = max_paths.unwrap_or(usize::MAX);
+    let available = limit.saturating_sub(usize::from(candidates.iter().any(is_root_git)));
+    let count_kind = |kind: SlotKind| {
+        candidates
+            .iter()
+            .filter(|candidate| slot_kind(candidate) == kind)
+            .count()
+    };
+    let observed_wanted = count_kind(SlotKind::Observed);
+    let ecosystem_wanted = count_kind(SlotKind::ExistingEcosystem);
+    let mut ecosystem_outstanding =
+        ecosystem_wanted.min(available - observed_wanted.min(available.div_ceil(2)));
+    let mut observed_outstanding = observed_wanted.min(available - ecosystem_outstanding);
+
     let mut selected = Vec::<WatcherExclusion>::new();
     let mut dropped = Vec::<WatcherExclusion>::new();
     for candidate in candidates {
+        let kind = slot_kind(&candidate);
         if coverage == WatcherExclusionCoverage::Subtree
             && candidate.source != WatcherExclusionSource::Observed
         {
@@ -1122,6 +1196,11 @@ fn derive_exclusion_plan(
                     && selected_relative.components().count() < candidate_depth
             });
             if nested_copy {
+                // A covered representative needs no slot of its own, so its
+                // reservation is released for whatever ranks next.
+                if kind == SlotKind::ExistingEcosystem {
+                    ecosystem_outstanding = ecosystem_outstanding.saturating_sub(1);
+                }
                 continue;
             }
         }
@@ -1129,13 +1208,29 @@ fn derive_exclusion_plan(
             path: candidate.path,
             source: candidate.source,
         };
-        if selected.len() < limit {
+        let reserved_for_others = match kind {
+            SlotKind::RootGit => 0,
+            SlotKind::ExistingEcosystem => observed_outstanding,
+            SlotKind::Observed => ecosystem_outstanding,
+            SlotKind::Other => ecosystem_outstanding + observed_outstanding,
+        };
+        if limit.saturating_sub(selected.len()) > reserved_for_others {
+            match kind {
+                SlotKind::ExistingEcosystem => {
+                    ecosystem_outstanding = ecosystem_outstanding.saturating_sub(1);
+                }
+                SlotKind::Observed => {
+                    observed_outstanding = observed_outstanding.saturating_sub(1);
+                }
+                SlotKind::RootGit | SlotKind::Other => {}
+            }
             selected.push(exclusion);
             continue;
         }
-        dropped.push(exclusion);
-        if dropped.len() >= WATCHER_DROPPED_CANDIDATE_LOG_LIMIT {
-            break;
+        // Reserved slots can still be claimed further down the ranking, so
+        // the scan continues past a full dropped list.
+        if dropped.len() < WATCHER_DROPPED_CANDIDATE_LOG_LIMIT {
+            dropped.push(exclusion);
         }
     }
     WatcherExclusionPlan { selected, dropped }
@@ -2578,6 +2673,271 @@ mod tests {
                 !paths.contains(&never),
                 "{} holds un-ignored paths and must never be excluded: {paths:?}",
                 never.display()
+            );
+        }
+        counters.set_observed_exclusion_prefixes(Vec::new());
+    }
+
+    /// Feed `burst` through a filter thread followed by an overflow, so the
+    /// thread records observed volume the way a live overflow does.
+    fn record_overflow_burst(root: &Path, matcher: &SharedGitignore, burst: Vec<PathBuf>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root.to_path_buf(), None),
+            Arc::clone(matcher),
+            Arc::new(AtomicU64::new(1)),
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+        for path in burst {
+            raw_tx
+                .send(Ok(
+                    notify::Event::new(EventKind::Create(CreateKind::File)).add_path(path)
+                ))
+                .unwrap();
+        }
+        raw_tx
+            .send(Ok(
+                notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
+            ))
+            .unwrap();
+        assert_eq!(
+            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+    }
+
+    const AGENT_SCRATCH_SIBLINGS: [&str; 7] = [
+        "prompts", "drafts", "plans", "audit", "context", "handoffs", "notepads",
+    ];
+
+    /// A Rust + JS workspace with build output and dependency folders on disk,
+    /// plus an agent scratch directory with seven busy sibling folders.
+    fn mixed_workspace_with_agent_scratch(ignore_rules: &str) -> (TempDir, PathBuf) {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), ignore_rules).unwrap();
+        for existing in [
+            "target",
+            "node_modules",
+            "packages/opencode/node_modules",
+            "packages/core/node_modules",
+            "packages/core/dist",
+            "modules/condition-runner/node_modules",
+            ".cortexkit/alfonso/rules",
+        ] {
+            std::fs::create_dir_all(root.path().join(existing)).unwrap();
+        }
+        for sibling in AGENT_SCRATCH_SIBLINGS {
+            std::fs::create_dir_all(root.path().join(".cortexkit/alfonso").join(sibling)).unwrap();
+        }
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        (root, canonical_root)
+    }
+
+    fn agent_scratch_burst(root: &Path) -> Vec<PathBuf> {
+        let alfonso = root.join(".cortexkit/alfonso");
+        AGENT_SCRATCH_SIBLINGS
+            .iter()
+            .flat_map(|sibling| {
+                let alfonso = alfonso.clone();
+                (0..70).map(move |index| alfonso.join(sibling).join(format!("{index}.md")))
+            })
+            .collect()
+    }
+
+    /// Events spread over the sibling folders of an ignored directory collapse
+    /// into one exclusion of that directory, and the build output and
+    /// dependency folders on disk keep their slots.
+    #[test]
+    fn overflow_across_siblings_of_an_ignored_directory_costs_one_slot() {
+        let (_root, canonical_root) = mixed_workspace_with_agent_scratch(
+            ".cortexkit/alfonso/\nnode_modules/\ndist/\n/target/\n",
+        );
+        let matcher = shared_matcher(&canonical_root);
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        record_overflow_burst(
+            &canonical_root,
+            &matcher,
+            agent_scratch_burst(&canonical_root),
+        );
+
+        assert_eq!(
+            counters.observed_exclusion_prefixes(),
+            vec![crate::context::WatcherOverflowPrefix {
+                prefix: ".cortexkit/alfonso".to_string(),
+                count: 490,
+            }]
+        );
+        let alfonso = canonical_root.join(".cortexkit/alfonso");
+        for coverage in [
+            WatcherExclusionCoverage::ExactPath,
+            WatcherExclusionCoverage::Subtree,
+        ] {
+            let selected = derive_exclusion_plan(
+                &canonical_root,
+                &matcher,
+                Some(WATCHER_EXCLUSION_LIMIT),
+                coverage,
+            )
+            .selected;
+            let paths = watcher_exclusion_paths(&selected);
+            assert_eq!(
+                paths[0],
+                canonical_root.join(".git"),
+                "{coverage:?}: {paths:?}"
+            );
+            assert_eq!(paths[1], alfonso, "{coverage:?}: {paths:?}");
+            // The `watcher exclusions:` log line labels this exclusion `by=observed`.
+            assert_eq!(selected[1].source().as_str(), "observed");
+            assert_eq!(
+                paths
+                    .iter()
+                    .filter(|path| path.starts_with(canonical_root.join(".cortexkit")))
+                    .count(),
+                1,
+                "{coverage:?}: the ignored directory must hold exactly one slot: {paths:?}"
+            );
+            for kept in ["target", "node_modules"] {
+                assert!(
+                    paths.contains(&canonical_root.join(kept)),
+                    "{coverage:?}: {kept} lost its slot: {paths:?}"
+                );
+            }
+        }
+        counters.set_observed_exclusion_prefixes(Vec::new());
+    }
+
+    /// The same flood where the scratch directory itself is not ignored: only
+    /// its children are, and one child is re-included because it is tracked.
+    /// The parent can never be excluded, so the siblings cannot collapse into
+    /// one slot, and they must not take every slot either: `target`,
+    /// `node_modules` and `dist` exist on disk and the next build or install
+    /// would overflow the watcher again if they lost their exclusion.
+    #[test]
+    fn busy_sibling_folders_do_not_evict_existing_build_output_exclusions() {
+        let (_root, canonical_root) = mixed_workspace_with_agent_scratch(
+            ".cortexkit/alfonso/*\n!.cortexkit/alfonso/rules/\nnode_modules/\ndist/\n/target/\n",
+        );
+        let matcher = shared_matcher(&canonical_root);
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let alfonso = canonical_root.join(".cortexkit/alfonso");
+        let mut burst = agent_scratch_burst(&canonical_root);
+        burst.extend((0..20).map(|index| alfonso.join(format!("rules/{index}.md"))));
+        record_overflow_burst(&canonical_root, &matcher, burst);
+
+        for coverage in [
+            WatcherExclusionCoverage::ExactPath,
+            WatcherExclusionCoverage::Subtree,
+        ] {
+            let plan = derive_exclusion_plan(
+                &canonical_root,
+                &matcher,
+                Some(WATCHER_EXCLUSION_LIMIT),
+                coverage,
+            );
+            let paths = watcher_exclusion_paths(&plan.selected);
+            assert_eq!(
+                paths.len(),
+                WATCHER_EXCLUSION_LIMIT,
+                "{coverage:?}: {paths:?}"
+            );
+            assert_eq!(
+                paths[0],
+                canonical_root.join(".git"),
+                "{coverage:?}: {paths:?}"
+            );
+            assert!(
+                paths.contains(&canonical_root.join("target")),
+                "{coverage:?}: target lost its slot: {paths:?}"
+            );
+            // Which copy represents a name is the representative rule's
+            // choice; what matters here is that the name keeps one.
+            for kept in ["node_modules", "dist"] {
+                assert!(
+                    paths
+                        .iter()
+                        .any(|path| path.file_name() == Some(std::ffi::OsStr::new(kept))),
+                    "{coverage:?}: every {kept} lost its slot: {paths:?}"
+                );
+            }
+            let observed = plan
+                .selected
+                .iter()
+                .filter(|exclusion| exclusion.source() == WatcherExclusionSource::Observed)
+                .count();
+            assert!(
+                observed >= 1,
+                "{coverage:?}: the folders that flooded lost every slot: {paths:?}"
+            );
+            for never in [alfonso.clone(), alfonso.join("rules")] {
+                assert!(
+                    !paths.contains(&never),
+                    "{coverage:?}: {} is not ignored and must never be excluded: {paths:?}",
+                    never.display()
+                );
+            }
+        }
+        counters.set_observed_exclusion_prefixes(Vec::new());
+    }
+
+    /// A folder that is not ignored is never excluded, however busy: neither
+    /// when its volume comes from a live overflow nor from a stored ranking.
+    #[test]
+    fn busy_folder_that_is_not_ignored_is_never_excluded() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join(".gitignore"), "generated-cache/\n").unwrap();
+        std::fs::create_dir_all(root.path().join("src/generated/nested")).unwrap();
+        std::fs::create_dir_all(root.path().join("generated-cache")).unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let busy = canonical_root.join("src/generated");
+        record_overflow_burst(
+            &canonical_root,
+            &matcher,
+            (0..300)
+                .map(|index| busy.join(format!("nested/{index}.rs")))
+                .collect(),
+        );
+        assert!(
+            counters.observed_exclusion_prefixes().is_empty(),
+            "volume in tracked folders has no excludable owner: {:?}",
+            counters.observed_exclusion_prefixes()
+        );
+
+        // A ranking stored by an older build could still name the folder.
+        counters.set_observed_exclusion_prefixes(vec![crate::context::WatcherOverflowPrefix {
+            prefix: "src/generated".to_string(),
+            count: 300,
+        }]);
+        for coverage in [
+            WatcherExclusionCoverage::ExactPath,
+            WatcherExclusionCoverage::Subtree,
+        ] {
+            let paths = watcher_exclusion_paths(
+                &derive_exclusion_plan(
+                    &canonical_root,
+                    &matcher,
+                    Some(WATCHER_EXCLUSION_LIMIT),
+                    coverage,
+                )
+                .selected,
+            );
+            assert!(
+                paths
+                    .iter()
+                    .all(|path| !path.starts_with(canonical_root.join("src"))),
+                "{coverage:?}: a tracked folder was excluded: {paths:?}"
             );
         }
         counters.set_observed_exclusion_prefixes(Vec::new());
