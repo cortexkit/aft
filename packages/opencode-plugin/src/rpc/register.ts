@@ -1,4 +1,8 @@
-import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
+import {
+  type AftProjectTransport,
+  type AftTransportPool,
+  configErrorStatusSnapshot,
+} from "@cortexkit/aft-bridge";
 import { Effect, type Scope } from "effect";
 
 import {
@@ -239,6 +243,40 @@ export function registerAftRpc(
         bridgeUnsubscribes.clear();
         restoreOwnProperty(pool, "getBridge", ownGetBridge);
         restoreOwnProperty(pool, "toolCall", ownToolCall);
+        await Effect.runPromise(registration.dispose);
+      },
+    };
+  });
+}
+
+/**
+ * Status endpoint for the config error state. There is no bridge to observe,
+ * so every status request answers with the configuration error, which the
+ * sidebar and footer render as one line.
+ */
+export function registerAftConfigErrorRpc(
+  context: AftRpcContext,
+  message: string,
+): Effect.Effect<RegisteredAftRpc, unknown, Scope.Scope> {
+  return Effect.gen(function* () {
+    let disposed = false;
+    const registration = yield* context.rpc.register(AftRpc, {
+      getStatus: () => Effect.succeed(configErrorStatusSnapshot(message)),
+    });
+    const emit = async (
+      name: keyof typeof AftRpc.events,
+      payload: Record<string, unknown>,
+    ): Promise<void> => {
+      if (disposed) return;
+      await Effect.runPromise(registration.events.emit(name, payload));
+    };
+    return {
+      emitStatusInvalidated: (payload = {}) => emit("statusInvalidated", payload),
+      emitShowStatusDialog: (payload = {}) => emit("showStatusDialog", payload),
+      emitIndexProgress: (payload) => emit("indexProgress", payload),
+      async dispose() {
+        if (disposed) return;
+        disposed = true;
         await Effect.runPromise(registration.dispose);
       },
     };

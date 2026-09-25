@@ -125,6 +125,12 @@ export interface AftStatusSnapshot {
    * Empty string when the snapshot is real bridge data.
    */
   message: string;
+  /**
+   * Present only when the plugin is in the config error state: its
+   * configuration could not be used, so no bridge runs and every tool call
+   * fails with this text. `message` then carries its one-line form.
+   */
+  config_error?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -324,6 +330,9 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     status_bar: readStatusBar(response.status_bar),
     status_bar_values: readStatusBar(response.status_bar_values),
     message: readString(response.message, ""),
+    ...(typeof response.config_error === "string" && response.config_error.length > 0
+      ? { config_error: response.config_error }
+      : {}),
   };
 }
 

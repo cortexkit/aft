@@ -6,15 +6,16 @@ import {
   createProjectAcceptance,
   createSharedPoolOptions,
   defaultBridgeBootstrapDependencies,
-  loadBootstrapConfig,
   prepareBridgeEnvironment,
   reportHashlineDowngrade,
+  resolveBootstrapConfig,
   unknownDisabledToolsReporter,
 } from "../bridge-bootstrap.js";
 import { resolveBridgePoolTransportOptions } from "../config.js";
+import { buildConfigErrorToolMap } from "../config-error-surface.js";
 import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
-import { registerAftRpc } from "../rpc/register.js";
+import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
 import { createV2RuntimeConsumer } from "../wakes/runtime-consumer.js";
 import {
@@ -31,6 +32,7 @@ const defaults = {
   buildToolMap: buildAftToolDefinitions,
   registerTools: registerAftTools,
   registerRpc: registerAftRpc,
+  registerConfigErrorRpc: registerAftConfigErrorRpc,
   toolConsumers: (context) => ({
     ...hoistedV2ToolConsumers(context),
     ...createV2RuntimeConsumer(context),
@@ -46,8 +48,24 @@ async function bootLocation(context, location, dependencies) {
   // The V2 host has no session UI to deliver startup warnings into, so they
   // go to the plugin log.
   const notify = (message) => warn(message);
-  const config = loadBootstrapConfig(directory, notify, dependencies);
-  if (!config) return undefined;
+  const bootstrap = await resolveBootstrapConfig(directory, notify, dependencies);
+  if (!bootstrap.ok) {
+    // The config error state: register the tool surface with every call
+    // failing, and acquire no bridge.
+    log(`AFT is in the config error state for ${directory}; every tool call will fail`);
+    return {
+      configError: bootstrap.message,
+      consumers: {},
+      pool: null,
+      tools: buildConfigErrorToolMap(
+        bootstrap.config,
+        bootstrap.message,
+        context,
+        dependencies.buildToolMap,
+      ),
+    };
+  }
+  const config = bootstrap.config;
 
   const pluginVersion = dependencies.resolveVersion();
   const environment = await prepareBridgeEnvironment(
@@ -119,6 +137,13 @@ export function makeServerEffect(overrides = {}) {
     return Effect.gen(function* () {
       const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies));
       if (!runtime) return;
+
+      if (runtime.configError !== undefined) {
+        const rpc = yield* dependencies.registerConfigErrorRpc(context, runtime.configError);
+        yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
+        yield* dependencies.registerTools(context, location, runtime.tools, runtime.consumers);
+        return;
+      }
 
       yield* Effect.addFinalizer(() =>
         Effect.promise(async () => {

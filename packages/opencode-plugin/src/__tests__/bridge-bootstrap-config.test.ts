@@ -11,8 +11,10 @@ import { describe, expect, test } from "bun:test";
 import {
   type BridgeBootstrapDependencies,
   createProjectAcceptance,
+  defaultSurfaceConfig,
   loadBootstrapConfig,
   reportHashlineDowngrade,
+  resolveBootstrapConfig,
   unknownDisabledToolsReporter,
 } from "../bridge-bootstrap.js";
 import { type AftConfig, ConfigRejectedError } from "../config.js";
@@ -29,13 +31,49 @@ const rejecting = (directory: string): AftConfig => {
 };
 
 describe("bootstrap configuration", () => {
-  test("a rejected configuration returns null, reports once, and skips migration", () => {
+  test("a rejected configuration yields the config error state, reports once, and skips migration", () => {
     const notices: string[] = [];
-    expect(
-      loadBootstrapConfig("/p", (message) => notices.push(message), dependencies(rejecting)),
-    ).toBeNull();
-    expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain("removed_config_key:aft_glob:use:glob");
+    const result = loadBootstrapConfig(
+      "/p",
+      (message) => notices.push(message),
+      dependencies(rejecting),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.message).toContain("removed_config_key:aft_glob:use:glob");
+    expect(result.message).toContain("npx @cortexkit/aft doctor --fix");
+    expect(result.message).toContain("restart");
+    // Too broken to compute its own surface: the default surface registers.
+    expect(result.config).toEqual(defaultSurfaceConfig());
+    expect(notices).toEqual([result.message]);
+  });
+
+  test("a config file that does not parse yields the config error state", () => {
+    const notices: string[] = [];
+    const result = loadBootstrapConfig("/p", (message) => notices.push(message), {
+      ...dependencies(() => ({ disabled_tools: [] }) as AftConfig),
+      configLoadErrors: () => [{ path: "/p/aft.jsonc", message: "Unexpected token }" }],
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unreachable");
+    expect(result.message).toContain("/p/aft.jsonc failed to parse: Unexpected token }");
+    expect(result.message).toContain("Fix the JSONC syntax");
+    expect(result.config).toEqual(defaultSurfaceConfig());
+    // Migration never ran: the only notice is the error itself.
+    expect(notices).toEqual([result.message]);
+  });
+
+  test("a missing subc connection file yields the config error state with the loaded surface", async () => {
+    const config = { disabled_tools: ["aft_move"], subc: { connection_file: "/nope" } } as AftConfig;
+    const result = await resolveBootstrapConfig("/p", () => {}, {
+      ...dependencies(() => config),
+      subcConnectionFileError: async (file) => (file ? `missing ${file}` : null),
+    });
+    expect(result).toEqual({
+      ok: false,
+      message: expect.stringContaining("missing /nope."),
+      config,
+    });
   });
 
   test("the retired top-level enabled key no longer stops the boot", () => {
@@ -47,7 +85,7 @@ describe("bootstrap configuration", () => {
         (message) => notices.push(message),
         dependencies(() => config),
       ),
-    ).toBe(config);
+    ).toEqual({ ok: true, config });
     expect(notices).toEqual(["migrated"]);
   });
 

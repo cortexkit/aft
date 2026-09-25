@@ -1,9 +1,25 @@
 import { describe, expect, test } from "bun:test";
-import { Effect } from "effect";
+import { subcConnectionFileError } from "@cortexkit/aft-bridge";
+import { Cause, Effect } from "effect";
 import { z } from "zod";
 
 import { ConfigRejectedError } from "../../src/config.js";
 import { makeServerEffect } from "../../src/entry/server-runtime.mjs";
+
+/** A registered V2 tool call fails (an Effect failure, red in the host) with the fix text. */
+async function expectConfigErrorCall(tool: Record<string, unknown> | undefined, fix: string) {
+  const registered = tool as {
+    execute(input: unknown, context: unknown): Effect.Effect<Record<string, unknown>, Error>;
+  };
+  const exit = await Effect.runPromiseExit(
+    registered.execute({ value: "x" }, { progress: () => Effect.void }),
+  );
+  expect(exit._tag).toBe("Failure");
+  if (exit._tag !== "Failure") return;
+  const text = Cause.pretty(exit.cause);
+  expect(text).toContain(fix);
+  expect(text).toContain("restart");
+}
 
 function testDependencies(events: string[]) {
   return {
@@ -44,6 +60,15 @@ function testDependencies(events: string[]) {
         return {
           dispose: async () => {
             events.push(`rpc-dispose:${location.directory}`);
+          },
+        };
+      }),
+    registerConfigErrorRpc: () =>
+      Effect.sync(() => {
+        events.push("config-error-rpc");
+        return {
+          dispose: async () => {
+            events.push("config-error-rpc-dispose");
           },
         };
       }),
@@ -214,10 +239,11 @@ describe("V2 server effect", () => {
     });
   });
 
-  test("keeps a Location with a rejected configuration inert", async () => {
-    // Top-level `enabled` is retired; only a rejected configuration keeps AFT
-    // from doing any work for a Location.
+  test("a rejected configuration registers failing tools and acquires no bridge", async () => {
+    // Top-level `enabled` is retired; a rejected configuration puts the
+    // Location in the config error state instead of leaving it without tools.
     const events: string[] = [];
+    const added: Array<Record<string, unknown>> = [];
     const dependencies = {
       ...testDependencies(events),
       loadConfig: (directory: string) => {
@@ -225,11 +251,59 @@ describe("V2 server effect", () => {
         throw new ConfigRejectedError(["removed_config_key:aft_glob:use:glob"], directory);
       },
     };
-    const host = hostContext("/work/rejected", events, []);
+    const host = hostContext("/work/rejected", events, added);
 
     await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(host.context)));
 
-    expect(events).toEqual(["location:/work/rejected", "config:/work/rejected"]);
+    expect(events).toEqual([
+      "location:/work/rejected",
+      "config:/work/rejected",
+      "tools:",
+      "config-error-rpc",
+      "transform:/work/rejected",
+      "add:/work/rejected:aft_probe",
+      "config-error-rpc-dispose",
+    ]);
+    await expectConfigErrorCall(added[0], "npx @cortexkit/aft doctor --fix");
+  });
+
+  test("a config file that does not parse registers failing tools and acquires no bridge", async () => {
+    const events: string[] = [];
+    const added: Array<Record<string, unknown>> = [];
+    const dependencies = {
+      ...testDependencies(events),
+      configLoadErrors: () => [{ path: "/work/p/aft.jsonc", message: "Unexpected end" }],
+    };
+    const host = hostContext("/work/p", events, added);
+
+    await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(host.context)));
+
+    expect(events.some((event) => event.startsWith("acquire:"))).toBe(false);
+    expect(events.some((event) => event.startsWith("binary:"))).toBe(false);
+    expect(added.map((tool) => tool.name)).toEqual(["aft_probe"]);
+    await expectConfigErrorCall(added[0], "Fix the JSONC syntax in that file");
+  });
+
+  test("a missing subc connection file registers failing tools and acquires no bridge", async () => {
+    const events: string[] = [];
+    const added: Array<Record<string, unknown>> = [];
+    const dependencies = {
+      ...testDependencies(events),
+      loadConfig: () => ({ subc: { connection_file: "/nowhere/subc.json" } }),
+      // The real check, against a path that does not exist.
+      subcConnectionFileError,
+    };
+    const host = hostContext("/work/subc", events, added);
+
+    await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(host.context)));
+
+    expect(events.some((event) => event.startsWith("acquire:"))).toBe(false);
+    expect(events.some((event) => event.startsWith("binary:"))).toBe(false);
+    expect(events).toContain("config-error-rpc");
+    await expectConfigErrorCall(
+      added[0],
+      "Start the Subconscious daemon, correct the path, or remove subc.connection_file",
+    );
   });
 
   test("returns a no-op when the host context has no location", async () => {

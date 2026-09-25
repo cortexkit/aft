@@ -1,8 +1,10 @@
 import {
+  configErrorStatusSnapshot,
   createAftTransportPool,
   getManualInstallHint,
   isOrtAutoDownloadSupported,
   markAnnouncementSeen,
+  resolveCortexKitStorageRoot,
   setActiveLogger,
   shouldShowAnnouncement,
 } from "@cortexkit/aft-bridge";
@@ -29,9 +31,9 @@ import {
   applyToolSurfaceOverrides,
   createProjectAcceptance,
   createSharedPoolOptions,
-  loadBootstrapConfig,
   prepareBridgeEnvironment,
   reportHashlineDowngrade,
+  resolveBootstrapConfig,
   unknownDisabledToolsReporter,
 } from "./bridge-bootstrap.js";
 import {
@@ -49,6 +51,7 @@ import {
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
 } from "./configure-warnings.js";
+import { buildConfigErrorToolMap } from "./config-error-surface.js";
 import { createAutoUpdateCheckerHook } from "./hooks/auto-update-checker/index.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
 import { abortInFlightAutoInstalls } from "./lsp-auto-install.js";
@@ -228,6 +231,31 @@ const ANNOUNCEMENT_FOOTER = "Join us on Discord: https://discord.gg/DSa65w8wuf";
 // not work and have been removed. The fix belongs upstream in OpenCode.
 const plugin: Plugin = async (input) => initializePluginForDirectory(input);
 
+/**
+ * Hooks for the config error state. The tool surface registers so the model
+ * sees the error when it calls a tool; each call fails without starting a
+ * bridge. The status endpoint reports the error so the TUI sidebar can show
+ * it. No other hook runs: there is nothing for them to act on.
+ */
+function configErrorPluginHooks(
+  input: Parameters<Plugin>[0],
+  config: Parameters<typeof buildConfigErrorToolMap>[0],
+  message: string,
+) {
+  const rpcServer = new AftRpcServer(resolveCortexKitStorageRoot(), input.directory);
+  rpcServer.handle("status", async () => ({
+    ...configErrorStatusSnapshot(message),
+    served_directory: input.directory,
+  }));
+  rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
+  return {
+    tool: buildConfigErrorToolMap(config, message, input.client),
+    dispose: async () => {
+      rpcServer.stop();
+    },
+  };
+}
+
 async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const deliverConfigMigrationWarnings = (directory: string, messages: readonly string[]) => {
     for (const message of messages) {
@@ -242,18 +270,20 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // config so schema selection and the bridge's runtime project agree.
   const registrationRoot = resolveOpenCodeRegistrationRoot(input.directory, input.worktree);
 
-  // Load the AFT config before any binary, storage or index work. A rejected
-  // configuration (a retired key after its migration window, or an already
-  // retired GitHub alias) publishes no AFT registrations at all. Load order:
+  // Load the AFT config before any binary, storage or index work. An unusable
+  // configuration (a retired key after its migration window, an already
+  // retired GitHub alias, a file that does not parse, a missing subc
+  // connection file) still loads the plugin, in the config error state: the
+  // tools register but every call fails with the error and its fix. Load order:
   // ~/.config/cortexkit/aft.jsonc → <project>/.cortexkit/aft.jsonc
-  const loadedConfig = loadBootstrapConfig(registrationRoot, (message) =>
+  const bootstrap = await resolveBootstrapConfig(registrationRoot, (message) =>
     deliverConfigMigrationWarnings(registrationRoot, [message]),
   );
-  if (!loadedConfig) {
-    log(`AFT not started for ${registrationRoot}: its configuration was rejected`);
-    return { tool: {} };
+  if (!bootstrap.ok) {
+    log(`AFT is in the config error state for ${registrationRoot}; every tool call will fail`);
+    return configErrorPluginHooks(input, bootstrap.config, bootstrap.message);
   }
-  const aftConfig = loadedConfig;
+  const aftConfig = bootstrap.config;
   enqueueConfigParseWarnings(registrationRoot, getConfigLoadErrors());
 
   const notifyOpts: NotificationOptions = {

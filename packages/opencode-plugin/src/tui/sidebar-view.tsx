@@ -501,10 +501,16 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
           rows so users understand why metrics are blank. */}
       {notInitialized() && (
         <box marginTop={1} width="100%">
-          <text fg={props.palette.textMuted}>
-            {s()!.message ||
-              "AFT bridge is now spawned lazily, information here will be populated after first tool call."}
-          </text>
+          {s()!.config_error ? (
+            // Config error state: no bridge will ever start in this process,
+            // so the placeholder text would mislead; show the error instead.
+            <text fg={props.palette.error}>✖ {s()!.message}</text>
+          ) : (
+            <text fg={props.palette.textMuted}>
+              {s()!.message ||
+                "AFT bridge is now spawned lazily, information here will be populated after first tool call."}
+            </text>
+          )}
         </box>
       )}
 

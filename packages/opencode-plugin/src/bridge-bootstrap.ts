@@ -13,7 +13,8 @@
  *
  * What lives here:
  *   - loading the AFT config after migrating legacy config file locations,
- *     refusing a rejected configuration and delivering migration notices;
+ *     putting an unusable configuration into the config error state and
+ *     delivering migration notices;
  *   - resolving the `aft` binary (with a background download when uncached);
  *   - the one-time storage migration into the shared CortexKit root;
  *   - the flat configure overrides: config tiers, `storage_dir`,
@@ -30,23 +31,29 @@
 
 import {
   type AftTransportPool,
+  DEFAULT_DISABLED_TOOLS,
   ensureBinary,
   ensureOnnxRuntime,
   ensureStorageMigrated,
   findBinary,
   findBinarySync,
+  formatConfigErrorMessage,
+  formatConfigParseErrorMessage,
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isOrtAutoDownloadSupported,
   type PoolOptions,
   resolveCortexKitStorageRoot,
+  subcConnectionFileError,
 } from "@cortexkit/aft-bridge";
 
 import {
   type AftConfig,
   buildConfigTierConfigureParams,
+  type ConfigLoadError,
   ConfigRejectedError,
   deliverConfigLoadNotices,
+  getConfigLoadErrors,
   getConfigLoadNotices,
   loadAftConfig,
   migrateAftConfigLocations,
@@ -76,6 +83,14 @@ export interface BridgeBootstrapDependencies {
    * does not deliver notices left over from a real load.
    */
   deliverLoadNotices?(notify: BootstrapNotify): void;
+  /**
+   * Parse failures recorded by the most recent `loadConfig` call. Optional for
+   * the same reason as `deliverLoadNotices`: a substituted `loadConfig` must
+   * not see failures left over from a real load.
+   */
+  configLoadErrors?(): readonly ConfigLoadError[];
+  /** Error for a configured subc connection file that does not exist, or null. */
+  subcConnectionFileError?(subcConnectionFile: string | undefined): Promise<string | null>;
   /** Moves legacy config files into the CortexKit layout; returns user-facing warnings. */
   migrateConfigLocations(directory: string): string[];
   resolveBinary(version: string): Promise<string>;
@@ -288,6 +303,8 @@ function startLspAutoInstall(
 export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   loadConfig: loadAftConfig,
   deliverLoadNotices: (notify) => deliverConfigLoadNotices(notify, getConfigLoadNotices()),
+  configLoadErrors: getConfigLoadErrors,
+  subcConnectionFileError,
   migrateConfigLocations: (directory) =>
     migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   resolveBinary: resolveBinaryWithWarmup,
@@ -307,44 +324,95 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
 };
 
 /**
- * Load `directory`'s config, or null when it is rejected (a retired key after
- * its migration window, or an already retired GitHub alias). The rejection is
- * reported through `notify`; other load errors propagate.
+ * Result of loading the configuration an entry boots with. A configuration
+ * that cannot be used does not stop the plugin from loading: it yields the
+ * config error state, in which the entry registers the tool surface of
+ * `config` but every tool call fails with `message` (see
+ * {@link buildConfigErrorToolMap}).
  */
-function loadConfigOrNull(
-  directory: string,
+export type BootstrapConfig =
+  | { ok: true; config: AftConfig }
+  | {
+      ok: false;
+      /** The error, its fix, and the note that a restart is needed. */
+      message: string;
+      /** Config whose tool surface is registered: the loaded one when usable, else the default. */
+      config: AftConfig;
+    };
+
+/** The surface registered when the configuration is too broken to compute its own. */
+export function defaultSurfaceConfig(): AftConfig {
+  return { disabled_tools: [...DEFAULT_DISABLED_TOOLS] };
+}
+
+/**
+ * Enter the config error state: log the error once at ERROR, report it once
+ * through `notify`, and never fall back to a default configuration.
+ */
+function configErrorState(
+  detail: string,
   notify: BootstrapNotify,
-  dependencies: BridgeBootstrapDependencies,
-): AftConfig | null {
-  try {
-    return dependencies.loadConfig(directory);
-  } catch (err) {
-    if (!(err instanceof ConfigRejectedError)) throw err;
-    error(err.message);
-    notify(err.message);
-    return null;
-  }
+  surfaceConfig: AftConfig = defaultSurfaceConfig(),
+): BootstrapConfig {
+  const message = formatConfigErrorMessage(detail);
+  error(message);
+  notify(message);
+  return { ok: false, message, config: surfaceConfig };
+}
+
+/** The first parse failure of the last load, as config error text, or null. */
+function parseFailure(dependencies: BridgeBootstrapDependencies): string | null {
+  const [failure] = dependencies.configLoadErrors?.() ?? [];
+  return failure ? formatConfigParseErrorMessage(failure.path, failure.message) : null;
 }
 
 /**
  * Load the config for `directory`, migrating legacy config file locations
- * first. Returns null when the configuration is rejected: a rejected project
- * publishes no AFT registrations and does no binary, storage or index work,
- * so migration is skipped too. Migration notices for retired keys that are
- * still translated are delivered through `notify`, once per notice identity.
+ * first. Migration notices for retired keys that are still translated are
+ * delivered through `notify`, once per notice identity.
+ *
+ * A configuration that is rejected (a retired key after its migration window,
+ * an already retired GitHub alias), that does not parse, or whose load throws
+ * for any other reason yields the config error state with the default tool
+ * surface; migration is skipped then. Nothing falls back to defaults.
  */
 export function loadBootstrapConfig(
   directory: string,
   notify: BootstrapNotify,
   dependencies: BridgeBootstrapDependencies = defaultBridgeBootstrapDependencies,
-): AftConfig | null {
-  if (loadConfigOrNull(directory, notify, dependencies) === null) return null;
-  for (const message of dependencies.migrateConfigLocations(directory)) notify(message);
-  // Reload: migration may have moved the file the first read came from.
-  const config = loadConfigOrNull(directory, notify, dependencies);
-  if (config === null) return null;
-  dependencies.deliverLoadNotices?.(notify);
-  return config;
+): BootstrapConfig {
+  try {
+    dependencies.loadConfig(directory);
+    const firstFailure = parseFailure(dependencies);
+    if (firstFailure) return configErrorState(firstFailure, notify);
+    for (const message of dependencies.migrateConfigLocations(directory)) notify(message);
+    // Reload: migration may have moved the file the first read came from.
+    const config = dependencies.loadConfig(directory);
+    const failure = parseFailure(dependencies);
+    if (failure) return configErrorState(failure, notify);
+    dependencies.deliverLoadNotices?.(notify);
+    return { ok: true, config };
+  } catch (err) {
+    return configErrorState(err instanceof Error ? err.message : String(err), notify);
+  }
+}
+
+/**
+ * {@link loadBootstrapConfig} plus the checks that need the loaded config: a
+ * configured `subc.connection_file` that does not exist also yields the config
+ * error state, keeping the loaded config's tool surface. The check runs before
+ * any binary, storage or transport work so the error state starts none of it.
+ */
+export async function resolveBootstrapConfig(
+  directory: string,
+  notify: BootstrapNotify,
+  dependencies: BridgeBootstrapDependencies = defaultBridgeBootstrapDependencies,
+): Promise<BootstrapConfig> {
+  const loaded = loadBootstrapConfig(directory, notify, dependencies);
+  if (!loaded.ok) return loaded;
+  const subcCheck = dependencies.subcConnectionFileError ?? subcConnectionFileError;
+  const missing = await subcCheck(loaded.config.subc?.connection_file);
+  return missing === null ? loaded : configErrorState(missing, notify, loaded.config);
 }
 
 /**

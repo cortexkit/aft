@@ -12,6 +12,9 @@ function count(value: number | undefined): string {
  * can leave the complete `status_bar` missing for the whole session.
  */
 export function formatAftStatusSegment(status: AftStatusSnapshot | null): string {
+  // The config error state never produces a real snapshot; say so instead of
+  // "starting", which would suggest the bridge is on its way.
+  if (status?.config_error) return "AFT config error";
   if (!status || status.cache_role === "not_initialized") return "AFT starting…";
   const bar: StatusBar = status.status_bar ?? status.status_bar_values ?? {};
   const stale = bar.tier2_stale ? "~" : "";
