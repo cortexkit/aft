@@ -1532,6 +1532,32 @@ fn note_unbound_ttl_retention(
     }
 }
 
+/// Queue the ignore-rule load for a root whose watcher was restored before
+/// anything built its gitignore matcher. The load walks the project for ignore
+/// files, so it runs as a maintenance job on the root's actor, never on this
+/// transport loop. Publishing the matcher bumps its generation, and the running
+/// watcher backend re-derives its exclusions (`target/`, `node_modules/`, ...)
+/// from it without a restart.
+fn submit_ignore_rule_load(executor: &Executor, root_id: &ProjectRootId) {
+    let request_id = format!(
+        "subc-ignore-rule-load-{}",
+        root_id.as_path().to_string_lossy()
+    );
+    let response_id = request_id.clone();
+    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+        let published = crate::commands::configure::load_ignore_rules_if_unpublished(ctx);
+        Response::success(response_id, json!({ "published": published }))
+    });
+    // Nothing waits on the outcome: an unpublished root is queued again on
+    // its next rebind.
+    drop(executor.submit_maintenance_async(
+        root_id.clone(),
+        Lane::MaintenanceCommit,
+        request_id,
+        job,
+    ));
+}
+
 /// Queue the final artifact work for an unbound root past its idle TTL:
 /// persist the search delta the way graceful shutdown does and drop inspect
 /// completions nobody will drain. It runs as a maintenance job on the root's
@@ -5172,6 +5198,9 @@ async fn handle_route_bind_completion(
         if restore_watcher {
             crate::commands::configure::ensure_project_watcher(&ctx);
         }
+        if crate::commands::configure::ignore_rules_load_pending(&ctx) {
+            submit_ignore_rule_load(executor, &completion.bind_root_id);
+        }
     }
 
     let ack =
@@ -6176,6 +6205,9 @@ async fn handle_tool_call(
     if restore_watcher {
         if let Some(ctx) = executor.actor_context(&identity.root) {
             crate::commands::configure::ensure_project_watcher(&ctx);
+            if crate::commands::configure::ignore_rules_load_pending(&ctx) {
+                submit_ignore_rule_load(executor, &identity.root);
+            }
         }
     }
 

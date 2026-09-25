@@ -47,6 +47,13 @@ pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
 const STATUS_DEBOUNCE_MS: u64 = 1_000;
 
+#[cfg(test)]
+thread_local! {
+    /// Ignore-file walks run by this thread; see
+    /// `AppContext::ignore_walks_on_current_thread_for_test`.
+    static IGNORE_WALKS_ON_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Canonicalize a path that may no longer exist (pending callgraph paths
 /// legitimately include deleted files): canonicalize the nearest existing
 /// ancestor of the ORIGINAL spelling and re-append the missing tail, so alias
@@ -3664,6 +3671,8 @@ impl AppContext {
         }
 
         let git_common_dir = self.git_common_dir.lock().clone();
+        #[cfg(test)]
+        IGNORE_WALKS_ON_THREAD.with(|walks| walks.set(walks.get() + 1));
         let inputs = gitignore_state::IgnoreInputSnapshot::collect(root, git_common_dir.as_deref());
         if inputs.has_same_effective_inputs(previous_inputs.as_ref()) {
             self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
@@ -3693,6 +3702,14 @@ impl AppContext {
     #[doc(hidden)]
     pub fn gitignore_matcher_rebuild_count_for_test(&self) -> u64 {
         self.gitignore_matcher_rebuilds.load(Ordering::SeqCst)
+    }
+
+    /// How many ignore-file walks the calling thread has run, across every
+    /// context. Lets a test prove a path never walks a project on the thread
+    /// that called it.
+    #[cfg(test)]
+    pub(crate) fn ignore_walks_on_current_thread_for_test() -> u64 {
+        IGNORE_WALKS_ON_THREAD.with(std::cell::Cell::get)
     }
 
     /// Shared atomic mirror of `experimental.bash.compress`. Updated by the

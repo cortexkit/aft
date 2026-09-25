@@ -573,34 +573,51 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
     paths
 }
 
-/// Load the ignore rules before a watcher starts, if nothing has loaded them yet.
+/// Load a root's ignore rules if nothing has loaded them yet.
 ///
 /// The OS backend derives its kernel exclusion set (`target/`, `node_modules/`,
 /// and the other ecosystem directories) from the gitignore matcher when it is
-/// created, and re-derives only when the matcher generation moves. The
-/// configure tail normally builds the matcher in its `ProjectRuntime` stage
-/// before its `Watcher` stage, but a watcher can also start without that tail:
-/// when a root is quiesced (its queued configure maintenance cancelled before
-/// `ProjectRuntime` ran) and then rebound, `ensure_project_watcher` restarts
-/// the watcher directly, and the next configure sees an active watcher and
-/// skips the project-runtime refresh. Nothing then ever builds the matcher, so
-/// the backend keeps the only plan it can make without one: `.git` alone.
+/// created, and re-derives whenever the matcher generation moves. The
+/// configure tail builds the matcher in its `ProjectRuntime` stage before its
+/// `Watcher` stage, so a watcher it starts is always covered. A watcher can
+/// also start without that tail: when a root is quiesced (its queued configure
+/// maintenance cancelled before `ProjectRuntime` ran) and then rebound,
+/// `ensure_project_watcher` restarts the watcher directly, and the next
+/// configure sees an active watcher and skips the project-runtime refresh.
+/// Nothing then ever builds the matcher, and the backend keeps the only plan
+/// it can make without one: `.git` alone.
 ///
-/// Every watcher start funnels through here, so a root's first watcher always
-/// sees the same matcher the configure tail would have built. This is a no-op
-/// once any matcher has been published, including the deliberate empty one for
-/// the home directory.
-fn publish_ignore_rules_before_watcher_start(ctx: &AppContext, root_path: &Path) {
+/// `ensure_project_watcher` runs on the subc frame loop, which must never walk
+/// a project tree, so it does not call this. Its callers queue this as a
+/// maintenance job on the root's actor instead (see
+/// `ignore_rules_load_pending`); publishing the matcher bumps the generation
+/// and the running backend re-derives from it.
+///
+/// Returns whether ignore rules are now published. A root that is unbound
+/// again by the time this runs is left unloaded on purpose: its next rebind
+/// restores the watcher and queues this again. Degraded roots (the home
+/// directory among them) get the same explicit empty matcher the watcher drain
+/// installs for them, because walking them for ignore files is too costly.
+pub(crate) fn load_ignore_rules_if_unpublished(ctx: &AppContext) -> bool {
     if ctx.gitignore_published() {
-        return;
+        return true;
     }
-    // Same rule as the configure tail: the home directory is too large to walk
-    // for ignore files, so it gets an explicit empty matcher instead.
-    if resolve_home_dir().is_some_and(|home| home == root_path) {
-        ctx.clear_gitignore();
-    } else {
+    if ctx.subc_unbound_quiesced() {
+        return false;
+    }
+    if ctx.heavy_root_work_allowed() {
         ctx.rebuild_gitignore();
+    } else {
+        ctx.clear_gitignore();
     }
+    true
+}
+
+/// Whether a watcher is running for this root with ignore rules that were
+/// never loaded, so the caller must queue [`load_ignore_rules_if_unpublished`]
+/// off its own thread.
+pub(crate) fn ignore_rules_load_pending(ctx: &AppContext) -> bool {
+    ctx.watcher_runtime_active() && !ctx.gitignore_published()
 }
 
 fn start_project_watcher_with<W, E, F>(
@@ -618,7 +635,6 @@ fn start_project_watcher_with<W, E, F>(
     let generation = WATCHER_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
-    publish_ignore_rules_before_watcher_start(ctx, root_path);
     let (dispatch_tx, dispatch_rx) = watcher_filter::watcher_dispatch_channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
@@ -12459,74 +12475,221 @@ mod tests {
         ctx.stop_watcher_runtime();
     }
 
+    /// Fixture for the restart-ordering tests: a Rust root with an existing
+    /// `target/`, configured, but whose configure tail (the stage that loads
+    /// the ignore rules) was cancelled by a quiesce before it ran.
+    fn configured_root_with_cancelled_tail(root: &tempfile::TempDir) -> (PathBuf, AppContext) {
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        assert!(!ctx.gitignore_published());
+        (root, ctx)
+    }
+
     /// The daemon-restart ordering that left roots watched with only `.git`
     /// excluded: each root is configured, its queued configure maintenance is
-    /// cancelled when the root is quiesced (so the `ProjectRuntime` stage that
-    /// builds the gitignore matcher never runs), and the rebind then restarts
-    /// the watcher directly through `ensure_project_watcher`. The attach below
-    /// derives the plan exactly as the OS backend's `create` does, from the
-    /// shared matcher at watcher-start time.
+    /// cancelled when the root is quiesced, and the rebind then restores the
+    /// watcher directly (the `ensure_project_watcher` path) on the subc frame
+    /// loop. That thread must not walk any project for ignore files; the load
+    /// is queued and runs on another thread, and the backend must end up with
+    /// `target/` excluded.
+    ///
+    /// The fake backend below follows the OS backends' contract: derive the
+    /// plan from the shared matcher at create, then re-derive whenever the
+    /// matcher generation differs from the one it last derived at.
     #[test]
     fn watcher_restored_before_configure_tail_seeds_ecosystem_exclusions() {
         let _guard = watcher_test_mutex()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        struct FakeBackend {
+            stop: Arc<AtomicBool>,
+            join: Option<std::thread::JoinHandle<()>>,
+            _tx: mpsc::Sender<notify::Result<notify::Event>>,
+        }
+        impl Drop for FakeBackend {
+            fn drop(&mut self) {
+                self.stop.store(true, Ordering::SeqCst);
+                if let Some(join) = self.join.take() {
+                    let _ = join.join();
+                }
+            }
+        }
+        type Installed = Arc<Mutex<(u64, Vec<PathBuf>)>>;
+
         let roots = (0..6)
             .map(|_| tempfile::tempdir().unwrap())
             .collect::<Vec<_>>();
-        let mut contexts = Vec::new();
-        for root in &roots {
-            let root = std::fs::canonicalize(root.path()).unwrap();
-            std::fs::create_dir(root.join(".git")).unwrap();
-            std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
-            std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
-            std::fs::create_dir_all(root.join("target/debug")).unwrap();
-            let ctx = AppContext::new(
-                Box::new(TreeSitterProvider::new()),
-                Config {
-                    project_root: Some(root.clone()),
-                    ..Config::default()
-                },
-            );
-            ctx.set_canonical_cache_root(root.clone());
-            // Configured, but the tail that would load the ignore rules was
-            // cancelled before it ran.
-            assert!(!ctx.gitignore_published());
-            contexts.push((root, ctx));
-        }
+        let contexts = roots
+            .iter()
+            .map(configured_root_with_cancelled_tail)
+            .collect::<Vec<_>>();
 
-        // Every root rebinds in one burst, as after a daemon restart.
-        let (plan_tx, plan_rx) = mpsc::channel();
+        // Every root rebinds in one burst, as after a daemon restart. This
+        // thread stands in for the frame loop.
+        let walks_before = AppContext::ignore_walks_on_current_thread_for_test();
+        let mut installed = Vec::<(PathBuf, Installed)>::new();
+        let mut load_pending = Vec::new();
+        let (created_tx, created_rx) = mpsc::channel();
         for (root, ctx) in &contexts {
             let matcher = ctx.shared_gitignore();
-            let plan_tx = plan_tx.clone();
+            let generation = ctx.gitignore_generation();
+            let plan: Installed = Arc::new(Mutex::new((u64::MAX, Vec::new())));
+            installed.push((root.clone(), Arc::clone(&plan)));
+            let created_tx = created_tx.clone();
             install_project_watcher_with(ctx, root, Vec::new(), move |root, _extra, tx| {
-                let plan = crate::watcher_filter::derive_watcher_exclusion_plan(
-                    &root,
-                    &matcher,
-                    Some(crate::watcher_filter::WATCHER_EXCLUSION_LIMIT),
-                );
-                let paths = crate::watcher_filter::watcher_exclusion_paths(&plan.selected);
-                plan_tx.send((root, paths)).unwrap();
-                Ok::<_, &'static str>(tx)
+                let derive = move |root: &Path| {
+                    crate::watcher_filter::watcher_exclusion_paths(
+                        &crate::watcher_filter::derive_watcher_exclusion_plan(
+                            root,
+                            &matcher,
+                            Some(crate::watcher_filter::WATCHER_EXCLUSION_LIMIT),
+                        )
+                        .selected,
+                    )
+                };
+                let observed = generation.load(Ordering::Acquire);
+                *plan.lock().unwrap() = (observed, derive(&root));
+                created_tx.send(observed).unwrap();
+                let stop = Arc::new(AtomicBool::new(false));
+                let thread_stop = Arc::clone(&stop);
+                let join = std::thread::spawn(move || {
+                    let mut observed = observed;
+                    while !thread_stop.load(Ordering::SeqCst) {
+                        let current = generation.load(Ordering::Acquire);
+                        if current != observed {
+                            *plan.lock().unwrap() = (current, derive(&root));
+                            observed = current;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                });
+                Ok::<_, &'static str>(FakeBackend {
+                    stop,
+                    join: Some(join),
+                    _tx: tx,
+                })
             });
+            load_pending.push(crate::commands::configure::ignore_rules_load_pending(ctx));
         }
-        drop(plan_tx);
+        drop(created_tx);
+        let created = created_rx.iter().take(contexts.len()).collect::<Vec<_>>();
+        assert_eq!(
+            AppContext::ignore_walks_on_current_thread_for_test(),
+            walks_before,
+            "the rebind thread walked a project for ignore files"
+        );
+        assert_eq!(
+            load_pending,
+            vec![true; contexts.len()],
+            "a restored watcher with no ignore rules must ask for the load"
+        );
+        assert_eq!(created, vec![0; contexts.len()], "backends saw no matcher");
 
-        let mut seen = 0;
-        for (root, paths) in plan_rx.iter().take(contexts.len()) {
-            seen += 1;
-            assert!(
-                paths.contains(&root.join("target")),
-                "first watcher start must exclude target/ for {}: {paths:?}",
-                root.display()
-            );
+        // The queued maintenance jobs run on another thread (the root actor).
+        let job_walks = std::thread::scope(|scope| {
+            let jobs = contexts
+                .iter()
+                .map(|(_, ctx)| {
+                    scope.spawn(move || {
+                        let published = super::load_ignore_rules_if_unpublished(ctx);
+                        (
+                            published,
+                            AppContext::ignore_walks_on_current_thread_for_test(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        for (root, plan) in &installed {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let (generation, paths) = plan.lock().unwrap().clone();
+                if generation > 0 && paths.contains(&root.join("target")) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "backend never re-derived target/ for {}: generation={generation} {paths:?}",
+                    root.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        assert_eq!(seen, contexts.len());
+        for (published, walks) in job_walks {
+            assert!(published);
+            assert!(walks > 0, "the queued job is where the walk happens");
+        }
         for (_, ctx) in &contexts {
-            assert!(ctx.gitignore_published());
+            assert!(!crate::commands::configure::ignore_rules_load_pending(ctx));
             ctx.stop_watcher_runtime();
         }
+    }
+
+    /// End to end on the real OS backend: a watcher restored before any ignore
+    /// rules were loaded starts with `.git` only and says so, and the queued
+    /// load makes the running backend install `target/` without a restart.
+    #[test]
+    #[ignore = "requires a live OS file watcher service"]
+    fn restored_watcher_installs_target_after_queued_ignore_load() {
+        let _guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = tempfile::tempdir().unwrap();
+        let (root, ctx) = configured_root_with_cancelled_tail(&temp);
+        let counters = crate::context::watcher_counters_for_root(&root);
+
+        let walks_before = AppContext::ignore_walks_on_current_thread_for_test();
+        super::ensure_project_watcher(&ctx);
+        assert_eq!(
+            AppContext::ignore_walks_on_current_thread_for_test(),
+            walks_before
+        );
+        assert!(super::ignore_rules_load_pending(&ctx));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while counters.backend_exclusions().paths.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let before = counters.backend_exclusions();
+        assert_eq!(before.matcher_generation, 0);
+        assert!(!before.paths.contains(&root.join("target")));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| assert!(super::load_ignore_rules_if_unpublished(&ctx)));
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !counters
+            .backend_exclusions()
+            .paths
+            .contains(&root.join("target"))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = counters.backend_exclusions();
+        ctx.stop_watcher_runtime();
+        assert!(after.matcher_generation > 0);
+        assert!(
+            after.paths.contains(&root.join("target")),
+            "running backend never installed target/: {:?}",
+            after.paths
+        );
     }
 
     #[test]
