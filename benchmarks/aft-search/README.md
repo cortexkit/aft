@@ -149,6 +149,31 @@ Re-records so far:
   the real-query evidence tree, and those two families score against the pinned
   external clones and the offline vector pack instead.
 
+## Prefrontal search-miss rows
+
+`prefrontal-search-fixtures.json` holds real `aft_search` queries an agent
+typed while working in the prefrontal repository, each with its known answer
+as file and line ranges read at the commit pinned in `corpus/prefrontal.toml`,
+and a `failure_class` tag. `run_prefrontal_search.py` replays them and records,
+per row, the rank of each known answer and every result ranked above it.
+
+```bash
+python3 benchmarks/aft-search/provision_corpus.py --corpus benchmarks/aft-search/corpus/prefrontal.toml
+cd benchmarks/aft-search
+python3 run_prefrontal_search.py --out results/prefrontal-search-<date>.json
+```
+
+The rows sit outside the real-query gate because the gate cannot hold them:
+every real-query row must share AFT's own pinned tree and vector pack, and a
+row scores against one opened file with no line range. prefrontal also stays
+out of `corpus/corpus.toml`, which the exact-recall gate reads and which needs
+sentence and pair fixtures for every repository it lists. The runner calls the
+public `search` tool with the live local embedding model, the same surface and
+model the agent used, so it needs prefrontal access and the managed ONNX
+Runtime. It is report-only and never fails on a ranking outcome.
+`results/prefrontal-search-baseline.json` is the first recorded run; compare a
+ranking change against it row by row.
+
 ## Search-fusion quality sub-benchmark
 
 `run-fusion-quality` is a focused investigation harness for hybrid fusion

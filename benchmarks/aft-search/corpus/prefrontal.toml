@@ -1,0 +1,26 @@
+# Prefrontal corpus for the prefrontal search-miss rows
+#
+# Same schema as corpus.toml, kept in its own manifest on purpose. corpus.toml
+# feeds the exact-recall gate, which requires sentence and pair fixtures for
+# every repository it lists and clones each one in CI; prefrontal is a private
+# repository with no such fixtures. The separate clone_root keeps this
+# manifest's provisioned.json record from overwriting the Vera corpus record.
+#
+# Provision from the repository root with:
+#   python3 benchmarks/aft-search/provision_corpus.py --corpus benchmarks/aft-search/corpus/prefrontal.toml
+#
+# The commit is prefrontal's main at the time the rows were written. The rows'
+# line ranges were read at this commit, so moving the pin means re-reading
+# every range in prefrontal-search-fixtures.json.
+
+[corpus]
+version = 1
+description = "Prefrontal at a pinned commit - real aft_search misses from agents working in that repository"
+clone_root = ".bench/repos-prefrontal"
+
+[[repos]]
+name = "prefrontal"
+url = "git@github.com:cortexkit/prefrontal.git"
+commit = "bf1e86a885e26698afba39c810e52e66fc0992e6"
+language = "Polyglot"
+description = "Agent orchestration runtime. Large Rust crates with macro-wrapped runtime methods, TypeScript plugins, and many generated and census JSON artifacts."

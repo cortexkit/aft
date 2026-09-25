@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "source": "Real aft_search queries typed by an agent working in the prefrontal repository on 2026-09-25, replayed verbatim against prefrontal pinned in corpus/prefrontal.toml.",
+  "corpus": "corpus/prefrontal.toml",
+  "pinned_commit": "bf1e86a885e26698afba39c810e52e66fc0992e6",
+  "relevance_scale": "2 = the code that answers the query; 1 = supporting code or prose a reader would also accept. Line ranges are 1-based and inclusive, read at the pinned commit.",
+  "task_count": 4,
+  "tasks": [
+    {
+      "id": "prefrontal-board-nudge-lane-cap",
+      "query": "board staleness nudge wake text: what the board nudge shows the agent (stale lanes, terminal waits) and lane cap 8",
+      "include_tests": false,
+      "include_tests_source": "default_assumed",
+      "category": "intent",
+      "repo": "prefrontal",
+      "failure_class": "generated_or_census_outranks_source",
+      "description": "Two questions in one query: the text of the board-staleness nudge, and the board lane cap. The agent saw generated and census JSON at ranks 1-3 and the first real hit (docs/specs/board.md) at rank 4.",
+      "notes": [
+        "The lane cap moved from 8 to 20 before the pinned commit. The comment directly above the constant still says 'With an 8-lane cap', so rooms.rs 71-74 answers the query as typed.",
+        "The specimen named run_board_staleness_pass as the nudge text. The string itself is built in board_staleness_nudge_text, which that pass calls, so both carry relevance 2."
+      ],
+      "ground_truth": [
+        {"file_path": "crates/prefrontal-core-store/src/rooms.rs", "line_start": 71, "line_end": 74, "relevance": 2, "symbol": "BOARD_LANE_CAP"},
+        {"file_path": "crates/prefrontal-core-module/src/manager_runtime.rs", "line_start": 13697, "line_end": 13836, "relevance": 2, "symbol": "run_board_staleness_pass"},
+        {"file_path": "crates/prefrontal-core-module/src/manager_runtime.rs", "line_start": 16374, "line_end": 16398, "relevance": 2, "symbol": "board_staleness_nudge_text"},
+        {"file_path": "crates/prefrontal-core-store/src/rooms.rs", "line_start": 3295, "line_end": 3299, "relevance": 1, "symbol": "lane cap refusal in board.lanes update"}
+      ]
+    },
+    {
+      "id": "prefrontal-consult-roster-for-class",
+      "query": "athena roster per class lookup design_review key panel roster config",
+      "include_tests": false,
+      "include_tests_source": "default_assumed",
+      "category": "symbol_lookup",
+      "repo": "prefrontal",
+      "failure_class": "unclassified",
+      "description": "Where the consult panel roster is looked up per class. The agent saw campaign/scaffolding.rs, a gather comment, the TypeScript schema key list and a store test, and found the answer by grepping roster_json.",
+      "notes": [
+        "The specimen file names no failure pattern for this query, so the row is tagged unclassified rather than given one of the named classes."
+      ],
+      "ground_truth": [
+        {"file_path": "crates/prefrontal-core-module/src/consult/runtime.rs", "line_start": 7621, "line_end": 7647, "relevance": 2, "symbol": "consult_roster_for_class"},
+        {"file_path": "crates/prefrontal-core-module/src/consult/runtime.rs", "line_start": 7649, "line_end": 7665, "relevance": 1, "symbol": "consult_roster_with_authoritative_width"}
+      ]
+    },
+    {
+      "id": "prefrontal-ask-persist-answer-dispatch",
+      "query": "ask.persist_answer handler",
+      "include_tests": false,
+      "include_tests_source": "default_assumed",
+      "category": "symbol_lookup",
+      "repo": "prefrontal",
+      "failure_class": "op_string_dispatch_missed",
+      "description": "The handler for the ask.persist_answer operation. No function carries that name; the operation is dispatched by matching the op string. The agent saw a flat head: consumer.ts, push_sender.rs, a probe script and a doc line.",
+      "notes": [
+        "The specimen named the op-string arms in main.rs. The arm that performs the write is the \"persist_answer\" match arm in dispatch.rs, reached after the domain prefix is split off, so both carry relevance 2."
+      ],
+      "ground_truth": [
+        {"file_path": "crates/prefrontal-core-module/src/dispatch.rs", "line_start": 12510, "line_end": 12556, "relevance": 2, "symbol": "\"persist_answer\" match arm"},
+        {"file_path": "crates/prefrontal-core-module/src/main.rs", "line_start": 2117, "line_end": 2145, "relevance": 2, "symbol": "envelope.method == \"ask.persist_answer\" pre-dispatch arm"},
+        {"file_path": "crates/prefrontal-core-module/src/main.rs", "line_start": 2943, "line_end": 2977, "relevance": 2, "symbol": "envelope.method == \"ask.persist_answer\" post-dispatch arms"},
+        {"file_path": "crates/prefrontal-core-module/src/dispatch.rs", "line_start": 11463, "line_end": 11463, "relevance": 1, "symbol": "op(\"ask.persist_answer\", Mutate) registration"}
+      ]
+    },
+    {
+      "id": "prefrontal-spec-aggregator-repo-tools",
+      "query": "spec aggregator merge repository read tools search_repo read_file",
+      "include_tests": false,
+      "include_tests_source": "default_assumed",
+      "category": "intent",
+      "repo": "prefrontal",
+      "failure_class": "unclassified",
+      "description": "The read-only repository tools (read_file, search_repo) given to the spec aggregator's merge. The agent saw unrelated lexical read_file hits with no low-confidence signal.",
+      "notes": [
+        "The specimen recorded this as a no-answer query because the asker meant production code, and no production crate defines search_repo. That is wrong for the corpus at the pinned commit: the merge-tools replay experiment, committed on 2026-09-24, implements exactly these tools for the spec aggregator's merge. The row is therefore scored against those files and is not tagged with the no-answer class.",
+        "The report under .cortexkit/alfonso/reports is tracked but matches prefrontal's .gitignore pattern .cortexkit/alfonso/*, so AFT's walker may leave it unindexed; it is kept as a relevance-1 answer because it is the prose description of the same tools."
+      ],
+      "ground_truth": [
+        {"file_path": "script/experiments/merge-tools-replay/tools.ts", "line_start": 129, "line_end": 171, "relevance": 2, "symbol": "repoTool"},
+        {"file_path": "script/experiments/merge-tools-replay/config.ts", "line_start": 73, "line_end": 95, "relevance": 1, "symbol": "repoTools read_file and search_repo declarations"},
+        {"file_path": ".cortexkit/alfonso/reports/2026-09-24-merge-tools-replay.md", "line_start": 1, "line_end": 269, "relevance": 1, "symbol": "merge-tools replay report"}
+      ]
+    }
+  ],
+  "unsupported": [
+    {
+      "id": "prefrontal-zoom-macro-body-fn",
+      "specimen": "aft_zoom attachments_runtime_session_display_read (crates/prefrontal-core-module/src/attachments/runtime.rs:607) returned symbol not found, because the fn is written inside a macro_rules! body.",
+      "reason": "This miss is an aft_zoom symbol lookup, not an aft_search query, and no runner in this directory measures zoom or outline, so there is no row form for it. It is listed here so the specimen is accounted for, not scored."
+    }
+  ],
+  "no_answer_rows": {
+    "supported": false,
+    "reason": "Every runner in this directory scores against a non-empty ground truth (run_external.py rejects an empty ground_truth; the real-query rows score one opened_file). None of the four search specimens is a no-answer query at the pinned commit, so the no-answer class has no row yet."
+  }
+}

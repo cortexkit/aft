@@ -1,0 +1,3503 @@
+{
+  "binary": {
+    "path": "target/release/aft",
+    "sha256": "b8b25e18dbe6f33f518413a253421786bb49cda516cf97be350b06c09113fa60",
+    "version": "aft 0.57.2"
+  },
+  "corpus_manifest": "benchmarks/aft-search/corpus/prefrontal.toml",
+  "fixtures": "benchmarks/aft-search/prefrontal-search-fixtures.json",
+  "local_model_env": {
+    "fastembed_cache_dir": "/Users/ufukaltinok/.local/share/cortexkit/aft/semantic/models",
+    "ort_dylib_path": "/Users/ufukaltinok/.local/share/cortexkit/aft/onnxruntime/1.24.4/libonnxruntime.dylib"
+  },
+  "no_answer_rows": {
+    "reason": "Every runner in this directory scores against a non-empty ground truth (run_external.py rejects an empty ground_truth; the real-query rows score one opened_file). None of the four search specimens is a no-answer query at the pinned commit, so the no-answer class has no row yet.",
+    "supported": false
+  },
+  "repo_statuses": {
+    "prefrontal": {
+      "commit": "bf1e86a885e26698afba39c810e52e66fc0992e6",
+      "search_index": {
+        "files": 3024,
+        "status": "ready",
+        "trigrams": 78065
+      },
+      "semantic_index": {
+        "backend": "fastembed",
+        "dimension": 384,
+        "entries": 31191,
+        "model": "all-MiniLM-L6-v2",
+        "refreshing_count": 0,
+        "state": "ready",
+        "status": "ready"
+      }
+    }
+  },
+  "schema": "aft-search-prefrontal-report-v1",
+  "tasks": [
+    {
+      "failure_class": "generated_or_census_outranks_source",
+      "first_relevant_rank_file": 33,
+      "first_relevant_rank_line_overlap": null,
+      "ground_truth_ranks": [
+        {
+          "file_path": "crates/prefrontal-core-store/src/rooms.rs",
+          "line_end": 74,
+          "line_start": 71,
+          "rank_file": 33,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "BOARD_LANE_CAP"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/manager_runtime.rs",
+          "line_end": 13836,
+          "line_start": 13697,
+          "rank_file": null,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "run_board_staleness_pass"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/manager_runtime.rs",
+          "line_end": 16398,
+          "line_start": 16374,
+          "rank_file": null,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "board_staleness_nudge_text"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/rooms.rs",
+          "line_end": 3299,
+          "line_start": 3295,
+          "rank_file": 33,
+          "rank_line_overlap": null,
+          "relevance": 1,
+          "symbol": "lane cap refusal in board.lanes update"
+        }
+      ],
+      "outranked_by": [
+        {
+          "file_path": "assets/alfonso.schema.json",
+          "kind": "file_summary",
+          "line_end": 2466,
+          "line_start": 2466,
+          "name": "alfonso.schema",
+          "rank": 1,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/alfonso-core/module-op-kinds.generated.json",
+          "kind": "file_summary",
+          "line_end": 31,
+          "line_start": 31,
+          "name": "module-op-kinds.generated",
+          "rank": 2,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/campaign/census/S16-derived-scheduler-and-residual-completion.json",
+          "kind": "file_summary",
+          "line_end": 89,
+          "line_start": 89,
+          "name": "S16-derived-scheduler-and-residual-completion",
+          "rank": 3,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/board.md",
+          "kind": "file_summary",
+          "line_end": 42,
+          "line_start": 42,
+          "name": "board",
+          "rank": 4,
+          "source": "lexical"
+        },
+        {
+          "file_path": "plans/board-v3-lanes.md",
+          "kind": "file_summary",
+          "line_end": 72,
+          "line_start": 72,
+          "name": "board-v3-lanes",
+          "rank": 5,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/rooms/types.rs",
+          "kind": "file_summary",
+          "line_end": 655,
+          "line_start": 655,
+          "name": "types",
+          "rank": 6,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/personas/alfonso/PERSONA.md",
+          "kind": "file_summary",
+          "line_end": 190,
+          "line_start": 190,
+          "name": "PERSONA",
+          "rank": 7,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/opencode-v2-support-draft.md",
+          "kind": "file_summary",
+          "line_end": 48,
+          "line_start": 48,
+          "name": "opencode-v2-support-draft",
+          "rank": 8,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/2026-09-24-paperclip-vs-cortexkit.md",
+          "kind": "file_summary",
+          "line_end": 101,
+          "line_start": 101,
+          "name": "2026-09-24-paperclip-vs-cortexkit",
+          "rank": 9,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/manager/store.rs",
+          "kind": "file_summary",
+          "line_end": 507,
+          "line_start": 507,
+          "name": "store",
+          "rank": 10,
+          "source": "lexical"
+        }
+      ],
+      "query": "board staleness nudge wake text: what the board nudge shows the agent (stale lanes, terminal waits) and lane cap 8",
+      "request": {
+        "includeTests": false,
+        "query": "board staleness nudge wake text: what the board nudge shows the agent (stale lanes, terminal waits) and lane cap 8",
+        "topK": 50
+      },
+      "response_fields": {
+        "complete": true,
+        "engine_capped": false,
+        "enrichment": {
+          "code": "callgraph_building",
+          "edges": null,
+          "index": {
+            "reason": null,
+            "status": "building"
+          },
+          "status": "omitted"
+        },
+        "fully_degraded": false,
+        "include_tests": false,
+        "interpreted_as": "engine",
+        "lanes": {
+          "semantic": {
+            "reason": null,
+            "status": "ready"
+          },
+          "trigram": {
+            "reason": null,
+            "status": "ready"
+          }
+        },
+        "lexical_engine_capped": false,
+        "lexical_only_fallback": false,
+        "more_available": true,
+        "omitted_lanes": [],
+        "query": "board staleness nudge wake text: what the board nudge shows the agent (stale lanes, terminal waits) and lane cap 8",
+        "query_kind": "NaturalLanguage",
+        "result_count": 50,
+        "results_list_envelope": {
+          "causes": [
+            "cap"
+          ],
+          "narrow": [
+            "offset",
+            "topK",
+            "path",
+            "includeTests"
+          ],
+          "reason": "cap",
+          "shown": 50,
+          "total": {
+            "kind": "at_least",
+            "value": 200
+          },
+          "unit": "results"
+        },
+        "semantic_status": "ready",
+        "semantic_unavailable": false,
+        "status": "ready",
+        "structuredContent": {
+          "plan": {
+            "callback_counts": {
+              "exact": 1,
+              "lexical": 1
+            },
+            "confidence": "low",
+            "depth_tier": 0,
+            "embedding_cache_hits": 0,
+            "embedding_calls": 0,
+            "exact_input": "board staleness nudge wake text: what the board nudge shows the agent (stale lanes, terminal waits) and lane cap 8",
+            "exact_mode": "ready",
+            "exact_tier": "none",
+            "executed_callbacks": [
+              "exact",
+              "lexical"
+            ],
+            "lanes_exhausted": false,
+            "lanes_run": [
+              "exact",
+              "lexical"
+            ],
+            "live_embed_calls": 0,
+            "query_facts": {
+              "embedded_span": null,
+              "exact_input_tokens": 19,
+              "has_identifier_token": false,
+              "has_path_token": false,
+              "has_timestamp_or_pid": false
+            },
+            "readiness": {
+              "lexical_index": true,
+              "semantic_index": true,
+              "symbol_index": true
+            },
+            "retrieval_depth": 200,
+            "shape": "code_literal",
+            "snapshot_generation": "1:1_220b3e2dd6ead48d8ef5209052e1efe1",
+            "stability_void": false,
+            "variants": []
+          },
+          "search": {
+            "embedding_cache_hits": 0,
+            "embedding_calls": 0,
+            "live_embed_calls": 0
+          }
+        }
+      },
+      "result_count": 50,
+      "results": [
+        {
+          "file_path": "assets/alfonso.schema.json",
+          "kind": "file_summary",
+          "line_end": 2466,
+          "line_start": 2466,
+          "name": "alfonso.schema",
+          "rank": 1,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.8580353260040283,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/alfonso-core/module-op-kinds.generated.json",
+          "kind": "file_summary",
+          "line_end": 31,
+          "line_start": 31,
+          "name": "module-op-kinds.generated",
+          "rank": 2,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.844383955001831,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/campaign/census/S16-derived-scheduler-and-residual-completion.json",
+          "kind": "file_summary",
+          "line_end": 89,
+          "line_start": 89,
+          "name": "S16-derived-scheduler-and-residual-completion",
+          "rank": 3,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.8063840866088867,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/board.md",
+          "kind": "file_summary",
+          "line_end": 42,
+          "line_start": 42,
+          "name": "board",
+          "rank": 4,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.793567180633545,
+          "source": "lexical"
+        },
+        {
+          "file_path": "plans/board-v3-lanes.md",
+          "kind": "file_summary",
+          "line_end": 72,
+          "line_start": 72,
+          "name": "board-v3-lanes",
+          "rank": 5,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.7840240001678467,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/rooms/types.rs",
+          "kind": "file_summary",
+          "line_end": 655,
+          "line_start": 655,
+          "name": "types",
+          "rank": 6,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.777068614959717,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/personas/alfonso/PERSONA.md",
+          "kind": "file_summary",
+          "line_end": 190,
+          "line_start": 190,
+          "name": "PERSONA",
+          "rank": 7,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.7503151893615723,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/opencode-v2-support-draft.md",
+          "kind": "file_summary",
+          "line_end": 48,
+          "line_start": 48,
+          "name": "opencode-v2-support-draft",
+          "rank": 8,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.70237135887146,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/2026-09-24-paperclip-vs-cortexkit.md",
+          "kind": "file_summary",
+          "line_end": 101,
+          "line_start": 101,
+          "name": "2026-09-24-paperclip-vs-cortexkit",
+          "rank": 9,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.687682867050171,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/manager/store.rs",
+          "kind": "file_summary",
+          "line_end": 507,
+          "line_start": 507,
+          "name": "store",
+          "rank": 10,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.6480841636657715,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/2026-09-25-board-usage-survey.md",
+          "kind": "file_summary",
+          "line_end": 307,
+          "line_start": 307,
+          "name": "2026-09-25-board-usage-survey",
+          "rank": 11,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.6439971923828125,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/prefrontal-cross-machine.md",
+          "kind": "file_summary",
+          "line_end": 128,
+          "line_start": 128,
+          "name": "prefrontal-cross-machine",
+          "rank": 12,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.620116949081421,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/render/board/mod.rs",
+          "kind": "file_summary",
+          "line_end": 721,
+          "line_start": 721,
+          "name": "mod",
+          "rank": 13,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.6198432445526123,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/lib.rs",
+          "kind": "file_summary",
+          "line_end": 63,
+          "line_start": 63,
+          "name": "lib",
+          "rank": 14,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.6146674156188965,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/configuration.md",
+          "kind": "file_summary",
+          "line_end": 347,
+          "line_start": 347,
+          "name": "configuration",
+          "rank": 15,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.609919548034668,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/tools/contracts.generated.json",
+          "kind": "file_summary",
+          "line_end": 303,
+          "line_start": 303,
+          "name": "contracts.generated",
+          "rank": 16,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5910465717315674,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/manager.rs",
+          "kind": "file_summary",
+          "line_end": 1766,
+          "line_start": 1766,
+          "name": "manager",
+          "rank": 17,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5845768451690674,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/worker_liveness/tests.rs",
+          "kind": "file_summary",
+          "line_end": 3610,
+          "line_start": 3610,
+          "name": "tests",
+          "rank": 18,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.576092004776001,
+          "source": "lexical"
+        },
+        {
+          "file_path": "audit/loop-perf-unproven-hot-paths.md",
+          "kind": "file_summary",
+          "line_end": 3,
+          "line_start": 3,
+          "name": "loop-perf-unproven-hot-paths",
+          "rank": 19,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5670347213745117,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/2026-09-25-nats-migration-inventory.md",
+          "kind": "file_summary",
+          "line_end": 647,
+          "line_start": 647,
+          "name": "2026-09-25-nats-migration-inventory",
+          "rank": 20,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5622446537017822,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/worker-lifecycle.md",
+          "kind": "file_summary",
+          "line_end": 37,
+          "line_start": 37,
+          "name": "worker-lifecycle",
+          "rank": 21,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.561640501022339,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/board/types.ts",
+          "kind": "file_summary",
+          "line_end": 484,
+          "line_start": 484,
+          "name": "types",
+          "rank": 22,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5606958866119385,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/ask.rs",
+          "kind": "file_summary",
+          "line_end": 1202,
+          "line_start": 1202,
+          "name": "ask",
+          "rank": 23,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5511624813079834,
+          "source": "lexical"
+        },
+        {
+          "file_path": "script/health-sentinel.ts",
+          "kind": "file_summary",
+          "line_end": 73,
+          "line_start": 73,
+          "name": "health-sentinel",
+          "rank": 24,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.543499231338501,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/opencode-v2-surface-matrix.md",
+          "kind": "file_summary",
+          "line_end": 116,
+          "line_start": 116,
+          "name": "opencode-v2-surface-matrix",
+          "rank": 25,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5416526794433594,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/host_consumer.rs",
+          "kind": "file_summary",
+          "line_end": 634,
+          "line_start": 634,
+          "name": "host_consumer",
+          "rank": 26,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5326571464538574,
+          "source": "lexical"
+        },
+        {
+          "file_path": "scripts/census/physical_s7_worker_liveness.py",
+          "kind": "file_summary",
+          "line_end": 257,
+          "line_start": 257,
+          "name": "physical_s7_worker_liveness",
+          "rank": 27,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.521265983581543,
+          "source": "lexical"
+        },
+        {
+          "file_path": "scripts/census/physical_s8_task_lifecycle.py",
+          "kind": "file_summary",
+          "line_end": 473,
+          "line_start": 473,
+          "name": "physical_s8_task_lifecycle",
+          "rank": 28,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.518986225128174,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/wake_external_events/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 366,
+          "line_start": 366,
+          "name": "runtime",
+          "rank": 29,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5130043029785156,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/state-of-record-by-surface.md",
+          "kind": "file_summary",
+          "line_end": 634,
+          "line_start": 634,
+          "name": "state-of-record-by-surface",
+          "rank": 30,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.510923147201538,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/worker_liveness/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 7159,
+          "line_start": 7159,
+          "name": "runtime",
+          "rank": 31,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.51015567779541,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/rooms.md",
+          "kind": "file_summary",
+          "line_end": 18,
+          "line_start": 18,
+          "name": "rooms",
+          "rank": 32,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5046401023864746,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/rooms.rs",
+          "kind": "file_summary",
+          "line_end": 4135,
+          "line_start": 4135,
+          "name": "rooms",
+          "rank": 33,
+          "relevant_file": true,
+          "relevant_line_overlap": false,
+          "score": 3.503392219543457,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/wakes.md",
+          "kind": "file_summary",
+          "line_end": 93,
+          "line_start": 93,
+          "name": "wakes",
+          "rank": 34,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4872095584869385,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/2026-09-24-worktree-session-create-latency.md",
+          "kind": "file_summary",
+          "line_end": 69,
+          "line_start": 69,
+          "name": "2026-09-24-worktree-session-create-latency",
+          "rank": 35,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.478048324584961,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/work_graph.rs",
+          "kind": "file_summary",
+          "line_end": 7366,
+          "line_start": 7366,
+          "name": "work_graph",
+          "rank": 36,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.47450590133667,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/tests.rs",
+          "kind": "file_summary",
+          "line_end": 8376,
+          "line_start": 8376,
+          "name": "tests",
+          "rank": 37,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4743475914001465,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/background-agent/types.ts",
+          "kind": "file_summary",
+          "line_end": 231,
+          "line_start": 231,
+          "name": "types",
+          "rank": 38,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.466237783432007,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/lib.rs",
+          "kind": "file_summary",
+          "line_end": 76,
+          "line_start": 76,
+          "name": "lib",
+          "rank": 39,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4658100605010986,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/effects.rs",
+          "kind": "file_summary",
+          "line_end": 44,
+          "line_start": 44,
+          "name": "effects",
+          "rank": 40,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4493119716644287,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/render/rooms/mod.rs",
+          "kind": "file_summary",
+          "line_end": 652,
+          "line_start": 652,
+          "name": "mod",
+          "rank": 41,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4486711025238037,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/wake_external_events/consumers.rs",
+          "kind": "file_summary",
+          "line_end": 1299,
+          "line_start": 1299,
+          "name": "consumers",
+          "rank": 42,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.447654962539673,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/opencode/src/features/host-bridge/host-provider.ts",
+          "kind": "file_summary",
+          "line_end": 87,
+          "line_start": 87,
+          "name": "host-provider",
+          "rank": 43,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4470717906951904,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/effects/store.rs",
+          "kind": "file_summary",
+          "line_end": 270,
+          "line_start": 270,
+          "name": "store",
+          "rank": 44,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.442519187927246,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding_tests.rs",
+          "kind": "file_summary",
+          "line_end": 5474,
+          "line_start": 5474,
+          "name": "scaffolding_tests",
+          "rank": 45,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.427964687347412,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/dispatch.rs",
+          "kind": "file_summary",
+          "line_end": 5599,
+          "line_start": 5599,
+          "name": "dispatch",
+          "rank": 46,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4231700897216797,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/knowhow_semantic_offline_tests.rs",
+          "kind": "file_summary",
+          "line_end": 666,
+          "line_start": 666,
+          "name": "knowhow_semantic_offline_tests",
+          "rank": 47,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.419450044631958,
+          "source": "lexical"
+        },
+        {
+          "file_path": "ARCHITECTURE.md",
+          "kind": "file_summary",
+          "line_end": 66,
+          "line_start": 66,
+          "name": "ARCHITECTURE",
+          "rank": 48,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.415570020675659,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/push_sender.rs",
+          "kind": "file_summary",
+          "line_end": 883,
+          "line_start": 883,
+          "name": "push_sender",
+          "rank": 49,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4144492149353027,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/spec/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 12193,
+          "line_start": 12193,
+          "name": "runtime",
+          "rank": 50,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.400756359100342,
+          "source": "lexical"
+        }
+      ],
+      "retrieval_metrics_file": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "retrieval_metrics_line_overlap": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "prefrontal-board-nudge-lane-cap"
+    },
+    {
+      "failure_class": "unclassified",
+      "first_relevant_rank_file": 14,
+      "first_relevant_rank_line_overlap": null,
+      "ground_truth_ranks": [
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/runtime.rs",
+          "line_end": 7647,
+          "line_start": 7621,
+          "rank_file": 14,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "consult_roster_for_class"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/runtime.rs",
+          "line_end": 7665,
+          "line_start": 7649,
+          "rank_file": 14,
+          "rank_line_overlap": null,
+          "relevance": 1,
+          "symbol": "consult_roster_with_authoritative_width"
+        }
+      ],
+      "outranked_by": [
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding.rs",
+          "kind": "function",
+          "line_end": 585,
+          "line_start": 476,
+          "name": "validate_athena_request_params",
+          "rank": 1,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gather_evidence/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 1804,
+          "line_start": 1804,
+          "name": "runtime",
+          "rank": 2,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/config/schema/athena-v2.ts",
+          "kind": "variable",
+          "line_end": 21,
+          "line_start": 10,
+          "name": "ATHENA_MEMBER_CLASS_KEYS",
+          "rank": 3,
+          "source": "semantic"
+        },
+        {
+          "file_path": "assets/alfonso.schema.json",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "alfonso.schema",
+          "rank": 4,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/consult.rs",
+          "kind": "method",
+          "line_end": 2432,
+          "line_start": 2395,
+          "name": "list_spec_status_consults",
+          "rank": 5,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/tests.rs",
+          "kind": "function",
+          "line_end": 6993,
+          "line_start": 6929,
+          "name": "explicit_roster_overrides_a_classifier_panel_of_one",
+          "rank": 6,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gather_evidence/tests.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "tests",
+          "rank": 7,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/consult/matrix.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "matrix",
+          "rank": 8,
+          "source": "exact"
+        },
+        {
+          "file_path": "docs/configuration.md",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "configuration",
+          "rank": 9,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding_tests.rs",
+          "kind": "function",
+          "line_end": 654,
+          "line_start": 647,
+          "name": "per_class_roster_rejects_unknown_class_keys",
+          "rank": 10,
+          "source": "semantic"
+        }
+      ],
+      "query": "athena roster per class lookup design_review key panel roster config",
+      "request": {
+        "includeTests": false,
+        "query": "athena roster per class lookup design_review key panel roster config",
+        "topK": 50
+      },
+      "response_fields": {
+        "complete": true,
+        "engine_capped": false,
+        "enrichment": {
+          "code": "callgraph_building",
+          "edges": null,
+          "index": {
+            "reason": null,
+            "status": "building"
+          },
+          "status": "omitted"
+        },
+        "fully_degraded": false,
+        "include_tests": false,
+        "interpreted_as": "hybrid",
+        "lanes": {
+          "semantic": {
+            "reason": null,
+            "status": "ready"
+          },
+          "trigram": {
+            "reason": null,
+            "status": "ready"
+          }
+        },
+        "more_available": true,
+        "omitted_lanes": [],
+        "query": "athena roster per class lookup design_review key panel roster config",
+        "query_kind": "Mixed",
+        "result_count": 50,
+        "results_list_envelope": {
+          "causes": [
+            "cap"
+          ],
+          "narrow": [
+            "offset",
+            "topK",
+            "path",
+            "includeTests"
+          ],
+          "reason": "cap",
+          "shown": 50,
+          "total": {
+            "kind": "at_least",
+            "value": 232
+          },
+          "unit": "results"
+        },
+        "semantic_status": "ready",
+        "status": "ready",
+        "structuredContent": {
+          "plan": {
+            "callback_counts": {
+              "exact": 1,
+              "lexical": 1,
+              "semantic": 1,
+              "symbol": 1
+            },
+            "confidence": "low",
+            "depth_tier": 0,
+            "embedding_cache_hits": 0,
+            "embedding_calls": 1,
+            "exact_input": "athena roster per class lookup design_review key panel roster config",
+            "exact_mode": "ready",
+            "exact_tier": "definition",
+            "executed_callbacks": [
+              "symbol",
+              "exact",
+              "lexical",
+              "semantic"
+            ],
+            "lanes_exhausted": false,
+            "lanes_run": [
+              "symbol",
+              "exact",
+              "lexical",
+              "semantic"
+            ],
+            "live_embed_calls": 1,
+            "query_facts": {
+              "embedded_span": null,
+              "exact_input_tokens": 10,
+              "has_identifier_token": true,
+              "has_path_token": false,
+              "has_timestamp_or_pid": false
+            },
+            "readiness": {
+              "lexical_index": true,
+              "semantic_index": true,
+              "symbol_index": true
+            },
+            "retrieval_depth": 200,
+            "shape": "natural_language",
+            "snapshot_generation": "1:1_220b3e2dd6ead48d8ef5209052e1efe1",
+            "stability_void": false,
+            "variants": []
+          },
+          "search": {
+            "embedding_cache_hits": 0,
+            "embedding_calls": 1,
+            "live_embed_calls": 1
+          }
+        }
+      },
+      "result_count": 50,
+      "results": [
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding.rs",
+          "kind": "function",
+          "line_end": 585,
+          "line_start": 476,
+          "name": "validate_athena_request_params",
+          "rank": 1,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gather_evidence/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 1804,
+          "line_start": 1804,
+          "name": "runtime",
+          "rank": 2,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/config/schema/athena-v2.ts",
+          "kind": "variable",
+          "line_end": 21,
+          "line_start": 10,
+          "name": "ATHENA_MEMBER_CLASS_KEYS",
+          "rank": 3,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "assets/alfonso.schema.json",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "alfonso.schema",
+          "rank": 4,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/consult.rs",
+          "kind": "method",
+          "line_end": 2432,
+          "line_start": 2395,
+          "name": "list_spec_status_consults",
+          "rank": 5,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/tests.rs",
+          "kind": "function",
+          "line_end": 6993,
+          "line_start": 6929,
+          "name": "explicit_roster_overrides_a_classifier_panel_of_one",
+          "rank": 6,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gather_evidence/tests.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "tests",
+          "rank": 7,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/consult/matrix.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "matrix",
+          "rank": 8,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "docs/configuration.md",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "configuration",
+          "rank": 9,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding_tests.rs",
+          "kind": "function",
+          "line_end": 654,
+          "line_start": 647,
+          "name": "per_class_roster_rejects_unknown_class_keys",
+          "rank": 10,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/spec/tests.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "tests",
+          "rank": 11,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/consult/types.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "types",
+          "rank": 12,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": ".cortexkit/alfonso/docs/observe-ops-wire-examples.md",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "observe-ops-wire-examples",
+          "rank": 13,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/runtime.rs",
+          "kind": "function",
+          "line_end": 7795,
+          "line_start": 7787,
+          "name": "normalized_panel_class",
+          "rank": 14,
+          "relevant_file": true,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/spec/runtime.rs",
+          "kind": "function",
+          "line_end": 9710,
+          "line_start": 9690,
+          "name": "validate_roster_by_class",
+          "rank": 15,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "packages/core/src/tools/athena/execute.ts",
+          "kind": "function",
+          "line_end": 43,
+          "line_start": 24,
+          "name": "canonicalizeConsultRosterEntries",
+          "rank": 16,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/consult/requests.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "requests",
+          "rank": 17,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-routing-core/src/panel.rs",
+          "kind": "function",
+          "line_end": 654,
+          "line_start": 633,
+          "name": "order_candidates",
+          "rank": 18,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "docs/specs/athena-consults.md",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "athena-consults",
+          "rank": 19,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "reports/2026-09-25-compat-inventory.md",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "2026-09-25-compat-inventory",
+          "rank": 20,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/campaign-probe.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "campaign-probe",
+          "rank": 21,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/config/schema/athena-v2.ts",
+          "kind": "file_summary",
+          "line_end": 65,
+          "line_start": 65,
+          "name": "athena-v2",
+          "rank": 22,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.8621654510498047,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/tools/athena/execute.ts",
+          "kind": "file_summary",
+          "line_end": 65,
+          "line_start": 65,
+          "name": "execute",
+          "rank": 23,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5806050300598145,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 7759,
+          "line_start": 7759,
+          "name": "runtime",
+          "rank": 24,
+          "relevant_file": true,
+          "relevant_line_overlap": false,
+          "score": 3.4688267707824707,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding.rs",
+          "kind": "file_summary",
+          "line_end": 2087,
+          "line_start": 2087,
+          "name": "scaffolding",
+          "rank": 25,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.472888946533203,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/tests.rs",
+          "kind": "file_summary",
+          "line_end": 8143,
+          "line_start": 8143,
+          "name": "tests",
+          "rank": 26,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4743475914001465,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/spec/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 1734,
+          "line_start": 1734,
+          "name": "runtime",
+          "rank": 27,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.400756359100342,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/agent_registry_ops.rs",
+          "kind": "function",
+          "line_end": 1539,
+          "line_start": 1498,
+          "name": "workspace_roster_from_enumeration",
+          "rank": 28,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.095179796218872,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/render/athena/mod.rs",
+          "kind": "function",
+          "line_end": 736,
+          "line_start": 734,
+          "name": "render_decision_outcome",
+          "rank": 29,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.8626787662506104,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/campaign/spec.rs",
+          "kind": "struct",
+          "line_end": 320,
+          "line_start": 298,
+          "name": "SpecFinding",
+          "rank": 30,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.1564557552337646,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign_driver/machines.rs",
+          "kind": "struct",
+          "line_end": 340,
+          "line_start": 336,
+          "name": "AthenaConfig",
+          "rank": 31,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.702519416809082,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/tools/athena-view/execute.ts",
+          "kind": "function",
+          "line_end": 76,
+          "line_start": 24,
+          "name": "createAthenaViewCoreTool",
+          "rank": 32,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 0.47825559973716736,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/rooms/types.rs",
+          "kind": "method",
+          "line_end": 448,
+          "line_start": 440,
+          "name": "as_member_key",
+          "rank": 33,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.8883464336395264,
+          "source": "lexical"
+        },
+        {
+          "file_path": "script/health-sentinel/spec-campaign-types.ts",
+          "kind": "function",
+          "line_end": 49,
+          "line_start": 47,
+          "name": "isPanelMemberAttempt",
+          "rank": 34,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.821842908859253,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/work-graph.md",
+          "kind": "file_summary",
+          "line_end": 193,
+          "line_start": 193,
+          "name": "work-graph",
+          "rank": 35,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.6370246410369873,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/model-routing.md",
+          "kind": "file_summary",
+          "line_end": 84,
+          "line_start": 84,
+          "name": "model-routing",
+          "rank": 36,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.6206741333007812,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/test-only-triage-other-rust.md",
+          "kind": "file_summary",
+          "line_end": 101,
+          "line_start": 101,
+          "name": "test-only-triage-other-rust",
+          "rank": 37,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5999209880828857,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/agent_assertion.rs",
+          "kind": "file_summary",
+          "line_end": 614,
+          "line_start": 614,
+          "name": "agent_assertion",
+          "rank": 38,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5993587970733643,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/wakes.md",
+          "kind": "file_summary",
+          "line_end": 62,
+          "line_start": 62,
+          "name": "wakes",
+          "rank": 39,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.596184730529785,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/tools/work-graph/execute.ts",
+          "kind": "file_summary",
+          "line_end": 596,
+          "line_start": 596,
+          "name": "execute",
+          "rank": 40,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.572782278060913,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/consult/types.rs",
+          "kind": "file_summary",
+          "line_end": 620,
+          "line_start": 620,
+          "name": "types",
+          "rank": 41,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.554755926132202,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gather_evidence/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 1804,
+          "line_start": 1804,
+          "name": "runtime",
+          "rank": 42,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5456595420837402,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/worker_liveness/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 786,
+          "line_start": 786,
+          "name": "runtime",
+          "rank": 43,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.51015567779541,
+          "source": "lexical"
+        },
+        {
+          "file_path": "scripts/census/physical_s5_llm_runner.py",
+          "kind": "file_summary",
+          "line_end": 218,
+          "line_start": 218,
+          "name": "physical_s5_llm_runner",
+          "rank": 44,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.5042285919189453,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/spec-campaigns.md",
+          "kind": "file_summary",
+          "line_end": 46,
+          "line_start": 46,
+          "name": "spec-campaigns",
+          "rank": 45,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.494671583175659,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/llm_runner_consumer/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 191,
+          "line_start": 191,
+          "name": "runtime",
+          "rank": 46,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4903523921966553,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/alfonso-core/module-op-kinds.generated.json",
+          "kind": "file_summary",
+          "line_end": 71,
+          "line_start": 71,
+          "name": "module-op-kinds.generated",
+          "rank": 47,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4839727878570557,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/main.rs",
+          "kind": "file_summary",
+          "line_end": 52,
+          "line_start": 52,
+          "name": "main",
+          "rank": 48,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.4813101291656494,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gh_route.rs",
+          "kind": "file_summary",
+          "line_end": 4144,
+          "line_start": 4144,
+          "name": "gh_route",
+          "rank": 49,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.479663372039795,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/work_graph.rs",
+          "kind": "file_summary",
+          "line_end": 590,
+          "line_start": 590,
+          "name": "work_graph",
+          "rank": 50,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 3.47450590133667,
+          "source": "lexical"
+        }
+      ],
+      "retrieval_metrics_file": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "retrieval_metrics_line_overlap": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "prefrontal-consult-roster-for-class"
+    },
+    {
+      "failure_class": "op_string_dispatch_missed",
+      "first_relevant_rank_file": 7,
+      "first_relevant_rank_line_overlap": null,
+      "ground_truth_ranks": [
+        {
+          "file_path": "crates/prefrontal-core-module/src/dispatch.rs",
+          "line_end": 12556,
+          "line_start": 12510,
+          "rank_file": 11,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "\"persist_answer\" match arm"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/main.rs",
+          "line_end": 2145,
+          "line_start": 2117,
+          "rank_file": 7,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "envelope.method == \"ask.persist_answer\" pre-dispatch arm"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/main.rs",
+          "line_end": 2977,
+          "line_start": 2943,
+          "rank_file": 7,
+          "rank_line_overlap": null,
+          "relevance": 2,
+          "symbol": "envelope.method == \"ask.persist_answer\" post-dispatch arms"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/dispatch.rs",
+          "line_end": 11463,
+          "line_start": 11463,
+          "rank_file": 11,
+          "rank_line_overlap": null,
+          "relevance": 1,
+          "symbol": "op(\"ask.persist_answer\", Mutate) registration"
+        }
+      ],
+      "outranked_by": [
+        {
+          "file_path": "crates/prefrontal-core-module/src/ask_push_reply_tests.rs",
+          "kind": "function",
+          "line_end": 164,
+          "line_start": 30,
+          "name": "ask_persist_answer_reply_precedes_pending_push_and_records_delivery",
+          "rank": 1,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/ask/consumer.ts",
+          "kind": "method",
+          "line_end": 302,
+          "line_start": 279,
+          "name": "persistAnswer",
+          "rank": 2,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/browser_relay/tests.rs",
+          "kind": "function",
+          "line_end": 898,
+          "line_start": 874,
+          "name": "an_answer_that_lands_before_the_close_is_delivered_and_the_ask_stays_answered",
+          "rank": 3,
+          "source": "lexical"
+        },
+        {
+          "file_path": "script/probe-clarify-answer.ts",
+          "kind": "variable",
+          "line_end": 35,
+          "line_start": 29,
+          "name": "persisted",
+          "rank": 4,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/ask.rs",
+          "kind": "method",
+          "line_end": 1649,
+          "line_start": 1642,
+          "name": "persist_answer",
+          "rank": 5,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/spec-campaign-lifecycle-contracts.md",
+          "kind": "file_summary",
+          "line_end": 131,
+          "line_start": 131,
+          "name": "spec-campaign-lifecycle-contracts",
+          "rank": 6,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/main.rs",
+          "kind": "function",
+          "line_end": 3483,
+          "line_start": 3465,
+          "name": "already_open_ask_reply",
+          "rank": 7,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/org/ask.rs",
+          "kind": "function",
+          "line_end": 97,
+          "line_start": 39,
+          "name": "run_org_ask_evaluation_pass",
+          "rank": 8,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/render/athena/mod.rs",
+          "kind": "file_summary",
+          "line_end": 815,
+          "line_start": 815,
+          "name": "mod",
+          "rank": 9,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/push_sender.rs",
+          "kind": "file_summary",
+          "line_end": 278,
+          "line_start": 278,
+          "name": "push_sender",
+          "rank": 10,
+          "source": "lexical"
+        }
+      ],
+      "query": "ask.persist_answer handler",
+      "request": {
+        "includeTests": false,
+        "query": "ask.persist_answer handler",
+        "topK": 50
+      },
+      "response_fields": {
+        "complete": true,
+        "engine_capped": false,
+        "enrichment": {
+          "code": "callgraph_building",
+          "edges": null,
+          "index": {
+            "reason": null,
+            "status": "building"
+          },
+          "status": "omitted"
+        },
+        "fully_degraded": false,
+        "include_tests": false,
+        "interpreted_as": "hybrid",
+        "lanes": {
+          "semantic": {
+            "reason": null,
+            "status": "ready"
+          },
+          "trigram": {
+            "reason": null,
+            "status": "ready"
+          }
+        },
+        "more_available": true,
+        "omitted_lanes": [],
+        "query": "ask.persist_answer handler",
+        "query_kind": "Identifier",
+        "result_count": 50,
+        "results_list_envelope": {
+          "causes": [
+            "cap"
+          ],
+          "narrow": [
+            "offset",
+            "topK",
+            "path",
+            "includeTests"
+          ],
+          "reason": "cap",
+          "shown": 50,
+          "total": {
+            "kind": "at_least",
+            "value": 208
+          },
+          "unit": "results"
+        },
+        "semantic_status": "ready",
+        "status": "ready",
+        "structuredContent": {
+          "plan": {
+            "callback_counts": {
+              "exact": 1,
+              "lexical": 1,
+              "semantic": 1,
+              "symbol": 1,
+              "variants": 1
+            },
+            "confidence": "low",
+            "depth_tier": 0,
+            "embedding_cache_hits": 0,
+            "embedding_calls": 1,
+            "exact_input": "ask.persist_answer handler",
+            "exact_mode": "ready",
+            "exact_tier": "none",
+            "executed_callbacks": [
+              "symbol",
+              "exact",
+              "lexical",
+              "variants",
+              "semantic"
+            ],
+            "lanes_exhausted": false,
+            "lanes_run": [
+              "symbol",
+              "exact",
+              "lexical",
+              "variants",
+              "semantic"
+            ],
+            "live_embed_calls": 1,
+            "query_facts": {
+              "embedded_span": null,
+              "exact_input_tokens": 3,
+              "has_identifier_token": true,
+              "has_path_token": false,
+              "has_timestamp_or_pid": false
+            },
+            "readiness": {
+              "lexical_index": true,
+              "semantic_index": true,
+              "symbol_index": true
+            },
+            "retrieval_depth": 200,
+            "shape": "short",
+            "snapshot_generation": "1:1_220b3e2dd6ead48d8ef5209052e1efe1",
+            "stability_void": false,
+            "variants": [
+              "ask_persist_answer",
+              "ask-persist-answer",
+              "askPersistAnswer",
+              "AskPersistAnswer",
+              "ASK_PERSIST_ANSWER",
+              "ask.persist_answers"
+            ]
+          },
+          "search": {
+            "embedding_cache_hits": 0,
+            "embedding_calls": 1,
+            "live_embed_calls": 1
+          }
+        }
+      },
+      "result_count": 50,
+      "results": [
+        {
+          "file_path": "crates/prefrontal-core-module/src/ask_push_reply_tests.rs",
+          "kind": "function",
+          "line_end": 164,
+          "line_start": 30,
+          "name": "ask_persist_answer_reply_precedes_pending_push_and_records_delivery",
+          "rank": 1,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.5214812755584717,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/ask/consumer.ts",
+          "kind": "method",
+          "line_end": 302,
+          "line_start": 279,
+          "name": "persistAnswer",
+          "rank": 2,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.215195417404175,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/browser_relay/tests.rs",
+          "kind": "function",
+          "line_end": 898,
+          "line_start": 874,
+          "name": "an_answer_that_lands_before_the_close_is_delivered_and_the_ask_stays_answered",
+          "rank": 3,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.2271158695220947,
+          "source": "lexical"
+        },
+        {
+          "file_path": "script/probe-clarify-answer.ts",
+          "kind": "variable",
+          "line_end": 35,
+          "line_start": 29,
+          "name": "persisted",
+          "rank": 4,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.175431251525879,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/ask.rs",
+          "kind": "method",
+          "line_end": 1649,
+          "line_start": 1642,
+          "name": "persist_answer",
+          "rank": 5,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.088919162750244,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/spec-campaign-lifecycle-contracts.md",
+          "kind": "file_summary",
+          "line_end": 131,
+          "line_start": 131,
+          "name": "spec-campaign-lifecycle-contracts",
+          "rank": 6,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.3292810916900635,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/main.rs",
+          "kind": "function",
+          "line_end": 3483,
+          "line_start": 3465,
+          "name": "already_open_ask_reply",
+          "rank": 7,
+          "relevant_file": true,
+          "relevant_line_overlap": false,
+          "score": 2.0887861251831055,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/org/ask.rs",
+          "kind": "function",
+          "line_end": 97,
+          "line_start": 39,
+          "name": "run_org_ask_evaluation_pass",
+          "rank": 8,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1227433681488037,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/render/athena/mod.rs",
+          "kind": "file_summary",
+          "line_end": 815,
+          "line_start": 815,
+          "name": "mod",
+          "rank": 9,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.3121635913848877,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/push_sender.rs",
+          "kind": "file_summary",
+          "line_end": 278,
+          "line_start": 278,
+          "name": "push_sender",
+          "rank": 10,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.240732431411743,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/dispatch.rs",
+          "kind": "function",
+          "line_end": 13151,
+          "line_start": 13127,
+          "name": "answer_ask",
+          "rank": 11,
+          "relevant_file": true,
+          "relevant_line_overlap": false,
+          "score": 2.0539021492004395,
+          "source": "lexical"
+        },
+        {
+          "file_path": "scripts/harness/fire-and-forget-census.json",
+          "kind": "file_summary",
+          "line_end": 96,
+          "line_start": 96,
+          "name": "fire-and-forget-census",
+          "rank": 12,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1730082035064697,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/prefrontal-cross-machine.md",
+          "kind": "file_summary",
+          "line_end": 228,
+          "line_start": 228,
+          "name": "prefrontal-cross-machine",
+          "rank": 13,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.172070264816284,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/asks.md",
+          "kind": "file_summary",
+          "line_end": 23,
+          "line_start": 23,
+          "name": "asks",
+          "rank": 14,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.169468402862549,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/spec_decision.rs",
+          "kind": "method",
+          "line_end": 375,
+          "line_start": 301,
+          "name": "consume_spec_owner_answer_with_ruling",
+          "rank": 15,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.058851957321167,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/task_lifecycle/tests.rs",
+          "kind": "function",
+          "line_end": 4151,
+          "line_start": 4145,
+          "name": "answer_provider_consent_ask",
+          "rank": 16,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0505683422088623,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/state-of-record-by-surface.md",
+          "kind": "file_summary",
+          "line_end": 296,
+          "line_start": 296,
+          "name": "state-of-record-by-surface",
+          "rank": 17,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.168511390686035,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/alfonso-core/module-op-kinds.generated.json",
+          "kind": "file_summary",
+          "line_end": 62,
+          "line_start": 62,
+          "name": "module-op-kinds.generated",
+          "rank": 18,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.162465810775757,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/spec/runtime.rs",
+          "kind": "function",
+          "line_end": 8149,
+          "line_start": 8143,
+          "name": "ask_answer_requests_refire",
+          "rank": 19,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0404539108276367,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/manager.rs",
+          "kind": "file_summary",
+          "line_end": 2951,
+          "line_start": 2951,
+          "name": "manager",
+          "rank": 20,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1507461071014404,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/worker_liveness/tests.rs",
+          "kind": "file_summary",
+          "line_end": 570,
+          "line_start": 570,
+          "name": "tests",
+          "rank": 21,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1456551551818848,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/ask/store.rs",
+          "kind": "file_summary",
+          "line_end": 7,
+          "line_start": 7,
+          "name": "store",
+          "rank": 22,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1383817195892334,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/task_lifecycle/runtime.rs",
+          "kind": "function",
+          "line_end": 12002,
+          "line_start": 11872,
+          "name": "deliver_answered_user_asks",
+          "rank": 23,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.028047561645508,
+          "source": "lexical"
+        },
+        {
+          "file_path": "reports/2026-09-25-nats-migration-inventory.md",
+          "kind": "file_summary",
+          "line_end": 448,
+          "line_start": 448,
+          "name": "2026-09-25-nats-migration-inventory",
+          "rank": 24,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1373467445373535,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/spec/tests.rs",
+          "kind": "function",
+          "line_end": 1502,
+          "line_start": 1417,
+          "name": "twice_renudged_owner_answer_lands_without_rewriting_the_question",
+          "rank": 25,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0357160568237305,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/worker_liveness/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 5695,
+          "line_start": 5695,
+          "name": "runtime",
+          "rank": 26,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.106093406677246,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/ask/coordinator.ts",
+          "kind": "type_alias",
+          "line_end": 81,
+          "line_start": 59,
+          "name": "AnswerOutcome",
+          "rank": 27,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.9879568815231323,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/tools/work-graph/execute.ts",
+          "kind": "file_summary",
+          "line_end": 29,
+          "line_start": 29,
+          "name": "execute",
+          "rank": 28,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.1016366481781006,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/persona/identity.rs",
+          "kind": "file_summary",
+          "line_end": 78,
+          "line_start": 78,
+          "name": "identity",
+          "rank": 29,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0821828842163086,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/manager/completion_gate.rs",
+          "kind": "file_summary",
+          "line_end": 182,
+          "line_start": 182,
+          "name": "completion_gate",
+          "rank": 30,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0811052322387695,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/manager/candidacy.rs",
+          "kind": "file_summary",
+          "line_end": 17,
+          "line_start": 17,
+          "name": "candidacy",
+          "rank": 31,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.066389560699463,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/worktree_runtime/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 117,
+          "line_start": 117,
+          "name": "runtime",
+          "rank": 32,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.065791130065918,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/configuration.md",
+          "kind": "file_summary",
+          "line_end": 42,
+          "line_start": 42,
+          "name": "configuration",
+          "rank": 33,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0628111362457275,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/harness-substrates.md",
+          "kind": "file_summary",
+          "line_end": 72,
+          "line_start": 72,
+          "name": "harness-substrates",
+          "rank": 34,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0617332458496094,
+          "source": "lexical"
+        },
+        {
+          "file_path": "scripts/surface-parity.py",
+          "kind": "file_summary",
+          "line_end": 363,
+          "line_start": 363,
+          "name": "surface-parity",
+          "rank": 35,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0589115619659424,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/campaign.rs",
+          "kind": "file_summary",
+          "line_end": 11852,
+          "line_start": 11852,
+          "name": "campaign",
+          "rank": 36,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0577080249786377,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/pi/plugin_session.rs",
+          "kind": "function",
+          "line_end": 3101,
+          "line_start": 3038,
+          "name": "worker_question_and_parent_answer_use_one_plugin_route_but_worker_answer_does_not",
+          "rank": 37,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.9522287845611572,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/worker-lifecycle.md",
+          "kind": "file_summary",
+          "line_end": 105,
+          "line_start": 105,
+          "name": "worker-lifecycle",
+          "rank": 38,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0506415367126465,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/opencode/src/create-managers.ts",
+          "kind": "file_summary",
+          "line_end": 24,
+          "line_start": 24,
+          "name": "create-managers",
+          "rank": 39,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0453665256500244,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/runtime.rs",
+          "kind": "function",
+          "line_end": 650,
+          "line_start": 619,
+          "name": "wake_consult_answer",
+          "rank": 40,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.8830773830413818,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/llm_runner_consumer/mod.rs",
+          "kind": "file_summary",
+          "line_end": 1815,
+          "line_start": 1815,
+          "name": "mod",
+          "rank": 41,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0434494018554688,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-store/src/policy_domain.rs",
+          "kind": "method",
+          "line_end": 719,
+          "line_start": 621,
+          "name": "answer_parked_policy_ask",
+          "rank": 42,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.8662399053573608,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core/src/manager/store.rs",
+          "kind": "file_summary",
+          "line_end": 581,
+          "line_start": 581,
+          "name": "store",
+          "rank": 43,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.03863525390625,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/specs/work-graph.md",
+          "kind": "file_summary",
+          "line_end": 39,
+          "line_start": 39,
+          "name": "work-graph",
+          "rank": 44,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0324549674987793,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/consult/tests.rs",
+          "kind": "function",
+          "line_end": 4229,
+          "line_start": 4204,
+          "name": "consult_owned_answer_is_never_claimed_by_the_reviver",
+          "rank": 45,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.886074423789978,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/gather_evidence/runtime.rs",
+          "kind": "file_summary",
+          "line_end": 1728,
+          "line_start": 1728,
+          "name": "runtime",
+          "rank": 46,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0260910987854004,
+          "source": "lexical"
+        },
+        {
+          "file_path": "script/health-sentinel.ts",
+          "kind": "file_summary",
+          "line_end": 369,
+          "line_start": 369,
+          "name": "health-sentinel",
+          "rank": 47,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0248568058013916,
+          "source": "lexical"
+        },
+        {
+          "file_path": "docs/designs/opencode-v2-surface-matrix.md",
+          "kind": "file_summary",
+          "line_end": 75,
+          "line_start": 75,
+          "name": "opencode-v2-surface-matrix",
+          "rank": 48,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.023801565170288,
+          "source": "lexical"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/render/ask/mod.rs",
+          "kind": "function",
+          "line_end": 116,
+          "line_start": 100,
+          "name": "validate_replacement_replay",
+          "rank": 49,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.8469486236572266,
+          "source": "lexical"
+        },
+        {
+          "file_path": "packages/core/src/features/background-agent/manager-consumer.ts",
+          "kind": "file_summary",
+          "line_end": 57,
+          "line_start": 57,
+          "name": "manager-consumer",
+          "rank": 50,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 2.0233399868011475,
+          "source": "lexical"
+        }
+      ],
+      "retrieval_metrics_file": {
+        "mrr": 0.142857,
+        "ndcg_at_10": 0.14207,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.5,
+        "recall_at_5": 0.0
+      },
+      "retrieval_metrics_line_overlap": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "prefrontal-ask-persist-answer-dispatch"
+    },
+    {
+      "failure_class": "unclassified",
+      "first_relevant_rank_file": 13,
+      "first_relevant_rank_line_overlap": 13,
+      "ground_truth_ranks": [
+        {
+          "file_path": "script/experiments/merge-tools-replay/tools.ts",
+          "line_end": 171,
+          "line_start": 129,
+          "rank_file": 15,
+          "rank_line_overlap": 15,
+          "relevance": 2,
+          "symbol": "repoTool"
+        },
+        {
+          "file_path": "script/experiments/merge-tools-replay/config.ts",
+          "line_end": 95,
+          "line_start": 73,
+          "rank_file": 13,
+          "rank_line_overlap": 13,
+          "relevance": 1,
+          "symbol": "repoTools read_file and search_repo declarations"
+        },
+        {
+          "file_path": ".cortexkit/alfonso/reports/2026-09-24-merge-tools-replay.md",
+          "line_end": 269,
+          "line_start": 1,
+          "rank_file": null,
+          "rank_line_overlap": null,
+          "relevance": 1,
+          "symbol": "merge-tools replay report"
+        }
+      ],
+      "outranked_by": [
+        {
+          "file_path": "crates/prefrontal-routing-module/src/config_overrides.rs",
+          "kind": "file_summary",
+          "line_end": 1015,
+          "line_start": 1015,
+          "name": "config_overrides",
+          "rank": 1,
+          "source": "exact"
+        },
+        {
+          "file_path": "scripts/harness/extraction-inventory.json",
+          "kind": "file_summary",
+          "line_end": 567,
+          "line_start": 567,
+          "name": "extraction-inventory",
+          "rank": 2,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/artifacts_v2.rs",
+          "kind": "file_summary",
+          "line_end": 789,
+          "line_start": 789,
+          "name": "artifacts_v2",
+          "rank": 3,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/tools/delegate-task/prompt-file.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "prompt-file",
+          "rank": 4,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/tools/delegate-task/resolve-prompt-append.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "resolve-prompt-append",
+          "rank": 5,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/agents/builtin-agents/resolve-file-uri.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "resolve-file-uri",
+          "rank": 6,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/pi/src/index.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "index",
+          "rank": 7,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/experiments/merge-tools-replay/summarize.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "summarize",
+          "rank": 8,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/gather-distill-driver.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "gather-distill-driver",
+          "rank": 9,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/migrate-model-routing-config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "migrate-model-routing-config",
+          "rank": 10,
+          "source": "exact"
+        }
+      ],
+      "query": "spec aggregator merge repository read tools search_repo read_file",
+      "request": {
+        "includeTests": false,
+        "query": "spec aggregator merge repository read tools search_repo read_file",
+        "topK": 50
+      },
+      "response_fields": {
+        "complete": true,
+        "engine_capped": false,
+        "enrichment": {
+          "code": "callgraph_building",
+          "edges": null,
+          "index": {
+            "reason": null,
+            "status": "building"
+          },
+          "status": "omitted"
+        },
+        "fully_degraded": false,
+        "include_tests": false,
+        "interpreted_as": "hybrid",
+        "lanes": {
+          "semantic": {
+            "reason": null,
+            "status": "ready"
+          },
+          "trigram": {
+            "reason": null,
+            "status": "ready"
+          }
+        },
+        "more_available": true,
+        "omitted_lanes": [],
+        "query": "spec aggregator merge repository read tools search_repo read_file",
+        "query_kind": "Mixed",
+        "result_count": 50,
+        "results_list_envelope": {
+          "causes": [
+            "cap"
+          ],
+          "narrow": [
+            "offset",
+            "topK",
+            "path",
+            "includeTests"
+          ],
+          "reason": "cap",
+          "shown": 50,
+          "total": {
+            "kind": "at_least",
+            "value": 281
+          },
+          "unit": "results"
+        },
+        "semantic_status": "ready",
+        "status": "ready",
+        "structuredContent": {
+          "plan": {
+            "callback_counts": {
+              "exact": 1,
+              "lexical": 1,
+              "semantic": 1,
+              "symbol": 1
+            },
+            "confidence": "high",
+            "depth_tier": 0,
+            "embedding_cache_hits": 0,
+            "embedding_calls": 1,
+            "exact_input": "spec aggregator merge repository read tools search_repo read_file",
+            "exact_mode": "ready",
+            "exact_tier": "definition",
+            "executed_callbacks": [
+              "symbol",
+              "exact",
+              "lexical",
+              "semantic"
+            ],
+            "lanes_exhausted": false,
+            "lanes_run": [
+              "symbol",
+              "exact",
+              "lexical",
+              "semantic"
+            ],
+            "live_embed_calls": 1,
+            "query_facts": {
+              "embedded_span": null,
+              "exact_input_tokens": 8,
+              "has_identifier_token": true,
+              "has_path_token": false,
+              "has_timestamp_or_pid": false
+            },
+            "readiness": {
+              "lexical_index": true,
+              "semantic_index": true,
+              "symbol_index": true
+            },
+            "retrieval_depth": 200,
+            "shape": "natural_language",
+            "snapshot_generation": "1:1_220b3e2dd6ead48d8ef5209052e1efe1",
+            "stability_void": false,
+            "variants": []
+          },
+          "search": {
+            "embedding_cache_hits": 0,
+            "embedding_calls": 1,
+            "live_embed_calls": 1
+          }
+        }
+      },
+      "result_count": 50,
+      "results": [
+        {
+          "file_path": "crates/prefrontal-routing-module/src/config_overrides.rs",
+          "kind": "file_summary",
+          "line_end": 1015,
+          "line_start": 1015,
+          "name": "config_overrides",
+          "rank": 1,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "scripts/harness/extraction-inventory.json",
+          "kind": "file_summary",
+          "line_end": 567,
+          "line_start": 567,
+          "name": "extraction-inventory",
+          "rank": 2,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/artifacts_v2.rs",
+          "kind": "file_summary",
+          "line_end": 789,
+          "line_start": 789,
+          "name": "artifacts_v2",
+          "rank": 3,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/tools/delegate-task/prompt-file.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "prompt-file",
+          "rank": 4,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/tools/delegate-task/resolve-prompt-append.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "resolve-prompt-append",
+          "rank": 5,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/agents/builtin-agents/resolve-file-uri.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "resolve-file-uri",
+          "rank": 6,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/pi/src/index.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "index",
+          "rank": 7,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/experiments/merge-tools-replay/summarize.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "summarize",
+          "rank": 8,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/gather-distill-driver.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "gather-distill-driver",
+          "rank": 9,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/migrate-model-routing-config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "migrate-model-routing-config",
+          "rank": 10,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/repair-relocated-fixture-paths.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "repair-relocated-fixture-paths",
+          "rank": 11,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "crates/prefrontal-core-module/src/campaign/scaffolding.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "scaffolding",
+          "rank": 12,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "script/experiments/merge-tools-replay/config.ts",
+          "kind": "function",
+          "line_end": 109,
+          "line_start": 69,
+          "name": "repoTools",
+          "rank": 13,
+          "relevant_file": true,
+          "relevant_line_overlap": true,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "script/experiments/merge-tools-replay/review.ts",
+          "kind": "variable",
+          "line_end": 109,
+          "line_start": 102,
+          "name": "CLASSIFIER_SYSTEM",
+          "rank": 14,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "script/experiments/merge-tools-replay/tools.ts",
+          "kind": "function",
+          "line_end": 171,
+          "line_start": 129,
+          "name": "repoTool",
+          "rank": 15,
+          "relevant_file": true,
+          "relevant_line_overlap": true,
+          "score": 1.0,
+          "source": "semantic"
+        },
+        {
+          "file_path": "scripts/census/physical_s8_task_lifecycle.py",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "physical_s8_task_lifecycle",
+          "rank": 16,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "audit/loop-bug-windows-containment-root.md",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "loop-bug-windows-containment-root",
+          "rank": 17,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "modules/condition-runner/scripts/vendor-drift-check.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "vendor-drift-check",
+          "rank": 18,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "modules/condition-runner/src/runner.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "runner",
+          "rank": 19,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/build.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "build",
+          "rank": 20,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/features/alfonso-core/client.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "client",
+          "rank": 21,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/features/model-routing/subscription-classifier.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "subscription-classifier",
+          "rank": 22,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/shared/contains-path.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "contains-path",
+          "rank": 23,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/shared/json-file-cache-store.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "json-file-cache-store",
+          "rank": 24,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/shared/jsonc-parser.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "jsonc-parser",
+          "rank": 25,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/shared/migration/config-migration.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "config-migration",
+          "rank": 26,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/shared/migration/migrations-sidecar.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "migrations-sidecar",
+          "rank": 27,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/shared/model-availability.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "model-availability",
+          "rank": 28,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/core/src/tools/background-task/ask-attachments.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "ask-attachments",
+          "rank": 29,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/bin/alfonso.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "alfonso",
+          "rank": 30,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/postinstall.mjs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "postinstall",
+          "rank": 31,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/config-manager/add-plugin-to-opencode-config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "add-plugin-to-opencode-config",
+          "rank": 32,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/config-manager/detect-current-config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "detect-current-config",
+          "rank": 33,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/config-manager/parse-opencode-config-file.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "parse-opencode-config-file",
+          "rank": 34,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/config-manager/write-plugin-config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "write-plugin-config",
+          "rank": 35,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "config",
+          "rank": 36,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/model-resolution-cache.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "model-resolution-cache",
+          "rank": 37,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/model-resolution-config.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "model-resolution-config",
+          "rank": 38,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/system-loaded-version.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "system-loaded-version",
+          "rank": 39,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/system-plugin.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "system-plugin",
+          "rank": 40,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/system.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "system",
+          "rank": 41,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/cli/doctor/checks/tools-mcp.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "tools-mcp",
+          "rank": 42,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/features/host-bridge/effect-executor.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "effect-executor",
+          "rank": 43,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/cache.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "cache",
+          "rank": 44,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/checker/cached-version.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "cached-version",
+          "rank": 45,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/checker/local-dev-path.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "local-dev-path",
+          "rank": 46,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/checker/local-dev-version.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "local-dev-version",
+          "rank": 47,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/checker/package-json-locator.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "package-json-locator",
+          "rank": 48,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/checker/plugin-entry.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "plugin-entry",
+          "rank": 49,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        },
+        {
+          "file_path": "packages/opencode/src/hooks/auto-update-checker/checker/sync-package-json.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "sync-package-json",
+          "rank": 50,
+          "relevant_file": false,
+          "relevant_line_overlap": false,
+          "score": 1.0,
+          "source": "exact"
+        }
+      ],
+      "retrieval_metrics_file": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "retrieval_metrics_line_overlap": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "prefrontal-spec-aggregator-repo-tools"
+    }
+  ],
+  "top_k": 50,
+  "unsupported": [
+    {
+      "id": "prefrontal-zoom-macro-body-fn",
+      "reason": "This miss is an aft_zoom symbol lookup, not an aft_search query, and no runner in this directory measures zoom or outline, so there is no row form for it. It is listed here so the specimen is accounted for, not scored.",
+      "specimen": "aft_zoom attachments_runtime_session_display_read (crates/prefrontal-core-module/src/attachments/runtime.rs:607) returned symbol not found, because the fn is written inside a macro_rules! body."
+    }
+  ]
+}
