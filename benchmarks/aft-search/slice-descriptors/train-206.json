@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "watcher-reseed-reservations"
+  ],
+  "note": "Watcher exclusion re-seed keeps build-output and dependency folders after an overflow. No ranking-fence file touched."
+}
