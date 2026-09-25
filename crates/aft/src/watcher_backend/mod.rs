@@ -90,6 +90,7 @@ pub(crate) fn create_project_watcher(
 fn render_exclusions(
     root: &std::path::Path,
     exclusions: &[crate::watcher_filter::WatcherExclusion],
+    matcher_generation: u64,
 ) -> String {
     let seeded = exclusions
         .iter()
@@ -108,8 +109,16 @@ fn render_exclusions(
         .map(|exclusion| exclusion.source().as_str())
         .collect::<Vec<_>>()
         .join(",");
+    // Generation zero means no ignore rules were ever loaded for this root, so
+    // the plan could only see `.git`. Say so in the line instead of letting it
+    // read like a healthy root that simply has nothing to exclude.
+    let unloaded = if matcher_generation == 0 {
+        " matcher=unloaded"
+    } else {
+        ""
+    };
     format!(
-        "watcher exclusions: seeded=[{seeded}] by=[{sources}] root={}",
+        "watcher exclusions: seeded=[{seeded}] by=[{sources}] root={}{unloaded}",
         root.display()
     )
 }
@@ -118,8 +127,12 @@ fn render_exclusions(
 pub(crate) fn log_exclusions(
     root: &std::path::Path,
     exclusions: &[crate::watcher_filter::WatcherExclusion],
+    matcher_generation: u64,
 ) {
-    crate::slog_info!("{}", render_exclusions(root, exclusions));
+    crate::slog_info!(
+        "{}",
+        render_exclusions(root, exclusions, matcher_generation)
+    );
 }
 
 #[cfg(test)]
@@ -145,9 +158,16 @@ mod tests {
         let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
 
         assert_eq!(
-            render_exclusions(&root, &exclusions),
+            render_exclusions(&root, &exclusions, 1),
             format!(
                 "watcher exclusions: seeded=[target,generated] by=[ecosystem,gitignore] root={}",
+                root.display()
+            )
+        );
+        assert_eq!(
+            render_exclusions(&root, &exclusions[..0], 0),
+            format!(
+                "watcher exclusions: seeded=[] by=[] root={} matcher=unloaded",
                 root.display()
             )
         );

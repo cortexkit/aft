@@ -573,6 +573,36 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
     paths
 }
 
+/// Load the ignore rules before a watcher starts, if nothing has loaded them yet.
+///
+/// The OS backend derives its kernel exclusion set (`target/`, `node_modules/`,
+/// and the other ecosystem directories) from the gitignore matcher when it is
+/// created, and re-derives only when the matcher generation moves. The
+/// configure tail normally builds the matcher in its `ProjectRuntime` stage
+/// before its `Watcher` stage, but a watcher can also start without that tail:
+/// when a root is quiesced (its queued configure maintenance cancelled before
+/// `ProjectRuntime` ran) and then rebound, `ensure_project_watcher` restarts
+/// the watcher directly, and the next configure sees an active watcher and
+/// skips the project-runtime refresh. Nothing then ever builds the matcher, so
+/// the backend keeps the only plan it can make without one: `.git` alone.
+///
+/// Every watcher start funnels through here, so a root's first watcher always
+/// sees the same matcher the configure tail would have built. This is a no-op
+/// once any matcher has been published, including the deliberate empty one for
+/// the home directory.
+fn publish_ignore_rules_before_watcher_start(ctx: &AppContext, root_path: &Path) {
+    if ctx.gitignore_published() {
+        return;
+    }
+    // Same rule as the configure tail: the home directory is too large to walk
+    // for ignore files, so it gets an explicit empty matcher instead.
+    if resolve_home_dir().is_some_and(|home| home == root_path) {
+        ctx.clear_gitignore();
+    } else {
+        ctx.rebuild_gitignore();
+    }
+}
+
 fn start_project_watcher_with<W, E, F>(
     ctx: &AppContext,
     root_path: &Path,
@@ -588,6 +618,7 @@ fn start_project_watcher_with<W, E, F>(
     let generation = WATCHER_GENERATION
         .fetch_add(1, Ordering::SeqCst)
         .wrapping_add(1);
+    publish_ignore_rules_before_watcher_start(ctx, root_path);
     let (dispatch_tx, dispatch_rx) = watcher_filter::watcher_dispatch_channel();
     let shutdown = Arc::new(AtomicBool::new(false));
     let thread_shutdown = Arc::clone(&shutdown);
@@ -12426,6 +12457,76 @@ mod tests {
             other => panic!("unexpected watcher event: {other:?}"),
         }
         ctx.stop_watcher_runtime();
+    }
+
+    /// The daemon-restart ordering that left roots watched with only `.git`
+    /// excluded: each root is configured, its queued configure maintenance is
+    /// cancelled when the root is quiesced (so the `ProjectRuntime` stage that
+    /// builds the gitignore matcher never runs), and the rebind then restarts
+    /// the watcher directly through `ensure_project_watcher`. The attach below
+    /// derives the plan exactly as the OS backend's `create` does, from the
+    /// shared matcher at watcher-start time.
+    #[test]
+    fn watcher_restored_before_configure_tail_seeds_ecosystem_exclusions() {
+        let _guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let roots = (0..6)
+            .map(|_| tempfile::tempdir().unwrap())
+            .collect::<Vec<_>>();
+        let mut contexts = Vec::new();
+        for root in &roots {
+            let root = std::fs::canonicalize(root.path()).unwrap();
+            std::fs::create_dir(root.join(".git")).unwrap();
+            std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
+            std::fs::create_dir_all(root.join("target/debug")).unwrap();
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(root.clone()),
+                    ..Config::default()
+                },
+            );
+            ctx.set_canonical_cache_root(root.clone());
+            // Configured, but the tail that would load the ignore rules was
+            // cancelled before it ran.
+            assert!(!ctx.gitignore_published());
+            contexts.push((root, ctx));
+        }
+
+        // Every root rebinds in one burst, as after a daemon restart.
+        let (plan_tx, plan_rx) = mpsc::channel();
+        for (root, ctx) in &contexts {
+            let matcher = ctx.shared_gitignore();
+            let plan_tx = plan_tx.clone();
+            install_project_watcher_with(ctx, root, Vec::new(), move |root, _extra, tx| {
+                let plan = crate::watcher_filter::derive_watcher_exclusion_plan(
+                    &root,
+                    &matcher,
+                    Some(crate::watcher_filter::WATCHER_EXCLUSION_LIMIT),
+                );
+                let paths = crate::watcher_filter::watcher_exclusion_paths(&plan.selected);
+                plan_tx.send((root, paths)).unwrap();
+                Ok::<_, &'static str>(tx)
+            });
+        }
+        drop(plan_tx);
+
+        let mut seen = 0;
+        for (root, paths) in plan_rx.iter().take(contexts.len()) {
+            seen += 1;
+            assert!(
+                paths.contains(&root.join("target")),
+                "first watcher start must exclude target/ for {}: {paths:?}",
+                root.display()
+            );
+        }
+        assert_eq!(seen, contexts.len());
+        for (_, ctx) in &contexts {
+            assert!(ctx.gitignore_published());
+            ctx.stop_watcher_runtime();
+        }
     }
 
     #[test]

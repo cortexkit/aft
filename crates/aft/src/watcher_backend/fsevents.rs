@@ -43,7 +43,7 @@ impl ProjectWatcher {
         let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusions = plan.selected;
         let exclusion_paths = watcher_exclusion_paths(&exclusions);
-        super::log_exclusions(&root, &exclusions);
+        super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let stream = FsEventsStream::start(&root, &exclusion_paths, backend_tx.clone())?;
@@ -90,7 +90,11 @@ impl ProjectWatcher {
                                     watcher_exclusion_paths(&replacement_plan.dropped),
                                 );
                                 if replacement_exclusions != exclusions {
-                                    super::log_exclusions(&root, &replacement_exclusions);
+                                    super::log_exclusions(
+                                        &root,
+                                        &replacement_exclusions,
+                                        observed_generation,
+                                    );
                                     exclusions = replacement_exclusions;
                                 }
                             }
@@ -613,6 +617,55 @@ mod tests {
         assert_eq!(user[0].info(), Some("rescan: user dropped"));
         assert!(kernel[0].need_rescan());
         assert_eq!(kernel[0].info(), Some("rescan: kernel dropped"));
+    }
+
+    /// The backend half of a matcher loaded after the watcher started: the
+    /// first plan can only see `.git`, and publishing the matcher (which always
+    /// bumps the generation) must make the running backend re-derive and
+    /// install `target/` without a restart.
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn backend_rederives_exclusions_when_matcher_is_published_after_start() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "/target/\n").unwrap();
+        std::fs::create_dir_all(root.path().join("target/debug")).unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let target = canonical_root.join("target");
+        let matcher: SharedGitignore = Arc::new(RwLock::new(None));
+        let generation = Arc::new(AtomicU64::new(0));
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let (tx, _rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            canonical_root.clone(),
+            Vec::new(),
+            tx,
+            Arc::clone(&matcher),
+            Arc::clone(&generation),
+        )
+        .unwrap();
+        let before = counters.backend_exclusions();
+        assert_eq!(before.matcher_generation, 0);
+        assert_eq!(before.paths, vec![canonical_root.join(".git")]);
+
+        let mut builder = GitignoreBuilder::new(&canonical_root);
+        builder.add(canonical_root.join(".gitignore"));
+        *matcher.write().unwrap() = Some(Arc::new(builder.build().unwrap()));
+        generation.fetch_add(1, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while counters.backend_exclusions().matcher_generation != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let after = counters.backend_exclusions();
+        drop(watcher);
+        assert_eq!(after.matcher_generation, 1);
+        assert!(
+            after.paths.contains(&target),
+            "published matcher never reached the running backend: {:?}",
+            after.paths
+        );
     }
 
     #[test]

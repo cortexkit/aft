@@ -3551,6 +3551,18 @@ impl AppContext {
         Arc::clone(&self.gitignore_generation)
     }
 
+    /// Whether any matcher (including a deliberate "no matcher") has been
+    /// published for this context since it was created.
+    ///
+    /// Every publication path (`rebuild_gitignore`, `clear_gitignore`, and the
+    /// unchanged-input acknowledgement that only runs after an earlier build)
+    /// bumps the generation, so generation zero means the ignore rules were
+    /// never loaded. A `None` matcher at generation zero is "not known yet",
+    /// not "this project ignores nothing".
+    pub(crate) fn gitignore_published(&self) -> bool {
+        self.gitignore_generation.load(Ordering::SeqCst) > 0
+    }
+
     fn set_gitignore(&self, matcher: Option<Arc<ignore::gitignore::Gitignore>>) {
         *self
             .gitignore

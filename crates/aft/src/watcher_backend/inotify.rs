@@ -59,7 +59,7 @@ impl ProjectWatcher {
         let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusions = plan.selected;
         let exclusion_paths = watcher_exclusion_paths(&exclusions);
-        super::log_exclusions(&root, &exclusions);
+        super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
@@ -137,7 +137,11 @@ impl ProjectWatcher {
                             watcher_exclusion_paths(&replacement_plan.dropped),
                         );
                         if replacement_exclusions != exclusions {
-                            super::log_exclusions(&root, &replacement_exclusions);
+                            super::log_exclusions(
+                                &root,
+                                &replacement_exclusions,
+                                observed_generation,
+                            );
                             exclusions = replacement_exclusions;
                         }
                         exclusion_paths = replacement_paths;
