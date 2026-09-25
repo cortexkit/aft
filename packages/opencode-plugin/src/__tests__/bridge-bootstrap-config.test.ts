@@ -43,7 +43,7 @@ describe("bootstrap configuration", () => {
     expect(result.message).toContain("removed_config_key:aft_glob:use:glob");
     expect(result.message).toContain("npx @cortexkit/aft doctor --fix");
     expect(result.message).toContain("restart");
-    // Too broken to compute its own surface: the default surface registers.
+    // A rejected config cannot say which tools to disable, so the default surface registers.
     expect(result.config).toEqual(defaultSurfaceConfig());
     expect(notices).toEqual([result.message]);
   });
@@ -59,7 +59,7 @@ describe("bootstrap configuration", () => {
     expect(result.message).toContain("/p/aft.jsonc failed to parse: Unexpected token }");
     expect(result.message).toContain("Fix the JSONC syntax");
     expect(result.config).toEqual(defaultSurfaceConfig());
-    // Migration never ran: the only notice is the error itself.
+    // Parsing failed before the config-location migration, so the parse error is the only notice.
     expect(notices).toEqual([result.message]);
   });
 

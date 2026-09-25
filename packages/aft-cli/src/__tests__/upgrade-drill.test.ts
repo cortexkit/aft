@@ -198,7 +198,7 @@ describe("doctor reports every condition that puts the plugin in its config erro
     expect(text).toContain(
       "[HIGH] OpenCode: The plugin loads, but every AFT tool call fails with: subc.connection_file",
     );
-    // Doctor quotes the plugin's own error text, restart note included.
+    // Doctor quotes the error text every plugin tool call returns, including the restart note.
     expect(text).toContain("no subc connection file exists there");
     expect(text).toContain("restart the host");
     expect(text).toContain(
@@ -215,7 +215,7 @@ describe("doctor reports every condition that puts the plugin in its config erro
   });
 
   test("rejected retired keys are HIGH and planned for doctor --fix", async () => {
-    // gh_read is rejected at every version, so the plugin cannot use the file.
+    // The retired gh_read key is rejected by every plugin version, never migrated in place.
     writeUserConfig({ gh_read: true });
     const { code, text } = await plainDoctor();
     expect(code).toBe(1);

@@ -47,7 +47,7 @@ describe("config error state helpers", () => {
     const message = await subcConnectionFileError(missing);
     expect(message).toContain("no subc connection file exists there");
     expect(message).toContain("remove subc.connection_file");
-    // The factory refuses with exactly the same words.
+    // The transport factory refuses with the same text subcConnectionFileError returns.
     await expect(
       createAftTransportPool({
         harness: "opencode",
