@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "release-notes-0.58"
+  ],
+  "note": "v0.58.0 release notes and the 0.58 startup announcement in both plugins. No ranking-fence file touched."
+}
