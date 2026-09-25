@@ -325,21 +325,10 @@ fn refusal_exchanges() -> Vec<Exchange> {
             verb: "v14-api-patch-issue-comment",
             reply: HolderReply::Respond("refusal-custody_unreachable.response.json"),
         },
-        Exchange {
-            name: "v1-issue-comment-unbound-identity",
-            verb: "v1-issue-comment",
-            reply: HolderReply::Respond("unbound-identity.response.json"),
-        },
-        Exchange {
-            name: "v1-issue-comment-upstream-error",
-            verb: "v1-issue-comment",
-            reply: HolderReply::Respond("upstream-error.response.json"),
-        },
-        Exchange {
-            name: "v12-issue-close-state-applied-comment-failed",
-            verb: "v12-issue-close",
-            reply: HolderReply::Respond("state-applied-comment-failed.response.json"),
-        },
+        // The gh.route unbound-identity, upstream-error and "state applied,
+        // comment failed" replies have no counterpart on the AFT relay: plexus
+        // answers with a completed result or a refusal code, and posts a close
+        // comment before changing state, so those exchanges are not recorded.
     ]
 }
 
@@ -367,16 +356,68 @@ fn leak(value: String) -> &'static str {
 // Fake route holder
 // ---------------------------------------------------------------------------
 
-/// A request frame the holder read, in arrival order.
+/// A request frame the holder read, in arrival order. For the relayed bot
+/// write, `on_route` is set and `body` holds just the governed `gh.route`
+/// envelope the shim put in `params.request`, so the request goldens keep
+/// pinning exactly those bytes.
 #[derive(Clone, Debug)]
 struct CapturedFrame {
     on_route: bool,
     body: Vec<u8>,
 }
 
-/// Loopback subc daemon that advertises `prefrontal-core` as the `gh.route`
+/// Translate a recorded `gh.route` holder response into the reply the AFT
+/// daemon's relay gives for the same result: plexus's facade reply wrapped in
+/// the management envelope.
+fn relay_reply(gh_route_response: &[u8]) -> Vec<u8> {
+    let response: Value =
+        serde_json::from_slice(gh_route_response).expect("gh.route response is JSON");
+    let result = match response["outcome"].as_str() {
+        Some("result") => json!({"status": "completed", "result": response["result"]}),
+        Some("applied") => {
+            let mut state = serde_json::Map::new();
+            for key in ["state", "state_reason"] {
+                if let Some(value) = response.get(key).filter(|value| !value.is_null()) {
+                    state.insert(key.to_string(), value.clone());
+                }
+            }
+            json!({"status": "completed", "result": state})
+        }
+        Some("refusal") => json!({"status": "refused", "refusal_code": response["refusal_code"]}),
+        other => panic!("gh.route outcome {other:?} has no relay counterpart"),
+    };
+    serde_json::to_vec(&json!({
+        "op": "gh_shim.bot_request",
+        "status": "ok",
+        "data": {"repo_binding_generation": 1, "result": result},
+    }))
+    .expect("relay reply")
+}
+
+/// Plexus's bindings, matching the test manifest so the shim's version check
+/// passes.
+fn relay_bindings_reply() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "op": "gh_shim.bindings_read",
+        "status": "ok",
+        "data": {
+            "repo_binding_generation": 1,
+            "bindings": [
+                {"repository": REPOSITORY, "app_handle_id": "h1", "agent_id": "alfonso-aft"},
+                {"repository": OTHER_BOUND_REPOSITORY, "app_handle_id": "h2", "agent_id": OTHER_BOUND_AGENT},
+            ],
+        },
+    }))
+    .expect("bindings reply")
+}
+
+/// Stands in for the ticket the daemon gives an agent's command; the fake
+/// holder accepts any ticket.
+const TEST_GH_SHIM_TICKET: &str = "00112233445566778899aabbccddeeff";
+
+/// Loopback subc daemon that advertises `aft` serving the gh shim relay on its
 /// management surface, opens route channel 42, records every request frame
-/// body, and answers the governed request according to its `HolderReply`.
+/// body, and answers the relayed write according to its `HolderReply`.
 struct CapturingHolder {
     port: u16,
     key: Vec<u8>,
@@ -525,17 +566,25 @@ async fn serve_connection(
                 .expect("hello ack frame"),
             ),
             FrameType::Request => {
-                let on_route = frame.header.channel == ROUTE_CHANNEL;
+                let decoded = serde_json::from_slice::<Value>(&frame.body).ok();
+                let op = decoded
+                    .as_ref()
+                    .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_string));
+                let bot_write = frame.header.channel == ROUTE_CHANNEL
+                    && op.as_deref() == Some("gh_shim.bot_request");
+                let body = match decoded.as_ref() {
+                    Some(value) if bot_write => {
+                        serde_json::to_vec(&value["params"]["request"]).expect("governed envelope")
+                    }
+                    _ => frame.body.clone(),
+                };
                 captured
                     .lock()
                     .expect("captured frames lock")
                     .push(CapturedFrame {
-                        on_route,
-                        body: frame.body.clone(),
+                        on_route: bot_write,
+                        body,
                     });
-                let op = serde_json::from_slice::<Value>(&frame.body)
-                    .ok()
-                    .and_then(|value| value.get("op").and_then(Value::as_str).map(str::to_string));
                 match op.as_deref() {
                     Some("catalog.list") => Some(response_frame(
                         &frame,
@@ -543,11 +592,14 @@ async fn serve_connection(
                             "op": "catalog.list",
                             "generation": 1,
                             "modules": [{
-                                "module_id": "prefrontal-core",
+                                "module_id": "aft",
                                 "module_version": "0.1.0",
                                 "roles": [{
                                     "role": "management_surface",
-                                    "operations": [{ "name": "gh.route", "kind": "query" }],
+                                    "operations": [
+                                        { "name": "gh_shim.bot_request", "kind": "mutate" },
+                                        { "name": "gh_shim.bindings_read", "kind": "query" }
+                                    ],
                                     "config_schema": {},
                                     "observability": [],
                                     "identity_scope": ["project"]
@@ -572,7 +624,12 @@ async fn serve_connection(
                         serde_json::to_vec(&json!({ "op": "route.close" }))
                             .expect("route close body"),
                     )),
-                    _ if on_route => reply.clone().map(|bytes| response_frame(&frame, bytes)),
+                    Some("gh_shim.bindings_read") if frame.header.channel == ROUTE_CHANNEL => {
+                        Some(response_frame(&frame, relay_bindings_reply()))
+                    }
+                    _ if bot_write => reply
+                        .as_deref()
+                        .map(|bytes| response_frame(&frame, relay_reply(bytes))),
                     _ => None,
                 }
             }
@@ -797,6 +854,7 @@ fn run_shim(verb: &Verb, reply: &HolderReply) -> Run {
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", &recorder)
+        .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -1167,6 +1225,7 @@ fn run_targeting(
         .env("GH_SHIM_TEST_RECORD", &recorder)
         // Keep git from finding a repository above the temporary directory.
         .env("GIT_CEILING_DIRECTORIES", temp.path())
+        .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
         .env_remove("GIT_DIR")
         .env_remove("GH_REPO")
         .env_remove("GH_TOKEN")

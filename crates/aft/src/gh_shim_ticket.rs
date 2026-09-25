@@ -42,9 +42,7 @@ struct Entry {
 static REGISTRY: LazyLock<Mutex<Vec<Entry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 fn registry() -> std::sync::MutexGuard<'static, Vec<Entry>> {
-    REGISTRY
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
+    REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// Whether a session may hold a ticket. Requests without an agent session use
@@ -132,7 +130,7 @@ fn revoke(ticket: &str) {
 }
 
 /// Number of live tickets; lets tests prove a ticket was dropped.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn live_count_for_task(task_id: &str) -> usize {
     registry()
         .iter()
@@ -229,9 +227,11 @@ mod tests {
 
     #[test]
     fn default_and_empty_sessions_get_no_ticket() {
-        assert!(PendingTicket::issue(crate::protocol::DEFAULT_SESSION_ID, "/p")
-            .value()
-            .is_none());
+        assert!(
+            PendingTicket::issue(crate::protocol::DEFAULT_SESSION_ID, "/p")
+                .value()
+                .is_none()
+        );
         assert!(PendingTicket::issue("", "/p").value().is_none());
         assert!(ScopedTicket::issue("  ", "call", "/p").value().is_none());
     }

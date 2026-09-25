@@ -450,10 +450,9 @@ impl SubcRelayTransport {
             call_timeout: RELAY_CALL_TIMEOUT,
             ..subc_client_rs::ConsumerOptions::default()
         };
-        let consumer =
-            crate::fleet_status::connect_subc_consumer(&self.connection_file, options)
-                .await
-                .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+        let consumer = crate::fleet_status::connect_subc_consumer(&self.connection_file, options)
+            .await
+            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
         let consumer = Arc::new(consumer);
         *slot = Some(Arc::clone(&consumer));
         Ok(consumer)
@@ -469,7 +468,12 @@ impl SubcRelayTransport {
         use subc_client_rs::{CallError, CallOptions, CloseRouteOptions};
         let consumer = self.consumer().await?;
         let identity = subc_protocol::BindIdentity::new(
-            if project_root.is_empty() { "/" } else { project_root }.to_string(),
+            if project_root.is_empty() {
+                "/"
+            } else {
+                project_root
+            }
+            .to_string(),
             "aft-gh-relay",
             session.to_string(),
         );
@@ -499,9 +503,8 @@ impl SubcRelayTransport {
             .close_handle(&route, CloseRouteOptions::default())
             .await;
         match response {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-                TransportError::OutcomeUnknown("the reply was not JSON".to_string())
-            }),
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| TransportError::OutcomeUnknown("the reply was not JSON".to_string())),
             Err(CallError::Module(body)) => Err(TransportError::Refused {
                 code: body.code,
                 message: body.message,

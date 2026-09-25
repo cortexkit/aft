@@ -2,7 +2,7 @@
 
 `seen-marker-reaction.json` is a byte-for-byte copy of plexus's golden
 `crates/plexus-core/tests/fixtures/github_facade/seen-marker-reaction.json`
-at plexus commit `5def76f1b179f4d1dc4f5fa446319d8f48f2f3ef`. The gh shim relay
+at plexus commit `8233293201e54700208479fc83e16aa9a57550a2`. The gh shim relay
 tests use its `request` (the `bot_request` arguments plexus expects) and its
 `success` reply. Update it only by copying the plexus golden again.
 

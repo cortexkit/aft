@@ -16,6 +16,6 @@
   "response": "responses/success-result.response.json",
   "holder_behavior": "replied with the response file bytes",
   "exit_code": 0,
-  "stdout": "url: \"https://github.com/cortexkit/aft/issues/42#issuecomment-1\"\nid: 1\n",
+  "stdout": "https://github.com/cortexkit/aft/issues/42#issuecomment-1\n",
   "stderr": ""
 }

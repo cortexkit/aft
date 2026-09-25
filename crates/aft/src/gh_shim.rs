@@ -16,8 +16,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use ring::signature::{UnparsedPublicKey, ED25519};
@@ -469,6 +471,34 @@ fn dispatch_r3<F>(
 where
     F: FnOnce(&[OsString]) -> i32,
 {
+    dispatch_r3_with_relay(
+        args,
+        classification,
+        manifest,
+        paths,
+        rung,
+        agent_binding,
+        now,
+        delegate_to_upstream,
+        &RelayContext::from_process(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_r3_with_relay<F>(
+    args: &[OsString],
+    classification: Classification,
+    manifest: &Manifest,
+    paths: &StatePaths,
+    rung: &RungRecord,
+    agent_binding: &AgentBinding,
+    now: u64,
+    delegate_to_upstream: F,
+    relay: &RelayContext,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
     match classification {
         Classification::Mechanical => delegate_to_upstream(args),
         Classification::Admin { tuple } => {
@@ -538,7 +568,7 @@ where
                 ));
             }
             let mutation = GithubReadMutation::from_governed_request(&request);
-            let outcome = route_governed(paths, rung, agent_binding, request, now);
+            let outcome = route_governed(paths, rung, agent_binding, request, now, manifest, relay);
             invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
             governed_outcome_status(paths, agent_binding, now, outcome)
         }
@@ -758,8 +788,18 @@ fn governed_outcome_status(
             refuse_outcome_unknown(paths, agent_binding, now, elapsed_ms)
         }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
+        RouteOutcome::NoAgentSession => refuse(RefusalCode::UnboundIdentity, NO_AGENT_SESSION_TEXT),
+        RouteOutcome::RelayRefusal { text, .. } => refuse(RefusalCode::SeamRefusal, &text),
+        RouteOutcome::OutcomeUndetermined(text) => {
+            refuse_outcome_unknown_with_text(paths, agent_binding, now, &text)
+        }
     }
 }
+
+/// Refusal text for a governed write from a command that has no agent session
+/// ticket (for example, a terminal the operator opened by hand).
+const NO_AGENT_SESSION_TEXT: &str =
+    "no agent session is attached to this command; bot speech must come from an agent's own session";
 
 fn seam_refusal_text(code: &str) -> String {
     format!("governance seam refused the action: {code}")
@@ -1366,7 +1406,10 @@ fn determine_rung_for_target(
             RungDetermination::r2(now, R2Reason::DaemonUnreachable, None, &provenance)
         }
         ProbeResult::NoRoute => {
-            RungDetermination::r2(now, R2Reason::CatalogGhRouteAbsent, None, &provenance)
+            let mut determination =
+                RungDetermination::r2(now, R2Reason::CatalogGhRouteAbsent, None, &provenance);
+            determination.refusal_detail = Some(relay_client::RELAY_UNSERVED_TEXT.to_string());
+            determination
         }
         // Keep the holder-unbound status diagnostic distinct from an absent
         // repository binding. Dispatch no longer consumes either reason.
@@ -1580,7 +1623,11 @@ fn probe_governance(
                 .map_err(|_| ProbeResult::Unreachable)?;
             let holder = route_holder(&catalog.modules);
             record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
-            let Some(module_id) = holder.module_id else {
+            // Governed writes now travel through the AFT daemon's relay, so
+            // discovery asks whether `aft` serves it rather than who holds
+            // `gh.route`. The management route opened below is the one each
+            // governed write uses.
+            let Some(module_id) = relay_client::relay_holder(&catalog.modules) else {
                 return Err(ProbeResult::NoRoute);
             };
 
@@ -4653,9 +4700,25 @@ enum RouteOutcome {
     UnboundIdentity,
     SchemaMismatch(String),
     GovernanceUnavailable,
-    GovernanceUnavailableTimedOut { stage: ProbeStage, elapsed_ms: u64 },
-    OutcomeUnknown { elapsed_ms: u64 },
+    GovernanceUnavailableTimedOut {
+        stage: ProbeStage,
+        elapsed_ms: u64,
+    },
+    OutcomeUnknown {
+        elapsed_ms: u64,
+    },
     Unavailable(String),
+    /// The command carries no agent session ticket, so it cannot speak.
+    NoAgentSession,
+    /// The relay or plexus refused. `code` is recorded for `gh --status`;
+    /// `text` names the code and what it means for the caller.
+    RelayRefusal {
+        code: String,
+        text: String,
+    },
+    /// The relay reached plexus but plexus could not tell whether the write
+    /// happened. Never resent.
+    OutcomeUndetermined(String),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -4671,178 +4734,28 @@ struct LastSeamRefusal {
     at_unix_secs: u64,
 }
 
+/// Carry a governed request to plexus through the AFT daemon's relay. The
+/// details live in `relay_client`; this wrapper keeps the rung-record update
+/// that marks the daemon as recently reachable after a result.
+#[allow(clippy::too_many_arguments)]
 fn route_governed(
     paths: &StatePaths,
     determination: &RungRecord,
     agent_binding: &AgentBinding,
     request: GovernedRequest,
     now: u64,
+    manifest: &Manifest,
+    relay: &RelayContext,
 ) -> RouteOutcome {
-    if let Err(error) = write_seam_state(paths, governed_seam_state(paths, None, agent_binding)) {
-        return RouteOutcome::Unavailable(format!("governed self-report update failed: {error}"));
-    }
-
-    let Some(connection_file) = configured_connection_file() else {
-        return RouteOutcome::GovernanceUnavailable;
-    };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = project_root_for(&cwd);
-    let record_paths = paths.clone();
-    let agent_binding = agent_binding.clone();
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => return RouteOutcome::Unavailable(error.to_string()),
-    };
-    let current_stage = Arc::new(Mutex::new(ProbeStage::Connect));
-    let stage_handle = Arc::clone(&current_stage);
-    let call_timeout = Duration::from_secs(5);
-    let start = Instant::now();
-    let deadline = start + call_timeout;
-    let result = runtime.block_on(async move {
-        tokio::time::timeout(call_timeout, async move {
-            let options = ConsumerOptions {
-                call_timeout,
-                // The discovery probe already timed out at the connect stage
-                // under the same host load; the governed call must tolerate the
-                // same handshake delay, so its handshake timeout matches the
-                // 5 s call timeout rather than the 2 s default.
-                handshake_timeout: call_timeout,
-                ..ConsumerOptions::default()
-            };
-            let consumer = SubcConsumer::connect(&connection_file, options)
-                .await
-                .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
-            *stage_handle.lock().unwrap() = ProbeStage::CatalogList;
-            let catalog = consumer
-                .catalog_list()
-                .await
-                .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
-            let holder = route_holder(&catalog.modules);
-            record_unexpected_gh_route_advertisers(&record_paths, &holder.unexpected_advertisers);
-            let module_id = holder
-                .module_id
-                .ok_or(RouteOutcome::GovernanceUnavailable)?;
-            *stage_handle.lock().unwrap() = ProbeStage::OpenRoute;
-            let route = consumer
-                .open_route(
-                    RouteTarget::ManagementSurface {
-                        module_id: module_id.clone(),
-                    },
-                    BindIdentity::new(
-                        project_root.to_string_lossy().into_owned(),
-                        "aft-gh-shim",
-                        gh_session_id(&agent_binding.agent_id),
-                    ),
-                    CallOptions::default(),
-                )
-                .await
-                .map_err(|_| RouteOutcome::UnboundIdentity)?;
-            if let Err(error) = write_seam_state(
-                &record_paths,
-                governed_seam_state(&record_paths, Some(module_id.clone()), &agent_binding),
-            ) {
-                let _ = consumer
-                    .close_handle(&route, CloseRouteOptions::default())
-                    .await;
-                return Err(RouteOutcome::Unavailable(format!(
-                    "governed self-report update failed: {error}"
-                )));
-            }
-            let wire_request =
-                governed_wire_request(determination, &agent_binding.agent_id, request);
-            let body = serde_json::to_vec(&wire_request)
-                .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
-            *stage_handle.lock().unwrap() = ProbeStage::Request;
-            let response = consumer.request(&route, body, CallOptions::default()).await;
-            let _ = consumer
-                .close_handle(&route, CloseRouteOptions::default())
-                .await;
-            let response = match response {
-                Ok(response) => response,
-                Err(_) => {
-                    let elapsed_ms = if Instant::now() >= deadline {
-                        call_timeout.as_millis() as u64
-                    } else {
-                        start.elapsed().as_millis() as u64
-                    };
-                    return Err(RouteOutcome::OutcomeUnknown { elapsed_ms });
-                }
-            };
-            let outcome = parse_governed_response(&response)?;
-            if let RouteOutcome::Refusal(code) = &outcome {
-                write_seam_state(
-                    &record_paths,
-                    SeamState {
-                        bound_holder: Some(module_id),
-                        agent_binding: Some(agent_binding),
-                        last_seam_refusal: Some(LastSeamRefusal {
-                            code: code.clone(),
-                            at_unix_secs: now,
-                        }),
-                    },
-                )
-                .map_err(|error| {
-                    RouteOutcome::Unavailable(format!(
-                        "governed self-report update failed: {error}"
-                    ))
-                })?;
-            }
-            Ok(outcome)
-        })
-        .await
-    });
-
-    let final_stage = *current_stage.lock().unwrap();
-    let outcome = match result {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(RouteOutcome::GovernanceUnavailable)) => {
-            if Instant::now() >= deadline {
-                let probe = LastProbeReport {
-                    stage: final_stage.as_str().to_string(),
-                    elapsed_ms: call_timeout.as_millis() as u64,
-                    outcome: "timed_out".to_string(),
-                };
-                write_last_probe_silently(paths, &probe);
-                RouteOutcome::GovernanceUnavailableTimedOut {
-                    stage: final_stage,
-                    elapsed_ms: call_timeout.as_millis() as u64,
-                }
-            } else {
-                RouteOutcome::GovernanceUnavailable
-            }
-        }
-        Ok(Err(RouteOutcome::OutcomeUnknown { elapsed_ms })) => {
-            let probe = LastProbeReport {
-                stage: final_stage.as_str().to_string(),
-                elapsed_ms,
-                outcome: "timed_out".to_string(),
-            };
-            write_last_probe_silently(paths, &probe);
-            RouteOutcome::OutcomeUnknown { elapsed_ms }
-        }
-        Ok(Err(outcome)) => outcome,
-        Err(_) => {
-            let elapsed_ms = call_timeout.as_millis() as u64;
-            let probe = LastProbeReport {
-                stage: final_stage.as_str().to_string(),
-                elapsed_ms,
-                outcome: "timed_out".to_string(),
-            };
-            write_last_probe_silently(paths, &probe);
-            if final_stage == ProbeStage::Request {
-                RouteOutcome::OutcomeUnknown { elapsed_ms }
-            } else {
-                RouteOutcome::GovernanceUnavailableTimedOut {
-                    stage: final_stage,
-                    elapsed_ms,
-                }
-            }
-        }
-    };
+    let outcome = relay_client::route(
+        paths,
+        determination,
+        agent_binding,
+        request,
+        now,
+        manifest,
+        relay,
+    );
     if matches!(
         &outcome,
         RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
@@ -4855,6 +4768,10 @@ fn route_governed(
     }
     outcome
 }
+
+#[path = "gh_shim_relay_client.rs"]
+mod relay_client;
+use relay_client::RelayContext;
 
 fn refuse_governance_unavailable(
     paths: &StatePaths,
@@ -4891,6 +4808,15 @@ fn refuse_outcome_unknown(
     now: u64,
     elapsed_ms: u64,
 ) -> i32 {
+    refuse_outcome_unknown_with_text(paths, agent_binding, now, &outcome_unknown_text(elapsed_ms))
+}
+
+fn refuse_outcome_unknown_with_text(
+    paths: &StatePaths,
+    agent_binding: &AgentBinding,
+    now: u64,
+    text: &str,
+) -> i32 {
     let state = SeamState {
         bound_holder: seam_state(paths).bound_holder,
         agent_binding: Some(agent_binding.clone()),
@@ -4905,10 +4831,7 @@ fn refuse_outcome_unknown(
             &format!("governed self-report update failed: {error}"),
         );
     }
-    refuse(
-        RefusalCode::OutcomeUnknown,
-        &outcome_unknown_text(elapsed_ms),
-    )
+    refuse(RefusalCode::OutcomeUnknown, text)
 }
 
 fn governed_seam_state(
@@ -5006,6 +4929,12 @@ fn governed_wire_request(
     wire
 }
 
+/// Parser for the retired prefrontal `gh.route` reply. Governed writes now go
+/// through the AFT daemon's relay (see `relay_client`); this parser and the
+/// renderers only it reaches, including the partial "state applied, comment
+/// failed" one that the relay path can never produce, are kept with their
+/// tests rather than deleted.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_governed_response(bytes: &[u8]) -> Result<RouteOutcome, RouteOutcome> {
     let value: Value = serde_json::from_slice(bytes).map_err(|_| {
         RouteOutcome::SchemaMismatch(
@@ -11199,15 +11128,18 @@ INHERITED FLAGS
                                                     if !cat_delay.is_zero() {
                                                         tokio::time::sleep(cat_delay).await;
                                                     }
+                                                    // Governed writes are relayed by the AFT
+                                                    // daemon, so discovery looks for `aft`
+                                                    // serving the relay operation.
                                                     let response_body = json!({
                                                         "op": "catalog.list",
                                                         "generation": 1,
                                                         "modules": [{
-                                                            "module_id": "prefrontal-core",
+                                                            "module_id": "aft",
                                                             "module_version": "0.1.0",
                                                             "roles": [{
                                                                 "role": "management_surface",
-                                                                "operations": [{ "name": "gh.route", "kind": "query" }],
+                                                                "operations": [{ "name": crate::gh_shim_relay::BOT_REQUEST_OPERATION, "kind": "mutate" }],
                                                                 "config_schema": {},
                                                                 "observability": [],
                                                                 "identity_scope": ["project"]

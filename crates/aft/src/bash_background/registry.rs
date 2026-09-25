@@ -9929,6 +9929,7 @@ mod tests {
         (registry, shared, frames)
     }
 
+    #[cfg(unix)]
     fn files_containing(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let mut pending = vec![root.to_path_buf()];

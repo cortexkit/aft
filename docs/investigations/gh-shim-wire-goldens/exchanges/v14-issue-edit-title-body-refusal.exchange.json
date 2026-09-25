@@ -14,5 +14,5 @@
   "holder_behavior": "replied with the response file bytes",
   "exit_code": 86,
   "stdout": "",
-  "stderr": "gh-shim: gh_shim_seam_refusal: governance seam refused the action: identity_mismatch\n"
+  "stderr": "gh-shim: gh_shim_seam_refusal: plexus refused the bot write with a code this shim does not know: identity_mismatch; it was not retried\n"
 }

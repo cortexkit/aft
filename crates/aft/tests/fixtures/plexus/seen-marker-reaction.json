@@ -49,6 +49,10 @@
   "success": {
     "repo_binding_generation": 1,
     "result": {
+      "result": {
+        "content": "eyes",
+        "id": 701
+      },
       "status": "completed"
     }
   }

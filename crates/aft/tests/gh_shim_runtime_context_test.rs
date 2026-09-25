@@ -428,6 +428,8 @@ fn assert_status_provenance(report: &Value) {
         .is_some_and(|ids| ids.iter().any(|id| id == "gh-routing-dev-test-key-v1")));
 }
 
+const TEST_GH_SHIM_TICKET: &str = "00112233445566778899aabbccddeeff";
+
 fn shim_command(
     args: &[&str],
     project: &Path,
@@ -456,6 +458,9 @@ fn shim_command(
         .env("AFT_STORAGE_DIR", state_home.join("aft-test-storage"))
         .env("PATH", path)
         .env("GH_SHIM_TEST_RECORD", recorder)
+        // Stands in for the ticket the daemon gives an agent's command; the
+        // fake daemons accept any ticket.
+        .env("AFT_GH_SHIM_TICKET", TEST_GH_SHIM_TICKET)
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_ENTERPRISE_TOKEN")
@@ -2183,11 +2188,14 @@ impl SlowTestDaemon {
                                                     "op": "catalog.list",
                                                     "generation": 1,
                                                     "modules": [{
-                                                        "module_id": "prefrontal-core",
+                                                        "module_id": "aft",
                                                         "module_version": "0.1.0",
                                                         "roles": [{
                                                             "role": "management_surface",
-                                                            "operations": [{ "name": "gh.route", "kind": "query" }],
+                                                            "operations": [
+                                                                { "name": "gh_shim.bot_request", "kind": "mutate" },
+                                                                { "name": "gh_shim.bindings_read", "kind": "query" }
+                                                            ],
                                                             "config_schema": {},
                                                             "observability": [],
                                                             "identity_scope": ["project"]
@@ -2247,15 +2255,33 @@ impl SlowTestDaemon {
                                                     break;
                                                 }
                                             } else if frame.header.channel == 42 {
-                                                if !req_delay.is_zero() {
-                                                    tokio::time::sleep(req_delay).await;
-                                                }
-                                                let response_body = json!({
-                                                    "outcome": "result",
-                                                    "gh_route_schema": 1,
-                                                    "result": { "url": "https://github.com/cortexkit/aft/issues/1#issuecomment-123" },
-                                                    "field_order": ["url"]
-                                                });
+                                                // The AFT daemon's gh shim relay: the version
+                                                // check's bindings read, then the bot write.
+                                                let response_body = if op.as_deref() == Some("gh_shim.bindings_read") {
+                                                    json!({
+                                                        "op": "gh_shim.bindings_read",
+                                                        "status": "ok",
+                                                        "data": {
+                                                            "repo_binding_generation": 1,
+                                                            "bindings": [{"repository": "cortexkit/aft", "app_handle_id": "h", "agent_id": "alfonso-aft"}]
+                                                        }
+                                                    })
+                                                } else {
+                                                    if !req_delay.is_zero() {
+                                                        tokio::time::sleep(req_delay).await;
+                                                    }
+                                                    json!({
+                                                        "op": "gh_shim.bot_request",
+                                                        "status": "ok",
+                                                        "data": {
+                                                            "repo_binding_generation": 1,
+                                                            "result": {
+                                                                "status": "completed",
+                                                                "result": { "url": "https://github.com/cortexkit/aft/issues/1#issuecomment-123", "id": 123 }
+                                                            }
+                                                        }
+                                                    })
+                                                };
                                                 let resp = Frame::build_with_version(
                                                     frame.header.ver,
                                                     FrameType::Response,
@@ -2365,7 +2391,7 @@ fn gh_shim_slow_daemon_catalog_list_delay_routes_under_fallback_and_records_last
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "url: \"https://github.com/cortexkit/aft/issues/1#issuecomment-123\"\n"
+        "https://github.com/cortexkit/aft/issues/1#issuecomment-123\n"
     );
     assert!(!recorder.exists(), "must not reach upstream gh");
 
@@ -2540,7 +2566,7 @@ fn gh_shim_slow_daemon_connect_delay_routes_under_fallback_and_records_last_prob
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "url: \"https://github.com/cortexkit/aft/issues/1#issuecomment-123\"\n"
+        "https://github.com/cortexkit/aft/issues/1#issuecomment-123\n"
     );
     assert!(!recorder.exists(), "must not reach upstream gh");
 
@@ -2660,7 +2686,7 @@ fn gh_shim_discovery_retry_succeeds_when_only_the_first_attempt_times_out() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "url: \"https://github.com/cortexkit/aft/issues/1#issuecomment-123\"\n"
+        "https://github.com/cortexkit/aft/issues/1#issuecomment-123\n"
     );
     assert!(!recorder.exists(), "must not reach upstream gh");
 
@@ -2748,6 +2774,55 @@ fn gh_shim_slow_daemon_request_delay_reports_outcome_unknown_exit_87_and_records
     assert_eq!(status["last_probe"]["stage"], "request");
     assert_eq!(status["last_probe"]["outcome"], "timed_out");
     assert_eq!(status["last_probe"]["elapsed_ms"], 5000);
+}
+
+#[test]
+fn gh_shim_governed_write_without_an_agent_session_ticket_refuses_before_the_daemon() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
+        first_connection_only: false,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+    write_recently_reachable_r3_cache(&state_home, now, 30);
+
+    // A hand-opened terminal typing the head agent's session id is still not
+    // an agent session: only the daemon-issued ticket carries one.
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "AFT_SESSION_ID=ses-head"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .env_remove("AFT_GH_SHIM_TICKET")
+    .env("AFT_SESSION_ID", "ses-head")
+    .output()
+    .expect("spawn gh shim");
+
+    assert_eq!(output.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-shim: gh_shim_unbound_identity: no agent session is attached to this command; bot speech must come from an agent's own session\n"
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!recorder.exists(), "must not reach upstream gh");
 }
 
 #[test]

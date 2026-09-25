@@ -137,7 +137,10 @@ fn bot_params(ticket: &str, nonce: &str) -> Value {
 #[test]
 fn fabricated_ticket_with_a_typed_head_session_is_refused_before_any_call() {
     let head = crate::gh_shim_ticket::ScopedTicket::issue("ses-head", "call-head", "/p");
-    assert!(head.value().is_some(), "the head has a live ticket of its own");
+    assert!(
+        head.value().is_some(),
+        "the head has a live ticket of its own"
+    );
     let transport = FakeTransport::default();
     let cache = TokenCache::default();
     let mut params = bot_params("0123456789abcdef0123456789abcdef", "nonce-fab");
@@ -214,10 +217,8 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
     };
     config.sandbox.enabled = false;
     config.github.shim = true;
-    let ctx = crate::context::AppContext::new(
-        Box::new(crate::parser::TreeSitterProvider::new()),
-        config,
-    );
+    let ctx =
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let seen = project.path().join("seen-ticket");
     let command = format!(
         "printf %s \"$AFT_GH_SHIM_TICKET\" > '{}'; sleep 2",
@@ -292,7 +293,11 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         json!({"name": "github", "arguments": expected_arguments})
     );
     assert_eq!(lines.len(), 1);
-    assert!(lines[0].contains(&format!("task={task_id}")), "{}", lines[0]);
+    assert!(
+        lines[0].contains(&format!("task={task_id}")),
+        "{}",
+        lines[0]
+    );
 
     // A ticket from the shared default session is never issued.
     let default = crate::bash_background::spawn(
@@ -327,9 +332,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(std::fs::read_to_string(&default_path).unwrap(), "none");
 
-    let _ = ctx
-        .bash_background()
-        .kill(&task_id, "ses-agent");
+    let _ = ctx.bash_background().kill(&task_id, "ses-agent");
 }
 
 #[test]
@@ -357,9 +360,25 @@ fn token_is_reused_then_reminted_near_expiry_and_after_an_assertion_refusal() {
     let transport = FakeTransport::default();
     let cache = TokenCache::default();
 
-    run(&transport, &cache, BOT_REQUEST_OPERATION, bot_params(ticket, "n1"), NOW);
-    run(&transport, &cache, BOT_REQUEST_OPERATION, bot_params(ticket, "n2"), NOW);
-    assert_eq!(transport.count(Target::Prefrontal), 1, "second command reuses");
+    run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(ticket, "n1"),
+        NOW,
+    );
+    run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(ticket, "n2"),
+        NOW,
+    );
+    assert_eq!(
+        transport.count(Target::Prefrontal),
+        1,
+        "second command reuses"
+    );
     let plexus_tokens: Vec<Value> = transport
         .calls()
         .iter()
@@ -377,30 +396,66 @@ fn token_is_reused_then_reminted_near_expiry_and_after_an_assertion_refusal() {
         bot_params(ticket, "n3"),
         near_expiry,
     );
-    assert_eq!(transport.count(Target::Prefrontal), 2, "re-minted near expiry");
+    assert_eq!(
+        transport.count(Target::Prefrontal),
+        2,
+        "re-minted near expiry"
+    );
 
     // Plexus refusing the assertion drops the cached token.
     transport.push_plexus(Ok(json!({
         "repo_binding_generation": 1,
         "result": {"status": "refused", "refusal_code": "assertion_binding_generation_stale"},
     })));
-    let (refused, _) = run(&transport, &cache, BOT_REQUEST_OPERATION, bot_params(ticket, "n4"), NOW);
+    let (refused, _) = run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(ticket, "n4"),
+        NOW,
+    );
     assert!(refused.ok, "plexus's refusal is relayed unchanged");
     assert_eq!(
         facade_refusal_code(&refused.data),
         Some("assertion_binding_generation_stale")
     );
-    assert_eq!(transport.count(Target::Prefrontal), 2, "the refused call reused the cached token");
-    run(&transport, &cache, BOT_REQUEST_OPERATION, bot_params(ticket, "n4"), NOW);
-    assert_eq!(transport.count(Target::Prefrontal), 3, "re-minted after refusal");
+    assert_eq!(
+        transport.count(Target::Prefrontal),
+        2,
+        "the refused call reused the cached token"
+    );
+    run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(ticket, "n4"),
+        NOW,
+    );
+    assert_eq!(
+        transport.count(Target::Prefrontal),
+        3,
+        "re-minted after refusal"
+    );
 
     // A refusal that does not name the assertion keeps the token.
     transport.push_plexus(Ok(json!({
         "repo_binding_generation": 1,
         "result": {"status": "refused", "refusal_code": "repository_unbound"},
     })));
-    run(&transport, &cache, BOT_REQUEST_OPERATION, bot_params(ticket, "n5"), NOW);
-    run(&transport, &cache, BOT_REQUEST_OPERATION, bot_params(ticket, "n6"), NOW);
+    run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(ticket, "n5"),
+        NOW,
+    );
+    run(
+        &transport,
+        &cache,
+        BOT_REQUEST_OPERATION,
+        bot_params(ticket, "n6"),
+        NOW,
+    );
     assert_eq!(transport.count(Target::Prefrontal), 3);
 }
 
@@ -423,7 +478,11 @@ fn mint_refusals_reach_the_shim_with_prefrontals_code_and_skip_plexus() {
     assert_eq!(reply.data["refusal_code"], "assertion_session_unknown");
     assert_eq!(reply.data["stage"], "mint");
     assert_eq!(transport.count(Target::Plexus), 0);
-    assert!(lines[0].ends_with("outcome=assertion_session_unknown"), "{}", lines[0]);
+    assert!(
+        lines[0].ends_with("outcome=assertion_session_unknown"),
+        "{}",
+        lines[0]
+    );
 }
 
 #[test]

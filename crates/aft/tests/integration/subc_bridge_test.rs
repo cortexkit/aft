@@ -8311,8 +8311,14 @@ async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInpu
     let mut delivered = None;
     for attempt in 0_u64..100 {
         let corr = 1400 + attempt;
-        send_tool_call(&mut stream, WAIT_CHANNEL, corr, "bash_drain_completions", json!({}))
-            .await;
+        send_tool_call(
+            &mut stream,
+            WAIT_CHANNEL,
+            corr,
+            "bash_drain_completions",
+            json!({}),
+        )
+        .await;
         let frame = read_frame_timeout(&mut stream, "drain completions").await;
         assert_eq!(
             frame.header.corr, corr,
@@ -10357,7 +10363,13 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             .iter()
             .map(|operation| operation.name.as_str())
             .collect::<HashSet<_>>(),
-        HashSet::from(["health.digest", "memory.census", "writes.census"])
+        HashSet::from([
+            "health.digest",
+            "memory.census",
+            "writes.census",
+            "gh_shim.bot_request",
+            "gh_shim.bindings_read",
+        ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
         "../../src/subc_tool_schemas.json"
