@@ -1482,6 +1482,8 @@ impl Executor {
                                 maintenance_coalesce_key,
                                 rerun: rerun.take(),
                                 force_exclusive: false,
+                                not_before: None,
+                                exclusive_attempts: 0,
                             },
                         );
                     }
@@ -1713,6 +1715,9 @@ struct SchedulerState {
     config: EffectiveConfig,
     running_jobs: HashMap<u64, RunningJob>,
     next_job_id: u64,
+    /// Set when a bind was queued again with a retry time, so the loop knows
+    /// to look for the earliest one and wake for it.
+    bind_retry_pending: bool,
 }
 
 impl SchedulerState {
@@ -1727,7 +1732,24 @@ impl SchedulerState {
             config,
             running_jobs: HashMap::new(),
             next_job_id: 1,
+            bind_retry_pending: false,
         }
+    }
+
+    /// The earliest time a bind queued with a retry time becomes admissible,
+    /// clearing `bind_retry_pending` once none is left.
+    fn next_bind_retry_at(&mut self) -> Option<Instant> {
+        if !self.bind_retry_pending {
+            return None;
+        }
+        let next = self
+            .actors
+            .values()
+            .flat_map(|actor| actor.interactive.queue(Lane::Mutating).iter())
+            .filter_map(|job| job.not_before)
+            .min();
+        self.bind_retry_pending = next.is_some();
+        next
     }
 
     fn dispatch_liveness_snapshot(&self) -> DispatchLivenessSnapshot {
@@ -2475,6 +2497,11 @@ struct QueuedJob {
     /// A bind queued again after a shared-hold attempt: it is admitted only
     /// with exclusive use of the actor.
     force_exclusive: bool,
+    /// Not admissible before this time: a bind that found the epoch gate
+    /// held by a detached writer backs off instead of waiting on a worker.
+    not_before: Option<Instant>,
+    /// How many times this bind found the gate held by a detached writer.
+    exclusive_attempts: u32,
 }
 
 fn lane_index(lane: Lane) -> usize {
@@ -2607,6 +2634,7 @@ struct RunJob {
     /// When the job first queued; a requeued bind keeps its age so its
     /// promotion over new readers is not reset.
     queued_at: Instant,
+    exclusive_attempts: u32,
 }
 
 struct JobCompletionOwnership;
@@ -2685,7 +2713,21 @@ fn scheduler_loop(
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
     loop_liveness: Arc<DispatchLoopLiveness>,
 ) {
-    while let Ok(event) = event_rx.recv() {
+    let mut next_retry_at: Option<Instant> = None;
+    loop {
+        // A bind waiting out a retry time has no event to wake the loop, so
+        // the loop wakes itself when the earliest one comes due.
+        let event = match next_retry_at {
+            Some(at) => match event_rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => SchedulerEvent::Wake,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match event_rx.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
+        };
         loop_liveness.begin_event();
         let shutdown;
         {
@@ -2708,6 +2750,7 @@ fn scheduler_loop(
                 );
             }
             dispatch_liveness.record(&state.dispatch_liveness_snapshot());
+            next_retry_at = state.next_bind_retry_at();
         }
         loop_liveness.end_event();
 
@@ -2857,8 +2900,10 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<Jo
                 // Pending-bind diagnostics read the configure phases; name the
                 // wait instead of leaving the phase the discarded run reached.
                 actor.ctx.begin_configure_ack_phase("requeued_exclusive");
+                let has_retry_time = queued.not_before.is_some();
                 actor.interactive.push_front_job(Lane::Mutating, queued);
                 actor.sync_waiting_writers();
+                state.bind_retry_pending |= has_retry_time;
             }
             Some(_) => queued
                 .completion
@@ -3185,6 +3230,20 @@ fn try_admit_actor(
     {
         return None;
     }
+    // A bind backing off from a detached writer waits out its retry time.
+    if lane == Lane::Mutating {
+        let head = if bind_pass {
+            actor.interactive.first_bind_job()
+        } else {
+            actor.class_queues(job_class).queue(Lane::Mutating).front()
+        };
+        if head
+            .and_then(|job| job.not_before)
+            .is_some_and(|not_before| Instant::now() < not_before)
+        {
+            return None;
+        }
+    }
 
     let has_epoch_reader =
         actor.read_inflight > 0 || actor.lsp_inflight || actor.maintenance_commit_inflight;
@@ -3310,6 +3369,7 @@ fn try_admit_actor(
         shared_bind_gate,
         rerun: queued.rerun,
         queued_at: queued.queued_at,
+        exclusive_attempts: queued.exclusive_attempts,
     })
 }
 
@@ -3320,18 +3380,20 @@ fn worker_loop(run_rx: Receiver<RunJob>) {
         let panicked = response.is_err();
         let response = match response {
             Ok(LaneRun::Finished(response)) => response,
-            Ok(LaneRun::RerunExclusive) => match requeue_as_exclusive(&mut run_job) {
-                Ok(queued) => {
-                    let guard = run_job
-                        .completion_guard
-                        .as_mut()
-                        .expect("dispatched executor job is missing its completion guard");
-                    guard.set_requeue(queued);
-                    guard.set_outcome(JobCompletionOutcome::Completed);
-                    continue;
+            Ok(LaneRun::RerunExclusive { retry_after }) => {
+                match requeue_as_exclusive(&mut run_job, retry_after) {
+                    Ok(queued) => {
+                        let guard = run_job
+                            .completion_guard
+                            .as_mut()
+                            .expect("dispatched executor job is missing its completion guard");
+                        guard.set_requeue(queued);
+                        guard.set_outcome(JobCompletionOutcome::Completed);
+                        continue;
+                    }
+                    Err(response) => response,
                 }
-                Err(response) => response,
-            },
+            }
             Err(payload) => panic_response(
                 run_job.request_id.clone(),
                 &run_job.command,
@@ -3357,7 +3419,10 @@ fn worker_loop(run_rx: Receiver<RunJob>) {
 /// Rebuild a shared-hold bind that must run again as a queued exclusive
 /// writer, keeping its completion, cancellation token, and original age.
 /// Returns the response to send instead when the bind was cancelled meanwhile.
-fn requeue_as_exclusive(run_job: &mut RunJob) -> Result<QueuedJob, Response> {
+fn requeue_as_exclusive(
+    run_job: &mut RunJob,
+    retry_after: Option<Duration>,
+) -> Result<QueuedJob, Response> {
     let cancelled = || {
         Response::error(
             run_job.request_id.clone(),
@@ -3395,6 +3460,8 @@ fn requeue_as_exclusive(run_job: &mut RunJob) -> Result<QueuedJob, Response> {
         maintenance_coalesce_key: None,
         rerun: Some(rerun),
         force_exclusive: true,
+        not_before: retry_after.map(|delay| Instant::now() + delay),
+        exclusive_attempts: run_job.exclusive_attempts + u32::from(retry_after.is_some()),
     })
 }
 
@@ -3440,9 +3507,18 @@ fn requeue_handoff_hook_for_test(_request_id: &str) {}
 /// How one dispatched job ended on its worker.
 enum LaneRun {
     Finished(Response),
-    /// A shared-hold bind that must run again as an exclusive writer; its
-    /// response (if it ran at all) is discarded.
-    RerunExclusive,
+    /// A repeatable bind that must run again as an exclusive writer; its
+    /// response (if it ran at all) is discarded. `retry_after` delays the
+    /// next admission when a detached writer held the epoch gate.
+    RerunExclusive {
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Delay before a repeatable bind that found the epoch gate held by a
+/// detached writer is admitted again: 10 ms, doubling, capped at 200 ms.
+fn detached_writer_backoff(attempts: u32) -> Duration {
+    Duration::from_millis(10u64.saturating_mul(1u64 << attempts.min(5)).min(200))
 }
 
 /// Poll interval for epoch waits that must stay responsive to cancellation.
@@ -3526,14 +3602,31 @@ fn run_lane_job(run_job: &mut RunJob) -> LaneRun {
             // readers hold it. Never wait here; a bind that cannot take the
             // shared hold at once is queued again as an exclusive writer.
             let Some(_epoch) = run_job.epoch.try_read() else {
-                return LaneRun::RerunExclusive;
+                return LaneRun::RerunExclusive { retry_after: None };
             };
             let scope = SharedBindScope::install();
             let response = run(job);
             if scope.rerun_requested() {
-                return LaneRun::RerunExclusive;
+                return LaneRun::RerunExclusive { retry_after: None };
             }
             response
+        }
+        // An exclusive repeatable bind is admitted only when no scheduler-
+        // tracked reader or maintenance job holds the gate, so a held gate
+        // here means a detached view publication. Its write can outlast one
+        // install (it takes the process-wide publication lock while holding
+        // the gate), so the bind backs off in the queue rather than wait on
+        // a worker.
+        Lane::Mutating if run_job.rerun.is_some() => {
+            if cancel_requested() {
+                return LaneRun::Finished(cancelled_before_execution());
+            }
+            let Some(_epoch) = run_job.epoch.try_write() else {
+                return LaneRun::RerunExclusive {
+                    retry_after: Some(detached_writer_backoff(run_job.exclusive_attempts)),
+                };
+            };
+            run(job)
         }
         Lane::Mutating => {
             if run_job.cancellation.is_some() {

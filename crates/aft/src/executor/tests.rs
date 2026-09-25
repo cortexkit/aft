@@ -2073,6 +2073,8 @@ fn starved_bind_promotes_over_pure_reads() {
         maintenance_coalesce_key: None,
         rerun: None,
         force_exclusive: false,
+        not_before: None,
+        exclusive_attempts: 0,
     };
     let read_job = QueuedJob {
         request_id: "read-1".to_string(),
@@ -2084,6 +2086,8 @@ fn starved_bind_promotes_over_pure_reads() {
         maintenance_coalesce_key: None,
         rerun: None,
         force_exclusive: false,
+        not_before: None,
+        exclusive_attempts: 0,
     };
     // Read arrived FIRST in arrival order; the starved bind must still win.
     actor.push_job(JobClass::Interactive, Lane::PureRead, read_job);
@@ -2119,6 +2123,8 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
     actor.push_job(
@@ -2134,6 +2140,8 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
 
@@ -2166,6 +2174,8 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
     actor.push_job(
@@ -2181,6 +2191,8 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
 
@@ -2496,6 +2508,8 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
     actor.push_job(
@@ -2511,6 +2525,8 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
     actor.push_job(
@@ -2526,6 +2542,8 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             maintenance_coalesce_key: None,
             rerun: None,
             force_exclusive: false,
+            not_before: None,
+            exclusive_attempts: 0,
         },
     );
 
@@ -3633,6 +3651,71 @@ fn cancelled_bind_waiting_for_the_epoch_frees_its_worker() {
     assert_eq!(cancel, JobCancelOutcome::RunningSignalled);
     let response = response.expect("a cancelled bind must not wait for the epoch");
     assert_eq!(response.data["code"], "request_cancelled");
+}
+
+/// A detached view publication holds the epoch write gate for its install,
+/// and while it holds it may also wait for the process-wide publication lock
+/// behind other roots' installs, so the hold can outlast one install. An
+/// exclusive route bind that finds the gate held therefore backs off in the
+/// actor's queue, holding no worker, and runs once the gate is free.
+#[test]
+fn repeatable_bind_blocked_by_a_detached_writer_backs_off_without_a_worker() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_dir, root) = test_root("bind-detached-writer-backoff");
+    assert!(executor.register_actor(root.clone(), test_ctx()));
+    let (epoch, _waiting, _detached) = actor_epoch_and_demand(&executor, &root);
+    let writer = epoch.write();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&runs);
+    let (bind, _token) = submit_repeatable_bind(&executor, &root, "subc-bind-backoff", move |_| {
+        counted.fetch_add(1, Ordering::AcqRel);
+        ok("subc-bind-backoff")
+    });
+    let queued = wait_for_bind_snapshot(
+        &executor,
+        &root,
+        "subc-bind-backoff",
+        Duration::from_secs(2),
+        |snapshot| {
+            snapshot.configure_state == "queued"
+                && snapshot
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker == "rerun_as_exclusive_writer")
+        },
+    );
+    // Sample workers across several back-off rounds; a retry holds a worker
+    // only for the instant of its attempt.
+    let total_workers = executor.inner.state.lock().config.total_workers();
+    let mut samples_all_idle = 0usize;
+    for _ in 0..30 {
+        thread::sleep(Duration::from_millis(10));
+        if executor.idle_workers_for_test() == total_workers {
+            samples_all_idle += 1;
+        }
+    }
+    let ran_while_held = runs.load(Ordering::Acquire);
+    let released_at = Instant::now();
+    drop(writer);
+    let response = recv_async(bind, "backoff bind");
+    let after_release = released_at.elapsed();
+
+    assert!(
+        queued.is_some(),
+        "the bind waits in the queue, not on a worker"
+    );
+    assert!(
+        samples_all_idle >= 20,
+        "no worker waits for the gate: all workers idle in only {samples_all_idle} of 30 samples"
+    );
+    assert_eq!(ran_while_held, 0);
+    assert!(response.success);
+    assert_eq!(runs.load(Ordering::Acquire), 1);
+    assert!(
+        after_release < Duration::from_secs(1),
+        "the bind ran {after_release:?} after the gate was freed"
+    );
 }
 
 /// The epoch lock is task-fair, so a reader waits behind a parked writer even
