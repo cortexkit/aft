@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "opencode2-callgraph-readiness-gate"
+  ],
+  "note": "OpenCode 2 end-to-end harness waits for the callgraph store before its callgraph calls. Test harness only; no ranking-fence file touched."
+}
