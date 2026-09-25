@@ -7,7 +7,7 @@ use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap},
     path::PathBuf,
-    sync::{Arc, LazyLock},
+    sync::{atomic::AtomicUsize, Arc, LazyLock},
     time::Instant,
 };
 
@@ -15,13 +15,26 @@ use std::{
 struct Target {
     ctx: Arc<AppContext>,
     epoch: Arc<RwLock<()>>,
+    /// The actor's count of detached threads waiting to write `epoch`, which
+    /// running maintenance reads as writer demand.
+    detached_writers: Arc<AtomicUsize>,
 }
 thread_local! { static CURRENT: RefCell<Option<Target>> = const { RefCell::new(None) }; }
 
 pub(super) struct ActorScope(Option<Target>);
 impl ActorScope {
-    pub(super) fn install(ctx: Arc<AppContext>, epoch: Arc<RwLock<()>>) -> Self {
-        Self(CURRENT.with(|slot| slot.replace(Some(Target { ctx, epoch }))))
+    pub(super) fn install(
+        ctx: Arc<AppContext>,
+        epoch: Arc<RwLock<()>>,
+        detached_writers: Arc<AtomicUsize>,
+    ) -> Self {
+        Self(CURRENT.with(|slot| {
+            slot.replace(Some(Target {
+                ctx,
+                epoch,
+                detached_writers,
+            }))
+        }))
     }
 }
 impl Drop for ActorScope {
@@ -83,6 +96,22 @@ impl Drop for Lifecycle {
     fn drop(&mut self) {
         JOBS.lock().remove(&self.0);
     }
+}
+
+/// Take the actor's epoch write gate from this detached thread, counted as
+/// writer demand while it waits: a configure tail holding the read gate then
+/// steps aside at its next unit instead of keeping this install (and, the lock
+/// being task-fair, every new reader queued behind it) waiting for the rest of
+/// the tail.
+fn write_epoch_as_detached_writer(target: &Target) -> parking_lot::RwLockWriteGuard<'_, ()> {
+    target
+        .detached_writers
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    let guard = target.epoch.write();
+    target
+        .detached_writers
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    guard
 }
 
 /// Scheduling succeeds once ownership has moved to the detached worker. Direct
@@ -157,7 +186,7 @@ pub(crate) fn schedule(
                     // Equivalent unbind/rebind retains this root actor and its epoch.
                     // Content-changing configure is rejected by commit_view_update.
                     let report = {
-                        let _epoch = target.epoch.write();
+                        let _epoch = write_epoch_as_detached_writer(&target);
                         lifecycle.phase("cas").map_err(|error| error.to_string())?;
                         // Sealing and cancellation are atomic with respect to superseding
                         // submissions, which hold JOBS while signaling this token.

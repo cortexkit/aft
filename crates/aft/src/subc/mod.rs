@@ -5701,13 +5701,15 @@ async fn handle_control_request(
                 meta.maintenance_queued_kinds.clear();
                 meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
             }
-            let (configure_rx, configure_cancellation) = executor.submit_cancellable_async(
+            // Repeatable: the executor may start the bind beside a running
+            // maintenance job and run it again as an exclusive writer when the
+            // configure must change the root, so the job re-reads the request.
+            let (configure_rx, configure_cancellation) = executor.submit_bind_cancellable_async(
                 bind_root_id.clone(),
-                Lane::Mutating,
                 configure_request_id.clone(),
-                Box::new(move |ctx| {
+                Arc::new(move |ctx| {
                     log_ctx::with_session(Some(configure_session.clone()), || {
-                        dispatch(configure_req, ctx)
+                        dispatch(configure_req.clone(), ctx)
                     })
                 }),
             );
@@ -11873,28 +11875,21 @@ mod tests {
         assert_eq!(dirs.len(), ROOTS);
     }
 
-    /// A small committed git root whose first route bind has configured it,
-    /// with that bind's configure tail running on the executor and held at
-    /// the start of one stage, standing in for a stage that runs long on a
-    /// large root.
-    struct HeldConfigureTail {
-        executor: Arc<Executor>,
+    /// A small committed git root whose first route bind (session 0, opencode)
+    /// has configured it through the executor. Its configure tail is left
+    /// queued on the context.
+    struct ConfiguredRoot {
         root: ProjectRootId,
         canonical_root: PathBuf,
         ctx: Arc<AppContext>,
         dir: tempfile::TempDir,
         storage: tempfile::TempDir,
-        release: Option<crossbeam_channel::Sender<()>>,
-        tail: Option<tokio::sync::oneshot::Receiver<Response>>,
-        _gate: crate::commands::configure::ConfigureTailStageGateGuard,
-        _git_env: crate::test_env::HermeticGitEnvGuard,
     }
 
-    impl HeldConfigureTail {
-        fn start(held_stage: &'static str) -> Self {
-            let git_env = crate::test_env::hermetic_git_env_guard();
+    impl ConfiguredRoot {
+        /// The caller holds `crate::test_env::hermetic_git_env_guard()`.
+        fn new(executor: &Executor) -> Self {
             let storage = tempfile::tempdir().unwrap();
-            let executor = Arc::new(Executor::new());
             let dir = tempfile::tempdir().unwrap();
             for file in 0..20 {
                 std::fs::write(
@@ -11931,29 +11926,16 @@ mod tests {
                 },
             ));
             assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-            let (gate, tail_held, release) =
-                crate::commands::configure::gate_configure_tail_stage_for_test(
-                    canonical_root.clone(),
-                    held_stage,
-                );
-            let mut fixture = Self {
-                executor,
+            let configured = Self {
                 root,
                 canonical_root,
                 ctx,
                 dir,
                 storage,
-                release: Some(release),
-                tail: None,
-                _gate: gate,
-                _git_env: git_env,
             };
-
-            // The first session's bind configures the cold root and queues
-            // its tail.
-            let first = fixture.bind_request(0, "opencode");
-            let first = fixture.executor.submit(
-                fixture.root.clone(),
+            let first = configured.bind_request(0, "opencode");
+            let first = executor.submit(
+                configured.root.clone(),
                 Lane::Mutating,
                 first.id.clone(),
                 Box::new(move |ctx| crate::commands::configure::handle_configure(&first, ctx)),
@@ -11962,23 +11944,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(30))
                 .expect("first bind completes");
             assert!(first.success, "{}", first.data);
-
-            fixture.tail = Some(fixture.executor.submit_maintenance_async(
-                fixture.root.clone(),
-                Lane::MaintenanceCommit,
-                format!(
-                    "subc-maintenance-drain-configure-tail-{}",
-                    fixture.root.as_path().display()
-                ),
-                Box::new(|ctx| {
-                    let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
-                    Response::success("tail", json!({ "requeue": requeue }))
-                }),
-            ));
-            tail_held
-                .recv_timeout(Duration::from_secs(30))
-                .expect("the tail reaches the held stage");
-            fixture
+            configured
         }
 
         fn bind_request(&self, index: usize, harness: &str) -> RawRequest {
@@ -11999,16 +11965,91 @@ mod tests {
         }
 
         /// Submit a route bind the way the module loop does.
-        fn submit_bind(&self, request: RawRequest) -> tokio::sync::oneshot::Receiver<Response> {
-            self.executor.submit_async(
-                self.root.clone(),
-                Lane::Mutating,
-                request.id.clone(),
-                Box::new(move |ctx| crate::commands::configure::handle_configure(&request, ctx)),
-            )
+        fn submit_bind(
+            &self,
+            executor: &Executor,
+            request: RawRequest,
+        ) -> tokio::sync::oneshot::Receiver<Response> {
+            let request_id = request.id.clone();
+            executor
+                .submit_bind_cancellable_async(
+                    self.root.clone(),
+                    request_id,
+                    Arc::new(move |ctx| {
+                        crate::commands::configure::handle_configure(&request, ctx)
+                    }),
+                )
+                .0
+        }
+    }
+
+    /// A [`ConfiguredRoot`] whose configure tail runs on the executor and is
+    /// held at the start of one stage, standing in for a stage that runs long
+    /// on a large root.
+    struct HeldConfigureTail {
+        executor: Arc<Executor>,
+        configured: ConfiguredRoot,
+        release: Option<crossbeam_channel::Sender<()>>,
+        tail: Option<tokio::sync::oneshot::Receiver<Response>>,
+        _gate: crate::commands::configure::ConfigureTailStageGateGuard,
+        _git_env: Option<crate::test_env::HermeticGitEnvGuard>,
+    }
+
+    impl std::ops::Deref for HeldConfigureTail {
+        type Target = ConfiguredRoot;
+
+        fn deref(&self) -> &ConfiguredRoot {
+            &self.configured
+        }
+    }
+
+    impl HeldConfigureTail {
+        fn start(held_stage: &'static str) -> Self {
+            let git_env = crate::test_env::hermetic_git_env_guard();
+            let mut fixture = Self::start_on(Arc::new(Executor::new()), held_stage);
+            fixture._git_env = Some(git_env);
+            fixture
         }
 
-        /// Let the tail go, wait for it, and drain whatever it left queued.
+        /// The caller holds `crate::test_env::hermetic_git_env_guard()`.
+        fn start_on(executor: Arc<Executor>, held_stage: &'static str) -> Self {
+            let configured = ConfiguredRoot::new(&executor);
+            let (gate, tail_held, release) =
+                crate::commands::configure::gate_configure_tail_stage_for_test(
+                    configured.canonical_root.clone(),
+                    held_stage,
+                );
+            let tail = executor.submit_maintenance_async(
+                configured.root.clone(),
+                Lane::MaintenanceCommit,
+                format!(
+                    "subc-maintenance-drain-configure-tail-{}",
+                    configured.root.as_path().display()
+                ),
+                Box::new(|ctx| {
+                    let requeue = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
+                    Response::success("tail", json!({ "requeue": requeue }))
+                }),
+            );
+            let fixture = Self {
+                executor,
+                configured,
+                release: Some(release),
+                tail: Some(tail),
+                _gate: gate,
+                _git_env: None,
+            };
+            tail_held
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the tail reaches the held stage");
+            fixture
+        }
+
+        fn submit_bind(&self, request: RawRequest) -> tokio::sync::oneshot::Receiver<Response> {
+            self.configured.submit_bind(&self.executor, request)
+        }
+
+        /// Let the tail go and wait for it.
         fn release_tail(&mut self) {
             if let Some(release) = self.release.take() {
                 let _ = release.send(());
@@ -12111,10 +12152,42 @@ mod tests {
         }
     }
 
+    /// Poll a bind's diagnostics until `accept` holds or `within` passes.
+    fn wait_for_bind_blockers(
+        executor: &Executor,
+        root: &ProjectRootId,
+        request_id: &str,
+        within: Duration,
+        accept: impl Fn(&crate::executor::BindBlockerSnapshot) -> bool,
+    ) -> Option<crate::executor::BindBlockerSnapshot> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(snapshot) = executor
+                .try_bind_blocker_snapshot(root, request_id)
+                .filter(|snapshot| accept(snapshot))
+            {
+                return Some(snapshot);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn queued_for_exclusive_rerun(snapshot: &crate::executor::BindBlockerSnapshot) -> bool {
+        snapshot.configure_state == "queued"
+            && snapshot
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "rerun_as_exclusive_writer")
+    }
+
     /// A bind that changes the root's configuration (here its harness) must
     /// not re-establish the root beside a running tail of the previous
-    /// configuration: it waits for exclusive use of the actor, says so in the
-    /// pending-bind diagnostics, and reconfigures once the tail lets go.
+    /// configuration: it hands its worker back, waits in the actor's queue as
+    /// an exclusive writer (saying so in the pending-bind diagnostics), and
+    /// reconfigures once the tail steps aside.
     #[test]
     fn config_changing_bind_waits_for_the_held_tail_before_reconfiguring() {
         let mut fixture = HeldConfigureTail::start("view_load");
@@ -12122,30 +12195,19 @@ mod tests {
 
         let request = fixture.bind_request(1, "pi");
         let request_id = request.id.clone();
-        let mut bind = fixture.submit_bind(request);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let blockers = loop {
-            if let Some(snapshot) = fixture
-                .executor
-                .try_bind_blocker_snapshot(&fixture.root, &request_id)
-                .filter(|snapshot| {
-                    snapshot
-                        .blockers
-                        .iter()
-                        .any(|blocker| blocker == "waiting_for_exclusive_gate")
-                })
-            {
-                break Some(snapshot.blockers);
-            }
-            if bind.try_recv().is_ok() || Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        };
+        let bind = fixture.submit_bind(request);
+        let blockers = wait_for_bind_blockers(
+            &fixture.executor,
+            &fixture.root,
+            &request_id,
+            Duration::from_secs(10),
+            queued_for_exclusive_rerun,
+        )
+        .map(|snapshot| snapshot.blockers);
         let reconfigured_while_held = fixture.ctx.configure_generation() != generation;
 
         fixture.release_tail();
-        let blockers = blockers.expect("the bind waits for exclusive use while the tail is held");
+        let blockers = blockers.expect("the bind waits as a queued writer while the tail is held");
         assert!(!reconfigured_while_held);
         assert!(
             blockers
@@ -12156,6 +12218,162 @@ mod tests {
         let response = bind.blocking_recv().expect("bind completion");
         assert!(response.success, "{}", response.data);
         assert!(fixture.ctx.configure_generation() > generation);
+    }
+
+    /// Two roots each change harness (opencode, then pi) while their tails
+    /// are held in a long stage, with the general pool busy. Those binds must
+    /// hand back the reserved bind workers rather than wait on them for the
+    /// actor, so a third root's ordinary rebind is still answered well inside
+    /// the daemon's 12 s relay limit while both tails are held.
+    #[test]
+    fn harness_changing_binds_on_held_roots_leave_the_bind_reserve_to_other_roots() {
+        const ACK_BOUND: Duration = Duration::from_secs(3);
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 4,
+            read_cap: 2,
+            actor_cap: 2,
+            heavy_permits: 2,
+            drr_quantum: 1,
+        }));
+        let unrelated = ConfiguredRoot::new(&executor);
+        let mut held_a = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+        let mut held_b = HeldConfigureTail::start_on(Arc::clone(&executor), "view_load");
+
+        // Fill what is left of the general pool with long reads elsewhere.
+        let busy_dir = tempfile::tempdir().unwrap();
+        let busy_root = ProjectRootId::from_path(busy_dir.path()).unwrap();
+        assert!(executor.register_actor(
+            busy_root.clone(),
+            Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                Config::default(),
+            )),
+        ));
+        let (busy_started_tx, busy_started_rx) = crossbeam_channel::unbounded::<()>();
+        let (release_busy_tx, release_busy_rx) = crossbeam_channel::unbounded::<()>();
+        let busy = (0..2)
+            .map(|index| {
+                let started = busy_started_tx.clone();
+                let release = release_busy_rx.clone();
+                executor.submit_async(
+                    busy_root.clone(),
+                    Lane::PureRead,
+                    format!("busy-read-{index}"),
+                    Box::new(move |_| {
+                        let _ = started.send(());
+                        let _ = release.recv_timeout(Duration::from_secs(30));
+                        Response::success("busy", json!({}))
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        for _ in 0..2 {
+            busy_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("busy read occupies a general worker");
+        }
+
+        let pi_a = held_a.submit_bind(held_a.bind_request(1, "pi"));
+        let pi_b = held_b.submit_bind(held_b.bind_request(1, "pi"));
+        let queued_a = wait_for_bind_blockers(
+            &executor,
+            &held_a.root,
+            "subc-bind-herd-1",
+            Duration::from_secs(10),
+            queued_for_exclusive_rerun,
+        );
+        let queued_b = wait_for_bind_blockers(
+            &executor,
+            &held_b.root,
+            "subc-bind-herd-1",
+            Duration::from_secs(10),
+            queued_for_exclusive_rerun,
+        );
+        let idle_with_pi_binds_waiting = executor.idle_workers_for_test();
+
+        let started = Instant::now();
+        let mut rebind = unrelated.submit_bind(&executor, unrelated.bind_request(1, "opencode"));
+        let rebind_response = loop {
+            if let Ok(response) = rebind.try_recv() {
+                break Some((response, started.elapsed()));
+            }
+            if started.elapsed() >= ACK_BOUND {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+
+        held_a.release_tail();
+        held_b.release_tail();
+        for _ in 0..busy.len() {
+            let _ = release_busy_tx.send(());
+        }
+        for read in busy {
+            let _ = read.blocking_recv();
+        }
+        let rebind_response = match rebind_response {
+            Some(answered) => Some(answered),
+            None => rebind
+                .blocking_recv()
+                .ok()
+                .map(|response| (response, started.elapsed())),
+        };
+        for pi in [pi_a, pi_b] {
+            let response = pi.blocking_recv().expect("pi bind completion");
+            assert!(response.success, "{}", response.data);
+        }
+
+        let (response, latency) = rebind_response.expect("the unrelated rebind completes");
+        assert!(response.success, "{}", response.data);
+        assert!(
+            latency < ACK_BOUND,
+            "the unrelated rebind took {latency:?} while both pi binds waited \
+             (idle workers {idle_with_pi_binds_waiting})"
+        );
+        assert!(queued_a.is_some(), "root A's pi bind waits in the queue");
+        assert!(queued_b.is_some(), "root B's pi bind waits in the queue");
+        assert_eq!(
+            idle_with_pi_binds_waiting, 2,
+            "both reserved bind workers are free while the pi binds wait"
+        );
+    }
+
+    /// A root whose routes all detached is quiesced, and a configure tail
+    /// that was already running cancels every configure job it finds queued
+    /// at its next unit. A rebind that arrives meanwhile must not be acked
+    /// beside that tail with its session's replay job queued underneath it:
+    /// the tail would cancel the job and forget the session after the ack.
+    #[test]
+    fn rebind_of_a_quiesced_root_keeps_its_session_despite_the_running_tail() {
+        let mut fixture = HeldConfigureTail::start("view_load");
+        fixture.ctx.mark_subc_unbound();
+
+        let request = fixture.bind_request(1, "opencode");
+        let bind = fixture.submit_bind(request);
+        let requeued = wait_for_bind_blockers(
+            &fixture.executor,
+            &fixture.root,
+            "subc-bind-herd-1",
+            Duration::from_secs(5),
+            queued_for_exclusive_rerun,
+        );
+        fixture.release_tail();
+        let response = bind.blocking_recv().expect("bind completion");
+        // The module loop marks the root bound when it handles the ack, and
+        // the tail it queues then drains what the bind left.
+        fixture.ctx.mark_subc_bound();
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+
+        assert!(response.success, "{}", response.data);
+        assert!(
+            fixture
+                .ctx
+                .has_configure_session_binding(&fixture.canonical_root, "herd-session-1"),
+            "the rebound session kept its binding (requeued first: {})",
+            requeued.is_some()
+        );
+        assert!(requeued.is_some(), "the rebind waited for exclusive use");
     }
 
     #[test]

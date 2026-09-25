@@ -2540,25 +2540,25 @@ fn slow_configure_prefix_line(total: Duration, phases: &str) -> String {
     )
 }
 
-/// Route binds start beside a running configure tail or reads with only a
-/// shared hold on the actor (see `crate::executor::ensure_exclusive_actor_gate`).
+/// Route binds may start beside a running configure tail with only a shared
+/// hold on the actor (see `crate::executor::current_bind_gate_is_shared`).
 /// The equivalent-rebind fast paths need nothing more: they compare the bind
 /// against the configuration already published, which the tail never changes,
 /// and record the session in state behind its own locks. Any path that changes
-/// the root calls this first and waits until the tail and readers let go.
-fn acquire_exclusive_configure_gate(ctx: &AppContext) {
-    if !crate::executor::current_bind_gate_is_shared() {
-        return;
+/// the root calls this first, before any change: under a shared hold it asks
+/// the executor to run the bind again as an exclusive writer and returns the
+/// response the caller must return at once (the executor discards it). The
+/// worker is handed back rather than waiting for the tail.
+fn defer_to_exclusive_configure(ctx: &AppContext, req_id: &str) -> Option<Response> {
+    if !crate::executor::request_exclusive_rerun() {
+        return None;
     }
-    ctx.begin_configure_ack_phase("exclusive_gate");
-    if let Some(waited) = crate::executor::ensure_exclusive_actor_gate() {
-        if waited >= Duration::from_secs(1) {
-            slog_info!(
-                "configure waited {}ms for exclusive use of the root",
-                waited.as_millis()
-            );
-        }
-    }
+    ctx.begin_configure_ack_phase("rerun_as_exclusive");
+    Some(Response::error(
+        req_id,
+        "configure_needs_exclusive",
+        "configure must run with exclusive use of the root; queued again",
+    ))
 }
 
 fn log_slow_configure_prefix(ctx: &AppContext, started_at: Instant) {
@@ -2941,7 +2941,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         if session_already_bound && only_lsp_process_state_changed(&previous_config, &next_config) {
             // Publishes a new config, so readers must not overlap it.
-            acquire_exclusive_configure_gate(ctx);
+            if let Some(deferred) = defer_to_exclusive_configure(ctx, &req.id) {
+                return deferred;
+            }
             if let Some(token) = crate::executor::current_job_cancellation() {
                 if !token.try_seal_committed() {
                     return Response::error(
@@ -3008,22 +3010,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let watcher_topology_changed =
         ctx.is_worktree_bridge() != is_worktree_bridge || ctx.git_common_dir() != git_common_dir;
-
-    let child_storage_root =
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-    if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
-        return Response::error(&req.id, "child_environment_unavailable", error);
-    }
-    // Resolve the plugin-managed ONNX Runtime before the semantic build worker
-    // thread spawns below. This sets the process-global ORT_DYLIB_PATH once at
-    // startup so pre_validate_onnx_runtime finds the runtime the plugin already
-    // downloaded (issue #128). Idempotent: once ORT_DYLIB_PATH is set (by us or
-    // by an explicit user override) it short-circuits. Must run here, not lazily
-    // from the worker thread, because env mutation races ort's own dlopen.
-    if let Some(storage_dir) = next_config.storage_dir.as_deref() {
-        crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
-    }
-
     // Detect "this is not really a project root" scenarios before any walks
     // that traverse `project_root`.
     let mut degraded_reasons: Vec<String> = Vec::new();
@@ -3103,6 +3089,23 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         // Equivalent-configure fast path: same commit boundary as the full
         // path — session binding registration is a state mutation. The seal
         // races the canceller atomically; losing means abort without mutating.
+        //
+        // A root whose routes all detached is quiesced until this bind's
+        // completion marks it bound again. A configure tail that was already
+        // running at quiesce time cancels, at its next unit, every configure
+        // job it finds queued, forgetting their session bindings. Beside such
+        // a tail, the session-only replay job this path queues would be
+        // cancelled after the bind acked success, losing that session's bash
+        // replay. So a quiesced root takes this path only with exclusive use:
+        // then no tail runs (queued maintenance was cancelled at quiesce, and
+        // new maintenance for the root waits while its bind is pending), and
+        // the root cannot quiesce again while the bind is pending, so the
+        // check cannot go stale before the seal below.
+        if ctx.subc_unbound_quiesced() {
+            if let Some(deferred) = defer_to_exclusive_configure(ctx, &req.id) {
+                return deferred;
+            }
+        }
         let needs_session_maintenance =
             !ctx.has_configure_session_binding(&canonical_cache_root, req.session());
         if needs_session_maintenance && !ctx.configure_maintenance_has_capacity() {
@@ -3203,9 +3206,32 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Everything below re-establishes the root (a new generation, config,
     // runtime, and artifact loads), so it runs with exclusive use of the actor.
-    acquire_exclusive_configure_gate(ctx);
+    if let Some(deferred) = defer_to_exclusive_configure(ctx, &req.id) {
+        return deferred;
+    }
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
+    }
+
+    // Both calls below act on the candidate configuration outside the actor:
+    // `maintain` installs or removes child-process hooks and the gh shim, and
+    // the ONNX runtime lookup sets a process-wide environment variable. The
+    // equivalent fast paths above never need them (the configuration they
+    // accept is the one already applied), so they run only here, with
+    // exclusive use of the root, and still before any build worker starts.
+    let child_storage_root =
+        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
+        return Response::error(&req.id, "child_environment_unavailable", error);
+    }
+    // Resolve the plugin-managed ONNX Runtime before the semantic build worker
+    // thread spawns below. This sets the process-global ORT_DYLIB_PATH once at
+    // startup so pre_validate_onnx_runtime finds the runtime the plugin already
+    // downloaded (issue #128). Idempotent: once ORT_DYLIB_PATH is set (by us or
+    // by an explicit user override) it short-circuits. Must run here, not lazily
+    // from the worker thread, because env mutation races ort's own dlopen.
+    if let Some(storage_dir) = next_config.storage_dir.as_deref() {
+        crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
     }
 
     if search_disabled_for_home {

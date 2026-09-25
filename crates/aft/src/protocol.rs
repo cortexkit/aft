@@ -449,7 +449,7 @@ pub const DEFAULT_SESSION_ID: &str = "__default__";
 ///
 /// Two-stage parse: deserialize this first to get `id` + `command`, then
 /// dispatch on `command` and pull specific params from the flattened `params`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RawRequest {
     pub id: String,
     #[serde(alias = "method")]
