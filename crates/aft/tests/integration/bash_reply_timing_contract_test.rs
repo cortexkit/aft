@@ -207,9 +207,9 @@ fn assert_subc_held_call_times_out(flag: &'static str) {
     });
 }
 
-/// A shell that starts a `sleep` grandchild in its own process group, records
-/// the grandchild's pid, and waits on it. Killing only the shell would leave
-/// the grandchild alive, so its death proves the whole group was killed.
+/// A shell that starts a `sleep` grandchild in the shell's own process group,
+/// records the grandchild's pid, and waits on it. Killing only the shell would
+/// leave the grandchild alive, so its death proves the whole group was killed.
 fn sleeping_command(pidfile: &Path) -> String {
     format!("sleep 30 & echo $! > {}; wait", shell_quote(pidfile))
 }
