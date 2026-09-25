@@ -1949,7 +1949,7 @@ fn auto_child_hook_commits_the_cached_bound_identity_exactly_once_on_amend() {
         ),
         ("HOME".to_string(), home.to_string_lossy().into_owned()),
     ]);
-    aft::agent_child_env::inject(&config, &storage, &mut environment)
+    aft::agent_child_env::inject(&config, &storage, &mut environment, None)
         .expect("inject child Git environment");
 
     for args in [

@@ -190,9 +190,16 @@ pub fn spawn(
     let mut env = env.unwrap_or_default();
     let config = ctx.config();
     let child_storage_root = self::storage_dir(config.storage_dir.as_deref());
-    if let Err(error) =
-        crate::agent_child_env::inject(config.as_ref(), &child_storage_root, &mut env)
-    {
+    // The ticket lets this command's `gh` shim relay bot writes for the
+    // session that spawned it. Dropping it on any early return revokes it; a
+    // spawned task's terminal transition revokes it after `bind_task`.
+    let gh_shim_ticket = crate::gh_shim_ticket::PendingTicket::issue(session_id);
+    if let Err(error) = crate::agent_child_env::inject(
+        config.as_ref(),
+        &child_storage_root,
+        &mut env,
+        gh_shim_ticket.value(),
+    ) {
         return Response::error(request_id, "child_environment_unavailable", error);
     }
     #[cfg(target_os = "linux")]
@@ -344,6 +351,13 @@ pub fn spawn(
 
     match spawn_result {
         Ok(task_id) => {
+            gh_shim_ticket.bind_task(&task_id);
+            // A command that finishes very quickly can be terminal before the
+            // ticket was bound to it, in which case its terminal write found
+            // nothing to revoke.
+            if ctx.bash_background().is_task_terminal(&task_id) {
+                crate::gh_shim_ticket::revoke_task(&task_id);
+            }
             if let Err(error) =
                 ctx.bash_background()
                     .record_scanner_report(&task_id, session_id, scanner_report)

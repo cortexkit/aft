@@ -87,6 +87,7 @@ pub mod fs_lock;
 pub mod fuzzy_match;
 pub mod gc;
 pub mod gh_shim;
+pub mod gh_shim_ticket;
 pub mod github_read;
 pub mod grep_executor;
 pub mod harness;

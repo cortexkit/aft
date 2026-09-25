@@ -1224,6 +1224,13 @@ pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Resul
 }
 
 fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io::Result<()> {
+    // Every terminal transition is persisted through here, so this is the one
+    // place that retires the task's gh shim ticket on completion, kill,
+    // timeout and unknown fate alike. It runs before the write so a failed
+    // write still leaves the ended task unable to speak.
+    if task.is_terminal() {
+        crate::gh_shim_ticket::revoke_task(&task.task_id);
+    }
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
@@ -1251,6 +1258,7 @@ where
 
 pub fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
     validate_task_id(&paths.task_id)?;
+    crate::gh_shim_ticket::revoke_task(&paths.task_id);
     let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
     if resolved.paths.layout != paths.layout {
         return Err(io::Error::new(

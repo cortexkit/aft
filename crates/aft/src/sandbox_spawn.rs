@@ -2543,6 +2543,7 @@ fn sandboxed_child_environment(
         // arrived through the (otherwise honored) request environment.
         if is_preexec_hijack_env_key(key.as_str())
             || crate::agent_child_env::is_subc_credential_env_key(key)
+            || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
         {
             continue;
         }
@@ -2623,7 +2624,19 @@ pub(crate) fn apply_sandbox_environment(
         // environments. Clear the daemon environment first so loader hooks,
         // shell startup hooks, and cloud credentials cannot leak around them.
         command.env_clear().envs(environment);
+        if let Some(ticket) = memory_only_ticket(request_environment) {
+            command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
+        }
     }
+}
+
+/// The gh shim ticket is kept out of the isolated environment above because
+/// that environment is written to the task's payload file on disk, and the
+/// ticket must exist only in memory. It is added back here, at exec time.
+fn memory_only_ticket(request_environment: &HashMap<String, String>) -> Option<&str> {
+    request_environment
+        .get(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+        .map(String::as_str)
 }
 
 /// Build a PTY `CommandBuilder` while enforcing the required launch plan.
@@ -2646,6 +2659,9 @@ pub(crate) fn pty_command_for_plan(
         command.env_clear();
         for (key, value) in environment {
             command.env(key, value);
+        }
+        if let Some(ticket) = memory_only_ticket(env) {
+            command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
         }
     } else {
         // Sandbox-disabled PTYs retain the historical full inheritance and add

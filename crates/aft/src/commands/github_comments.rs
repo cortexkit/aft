@@ -43,6 +43,7 @@ pub(crate) fn handle_comment_write(
     let working_directory = working_directory(ctx);
     let output = match run_governed_gh(
         ctx,
+        req,
         &working_directory,
         &comment_create_args(&resource),
         body,
@@ -212,7 +213,7 @@ pub(crate) fn handle_comment_edit(
         "--input".to_string(),
         "-".to_string(),
     ];
-    let output = match run_governed_gh(ctx, &working_directory, &args, &patch_body) {
+    let output = match run_governed_gh(ctx, req, &working_directory, &args, &patch_body) {
         Ok(output) => output,
         Err(error) => return Response::error(&req.id, "github_write_failed", error),
     };
@@ -394,14 +395,23 @@ pub(crate) fn working_directory(ctx: &AppContext) -> PathBuf {
 
 pub(crate) fn run_governed_gh(
     ctx: &AppContext,
+    req: &RawRequest,
     working_directory: &std::path::Path,
     args: &[String],
     body: &str,
 ) -> Result<std::process::Output, String> {
     let config = ctx.config();
     let mut environment: HashMap<String, String> = std::env::vars().collect();
-    crate::agent_child_env::inject(&config, &ctx.storage_dir(), &mut environment)
-        .map_err(|error| format!("could not prepare the governed gh shim: {error}"))?;
+    // This `gh` run speaks for the requesting session. Its ticket is revoked
+    // when this function returns, whether or not the shim used it.
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(req.session(), &req.id);
+    crate::agent_child_env::inject(
+        &config,
+        &ctx.storage_dir(),
+        &mut environment,
+        ticket.value(),
+    )
+    .map_err(|error| format!("could not prepare the governed gh shim: {error}"))?;
 
     let mut command = Command::new("gh");
     command

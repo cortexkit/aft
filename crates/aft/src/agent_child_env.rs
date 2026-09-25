@@ -280,10 +280,16 @@ pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
 
 /// Add governance to one child environment. This is the single seam used
 /// before foreground, background, sandboxed, and PTY launch planning.
+///
+/// `gh_shim_ticket` is the per-command ticket from [`crate::gh_shim_ticket`]
+/// that lets this child's `gh` shim ask the daemon to relay a bot write for
+/// the session that spawned it. An inherited ticket is always removed first, so
+/// a child never speaks with a ticket that was issued to some other command.
 pub fn inject(
     config: &Config,
     storage_root: &Path,
     environment: &mut HashMap<String, String>,
+    gh_shim_ticket: Option<&str>,
 ) -> Result<(), String> {
     // The module uses these launch-identity variables to authenticate its own
     // daemon connection. Remove them only from the child snapshot so the module
@@ -291,6 +297,15 @@ pub fn inject(
     environment.retain(|key, _| !is_subc_credential_env_key(key));
 
     let gh_enabled = config.github.shim;
+    environment.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
+    if gh_enabled {
+        if let Some(ticket) = gh_shim_ticket {
+            environment.insert(
+                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),
+                ticket.to_string(),
+            );
+        }
+    }
     let co_author_enabled = config.git.co_author != "off";
 
     // The inherited environment may already carry governance markers injected
@@ -912,8 +927,34 @@ mod tests {
             ("CUSTOM".to_string(), "value".to_string()),
         ]);
         let mut after = before.clone();
-        inject(&config, Path::new("/unused"), &mut after).unwrap();
+        inject(&config, Path::new("/unused"), &mut after, None).unwrap();
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn gh_shim_ticket_is_set_only_from_the_argument_and_never_inherited() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.github.shim = true;
+        config.git = GitConfig::default();
+        let ticket_key = crate::gh_shim_ticket::GH_SHIM_TICKET_ENV;
+
+        // An inherited ticket belongs to some other command and is dropped.
+        let mut inherited = HashMap::from([(ticket_key.to_string(), "stale".to_string())]);
+        inject(&config, storage.path(), &mut inherited, None).unwrap();
+        assert_eq!(inherited.get(ticket_key), None);
+
+        let mut issued = HashMap::from([(ticket_key.to_string(), "stale".to_string())]);
+        inject(&config, storage.path(), &mut issued, Some("fresh")).unwrap();
+        assert_eq!(issued.get(ticket_key).map(String::as_str), Some("fresh"));
+        // Only the ticket crosses into the child; no session id does.
+        assert!(issued.keys().all(|key| !key.contains("SESSION")));
+
+        // With the shim off, `gh` never reaches the shim, so no ticket is set.
+        config.github.shim = false;
+        let mut disabled = HashMap::new();
+        inject(&config, storage.path(), &mut disabled, Some("fresh")).unwrap();
+        assert_eq!(disabled.get(ticket_key), None);
     }
 
     #[test]
@@ -931,7 +972,7 @@ mod tests {
             ("CUSTOM".to_string(), "kept".to_string()),
         ]);
 
-        inject(&config, Path::new("/unused"), &mut environment).unwrap();
+        inject(&config, Path::new("/unused"), &mut environment, None).unwrap();
 
         assert_eq!(environment.get("CUSTOM").map(String::as_str), Some("kept"));
         assert!(
@@ -1219,7 +1260,7 @@ mod tests {
         config.github.shim = false;
         config.git.co_author = TEST_CO_AUTHOR.to_string();
         let mut environment = HashMap::new();
-        inject(&config, storage, &mut environment).unwrap();
+        inject(&config, storage, &mut environment, None).unwrap();
         environment
     }
 
@@ -1277,7 +1318,7 @@ mod tests {
         let previous = std::env::var_os(STORAGE_DIR_ENV);
         std::env::remove_var(STORAGE_DIR_ENV);
         let mut environment = HashMap::new();
-        inject(&config, storage.path(), &mut environment).unwrap();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
         assert_eq!(environment.get(STORAGE_DIR_ENV), None);
 
         // Explicit override present: propagated verbatim so spawned children
@@ -1285,7 +1326,7 @@ mod tests {
         let explicit = tempfile::tempdir().unwrap();
         std::env::set_var(STORAGE_DIR_ENV, explicit.path());
         let mut environment = HashMap::new();
-        inject(&config, storage.path(), &mut environment).unwrap();
+        inject(&config, storage.path(), &mut environment, None).unwrap();
         assert_eq!(
             environment.get(STORAGE_DIR_ENV),
             Some(&explicit.path().to_string_lossy().into_owned())
@@ -1435,7 +1476,7 @@ mod tests {
         config.gh_shim.binary_path = Some(shim);
         config.git.co_author = "auto".to_string();
         let mut environment = HashMap::new();
-        inject(&config, &storage, &mut environment).unwrap();
+        inject(&config, &storage, &mut environment, None).unwrap();
         run_git(
             &repo,
             &["commit", "--quiet", "-m", "mason: joint work"],
@@ -1825,7 +1866,7 @@ mod tests {
         config.github.shim = false;
         config.git.co_author = "Pair Agent <pair@example.test>".to_string();
         let mut environment = HashMap::new();
-        inject(&config, &storage, &mut environment).unwrap();
+        inject(&config, &storage, &mut environment, None).unwrap();
         assert!(!environment.contains_key(GH_SHIM_BINARY_ENV));
         run_git(
             &repo,

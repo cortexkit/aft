@@ -5818,6 +5818,12 @@ impl BgTaskRegistry {
             .and_then(|tasks| tasks.get(task_id).cloned())
     }
 
+    /// True when the task has reached a terminal state or is no longer in the
+    /// registry at all.
+    pub(crate) fn is_task_terminal(&self, task_id: &str) -> bool {
+        self.task(task_id).is_none_or(|task| task.is_terminal())
+    }
+
     fn task_for_session(&self, task_id: &str, session_id: &str) -> Option<Arc<BgTask>> {
         self.task(task_id)
             .filter(|task| task.session_id == session_id)
@@ -9921,6 +9927,104 @@ mod tests {
         let shared = Arc::new(Mutex::new(conn));
         registry.set_db_pool(shared.clone());
         (registry, shared, frames)
+    }
+
+    fn files_containing(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if fs::read(&path)
+                    .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    /// A gh shim ticket stops redeeming once its task ends, and no task file
+    /// or aft.db row ever holds it.
+    #[cfg(unix)]
+    #[test]
+    fn gh_shim_ticket_is_revoked_at_task_end_and_never_persisted() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let session = "ses-ticket-lifecycle";
+        let pending = crate::gh_shim_ticket::PendingTicket::issue(session);
+        let ticket = pending.value().unwrap().to_string();
+        let env = HashMap::from([(
+            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),
+            ticket.clone(),
+        )]);
+        let seen = project.path().join("seen-ticket");
+        let command = format!(
+            "printf %s \"$AFT_GH_SHIM_TICKET\" > '{}'; sleep 1",
+            seen.display()
+        );
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                &command,
+                session.to_string(),
+                project.path().to_path_buf(),
+                env,
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+        pending.bind_task(&task_id);
+        assert_eq!(
+            crate::gh_shim_ticket::redeem(&ticket),
+            Some(crate::gh_shim_ticket::Redeemed {
+                session_id: session.to_string(),
+                task_id: task_id.clone(),
+            }),
+            "a running task's ticket redeems to its own session"
+        );
+
+        wait_for_terminal_snapshot(
+            &registry,
+            &task_id,
+            session,
+            project.path(),
+            storage.path(),
+        );
+        assert_eq!(
+            crate::gh_shim_ticket::redeem(&ticket),
+            None,
+            "an ended task's ticket must not redeem"
+        );
+        assert_eq!(crate::gh_shim_ticket::live_count_for_task(&task_id), 0);
+        assert_eq!(
+            fs::read_to_string(&seen).unwrap(),
+            ticket,
+            "the child receives its ticket in the environment"
+        );
+
+        let row = crate::db::bash_tasks::get_bash_task(
+            &db.lock().unwrap(),
+            "opencode",
+            session,
+            &task_id,
+        )
+        .unwrap()
+        .expect("task row written");
+        assert!(!format!("{row:?}").contains(&ticket));
+        let leaks = files_containing(storage.path(), ticket.as_bytes());
+        assert!(leaks.is_empty(), "ticket persisted in {leaks:?}");
     }
 
     fn pattern_match_frames(frames: &Mutex<Vec<PushFrame>>) -> Vec<BashPatternMatchFrame> {
