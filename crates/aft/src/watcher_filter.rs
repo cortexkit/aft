@@ -1494,7 +1494,6 @@ impl WatcherFilterThread {
         let root_git = self.config.project_root.join(".git");
         let mut counts = BTreeMap::<String, u64>::new();
         for (path, _) in &self.recent_paths {
-            let mut relative = PathBuf::new();
             let mut absolute = self.config.project_root.clone();
             let names = path
                 .components()
@@ -1504,7 +1503,6 @@ impl WatcherFilterThread {
                 })
                 .collect::<Vec<_>>();
             for (index, name) in names.iter().enumerate() {
-                relative.push(name);
                 absolute.push(name);
                 // Every component above the event's own path is a directory,
                 // whether or not it still exists. The event's own path counts
@@ -1519,9 +1517,15 @@ impl WatcherFilterThread {
                 if absolute == root_git
                     || watcher_directory_is_ignored(matcher.as_deref(), &absolute)
                 {
-                    *counts
-                        .entry(relative.to_string_lossy().into_owned())
-                        .or_default() += 1;
+                    // Recorded with `/` on every platform: the prefix is a
+                    // persisted, logged key, and `Path` parses `/` on Windows
+                    // too, so candidates still match it there.
+                    let key = names[..=index]
+                        .iter()
+                        .map(|name| name.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    *counts.entry(key).or_default() += 1;
                     break;
                 }
             }
