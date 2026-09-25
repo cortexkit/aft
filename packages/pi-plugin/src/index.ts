@@ -200,11 +200,11 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.57.0";
+const ANNOUNCEMENT_VERSION = "0.58.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "OpenCode 2 is supported: tools, permission prompts, the sidebar and cancellation all work on the GA host, and an end-to-end matrix guards them.",
-  "`doctor` configures a machine that has only OpenCode 2 installed, and `--fix` no longer skips unrelated repairs when it cannot decide the generation.",
-  "A code-health scan no longer starts while the same project is still building its call graph, which cost about 90 MB of peak memory on large repositories.",
+  "Every AFT tool and background index, including semantic search, is on by default; `disabled_tools` is the one switch, and `npx @cortexkit/aft setup` walks you through the choices.",
+  "Old config keys still work with a notice until 0.59; run `npx @cortexkit/aft doctor --fix` to migrate them.",
+  "ONNX Runtime auto-install works again for new installs, and a config AFT cannot use now shows its error and fix instead of silently stopping the plugin.",
 ];
 
 /**
