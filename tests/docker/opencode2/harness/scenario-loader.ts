@@ -3,6 +3,7 @@ import { extname, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { fail } from "./errors.js";
+import { CALLGRAPH_READY_TIMEOUT_MS } from "./readiness.js";
 import { TRAJECTORIES, type ScenarioDefinition, type ScenarioRegistration } from "./types.js";
 import { asRecord } from "./util.js";
 
@@ -231,6 +232,28 @@ export function validateScenarioDefinition(
       fail("scenario_invalid", `${scenario.id}: invalid quiescence_timeout_ms`);
     }
   }
+  if (scenario.preconditions !== undefined) {
+    if (!Array.isArray(scenario.preconditions)) {
+      fail("scenario_invalid", `${scenario.id}: preconditions must be an array`);
+    }
+    for (const precondition of scenario.preconditions) {
+      if (precondition !== "callgraph_ready") {
+        fail("scenario_invalid", `${scenario.id}: unknown precondition ${String(precondition)}`);
+      }
+    }
+    // The wait needs AFT to have been started by an earlier copy of the call;
+    // a row with no callgraph call would only ever run out its budget.
+    if (
+      scenario.preconditions.includes("callgraph_ready") &&
+      !scenario.turns.some(
+        (turn) =>
+          turn.response.kind === "tool_calls" &&
+          turn.response.calls.some((call) => call.name === "aft_callgraph"),
+      )
+    ) {
+      fail("scenario_invalid", `${scenario.id}: callgraph_ready requires an aft_callgraph call`);
+    }
+  }
 }
 
 function parseRegistration(value: unknown, path: string): ScenarioRegistration {
@@ -248,8 +271,20 @@ function parseRegistration(value: unknown, path: string): ScenarioRegistration {
   return registration;
 }
 
+/**
+ * Hold a `callgraph_ready` row's callgraph call back until the fixture
+ * project's callgraph store is built.
+ *
+ * The plugin starts AFT only when the first tool call arrives, and AFT builds
+ * the callgraph in the background from there, answering "building, retry
+ * shortly" until it is done. Nothing is building before the row's first call,
+ * so there is nothing to wait for yet. The row's first callgraph turn is
+ * therefore played twice: an unjudged copy that starts AFT and its build, then
+ * the real call, which the driver withholds until the store is published (see
+ * `awaitTurnReadiness`). Rows without the declaration are left as registered.
+ */
 export function addCallgraphWarmup(scenario: ScenarioDefinition): ScenarioDefinition {
-  if (scenario.tool !== "callgraph") return scenario;
+  if (!scenario.preconditions?.includes("callgraph_ready")) return scenario;
   const index = scenario.turns.findIndex(
     (turn) =>
       turn.response.kind === "tool_calls" &&
@@ -262,7 +297,10 @@ export function addCallgraphWarmup(scenario: ScenarioDefinition): ScenarioDefini
   target.label = warmupLabel;
   for (const call of target.response.calls) call.id = `warmup-${call.id}`;
   const turns = scenario.turns.map((turn) => structuredClone(turn));
-  turns[index] = { ...turns[index], delay_ms: Math.max(turns[index].delay_ms ?? 0, 2_000) };
+  turns[index] = {
+    ...turns[index],
+    await_ready: { subject: "callgraph", timeout_ms: CALLGRAPH_READY_TIMEOUT_MS },
+  };
   turns.splice(index, 0, target);
   const expectedTurns = [
     ...(scenario.expected_turns ?? scenario.turns.map((turn) => turn.label)),

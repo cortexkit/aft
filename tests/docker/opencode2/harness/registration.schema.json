@@ -18,7 +18,13 @@
           "trajectory": { "enum": ["T1", "T2", "T3", "T4", "T5", "T6", "T7"] },
           "execution": { "enum": ["standalone", "shared-server"] },
           "prompt": { "type": "string", "minLength": 1 },
-          "turns": { "type": "array", "minItems": 1 }
+          "turns": { "type": "array", "minItems": 1 },
+          "preconditions": {
+            "description": "Product states the harness waits for before answering the row's call. callgraph_ready holds the first aft_callgraph call until the fixture project's callgraph store is published, and fails the row as callgraph_never_ready if it never is.",
+            "type": "array",
+            "items": { "enum": ["callgraph_ready"] },
+            "uniqueItems": true
+          }
         },
         "additionalProperties": true
       }

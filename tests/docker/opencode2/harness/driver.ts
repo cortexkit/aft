@@ -42,6 +42,7 @@ import {
   sessionPermissionRules,
 } from "./permission-plan.js";
 import { readPinnedHostVersion, readPinnedV1HostVersion } from "./pin.js";
+import { awaitTurnReadiness, callgraphStorePublished, readinessBudgetMs } from "./readiness.js";
 import {
   type AbortSettlementEvidence,
   callAbortedFailure,
@@ -532,6 +533,9 @@ async function runOneScenario(options: {
   let transportDeadStub: TransportDeadStub | undefined;
   let transportDeadActive = false;
   let excludedHostExit: Record<string, unknown> | undefined;
+  // Kept apart from other recorded failures because it is the cause of
+  // whatever the withheld call then reports, and must be what the row fails on.
+  let readinessFailure: unknown;
 
   /**
    * Resolves once the mock has answered the scenario's last scripted turn.
@@ -581,6 +585,22 @@ async function runOneScenario(options: {
   try {
     mock = new DeterministicScenarioMock(scenario, turnLogPath, {
       beforeTurn: async (turn, request) => {
+        // A turn that needs a built index is held here, before the host is
+        // handed the call, until AFT has published that index. Turns without
+        // the declaration return at once.
+        if (turn.await_ready && isolation) {
+          const storageDir =
+            isolation.env.AFT_STORAGE_DIR ?? join(isolation.data, "cortexkit", "aft");
+          try {
+            const readiness = await awaitTurnReadiness(turn, {
+              callgraph: () => callgraphStorePublished(storageDir),
+            });
+            await forensics.writeJson(`readiness-${turn.label}.json`, readiness);
+          } catch (error) {
+            readinessFailure ??= error;
+            recordFailure(error);
+          }
+        }
         // The host has created the session by the time it asks for a response
         // and cannot run a tool before receiving one, so this is the last
         // moment that is both late enough to name the session and early enough
@@ -822,9 +842,14 @@ async function runOneScenario(options: {
       smokeRan = true;
     }
     const hostTimeoutMs =
-      typeof scenario.metadata?.host_timeout_ms === "number"
+      (typeof scenario.metadata?.host_timeout_ms === "number"
         ? scenario.metadata.host_timeout_ms
-        : 45_000;
+        : 45_000) +
+      // The host is waiting on the mock while a turn is held for readiness, so
+      // that wait is added to its budget; otherwise the host would be killed
+      // first and the row would fail on the kill instead of on the readiness
+      // failure that caused it.
+      readinessBudgetMs(scenario.turns);
     // A leg whose row has already taken this host's exit out of its verdict is
     // not waited on to the row timeout. Once the scenario has been served the
     // harness has everything it judges, so it allows a short settling window —
@@ -843,6 +868,7 @@ async function runOneScenario(options: {
     await forensics.writeJson("host-command.json", host);
     await forensics.writeText("host-stream.ndjson", host.stdout);
     await forensics.writeText("host-stderr.log", host.stderr);
+    if (readinessFailure) throw readinessFailure;
     const acceptedExitCodes = Array.isArray(scenario.metadata?.accepted_exit_codes)
       ? scenario.metadata.accepted_exit_codes
       : [0];

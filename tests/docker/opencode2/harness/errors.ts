@@ -1,4 +1,5 @@
 export type HarnessFailureCode =
+  | "callgraph_never_ready"
   | "contract_uncaptured"
   | "disk_effect_observation_incomplete"
   | "executable_provenance"

@@ -74,11 +74,28 @@ export interface TextTurnResponse {
   content: string;
 }
 
+/**
+ * A product state the harness waits for before it answers a turn. Set by the
+ * loader from a scenario's `preconditions`, not written in registrations.
+ */
+export interface ReadinessGate {
+  subject: "callgraph";
+  timeout_ms: number;
+}
+
 export interface ScriptedTurn {
   label: string;
   delay_ms?: number;
+  await_ready?: ReadinessGate;
   response: ToolTurnResponse | TextTurnResponse;
 }
+
+/**
+ * `callgraph_ready`: the row's call must be answered from a built callgraph
+ * store, so the harness holds that call back until the fixture project's store
+ * is published rather than letting it race the background cold build.
+ */
+export type ScenarioPrecondition = "callgraph_ready";
 
 export interface ApiControlPlan {
   id: string;
@@ -145,6 +162,7 @@ export interface ScenarioDefinition {
   restore_evidence?: RestoreEvidencePlan;
   quiescence_timeout_ms?: number;
   expected_fail_issue?: string;
+  preconditions?: ScenarioPrecondition[];
   project_config?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   /** Added by the loader so fixture paths can stay registration-relative. */

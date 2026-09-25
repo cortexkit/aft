@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -61,6 +62,12 @@ import {
   waitForTaskStatus,
 } from "./process-observer.js";
 import { readPinnedV1HostVersion } from "./pin.js";
+import {
+  awaitTurnReadiness,
+  CALLGRAPH_READY_TIMEOUT_MS,
+  callgraphStorePublished,
+  readinessBudgetMs,
+} from "./readiness.js";
 import { parentDisposition, reportTable } from "./report.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import {
@@ -880,15 +887,71 @@ describe("source-of-truth derivation", () => {
     expect(error.message).toContain("do not match the explicit exclusion table");
   });
 
-  test("callgraph scenarios retry after the background store warms", () => {
+  test("a callgraph_ready row starts AFT with a warm-up call and gates the real one", () => {
     const input = scenario(call({ name: "aft_callgraph" }));
     input.tool = "callgraph";
+    input.preconditions = ["callgraph_ready"];
     const warmed = addCallgraphWarmup(input);
     expect(warmed.expected_turns).toEqual(["turn-1-warmup", "turn-1"]);
     expect(warmed.turns[0].response).toMatchObject({
       calls: [{ id: "warmup-call-1", name: "aft_callgraph" }],
     });
-    expect(warmed.turns[1].delay_ms).toBe(2_000);
+    expect(warmed.turns[0].await_ready).toBeUndefined();
+    expect(warmed.turns[1].await_ready).toEqual({
+      subject: "callgraph",
+      timeout_ms: CALLGRAPH_READY_TIMEOUT_MS,
+    });
+    // The readiness gate replaces a fixed pause; nothing is left to sleep.
+    expect(warmed.turns[1].delay_ms).toBeUndefined();
+  });
+
+  test("a callgraph row without the declaration is left as registered", () => {
+    const input = scenario(call({ name: "aft_callgraph" }));
+    input.tool = "callgraph";
+    const unchanged = addCallgraphWarmup(input);
+    expect(unchanged).toBe(input);
+    expect(unchanged.turns.every((turn) => turn.await_ready === undefined)).toBe(true);
+  });
+
+  test("preconditions are validated when registrations load", async () => {
+    const directory = await root();
+    const registration = (preconditions: unknown, name: string) => ({
+      schema_version: 1,
+      tool: "callgraph",
+      scenarios: [
+        {
+          ...scenario(call({ name, arguments: {}, id: "call-1" })),
+          id: "callgraph/T2/control",
+          tool: "callgraph",
+          trajectory: "T2",
+          preconditions,
+        },
+      ],
+    });
+    await writeFile(
+      join(directory, "registration.json"),
+      JSON.stringify(registration(["index_ready"], "aft_callgraph")),
+    );
+    const unknown = await expectCode(() => loadScenarios(directory), "scenario_invalid");
+    expect(unknown.message).toContain("unknown precondition index_ready");
+    await writeFile(
+      join(directory, "registration.json"),
+      JSON.stringify(registration(["callgraph_ready"], "aft_zoom")),
+    );
+    const uncalled = await expectCode(() => loadScenarios(directory), "scenario_invalid");
+    expect(uncalled.message).toContain("callgraph_ready requires an aft_callgraph call");
+  });
+
+  test("every callgraph row AFT answers declares callgraph_ready; host-rejected rows do not", async () => {
+    const loaded = await loadScenarios(
+      join(import.meta.dir, "..", "scenarios", "aft_callgraph"),
+    );
+    for (const row of loaded) {
+      const gated = row.turns.some((turn) => turn.await_ready?.subject === "callgraph");
+      // Host-rejected arguments never reach AFT, so no build would start and
+      // a wait could only time out.
+      expect({ id: row.id, gated }).toEqual({ id: row.id, gated: row.error_origin !== "host" });
+    }
   });
 
   test("T7 is materialized from the same T1 scenario data", () => {
@@ -2265,5 +2328,85 @@ describe("comparing tool output that carries AFT's status bar", () => {
     expect(() =>
       assertComparison("[AFT E? W? | D? U? C? | T0]\n\n1: alpha\n2: beta\n", exact),
     ).toThrow(/exact comparison failed/);
+  });
+});
+
+describe("a row that needs the callgraph waits for it", () => {
+  const gatedTurn = (timeoutMs: number): ScriptedTurn => ({
+    label: "call-tool",
+    await_ready: { subject: "callgraph", timeout_ms: timeoutMs },
+    response: { kind: "tool_calls", calls: [call({ name: "aft_callgraph" })] },
+  });
+
+  test("the call is held until the probe reports ready", async () => {
+    let polls = 0;
+    const record = await awaitTurnReadiness(
+      gatedTurn(5_000),
+      { callgraph: async () => ++polls >= 3 },
+      5,
+    );
+    expect(polls).toBe(3);
+    expect(record).toMatchObject({ subject: "callgraph", turn: "call-tool", polls: 3 });
+  });
+
+  test("a store that never becomes ready fails the row by name", async () => {
+    let polls = 0;
+    const error = await expectCode(
+      () =>
+        awaitTurnReadiness(
+          gatedTurn(60),
+          {
+            callgraph: async () => {
+              polls += 1;
+              return false;
+            },
+          },
+          10,
+        ),
+      "callgraph_never_ready",
+    );
+    expect(error.message).toContain("callgraph never became ready within 60ms");
+    // It kept checking until the budget ran out rather than giving up at once.
+    expect(polls).toBeGreaterThan(1);
+  });
+
+  test("a turn without the declaration does not wait or probe", async () => {
+    const turn: ScriptedTurn = {
+      label: "call-tool",
+      response: { kind: "tool_calls", calls: [call({ name: "aft_callgraph" })] },
+    };
+    const record = await awaitTurnReadiness(turn, {
+      callgraph: async () => {
+        throw new Error("an undeclared turn consulted the readiness probe");
+      },
+    });
+    expect(record).toBeUndefined();
+    expect(readinessBudgetMs([turn])).toBe(0);
+  });
+
+  test("the host budget grows by every declared wait", () => {
+    expect(readinessBudgetMs([gatedTurn(1_000), gatedTurn(2_000)])).toBe(3_000);
+  });
+
+  test("the store counts as ready only once AFT has published it marked ready", async () => {
+    const storage = await root();
+    expect(await callgraphStorePublished(storage)).toBe(false);
+    const directory = join(storage, "callgraph", "key123");
+    await mkdir(directory, { recursive: true });
+    const generation = "key123.g1.1.sqlite";
+    const database = new Database(join(directory, generation));
+    database.exec("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
+    database.exec("INSERT INTO meta (k, v) VALUES ('ready', '0')");
+    // A generation file with no pointer to it is a build still in progress.
+    expect(await callgraphStorePublished(storage)).toBe(false);
+    await writeFile(join(directory, "key123.current"), `${generation}\n`);
+    // Published but not yet marked ready.
+    expect(await callgraphStorePublished(storage)).toBe(false);
+    database.exec("UPDATE meta SET v = '1' WHERE k = 'ready'");
+    database.close();
+    expect(await callgraphStorePublished(storage)).toBe(true);
+    // A pointer naming a generation that is gone is not ready.
+    await writeFile(join(directory, "key123.current"), "key123.g2.1.sqlite\n");
+    expect(await callgraphStorePublished(storage)).toBe(false);
   });
 });

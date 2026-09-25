@@ -9,6 +9,9 @@
       "tool": "callgraph",
       "trajectory": "T1",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the deterministic callgraph fixture call.",
       "fixture": "./fixture",
@@ -152,6 +155,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the complete callgraph.impact.payload.sites fixture.",
       "fixture": "./fixture",
@@ -205,6 +211,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the incomplete callgraph.impact.payload.sites fixture.",
       "fixture": "./fixture",
@@ -260,6 +269,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the complete callgraph.callers.payload.callers fixture.",
       "fixture": "./fixture",
@@ -313,6 +325,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the incomplete callgraph.callers.payload.callers fixture.",
       "fixture": "./fixture",
@@ -368,6 +383,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the complete callgraph.call_tree.payload.tree fixture.",
       "fixture": "./fixture",
@@ -421,6 +439,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the incomplete callgraph.call_tree.payload.tree fixture.",
       "fixture": "./fixture",
@@ -476,6 +497,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the complete callgraph.trace_to.payload.paths fixture.",
       "fixture": "./fixture",
@@ -529,6 +553,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the incomplete callgraph.trace_to.payload.paths fixture.",
       "fixture": "./fixture",
@@ -584,6 +611,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the complete callgraph.trace_data.payload.hops fixture.",
       "fixture": "./fixture",
@@ -638,6 +668,9 @@
       "tool": "callgraph",
       "trajectory": "T6",
       "execution": "standalone",
+      "preconditions": [
+        "callgraph_ready"
+      ],
       "auto": true,
       "prompt": "Run the incomplete callgraph.trace_data.payload.hops fixture.",
       "fixture": "./fixture",
