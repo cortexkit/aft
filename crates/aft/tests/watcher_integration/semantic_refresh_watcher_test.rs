@@ -1028,18 +1028,15 @@ fn semantic_build_recovers_when_backend_returns_after_transient_outage() {
         "configure should succeed: {configure:?}"
     );
 
-    // While the backend is down, the index must stay "loading" (the Building
-    // state, shown as "loading" in the snapshot) with a waiting stage, NOT flip
-    // to "failed". Observe the waiting stage explicitly.
+    // While the backend is down, status must say so ("backend_unavailable",
+    // with the reason and the next retry), not "loading" and never "failed":
+    // the build is waiting on the backend, not broken.
     let waiting = wait_for_semantic_status(&mut aft, "waiting for backend", |response| {
-        response["semantic_index"]["status"] == "loading"
-            && response["semantic_index"]["stage"]
-                .as_str()
-                .is_some_and(|stage| stage.contains("waiting_for_embedding_backend"))
+        response["semantic_index"]["status"] == "backend_unavailable"
+            && response["semantic_index"]["next_retry_ms"].is_u64()
     });
-    assert_eq!(waiting["semantic_index"]["status"], "loading");
-    // It must never have gone to "failed" while merely waiting.
-    assert_ne!(waiting["semantic_index"]["status"], "failed");
+    assert_eq!(waiting["semantic_index"]["status"], "backend_unavailable");
+    assert_eq!(waiting["semantic_index"]["backend_url"], server.base_url.as_str());
 
     // Bring the backend up: the in-flight retry loop's next attempt succeeds.
     server.bring_up();
