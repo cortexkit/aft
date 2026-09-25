@@ -789,6 +789,10 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
     };
     if root_path.exists() {
         install_project_watcher(ctx, &root_path);
+        // With the watcher attached again, edits from here on are observed, so
+        // this is the point to compare the callgraph store with the disk for
+        // the edits made while nothing was watching.
+        ctx.start_pending_callgraph_reconcile();
     }
 }
 
@@ -1511,41 +1515,47 @@ fn workspace_manifest_fingerprint_scans_for_test() -> usize {
     WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(std::cell::Cell::get)
 }
 
-fn workspace_manifest_fingerprint(project_root: &Path) -> String {
+/// Resolution fields of the workspace manifests configure watches, keyed by
+/// path; None marks a watched file that does not exist.
+type WorkspaceResolutionManifests = std::collections::BTreeMap<PathBuf, Option<String>>;
+
+/// Read what module resolution uses from the workspace manifests (see
+/// `callgraph_store::resolution_config`). A `version` bump or a new dependency
+/// leaves this unchanged; an `exports`, `main`, `name` or `workspaces` change
+/// does not.
+fn workspace_manifest_fingerprint(project_root: &Path) -> WorkspaceResolutionManifests {
     #[cfg(test)]
     WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(count.get() + 1));
-    let mut parts = Vec::new();
-    push_manifest_fingerprint(&mut parts, project_root.join("package.json"));
-    let packages_dir = project_root.join("packages");
-    if let Ok(entries) = fs::read_dir(packages_dir) {
-        let mut manifests = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join("package.json"))
-            .collect::<Vec<_>>();
-        manifests.sort();
-        for manifest in manifests {
-            push_manifest_fingerprint(&mut parts, manifest);
-        }
-    }
-    parts.join("|")
+    crate::callgraph_store::resolution_config::workspace_resolution_manifest_paths(project_root)
+        .into_iter()
+        .map(|path| {
+            let fields = crate::callgraph_store::resolution_config::resolution_fields(&path);
+            (path, fields)
+        })
+        .collect()
 }
 
-fn push_manifest_fingerprint(parts: &mut Vec<String>, path: PathBuf) {
-    if let Ok(metadata) = fs::metadata(&path) {
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-            .unwrap_or((0, 0));
-        parts.push(format!(
-            "{}:{}:{}:{}",
-            path.display(),
-            metadata.len(),
-            modified.0,
-            modified.1
-        ));
+/// Hand workspace manifests whose resolution fields changed since this root's
+/// previous configure to the incremental callgraph refresh. The refresh
+/// compares each with the fields the store recorded and re-resolves only the
+/// files importing through it, so a manifest change never rebuilds the store.
+fn refresh_changed_workspace_manifests(
+    ctx: &AppContext,
+    canonical_root: &Path,
+    manifests: Option<WorkspaceResolutionManifests>,
+) {
+    let Some(manifests) = manifests else {
+        return;
+    };
+    let changed = ctx.note_workspace_resolution_manifests(canonical_root, manifests);
+    if changed.is_empty() || !ctx.callgraph_writer() {
+        return;
     }
+    slog_info!(
+        "workspace manifest resolution fields changed in {} file(s); refreshing their importers in the callgraph store",
+        changed.len()
+    );
+    ctx.enqueue_callgraph_store_refresh(changed);
 }
 
 /// Parse the `lsp_paths_extra` config param: an array of absolute directory
@@ -2423,10 +2433,9 @@ fn configure_warm_key(
     home_match: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
-    workspace_manifests: Option<&str>,
 ) -> String {
     format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}:{};inspect={};manifests={}",
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}:{};inspect={}",
         canonical_root,
         config.storage_dir,
         home_match,
@@ -2440,27 +2449,27 @@ fn configure_warm_key(
         config.indexes.callgraph,
         config.callgraph_chunk_size,
         config.inspect.enabled,
-        workspace_manifests.unwrap_or_default(),
     )
 }
 
+/// What selects the callgraph store itself. Workspace manifests are not part
+/// of it: a manifest change moves only the imports that resolve through it,
+/// which `refresh_changed_workspace_manifests` refreshes incrementally.
 fn configure_callgraph_build_key(
     canonical_root: &Path,
     config: &Config,
     home_match: bool,
     is_worktree_bridge: bool,
     shared_artifacts_read_only: bool,
-    workspace_manifests: Option<&str>,
 ) -> String {
     format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};enabled={};manifests={}",
+        "root={:?};storage={:?};home={};worktree={};readonly={};enabled={}",
         canonical_root,
         config.storage_dir,
         home_match,
         is_worktree_bridge,
         shared_artifacts_read_only,
         config.indexes.callgraph,
-        workspace_manifests.unwrap_or_default(),
     )
 }
 
@@ -3060,9 +3069,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             )
         });
     let effective_configure_changed = current_fingerprint.as_ref() != Some(&requested_fingerprint);
-    // Package manifests can only affect callgraph-store warming. Capture their
-    // fingerprint once when that lane is enabled; disabled roots should not stat
-    // every package on every equivalent bind.
+    // Workspace manifests only matter to the callgraph store. Read them once
+    // when that lane is enabled; disabled roots should not read every package
+    // manifest on every equivalent bind.
     let workspace_manifests = next_config
         .indexes
         .callgraph
@@ -3073,7 +3082,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         home_match,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
-        workspace_manifests.as_deref(),
     );
     if ctx.configure_generation() > 0
         && current_fingerprint.as_ref() == Some(&requested_fingerprint)
@@ -3119,6 +3127,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
+        refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
         register_hashline_for_configure(
             ctx,
             &canonical_cache_root,
@@ -3442,7 +3451,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         home_match,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
-        workspace_manifests.as_deref(),
     );
     let semantic_build_inputs_changed = project_root_changed
         || previous_config.indexes.semantic != next_config.indexes.semantic
@@ -3461,7 +3469,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         home_match,
         is_worktree_bridge,
         ctx.shared_artifacts_read_only(),
-        workspace_manifests.as_deref(),
     );
     let equivalent_callgraph_build = ctx.note_callgraph_build_key(callgraph_build_key);
     let callgraph_build_in_progress = ctx.callgraph_store_rx().lock().is_some();
@@ -3616,7 +3623,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             // owner's published store; a token here would never be fulfilled
             // and would keep every later callgraph query Unavailable.
             if previous_project_root.as_ref() == Some(&root_path) && ctx.callgraph_writer() {
-                ctx.mark_callgraph_store_force_rebuild();
+                ctx.mark_callgraph_store_force_rebuild(
+                    "callgraph build inputs changed (storage, enablement, or worktree topology)",
+                );
             }
         }
         if !semantic_build_adopted {
@@ -3647,6 +3656,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             crate::callgraph::clear_workspace_package_cache_under(root);
         }
     }
+    refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
 
     let refresh_project_runtime =
         project_root_changed || watcher_topology_changed || !ctx.watcher_runtime_active();
@@ -11922,10 +11932,13 @@ mod tests {
         )
         .unwrap();
         assert!(handle_configure_for_test(&enabled, &ctx).success);
-        assert_eq!(ctx.configure_generation(), enabled_generation + 1);
+        // Manifests are not part of the configure identity: a manifest change
+        // is handed to the incremental callgraph refresh instead, so the
+        // configure stays equivalent while the manifests are still read once.
+        assert_eq!(ctx.configure_generation(), enabled_generation);
         assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 2);
         assert!(handle_configure_for_test(&enabled, &ctx).success);
-        assert_eq!(ctx.configure_generation(), enabled_generation + 1);
+        assert_eq!(ctx.configure_generation(), enabled_generation);
         assert_eq!(super::workspace_manifest_fingerprint_scans_for_test(), 3);
     }
 

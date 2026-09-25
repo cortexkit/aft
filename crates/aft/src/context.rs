@@ -2482,8 +2482,12 @@ pub struct AppContext {
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
-    callgraph_store_force_requested: AtomicU64,
-    callgraph_store_force_fulfilled: AtomicU64,
+    callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
+    callgraph_reconcile: Arc<crate::callgraph_maintenance::CallgraphReconcileState>,
+    /// Resolution fields of the watched workspace manifests at the last
+    /// configure, with the root they were read under.
+    workspace_resolution_manifests:
+        parking_lot::Mutex<Option<(PathBuf, BTreeMap<PathBuf, Option<String>>)>>,
     callgraph_store_rx:
         parking_lot::Mutex<Option<crossbeam_channel::Receiver<CallGraphStoreBuildEvent>>>,
     callgraph_store_rx_generation: AtomicU64,
@@ -2984,8 +2988,9 @@ impl AppContext {
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
-            callgraph_store_force_requested: AtomicU64::new(0),
-            callgraph_store_force_fulfilled: AtomicU64::new(0),
+            callgraph_force_demand: Arc::default(),
+            callgraph_reconcile: Arc::default(),
+            workspace_resolution_manifests: parking_lot::Mutex::new(None),
             callgraph_store_rx: parking_lot::Mutex::new(None),
             callgraph_store_rx_generation: AtomicU64::new(0),
             callgraph_store_rx_epoch: AtomicU64::new(0),
@@ -5225,16 +5230,46 @@ impl AppContext {
         self.callgraph_store.as_ref()
     }
 
-    pub fn mark_callgraph_store_force_rebuild(&self) -> u64 {
-        self.callgraph_store_force_requested
-            .fetch_add(1, Ordering::SeqCst)
-            .wrapping_add(1)
+    /// Record the workspace manifests' resolution fields read by this
+    /// configure and return the manifests whose fields changed since the
+    /// previous configure of the same root. A first configure, or one for a
+    /// different root, has nothing to compare with and returns none.
+    pub(crate) fn note_workspace_resolution_manifests(
+        &self,
+        root: &Path,
+        manifests: BTreeMap<PathBuf, Option<String>>,
+    ) -> Vec<PathBuf> {
+        let mut noted = self.workspace_resolution_manifests.lock();
+        let changed = match noted.as_ref() {
+            Some((previous_root, previous)) if previous_root == root => {
+                let mut paths = previous
+                    .keys()
+                    .chain(manifests.keys())
+                    .filter(|path| {
+                        previous.get(*path).cloned().flatten()
+                            != manifests.get(*path).cloned().flatten()
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                paths.sort();
+                paths.dedup();
+                paths
+            }
+            _ => Vec::new(),
+        };
+        *noted = Some((root.to_path_buf(), manifests));
+        changed
+    }
+
+    /// Request a full rebuild of the callgraph store and record why. The reason
+    /// is printed when the rebuild starts, so it should name the trigger (for
+    /// example "callgraph build inputs changed" or "ignore-rule change").
+    pub fn mark_callgraph_store_force_rebuild(&self, reason: &str) -> u64 {
+        self.callgraph_force_demand.mark(reason)
     }
 
     pub(crate) fn pending_callgraph_store_force_token(&self) -> Option<u64> {
-        let requested = self.callgraph_store_force_requested.load(Ordering::SeqCst);
-        let fulfilled = self.callgraph_store_force_fulfilled.load(Ordering::SeqCst);
-        (requested > fulfilled).then_some(requested)
+        self.callgraph_force_demand.pending()
     }
 
     #[doc(hidden)]
@@ -5243,8 +5278,146 @@ impl AppContext {
     }
 
     pub fn fulfill_callgraph_store_force_token(&self, token: u64) {
-        self.callgraph_store_force_fulfilled
-            .fetch_max(token, Ordering::SeqCst);
+        self.callgraph_force_demand.fulfill(token);
+    }
+
+    /// The pending force token a build on this context may act on. Only a
+    /// callgraph writer can run the forced build. A context that became
+    /// read-only while a token was pending (its owner lease moved to another
+    /// process) would otherwise skip the published store forever while
+    /// waiting for a build it may not start, so the token is dropped and the
+    /// context follows the owner's published store instead.
+    fn callgraph_force_token_for_build(&self) -> Option<u64> {
+        let token = self.pending_callgraph_store_force_token()?;
+        if self.callgraph_writer() {
+            return Some(token);
+        }
+        crate::slog_info!(
+            "callgraph force rebuild dropped on read-only root (requested for: {}); following the owner's published store",
+            self.callgraph_force_demand.reason()
+        );
+        self.fulfill_callgraph_store_force_token(token);
+        None
+    }
+
+    /// Ask for the store to be compared with the disk, because watcher events
+    /// for this root were lost. Only a callgraph writer can apply the result;
+    /// a read-only root follows the owner's published store.
+    pub(crate) fn request_callgraph_reconcile(&self, reason: &str) {
+        if self.callgraph_writer() && self.config().indexes.callgraph {
+            self.callgraph_reconcile.request(reason);
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn pending_callgraph_reconcile_reason(&self) -> Option<String> {
+        self.callgraph_reconcile.pending_reason()
+    }
+
+    /// The last finished reconcile and how many have finished, for status and
+    /// tests.
+    #[doc(hidden)]
+    pub fn last_callgraph_reconcile(
+        &self,
+    ) -> (
+        u64,
+        Option<crate::callgraph_maintenance::CallgraphReconcileOutcome>,
+    ) {
+        (
+            self.callgraph_reconcile.completed(),
+            self.callgraph_reconcile.last(),
+        )
+    }
+
+    /// Start a requested reconcile off the calling thread. It compares the
+    /// published store with the disk and hands the differing files to the
+    /// incremental refresh; see [`crate::callgraph_maintenance`].
+    pub(crate) fn start_pending_callgraph_reconcile(&self) -> bool {
+        if self.callgraph_reconcile.pending_reason().is_none() {
+            return false;
+        }
+        if !self.callgraph_writer() || !self.config().indexes.callgraph {
+            // Nothing here can apply a refresh: a read-only root reads the
+            // owner's store, and a disabled index has no store.
+            self.callgraph_reconcile.clear_pending();
+            return false;
+        }
+        if !self.heavy_root_work_allowed() {
+            return false;
+        }
+        let Some(project_root) = self.callgraph_project_root() else {
+            return false;
+        };
+        let generation = self.configure_generation();
+        let Some(enqueue_refresh) =
+            self.callgraph_refresh_enqueuer(project_root.clone(), generation)
+        else {
+            return false;
+        };
+        let Some(reason) = self.callgraph_reconcile.begin() else {
+            return false;
+        };
+        let job = crate::callgraph_maintenance::CallgraphReconcileJob {
+            reason,
+            callgraph_dir: self.callgraph_store_dir(),
+            project_root,
+            max_examined: crate::callgraph_maintenance::RECONCILE_MAX_EXAMINED_FILES,
+            state: Arc::clone(&self.callgraph_reconcile),
+            force: Arc::clone(&self.callgraph_force_demand),
+            enqueue_refresh,
+        };
+        let session = crate::log_ctx::current_session();
+        let spawned = std::thread::Builder::new()
+            .name("aft-callgraph-reconcile".to_string())
+            .spawn(move || {
+                crate::log_ctx::with_session(session, || {
+                    job.run();
+                })
+            });
+        if let Err(error) = spawned {
+            crate::slog_warn!("callgraph reconcile thread failed to start: {}", error);
+        }
+        true
+    }
+
+    /// A detached sink for refresh paths fenced to `generation`: the same
+    /// admission, generation and publication fences
+    /// `enqueue_callgraph_store_refresh_for_generation` applies, captured so
+    /// another thread can enqueue after this call returns. The fences are
+    /// checked when the refresh commits, so this may be called from inside a
+    /// lifecycle admission scope.
+    fn callgraph_refresh_enqueuer(
+        &self,
+        project_root: PathBuf,
+        generation: u64,
+    ) -> Option<Box<dyn FnOnce(Vec<PathBuf>) + Send>> {
+        if self.configure_generation() != generation {
+            return None;
+        }
+        let ticket = crate::callgraph_store::CallgraphRefreshTicket::new(
+            self.subc_lifecycle_admission(),
+            self.configure_generation_flag(),
+            generation,
+            self.callgraph_persist_epoch_flag(),
+            self.callgraph_persist_epoch_flag().current(),
+        );
+        let callgraph_dir = self.callgraph_store_dir();
+        let pending = Arc::clone(&self.pending_callgraph_store_paths);
+        let refresh_state = crate::callgraph_store::CallgraphRefreshState::new(
+            Arc::clone(&self.callgraph_store),
+            Arc::clone(&self.heavy_root_work_allowed),
+        )
+        .with_matcher(Arc::clone(&self.gitignore));
+        Some(Box::new(move |paths| {
+            crate::callgraph_store::enqueue_callgraph_store_refresh_fenced_with_state(
+                callgraph_dir,
+                project_root,
+                paths,
+                pending,
+                refresh_state,
+                ticket,
+            );
+        }))
     }
 
     #[doc(hidden)]
@@ -5326,7 +5499,8 @@ impl AppContext {
             return Ok(None);
         }
         self.revalidate_callgraph_store_generation();
-        let force_token = self.pending_callgraph_store_force_token();
+        self.start_pending_callgraph_reconcile();
+        let force_token = self.callgraph_force_token_for_build();
         if force_token.is_none() {
             if let Some(store) = {
                 let guard = self
@@ -5533,7 +5707,8 @@ impl AppContext {
         // rebuild) may have published: if our resident store is superseded, drop
         // it so the open path below reopens via the pointer. Cheap pointer read.
         self.revalidate_callgraph_store_generation();
-        let force_token = self.pending_callgraph_store_force_token();
+        self.start_pending_callgraph_reconcile();
+        let force_token = self.callgraph_force_token_for_build();
         if force_token.is_none() {
             if let Some(store) = {
                 let guard = self
@@ -5630,7 +5805,8 @@ impl AppContext {
             // observable while the cold build runs in the background.
             let work = if let Some(force_token) = force_token {
                 crate::slog_info!(
-                    "callgraph cold-build decision: reason=corpus drift; action=force rebuild"
+                    "callgraph cold-build decision: reason={}; action=force rebuild",
+                    self.callgraph_force_demand.reason()
                 );
                 CallgraphBackgroundWork::ForceRebuild(force_token)
             } else {
@@ -6562,12 +6738,12 @@ impl AppContext {
         } else {
             SemanticIndexStatus::Disabled
         };
-        // A force token is only fulfillable by a local writer build; read-only
-        // roots follow the owner's published pointer and would be stuck
-        // permanently unavailable behind an unfulfillable token.
-        if self.callgraph_writer() {
-            self.mark_callgraph_store_force_rebuild();
-        }
+        // Files may change before the watcher is restored. The store is still
+        // the right store and only missed edits, so the next use compares it
+        // with the disk and refreshes what differs instead of rebuilding it.
+        // `request_callgraph_reconcile` ignores read-only roots, which follow
+        // the owner's published store.
+        self.request_callgraph_reconcile("watcher gap");
 
         if let Some(root) = self
             .canonical_cache_root_opt()
@@ -10599,6 +10775,11 @@ mod callgraph_store_for_ops_tests {
             None,
             "read-only root must not be stuck behind an unfulfillable force token"
         );
+        assert_eq!(
+            ctx.pending_callgraph_reconcile_reason(),
+            None,
+            "read-only root cannot apply a reconcile; it follows the owner's store"
+        );
     }
 
     /// A writer root can hold a pending force token and then lose its owner
@@ -10628,17 +10809,18 @@ mod callgraph_store_for_ops_tests {
         ctx.set_canonical_cache_root(root.clone());
         let project_key = crate::search_index::artifact_cache_key(&root);
         crate::root_cache::configure_artifact_access(&root, &project_key, false);
-        let (store, _stats) = crate::callgraph_store::CallGraphStore::cold_build_with_lease_chunked(
-            ctx.callgraph_store_dir(),
-            root.clone(),
-            &[source],
-            1,
-        )
-        .expect("publish the owner's callgraph store");
+        let (store, _stats) =
+            crate::callgraph_store::CallGraphStore::cold_build_with_lease_chunked(
+                ctx.callgraph_store_dir(),
+                root.clone(),
+                &[source],
+                1,
+            )
+            .expect("publish the owner's callgraph store");
         drop(store);
 
         ctx.set_cache_writer_capabilities(true, true);
-        ctx.mark_callgraph_store_force_rebuild();
+        ctx.mark_callgraph_store_force_rebuild("test");
         // The owner lease moves to another process: this root is now read-only.
         ctx.set_cache_writer_capabilities(false, true);
 
@@ -10650,7 +10832,7 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn watcher_gap_invalidation_marks_force_rebuild_for_writer_roots() {
+    fn watcher_gap_invalidation_requests_reconcile_for_writer_roots() {
         let project = TempDir::new().expect("project tempdir");
         // Semantic indexing now defaults on; this case exercises the
         // semantic-off mapping, so it switches that index off explicitly.
@@ -10670,9 +10852,17 @@ mod callgraph_store_for_ops_tests {
 
         ctx.invalidate_artifacts_after_watcher_gap();
 
-        assert!(
-            ctx.pending_callgraph_store_force_token().is_some(),
+        // The gap only means edits were missed, so the store is compared with
+        // the disk on its next use instead of being rebuilt from scratch.
+        assert_eq!(
+            ctx.pending_callgraph_reconcile_reason().as_deref(),
+            Some("watcher gap"),
             "writer roots must still reconcile the store after the unobserved interval"
+        );
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token(),
+            None,
+            "a watcher gap must not force a full rebuild"
         );
         assert!(
             matches!(
@@ -11076,7 +11266,8 @@ mod callgraph_store_for_ops_tests {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_none());
-        assert!(ctx.pending_callgraph_store_force_token().is_some());
+        assert!(ctx.pending_callgraph_reconcile_reason().is_some());
+        assert!(ctx.pending_callgraph_store_force_token().is_none());
         assert_eq!(
             crate::cache_freshness::warm_verify_plan(
                 &canonical_root,

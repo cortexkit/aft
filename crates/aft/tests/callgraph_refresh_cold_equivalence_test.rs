@@ -936,8 +936,14 @@ const EXPORTS_WORKSPACE: &[(&str, &str)] = &[
         "packages/core/package.json",
         "{\"name\":\"@s/core\",\"version\":\"1.0.0\",\"exports\":{\".\":\"./src/a.ts\"}}\n",
     ),
-    ("packages/core/src/a.ts", "export function run() { return 1; }\n"),
-    ("packages/core/src/b.ts", "export function run() { return 2; }\n"),
+    (
+        "packages/core/src/a.ts",
+        "export function run() { return 1; }\n",
+    ),
+    (
+        "packages/core/src/b.ts",
+        "export function run() { return 2; }\n",
+    ),
     (
         "packages/app/package.json",
         "{\"name\":\"@s/app\",\"main\":\"src/index.ts\"}\n",
@@ -986,14 +992,30 @@ fn workspace_exports_change_refreshes_package_importers() {
         "packages/core/package.json",
         "{\"name\":\"@s/core\",\"version\":\"1.0.1\",\"exports\":{\".\":\"./src/a.ts\"},\"dependencies\":{\"left-pad\":\"^1.3.0\"}}\n",
     );
-    store.refresh_files(&[manifest]).unwrap();
+    let bump = store.refresh_files(&[manifest]).unwrap();
+    assert!(
+        bump.resolution_config_changes.is_empty() && bump.resolution_importers.is_empty(),
+        "a version bump moves no resolution: {bump:#?}"
+    );
 
     let manifest = write_file(
         &root,
         "packages/core/package.json",
         "{\"name\":\"@s/core\",\"version\":\"1.0.1\",\"exports\":{\".\":\"./src/b.ts\"},\"dependencies\":{\"left-pad\":\"^1.3.0\"}}\n",
     );
-    store.refresh_files(&[manifest]).unwrap();
+    let exports = store.refresh_files(&[manifest]).unwrap();
+    assert_eq!(
+        exports.resolution_config_changes,
+        vec!["packages/core/package.json".to_string()]
+    );
+    assert_eq!(
+        exports.resolution_importers,
+        vec![
+            "packages/app/src/direct.ts".to_string(),
+            "packages/app/src/index.ts".to_string(),
+        ],
+        "only the files importing @s/core are re-resolved"
+    );
     let refreshed = snapshot(&store);
     drop(store);
 
@@ -1006,5 +1028,158 @@ fn workspace_exports_change_refreshes_package_importers() {
             .iter()
             .all(|target| target.0 == "packages/core/src/b.ts"),
         "{targets:#?}"
+    );
+}
+
+/// After lost watcher events, the reconcile compares every stored file's size
+/// and content hash with the disk. Three edits (a changed call target, a
+/// same-size rewrite and a deletion) plus a new file must come back as exactly
+/// those paths, and refreshing only them must give the cold-build graph.
+#[test]
+fn disk_reconcile_finds_exactly_the_changed_files() {
+    let project = tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    let stores = tempdir().unwrap();
+    let before: &[(&str, &str)] = &[
+        ("util.ts", "export function helper() { return 1; }\n"),
+        ("extra.ts", "export function extra() { return 2; }\n"),
+        (
+            "a.ts",
+            "import { helper } from \"./util\";\nexport function a() { return helper(); }\n",
+        ),
+        (
+            "b.ts",
+            "import { a } from \"./a\";\nexport function b() { return a(); }\n",
+        ),
+        ("c.ts", "export function c() { return 3; }\n"),
+        ("gone.ts", "export function gone() { return 5; }\n"),
+        (
+            "d.ts",
+            "import { c } from \"./c\";\nexport function d() { return c(); }\n",
+        ),
+    ];
+    for (rel, content) in before {
+        write_file(&root, rel, content);
+    }
+    let store =
+        CallGraphStore::open(stores.path().join("incremental"), root.to_path_buf()).unwrap();
+    let files: Vec<PathBuf> = walk_project_files(&root).collect();
+    store.cold_build(&files).unwrap();
+
+    let unchanged = store.reconcile_with_disk(1_000).unwrap();
+    assert_eq!(unchanged.changed_count(), 0, "{unchanged:#?}");
+    assert_eq!(unchanged.examined_files, before.len());
+    assert_eq!(unchanged.hashed_files, before.len());
+
+    let modified_call = write_file(
+        &root,
+        "a.ts",
+        "import { extra } from \"./extra\";\nexport function a() { return extra(); }\n",
+    );
+    // Same size as before: only the content hash can tell it changed.
+    let same_size = write_file(&root, "c.ts", "export function c() { return 4; }\n");
+    let deleted = root.join("gone.ts");
+    fs::remove_file(&deleted).unwrap();
+    let created = write_file(
+        &root,
+        "e.ts",
+        "import { d } from \"./d\";\nexport function e() { return d(); }\n",
+    );
+
+    let report = store.reconcile_with_disk(1_000).unwrap();
+    assert!(!report.truncated);
+    assert_eq!(report.stored_files, before.len());
+    assert_eq!(report.examined_files, before.len());
+    assert_eq!(report.created, vec![created.clone()]);
+    assert_eq!(
+        report.modified,
+        vec![modified_call.clone(), same_size.clone()]
+    );
+    assert_eq!(report.deleted, vec![deleted.clone()]);
+    let mut expected = vec![modified_call, same_size, deleted, created];
+    expected.sort();
+    assert_eq!(report.changed_paths(), expected);
+
+    store.refresh_files(&report.changed_paths()).unwrap();
+    let refreshed = snapshot(&store);
+    assert_eq!(store.reconcile_with_disk(1_000).unwrap().changed_count(), 0);
+    drop(store);
+    let cold = cold_snapshot(&root, &stores.path().join("cold"));
+    assert_same_graph("disk reconcile", &refreshed, &cold);
+}
+
+/// The bound applies to the walk: a reconcile stops after that many files,
+/// says so, and does not guess deletions from a partial walk.
+#[test]
+fn disk_reconcile_stops_at_its_bound() {
+    let project = tempdir().unwrap();
+    let root = fs::canonicalize(project.path()).unwrap();
+    let stores = tempdir().unwrap();
+    for index in 0..5 {
+        write_file(
+            &root,
+            &format!("f{index}.ts"),
+            &format!("export function f{index}() {{}}\n"),
+        );
+    }
+    let store =
+        CallGraphStore::open(stores.path().join("incremental"), root.to_path_buf()).unwrap();
+    let files: Vec<PathBuf> = walk_project_files(&root).collect();
+    store.cold_build(&files).unwrap();
+    fs::remove_file(root.join("f4.ts")).unwrap();
+
+    let report = store.reconcile_with_disk(2).unwrap();
+    assert!(report.truncated, "{report:#?}");
+    assert_eq!(report.examined_files, 2);
+    assert!(
+        report.deleted.is_empty(),
+        "a partial walk cannot prove a deletion"
+    );
+
+    let exact = store.reconcile_with_disk(4).unwrap();
+    assert!(!exact.truncated, "a walk ending at the bound is complete");
+    assert_eq!(exact.deleted, vec![root.join("f4.ts")]);
+}
+
+/// A tsconfig `paths` change moves every non-relative import under the
+/// tsconfig's directory; refreshing only the tsconfig must re-resolve them.
+#[test]
+fn tsconfig_paths_change_refreshes_bare_importers() {
+    let cold = assert_refresh_matches_cold(
+        "tsconfig paths change",
+        &[
+            (
+                "tsconfig.json",
+                "{\"compilerOptions\":{\"strict\":true,\"paths\":{\"@/*\":[\"src/*\"]}}}\n",
+            ),
+            ("src/x.ts", "export function run() { return 1; }\n"),
+            ("lib/x.ts", "export function run() { return 2; }\n"),
+            (
+                "main.ts",
+                "import { run } from \"@/x\";\nexport function main() { run(); }\n",
+            ),
+            (
+                "local.ts",
+                "import { main } from \"./main\";\nexport function local() { main(); }\n",
+            ),
+        ],
+        &[
+            // Not read by the resolver: nothing may move.
+            &[(
+                "tsconfig.json",
+                Some("{\"compilerOptions\":{\"strict\":false,\"paths\":{\"@/*\":[\"src/*\"]}}}\n"),
+            )],
+            &[(
+                "tsconfig.json",
+                Some("{\"compilerOptions\":{\"strict\":false,\"paths\":{\"@/*\":[\"lib/*\"]}}}\n"),
+            )],
+        ],
+    );
+    assert_eq!(
+        edges_to(&cold, "run")
+            .into_iter()
+            .map(|target| target.0)
+            .collect::<Vec<_>>(),
+        vec!["lib/x.ts".to_string()]
     );
 }

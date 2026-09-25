@@ -2040,11 +2040,7 @@ fn spawn_search_corpus_refresh_admitted(
     });
 }
 
-pub fn refresh_project_corpus(
-    ctx: &AppContext,
-    reason: &str,
-    _invalidate_ignore_paths: bool,
-) -> bool {
+pub fn refresh_project_corpus(ctx: &AppContext, reason: &str, ignore_rules_changed: bool) -> bool {
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
         let Some(root) = ctx.canonical_cache_root_opt() else {
@@ -2053,18 +2049,18 @@ pub fn refresh_project_corpus(
         let config = ctx.config();
         let mut status_changed = false;
 
-        if ctx.callgraph_writer() {
+        // Lost watcher events leave the callgraph store the right store with
+        // some edits missing; the rescan path reconciles it against the disk.
+        // Only an ignore-rule change alters which files belong in the store,
+        // which the reconcile does not model, so only that forces a rebuild.
+        if ignore_rules_changed && ctx.callgraph_writer() {
             // Do NOT cold-build the callgraph store synchronously here. This function
             // runs on the single-threaded dispatch loop from `drain_watcher_events`,
             // which fires before EVERY request (and on idle ticks). A full O(repo)
             // `refresh_corpus` (= `cold_build`: parse all files + resolve refs +
             // rewrite SQLite) blocks ALL queued requests — including `configure` and
             // `bash` — for its entire duration, which exceeds the 30s transport
-            // timeout on a large repo. On a long-lived bridge (OpenCode Desktop) an
-            // FSEvents overflow triggers this drain, so the user sees configure/bash
-            // time out (regression: the watcher-overflow path that calls this is new
-            // in 0.39.1; the ignore-rule path that also calls this had the same
-            // latent inline block, just rarely triggered).
+            // timeout on a large repo.
             //
             // Instead, drop the resident store and force a BACKGROUND rebuild: the
             // next `callgraph_store_for_ops()` spawns the cold build off-thread and
@@ -2086,7 +2082,7 @@ pub fn refresh_project_corpus(
                 *ctx.callgraph_store()
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                ctx.mark_callgraph_store_force_rebuild();
+                ctx.mark_callgraph_store_force_rebuild(reason);
                 status_changed = true;
                 aft::slog_info!(
                     "callgraph store scheduled for background rebuild after {}",
@@ -2228,14 +2224,13 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     // each lane regardless of residency.
     let hardened = ctx.run_if_subc_bound_generation(generation, || {
         let config = ctx.config();
-        if ctx.callgraph_writer()
-            && config.indexes.callgraph
-            && ctx.pending_callgraph_store_force_token().is_none()
-        {
-            // The corpus refresh above forces a rebuild only when a store was
-            // resident or building; lost events invalidate the disk
-            // generation either way.
-            ctx.mark_callgraph_store_force_rebuild();
+        if ctx.callgraph_writer() && config.indexes.callgraph {
+            // Compare the store with the disk and refresh only what differs,
+            // off this dispatch thread (started below, outside this admission
+            // scope). The resident store keeps serving in the meantime; the
+            // reconcile falls back to a forced rebuild only when it cannot
+            // finish within its bound.
+            ctx.request_callgraph_reconcile("watcher overflow");
         }
         if ctx.shared_artifacts_read_only() {
             // Read-only roots reconcile by re-opening the shared artifacts:
@@ -2268,6 +2263,9 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
         }
     });
     status_changed |= hardened.is_some();
+    if hardened.is_some() {
+        ctx.start_pending_callgraph_reconcile();
+    }
     status_changed
 }
 
@@ -4237,7 +4235,7 @@ mod tests {
                 ..Config::default()
             },
         );
-        let force_token = ctx.mark_callgraph_store_force_rebuild();
+        let force_token = ctx.mark_callgraph_store_force_rebuild("test");
         assert_eq!(ctx.pending_callgraph_store_force_token(), Some(force_token));
 
         let generation = ctx.configure_generation();
@@ -4280,7 +4278,7 @@ mod tests {
             1,
         )
         .unwrap();
-        let older = ctx.mark_callgraph_store_force_rebuild();
+        let older = ctx.mark_callgraph_store_force_rebuild("test");
         let generation = ctx.configure_generation();
         let (tx, rx) = crossbeam_channel::unbounded();
         ctx.note_callgraph_store_rx_generation(generation);
@@ -4292,7 +4290,7 @@ mod tests {
             publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
         })
         .unwrap();
-        let newer = ctx.mark_callgraph_store_force_rebuild();
+        let newer = ctx.mark_callgraph_store_force_rebuild("test");
 
         drain_callgraph_store_events(&ctx);
 

@@ -8,6 +8,7 @@
 pub(crate) mod disk_facts;
 pub(crate) mod facts;
 pub mod join;
+pub(crate) mod resolution_config;
 use disk_facts::DiskFacts;
 use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
 
@@ -2470,6 +2471,49 @@ pub struct IncrementalStats {
     /// example a symlink inside the project pointing elsewhere). They are not
     /// part of this project's graph, so the refresh ignores them.
     pub skipped_out_of_root: Vec<PathBuf>,
+    /// Manifests and tsconfig files in this batch whose resolution fields
+    /// changed (see `resolution_config`).
+    pub resolution_config_changes: Vec<String>,
+    /// Files re-resolved because such a change can move their imports.
+    pub resolution_importers: Vec<String>,
+}
+
+/// What [`CallGraphStore::reconcile_with_disk`] examined and what differs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskReconcileReport {
+    /// Files recorded in the store before the comparison.
+    pub stored_files: usize,
+    /// Files the walk visited, at most `max_examined`.
+    pub examined_files: usize,
+    /// Visited files whose size matched and were hashed.
+    pub hashed_files: usize,
+    /// The bound the walk ran under.
+    pub max_examined: usize,
+    /// The walk stopped at the bound, so files past it were not compared and
+    /// deletions were not computed.
+    pub truncated: bool,
+    /// On disk but not in the store.
+    pub created: Vec<PathBuf>,
+    /// In the store with a different size or content hash.
+    pub modified: Vec<PathBuf>,
+    /// In the store but gone from disk.
+    pub deleted: Vec<PathBuf>,
+}
+
+impl DiskReconcileReport {
+    /// Every path that differs, in the form `refresh_files` accepts.
+    pub fn changed_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::with_capacity(self.changed_count());
+        paths.extend(self.created.iter().cloned());
+        paths.extend(self.modified.iter().cloned());
+        paths.extend(self.deleted.iter().cloned());
+        paths.sort();
+        paths
+    }
+
+    pub fn changed_count(&self) -> usize {
+        self.created.len() + self.modified.len() + self.deleted.len()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -4473,6 +4517,18 @@ impl CallGraphStore {
                     for extract in &build.extracts {
                         delete_staged_file_rows(&tx, &extract.rel_path)?;
                         insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                        if resolution_config::resolution_config_kind(Path::new(&extract.rel_path))
+                            .is_some()
+                        {
+                            store_resolution_config_fields(
+                                &tx,
+                                &extract.rel_path,
+                                resolution_config::resolution_fields(
+                                    &self.project_root.join(&extract.rel_path),
+                                )
+                                .as_deref(),
+                            )?;
+                        }
                         for raw in &extract.raw_refs {
                             insert_staged_ref_prepared(&mut inserts, raw)?;
                         }
@@ -4704,6 +4760,15 @@ impl CallGraphStore {
         }
 
         let mut skipped_out_of_root = Vec::new();
+        if changed_files
+            .iter()
+            .any(|path| resolution_config::resolution_config_kind(path).is_some())
+        {
+            // Workspace membership and package names are cached process-wide;
+            // a manifest in this batch may have changed them, and the files
+            // extracted below resolve their imports against that cache.
+            callgraph::clear_workspace_package_cache_under(&self.project_root);
+        }
         for input in changed_files {
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
@@ -4826,6 +4891,49 @@ impl CallGraphStore {
         // specifier only now resolves to a created file, and callers that reach
         // a changed file through re-exporting barrels.
         let started = Instant::now();
+        // A manifest or tsconfig whose resolution fields changed moves the
+        // imports that resolve through it, although no importer's bytes
+        // changed. Their refs are selected here like any other dependents.
+        let resolution_updates = resolution_config_updates(
+            &conn,
+            &self.project_root,
+            deleted.iter().chain(changed_extracts.keys()),
+        )?;
+        let mut resolution_importers = BTreeSet::new();
+        if !resolution_updates.is_empty() {
+            callgraph::clear_workspace_package_cache_under(&self.project_root);
+            let (importers, barrels) = resolution_change_importers(
+                &conn,
+                resolution_updates
+                    .iter()
+                    .filter_map(|update| update.change.as_ref()),
+            )?;
+            for importer in &importers {
+                if deleted.contains(importer) {
+                    continue;
+                }
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    all_refs_of_caller(&conn, importer)?,
+                );
+            }
+            for barrel in barrels {
+                if deleted.contains(&barrel) {
+                    continue;
+                }
+                // A barrel re-exporting through a moved import now passes on
+                // different targets: its own importers and the consumers
+                // behind further barrels resolve through it again.
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    ref_ids_depending_on(&conn, &self.project_root, &barrel)?,
+                );
+                surface_changes.push((barrel, None));
+            }
+            resolution_importers = importers;
+        }
         let (created_importers, created_reexporters) =
             importers_of_created_files(&conn, &self.project_root, &created)?;
         profile.created_file_scan = started.elapsed();
@@ -4905,6 +5013,9 @@ impl CallGraphStore {
         }
 
         let tx = conn.transaction()?;
+        for update in &resolution_updates {
+            store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;
+        }
         for (rel_path, freshness) in fresh_metadata {
             update_file_fresh_metadata(
                 &tx,
@@ -4963,6 +5074,12 @@ impl CallGraphStore {
                     refreshed_own_files: 0,
                     unchanged_extract_files: 0,
                     skipped_out_of_root,
+                    resolution_config_changes: resolution_updates
+                        .iter()
+                        .filter(|update| update.change.is_some())
+                        .map(|update| update.rel_path.clone())
+                        .collect(),
+                    resolution_importers: resolution_importers.into_iter().collect(),
                 },
                 profile,
             ));
@@ -5123,6 +5240,12 @@ impl CallGraphStore {
                 refreshed_own_files: own_refresh.len(),
                 unchanged_extract_files: unchanged_extracts,
                 skipped_out_of_root,
+                resolution_config_changes: resolution_updates
+                    .iter()
+                    .filter(|update| update.change.is_some())
+                    .map(|update| update.rel_path.clone())
+                    .collect(),
+                resolution_importers: resolution_importers.into_iter().collect(),
             },
             profile,
         ))
@@ -5218,6 +5341,24 @@ impl CallGraphStore {
         indexed_file_count(&conn)
     }
 
+    /// Compare the stored per-file size and content hash with the files on
+    /// disk, for when watcher events were lost. At most `max_examined` walked
+    /// files are compared; the bound is applied to the walk itself, so a huge
+    /// tree costs no more than the bound. The returned paths are what an
+    /// incremental `refresh_files` needs to catch the store up.
+    pub fn reconcile_with_disk(&self, max_examined: usize) -> Result<DiskReconcileReport> {
+        let stored = {
+            let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+            self.ensure_ready(&conn)?;
+            stored_file_identities(&conn)?
+        };
+        Ok(reconcile_stored_files_with_disk(
+            &self.project_root,
+            stored,
+            callgraph::walk_project_files(&self.project_root),
+            max_examined,
+        ))
+    }
     pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
         self.refresh_read_marker()?;
         let abs_path = normalize_file_path(&self.project_root, file_rel)?;
@@ -5761,6 +5902,12 @@ impl ReadonlyCallGraphStore {
         self.inner.indexed_file_count()
     }
 
+    /// Compare this reader's stored files with the disk; see
+    /// [`CallGraphStore::reconcile_with_disk`] for what is compared.
+    pub fn reconcile_with_disk(&self, max_examined: usize) -> Result<DiskReconcileReport> {
+        self.inner.reconcile_with_disk(max_examined)
+    }
+
     pub fn node_for(&self, file_rel: &Path, symbol: &str) -> Result<StoreNode> {
         self.inner.node_for(file_rel, symbol)
     }
@@ -6169,6 +6316,90 @@ impl CallGraphRead for ReadonlyCallGraphStore {
 fn indexed_file_count(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
     Ok(count.max(0) as usize)
+}
+
+/// Size and hex content hash of every stored file, keyed by relative path.
+fn stored_file_identities(conn: &Connection) -> Result<HashMap<String, (u64, String)>> {
+    let mut statement = conn.prepare("SELECT path, size, content_hash FROM files")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, i64>(1)?.max(0) as u64,
+                row.get::<_, String>(2)?,
+            ),
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<HashMap<_, _>>>()?)
+}
+
+/// Classify each walked file against the stored identities. A file is compared
+/// by size first and hashed only when the size matches, the same content hash
+/// the store records (files over the hash size cap are stored with a zero hash,
+/// so for them only the size is compared). Stored files the walk did not reach
+/// are reported deleted only when the walk was complete and the file is really
+/// gone: a truncated walk cannot tell a deletion from an unvisited file.
+fn reconcile_stored_files_with_disk(
+    project_root: &Path,
+    mut stored: HashMap<String, (u64, String)>,
+    walk: impl Iterator<Item = PathBuf>,
+    max_examined: usize,
+) -> DiskReconcileReport {
+    let mut report = DiskReconcileReport {
+        stored_files: stored.len(),
+        max_examined,
+        ..DiskReconcileReport::default()
+    };
+    // One extra item tells a walk that ended exactly at the bound from one
+    // that was cut off by it.
+    for path in walk.take(max_examined.saturating_add(1)) {
+        if report.examined_files == max_examined {
+            report.truncated = true;
+            break;
+        }
+        report.examined_files += 1;
+        let rel_path = relative_path(project_root, &path);
+        let Some((stored_size, stored_hash)) = stored.remove(&rel_path) else {
+            report.created.push(path);
+            continue;
+        };
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            report.modified.push(path);
+            continue;
+        };
+        if metadata.len() != stored_size {
+            report.modified.push(path);
+            continue;
+        }
+        report.hashed_files += 1;
+        let disk_hash = match cache_freshness::hash_file_if_small(&path, stored_size) {
+            Ok(hash) => hash.unwrap_or_else(cache_freshness::zero_hash),
+            Err(_) => {
+                report.modified.push(path);
+                continue;
+            }
+        };
+        if hash_to_hex(disk_hash) != stored_hash {
+            report.modified.push(path);
+        }
+    }
+    if !report.truncated {
+        let mut deleted = stored
+            .into_keys()
+            .map(|rel_path| project_root.join(rel_path))
+            .filter(|path| {
+                matches!(
+                    std::fs::symlink_metadata(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            })
+            .collect::<Vec<_>>();
+        deleted.sort();
+        report.deleted = deleted;
+    }
+    report.created.sort();
+    report.modified.sort();
+    report
 }
 
 fn resolve_node_for_rel(conn: &Connection, rel_path: &str, symbol: &str) -> Result<StoreNode> {
@@ -8055,6 +8286,14 @@ pub(crate) fn initialize_schema(conn: &Connection) -> Result<()> {
             name TEXT PRIMARY KEY
         );
 
+        -- What the module resolver read from each indexed package.json,
+        -- pnpm-workspace.yaml and tsconfig.json when it was last indexed, so a
+        -- refresh can tell a resolution change from a version bump.
+        CREATE TABLE IF NOT EXISTS resolution_config_fields (
+            path   TEXT PRIMARY KEY,
+            fields TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS backend_file_state (
             backend        TEXT NOT NULL,
             workspace_root TEXT NOT NULL,
@@ -8316,6 +8555,7 @@ fn clear_tables(tx: &Transaction<'_>) -> Result<()> {
          DELETE FROM type_ref_names;
          DELETE FROM backend_file_state;
          DELETE FROM nodes;
+         DELETE FROM resolution_config_fields;
          DELETE FROM files;",
     )?;
     Ok(())
@@ -16556,6 +16796,138 @@ fn refs_by_caller_for_ref_ids(
         }
     }
     Ok(by_caller)
+}
+
+/// A resolution config file seen by a refresh: its current fields (None when
+/// deleted) and, when those differ from the stored fields, what they can move.
+struct ResolutionConfigUpdate {
+    rel_path: String,
+    fields: Option<String>,
+    change: Option<resolution_config::ResolutionChange>,
+}
+
+/// Compare the current resolution fields of every config file among
+/// `rel_paths` with the fields stored when it was last indexed. A file with no
+/// stored row (created since, or indexed before these rows were recorded) is
+/// compared as absent, which errs toward refreshing its importers.
+fn resolution_config_updates<'a>(
+    conn: &Connection,
+    project_root: &Path,
+    rel_paths: impl Iterator<Item = &'a String>,
+) -> Result<Vec<ResolutionConfigUpdate>> {
+    let mut updates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for rel_path in rel_paths {
+        if resolution_config::resolution_config_kind(Path::new(rel_path)).is_none()
+            || !seen.insert(rel_path.clone())
+        {
+            continue;
+        }
+        let stored = conn
+            .query_row(
+                "SELECT fields FROM resolution_config_fields WHERE path = ?1",
+                params![rel_path],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let fields = resolution_config::resolution_fields(&project_root.join(rel_path));
+        if stored == fields {
+            continue;
+        }
+        updates.push(ResolutionConfigUpdate {
+            rel_path: rel_path.clone(),
+            change: resolution_config::resolution_change(
+                rel_path,
+                stored.as_deref(),
+                fields.as_deref(),
+            ),
+            fields,
+        });
+    }
+    Ok(updates)
+}
+
+/// Files whose stored imports a resolution change can move, and the subset
+/// that re-export through such an import (their own importers can move too).
+fn resolution_change_importers<'a>(
+    conn: &Connection,
+    changes: impl Iterator<Item = &'a resolution_config::ResolutionChange>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut importers = BTreeSet::new();
+    let mut barrels = BTreeSet::new();
+    let mut collect = |rows: Vec<(String, String)>| {
+        for (caller_file, kind) in rows {
+            if kind == "reexport" {
+                barrels.insert(caller_file.clone());
+            }
+            importers.insert(caller_file);
+        }
+    };
+    for change in changes {
+        for name in &change.package_names {
+            // `substr` instead of LIKE: package names may contain `_`, a LIKE
+            // wildcard.
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT caller_file, kind FROM refs
+                 WHERE module_path = ?1
+                    OR substr(module_path, 1, length(?1) + 1) = ?1 || '/'",
+            )?;
+            let rows = statement
+                .query_map(params![name], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            collect(rows);
+        }
+        if change.bare_imports_under_dir {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT caller_file, kind FROM refs
+                 WHERE module_path IS NOT NULL
+                   AND module_path <> ''
+                   AND substr(module_path, 1, 1) NOT IN ('.', '/')
+                   AND (?1 = '' OR substr(caller_file, 1, length(?1) + 1) = ?1 || '/')",
+            )?;
+            let rows = statement
+                .query_map(params![change.dir], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            collect(rows);
+        }
+    }
+    Ok((importers, barrels))
+}
+
+/// Every stored ref of `caller_file`, selected for re-resolution.
+fn all_refs_of_caller(conn: &Connection, caller_file: &str) -> Result<Vec<DependentRefSelection>> {
+    let mut statement =
+        conn.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1 ORDER BY ref_id")?;
+    let rows = statement
+        .query_map(params![caller_file], |row| row.get::<_, String>(0))?
+        .map(|ref_id| {
+            ref_id.map(|ref_id| DependentRefSelection {
+                ref_id,
+                caller_file: caller_file.to_string(),
+            })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Record (or, for a deleted file, forget) the resolution fields a later
+/// refresh compares against.
+fn store_resolution_config_fields(
+    tx: &Transaction<'_>,
+    rel_path: &str,
+    fields: Option<&str>,
+) -> Result<()> {
+    match fields {
+        Some(fields) => tx.execute(
+            "INSERT OR REPLACE INTO resolution_config_fields(path, fields) VALUES(?1, ?2)",
+            params![rel_path, fields],
+        )?,
+        None => tx.execute(
+            "DELETE FROM resolution_config_fields WHERE path = ?1",
+            params![rel_path],
+        )?,
+    };
+    Ok(())
 }
 
 fn delete_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {

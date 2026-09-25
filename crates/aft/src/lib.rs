@@ -61,6 +61,7 @@ pub mod blob_store;
 pub mod build_breaker;
 pub mod cache_freshness;
 pub mod callgraph;
+pub mod callgraph_maintenance;
 pub mod callgraph_store;
 pub mod calls;
 pub mod checkpoint;

@@ -3927,23 +3927,27 @@ mod watcher_filter_tests {
     }
 
     #[test]
-    fn watcher_overflow_rescan_reschedules_callgraph_store_instead_of_blocking() {
+    fn watcher_overflow_rescan_reconciles_callgraph_store_instead_of_blocking() {
         // Regression for the configure/bash timeout on OpenCode Desktop large
         // repos (v0.39.1): a watcher overflow (RescanRequired) used to run the
         // callgraph store's full cold_build SYNCHRONOUSLY inside
         // drain_watcher_events — which runs on the single dispatch thread before
         // every request — blocking configure/bash past the 30s transport
-        // timeout. The drain must now DROP the resident store and schedule a
-        // BACKGROUND rebuild, never cold-build inline.
+        // timeout. The drain must never build inline. Lost events only mean
+        // missed edits, so the resident store keeps serving while a background
+        // reconcile compares it with the disk; no full rebuild is forced.
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         std::fs::write(root.join("lib.rs"), "fn used() {}\nfn main() { used(); }\n").unwrap();
+        // Storage lives outside the project, as it does for real roots, so the
+        // store's own files are not part of the walked corpus.
+        let storage = TempDir::new().unwrap();
 
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.clone()),
-                storage_dir: Some(tmp.path().join("storage")),
+                storage_dir: Some(storage.path().to_path_buf()),
                 indexes: aft::config::IndexesConfig {
                     trigram: false,
                     semantic: false,
@@ -3981,25 +3985,40 @@ mod watcher_filter_tests {
 
         drain_watcher_events(&ctx);
 
-        // The resident store is dropped (rescheduled), NOT refreshed in place...
+        // The resident store keeps serving: it is the right store and only
+        // missed edits...
         assert!(
             ctx.callgraph_store()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "watcher overflow must drop the resident store to reschedule, not refresh inline"
+                .is_some(),
+            "watcher overflow must keep the resident store while it reconciles"
         );
         // ...and the drain itself did NOT spawn a build (no inline cold_build on
-        // the dispatch thread); the rebuild happens lazily on the next op.
+        // the dispatch thread).
         assert!(
             ctx.callgraph_store_rx().lock().is_none(),
             "drain must not start a synchronous/inline callgraph build"
         );
         assert!(
-            ctx.pending_callgraph_store_force_token_for_test().is_some(),
-            "lost watcher events must retain a force-rebuild token"
+            ctx.pending_callgraph_store_force_token_for_test().is_none(),
+            "lost watcher events must be reconciled, not answered with a full rebuild"
         );
-        // The next callgraph op will see the force flag and background-build.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while ctx.last_callgraph_reconcile().0 == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the overflow never started a reconcile"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let outcome = ctx.last_callgraph_reconcile().1.expect("reconcile outcome");
+        assert_eq!(outcome.reason, "watcher overflow");
+        assert_eq!(
+            outcome.action,
+            aft::callgraph_maintenance::CallgraphReconcileAction::Unchanged,
+            "nothing changed on disk, so the reconcile refreshes nothing"
+        );
     }
 
     /// Lost watcher events on a tree where three files changed must refresh
@@ -4019,6 +4038,9 @@ mod watcher_filter_tests {
 
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
+        // Storage lives outside the project, as it does for real roots, so the
+        // store's own files are not part of the walked corpus.
+        let storage = TempDir::new().unwrap();
         let write = |name: &str, body: &str| {
             let path = root.join(name);
             std::fs::write(&path, body).unwrap();
@@ -4044,7 +4066,7 @@ mod watcher_filter_tests {
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.clone()),
-                storage_dir: Some(tmp.path().join("storage")),
+                storage_dir: Some(storage.path().to_path_buf()),
                 indexes: aft::config::IndexesConfig {
                     trigram: false,
                     semantic: false,
@@ -4133,7 +4155,7 @@ mod watcher_filter_tests {
         .edge_snapshot()
         .expect("refreshed edges");
         let cold_store = aft::callgraph_store::CallGraphStore::open(
-            tmp.path().join("cold-store"),
+            storage.path().join("cold-store"),
             root.clone(),
         )
         .expect("open cold store");
