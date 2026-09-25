@@ -130,6 +130,16 @@ export * from "./feature-config.js";
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
 export { stripJsoncSymbols } from "./jsonc.js";
+// --- config error state (a plugin that loads but fails every tool call) ---
+export {
+  AftConfigError,
+  CONFIG_ERROR_RESTART_NOTE,
+  ConfigErrorTransportPool,
+  configErrorStatusSnapshot,
+  formatConfigErrorMessage,
+  formatConfigErrorStatusLine,
+  formatConfigParseErrorMessage,
+} from "./config-error.js";
 // --- per-Location process-global transport ownership ---
 export type {
   AcquireBridgeDependencies,
@@ -267,6 +277,7 @@ export type {
 export {
   type AftTransportFactoryOptions,
   createAftTransportPool,
+  subcConnectionFileError,
 } from "./transport-factory.js";
 export { readBinaryVersionOffThread } from "./version-probe.js";
 // --- aft_zoom plain-text formatter (shared by both plugin hosts) ---

@@ -187,23 +187,40 @@ export async function createAftTransportPool(
   return wrapper;
 }
 
+/**
+ * The error for a configured `subc.connection_file` that does not exist, or
+ * null when subc is not configured or its connection file is present. Plugins
+ * call this before building a pool so a missing file puts them in the config
+ * error state instead of failing initialization; the factory below applies the
+ * same check.
+ */
+export async function subcConnectionFileError(
+  subcConnectionFile: string | undefined,
+): Promise<string | null> {
+  const raw = subcConnectionFile?.trim();
+  if (!raw) return null;
+  const connectionFile = resolveConnectionFilePath(raw);
+  if (await SubcTransportPool.connectionAvailable(connectionFile)) return null;
+  return (
+    `subc.connection_file is set to "${raw}" (resolved: ${connectionFile}) but no subc ` +
+    `connection file exists there. Start the Subconscious daemon, correct the path, ` +
+    `or remove subc.connection_file from your user config to use the standalone bridge.`
+  );
+}
+
 async function createConcreteAftTransportPool(
   opts: AftTransportFactoryOptions,
 ): Promise<AftTransportPool> {
   const raw = opts.subcConnectionFile?.trim();
   if (raw && raw.length > 0) {
     const connectionFile = resolveConnectionFilePath(raw);
-    const available = await SubcTransportPool.connectionAvailable(connectionFile);
-    if (!available) {
+    const missing = await subcConnectionFileError(raw);
+    if (missing !== null) {
       // FAIL LOUD: the user explicitly selected subc but the daemon's connection
       // file is absent. Downgrading to standalone here would split-brain a user
       // who expects the daemon to own indexes/caches — surface the error so they
       // start the daemon or clear the config.
-      throw new Error(
-        `subc.connection_file is set to "${raw}" (resolved: ${connectionFile}) but no subc ` +
-          `connection file exists there. Start the Subconscious daemon, correct the path, ` +
-          `or remove subc.connection_file from your user config to use the standalone bridge.`,
-      );
+      throw new Error(missing);
     }
     return new SubcTransportPool({
       connectionFile,
