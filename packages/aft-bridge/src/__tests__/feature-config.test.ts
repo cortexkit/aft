@@ -65,6 +65,10 @@ describe("feature-config policy", () => {
     expect(out.warnings.map((warning) => warning.code)).toContain(
       "legacy_runtime_gate_requires_fix",
     );
+    const gateWarning = out.warnings.find(
+      (warning) => warning.code === "legacy_runtime_gate_requires_fix",
+    );
+    expect(gateWarning?.message).toContain("run `npx @cortexkit/aft doctor --fix`");
 
     const explicit: Record<string, unknown> = { hoist_builtin_tools: false, disabled_tools: [] };
     translateConfigDocument(explicit, "window", "user");
@@ -170,9 +174,12 @@ describe("migration notice delivery", () => {
 });
 
 describe("semantic cost notice", () => {
-  test("uses the exact spec text", () => {
+  test("uses the spec text, with commands a plugin user can run", () => {
+    // The spec's wording, but `aft setup` / `aft doctor --fix` become the npx
+    // form: the notice reaches users through the plugin, and a plugin user has
+    // no `aft` command on PATH.
     expect(SEMANTIC_COST_NOTICE).toBe(
-      "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run aft setup to change indexes.semantic; if legacy configuration is rejected, run aft doctor --fix first.",
+      "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic; if legacy configuration is rejected, run npx @cortexkit/aft doctor --fix first.",
     );
   });
 

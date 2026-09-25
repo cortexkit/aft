@@ -42,6 +42,21 @@ export function pinnedPluginEntry(version: string): string {
   return `${AFT_OPENCODE_PACKAGE}@${version}`;
 }
 
+const EXACT_VERSION =
+  /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/**
+ * `@latest` or an exact version: the OpenCode 1 registrations doctor does not
+ * report as a problem, because the host loads them correctly. `doctor --fix`
+ * and setup still rewrite them to this CLI's exact version (the exact-pin
+ * rule); only an entry with no version at all is reported.
+ */
+export function acceptV1Entry(entry: string): boolean {
+  if (!entry.startsWith(`${AFT_OPENCODE_PACKAGE}@`)) return false;
+  const tag = entry.slice(AFT_OPENCODE_PACKAGE.length + 1);
+  return tag === "latest" || EXACT_VERSION.test(tag);
+}
+
 export function isAftNpmEntry(entry: unknown): entry is string {
   return (
     typeof entry === "string" &&

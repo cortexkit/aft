@@ -17,6 +17,7 @@ import {
   npmInvocation,
   npmSpawnEnv,
   type ResolvedNpm,
+  resolveCortexKitUserConfigPath,
   resolveNpm,
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
@@ -26,7 +27,7 @@ import type { HarnessAdapter } from "../adapters/types.js";
 import { diagnoseOpenCodeLoad } from "../doctor/opencode.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
-import { type BinaryDownloader, obtainAftBinary } from "../lib/binary-install.js";
+import { type BinaryDownloader, cachedBinaryFor, obtainAftBinary } from "../lib/binary-install.js";
 import { findAftBinary, missingAftBinaryMessage, probeAftBinary } from "../lib/binary-probe.js";
 import { buildRecentAftToolFailuresSectionFromLog } from "../lib/bridge-tool-failures.js";
 import {
@@ -36,6 +37,14 @@ import {
 } from "../lib/build-breaker.js";
 import { CLI } from "../lib/cli.js";
 import { installCliLogger } from "../lib/cli-logger.js";
+import {
+  type ConfigMigrationTarget,
+  configMigrationTargets,
+  describeConfigChange,
+  diffConfig,
+  previewConfigMigration,
+  readPlainConfig,
+} from "../lib/config-migration.js";
 import {
   collectDiagnosticIssues,
   collectDiagnostics,
@@ -70,6 +79,7 @@ import {
 } from "../lib/jsonc.js";
 import { type ClearResult, clearLspCaches } from "../lib/lsp-cache.js";
 import { findOnnxFixCandidates, runOnnxFix } from "../lib/onnx-fix.js";
+import { getAftBinaryCacheDir } from "../lib/paths.js";
 import { confirm, intro, log, note, outro, selectMany, selectOne, text } from "../lib/prompts.js";
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
@@ -272,10 +282,9 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
           logPath: opencodeHarness.logFile.path,
           pluginCachePath: opencodeHarness.pluginCache.path,
           cachedPluginVersion: opencodeHarness.pluginCache.cached,
-          expectedPluginEntry:
-            hostDetection.status === "v1"
-              ? `${opencodeAdapter.pluginPackageName}@latest`
-              : opencodeAdapter.pluginEntryWithVersion,
+          // The entry doctor --fix writes. OpenCode 1 also accepts `@latest`
+          // or any exact version the user chose, and --fix leaves those alone.
+          expectedPluginEntry: opencodeAdapter.pluginEntryWithVersion,
           acceptExplicitPluginVersion: hostDetection.status === "v1",
         })
       : null;
@@ -348,7 +357,14 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
     }
-    log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
+    const blockers = h.pluginLoad?.blockers ?? [];
+    if (h.pluginRegistered && blockers.length > 0) {
+      // Registered is not loaded: the plugin aborts at startup on these, and
+      // the host then runs with no AFT tools. The issues list below has the fix.
+      log.error("  plugin registered: yes, but it will not load (see Issues found)");
+    } else {
+      log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
+    }
     log.info(
       `  plugin version: ${h.kind === "opencode" ? (opencodeDoctor?.pluginVersion ?? h.pluginCache.cached ?? "not installed") : (h.pluginCache.cached ?? "not installed")}`,
     );
@@ -402,7 +418,12 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       }
       log.info(`  onnx runtime: ${parts.join(" · ")}`);
     } else {
-      log.info("  onnx runtime: not required (semantic search disabled; ignoring ONNX status)");
+      const load = h.pluginLoad;
+      const why =
+        load?.semanticIndex && load.semanticBackend !== "fastembed"
+          ? `the semantic backend is ${load.semanticBackend}, a remote embedding service`
+          : "the semantic index is off";
+      log.info(`  onnx runtime: not required (${why})`);
     }
 
     log.info(
@@ -741,7 +762,7 @@ export function clearOldBinaries(): BinaryCacheClearResult {
 }
 
 export interface DoctorFixPlanItem {
-  kind: "plugin" | "plugin-update" | "binary" | "onnx" | "storage" | "schema";
+  kind: "plugin" | "plugin-update" | "binary" | "onnx" | "storage" | "schema" | "config";
   message: string;
 }
 
@@ -987,12 +1008,25 @@ export function buildDoctorFixPlan(
   });
   if (!report.binaryVersion && hasEnabledHarness) {
     const skews = findPluginCliVersionSkews(report);
+    const cached = cachedBinaryFor(report.cliVersion);
     items.push({
       kind: "binary",
       message:
         skews.length > 0
           ? `Will ask before caching CLI v${report.cliVersion} because the installed plugin will not use it until updated`
-          : `Will download/cache the aft binary matching CLI v${report.cliVersion}`,
+          : cached
+            ? `Will check the cached aft binary at ${cached} (it did not answer the quick version check) and download v${report.cliVersion} only if it is not that version`
+            : `Will download the aft binary v${report.cliVersion} into ${getAftBinaryCacheDir()}`,
+    });
+  }
+
+  for (const preview of previewConfigMigration(configMigrationTargets(userAftConfigPath(report)))) {
+    items.push({
+      kind: "config",
+      message: [
+        `Will migrate retired keys in the ${preview.tier} config ${preview.path}:`,
+        ...preview.changes.map((change) => `    ${describeConfigChange(change)}`),
+      ].join("\n"),
     });
   }
 
@@ -1027,6 +1061,11 @@ export function buildDoctorFixPlan(
   }
 
   return items;
+}
+
+/** The shared user AFT config every harness reads (the same path for all of them). */
+function userAftConfigPath(report: DiagnosticReport): string {
+  return report.harnesses[0]?.configPaths.aftConfig ?? resolveCortexKitUserConfigPath();
 }
 
 export function shouldSkipDoctorFixConfirmation(argv: string[]): boolean {
@@ -1146,6 +1185,7 @@ async function runFixFlow(
   // the cache (so it's idempotent if the binary was downloaded concurrently
   // by another OpenCode session) and only hits the network when needed.
   let binaryDownloaded = false;
+  let binaryVerified = false;
   let binaryDownloadSkipped = false;
   let binaryDownloadError: string | null = null;
   if (!report.binaryVersion) {
@@ -1154,11 +1194,21 @@ async function runFixFlow(
       binaryDownloadSkipped = true;
       skipped.push("aft binary download (declined because the installed plugin would not use it)");
     } else {
-      log.info(`Downloading the AFT binary v${report.cliVersion}…`);
+      const cached = cachedBinaryFor(report.cliVersion);
+      log.info(
+        cached
+          ? `Checking the cached AFT binary at ${cached}…`
+          : `Downloading the AFT binary v${report.cliVersion}…`,
+      );
       const obtained = await obtainAftBinary(report.cliVersion, downloadBinaryFn);
       if (obtained.ok) {
-        log.success(`AFT binary installed at ${obtained.path}`);
-        binaryDownloaded = true;
+        log.success(
+          obtained.path === cached
+            ? `The cached AFT binary at ${obtained.path} is v${report.cliVersion}; nothing to download.`
+            : `AFT binary installed at ${obtained.path}`,
+        );
+        binaryDownloaded = obtained.path !== cached;
+        binaryVerified = obtained.path === cached;
       } else {
         log.error(`AFT binary download failed: ${obtained.message}`);
         binaryDownloadError = obtained.message;
@@ -1171,7 +1221,11 @@ async function runFixFlow(
 
   // Rewrite retired config keys to their canonical replacements. This is the
   // only path allowed to repair configuration that ordinary loading rejects.
-  const configSummary = applyConfigMigration(runNativeFn, binaryDownloadError !== null);
+  const configSummary = applyConfigMigration(
+    runNativeFn,
+    binaryDownloadError !== null,
+    configMigrationTargets(userAftConfigPath(report)),
+  );
 
   const applied: string[] = [];
   if (pluginEntrySummary.changed > 0) applied.push("plugin registration");
@@ -1180,6 +1234,7 @@ async function runFixFlow(
   if (schemaSummary.changed > 0) applied.push("AFT config $schema");
   if (configSummary.changed > 0) applied.push("AFT config migration");
   if (binaryDownloaded) applied.push("aft binary download");
+  if (binaryVerified) applied.push("cached aft binary verified");
   if ((onnxResult?.installed ?? 0) > 0) applied.push("ONNX Runtime install");
 
   // Decide outro state based on combined results. We can have any
@@ -1189,6 +1244,7 @@ async function runFixFlow(
   const nothingAttempted =
     onnxResult === null &&
     !binaryDownloaded &&
+    !binaryVerified &&
     !binaryDownloadSkipped &&
     !binaryDownloadError &&
     storageSummary.created === 0 &&
@@ -1276,7 +1332,10 @@ function logFeatureStatus(argv: string[], run: NativeRunner = runNative): boolea
 function applyConfigMigration(
   run: NativeRunner,
   binaryDownloadFailed = false,
+  targets: ConfigMigrationTarget[] = [],
 ): { changed: number; errors: number } {
+  // Snapshot each file first so the report can say exactly what changed.
+  const before = new Map(targets.map((target) => [target.path, readPlainConfig(target.path)]));
   const result = runConfigFix(run);
   if (!result.ok) {
     if (result.missingBinary) {
@@ -1295,7 +1354,15 @@ function applyConfigMigration(
   for (const file of result.files) {
     if (file.status === "rewritten") {
       changed += 1;
-      log.success(`Migrated ${file.tier} config ${file.path}`);
+      const previous = before.get(file.path);
+      const current = readPlainConfig(file.path);
+      const changes = previous && current ? diffConfig(previous, current) : [];
+      log.success(
+        [
+          `Migrated ${file.tier} config ${file.path}${changes.length > 0 ? ":" : ""}`,
+          ...changes.map((change) => `  ${describeConfigChange(change)}`),
+        ].join("\n"),
+      );
       // Only a successfully rewritten file loses its delivered-notice records,
       // so its next notice (if any still applies) is delivered afresh.
       try {

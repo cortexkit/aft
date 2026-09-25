@@ -1,6 +1,29 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { CLI } from "./cli.js";
 import { captureBridgeLog } from "./cli-logger.js";
 import { formatFsError, isPermissionError } from "./fs-errors.js";
+import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
+
+/**
+ * The binary already sitting in the versioned cache for `version`, if any.
+ *
+ * A file here is not proof of a usable binary: the quick version probe can
+ * time out on the first run of a freshly copied binary (macOS assesses every
+ * new executable, which has taken seconds), and an entry written before
+ * identity sidecars existed is only trusted after it is asked its version.
+ * Callers use this to say "checking the cached binary" rather than "not
+ * found, downloading" when the downloader will in fact reuse the file.
+ */
+export function cachedBinaryFor(version: string): string | null {
+  const tag = version.startsWith("v") ? version : `v${version}`;
+  const path = join(getAftBinaryCacheDir(), tag, getAftBinaryName());
+  try {
+    return existsSync(path) ? path : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Obtain the native binary matching this CLI. Setup and `doctor --fix` both

@@ -139,13 +139,24 @@ function nonSchemaMessages(plan: DoctorFixPlanItem[]): string[] {
 describe("doctor --fix planning", () => {
   test("lists plugin and binary mutations before applying fixes", () => {
     const report = makeReport([makeHarness({ pluginRegistered: false })], null);
+    // An empty cache, so the plan cannot depend on binaries on this machine.
+    const saved = process.env.AFT_CACHE_DIR;
+    const cacheDir = mkdtempSync(join(tmpdir(), "aft-doctor-plan-cache-"));
+    process.env.AFT_CACHE_DIR = cacheDir;
+    try {
+      const plan = buildDoctorFixPlan([makeAdapter()], report);
 
-    const plan = buildDoctorFixPlan([makeAdapter()], report);
-
-    expect(nonSchemaMessages(plan)).toEqual([
-      "Will add @cortexkit/aft-opencode@latest to /tmp/aft-test/opencode.jsonc",
-      "Will download/cache the aft binary matching CLI v0.30.1",
-    ]);
+      // The binary line now says where it will download to (and, when a
+      // cached binary exists, that it only checks it); it used to read
+      // "Will download/cache the aft binary matching CLI v…".
+      expect(nonSchemaMessages(plan)).toEqual([
+        "Will add @cortexkit/aft-opencode@latest to /tmp/aft-test/opencode.jsonc",
+        `Will download the aft binary v0.30.1 into ${join(cacheDir, "bin")}`,
+      ]);
+    } finally {
+      if (saved === undefined) delete process.env.AFT_CACHE_DIR;
+      else process.env.AFT_CACHE_DIR = saved;
+    }
   });
 
   test("does not plan binary or plugin updates for a disabled registered harness", () => {

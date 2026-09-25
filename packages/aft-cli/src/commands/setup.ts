@@ -38,7 +38,7 @@ export async function runSetup(argv: string[], options: SetupOptions = {}): Prom
 
   const adapters = await (options.resolveAdapters ?? resolveAdaptersForCommand)(argv, {
     allowMulti: true,
-    verb: "setup",
+    verb: "set up",
   });
 
   let anyFailure = false;

@@ -31,6 +31,11 @@ import {
   REQUIRED_ORT_MAJOR,
   REQUIRED_ORT_MIN_MINOR,
 } from "./onnx.js";
+import {
+  evaluatePluginLoad,
+  type PluginLoadBlockerCode,
+  type PluginLoadEvaluation,
+} from "./plugin-load.js";
 import { sanitizeValue } from "./sanitize.js";
 import { getSelfVersion } from "./self-version.js";
 
@@ -59,7 +64,8 @@ export interface DiagnosticIssue {
     | "config_parse_error"
     | "plugin_cli_version_skew"
     | "onnx_missing"
-    | "onnx_incompatible";
+    | "onnx_incompatible"
+    | PluginLoadBlockerCode;
   severity: DiagnosticIssueSeverity;
   scope: string;
   message: string;
@@ -115,6 +121,12 @@ export interface HarnessDiagnostic {
     exists: boolean;
     sizeKb: number;
   };
+  /**
+   * What the plugin will do with this config at startup: the conditions that
+   * stop it from loading at all, and the effective semantic backend. Optional
+   * so hand-built reports (tests, older callers) still type-check.
+   */
+  pluginLoad?: PluginLoadEvaluation;
 }
 
 export async function collectDiagnostics(adapters: HarnessAdapter[]): Promise<DiagnosticReport> {
@@ -187,11 +199,16 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       : {};
   const legacyDuplication = summarizeLegacyPartitionDuplication(storage);
 
-  const semanticEnabled =
-    aftEnabled &&
-    ((aftConfigRead.value as Record<string, unknown> | null)?.semantic_search === true ||
-      (aftConfigRead.value as Record<string, unknown> | null)?.experimental_semantic_search ===
-        true);
+  // ONNX Runtime is needed only when the semantic index is on AND the
+  // effective backend is the local one; a remote embedding backend
+  // (openai_compatible, ollama, ...) downloads nothing.
+  const pluginLoad = evaluatePluginLoad({
+    userConfigPath: configPaths.aftConfig,
+    projectDirectory: process.cwd(),
+    harness: adapter.kind === "opencode" ? "opencode" : "pi",
+    pluginVersion: pluginCache.cached ?? getSelfVersion(),
+  });
+  const semanticEnabled = aftEnabled && pluginLoad.onnxRequired;
 
   const systemInspection = inspectSystemOnnxRuntime();
   const systemOrtDir = systemInspection.path;
@@ -252,6 +269,7 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       exists: existsSync(logPath),
       sizeKb: existsSync(logPath) ? Math.round(statSync(logPath).size / 1024) : 0,
     },
+    pluginLoad,
   };
 }
 
@@ -434,7 +452,19 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
       });
     }
 
-    if (h.aftConfig.parseError) {
+    // Conditions that stop the plugin from loading at all. They are HIGH: the
+    // host starts, but the model gets no AFT tools and nothing else says why.
+    for (const blocker of h.pluginLoad?.blockers ?? []) {
+      issues.push({
+        code: blocker.code,
+        severity: "high",
+        scope: h.displayName,
+        message: blocker.message,
+        remediation: blocker.remediation,
+      });
+    }
+
+    if (h.aftConfig.parseError && !h.pluginLoad) {
       issues.push({
         code: "config_parse_error",
         severity: "high",

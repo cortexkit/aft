@@ -2,10 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { CLI } from "../lib/cli.js";
 import { readJsoncFile } from "../lib/jsonc.js";
 import type { OpenCodeHostDetection, OpenCodeHostRuntime } from "../setup/host-generation.js";
 import {
   AFT_OPENCODE_PACKAGE,
+  acceptV1Entry,
   isAftNpmEntry,
   type OpenCodeConfigGeneration,
   type OpenCodePluginKey,
@@ -146,14 +148,17 @@ function pluginManifest(entry: string | null, cachePath: string): PluginManifest
   );
 }
 
-function hasExplicitSemver(entry: string): boolean {
-  const version = configuredVersion(entry);
-  return Boolean(
-    version &&
-      /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
-        version,
-      ),
-  );
+/**
+ * The problem line for an entry `doctor --fix` would rewrite. It names the
+ * entry --fix writes, so the report and the fix always agree.
+ */
+export function pinProblem(entry: string, pinned: string): string {
+  const version = pinned.slice(pinned.lastIndexOf("@") + 1);
+  const current =
+    entry === AFT_OPENCODE_PACKAGE
+      ? "has no version"
+      : `is ${entry.slice(entry.lastIndexOf("@") + 1)}`;
+  return `the plugin entry ${entry} ${current}; run \`${CLI} doctor --fix\` to pin it to ${pinned}, the version this CLI and its binary belong to, so the plugin only changes version when you update AFT (v${version})`;
 }
 
 function latestLoggedLoadPath(logPath: string): OpenCodeLoadPath | null {
@@ -215,11 +220,9 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     isAftNpmEntry(entry) &&
     input.expectedPluginEntry &&
     entry !== input.expectedPluginEntry &&
-    !(input.acceptExplicitPluginVersion && hasExplicitSemver(entry))
+    !(input.acceptExplicitPluginVersion && acceptV1Entry(entry))
   ) {
-    problems.push(
-      `plugin entry ${entry} is not the required exact pin ${input.expectedPluginEntry}`,
-    );
+    problems.push(pinProblem(entry, input.expectedPluginEntry));
   }
   if (generation === "ambiguous") {
     problems.push(

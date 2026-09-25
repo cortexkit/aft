@@ -740,7 +740,7 @@ describe("OpenCode doctor generation and load path", () => {
     expect(code).toBe(0);
     expect(output).toContain("host generation: V1");
     expect(output).toContain("load path: root-default");
-    expect(output).not.toContain("required exact pin");
+    expect(output).not.toContain("to pin it to");
   });
 
   test("reports every plan feature, and a rejected config as a problem", async () => {
@@ -850,7 +850,9 @@ describe("OpenCode doctor generation and load path", () => {
     const output = lines.join("\n");
     expect(code).toBe(1);
     expect(output).toContain(
-      `plugin entry ${AFT_OPENCODE_PACKAGE}@latest is not the required exact pin ${pinnedPluginEntry(getSelfVersion())}`,
+      // Reworded for users: the line now names the exact entry doctor --fix
+      // writes and why, instead of "is not the required exact pin".
+      `the plugin entry ${AFT_OPENCODE_PACKAGE}@latest is latest; run \`npx @cortexkit/aft doctor --fix\` to pin it to ${pinnedPluginEntry(getSelfVersion())}`,
     );
   });
 

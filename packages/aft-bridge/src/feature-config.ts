@@ -389,7 +389,7 @@ function translateBlock(
     out.warnings.push({
       code: "legacy_runtime_gate_requires_fix",
       key: blockLabel,
-      message: `${gates.join(", ")} still removes tool registrations during this release only; run \`aft doctor --fix\` to record the choice in disabled_tools`,
+      message: `${gates.join(", ")} still removes tool registrations during this release only; run \`npx @cortexkit/aft doctor --fix\` to record the choice in disabled_tools`,
     });
   }
 }
@@ -580,10 +580,12 @@ export function noticeDigest(projection: unknown): string {
 
 /**
  * One-time notice shown when the semantic index is on only because indexes now
- * default on. The text is fixed by the feature-config spec.
+ * default on. The text follows the feature-config spec, except that commands
+ * are spelled as `npx @cortexkit/aft …`: users reach this notice through the
+ * plugin, with no `aft` command on their PATH.
  */
 export const SEMANTIC_COST_NOTICE =
-  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run aft setup to change indexes.semantic; if legacy configuration is rejected, run aft doctor --fix first.";
+  "AFT indexes now default on; the local semantic backend may download an ONNX runtime and model and use CPU. Run npx @cortexkit/aft setup to change indexes.semantic; if legacy configuration is rejected, run npx @cortexkit/aft doctor --fix first.";
 
 /**
  * Identity of the semantic cost notice. It is a constant rather than a digest

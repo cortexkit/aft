@@ -261,7 +261,7 @@ function findCachedOnnxRuntime(ortVersionDir: string, libName: string): string |
           error(
             `ONNX Runtime at ${resolvedOrtDir}: TOFU sha256 mismatch — refusing to use ` +
               `tampered binary. Recorded ${meta.sha256}, current ${currentHash}. ` +
-              `Run \`aft doctor --clear\` to re-download from scratch.`,
+              `Run \`npx @cortexkit/aft doctor --clear\` to re-download from scratch.`,
           );
           // Fall through to system path / re-download attempt below.
         } else {

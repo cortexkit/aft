@@ -1,6 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import {
+  assign as assignJsonc,
+  parse as parseJsonc,
+  stringify as stringifyJsonc,
+} from "comment-json";
 
 export type JsoncFormat = "json" | "jsonc" | "none";
 
@@ -101,10 +105,18 @@ export function ensureAftSchemaUrl(
     return { action: "unchanged", message: `$schema already present in ${path}` };
   }
 
-  // Mutate in place so comment-json preserves the comment associations on
-  // the existing object. Spreading into a fresh literal would drop them.
-  value.$schema = AFT_SCHEMA_URL;
-  writeJsoncFile(path, value, format === "none" ? "json" : format);
+  // `$schema` goes first: editors and readers expect it at the top, and an
+  // appended key ends up below the user's own settings. comment-json's
+  // `assign` copies every remaining key after it together with its comments
+  // (and the file's leading/trailing comments), so nothing the user wrote is
+  // lost. A plain spread would drop those comment associations.
+  const { $schema: _previous, ...rest } = value;
+  void _previous;
+  const reordered = assignJsonc({ $schema: AFT_SCHEMA_URL } as Record<string, unknown>, value, [
+    ...Object.keys(rest),
+  ]);
+  copyNonPropertyComments(value, reordered);
+  writeJsoncFile(path, reordered, format === "none" ? "json" : format);
 
   if (previous === undefined) {
     return {
@@ -116,4 +128,18 @@ export function ensureAftSchemaUrl(
     action: "updated",
     message: `updated $schema URL in ${path}`,
   };
+}
+
+/**
+ * comment-json keeps comments that are not attached to one key (before the
+ * opening brace, after the closing one, inside an empty object) under symbol
+ * keys such as `Symbol.for("before-all")`. `assign` with an explicit key list
+ * copies only per-key comments, so carry the rest across here.
+ */
+function copyNonPropertyComments(from: object, to: object): void {
+  for (const symbol of Object.getOwnPropertySymbols(from)) {
+    const name = symbol.description ?? "";
+    if (/^(before|after|after-prop|after-colon|after-value|after-comma):/.test(name)) continue;
+    (to as Record<symbol, unknown>)[symbol] = (from as Record<symbol, unknown>)[symbol];
+  }
 }
