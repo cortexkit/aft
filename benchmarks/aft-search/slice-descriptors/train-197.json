@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "frame-loop-stall-bash-mutex"
+  ],
+  "note": "Bash task state lock and aft.db write ordering; persisted GC coalescing. No ranking-fence file touched."
+}
