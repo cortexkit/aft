@@ -7010,7 +7010,8 @@ fn rebuild_cooldown_denial(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let record = records.get(&key)?;
-    if record.project_root == project_root || !record.cross_root_cooldown_armed {
+    if same_workspace_root(&record.project_root, project_root) || !record.cross_root_cooldown_armed
+    {
         return None;
     }
     let elapsed = now.saturating_duration_since(record.published_at);
@@ -7033,7 +7034,8 @@ fn record_successful_rebuild(
         }
     }
     let cross_root_cooldown_armed = records.get(&key).is_some_and(|previous| {
-        previous.cross_root_cooldown_armed || previous.project_root != project_root
+        previous.cross_root_cooldown_armed
+            || !same_workspace_root(&previous.project_root, project_root)
     });
     records.insert(
         key,
@@ -8704,7 +8706,11 @@ fn reconcile_workspace_roots(
     }
 
     for stored_root in roots.iter() {
-        if stored_root == &current_root {
+        // A stored root that is only another spelling of the opener's directory
+        // is not a second clone: the relative rows describe this very tree, so
+        // the in-place rewrite below is safe and a rebuild would be wasted.
+        if stored_root == &current_root || same_workspace_root(Path::new(stored_root), project_root)
+        {
             continue;
         }
         if Path::new(stored_root).exists() {
@@ -8749,6 +8755,24 @@ fn reconcile_workspace_roots(
         current_root
     );
     Ok(OpenRootRepair::ReRooted)
+}
+
+/// Whether two workspace-root spellings name the same directory on disk.
+///
+/// One checkout reaches the store under several spellings: on Windows as
+/// `C:\x`, as the verbatim `\\?\C:\x` that `std::fs::canonicalize` returns,
+/// or through an 8.3 short name; on macOS as `/var/...` and `/private/var/...`.
+/// Comparing the strings alone reads those as two live clones sharing one cache
+/// key, which forces a rebuild and then arms the cross-root rebuild cooldown
+/// against the very same directory, leaving the callgraph unavailable.
+fn same_workspace_root(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn stored_workspace_roots(conn: &Connection) -> Result<Vec<String>> {
@@ -18396,6 +18420,105 @@ mod cold_build_insert_tests {
         assert_eq!(
             stored_workspace_roots(&conn).unwrap(),
             vec![previous_root.display().to_string()]
+        );
+    }
+
+    /// Store `current_root`'s rows under `stored_spelling`, then open with
+    /// `current_root`: a different spelling of the same live directory must be
+    /// rewritten in place, not refused as a concurrent clone.
+    fn assert_respelled_root_is_rerooted_in_place(stored_spelling: &Path, current_root: &Path) {
+        assert_ne!(
+            stored_spelling.display().to_string(),
+            current_root.display().to_string(),
+            "fixture must store a different spelling of the root"
+        );
+        let mut conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO backend_file_state(
+                backend, workspace_root, file_path, content_hash, status, updated_at
+             ) VALUES ('rust', ?1, 'src/main.rs', 'hash', 'ready', 1)",
+            params![stored_spelling.display().to_string()],
+        )
+        .unwrap();
+
+        let repair = reconcile_workspace_roots(&mut conn, current_root, true).unwrap();
+
+        assert!(
+            matches!(repair, OpenRootRepair::ReRooted),
+            "respelled root must re-root in place, got {repair:?}"
+        );
+        assert_eq!(
+            stored_workspace_roots(&conn).unwrap(),
+            vec![current_root.display().to_string()]
+        );
+    }
+
+    #[test]
+    fn respelled_live_root_is_rerooted_in_place_not_rebuilt_as_a_clone() {
+        let dir = tempdir().unwrap();
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(current_root.join("nested")).unwrap();
+        assert_respelled_root_is_rerooted_in_place(
+            &current_root.join("nested").join(".."),
+            &current_root,
+        );
+    }
+
+    /// The Windows shape: one opener passes the plain `C:\...` root, another
+    /// the verbatim `\\?\C:\...` spelling that `std::fs::canonicalize` returns.
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_windows_root_spelling_is_rerooted_in_place() {
+        let dir = tempdir().unwrap();
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(&current_root).unwrap();
+        let verbatim = fs::canonicalize(&current_root).unwrap();
+        assert!(verbatim.display().to_string().starts_with(r"\\?\"));
+        assert_respelled_root_is_rerooted_in_place(&verbatim, &current_root);
+    }
+
+    #[test]
+    fn rebuild_cooldown_does_not_arm_against_a_respelling_of_the_same_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("owner");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        let respelled = root.join("nested").join("..");
+        let callgraph_dir = dir.path().join("callgraph");
+        let project_key = "respelled-root-cooldown";
+
+        let other_root = dir.path().join("other-clone");
+        fs::create_dir_all(&other_root).unwrap();
+        let cooldown_key = rebuild_cooldown_key(&callgraph_dir, project_key);
+        let armed = || {
+            rebuild_cooldown_records()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&cooldown_key)
+                .expect("cooldown record")
+                .cross_root_cooldown_armed
+        };
+
+        // Two publications for one directory under two spellings are not a
+        // second clone, so they must not arm the cross-root cooldown.
+        record_successful_rebuild(&callgraph_dir, project_key, &root, Instant::now());
+        record_successful_rebuild(&callgraph_dir, project_key, &respelled, Instant::now());
+        assert!(!armed(), "a respelled root must not arm the cooldown");
+
+        // Once a genuinely different clone has armed it, an opener that only
+        // respells the last publisher's root must still not be refused.
+        record_successful_rebuild(&callgraph_dir, project_key, &other_root, Instant::now());
+        record_successful_rebuild(&callgraph_dir, project_key, &root, Instant::now());
+        assert!(armed(), "a different clone arms the cooldown");
+        assert!(
+            rebuild_cooldown_denial(&callgraph_dir, project_key, &respelled, Instant::now())
+                .is_none(),
+            "a respelled root must not be refused by the cross-root cooldown"
+        );
+        assert!(
+            rebuild_cooldown_denial(&callgraph_dir, project_key, &other_root, Instant::now())
+                .is_some(),
+            "a genuinely different clone is still refused"
         );
     }
 
