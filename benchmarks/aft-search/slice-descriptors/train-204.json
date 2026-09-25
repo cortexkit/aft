@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "callgraph-reconcile-instead-of-forced-rebuild"
+  ],
+  "note": "The only ranking-fence file touched is crates/aft/src/lib.rs, which declares the new callgraph_maintenance module. The change replaces forced callgraph rebuilds after manifest edits and watcher overflows with targeted refreshes; no search, ranking, fusion, lane or truncation code changed, and the parity fixture file is untouched, so ranked rows should be byte-equal to the reference."
+}
