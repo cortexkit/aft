@@ -212,8 +212,12 @@ fn ensure_callgraph_store_ready(ctx: &AppContext) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match ctx.callgraph_store_for_ops() {
-            CallgraphStoreAccess::Ready(_) => return,
-            CallgraphStoreAccess::Building => {
+            // A published store is served while its build is still settling,
+            // and Tier-2 dispatch waits for that build to finish. These tests
+            // start from a finished build, so keep draining until the build's
+            // completion has been adopted.
+            CallgraphStoreAccess::Ready(_) if !ctx.callgraph_cold_build_active() => return,
+            CallgraphStoreAccess::Ready(_) | CallgraphStoreAccess::Building => {
                 drain_callgraph_store_for_test(ctx);
                 assert!(
                     Instant::now() < deadline,
