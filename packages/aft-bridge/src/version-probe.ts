@@ -9,7 +9,10 @@
  * while the host's event loop keeps serving, and the caller awaits the result.
  *
  * The worker source is passed inline (`eval: true`) so bundled plugin builds
- * do not need a separate worker file on disk.
+ * do not need a separate worker file on disk. That inline source cannot import
+ * the shared `./child-process.js` wrappers, so it sets `windowsHide: true`
+ * itself: without it a host running with no console (a Windows background
+ * service) gets a visible console window for every probe.
  */
 
 import { Worker } from "node:worker_threads";
@@ -30,6 +33,7 @@ try {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: workerData.timeoutMs,
+    windowsHide: true,
   });
   message = { stdout: result.stdout || "", stderr: result.stderr || "" };
 } catch (err) {

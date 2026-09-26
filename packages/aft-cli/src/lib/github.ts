@@ -1,4 +1,4 @@
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "@cortexkit/aft-bridge";
 
 export function isGhInstalled(): boolean {
   try {

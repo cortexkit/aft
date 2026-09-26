@@ -11,7 +11,6 @@
  * Cache dir respects XDG_CACHE_HOME on Linux/macOS and LOCALAPPDATA on Windows.
  */
 
-import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
@@ -41,6 +40,7 @@ import {
   writeBinaryIdentitySidecar,
 } from "./binary-identity.js";
 import { getAftBinaryCacheDir } from "./cache-paths.js";
+import { spawnSync } from "./child-process.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "./platform.js";
 import { parseAftVersionOutput, readBinaryVersionOffThread } from "./version-probe.js";
 

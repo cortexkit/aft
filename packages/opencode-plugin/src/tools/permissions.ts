@@ -1,7 +1,7 @@
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
 import { sendIgnoredMessage } from "../shared/ignored-message.js";

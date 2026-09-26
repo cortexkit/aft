@@ -30,7 +30,6 @@
  *   brew install onnxruntime
  */
 
-import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -56,6 +55,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "n
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import { execFileSync } from "./child-process.js";
 import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 import { withPathPrepended } from "./path-env.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";

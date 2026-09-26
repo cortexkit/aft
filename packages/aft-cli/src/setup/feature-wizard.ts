@@ -1,5 +1,4 @@
-import { spawnSync } from "node:child_process";
-import { resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
+import { resolveCortexKitUserConfigPath, spawnSync } from "@cortexkit/aft-bridge";
 import { CLI } from "../lib/cli.js";
 import {
   explicitHarness,

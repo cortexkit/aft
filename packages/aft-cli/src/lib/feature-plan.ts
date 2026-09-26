@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "@cortexkit/aft-bridge";
 import { findAftBinary } from "./binary-probe.js";
 import { CLI } from "./cli.js";
 

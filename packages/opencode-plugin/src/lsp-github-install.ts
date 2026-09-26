@@ -29,7 +29,6 @@
  *   specific pinned tag valid".
  */
 
-import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   copyFileSync,
@@ -52,6 +51,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
+  execFileSync,
   execTarExtractionSync,
   getAftLspBinariesDir,
   windowsTarExecutable,

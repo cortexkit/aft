@@ -1,9 +1,13 @@
-import { execSync, spawnSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { compareSemver, isNativeExecutable } from "@cortexkit/aft-bridge";
+import {
+  compareSemver,
+  findExecutablesOnPath,
+  isNativeExecutable,
+  spawnSync,
+} from "@cortexkit/aft-bridge";
 import { CLI } from "./cli.js";
 import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
 
@@ -285,28 +289,16 @@ function platformPackageLocation(): BinarySearchLocation {
 }
 
 function pathLocation(): BinarySearchLocation {
-  const lookup = process.platform === "win32" ? "where aft" : "which aft";
   const label = "PATH";
-  let hits: string[] = [];
-  try {
-    const resolved = execSync(lookup, {
-      stdio: "pipe",
-      encoding: "utf-8",
-      env: process.env,
-    }).trim();
-    hits = resolved
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-  } catch {
-    // ignore — PATH lookup is best-effort
-  }
+  // Searched in-process rather than through `which aft` / `where aft`, which
+  // cost a child process (and a console window on Windows) per lookup.
+  const hits = findExecutablesOnPath("aft");
 
   // Guard against self-resolution recursion: `aft` on PATH may be THIS CLI's
   // own node-script shim (npx prepends node_modules/.bin to PATH, and the
   // CLI's bin is named `aft`). Probing it with --version re-enters the CLI and
-  // fork-bombs. Only accept native executables. Iterate all lines so a real
-  // native binary after a `.cmd`/script shim (Windows `where`) is still found.
+  // fork-bombs. Only accept native executables. Check every hit so a real
+  // native binary after a `.cmd`/script shim on Windows is still found.
   const native = hits.filter((candidate) => isNativeExecutable(candidate));
   return {
     label,
@@ -314,7 +306,7 @@ function pathLocation(): BinarySearchLocation {
     emptyReason:
       hits.length > 0
         ? `only non-native \`aft\` entries on PATH (${hits.join(", ")}), skipped because running them would re-enter this CLI`
-        : `no \`aft\` on PATH (\`${lookup}\` found nothing)`,
+        : "no `aft` on PATH",
   };
 }
 

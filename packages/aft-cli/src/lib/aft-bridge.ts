@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn } from "@cortexkit/aft-bridge";
 import { CLI } from "./cli.js";
 
 export interface AftRequest {

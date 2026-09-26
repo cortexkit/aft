@@ -28,7 +28,6 @@
  *      avoids mid-session bridge restarts.
  */
 
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   createReadStream,
@@ -46,6 +45,7 @@ import {
   npmInvocation,
   npmSpawnEnv,
   resolveNpm,
+  spawn,
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";

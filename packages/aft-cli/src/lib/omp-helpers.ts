@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, extname, join, resolve } from "node:path";
+import { spawnSync } from "@cortexkit/aft-bridge";
 
 import { getOmpPackageDir } from "./omp-paths.js";
 

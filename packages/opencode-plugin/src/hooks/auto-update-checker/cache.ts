@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -6,6 +5,7 @@ import {
   npmInvocation,
   npmSpawnEnv,
   resolveNpm,
+  spawn,
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 import { parse as parseJsonc } from "comment-json";

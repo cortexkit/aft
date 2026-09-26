@@ -1,10 +1,9 @@
-import { type ChildProcess, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
 import { binaryContentHash, binaryStampKey, peekBinaryContentHash } from "./binary-identity.js";
+import { type ChildProcess, spawn } from "./child-process.js";
 import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
 import { withPathPrepended } from "./path-env.js";

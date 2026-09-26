@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { spawn } from "./child-process.js";
 import type { BashHostFallbackCause } from "./error-contract.js";
 import { withPathPrepended } from "./path-env.js";
 import { resolveCortexKitStorageRoot, resolveStoragePath } from "./storage-paths.js";

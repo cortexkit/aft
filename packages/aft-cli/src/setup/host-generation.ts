@@ -1,9 +1,6 @@
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  accessSync,
   closeSync,
-  constants,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -17,7 +14,11 @@ import {
   statSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join, parse, resolve } from "node:path";
+import { dirname, join, parse } from "node:path";
+import {
+  findExecutableOnPath as findSharedExecutableOnPath,
+  spawnSync,
+} from "@cortexkit/aft-bridge";
 
 import { MODERN_V1_VERSION } from "./opencode-config.js";
 
@@ -73,30 +74,12 @@ export interface V1VersionProbeOptions {
   ) => SpawnResult;
 }
 
-function executableNames(name: string, platform: NodeJS.Platform): string[] {
-  if (platform !== "win32") return [name];
-  return [name, `${name}.exe`, `${name}.cmd`, `${name}.bat`];
-}
-
 export function findExecutableOnPath(
   name: "opencode" | "opencode2",
   pathValue = process.env.PATH ?? "",
   platform: NodeJS.Platform = process.platform,
 ): string | null {
-  const pathDelimiter = platform === "win32" ? ";" : delimiter;
-  for (const directory of pathValue.split(pathDelimiter)) {
-    if (!directory) continue;
-    for (const candidateName of executableNames(name, platform)) {
-      const candidate = resolve(directory, candidateName);
-      try {
-        accessSync(candidate, platform === "win32" ? constants.F_OK : constants.X_OK);
-        if (statSync(candidate).isFile()) return candidate;
-      } catch {
-        // Keep looking through PATH.
-      }
-    }
-  }
-  return null;
+  return findSharedExecutableOnPath(name, { pathValue, platform });
 }
 
 function packageMetadataAt(path: string, expectedName: string): PackageMetadata | null {

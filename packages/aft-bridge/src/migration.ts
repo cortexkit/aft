@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -13,6 +12,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { spawnSync } from "./child-process.js";
 import { type LegacyAftConfigSource, resolveHarnessStoragePath } from "./paths.js";
 import { findBinary } from "./resolver.js";
 import { resolveCortexKitStorageRoot } from "./storage-paths.js";

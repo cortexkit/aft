@@ -1,4 +1,3 @@
-import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -19,6 +18,8 @@ import {
   type ResolvedNpm,
   resolveCortexKitUserConfigPath,
   resolveNpm,
+  spawn,
+  spawnSync,
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 

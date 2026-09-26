@@ -1,6 +1,6 @@
-import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { execFileSync } from "./child-process.js";
 
 interface TarResolverOptions {
   platform?: NodeJS.Platform;

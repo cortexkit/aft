@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve, sep } from "node:path";
+import { spawnSync } from "@cortexkit/aft-bridge";
 
 /**
  * Turn filesystem errors into one readable line for the setup and doctor UI.

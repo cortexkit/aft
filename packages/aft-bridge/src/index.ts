@@ -78,6 +78,17 @@ export {
 // --- aft_callgraph flat formatter (shared by both plugin hosts) ---
 export type { CallgraphFormatOptions, CallgraphTheme } from "./callgraph-format.js";
 export { formatCallgraphSections, PLAIN_CALLGRAPH_THEME } from "./callgraph-format.js";
+// --- child processes and PATH lookup: every spawn in the TypeScript packages
+// goes through these so Windows never opens a console window for a child ---
+export type {
+  ChildProcess,
+  ExecFileSyncOptions,
+  ExecSyncOptions,
+  SpawnOptions,
+  SpawnSyncOptions,
+  SpawnSyncReturns,
+} from "./child-process.js";
+export { execFileSync, execSync, spawn, spawnSync, withWindowsHidden } from "./child-process.js";
 export {
   coerceAliasedStringParam,
   coerceBoolean,
@@ -206,6 +217,11 @@ export {
   prepareCanonicalPathArguments,
 } from "./path-aliases.js";
 export { withPathPrepended } from "./path-env.js";
+export {
+  findExecutableOnPath,
+  findExecutablesOnPath,
+  type PathLookupOptions,
+} from "./path-lookup.js";
 export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
 export {
   decodeFileUrl,

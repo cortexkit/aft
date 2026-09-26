@@ -15,10 +15,11 @@
  * its bin directory; `npmSpawnEnv()` prepends that directory to PATH for the
  * spawn so npm can find its own node.
  */
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { type ChildProcess, spawn, spawnSync } from "./child-process.js";
 
 import { withPathPrepended } from "./path-env.js";
 
