@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
-"""Loopback-only OpenAI-compatible server for checked-in benchmark vectors."""
+"""Loopback-only OpenAI-compatible server for checked-in benchmark vectors.
+
+The server only ever answers with a stored vector. A text it has no vector for
+is refused with `vector_missing`, never approximated, so a chunking change
+shows up as a named fault instead of a silently different ranking. The one
+exception is capture: `capture_real_query_vectors.py` passes a `recorder` that
+embeds a missing text with the real model and stores the result.
+"""
 from __future__ import annotations
-import argparse, hashlib, json, math, sys
+import argparse, hashlib, json, sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, MutableMapping, Mapping, Optional
 
 from search_quality_lib import EVIDENCE_SHA, InputFault, ensure_loopback
+from vector_pack import read_pack
 
 
 def text_hash(text: str) -> str: return hashlib.sha256(text.encode()).hexdigest()
 def query_key(text: str, template: str) -> str: return f"query:{text_hash(text)}:{template}"
 def corpus_key(text: str, template: str) -> str: return f"corpus:{EVIDENCE_SHA}:{text_hash(text)}:{template}"
 
-def fixture_vector(text: str) -> list[float]:
-    raw = hashlib.sha256(text.encode()).digest()
-    values = [(raw[index] - 127.5) / 127.5 for index in range(8)]
-    norm = math.sqrt(sum(value * value for value in values))
-    return [round(value / norm, 8) for value in values]
+# Computes the real-model vector for one text. Only capture_real_query_vectors.py
+# passes one, to fill a new pack; the gate never does.
+Recorder = Callable[[str], list[float]]
 
 
 class Server(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], vectors: dict[str, list[float]], template: str, log: Path, *, record_missing: bool = False, query_texts: set[str] | None = None):
-        super().__init__(address, Handler); self.vectors=vectors; self.template=template; self.log=log; self.record_missing=record_missing; self.query_texts=query_texts or set()
+    def __init__(self, address: tuple[str, int], vectors: Mapping[str, list[float]], template: str, log: Path, *, recorder: Optional[Recorder] = None, query_texts: Optional[set[str]] = None):
+        if recorder is not None and not isinstance(vectors, MutableMapping):
+            raise InputFault("vector_capture_needs_mutable_store")
+        super().__init__(address, Handler); self.vectors=vectors; self.template=template; self.log=log; self.recorder=recorder; self.query_texts=query_texts or set()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None: pass
@@ -40,10 +48,11 @@ class Handler(BaseHTTPRequestHandler):
                 qkey=query_key(text,server.template); ckey=corpus_key(text,server.template)
                 key=qkey if qkey in server.vectors else ckey
                 if key not in server.vectors:
-                    if not server.record_missing:
+                    if server.recorder is None:
                         self._json(422,{"error":f"vector_missing:{qkey}|{ckey}"}); return
                     key = qkey if text in server.query_texts else ckey
-                    server.vectors[key] = fixture_vector(text)
+                    # Server.__init__ only accepts a recorder with a mutable store.
+                    server.vectors[key] = server.recorder(text)  # type: ignore[index]
                 vector=server.vectors[key]
                 if not vector or any(not isinstance(item,(int,float)) for item in vector): raise ValueError("vector")
                 output.append({"object":"embedding","index":index,"embedding":vector}); requests.append(key)
@@ -58,7 +67,7 @@ def main()->int:
     parser=argparse.ArgumentParser(); parser.add_argument("--vectors",required=True); parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=0); parser.add_argument("--log",required=True); parser.add_argument("--check-key")
     args=parser.parse_args()
     try:
-        ensure_loopback(args.host); pack=json.loads(Path(args.vectors).read_text()); template=str(pack["embed_template_version"]); vectors=pack["vectors"]
+        ensure_loopback(args.host); pack=read_pack(Path(args.vectors)); template=str(pack["embed_template_version"]); vectors=pack["vectors"]
         if args.check_key:
             if args.check_key not in vectors: raise InputFault(f"vector_missing:{args.check_key}")
             return 0

@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-import hashlib
 import json
-import math
 import re
 import subprocess
 import sys
@@ -117,28 +115,14 @@ def classify_queries(repo: Path, queries: list[str]) -> list[str]:
     return shapes
 
 
-def fixture_vector(text: str) -> list[float]:
-    raw = hashlib.sha256(text.encode()).digest()
-    values = [(raw[index] - 127.5) / 127.5 for index in range(8)]
-    norm = math.sqrt(sum(value * value for value in values))
-    return [round(value / norm, 8) for value in values]
+def vector_pack_binding(output: Path) -> str:
+    """Digest of the existing vector pack, or "unbound" before the first capture.
 
-
-def vector_pack(output: Path, contents: dict[str, str], queries: list[str]) -> str:
-    template = "aft-search-template-v1"
-    vectors: dict[str, list[float]] = {}
-    if output.is_file():
-        existing = json.loads(output.read_text())
-        if existing.get("pinned_sha") == EVIDENCE_SHA and existing.get("embed_template_version") == template:
-            vectors.update(existing.get("vectors", {}))
-    corpus_inputs = list(contents.values()) + ["semantic index fingerprint probe"]
-    vectors.update({
-        f"corpus:{EVIDENCE_SHA}:{hashlib.sha256(text.encode()).hexdigest()}:{template}": fixture_vector(text)
-        for text in corpus_inputs
-    })
-    vectors.update({f"query:{hashlib.sha256(query.encode()).hexdigest()}:{template}": fixture_vector(query) for query in queries})
-    output.write_bytes(canonical_json({"schema": "aft-search-vector-pack-v1", "pinned_sha": EVIDENCE_SHA, "embed_template_version": template, "model_id": "aft-search-fixture-v1", "vectors": vectors}))
-    return sha256_file(output)
+    Authoring never writes vectors. `capture_real_query_vectors.py` embeds what
+    AFT actually indexes with the real model and rebinds every row, and the
+    gate refuses a row whose binding does not match the pack on disk.
+    """
+    return sha256_file(output) if output.is_file() else "unbound"
 
 
 def query_tokens(query: str) -> set[str]:
@@ -162,9 +146,8 @@ def author(args: argparse.Namespace) -> dict[str, Any]:
     tree_digest, evidence_paths, evidence_contents = pinned_evidence(repo)
     label_ids = {row["episode_id"] for row in labels}
     plan = sample_plan(mechanisms, args.manifest_seed, label_ids)
-    selected_queries = [row["query"] for row in mechanisms if row["episode_id"] in set(plan["union_order"])]
     vector_path = Path(args.vector_output)
-    vector_digest = vector_pack(vector_path, evidence_contents, selected_queries)
+    vector_digest = vector_pack_binding(vector_path)
     pinned_by_id = dict(zip((row["episode_id"] for row in mechanisms), classify_queries(repo, [row["query"] for row in mechanisms])))
     source_by_id = {row["episode_id"]: row for row in mechanisms}
     label_by_id = {row["episode_id"]: row for row in labels}
@@ -234,7 +217,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--expected-digests", required=True)
     result.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[2]))
     result.add_argument("--manifest-seed", default="20260908")
-    result.add_argument("--vector-output", default=str(Path(__file__).resolve().parent / "real-query-vectors.json"))
+    result.add_argument("--vector-output", default=str(Path(__file__).resolve().parent / "real-query-vectors.bin"))
     result.add_argument("--output", required=True)
     result.add_argument("--plan-output")
     return result

@@ -24,9 +24,9 @@ Sources:
 - real-query: the 43 included rows of real-query-manifest.json, on the
   gate's pinned evidence tree. With the default `pack` backend the replay uses
   the gate's own vector pack and fixture embedding server, so ranks match the
-  gate; those vectors are hash-derived stand-ins, not semantic, so semantic
-  ranks in that mode say nothing about semantic relevance. `--real-query-backend
-  local` (or `both`) replays the same rows with the live local model.
+  gate; those are stored all-MiniLM-L6-v2 vectors, the same model the local
+  backend runs. `--real-query-backend local` (or `both`) replays the same rows
+  with the live local model.
 - prefrontal: prefrontal-search-fixtures.json on the prefrontal pin.
 - named: named-case-fixtures.json, report-only rows for failure modes the gate
   has no row for, including validated no-answer queries.
@@ -413,7 +413,7 @@ def run_pack_group(binary: Path, root: Path, pack: Mapping[str, Any], cases: Seq
         with rq.fixture_endpoint(pack, runtime / "embedding-requests.log") as endpoint:
             client = rq.NdjsonClient(binary, root, runtime / "storage", runtime / "aft.stderr")
             try:
-                client.configure(endpoint, str(pack["model_id"]), ready_timeout)
+                client.configure(endpoint, rq.FIXTURE_PROVIDER_MODEL, ready_timeout)
                 client.wait_ready(ready_timeout)
                 for case in cases:
                     response = client.search(search_arguments(case, top_k))

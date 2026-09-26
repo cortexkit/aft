@@ -21,4 +21,6 @@ crates/aft/tests/fixtures/bash/** text eol=lf
 # run, so the checked-out bytes have to be the pinned bytes on every autocrlf
 # setting.
 benchmarks/aft-search/*.json text eol=lf
+# The real-query vector pack is float16 data read byte-for-byte by its digest.
+benchmarks/aft-search/*.bin binary
 benchmarks/aft-search/manifest.sha256 text eol=lf

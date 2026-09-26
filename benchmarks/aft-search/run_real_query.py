@@ -13,7 +13,7 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
@@ -38,6 +38,7 @@ from search_quality_lib import (
     validate_profile_score,
     validate_scored_population,
 )
+from vector_pack import read_pack
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -47,6 +48,15 @@ PROBE_TEXT = "semantic index fingerprint probe"
 # Exit code reserved for "this platform cannot evaluate the reference pair", so
 # a caller can tell it apart from an ordinary input fault (2).
 PLATFORM_UNSUPPORTED_EXIT = 3
+# The provider model name the harness configures for the fixture server. AFT
+# counts calls to this name as fixture traffic rather than live model calls
+# (search_b2::embed_counter::FIXTURE_PROVIDER_MODEL), so it stays fixed even
+# though the vectors behind it are real all-MiniLM-L6-v2 output. The score's
+# model_id names the pack's model instead.
+FIXTURE_PROVIDER_MODEL = "aft-search-fixture-v1"
+# A live-model replay differs from the pack only in who computes the vectors,
+# but it is not deterministic, so its score must never be taken for a pack score.
+LIVE_MODEL_SUFFIX = ":live"
 JsonObject = dict[str, Any]
 
 
@@ -72,7 +82,7 @@ def assert_reference_platform(platform: Optional[str] = None) -> None:
     if platform.startswith("win") or platform == "cygwin":
         raise UnsupportedPlatform(
             f"real_query_platform_unsupported:{platform}: the real-query reference pair "
-            "(real-query-vectors.json and real-query-baseline.json) is Unix-captured and "
+            "(real-query-vectors.bin and real-query-baseline.json) is Unix-captured and "
             "cannot be evaluated on this platform. Run this gate on Linux or macOS; CI "
             "runs it on ubuntu-latest."
         )
@@ -81,10 +91,23 @@ def assert_reference_platform(platform: Optional[str] = None) -> None:
 class NdjsonClient:
     """Minimal client for configure and public tool_call requests."""
 
-    def __init__(self, binary: Path, project_root: Path, storage_dir: Path, stderr_path: Path):
+    def __init__(
+        self,
+        binary: Path,
+        project_root: Path,
+        storage_dir: Path,
+        stderr_path: Path,
+        model_env: Optional[Mapping[str, str]] = None,
+    ):
         env = os.environ.copy()
         env["AFT_STORAGE_DIR"] = str(storage_dir)
+        # An empty model cache by default: the pack replay must never find a
+        # local model to fall back on. The live-model replay passes the
+        # pre-provisioned cache and runtime instead; the proxy below still
+        # blocks any download, so a missing model fails instead of fetching.
         env["FASTEMBED_CACHE_DIR"] = str(storage_dir / "model-cache")
+        if model_env:
+            env.update(model_env)
         env["HTTP_PROXY"] = env["HTTPS_PROXY"] = env["ALL_PROXY"] = "http://127.0.0.1:9"
         env["NO_PROXY"] = "127.0.0.1,localhost,::1"
         env.setdefault("RUST_LOG", "warn")
@@ -142,20 +165,22 @@ class NdjsonClient:
         self._stderr.seek(position)
         return text.strip()
 
-    def configure(self, endpoint: str, model_id: str, timeout: float) -> None:
+    def configure(self, endpoint: Optional[str], model_id: str, timeout: float) -> None:
+        semantic: JsonObject = {
+            "backend": "openai_compatible" if endpoint else "fastembed",
+            "model": model_id,
+            "timeout_ms": int(timeout * 1000),
+            "query_timeout_ms": int(timeout * 1000),
+            "max_batch_size": 64,
+            "max_files": 20000,
+        }
+        if endpoint:
+            semantic["base_url"] = endpoint
         doc = {
             "search_index": True,
             "semantic_search": True,
             "callgraph_store": False,
-            "semantic": {
-                "backend": "openai_compatible",
-                "model": model_id,
-                "base_url": endpoint,
-                "timeout_ms": int(timeout * 1000),
-                "query_timeout_ms": int(timeout * 1000),
-                "max_batch_size": 64,
-                "max_files": 20000,
-            },
+            "semantic": semantic,
         }
         response = self.call(
             "configure",
@@ -196,6 +221,22 @@ class NdjsonClient:
         if not isinstance(response.get("results"), list):
             raise AftProtocolError("aft_search_failed:results_not_array")
         return response
+
+
+def live_model_env() -> dict[str, str]:
+    """The managed ONNX Runtime and model cache for a live-model replay.
+
+    The client still points every proxy at a dead port, so a missing model
+    fails the semantic index instead of being downloaded mid-run.
+    """
+    from run_prefrontal_search import ensure_local_model_env
+
+    chosen = ensure_local_model_env()
+    env = {
+        "ORT_DYLIB_PATH": chosen.get("ort_dylib_path"),
+        "FASTEMBED_CACHE_DIR": chosen.get("fastembed_cache_dir"),
+    }
+    return {key: str(value) for key, value in env.items() if value}
 
 
 def _schema_block(text: str) -> str:
@@ -478,9 +519,10 @@ def assemble_score(
     }
 
 
-def load_inputs(
+def load_manifest_and_tree(
     manifest_path: Path, project_root: Optional[Path] = None
-) -> tuple[JsonObject, Path, Path, JsonObject]:
+) -> tuple[JsonObject, Path, Path, str]:
+    """Validate the manifest and pinned tree; return the pack path and its bound digest."""
     manifest = json.loads(manifest_path.read_text())
     if not isinstance(manifest, dict) or manifest.get("evidence_sha") != EVIDENCE_SHA:
         raise InputFault("corpus_vector_model_mismatch:manifest")
@@ -493,17 +535,23 @@ def load_inputs(
     if len(packs) != 1 or len(tree_digests) != 1 or len(pack_digests) != 1:
         raise InputFault("corpus_vector_model_mismatch:row_bindings")
     tree = project_root or evidence_root(EVIDENCE_SHA)
-    pack_path = ROOT / next(iter(packs))
     try:
         tree_digest = evidence_tree_sha256(tree)
     except (FileNotFoundError, OSError, ValueError):
         tree_digest = None
     if tree_digest != next(iter(tree_digests)):
         raise InputFault(f"corpus_vector_model_mismatch:{_display_path(tree)}")
-    if not pack_path.is_file() or sha256_file(pack_path) != next(iter(pack_digests)):
+    return manifest, tree, ROOT / next(iter(packs)), next(iter(pack_digests))
+
+
+def load_inputs(
+    manifest_path: Path, project_root: Optional[Path] = None
+) -> tuple[JsonObject, Path, Path, JsonObject]:
+    manifest, tree, pack_path, pack_digest = load_manifest_and_tree(manifest_path, project_root)
+    if not pack_path.is_file() or sha256_file(pack_path) != pack_digest:
         raise InputFault(f"corpus_vector_model_mismatch:{_display_path(pack_path)}")
-    pack = json.loads(pack_path.read_text())
-    if pack.get("pinned_sha") != EVIDENCE_SHA or pack.get("schema") != "aft-search-vector-pack-v1":
+    pack = read_pack(pack_path)
+    if pack.get("pinned_sha") != EVIDENCE_SHA:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
     return manifest, tree, pack_path, pack
 
@@ -544,7 +592,7 @@ def copy_answer_key_ignore(root: Path) -> Optional[Path]:
 def fixture_endpoint(pack: Mapping[str, Any], log_path: Path) -> Iterator[str]:
     vectors = pack.get("vectors")
     template = pack.get("embed_template_version")
-    if not isinstance(vectors, dict) or not isinstance(template, str) or not vectors:
+    if not isinstance(vectors, Mapping) or not isinstance(template, str) or not vectors:
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
     server = Server(("127.0.0.1", 0), vectors, template, log_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -568,6 +616,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--reference", default=str(HERE / "real-query-baseline.json"))
     result.add_argument("--output", default=str(HERE / ".bench/search-quality/score.json"))
     result.add_argument("--ready-timeout", type=float, default=600.0)
+    result.add_argument(
+        "--live-model",
+        action="store_true",
+        help=(
+            "Report-only fidelity check: replay with AFT's own local backend (the managed ONNX "
+            "Runtime and model cache) instead of the vector pack. Its model_id carries a "
+            f"'{LIVE_MODEL_SUFFIX}' suffix so the gate refuses to compare it with the reference."
+        ),
+    )
     return result
 
 
@@ -594,10 +651,20 @@ def run(args: argparse.Namespace) -> int:
         runtime = Path(run_dir)
         log_path = runtime / "embedding-requests.log"
         stderr_path = runtime / "aft.stderr"
-        with fixture_endpoint(pack, log_path) as endpoint:
-            client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path)
+        if args.live_model:
+            model_id = str(pack["model_id"]) + LIVE_MODEL_SUFFIX
+            endpoint_context: Any = nullcontext(None)
+            client_env: Optional[dict[str, str]] = live_model_env()
+            configured_model = str(pack["model_id"])
+        else:
+            model_id = str(pack["model_id"])
+            endpoint_context = fixture_endpoint(pack, log_path)
+            client_env = None
+            configured_model = FIXTURE_PROVIDER_MODEL
+        with endpoint_context as endpoint:
+            client = NdjsonClient(binary, project_root, runtime / "storage", stderr_path, client_env)
             try:
-                client.configure(endpoint, str(pack["model_id"]), args.ready_timeout)
+                client.configure(endpoint, configured_model, args.ready_timeout)
                 client.wait_ready(args.ready_timeout)
                 rows = score_manifest_rows(manifest, args.profile, capability, client, project_root)
             finally:
@@ -607,7 +674,7 @@ def run(args: argparse.Namespace) -> int:
         rows,
         args.profile,
         capability,
-        str(pack["model_id"]),
+        model_id,
         exact_report,
         concept_report,
         manifest_path,

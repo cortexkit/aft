@@ -3,17 +3,23 @@ from __future__ import annotations
 
 import copy
 import json
+import struct
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Mapping
 
+from embedding_fixture_server import Server, corpus_key, query_key
 from evidence_tree import evidence_tree_sha256
 from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
 from run_real_query import ROOT, assemble_score, load_inputs, score_manifest_rows
 from search_quality_lib import (
     D_0,
+    EVIDENCE_SHA,
     INVARIANCE_DEPTH,
     PAGE_SIZE,
     InputFault,
@@ -23,6 +29,7 @@ from search_quality_lib import (
     validate_profile_score,
 )
 from setup_corpus import parse_corpus_toml
+from vector_pack import read_pack, write_pack
 
 
 class FakeClient:
@@ -257,6 +264,86 @@ class RealQueryRunnerTests(unittest.TestCase):
         self.assertEqual(false_rows[0]["request"]["includeTests"], False)
         self.assertNotEqual(true_rows[0]["ranked_paths"], false_rows[0]["ranked_paths"])
         self.assertEqual(true_rows[0]["ranked_paths"][0], "tests/recorded_true_test.py")
+
+
+def _post_embeddings(port: int, texts: list[str]) -> tuple[int, dict[str, Any]]:
+    body = json.dumps({"model": "aft-search-fixture-v1", "input": texts}).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/embeddings", data=body, headers={"content-type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        return error.code, json.load(error)
+
+
+class VectorPackTests(unittest.TestCase):
+    TEMPLATE = "aft-search-template-v1"
+
+    def _pack(self, directory: Path) -> tuple[Path, dict[str, list[float]]]:
+        vectors = {
+            query_key("known query", self.TEMPLATE): [0.1, -0.2, 0.3],
+            corpus_key("known chunk", self.TEMPLATE): [0.5, 0.25, -0.125],
+        }
+        path = directory / "pack.bin"
+        write_pack(
+            path,
+            {"pinned_sha": EVIDENCE_SHA, "embed_template_version": self.TEMPLATE, "model_id": "test-model"},
+            vectors,
+        )
+        return path, vectors
+
+    def test_vector_pack_round_trips_float16_values_by_text_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, vectors = self._pack(Path(directory))
+            pack = read_pack(path)
+            self.assertEqual(pack["model_id"], "test-model")
+            self.assertEqual(pack["dimension"], 3)
+            self.assertEqual(set(pack["vectors"]), set(vectors))
+            for key, vector in vectors.items():
+                expected = list(struct.unpack("<3e", struct.pack("<3e", *vector)))
+                self.assertEqual(pack["vectors"][key], expected)
+            # 0.1 is not a float16 value, so the stored vector is the rounded one.
+            self.assertNotEqual(pack["vectors"][query_key("known query", self.TEMPLATE)][0], 0.1)
+            self.assertNotIn(query_key("known query", "another-template"), pack["vectors"])
+            self.assertNotIn(query_key("unknown query", self.TEMPLATE), pack["vectors"])
+
+    def test_vector_pack_rejects_a_file_that_is_not_a_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, _ = self._pack(Path(directory))
+            truncated = Path(directory) / "truncated.bin"
+            truncated.write_bytes(path.read_bytes()[:-1])
+            with self.assertRaisesRegex(InputFault, "embedding_pack_length"):
+                read_pack(truncated)
+            legacy = Path(directory) / "legacy.json"
+            legacy.write_bytes(canonical_json({"schema": "aft-search-vector-pack-v1", "vectors": {}}))
+            with self.assertRaisesRegex(InputFault, "embedding_pack_format"):
+                read_pack(legacy)
+
+    def test_fixture_server_refuses_a_missing_vector_instead_of_inventing_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path, vectors = self._pack(Path(directory))
+            pack = read_pack(path)
+            server = Server(("127.0.0.1", 0), pack["vectors"], self.TEMPLATE, Path(directory) / "requests.log")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status, payload = _post_embeddings(server.server_port, ["known query", "known chunk"])
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    [item["embedding"] for item in payload["data"]],
+                    [pack["vectors"][key] for key in vectors],
+                )
+                status, payload = _post_embeddings(server.server_port, ["known query", "text with no vector"])
+                self.assertEqual(status, 422)
+                self.assertTrue(payload["error"].startswith("vector_missing:"))
+                self.assertIn(query_key("text with no vector", self.TEMPLATE), payload["error"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+            self.assertEqual(len(pack["vectors"]), 2)
 
 
 if __name__ == "__main__":
