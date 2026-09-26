@@ -258,8 +258,9 @@ export function assertDualHostParity(
     });
   const v1Shapes = shapesOf(v1Readings);
   const v2Shapes = shapesOf(v2Readings);
-  // A text no reading of which projects gets the projection's own error, which
-  // names the line the rules could not parse.
+  // When none of one host's readings (with or without the status bar)
+  // projects, project its first reading again unguarded so the failure is the
+  // projection's own error, which names the line the rules could not parse.
   if (v1Shapes.length === 0) projectText(v1Readings[0], rules);
   if (v2Shapes.length === 0) projectText(v2Readings[0], rules);
   if (!v1Shapes.some((shape) => v2Shapes.includes(shape))) {
