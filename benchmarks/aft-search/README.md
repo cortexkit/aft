@@ -79,6 +79,19 @@ sentence rank-1 or pair recall@10 drops below the checked-in baseline. The
 nightly workflow appends the same table to its job summary and uploads the JSON
 beside the index-cost artifacts.
 
+`--semantic` replays the same fixtures and invariants with semantic search on,
+using the live local model (the managed ONNX Runtime and model cache, as the
+prefrontal runner uses). It answers a question the gate cannot: whether
+routing a query to a semantic plan displaces its exact answer. It is
+report-only and exits 0 unless the run fails, because the baseline was
+recorded with semantic search off. Each row records the router `shape` and
+`lanes_run`, so a reader can see which rows actually ran the semantic lane.
+
+```bash
+python3 run_exact_recall.py --semantic --ready-timeout 5400 \
+  --out results/exact-recall-semantic-<date>.json
+```
+
 ## Real-query quality gate
 
 After the exact-recall corpus has been provisioned once, this command provisions
@@ -184,6 +197,36 @@ model the agent used, so it needs prefrontal access and the managed ONNX
 Runtime. It is report-only and never fails on a ranking outcome.
 `results/prefrontal-search-baseline.json` is the first recorded run; compare a
 ranking change against it row by row.
+
+## Recall audit and named cases
+
+`run_recall_audit.py` says where each known answer is lost: never indexed,
+not produced by any lane that ran, produced beyond a candidate limit, ranked
+below the page, or shown through another span of the same file. It replays the
+real-query rows (with the gate's vector pack, the live local model, or both),
+the prefrontal rows, and `named-case-fixtures.json`, and records each reply's
+confidence label beside whether the answer reached the top 5.
+
+It relies on a benchmark-only switch in the binary: `AFT_SEARCH_RECALL_AUDIT=1`
+in the aft process environment adds a `recall_audit` object to engine-ranked
+search replies, and `AFT_SEARCH_RECALL_AUDIT_TARGETS` names the files to
+report index coverage and unlimited-depth lane ranks for. It is not a tool
+parameter. The runner starts its own binaries with temporary storage and never
+uses a shared daemon.
+
+`named-case-fixtures.json` holds report-only rows for failure modes the gate
+has no row for: punctuated prose, prose with one exact fragment, op-string
+dispatch, a partial anchor that outranks the answer, and validated no-answer
+queries. Each row states how its answer, or its absence, was verified.
+
+```bash
+python3 run_recall_audit.py --real-query-backend both \
+  --out results/recall-audit-<date>.json --markdown .bench/recall-audit/tables.md
+python3 -m unittest -v test_run_recall_audit
+```
+
+The first run is written up in
+`docs/investigations/search-recall-audit-2026-09.md`.
 
 ## Search-fusion quality sub-benchmark
 

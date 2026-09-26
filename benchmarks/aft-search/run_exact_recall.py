@@ -256,7 +256,8 @@ def run(argv: Sequence[str]) -> int:
     protocol_version: Optional[str] = None
     model_env: Optional[JsonObject] = None
     if args.semantic:
-        # Imported here because run_prefrontal_search imports this module.
+        # Imported here, not at module level: run_prefrontal_search imports
+        # this module, so a top-level import would be circular.
         from run_prefrontal_search import ensure_local_model_env
 
         model_env = ensure_local_model_env()

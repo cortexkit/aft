@@ -1,0 +1,591 @@
+{
+  "baseline": {
+    "pair_recall_at_10": 1.0,
+    "sample_per_family_per_repo": 2,
+    "schema_version": 1,
+    "sentence_rank1": 1.0
+  },
+  "benchmark": "aft-search-exact-recall",
+  "binary": {
+    "path": "target/release/aft",
+    "sha256": "645c495569931c0145463128a1645eb0bf03aff3d9de7f849ebbb8d380f5863d",
+    "version": "0.57.2"
+  },
+  "local_model_env": {
+    "fastembed_cache_dir": "/Users/ufukaltinok/.local/share/cortexkit/aft/semantic/models",
+    "ort_dylib_path": "/Users/ufukaltinok/.local/share/cortexkit/aft/onnxruntime/1.24.4/libonnxruntime.dylib"
+  },
+  "metrics": {
+    "all_passed": true,
+    "pair_recall_at_10": 1.0,
+    "sentence_rank1": 1.0
+  },
+  "repo_statuses": {
+    "fastify": {
+      "search_index": {
+        "files": 383,
+        "status": "ready"
+      },
+      "semantic_index": {
+        "entries": 1870,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      }
+    },
+    "flask": {
+      "search_index": {
+        "files": 236,
+        "status": "ready"
+      },
+      "semantic_index": {
+        "entries": 1951,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      }
+    },
+    "ripgrep": {
+      "search_index": {
+        "files": 219,
+        "status": "ready"
+      },
+      "semantic_index": {
+        "entries": 3502,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      }
+    },
+    "turborepo": {
+      "search_index": {
+        "files": 5703,
+        "status": "ready"
+      },
+      "semantic_index": {
+        "entries": 14662,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      }
+    }
+  },
+  "results": [
+    {
+      "exact_marker": true,
+      "expected_file": "crates/searcher/src/sink.rs",
+      "family": "sentence",
+      "id": "ripgrep-sentence-sink-match",
+      "latency_ms": 431.354,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "shape": "natural_language"
+      },
+      "query": "This method is called whenever a match is found.",
+      "rank": 1,
+      "repo": "ripgrep",
+      "result_files": [
+        "crates/searcher/src/sink.rs",
+        "crates/core/search.rs",
+        "crates/printer/src/summary.rs",
+        "crates/searcher/src/searcher/mod.rs",
+        "crates/printer/src/standard.rs"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/ignore/src/types.rs",
+      "family": "sentence",
+      "id": "ripgrep-sentence-file-types",
+      "latency_ms": 210.496,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 0,
+        "lanes_run": [
+          "exact",
+          "lexical"
+        ],
+        "shape": "code_literal"
+      },
+      "query": "All of the file type definitions, sorted lexicographically by name.",
+      "rank": 1,
+      "repo": "ripgrep",
+      "result_files": [
+        "crates/ignore/src/types.rs",
+        "crates/core/flags/lowargs.rs",
+        "crates/printer/src/hyperlink/mod.rs",
+        "crates/ignore/src/default_types.rs",
+        "crates/core/flags/hiargs.rs"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/searcher/src/sink.rs",
+      "family": "pair",
+      "id": "ripgrep-pair-sink-match",
+      "latency_ms": 315.765,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "whenever match found",
+      "rank": 1,
+      "repo": "ripgrep",
+      "result_files": [
+        "crates/searcher/src/sink.rs",
+        "crates/core/search.rs",
+        "crates/regex/src/matcher.rs",
+        "crates/printer/src/summary.rs",
+        "crates/searcher/src/searcher/mod.rs",
+        "crates/matcher/src/lib.rs",
+        "crates/printer/src/json.rs",
+        "crates/printer/src/stats.rs",
+        "crates/globset/src/lib.rs",
+        "crates/printer/src/standard.rs"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/ignore/src/types.rs",
+      "family": "pair",
+      "id": "ripgrep-pair-file-types",
+      "latency_ms": 209.169,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "definitions lexicographically name",
+      "rank": 1,
+      "repo": "ripgrep",
+      "result_files": [
+        "crates/ignore/src/types.rs",
+        "crates/printer/src/hyperlink/mod.rs",
+        "crates/core/flags/lowargs.rs",
+        "crates/core/flags/defs.rs",
+        "crates/globset/src/lib.rs",
+        "crates/printer/src/standard.rs",
+        "crates/core/flags/hiargs.rs",
+        "crates/ignore/src/default_types.rs",
+        "crates/core/flags/doc/template.rg.1",
+        "CHANGELOG.md"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "src/flask/sansio/app.py",
+      "family": "sentence",
+      "id": "flask-sentence-blueprint-order",
+      "latency_ms": 233.46,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "shape": "natural_language"
+      },
+      "query": "Iterates over all blueprints by the order they were registered.",
+      "rank": 1,
+      "repo": "flask",
+      "result_files": [
+        "src/flask/sansio/app.py",
+        "src/flask/sansio/blueprints.py",
+        "src/flask/wrappers.py",
+        "src/flask/helpers.py",
+        "src/flask/blueprints.py"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "src/flask/sessions.py",
+      "family": "sentence",
+      "id": "flask-sentence-permanent-key",
+      "latency_ms": 102.742,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "shape": "natural_language"
+      },
+      "query": "This reflects the ``'_permanent'`` key in the dict.",
+      "rank": 1,
+      "repo": "flask",
+      "result_files": [
+        "src/flask/sessions.py",
+        "src/flask/sansio/app.py",
+        "src/flask/app.py",
+        "docs/config.rst",
+        "docs/patterns/fileuploads.rst"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "src/flask/sansio/app.py",
+      "family": "pair",
+      "id": "flask-pair-blueprint-order",
+      "latency_ms": 206.669,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "blueprints order registered",
+      "rank": 1,
+      "repo": "flask",
+      "result_files": [
+        "src/flask/sansio/app.py",
+        "src/flask/sansio/blueprints.py",
+        "examples/tutorial/flaskr/auth.py",
+        "src/flask/helpers.py",
+        "src/flask/blueprints.py",
+        "src/flask/wrappers.py",
+        "docs/lifecycle.rst",
+        "src/flask/sansio/scaffold.py",
+        "docs/patterns/appfactories.rst",
+        "src/flask/cli.py"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "src/flask/sessions.py",
+      "family": "pair",
+      "id": "flask-pair-permanent-key",
+      "latency_ms": 110.239,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "permanent key dict",
+      "rank": 1,
+      "repo": "flask",
+      "result_files": [
+        "src/flask/sessions.py",
+        "src/flask/sansio/app.py",
+        "src/flask/app.py",
+        "src/flask/sansio/scaffold.py",
+        "src/flask/cli.py",
+        "docs/patterns/fileuploads.rst",
+        "src/flask/config.py",
+        "src/flask/wrappers.py",
+        "docs/api.rst",
+        "src/flask/json/tag.py"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "lib/route.js",
+      "family": "sentence",
+      "id": "fastify-sentence-shallow-copy",
+      "latency_ms": 110.301,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 0,
+        "lanes_run": [
+          "exact",
+          "lexical"
+        ],
+        "shape": "code_literal"
+      },
+      "query": "Since we are mutating/assigning only top level props, it is fine to have a shallow copy using the spread operator",
+      "rank": 1,
+      "repo": "fastify",
+      "result_files": [
+        "lib/route.js",
+        "fastify.js",
+        "docs/Reference/Plugins.md",
+        "docs/Guides/Prototype-Poisoning.md",
+        "docs/Reference/Hooks.md"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "lib/reply.js",
+      "family": "sentence",
+      "id": "fastify-sentence-reply-hijacked",
+      "latency_ms": 200.985,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "exact",
+          "lexical",
+          "semantic"
+        ],
+        "shape": "natural_language"
+      },
+      "query": "We are checking whether reply was hijacked or the response has ended.",
+      "rank": 1,
+      "repo": "fastify",
+      "result_files": [
+        "lib/reply.js",
+        "types/reply.d.ts",
+        "lib/content-type-parser.js",
+        "lib/wrap-thenable.js",
+        "test/types/reply.test-d.ts"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "lib/route.js",
+      "family": "pair",
+      "id": "fastify-pair-shallow-copy",
+      "latency_ms": 108.511,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "mutating shallow spread",
+      "rank": 1,
+      "repo": "fastify",
+      "result_files": [
+        "lib/route.js",
+        "fastify.js",
+        "lib/reply.js",
+        "docs/Reference/Reply.md",
+        "docs/Reference/Decorators.md",
+        "docs/Reference/Hooks.md",
+        "lib/hooks.js",
+        "docs/Reference/Plugins.md",
+        "docs/Reference/Request.md",
+        "test/types/type-provider.test-d.ts"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "lib/reply.js",
+      "family": "pair",
+      "id": "fastify-pair-reply-hijacked",
+      "latency_ms": 108.858,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "reply hijacked ended",
+      "rank": 1,
+      "repo": "fastify",
+      "result_files": [
+        "lib/reply.js",
+        "lib/wrap-thenable.js",
+        "test/types/reply.test-d.ts",
+        "types/reply.d.ts",
+        "lib/content-type-parser.js",
+        "lib/symbols.js",
+        "docs/Reference/Reply.md",
+        "docs/Reference/Lifecycle.md",
+        "docs/Reference/Server.md",
+        "docs/Guides/Migration-Guide-V5.md"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/turborepo-lib/src/run/task_filter.rs",
+      "family": "sentence",
+      "id": "turborepo-sentence-include-selector",
+      "latency_ms": 1127.179,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 0,
+        "lanes_run": [
+          "exact",
+          "lexical"
+        ],
+        "shape": "code_literal"
+      },
+      "query": "Each include selector contributes a set of tasks (unioned together).",
+      "rank": 1,
+      "repo": "turborepo",
+      "result_files": [
+        "crates/turborepo-lib/src/run/task_filter.rs",
+        "CONTRIBUTING.md",
+        "apps/docs/content/blog/turbo-1-2-0.mdx",
+        "crates/turborepo/ARCHITECTURE.md",
+        "apps/docs/content/blog/turbo-2-4.mdx"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/turborepo-lib/src/run/builder.rs",
+      "family": "sentence",
+      "id": "turborepo-sentence-watch-entrypoint",
+      "latency_ms": 823.408,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 0,
+        "lanes_run": [
+          "exact",
+          "lexical"
+        ],
+        "shape": "code_literal"
+      },
+      "query": "In watch mode, we can have a changed package that we want to serve as an entrypoint.",
+      "rank": 1,
+      "repo": "turborepo",
+      "result_files": [
+        "crates/turborepo-lib/src/run/builder.rs",
+        "apps/docs/content/docs/guides/tools/typescript.mdx",
+        "packages/turbo-vsc/ARCHITECTURE.md",
+        "apps/docs/content/docs/reference/system-environment-variables.mdx",
+        "apps/docs/content/blog/turbo-2-6.mdx"
+      ],
+      "top_k": 5
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/turborepo-lib/src/run/task_filter.rs",
+      "family": "pair",
+      "id": "turborepo-pair-include-selector",
+      "latency_ms": 208.079,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "contributes unioned",
+      "rank": 1,
+      "repo": "turborepo",
+      "result_files": [
+        "crates/turborepo-lib/src/run/task_filter.rs",
+        "CODE_OF_CONDUCT.md",
+        "apps/docs/content/blog/turbo-1-9-0.mdx",
+        "apps/docs/content/blog/turbo-1-8-0.mdx",
+        "apps/docs/content/blog/turbo-2-3.mdx",
+        "crates/turborepo-task-hash/src/lib.rs",
+        "apps/docs/content/blog/turbo-1-13-0.mdx",
+        "apps/docs/content/blog/turbo-1-4-0.mdx",
+        "apps/docs/content/blog/turbo-1-11-0.mdx",
+        "crates/turborepo-vt100/CHANGELOG.md"
+      ],
+      "top_k": 10
+    },
+    {
+      "exact_marker": true,
+      "expected_file": "crates/turborepo-lib/src/run/builder.rs",
+      "family": "pair",
+      "id": "turborepo-pair-watch-entrypoint",
+      "latency_ms": 419.371,
+      "passed": true,
+      "plan": {
+        "confidence": "high",
+        "embedding_calls": 1,
+        "lanes_run": [
+          "symbol",
+          "exact",
+          "lexical",
+          "variants",
+          "semantic"
+        ],
+        "shape": "short"
+      },
+      "query": "changed package entrypoint",
+      "rank": 1,
+      "repo": "turborepo",
+      "result_files": [
+        "crates/turborepo-lib/src/run/builder.rs",
+        "crates/turborepo-lib/src/run/watch.rs",
+        "skills/turborepo/references/best-practices/packages.md",
+        "apps/docs/content/docs/crafting-your-repository/running-tasks.mdx",
+        "apps/docs/content/docs/guides/publishing-libraries.mdx",
+        "apps/docs/content/docs/crafting-your-repository/creating-an-internal-package.mdx",
+        "apps/docs/content/docs/guides/tools/typescript.mdx",
+        "crates/turborepo-lib/src/lib.rs",
+        "crates/turborepo-engine/src/lib.rs",
+        "apps/docs/content/docs/core-concepts/internal-packages.mdx"
+      ],
+      "top_k": 10
+    }
+  ],
+  "sample_per_family_per_repo": 2,
+  "schema_version": 1,
+  "semantic_search": true,
+  "timestamp": "2026-09-26T11:07:14.520614+00:00"
+}
