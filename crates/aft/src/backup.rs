@@ -15,6 +15,21 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 /// Default upper bound for one automatic undo snapshot (64 MiB).
 pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;
+/// Most files one recursive delete may copy into the undo store.
+///
+/// A recursive delete snapshots every file before it removes anything, and the
+/// copy runs while the delete holds its root's write lane. A tree of 12,000
+/// files (3.2 GB) was once copied at about 4 MB/s for minutes, far past the
+/// caller's 30 s tool timeout. Two thousand small files copy in a few seconds;
+/// larger trees are refused before anything is deleted.
+pub const RECURSIVE_DELETE_BACKUP_MAX_FILES: usize = 2_000;
+/// Most bytes one recursive delete may copy into the undo store (100 MiB).
+///
+/// At the slow 4 MB/s once observed that is about 25 s, inside the caller's
+/// 30 s tool timeout, and it still admits one file at the per-file limit
+/// ([`DEFAULT_MAX_BACKUP_FILE_SIZE`]). Files above the per-file limit are not
+/// copied, so they count toward the file budget but not toward this one.
+pub const RECURSIVE_DELETE_BACKUP_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 static BACKUP_SKIPPED_TOO_LARGE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKUP_SKIPPED_TEMP_PATH_TOTAL: AtomicU64 = AtomicU64::new(0);

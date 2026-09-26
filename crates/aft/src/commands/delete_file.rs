@@ -23,6 +23,12 @@ use crate::protocol::{RawRequest, Response};
 /// All deletes inside a single tool call share one operation id, so a single
 /// `aft_safety undo` (without filePath) restores everything atomically.
 ///
+/// A recursive delete whose undo backup would copy more than
+/// `RECURSIVE_DELETE_BACKUP_MAX_FILES` files or
+/// `RECURSIVE_DELETE_BACKUP_MAX_BYTES` bytes (a budget shared by the whole
+/// call) is refused with `recursive_delete_backup_too_large` before anything
+/// is deleted.
+///
 /// Returns single-file: `{ file, deleted, backup_id? }`
 /// Returns directory:   `{ file, deleted, is_directory, files_deleted, backup_ids }`
 /// Returns batch:       `{ complete, deleted: [...], skipped_files: [...] }`
@@ -33,6 +39,7 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
         .get("recursive")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let mut budget = RecursiveDeleteBackupBudget::for_request(ctx);
 
     // Batch mode: `files: [...]`
     if let Some(files) = req.params.get("files").and_then(|v| v.as_array()) {
@@ -43,7 +50,7 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
                 skipped.push(serde_json::json!({"file": value, "reason": "not a string"}));
                 continue;
             };
-            match delete_one_or_dir(req, ctx, file, recursive, &op_id) {
+            match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget) {
                 Ok(result) => deleted.push(result),
                 Err(resp) => skipped.push(serde_json::json!({
                     "file": file,
@@ -106,7 +113,7 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match delete_one_or_dir(req, ctx, file, recursive, &op_id) {
+    match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget) {
         Ok(result) => Response::success(&req.id, result),
         Err(resp) => resp,
     }
@@ -122,6 +129,7 @@ fn delete_one_or_dir(
     file: &str,
     recursive: bool,
     op_id: &str,
+    budget: &mut RecursiveDeleteBackupBudget,
 ) -> Result<serde_json::Value, Response> {
     let path = match ctx.validate_write_location(&req.id, Path::new(file)) {
         Ok(path) => path,
@@ -164,7 +172,7 @@ fn delete_one_or_dir(
                 ),
             ));
         }
-        return delete_directory(req, ctx, &path, file, op_id);
+        return delete_directory(req, ctx, &path, file, op_id, budget);
     }
 
     if !path.is_file() {
@@ -269,6 +277,7 @@ fn delete_directory(
     path: &Path,
     original: &str,
     op_id: &str,
+    budget: &mut RecursiveDeleteBackupBudget,
 ) -> Result<serde_json::Value, Response> {
     // A vanished mounted child can make std::fs::ReadDir::drop panic after
     // closedir returns ENXIO, aborting the daemon. Capture the root device before
@@ -283,6 +292,25 @@ fn delete_directory(
             ),
         )
     })?;
+    // Bound the backup before anything else walks the tree: validation below
+    // reads every directory, so it runs only on a tree already known to fit.
+    let collected = match collect_files_within_budget(path, &boundary, budget) {
+        Ok(collected) => collected,
+        Err(CollectError::OverBudget(exceeded)) => {
+            return Err(over_budget_response(req, original, exceeded, budget));
+        }
+        Err(CollectError::Io(e)) => {
+            return Err(Response::error(
+                &req.id,
+                "io_error",
+                format!(
+                    "delete_file: failed to walk directory '{}': {}",
+                    original, e
+                ),
+            ));
+        }
+    };
+
     let unsupported_paths =
         validate_directory_for_recursive_delete(path, &boundary).map_err(|e| {
             Response::error(
@@ -302,17 +330,7 @@ fn delete_directory(
         ));
     }
 
-    let mut files_to_backup: Vec<PathBuf> = Vec::new();
-    if let Err(e) = collect_files(path, &boundary, &mut files_to_backup) {
-        return Err(Response::error(
-            &req.id,
-            "io_error",
-            format!(
-                "delete_file: failed to walk directory '{}': {}",
-                original, e
-            ),
-        ));
-    }
+    let files_to_backup = collected.files;
 
     let mut backup_ids: Vec<String> = Vec::new();
     let mut backed_up_paths: Vec<PathBuf> = Vec::new();
@@ -365,6 +383,9 @@ fn delete_directory(
             ),
         ));
     }
+
+    budget.files_left = budget.files_left.saturating_sub(collected.entries_counted);
+    budget.bytes_left = budget.bytes_left.saturating_sub(collected.bytes_counted);
 
     // Notify LSP for every file that disappeared so watched-file diagnostics
     // refresh.
@@ -474,29 +495,292 @@ fn unsupported_directory_contents_message(paths: &[String]) -> String {
     message
 }
 
-/// Walk a directory recursively, collecting all regular file paths.
-/// Skips symlinked directories to avoid following loops; symlinked files
-/// are included.
-fn collect_files(
+/// How much one `delete_file` call may still copy into the undo store for
+/// recursive directory deletes. Shared by every directory in a batch, because
+/// the whole call holds the root's write lane while it copies.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RecursiveDeleteBackupBudget {
+    /// Files still allowed. Every non-directory entry counts, including
+    /// entries later refused as unsupported, so the walk itself stays bounded.
+    files_left: usize,
+    /// Bytes still allowed, counting only files small enough to be copied.
+    bytes_left: u64,
+    /// The backup store's per-file limit; larger files are skipped by the
+    /// store and so cost no copy.
+    per_file_limit: Option<u64>,
+    /// Whether backups are captured at all. With backups disabled by user
+    /// config nothing is copied, so there is nothing to bound.
+    enabled: bool,
+}
+
+impl RecursiveDeleteBackupBudget {
+    pub(crate) fn new(
+        policy: crate::backup::BackupPolicy,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> Self {
+        Self {
+            files_left: max_files,
+            bytes_left: max_bytes,
+            per_file_limit: policy.max_file_size,
+            enabled: policy.enabled && policy.max_file_size != Some(0),
+        }
+    }
+
+    fn for_request(ctx: &AppContext) -> Self {
+        Self::new(
+            ctx.backup().lock().policy(),
+            crate::backup::RECURSIVE_DELETE_BACKUP_MAX_FILES,
+            crate::backup::RECURSIVE_DELETE_BACKUP_MAX_BYTES,
+        )
+    }
+}
+
+/// Which budget a recursive delete walk ran out of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BudgetLimit {
+    Files,
+    Bytes,
+}
+
+/// A walk stopped because the tree needs more backup than the budget allows.
+/// The counts are what the walk had seen when it stopped, so they are lower
+/// bounds on the tree's real size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BudgetExceeded {
+    pub(crate) limit: BudgetLimit,
+    pub(crate) files_counted: usize,
+    pub(crate) bytes_counted: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum CollectError {
+    Io(std::io::Error),
+    OverBudget(BudgetExceeded),
+}
+
+impl From<std::io::Error> for CollectError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Files a recursive delete will back up, with what they cost.
+#[derive(Debug, Default)]
+pub(crate) struct CollectedFiles {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) entries_counted: usize,
+    pub(crate) bytes_counted: u64,
+}
+
+/// Walk a directory recursively, collecting all regular file paths, and stop
+/// the moment the tree needs more backup than `budget` allows. The walk must
+/// stop at the cap rather than count the whole tree first: a tree large enough
+/// to refuse can also be large enough that counting it is itself slow.
+///
+/// Symlinks and other non-regular entries are counted but not collected; the
+/// validation pass that follows refuses them. Directories on another
+/// filesystem are not entered, and validation refuses them as well.
+pub(crate) fn collect_files_within_budget(
     dir: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    out: &mut Vec<PathBuf>,
-) -> std::io::Result<()> {
+    budget: &RecursiveDeleteBackupBudget,
+) -> Result<CollectedFiles, CollectError> {
+    let mut collected = CollectedFiles::default();
+    collect_files_into(dir, boundary, budget, &mut collected)?;
+    Ok(collected)
+}
+
+fn collect_files_into(
+    dir: &Path,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    budget: &RecursiveDeleteBackupBudget,
+    out: &mut CollectedFiles,
+) -> Result<(), CollectError> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
-        if file_type.is_file() {
-            out.push(path);
-        } else if file_type.is_dir() {
-            if !boundary.should_descend(&path)? {
-                return Err(std::io::Error::other(format!(
-                    "refusing to cross foreign filesystem mount {} while collecting delete backups",
-                    path.display()
-                )));
+        if file_type.is_dir() {
+            if boundary.should_descend(&path)? {
+                collect_files_into(&path, boundary, budget, out)?;
             }
-            collect_files(&path, boundary, out)?;
+            continue;
         }
+
+        out.entries_counted += 1;
+        if budget.enabled && out.entries_counted > budget.files_left {
+            return Err(CollectError::OverBudget(BudgetExceeded {
+                limit: BudgetLimit::Files,
+                files_counted: out.entries_counted,
+                bytes_counted: out.bytes_counted,
+            }));
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow symlinks, and only regular
+        // files reach this point.
+        let len = entry.metadata()?.len();
+        let copied = budget.per_file_limit.is_none_or(|limit| len <= limit);
+        if copied {
+            out.bytes_counted = out.bytes_counted.saturating_add(len);
+            if budget.enabled && out.bytes_counted > budget.bytes_left {
+                return Err(CollectError::OverBudget(BudgetExceeded {
+                    limit: BudgetLimit::Bytes,
+                    files_counted: out.entries_counted,
+                    bytes_counted: out.bytes_counted,
+                }));
+            }
+        }
+        out.files.push(path);
     }
     Ok(())
+}
+
+fn format_mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+fn over_budget_response(
+    req: &RawRequest,
+    original: &str,
+    exceeded: BudgetExceeded,
+    budget: &RecursiveDeleteBackupBudget,
+) -> Response {
+    let max_files = crate::backup::RECURSIVE_DELETE_BACKUP_MAX_FILES;
+    let max_bytes = crate::backup::RECURSIVE_DELETE_BACKUP_MAX_BYTES;
+    // Earlier directories in the same batch call already spent part of the
+    // budget; say so, or the numbers below would not add up for the caller.
+    let used_files = max_files.saturating_sub(budget.files_left);
+    let used_bytes = max_bytes.saturating_sub(budget.bytes_left);
+    let counted = match exceeded.limit {
+        BudgetLimit::Files => format!("at least {} files", exceeded.files_counted),
+        BudgetLimit::Bytes => format!(
+            "at least {} in {} files",
+            format_mib(exceeded.bytes_counted),
+            exceeded.files_counted
+        ),
+    };
+    let earlier = if used_files > 0 || used_bytes > 0 {
+        format!(
+            " Earlier directories in this call already used {} files and {}.",
+            used_files,
+            format_mib(used_bytes)
+        )
+    } else {
+        String::new()
+    };
+    Response::error_with_data(
+        req.id.clone(),
+        "recursive_delete_backup_too_large",
+        format!(
+            "delete_file: refusing to delete '{original}': its undo backup would copy {counted} \
+             (limit per call: {max_files} files and {}); counting stopped at the limit.{earlier} \
+             Nothing was deleted. Delete it in smaller pieces to keep undo, or, when no undo \
+             is needed, remove it with bash `rm -rf`.",
+            format_mib(max_bytes)
+        ),
+        serde_json::json!({
+            "limit": match exceeded.limit {
+                BudgetLimit::Files => "files",
+                BudgetLimit::Bytes => "bytes",
+            },
+            "files_counted_at_least": exceeded.files_counted,
+            "bytes_counted_at_least": exceeded.bytes_counted,
+            "max_files": max_files,
+            "max_bytes": max_bytes,
+            "counting_stopped_early": true,
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup::BackupPolicy;
+    use crate::walk_boundary::DeviceBoundary;
+
+    fn write_tree(root: &Path, files: usize, bytes_each: usize) {
+        for index in 0..files {
+            let dir = root.join(format!("d{}", index / 50));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("f{index}")), vec![b'x'; bytes_each]).unwrap();
+        }
+    }
+
+    fn collect(
+        root: &Path,
+        policy: BackupPolicy,
+        max_files: usize,
+        max_bytes: u64,
+    ) -> Result<CollectedFiles, CollectError> {
+        let boundary = DeviceBoundary::for_root(root).unwrap();
+        let budget = RecursiveDeleteBackupBudget::new(policy, max_files, max_bytes);
+        collect_files_within_budget(root, &boundary, &budget)
+    }
+
+    #[test]
+    fn file_budget_stops_the_walk_one_past_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), 1_500, 8);
+
+        let Err(CollectError::OverBudget(exceeded)) =
+            collect(dir.path(), BackupPolicy::default(), 1_000, u64::MAX)
+        else {
+            panic!("a 1,500-file tree must exceed a 1,000-file budget");
+        };
+        assert_eq!(exceeded.limit, BudgetLimit::Files);
+        // Counting the whole tree before comparing would report 1,500 here.
+        assert_eq!(exceeded.files_counted, 1_001);
+    }
+
+    #[test]
+    fn byte_budget_counts_only_files_the_store_would_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), 200, 1_024);
+
+        let Err(CollectError::OverBudget(exceeded)) =
+            collect(dir.path(), BackupPolicy::default(), usize::MAX, 100 * 1_024)
+        else {
+            panic!("200 KiB of files must exceed a 100 KiB budget");
+        };
+        assert_eq!(exceeded.limit, BudgetLimit::Bytes);
+        assert_eq!(exceeded.files_counted, 101);
+        assert_eq!(exceeded.bytes_counted, 101 * 1_024);
+
+        // With a per-file limit below every file's size the store copies
+        // nothing, so the same tree fits a byte budget of zero.
+        let small_files_only = BackupPolicy {
+            max_file_size: Some(512),
+            ..BackupPolicy::default()
+        };
+        let collected = collect(dir.path(), small_files_only, usize::MAX, 0).unwrap();
+        assert_eq!(collected.files.len(), 200);
+        assert_eq!(collected.bytes_counted, 0);
+    }
+
+    #[test]
+    fn tree_within_budget_collects_every_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), 120, 16);
+
+        let collected = collect(dir.path(), BackupPolicy::default(), 120, 120 * 16).unwrap();
+        assert_eq!(collected.files.len(), 120);
+        assert_eq!(collected.entries_counted, 120);
+        assert_eq!(collected.bytes_counted, 120 * 16);
+    }
+
+    #[test]
+    fn disabled_backups_leave_the_walk_unbounded() {
+        let dir = tempfile::tempdir().unwrap();
+        write_tree(dir.path(), 30, 16);
+
+        let disabled = BackupPolicy {
+            enabled: false,
+            ..BackupPolicy::default()
+        };
+        let collected = collect(dir.path(), disabled, 1, 1).unwrap();
+        assert_eq!(collected.files.len(), 30);
+    }
 }

@@ -1137,6 +1137,75 @@ fn hard_link_blocks_recursive_delete() {
     assert!(status.success());
 }
 
+/// A recursive delete backs up every file before removing anything, and that
+/// copy runs while the delete holds its root's write lane. A large tree (a
+/// build output or a vendored dependency cache with thousands of small files)
+/// would hold the root for minutes, so the delete must refuse up front, leave
+/// the tree untouched, and say what it counted and what to do instead. The
+/// fixture is larger than the file budget so the count also has to stop at
+/// the cap instead of walking everything.
+#[test]
+fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
+    const FILES: usize = 2_500;
+    let dir = temp_dir("delete_recursive_backup_budget");
+    let tree = dir.join("node_modules");
+    for index in 0..FILES {
+        let package = tree.join(format!("pkg-{:03}", index / 25));
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join(format!("file-{index}.js")),
+            format!("module.exports = {index};\n"),
+        )
+        .unwrap();
+    }
+
+    let mut aft = AftProcess::spawn();
+    let delete = serde_json::json!({
+        "id": "delete-over-budget-tree",
+        "command": "delete_file",
+        "file": tree.display().to_string(),
+        "recursive": true,
+    });
+    let resp = aft.send(&serde_json::to_string(&delete).unwrap());
+
+    assert_eq!(resp["success"], false, "delete should be refused: {resp:?}");
+    assert_eq!(resp["code"], "recursive_delete_backup_too_large");
+    let message = resp["message"].as_str().unwrap();
+    assert!(
+        message.contains("at least 2001 files"),
+        "the count must stop just past the cap and say so: {message}"
+    );
+    assert!(message.contains("2000 files"), "names the limit: {message}");
+    assert!(message.contains("rm -rf"), "names the no-undo alternative: {message}");
+    assert!(
+        message.contains("smaller pieces"),
+        "names the undo-preserving alternative: {message}"
+    );
+
+    let remaining = fs::read_dir(&tree)
+        .unwrap()
+        .map(|package| fs::read_dir(package.unwrap().path()).unwrap().count())
+        .sum::<usize>();
+    assert_eq!(remaining, FILES, "nothing may be deleted");
+
+    let history = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "history-after-refusal",
+            "command": "edit_history",
+            "file": tree.join("pkg-000/file-0.js").display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        history["entries"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "a refused delete must not leave backups behind: {history:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 #[test]
 fn regular_tree_with_files_works_after_validation() {
     let dir = temp_dir("delete_recursive_regular_tree");
