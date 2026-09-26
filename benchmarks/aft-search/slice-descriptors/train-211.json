@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "write-census-trigram-and-tier2-credit",
+    "windows-hidden-child-processes"
+  ],
+  "note": "The only ranking-fence file touched is crates/aft/src/search_index.rs, where cache.bin and spill-segment writes are now credited to the write census. No search, ranking, fusion, lane or truncation code changed, and the parity fixture file is untouched, so ranked rows should be byte-equal to the reference."
+}
