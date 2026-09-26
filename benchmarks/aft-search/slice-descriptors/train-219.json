@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": ["semantic-watcher-unchanged-files"],
+  "note": "semantic_index.rs and semantic_search/mod.rs change: watcher events for files whose content still matches the index no longer mask their vectors, and a mass refresh reports refreshing with a partial-lane disclosure. The benchmark sees no watcher burst on Linux and no mass refresh, so ranked rows must be byte-equal to the reference."
+}
