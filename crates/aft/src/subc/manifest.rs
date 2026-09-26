@@ -35,6 +35,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
             | "move"
             | "import"
             | "safety"
+            | "bash_status"
+            | "bash_kill"
+            | "bash_write"
     )
 }
 
@@ -56,7 +59,10 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   bash calls that are still wait-registered; explicit background and PTY
 ///   tasks are not registered and are therefore untouched.
 /// - `bash_status`: read-only per-session task snapshot; required so a
-///   respawned module can report rehydrated detached tasks by task id.
+///   respawned module can report rehydrated detached tasks by task id. It is
+///   also an agent tool (see `is_subc_agent_core_tool`); it stays listed here
+///   so the plugins' own status polling keeps being treated as plumbing (for
+///   example, it is not counted by the repeated-call breaker).
 /// - `bash_drain_completions` / `bash_ack_completions`: per-session completion
 ///   registry plumbing for the bg_events wake lane (drain = PureRead,
 ///   ack = Mutating in `command_lane`).
@@ -69,7 +75,9 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 ///   plugins invoke natively (kill a task, drive a PTY, register/remove a
 ///   watch, detach a wait-mode command when a user message arrives). All are
 ///   session-scoped task plumbing; the untrusted-bind bash denial still fires
-///   first for every `bash_*` name.
+///   first for every `bash_*` name. `bash_kill` and `bash_write` are also agent
+///   tools; like `bash_status`, they stay listed here so the plugins' own calls
+///   keep being treated as plumbing.
 /// - `bash_regex_match`: pure regex compilation and matching for the plugins'
 ///   `bash_watch` validation and output scan; its parameters are only a regex
 ///   pattern and text, with no session or configuration privileges.
@@ -331,6 +339,17 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     tool("move", ExecutionMode::Mutating),
                     tool("import", ExecutionMode::Mutating),
                     tool("safety", ExecutionMode::Mutating),
+                    // Companions for the task ids `bash`/`powershell` hand back
+                    // (explicit background, PTY, promotion after the wait
+                    // window, detach on restart). The bash reply text tells
+                    // the model to call them, so a consumer that builds its
+                    // tool surface from this catalog must be offered them.
+                    // There is no `bash_watch` here: that waiting loop is
+                    // implemented inside the OpenCode and Pi plugins, not by
+                    // the module, and the catalog text does not mention it.
+                    tool("bash_status", ExecutionMode::Pure),
+                    tool("bash_kill", ExecutionMode::Mutating),
+                    tool("bash_write", ExecutionMode::Mutating),
                 ])
                 .collect(),
                 identity_scope: vec![IdentityScope::Session, IdentityScope::Project],
@@ -448,6 +467,9 @@ mod tests {
         "move",
         "import",
         "safety",
+        "bash_status",
+        "bash_kill",
+        "bash_write",
     ];
 
     /// Tools listed here deliberately skip translation; adding one is a reviewed
@@ -669,6 +691,7 @@ mod tests {
             "callgraph",
             "conflicts",
             "ast_search",
+            "bash_status",
         ] {
             assert_eq!(
                 by_name[name].execution_mode,
@@ -688,6 +711,8 @@ mod tests {
             "move",
             "import",
             "safety",
+            "bash_kill",
+            "bash_write",
         ] {
             assert_eq!(
                 by_name[name].execution_mode,
@@ -776,6 +801,26 @@ mod tests {
         // `subc::readiness`); this is the only field readiness adds.
         let top = expected.as_object_mut().expect("manifest object");
         assert_eq!(top.insert("ready".to_string(), json!(false)), None);
+        // The snapshot predates the bash companion tools, which the catalog
+        // appends after `safety`.
+        expected["provides"][0]["tools"]
+            .as_array_mut()
+            .expect("tool provider tools")
+            .extend(
+                [
+                    ("bash_status", "pure"),
+                    ("bash_kill", "mutating"),
+                    ("bash_write", "mutating"),
+                ]
+                .map(|(name, mode)| {
+                    json!({
+                        "name": name,
+                        "description": "<embedded description>",
+                        "execution_mode": mode,
+                        "schema": "<embedded schema>",
+                    })
+                }),
+            );
         assert_eq!(actual, expected);
     }
 
@@ -977,6 +1022,120 @@ mod tests {
             _ => panic!("expected ToolProvider"),
         };
         assert_eq!(served, crate::bash_background::powershell_available());
+    }
+
+    /// Every `bash_*` identifier in `text` (e.g. `bash_status` in
+    /// "use bash_status({ taskId })"). Config keys are spelled with a dot
+    /// (`bash.watch_sync_max_ms`), so they are not picked up.
+    fn bash_companion_mentions(text: &str) -> HashSet<String> {
+        let mut names = HashSet::new();
+        let bytes = text.as_bytes();
+        let mut start = 0;
+        while let Some(offset) = text[start..].find("bash_") {
+            let at = start + offset;
+            let preceded_by_word =
+                at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let end = text[at..]
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                .map_or(text.len(), |len| at + len);
+            if !preceded_by_word {
+                names.insert(text[at..end].trim_end_matches('_').to_string());
+            }
+            start = end.max(at + 1);
+        }
+        names
+    }
+
+    /// Reply text the server renders for the bash family and its companions,
+    /// i.e. what a catalog consumer shows the model after a `bash`/`powershell`
+    /// call hands back a task id and the model follows up on it.
+    fn server_rendered_bash_reply_texts() -> Vec<String> {
+        use crate::commands::bash_orchestrate as orchestrate;
+        let task = "bash-0123456789abcdef";
+        let running_status = |mode: &str| {
+            crate::subc_format::format_response(
+                "bash_status",
+                &crate::protocol::Response::success(
+                    "status",
+                    json!({ "task_id": task, "status": "running", "mode": mode }),
+                ),
+                false,
+            )
+        };
+        vec![
+            orchestrate::format_background_launch(task, false),
+            orchestrate::format_background_launch(task, true),
+            orchestrate::format_promotion_message(task, None, 30_000),
+            orchestrate::format_wait_detach_message(task),
+            orchestrate::format_module_drain_detach_message(task),
+            running_status("pty"),
+            running_status("pipes"),
+        ]
+    }
+
+    /// A consumer that builds its tool surface from this catalog can only offer
+    /// the model what the catalog lists. Whenever `bash` or `powershell` is
+    /// advertised, every companion tool named by any advertised description,
+    /// property description, or server-rendered bash reply must be advertised
+    /// too; otherwise the model is told to call a tool its host refuses.
+    #[test]
+    fn catalog_advertises_every_bash_companion_its_text_names() {
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let tools = match manifest.provides.first() {
+                Some(ProviderRole::ToolProvider { tools, .. }) => tools,
+                _ => panic!("expected ToolProvider"),
+            };
+            let advertised: HashSet<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+            if !advertised.contains("bash") && !advertised.contains("powershell") {
+                continue;
+            }
+
+            let mut sources: Vec<(String, String)> = Vec::new();
+            for tool in tools {
+                if let Some(description) = &tool.description {
+                    sources.push((format!("{} description", tool.name), description.clone()));
+                }
+                let mut properties = Vec::new();
+                collect_properties(&tool.schema, &mut properties);
+                for (name, property) in properties {
+                    if let Some(description) = property.get("description").and_then(Value::as_str) {
+                        sources.push((
+                            format!("{}.{name} description", tool.name),
+                            description.to_string(),
+                        ));
+                    }
+                }
+            }
+            for text in server_rendered_bash_reply_texts() {
+                sources.push(("server-rendered bash reply".to_string(), text));
+            }
+
+            let mut referenced = HashSet::new();
+            let mut missing = Vec::new();
+            for (source, text) in &sources {
+                for name in bash_companion_mentions(text) {
+                    if !advertised.contains(name.as_str()) {
+                        missing.push(format!("{name} (named by {source})"));
+                    }
+                    referenced.insert(name);
+                }
+            }
+            missing.sort();
+            missing.dedup();
+            assert!(
+                missing.is_empty(),
+                "catalog (powershell_available={powershell_available}) names bash companions it does not advertise: {missing:?}"
+            );
+            // Guards against a vacuous pass: the launch text alone names
+            // bash_status, bash_kill and bash_write.
+            for expected in ["bash_status", "bash_kill", "bash_write"] {
+                assert!(
+                    referenced.contains(expected),
+                    "scan found no mention of {expected}; the text sources are not being read"
+                );
+            }
+        }
     }
 
     #[test]

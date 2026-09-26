@@ -191,7 +191,7 @@
       {"id": "SUBC-CAP-V049-002", "bind": "untrusted/MCP", "stage": "before manifest-schema validation", "required": true, "status": "contractual; implementation owned by later slice"}
     ],
     "artifact_capabilities": [
-      {"id": "SUBC-CAP-V049-003", "capability": "21 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
+      {"id": "SUBC-CAP-V049-003", "capability": "24 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
       {"id": "SUBC-CAP-V049-004", "capability": "schemas are loaded by Rust manifest translation", "evidence": "crates/aft/src/subc/manifest.rs include_str!", "status": "checked"},
       {"id": "SUBC-CAP-V049-005", "capability": "schema bytes can be regenerated from host definitions", "evidence": "packages/opencode-plugin/scripts/build-tool-schemas.ts", "status": "checked; regeneration prohibited in S0"},
       {"id": "SUBC-CAP-V049-006", "capability": "trusted and untrusted binds share canonical compatibility rules", "evidence": "v0.49 specification contract", "status": "target; boundary tests owned by later slices"}
@@ -217,7 +217,10 @@
       {"id": "SUBC-TOOL-V049-017", "name": "move", "preview": "unknown; verify host/command capability"},
       {"id": "SUBC-TOOL-V049-018", "name": "import", "preview": "unknown; verify host/command capability"},
       {"id": "SUBC-TOOL-V049-020", "name": "safety", "preview": "unknown; verify host/command capability"},
-      {"id": "SUBC-TOOL-V049-021", "name": "status", "preview": "not a mutation; subc-only probe"}
+      {"id": "SUBC-TOOL-V049-021", "name": "status", "preview": "not a mutation; subc-only probe"},
+      {"id": "SUBC-TOOL-V049-023", "name": "bash_status", "preview": "not a mutation"},
+      {"id": "SUBC-TOOL-V049-024", "name": "bash_kill", "preview": "unknown; verify at command capability boundary"},
+      {"id": "SUBC-TOOL-V049-025", "name": "bash_write", "preview": "unknown; verify at command capability boundary"}
     ]
   },
   "registration_profile_manifest": {

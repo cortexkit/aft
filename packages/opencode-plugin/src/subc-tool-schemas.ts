@@ -6,9 +6,15 @@
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-
+import { resolveBashConfig } from "./config.js";
 import { astTools } from "./tools/ast.js";
-import { createBashTool } from "./tools/bash.js";
+import {
+  bashToolDescription,
+  createBashKillTool,
+  createBashStatusTool,
+  createBashTool,
+} from "./tools/bash.js";
+import { createBashWriteTool } from "./tools/bash_write.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { createReadTool, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
@@ -23,6 +29,14 @@ import type { PluginContext } from "./types.js";
 const z = tool.schema;
 
 const STATUS_DESCRIPTION = "Show AFT status, index health, cache usage, and runtime details";
+
+/**
+ * Catalog wording for `bash_status`. The OpenCode description ends with "To
+ * wait, use bash_watch", but the module catalog cannot offer `bash_watch`: its
+ * waiting loop is implemented in the OpenCode and Pi plugins, not the module.
+ */
+const BASH_STATUS_CATALOG_DESCRIPTION =
+  "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately and never waits; the task keeps running, and a completion reminder arrives when it exits.";
 
 const STATUS_SCHEMA = {
   type: "object",
@@ -52,6 +66,9 @@ const BARE_TOOL_ORDER = [
   "move",
   "import",
   "safety",
+  "bash_status",
+  "bash_kill",
+  "bash_write",
 ] as const;
 
 export type SubcBareToolName = (typeof BARE_TOOL_ORDER)[number];
@@ -158,6 +175,19 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   }
 
   const bashSchema = argsToJsonSchema(bash);
+  // The catalog has no `bash_watch` (the waiting loop lives in the OpenCode and
+  // Pi plugins, not in the module), so the catalog description must not steer
+  // the model to it. Only the description differs; the bash arguments stay the
+  // OpenCode tool's own.
+  const bashConfig = resolveBashConfig(ctx.config);
+  bashSchema.description = bashToolDescription(
+    false,
+    bashConfig.compress,
+    bashConfig.background,
+    true,
+    true,
+    false,
+  );
   const bashProperties = (bashSchema.properties ??= {}) as Record<string, unknown>;
   bashProperties.foreground_orchestrate = consumerOnly({
     type: "boolean",
@@ -203,6 +233,15 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     move: argsToJsonSchema(moveTool),
     import: argsToJsonSchema(importTool),
     safety: argsToJsonSchema(safety),
+    // Companions for the task ids `bash` hands back: its reply text tells the
+    // model to call them, so a consumer that builds its surface from the catalog
+    // must be offered them. Arguments match the OpenCode tools exactly.
+    bash_status: {
+      ...argsToJsonSchema(createBashStatusTool(ctx)),
+      description: BASH_STATUS_CATALOG_DESCRIPTION,
+    },
+    bash_kill: argsToJsonSchema(createBashKillTool(ctx)),
+    bash_write: argsToJsonSchema(createBashWriteTool(ctx)),
   };
 }
 

@@ -1009,6 +1009,9 @@ pub(crate) fn supports_tool(bare_name: &str) -> bool {
             | "move"
             | "import"
             | "safety"
+            | "bash_status"
+            | "bash_kill"
+            | "bash_write"
     )
 }
 
@@ -1129,9 +1132,37 @@ pub fn subc_translate_owned_with_context(
         "move" => translate_move(agent_args, project_root),
         "import" => translate_import(agent_args),
         "safety" => translate_safety(agent_args, project_root),
+        "bash_status" | "bash_kill" | "bash_write" => {
+            Ok(translate_bash_task_tool(bare_name, agent_args))
+        }
         other => Err(unsupported_tool(format!(
             "subc_translate: unsupported tool {other:?}"
         ))),
+    }
+}
+
+/// Maps the catalog spelling of the bash companion tools (`taskId`,
+/// `outputMode`) onto the native snake_case parameters. Every other key passes
+/// through untouched, and an explicit snake_case key wins over the camelCase
+/// one: AFT's own plugins call these commands natively over the same route
+/// with `task_id`, `output_offset` and friends, and must keep working exactly
+/// as before.
+fn translate_bash_task_tool(bare_name: &str, args: Value) -> Translated {
+    fn rename(map: &mut Map<String, Value>, from: &str, to: &str) {
+        if let Some(value) = map.remove(from) {
+            map.entry(to.to_string()).or_insert(value);
+        }
+    }
+    let mut map = agent_args_map(args);
+    rename(&mut map, "taskId", "task_id");
+    rename(&mut map, "outputMode", "output_mode");
+    if let Some(Value::Object(params)) = map.get_mut("params") {
+        rename(params, "taskId", "task_id");
+        rename(params, "outputMode", "output_mode");
+    }
+    Translated {
+        command: bare_name.to_string(),
+        args: map,
     }
 }
 
@@ -3637,6 +3668,9 @@ mod tests {
             "move",
             "import",
             "safety",
+            "bash_status",
+            "bash_kill",
+            "bash_write",
         ] {
             // Every name the allowlist claims support for must actually
             // translate (not return unsupported_tool). A no-arg call may fail
@@ -3655,5 +3689,57 @@ mod tests {
         }
         // A name that is not a tool must be rejected by both.
         assert!(!supports_tool("definitely_not_a_tool"));
+    }
+
+    #[test]
+    fn bash_companion_translation_maps_catalog_keys_and_keeps_native_ones() {
+        // Catalog spelling from a model.
+        let translated = subc_translate_owned(
+            "bash_status",
+            serde_json::json!({ "taskId": "bash-1", "outputMode": "screen" }),
+            Path::new("/project"),
+        )
+        .expect("bash_status must translate");
+        assert_eq!(translated.command, "bash_status");
+        assert_eq!(
+            Value::Object(translated.args),
+            serde_json::json!({ "task_id": "bash-1", "output_mode": "screen" })
+        );
+
+        // snake_case arguments as AFT's own plugins send them when polling
+        // with output offsets.
+        let native = serde_json::json!({
+            "task_id": "bash-2",
+            "output_mode": "raw",
+            "output_offset": 10,
+            "stderr_offset": 4,
+        });
+        let translated = subc_translate_owned("bash_status", native.clone(), Path::new("/project"))
+            .expect("native bash_status must translate");
+        assert_eq!(Value::Object(translated.args), native);
+
+        let translated = subc_translate_owned(
+            "bash_write",
+            serde_json::json!({ "taskId": "bash-3", "input": ["q", { "key": "enter" }] }),
+            Path::new("/project"),
+        )
+        .expect("bash_write must translate");
+        assert_eq!(translated.command, "bash_write");
+        assert_eq!(
+            Value::Object(translated.args),
+            serde_json::json!({ "task_id": "bash-3", "input": ["q", { "key": "enter" }] })
+        );
+
+        let translated = subc_translate_owned(
+            "bash_kill",
+            serde_json::json!({ "taskId": "bash-4" }),
+            Path::new("/project"),
+        )
+        .expect("bash_kill must translate");
+        assert_eq!(translated.command, "bash_kill");
+        assert_eq!(
+            Value::Object(translated.args),
+            serde_json::json!({ "task_id": "bash-4" })
+        );
     }
 }

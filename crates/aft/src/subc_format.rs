@@ -44,6 +44,8 @@ pub struct FormatContext {
     pub safety_op: Option<String>,
     pub safety_file_arg: Option<String>,
     pub safety_name_arg: Option<String>,
+    /// `outputMode` of a `bash_status` call; PTY status text depends on it.
+    pub bash_output_mode: Option<String>,
 }
 
 impl Default for FormatContext {
@@ -64,6 +66,7 @@ impl Default for FormatContext {
             safety_op: None,
             safety_file_arg: None,
             safety_name_arg: None,
+            bash_output_mode: None,
         }
     }
 }
@@ -88,8 +91,20 @@ impl FormatContext {
             safety_op: safety_string_arg_for_call(bare_name, arguments, "op"),
             safety_file_arg: safety_string_arg_for_call(bare_name, arguments, "filePath"),
             safety_name_arg: safety_string_arg_for_call(bare_name, arguments, "name"),
+            bash_output_mode: bash_output_mode_for_call(bare_name, arguments),
         }
     }
+}
+
+fn bash_output_mode_for_call(bare_name: &str, arguments: &Value) -> Option<String> {
+    if bare_name != "bash_status" {
+        return None;
+    }
+    let obj = arguments.as_object()?;
+    obj.get("outputMode")
+        .or_else(|| obj.get("output_mode"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 fn agent_specified_read_range(arguments: &Value) -> bool {
@@ -245,6 +260,9 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "move"
             | "import"
             | "safety"
+            | "bash_status"
+            | "bash_kill"
+            | "bash_write"
     )
 }
 
@@ -304,6 +322,9 @@ pub fn format_response_with_context(
         "move" => format_move(data, ctx),
         "import" => format_import(data, ctx),
         "safety" => format_safety(data, ctx),
+        "bash_status" => format_bash_status(data, ctx.bash_output_mode.as_deref()),
+        "bash_kill" => format_bash_kill(data),
+        "bash_write" => format_bash_write(data),
         _ => unreachable!("core agent tools are exhaustive"),
     };
     if let Some(reason) = data.get("backup_skipped_reason").and_then(Value::as_str) {
@@ -828,6 +849,114 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 // Mirrors per-tool OpenCode wrapper error handling in packages/opencode-plugin/src/tools/*.ts.
+fn bash_task_id(data: &Value) -> &str {
+    data.get("task_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+// Mirrors packages/opencode-plugin/src/tools/bash.ts formatBashStatusText and
+// formatPtyStatus, so a catalog consumer shows the model the same status text
+// the OpenCode tool does.
+fn format_bash_status(data: &Value, output_mode: Option<&str>) -> String {
+    let task_id = bash_task_id(data);
+    let status = data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut text = format!("Task {task_id}: {status}");
+    if let Some(exit_code) = data.get("exit_code").and_then(Value::as_i64) {
+        text.push_str(&format!(" (exit {exit_code})"));
+    }
+    if let Some(duration_ms) = data.get("duration_ms").and_then(Value::as_u64) {
+        // Rounded to the nearest second, as the plugin displays it.
+        text.push_str(&format!(" {}s", duration_ms.saturating_add(500) / 1000));
+    }
+    if let Some(summary) = data.get("live_descendants_summary").and_then(Value::as_str) {
+        text.push_str(&format!(" · {summary}"));
+    }
+    let running = status == "running";
+    if data.get("mode").and_then(Value::as_str) == Some("pty") {
+        let raw = data
+            .get("pty_raw")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let screen = data
+            .get("pty_screen")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match output_mode.unwrap_or("screen") {
+            "raw" => {
+                if !raw.is_empty() {
+                    text.push('\n');
+                    text.push_str(raw);
+                }
+            }
+            "both" => {
+                // Built by hand so the keys come out as `screen` then `raw`,
+                // the order the plugin prints (serde_json would sort them).
+                text.push_str(&format!(
+                    "\n{{\n  \"screen\": {},\n  \"raw\": {}\n}}",
+                    Value::String(screen.to_string()),
+                    Value::String(raw.to_string()),
+                ));
+            }
+            _ => {
+                if !screen.is_empty() {
+                    text.push('\n');
+                    text.push_str(screen);
+                }
+            }
+        }
+        if running {
+            text.push_str(&format!(
+                "\nPTY task is still running. Use bash_status({{ taskId: \"{task_id}\", outputMode: \"screen\" }}) to inspect, bash_write({{ taskId: \"{task_id}\", input: \"...\" }}) to send keystrokes."
+            ));
+        }
+    } else {
+        let preview = data
+            .get("output_preview")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !preview.is_empty() && !running {
+            text.push('\n');
+            text.push_str(preview);
+        }
+        if running {
+            text.push_str("\nA completion reminder will be delivered automatically; don't poll.");
+        }
+    }
+    text
+}
+
+// Formats a kill result exactly as the OpenCode tool does
+// (packages/opencode-plugin/src/tools/bash.ts createBashKillTool), so catalog
+// consumers show the model the same text.
+fn format_bash_kill(data: &Value) -> String {
+    let task_id = bash_task_id(data);
+    if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
+        let reached = data
+            .get("kill_reached")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        return format!("Task {task_id}: kill_signaled · reached {reached} live descendants");
+    }
+    let status = data
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("killed");
+    format!("Task {task_id}: {status}")
+}
+
+// Formats a PTY write result exactly as the OpenCode tool does
+// (packages/opencode-plugin/src/tools/bash_write.ts createBashWriteTool).
+fn format_bash_write(data: &Value) -> String {
+    format!(
+        "{{\n  \"bytes_written\": {}\n}}",
+        data.get("bytes_written").cloned().unwrap_or(Value::Null)
+    )
+}
+
 fn format_error(bare_name: &str, data: &Value, ctx: &FormatContext) -> String {
     if bare_name == "inspect" {
         if let Some(text) = format_inspect_terminal(data) {
@@ -3673,5 +3802,110 @@ mod outline_format_tests {
 
         assert!(formatted.contains("notes.txt — unsupported_language"));
         assert!(!formatted.contains("no supported language"));
+    }
+}
+
+#[cfg(test)]
+mod bash_companion_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn status_text(data: Value, output_mode: Option<&str>) -> String {
+        let ctx = FormatContext::from_tool_call(
+            "bash_status",
+            &json!({ "taskId": "bash-1", "outputMode": output_mode }),
+            Path::new("/project"),
+        );
+        format_response_with_context("bash_status", &Response::success("1", data), &ctx)
+    }
+
+    #[test]
+    fn bash_status_renders_piped_and_pty_text_like_the_opencode_tool() {
+        assert_eq!(
+            status_text(
+                json!({
+                    "task_id": "bash-1",
+                    "status": "completed",
+                    "mode": "pipes",
+                    "exit_code": 0,
+                    "duration_ms": 1500,
+                    "output_preview": "done",
+                }),
+                None,
+            ),
+            "Task bash-1: completed (exit 0) 2s\ndone"
+        );
+        assert_eq!(
+            status_text(
+                json!({ "task_id": "bash-1", "status": "running", "mode": "pipes", "output_preview": "partial" }),
+                None,
+            ),
+            "Task bash-1: running\nA completion reminder will be delivered automatically; don't poll."
+        );
+        assert_eq!(
+            status_text(
+                json!({ "task_id": "bash-1", "status": "running", "mode": "pty", "pty_screen": ">>> " }),
+                None,
+            ),
+            "Task bash-1: running\n>>> \nPTY task is still running. Use bash_status({ taskId: \"bash-1\", outputMode: \"screen\" }) to inspect, bash_write({ taskId: \"bash-1\", input: \"...\" }) to send keystrokes."
+        );
+        assert_eq!(
+            status_text(
+                json!({ "task_id": "bash-1", "status": "completed", "mode": "pty", "pty_screen": "s", "pty_raw": "r" }),
+                Some("both"),
+            ),
+            "Task bash-1: completed\n{\n  \"screen\": \"s\",\n  \"raw\": \"r\"\n}"
+        );
+        assert_eq!(
+            status_text(
+                json!({ "task_id": "bash-1", "status": "completed", "mode": "pty", "pty_screen": "s", "pty_raw": "r" }),
+                Some("raw"),
+            ),
+            "Task bash-1: completed\nr"
+        );
+    }
+
+    #[test]
+    fn bash_kill_and_write_render_like_the_opencode_tools() {
+        let ctx = FormatContext::default();
+        assert_eq!(
+            format_response_with_context(
+                "bash_kill",
+                &Response::success(
+                    "1",
+                    json!({ "task_id": "bash-1", "status": "killed", "kill_signaled": true, "kill_reached": 2 }),
+                ),
+                &ctx,
+            ),
+            "Task bash-1: kill_signaled · reached 2 live descendants"
+        );
+        assert_eq!(
+            format_response_with_context(
+                "bash_kill",
+                &Response::success("1", json!({ "task_id": "bash-1", "status": "killed" })),
+                &ctx,
+            ),
+            "Task bash-1: killed"
+        );
+        assert_eq!(
+            format_response_with_context(
+                "bash_write",
+                &Response::success("1", json!({ "bytes_written": 3 })),
+                &ctx,
+            ),
+            "{\n  \"bytes_written\": 3\n}"
+        );
+        assert_eq!(
+            format_response_with_context(
+                "bash_write",
+                &Response::error(
+                    "1",
+                    "task_not_pty",
+                    "background task is not a PTY task: bash-1"
+                ),
+                &ctx,
+            ),
+            "background task is not a PTY task: bash-1"
+        );
     }
 }
