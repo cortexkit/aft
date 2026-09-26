@@ -5802,6 +5802,11 @@ mod watcher_slice_tests {
 
     #[test]
     fn watcher_batch_schedules_view_publication_within_its_own_quiet_window() {
+        // The assertion below reads the semantic quiet window, which other
+        // tests shorten through AFT_SEMANTIC_QUIET_WINDOW_MS while holding the
+        // process env lock. Hold it too, or a concurrent override makes the
+        // semantic window 1 ms and the comparison meaningless.
+        let _env = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
         let (ctx, tx) = context_with_watcher(temp.path());
         ctx.update_config(|config| config.views.enabled = true);
