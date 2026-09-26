@@ -129,7 +129,8 @@ function instrument(name: string, detail: string): Finding {
 }
 // The aft CLI writes its own log lines to stderr (for example
 // "[aft] log retention sweep: ..." or "[aft] login-shell PATH probe: ...",
-// optionally behind a UTC timestamp). A failing command's stderr therefore
+// optionally behind a UTC timestamp and followed by the level, as in
+// "2026-09-26T10:00:00Z [aft] INFO ..."). A failing command's stderr therefore
 // carries those lines ahead of the line that explains the failure, and
 // String(error) prefixes the first one with "Error: ".
 const CLI_LOG_LINE = /^(?:Error:\s*)?(?:\d{4}-\d\d-\d\dT\S+\s+)?\[aft(?:-lsp)?\]\s/;

@@ -4810,6 +4810,7 @@ where
                             completed.channel,
                             completed.corr,
                             completed.phases,
+                            completed.caller,
                         );
                     });
                 }
@@ -6406,6 +6407,13 @@ async fn handle_tool_call(
     };
     let bare_name = call.name;
     let arguments = strip_agent_preview_arg_owned(call.arguments);
+    // Decided before the arguments move into the job: slow-call logging needs
+    // to know whether a person is waiting on this call.
+    let caller = if manifest::is_native_plumbing_call(&bare_name, &arguments) {
+        crate::logging::ToolCallCaller::Plumbing
+    } else {
+        crate::logging::ToolCallCaller::Agent
+    };
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         &bare_name,
         &arguments,
@@ -6881,6 +6889,7 @@ async fn handle_tool_call(
                             let trace = ToolResponseWriteTrace::new(
                                 phase_trace,
                                 bare_name.clone(),
+                                caller,
                                 identity.project_root.clone(),
                                 identity.session.clone(),
                                 route.channel,
@@ -7060,6 +7069,7 @@ async fn handle_tool_call(
                     let trace = ToolResponseWriteTrace::new(
                         phase_trace,
                         bare_name_for_frame,
+                        caller,
                         completion_root,
                         completion_session,
                         route.channel,
@@ -7298,6 +7308,9 @@ async fn deliver_resolved_subc_response(
     let trace = ToolResponseWriteTrace::new(
         std::mem::replace(&mut entry.phase_trace, PhaseTrace::new(Instant::now())),
         entry.bare_name.clone(),
+        // Only `inspect` and LSP navigation take the deferred-response path,
+        // and both are agent tools.
+        crate::logging::ToolCallCaller::Agent,
         identity.project_root.clone(),
         entry.session_id.clone(),
         entry.route.channel,

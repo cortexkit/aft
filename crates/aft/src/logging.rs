@@ -672,14 +672,14 @@ pub fn init() {
                 })
                 .unwrap_or_else(|error| {
                     write_stderr_once(&format!(
-                        "[aft] durable log disabled: cannot start writer thread: {error}\n"
+                        "[aft] WARN durable log disabled: cannot start writer thread: {error}\n"
                     ));
                     None
                 })
         }
         Err(error) => {
             write_stderr_once(&format!(
-                "[aft] durable log disabled for {}: {error}\n",
+                "[aft] WARN durable log disabled for {}: {error}\n",
                 file_path.display()
             ));
             None
@@ -689,23 +689,16 @@ pub fn init() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(TeeWriter { file_tx })))
         .format(|buf, record| {
-            let prefix = if record.target().starts_with("aft::lsp")
-                || record.target().starts_with("aft_lsp")
-            {
-                "[aft-lsp]"
-            } else {
-                "[aft]"
-            };
             // Wall-clock stamp so post-hoc log forensics can correlate
             // lines with external events (health probes, module bounces).
             // Seconds precision is enough; chrono is avoided on purpose —
             // this hand-rolls UTC from the epoch to keep deps flat.
-            writeln!(
+            write_log_line(
                 buf,
-                "{} {} {}",
-                format_utc_timestamp(),
-                prefix,
-                record.args()
+                &format_utc_timestamp(),
+                record.level(),
+                record.target(),
+                record.args(),
             )
         })
         .init();
@@ -713,6 +706,29 @@ pub fn init() {
     if let Some(summary) = startup_sweep {
         log_sweep_summary(summary);
     }
+}
+
+/// Write one log line in the shared format used by both the stderr copy and
+/// the durable file copy (`TeeWriter` receives these exact bytes):
+/// `<timestamp> [aft] LEVEL <message>`.
+///
+/// The level sits after the `[aft]`/`[aft-lsp]` tag rather than before it so
+/// every existing reader that anchors on `<timestamp> [aft]` (the health
+/// sentinel's CLI-line filter, the plugins' stderr relay tag check, ad-hoc
+/// greps) keeps matching, while `grep ' WARN '` or `' ERROR '` now works.
+fn write_log_line<W: Write + ?Sized>(
+    out: &mut W,
+    timestamp: &str,
+    level: log::Level,
+    target: &str,
+    message: &std::fmt::Arguments<'_>,
+) -> io::Result<()> {
+    let prefix = if target.starts_with("aft::lsp") || target.starts_with("aft_lsp") {
+        "[aft-lsp]"
+    } else {
+        "[aft]"
+    };
+    writeln!(out, "{timestamp} {prefix} {level} {message}")
 }
 
 /// Render `now` as `YYYY-MM-DDTHH:MM:SSZ` without a date-time dependency.
@@ -857,7 +873,7 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
         if !lines.is_empty() {
             if let Err(error) = sink.write_batch(&lines) {
                 write_stderr_once(&format!(
-                    "[aft] durable log disabled after write failure for {}: {error}\n",
+                    "[aft] WARN durable log disabled after write failure for {}: {error}\n",
                     sink.path.display()
                 ));
                 break;
@@ -877,7 +893,7 @@ fn run_file_writer(mut sink: RotatingFile, rx: mpsc::Receiver<LogMessage>) {
                     log_sweep_summary(summary);
                 }
                 Err(error) => write_stderr_once(&format!(
-                    "[aft] durable log could not switch to {}: {error}\n",
+                    "[aft] WARN durable log could not switch to {}: {error}\n",
                     path.display()
                 )),
             }
@@ -1504,6 +1520,36 @@ pub fn note_callgraph_invalidations(files: usize) {
         .fetch_add(files as u64, Ordering::Relaxed);
 }
 
+/// Who made a tool call, which decides how loudly a slow one is logged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ToolCallCaller {
+    /// A tool call made on behalf of the model (an agent-facing tool).
+    Agent,
+    /// A background call the plugins make on their own (completion drains,
+    /// task status polls, permission previews). Nobody waits on these
+    /// interactively, so a slow one is not worth a warning.
+    Plumbing,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SLOW_TOOL_CALL_CAPTURE: RefCell<Vec<(log::Level, String)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Log level for a tool call that exceeded `SLOW_TOOL_CALL_THRESHOLD`.
+///
+/// Plugin plumbing calls (completion drains, status polls, detach checks) run
+/// in the background and made up about half of all slow-call warnings, which
+/// buried the slow calls an agent actually waited on. They still log at debug
+/// so a slow drain can be investigated with debug logging on.
+fn slow_tool_call_level(caller: ToolCallCaller) -> log::Level {
+    match caller {
+        ToolCallCaller::Agent => log::Level::Warn,
+        ToolCallCaller::Plumbing => log::Level::Debug,
+    }
+}
+
 /// Record a completed subc tool call for slow-call diagnostics and the standing
 /// perf-tick window. The writer calls this only after `write_all` has handed the
 /// complete response frame to the transport.
@@ -1513,6 +1559,7 @@ pub fn note_tool_call_trace(
     channel: u16,
     corr: u64,
     phases: ToolCallPhaseDurations,
+    caller: ToolCallCaller,
 ) {
     let sample = ToolCallPerfSample {
         total_ms: duration_millis_u64(phases.total),
@@ -1555,7 +1602,8 @@ pub fn note_tool_call_trace(
     );
 
     if phases.total > SLOW_TOOL_CALL_THRESHOLD {
-        crate::slog_warn!(
+        let level = slow_tool_call_level(caller);
+        let message = format!(
             "slow tool_call name={} channel={} corr={} total={}ms queue={} translate={} exec={} format={} finalize={} egress={} egress_enqueue={} egress_queue={} egress_prepare={} egress_write={} frame_bytes={} writer_queue_depth={} writer_active={} writer_queue_full={} reserve_timeouts={} waiting_on={} waiting_on_build_id={} wait_ms={} root={}",
             name,
             channel,
@@ -1581,6 +1629,10 @@ pub fn note_tool_call_trace(
             phases.wait_ms,
             root.display(),
         );
+        #[cfg(test)]
+        SLOW_TOOL_CALL_CAPTURE
+            .with(|captured| captured.borrow_mut().push((level, message.clone())));
+        log::log!(level, "{}{}", crate::log_ctx::session_prefix(), message);
     }
 }
 
@@ -1795,6 +1847,114 @@ mod tests {
 
     fn line(value: &str) -> Vec<Vec<u8>> {
         vec![format!("{value}\n").into_bytes()]
+    }
+
+    fn render_log_line(level: log::Level, target: &str, message: &str) -> String {
+        let mut out = Vec::new();
+        write_log_line(
+            &mut out,
+            "2026-09-26T10:00:00Z",
+            level,
+            target,
+            &format_args!("{message}"),
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn log_lines_carry_their_level_after_the_tag() {
+        assert_eq!(
+            render_log_line(log::Level::Warn, "aft::subc", "slow tool_call name=read"),
+            "2026-09-26T10:00:00Z [aft] WARN slow tool_call name=read\n"
+        );
+        assert_eq!(
+            render_log_line(log::Level::Error, "aft::lsp::client", "server crashed"),
+            "2026-09-26T10:00:00Z [aft-lsp] ERROR server crashed\n"
+        );
+        assert_eq!(
+            render_log_line(log::Level::Info, "aft", "started"),
+            "2026-09-26T10:00:00Z [aft] INFO started\n"
+        );
+        assert_eq!(
+            render_log_line(log::Level::Debug, "aft_lsp", "x"),
+            "2026-09-26T10:00:00Z [aft-lsp] DEBUG x\n"
+        );
+    }
+
+    fn slow_phases() -> ToolCallPhaseDurations {
+        ToolCallPhaseDurations {
+            queue: Duration::ZERO,
+            translate: Duration::ZERO,
+            execute: Duration::from_millis(120),
+            format: Duration::ZERO,
+            finalize: Duration::ZERO,
+            egress_enqueue: Duration::ZERO,
+            egress_queue: Duration::ZERO,
+            egress_prepare: Duration::ZERO,
+            egress_write: Duration::ZERO,
+            egress: Duration::ZERO,
+            frame_bytes: 10,
+            writer_queue_depth: 0,
+            writer_active_at_enqueue: false,
+            writer_queue_was_full: false,
+            writer_reserve_timeouts: 0,
+            total: SLOW_TOOL_CALL_THRESHOLD + Duration::from_millis(70),
+            waiting_on: WaitingOn::None,
+            waiting_on_build_id: None,
+            wait_ms: 0,
+        }
+    }
+
+    fn slow_call_levels(name: &str, caller: ToolCallCaller) -> Vec<log::Level> {
+        SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.borrow_mut().clear());
+        note_tool_call_trace(name, Path::new("/repo"), 7, 1, slow_phases(), caller);
+        SLOW_TOOL_CALL_CAPTURE.with(|captured| {
+            captured
+                .borrow_mut()
+                .drain(..)
+                .inspect(|(_, message)| {
+                    assert!(message.starts_with(&format!("slow tool_call name={name} ")))
+                })
+                .map(|(level, _)| level)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn slow_plumbing_call_logs_at_debug_while_slow_agent_call_warns() {
+        assert_eq!(
+            slow_call_levels("bash_drain_completions", ToolCallCaller::Plumbing),
+            vec![log::Level::Debug]
+        );
+        assert_eq!(
+            slow_call_levels("bash_status", ToolCallCaller::Plumbing),
+            vec![log::Level::Debug]
+        );
+        assert_eq!(
+            slow_call_levels("bash_status", ToolCallCaller::Agent),
+            vec![log::Level::Warn]
+        );
+        assert_eq!(
+            slow_call_levels("read", ToolCallCaller::Agent),
+            vec![log::Level::Warn]
+        );
+    }
+
+    #[test]
+    fn fast_call_logs_no_slow_line() {
+        let mut phases = slow_phases();
+        phases.total = SLOW_TOOL_CALL_THRESHOLD;
+        SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.borrow_mut().clear());
+        note_tool_call_trace(
+            "read",
+            Path::new("/repo"),
+            7,
+            1,
+            phases,
+            ToolCallCaller::Agent,
+        );
+        assert!(SLOW_TOOL_CALL_CAPTURE.with(|captured| captured.borrow().is_empty()));
     }
 
     #[test]

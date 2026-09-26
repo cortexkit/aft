@@ -86,6 +86,10 @@ human-readable log message is used as a gate input.
 - Peak RSS and CPU seconds come from the runner's process sampler.
 - `waiting_on.<cause>` is the breakdown emitted in the runner CSV from
   structured `slow tool_call` records whose total is greater than two seconds.
+  Slow calls the plugins make in the background (completion drains, task
+  status polls and the rest of the native plumbing allowlist) are logged at
+  debug level, so at the default level these records cover agent tool calls
+  only.
 - A regression prints the metric, baseline, observed minimum, allowed limit, and
   the three largest numeric `index_event` deltas for the selected observation.
 - Every repository also prints an `OBSERVED` line with both runs' values for

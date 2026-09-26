@@ -39,9 +39,26 @@ fn spawned_aft_writes_durable_log_under_aft_cache_dir() {
         .join("logs")
         .join(format!("aft-{pid}.log"));
     for _ in 0..20 {
-        if std::fs::read_to_string(&log_path)
-            .is_ok_and(|contents| contents.contains("started, pid"))
+        if let Some(file_line) = std::fs::read_to_string(&log_path)
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find(|line| line.contains("started, pid"))
+                    .map(str::to_string)
+            })
         {
+            // Both copies of a line carry its level after the tag, and the
+            // stderr copy is byte-for-byte the durable one.
+            assert!(
+                file_line.contains(" [aft] INFO started, pid "),
+                "{file_line}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.lines().any(|line| line == file_line),
+                "stderr lacks {file_line:?}: {stderr}"
+            );
             return;
         }
         thread::sleep(Duration::from_millis(25));

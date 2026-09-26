@@ -102,12 +102,13 @@ pub fn session_prefix() -> String {
 /// The macro automatically reads the thread-local session id and formats:
 ///
 /// ```text
-/// With session:    [aft] [ses_abcd1234] semantic index: rebuilding from scratch
-/// Without session: [aft] semantic index: rebuilding from scratch
+/// With session:    <ts> [aft] INFO [ses_abcd1234] semantic index: rebuilding from scratch
+/// Without session: <ts> [aft] INFO semantic index: rebuilding from scratch
 /// ```
 ///
-/// The `[aft]` / `[aft-lsp]` outer prefix is added by env_logger based on the
-/// log target — do NOT inline it into the macro body, that produces a doubled
+/// The timestamp, `[aft]` / `[aft-lsp]` outer prefix and level are added by
+/// the env_logger format in `logging.rs` based on the log record — do NOT
+/// inline them into the macro body, that produces a doubled
 /// `[aft-lsp] [aft]` prefix when LSP modules log.
 #[macro_export]
 macro_rules! slog_info {

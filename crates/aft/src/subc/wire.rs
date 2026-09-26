@@ -10,6 +10,7 @@ use super::{
     Frame, FrameType, Ordering, PathBuf, Response, RouteChannel, ToolCallResult, Value,
     CONTROL_SEND_TIMEOUT, RELIABLE_WRITER_RETRY_INITIAL_BACKOFF, RELIABLE_WRITER_RETRY_MAX_BACKOFF,
 };
+use crate::logging::ToolCallCaller;
 use crate::run_tool_call::{PhaseTrace, ToolCallEgressTiming, ToolCallPhaseDurations};
 use std::borrow::Cow;
 use subc_protocol::{FrameBuildError, MAX_FRAME_BODY_LEN};
@@ -19,6 +20,7 @@ pub(super) type WriterSender = mpsc::Sender<WriterFrame>;
 pub(super) struct ToolResponseWriteTrace {
     phase_trace: PhaseTrace,
     name: String,
+    caller: ToolCallCaller,
     root: PathBuf,
     session: String,
     channel: u16,
@@ -34,6 +36,7 @@ impl ToolResponseWriteTrace {
     pub(super) fn new(
         phase_trace: PhaseTrace,
         name: String,
+        caller: ToolCallCaller,
         root: PathBuf,
         session: String,
         channel: u16,
@@ -42,6 +45,7 @@ impl ToolResponseWriteTrace {
         Self {
             phase_trace,
             name,
+            caller,
             root,
             session,
             channel,
@@ -88,6 +92,7 @@ impl ToolResponseWriteTrace {
         })?;
         Some(CompletedToolResponseTrace {
             name: self.name,
+            caller: self.caller,
             root: self.root,
             session: self.session,
             channel: self.channel,
@@ -99,6 +104,7 @@ impl ToolResponseWriteTrace {
 
 pub(super) struct CompletedToolResponseTrace {
     pub(super) name: String,
+    pub(super) caller: ToolCallCaller,
     pub(super) root: PathBuf,
     pub(super) session: String,
     pub(super) channel: u16,

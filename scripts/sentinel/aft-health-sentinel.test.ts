@@ -486,6 +486,9 @@ describe("health sentinel pure detectors", () => {
       const stderr = [
         "Error: [aft] log retention sweep: removed_files=0 bytes_freed=0 recycled_pids=0",
         "2026-09-22T21:04:11Z [aft] login-shell PATH probe: resolved 14 entries",
+        // Daemon lines carry their level after the tag.
+        "2026-09-26T10:00:00Z [aft] INFO log retention sweep: removed_files=0 bytes_freed=0 recycled_pids=0",
+        "2026-09-26T10:00:01Z [aft-lsp] WARN server exited",
         "daemon returned an unsuccessful writes.census response: timed out",
       ].join("\n");
       expect(instrumentErrorText(stderr)).toBe("daemon returned an unsuccessful writes.census response: timed out");

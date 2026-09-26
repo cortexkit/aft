@@ -111,6 +111,28 @@ pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     )
 }
 
+/// Is this particular call the plugins' own background plumbing rather than an
+/// agent's tool call? Used to keep slow plumbing calls out of the warning log.
+///
+/// Names only on the plumbing allowlist are always plumbing. `bash_status`,
+/// `bash_kill` and `bash_write` are on both lists, so for them the arguments
+/// decide: an agent's call through the tool catalog is spelled with the
+/// catalog's required camelCase `taskId` (see `translate_bash_task_tool`),
+/// while the plugins' native calls use the snake_case `task_id`. The request
+/// carries no other marker of who sent it.
+pub(crate) fn is_native_plumbing_call(name: &str, arguments: &Value) -> bool {
+    if !is_subc_native_plumbing_tool(name) {
+        return false;
+    }
+    if !is_subc_agent_core_tool(name) {
+        return true;
+    }
+    let has_catalog_task_id = |value: &Value| value.get("taskId").is_some();
+    let agent_spelled =
+        has_catalog_task_id(arguments) || arguments.get("params").is_some_and(has_catalog_task_id);
+    !agent_spelled
+}
+
 pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
     match command {
         "ping"
@@ -831,6 +853,37 @@ mod tests {
         assert_eq!(command_lane("bash_status"), Lane::PureRead);
         assert_eq!(command_lane("bash_wait_detach"), Lane::PureRead);
         assert!(is_subc_native_plumbing_tool("bash_status"));
+    }
+
+    #[test]
+    fn plumbing_call_classification_follows_the_caller_for_shared_bash_tools() {
+        // Plumbing-only names are plumbing whatever they carry.
+        assert!(is_native_plumbing_call(
+            "bash_drain_completions",
+            &json!({ "session_id": "s" })
+        ));
+        assert!(is_native_plumbing_call("bash_wait_detach", &json!({})));
+        // Agent-only tools are never plumbing.
+        assert!(!is_native_plumbing_call(
+            "read",
+            &json!({ "filePath": "a" })
+        ));
+        // Shared names: the plugins' native snake_case call is plumbing, the
+        // catalog's camelCase call is the agent's.
+        for name in ["bash_status", "bash_kill", "bash_write"] {
+            assert!(
+                is_native_plumbing_call(name, &json!({ "task_id": "bash-1" })),
+                "{name} native call"
+            );
+            assert!(
+                !is_native_plumbing_call(name, &json!({ "taskId": "bash-1" })),
+                "{name} catalog call"
+            );
+            assert!(
+                !is_native_plumbing_call(name, &json!({ "params": { "taskId": "bash-1" } })),
+                "{name} catalog call wrapped in params"
+            );
+        }
     }
 
     #[test]

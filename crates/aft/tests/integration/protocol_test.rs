@@ -200,12 +200,12 @@ fn test_clean_shutdown() {
 
     // Verify stderr contains the expected lifecycle messages
     assert!(
-        stderr.contains("[aft] started"),
+        stderr.contains("[aft] INFO started"),
         "stderr should contain startup banner, got: {}",
         stderr
     );
     assert!(
-        stderr.contains("[aft] stdin closed, shutting down"),
+        stderr.contains("[aft] INFO stdin closed, shutting down"),
         "stderr should contain shutdown banner, got: {}",
         stderr
     );
