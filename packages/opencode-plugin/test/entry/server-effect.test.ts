@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { subcConnectionFileError } from "@cortexkit/aft-bridge";
 import { Cause, Effect } from "effect";
 import { z } from "zod";
 
 import { ConfigRejectedError } from "../../src/config.js";
 import { makeServerEffect } from "../../src/entry/server-runtime.mjs";
+import * as logger from "../../src/logger.js";
 
 /** A registered V2 tool call fails (an Effect failure, red in the host) with the fix text. */
 async function expectConfigErrorCall(tool: Record<string, unknown> | undefined, fix: string) {
@@ -124,6 +125,41 @@ function hostContext(
 }
 
 describe("V2 server effect", () => {
+  test("each start line names the entry and the Location, and pairs with a stop line", async () => {
+    const log = spyOn(logger, "log");
+    try {
+      const events: string[] = [];
+      const effect = makeServerEffect(testDependencies(events));
+      // Two Locations for one directory alive at the same time: the second
+      // start says so, which is what tells a double start from a reload.
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.all([
+            effect(hostContext("/work/one", events, []).context),
+            effect(hostContext("/work/one", events, []).context),
+          ]),
+        ),
+      );
+      const lines = log.mock.calls
+        .map((call) => String(call[0]))
+        .filter((line) => line.startsWith("AFT V2 runtime"));
+      expect(lines).toHaveLength(4);
+      const starts = lines.filter((line) => line.includes("starting"));
+      expect(starts).toHaveLength(2);
+      for (const line of starts) {
+        expect(line).toContain("server entry, Location (no id) at /work/one");
+      }
+      expect(starts[0]).not.toContain("still running");
+      expect(starts[1]).toContain("1 other Location(s) for this directory still running");
+      expect(lines.filter((line) => line.includes("stopped"))).toEqual([
+        "AFT V2 runtime stopped (server entry, Location (no id) at /work/one)",
+        "AFT V2 runtime stopped (server entry, Location (no id) at /work/one)",
+      ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   test("captures and boots each Location exactly once, then releases its pool", async () => {
     for (const directory of ["/work/a", "/work/b"]) {
       const events: string[] = [];

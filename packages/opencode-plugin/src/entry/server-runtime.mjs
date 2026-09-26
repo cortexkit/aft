@@ -116,6 +116,42 @@ async function bootLocation(context, location, dependencies) {
   return { consumers, pool, tools };
 }
 
+/**
+ * Locations whose runtime is running in this process, by directory, so the
+ * start line can say when the host starts a second Location for a directory
+ * that already has one.
+ */
+const runningByDirectory = new Map();
+let startsInProcess = 0;
+
+/**
+ * The start line names the entry, the Location and how many starts this
+ * process has seen. The V2 host calls the server effect once per Location and
+ * again when it reloads one, so two start lines on one host launch are two
+ * Locations or a reload; with the Location and the matching "stopped" line in
+ * the log, a reader can tell which instead of seeing the same line twice.
+ */
+function logRuntimeStart(location) {
+  startsInProcess += 1;
+  const directory = location.directory;
+  const running = runningByDirectory.get(directory) ?? 0;
+  runningByDirectory.set(directory, running + 1);
+  const id = typeof location.id === "string" ? location.id : "(no id)";
+  const overlap =
+    running > 0
+      ? `; ${running} other Location(s) for this directory still running`
+      : "";
+  log(
+    `AFT V2 runtime starting (server entry, Location ${id} at ${directory}; start ${startsInProcess} in this process${overlap})`,
+  );
+  return () => {
+    const left = (runningByDirectory.get(directory) ?? 1) - 1;
+    if (left > 0) runningByDirectory.set(directory, left);
+    else runningByDirectory.delete(directory);
+    log(`AFT V2 runtime stopped (server entry, Location ${id} at ${directory})`);
+  };
+}
+
 export function makeServerEffect(overrides = {}) {
   const dependencies = { ...defaults, ...overrides };
 
@@ -132,9 +168,11 @@ export function makeServerEffect(overrides = {}) {
       return Effect.void;
     }
 
-    log("AFT V2 runtime starting");
-
     return Effect.gen(function* () {
+      // Logged when the program runs, so every start pairs with the stop its
+      // finalizer logs when the host disposes the Location.
+      const logRuntimeStop = logRuntimeStart(location);
+      yield* Effect.addFinalizer(() => Effect.sync(logRuntimeStop));
       const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies));
       if (!runtime) return;
 

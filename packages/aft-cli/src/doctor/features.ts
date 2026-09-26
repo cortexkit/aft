@@ -31,9 +31,9 @@ export interface GitState {
 }
 
 /**
- * What AFT does with git, in user terms. Each keeps working in some form
- * without git (the engine falls back the way it does outside a repository),
- * so the list names what the user loses rather than what breaks.
+ * What AFT does with git, in user terms. Without git each of these is either
+ * unavailable (aft_conflicts) or takes the fallback the engine uses outside a
+ * repository, so the list names what the user loses.
  */
 export const GIT_BACKED_FEATURES = [
   "aft_conflicts (lists merge conflicts)",

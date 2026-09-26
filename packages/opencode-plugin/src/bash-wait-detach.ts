@@ -1,7 +1,7 @@
 import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
-import { log, warn } from "./logger.js";
+import { debug, log, warn } from "./logger.js";
 import { BASH_TRANSPORT_TIMEOUT_MS } from "./tools/_shared.js";
 
 type ActiveBridgePool = Pick<AftTransportPool, "getActiveBridgeForRoot" | "activeBridges">;
@@ -107,7 +107,12 @@ export async function signalBashWaitDetachForProject(
   const all = pool.activeBridges();
   const targets = exact ? [exact, ...all.filter((bridge) => bridge !== exact)] : all;
   if (targets.length === 0) {
-    warn(`[bash_wait_detach] no live bridge for session ${sessionID} (root ${projectRoot})`);
+    // A wait lives inside a bridge, so with no bridge there is nothing to
+    // detach. This is the normal state before the first tool call of a
+    // session starts one, not a fault, so it is not logged as a warning.
+    debug(
+      `[bash_wait_detach] no bridge running yet for session ${sessionID} (root ${projectRoot}); nothing to detach`,
+    );
     return;
   }
   let signaled = 0;

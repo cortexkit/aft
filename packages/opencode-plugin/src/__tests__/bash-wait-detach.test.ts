@@ -1,6 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import {
   signalBashWaitDetachForProject,
   stripUserMessageDetachKeyword,
 } from "../bash-wait-detach.js";
+import * as logger from "../logger.js";
 
 let projectRoot: string;
 
@@ -147,6 +148,26 @@ describe("bash wait detach helper", () => {
     );
 
     expect(send).not.toHaveBeenCalled();
+  });
+
+  test("no bridge yet is expected before the first tool call and is not a warning", async () => {
+    const warn = spyOn(logger, "warn");
+    const debug = spyOn(logger, "debug");
+    try {
+      await signalBashWaitDetachForProject(
+        { getActiveBridgeForRoot: () => null, activeBridges: () => [] } as unknown as Parameters<
+          typeof signalBashWaitDetachForProject
+        >[0],
+        projectRoot,
+        "session-first-run",
+      );
+      expect(warn).not.toHaveBeenCalled();
+      expect(debug).toHaveBeenCalledTimes(1);
+      expect(String(debug.mock.calls[0]?.[0])).toContain("nothing to detach");
+    } finally {
+      warn.mockRestore();
+      debug.mockRestore();
+    }
   });
 
   test("root-key miss fans out to every live bridge instead of dropping", async () => {
