@@ -98,6 +98,7 @@ import {
 } from "./bash-wait-detach.js";
 import { registerPiConfigErrorState, resolvePiBootstrapConfig } from "./config-error-state.js";
 import { recordActiveExtensionApi } from "./harness.js";
+import { MAGIC_CONTEXT_SUBAGENT_ENV, skipsEagerStartup } from "./session-kind.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import {
@@ -288,20 +289,6 @@ function bridgeDirectoryFromCallback(bridge: unknown, fallback: string): string 
 
 /** Longest the eager warmup waits for the ONNX Runtime before spawning without it. */
 const ONNX_WARMUP_WAIT_CAP_MS = 60_000;
-
-/**
- * pi-magic-context runs its historian and dreamer as child `pi --print`
- * processes that load every installed extension, aft-pi included, and it
- * guarantees this variable is set to "1" in each of them. Those children are
- * short-lived and mostly never call an AFT tool, so aft-pi skips its eager
- * startup work there (warmup bridge, ONNX Runtime preparation, LSP
- * auto-install) and keeps only tool registration with a lazily spawned bridge.
- */
-const MAGIC_CONTEXT_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
-
-function isMagicContextSubagent(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env[MAGIC_CONTEXT_SUBAGENT_ENV] === "1";
-}
 
 /**
  * Wait for `promise`, but give up after `capMs`. The cap timer is cleared as
@@ -497,7 +484,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // settles. Bridges spawned AFTER the download finishes pick it up
   // automatically. `ensureOnnxRuntime` returns null on unsupported platforms.
   let onnxRuntimePromise: Promise<string | null> | null = null;
-  const skipEagerStartup = isMagicContextSubagent();
+  // Which sessions skip, and why a plain headless run does not, is decided in
+  // session-kind.ts next to the worker signal bash and bash_watch use.
+  const skipEagerStartup = skipsEagerStartup();
   if (skipEagerStartup) {
     log(
       `${MAGIC_CONTEXT_SUBAGENT_ENV}=1: running as a pi-magic-context subagent, so skipping eager warmup, ONNX Runtime preparation and LSP auto-install; the bridge starts on the first AFT tool call`,
@@ -834,7 +823,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // startup) does not apply here, so eager warmup is the correct trade for Pi:
   // it removes first-tool-call latency without the bridge-storm downside.
   // The $HOME guard below is the only case we skip. See the home-dir note.
-  // (pi-magic-context subagents also skip it; see isMagicContextSubagent.)
+  // (pi-magic-context subagents also skip it; see skipsEagerStartup.)
   void (async () => {
     try {
       if (skipEagerStartup) return;

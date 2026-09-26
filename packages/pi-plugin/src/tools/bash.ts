@@ -35,6 +35,7 @@ import {
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
 import { resolveBashConfig, toolEnabled } from "../config.js";
+import { isPiWorkerSession } from "../session-kind.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -52,30 +53,15 @@ const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 /**
- * Set to "1" by the pi-magic-context extension in the child `pi --print`
- * processes it launches as delegated agents, so they count as workers here.
- */
-const MAGIC_CONTEXT_SUBAGENT_ENV = "MAGIC_CONTEXT_PI_SUBAGENT";
-
-/**
  * Decide whether a bash_watch caller should be treated as a delegated worker.
- *
- * Pi has no parent-session link comparable to OpenCode's `parentID`, so there
- * is no direct "is this a subagent" signal. The closest one is the run mode:
- * delegated Pi agents run as headless `pi --print`/JSON children, where the
- * extension context has no UI and ending the turn ends the process, so a
- * completion reminder can never wake the session. That is exactly the
- * situation the worker steer describes. Interactive and RPC sessions both have
- * a UI context and are treated as primary. A context without `hasUI` at all
- * (older hosts, tests) is also treated as primary unless pi-magic-context
- * marked the process as its subagent.
+ * The classification itself lives in session-kind.ts so bash, bash_watch and
+ * extension startup read the same signals.
  */
 export function watchCallerRole(
   extCtx: Pick<ExtensionContext, "hasUI"> | undefined,
   env: NodeJS.ProcessEnv = process.env,
 ): WatchCallerRole {
-  if (env[MAGIC_CONTEXT_SUBAGENT_ENV] === "1") return "worker";
-  return extCtx?.hasUI === false ? "worker" : "primary";
+  return isPiWorkerSession(extCtx, env) ? "worker" : "primary";
 }
 
 function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | undefined {
@@ -568,8 +554,20 @@ export function registerBashTool(
       }
       // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
       const requestedPty = !backgroundDisabled && rawRequestedPty;
-      const effectiveBackground = !backgroundDisabled && (rawRequestedBackground || requestedPty);
-      const blockToCompletion = backgroundDisabled || requestedWait;
+      // With `bash.subagent_background: false` a worker session runs every
+      // command to completion, as on OpenCode: a headless or delegated Pi run
+      // ends with its turn, so a backgrounded task could never report back.
+      const workerForcedForeground = !bashCfg.subagent_background && isPiWorkerSession(extCtx);
+      if (workerForcedForeground && requestedPty) {
+        // A PTY session only exists as a background task, which this setting
+        // rules out; running it in the foreground would just sit on the
+        // interactive program until the hard timeout.
+        throw new Error(
+          "pty:true is unavailable in this worker session because bash.subagent_background is false; run the command without pty.",
+        );
+      }
+      const blockToCompletion = backgroundDisabled || requestedWait || workerForcedForeground;
+      const effectiveBackground = !blockToCompletion && (rawRequestedBackground || requestedPty);
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
       // FOREGROUND auto-promote path a `timeout` below the foreground wait
@@ -828,8 +826,15 @@ export function createBashWatchTool(ctx: PluginContext) {
     ) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const waitFor = parseWaitPattern(params.pattern);
+      const bashCfg = resolveBashConfig(ctx.config);
+      // A worker that may not background also may not park an async watch it
+      // will never be woken by; the watch becomes a sync wait for the full cap.
+      const workerForcedSync =
+        coerceBoolean(params.background) &&
+        !bashCfg.subagent_background &&
+        isPiWorkerSession(extCtx);
       // Coerce at the boundary: stringified background must enable async mode (coerceBoolean).
-      if (coerceBoolean(params.background)) {
+      if (coerceBoolean(params.background) && !workerForcedSync) {
         if (!waitFor) {
           throw new Error(
             "invalid_request: Use auto-reminder; bash_watch without pattern in async mode is redundant",
@@ -861,13 +866,15 @@ export function createBashWatchTool(ctx: PluginContext) {
           watchDetails,
         );
       }
-      const syncWaitCap = resolveBashConfig(ctx.config).watch_sync_max_ms;
+      const syncWaitCap = bashCfg.watch_sync_max_ms;
       const role = watchCallerRole(extCtx);
-      const effectiveWaitMs = resolveWatchTimeoutMs(
-        coerceConfiguredWatchTimeout(params.timeout_ms, syncWaitCap),
-        role,
-        syncWaitCap,
-      );
+      const effectiveWaitMs = workerForcedSync
+        ? syncWaitCap
+        : resolveWatchTimeoutMs(
+            coerceConfiguredWatchTimeout(params.timeout_ms, syncWaitCap),
+            role,
+            syncWaitCap,
+          );
       const data = await waitForBashStatus(
         ctx,
         bridge,

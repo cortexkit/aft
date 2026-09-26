@@ -304,8 +304,12 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "background": false,
 
     // Allow subagents to run background bash. When false, `background: true`
-    // is converted to a foreground call that blocks up to the hard cap. Default
-    // true because workers are multi-turn and use bash_watch to wait.
+    // is converted to a foreground call that blocks up to the hard cap, and an
+    // async `bash_watch` becomes a sync wait. Default true because workers are
+    // multi-turn and use bash_watch to wait. OpenCode applies it to sessions
+    // with a parent session; Pi applies it to headless runs (`pi -p`,
+    // `--mode json`) and to processes started with MAGIC_CONTEXT_PI_SUBAGENT=1,
+    // where `pty: true` is then refused.
     "subagent_background": true,
 
     // How long a foreground bash call blocks before auto-promoting the task

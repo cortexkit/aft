@@ -295,7 +295,11 @@ export interface BashConfig {
   background?: boolean;
   /** Permit per-command host fallback after AFT transport failure. Default false. */
   host_fallback?: boolean;
-  /** Allow subagents to use background bash; when false, requests block to completion. Default true. */
+  /**
+   * Allow worker sessions (headless `pi -p` / JSON runs, or MAGIC_CONTEXT_PI_SUBAGENT=1)
+   * to use background bash; when false, requests block to completion and async
+   * bash_watch becomes a sync wait. Default true.
+   */
   subagent_background?: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
   detach_on_user_message?: boolean;
