@@ -675,6 +675,20 @@ impl SearchIndexSnapshot {
                 .count()
     }
 
+    /// How this snapshot holds `path`, for the benchmark-only search recall
+    /// audit: `indexed` (its trigrams are searchable), `unindexed` (the file
+    /// is known but its content was not indexed, for example because it is
+    /// too large), or `absent`. The audit needs this to tell "never indexed"
+    /// apart from "indexed but not retrieved".
+    pub(crate) fn audit_index_state(&self, path: &Path) -> &'static str {
+        match self.path_to_id.get(path) {
+            Some(file_id) if !self.is_active_file(*file_id) => "absent",
+            Some(file_id) if self.unindexed_files.contains(file_id) => "unindexed",
+            Some(_) => "indexed",
+            None => "absent",
+        }
+    }
+
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
         let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {

@@ -12,6 +12,7 @@ pub mod memo;
 pub mod paging;
 pub mod plan_table;
 pub mod provenance;
+mod recall_audit;
 pub mod scoring;
 pub mod telemetry;
 pub mod trailer;
@@ -2374,6 +2375,9 @@ struct EngineRanking {
     results_list_envelope: ListEnvelope,
     confidence_line: Option<&'static str>,
     structured_content: serde_json::Value,
+    /// Present only when the benchmark-only recall audit is switched on in the
+    /// process environment; see `recall_audit`.
+    recall_audit: Option<serde_json::Value>,
 }
 
 fn matching_line_from_source(
@@ -2707,6 +2711,16 @@ fn run_engine_ranking(
         exact_candidates = in_scope;
     }
 
+    let audit_enabled = recall_audit::enabled();
+    // The audit keeps every semantic chunk the lane returned, because the loop
+    // below lets only each file's best chunk into the ranking.
+    let audit_semantic_chunks =
+        (audit_enabled && plan.contains(SearchLaneKind::Semantic)).then(|| {
+            semantic_results
+                .iter()
+                .map(recall_audit::AuditChunk::from_result)
+                .collect::<Vec<_>>()
+        });
     let mut semantic_metadata = HashMap::new();
     let mut seen_semantic_paths = HashSet::new();
     let mut prepared_semantic = Vec::new();
@@ -2946,6 +2960,27 @@ fn run_engine_ranking(
     let confidence = ConfidenceEngine::running()
         .evaluate_reply(&page.reply)
         .map_err(|error| error.to_string())?;
+    let recall_audit = audit_enabled.then(|| {
+        recall_audit::engine_audit(recall_audit::EngineAuditInput {
+            project_root,
+            plan,
+            snapshot: &snapshot,
+            query_trigrams: &query_trigrams,
+            candidate_filter: &candidate_filter,
+            lexical_order: lexical_candidates
+                .iter()
+                .map(|candidate| candidate.path.clone())
+                .collect(),
+            lexical_pool_size: lexical.selected_pool_size(),
+            exact_candidates: &exact_candidates,
+            semantic_chunks: audit_semantic_chunks,
+            path_lookup_candidates: &path_lookup_candidates,
+            canonical_list: &page.reply.canonical_list,
+            page_len: page.reply.page.len(),
+            retrieval_depth: page.reply.retrieval_depth,
+            lanes_exhausted: page.reply.lanes_exhausted,
+        })
+    });
     let confidence_telemetry = match confidence.confidence {
         Some(Confidence::High) => Some(ConfidenceTelemetry::High),
         Some(Confidence::Low) => Some(ConfidenceTelemetry::Low),
@@ -3061,6 +3096,7 @@ fn run_engine_ranking(
         results_list_envelope,
         confidence_line: confidence.flat_head_line,
         structured_content,
+        recall_audit,
     })
 }
 
@@ -3140,6 +3176,20 @@ fn handle_engine_only_search(
         &ranked.results_list_envelope,
     );
     extras.insert("structuredContent".to_string(), ranked.structured_content);
+    if let Some(mut audit) = ranked.recall_audit {
+        // This route runs no semantic lane. The audit still reports where
+        // semantic retrieval would have ranked the targets, which is the
+        // question a routing change has to answer before it is made.
+        let full_ranking = if semantic_status == "ready" {
+            embed_query(&params.query, ctx).and_then(|vector| {
+                recall_audit_full_semantic(ctx, project_root, params.include_tests, &vector)
+            })
+        } else {
+            Err(format!("semantic index {semantic_status}"))
+        };
+        recall_audit::attach_semantic_coverage(&mut audit, project_root, full_ranking, false);
+        extras.insert("recall_audit".to_string(), audit);
+    }
     extras.insert(
         "lexical_only_fallback".to_string(),
         serde_json::json!(semantic_status != "ready"),
@@ -3500,6 +3550,11 @@ fn handle_semantic_or_hybrid_search(
             .retain(|result| result.file.is_file());
     }
     let more_available = engine_ranking.more_available || semantic_more_available;
+    if let Some(audit) = engine_ranking.recall_audit.as_mut() {
+        let full_ranking =
+            recall_audit_full_semantic(ctx, project_root, params.include_tests, &query_vector);
+        recall_audit::attach_semantic_coverage(audit, project_root, full_ranking, true);
+    }
     let mut results = engine_ranking.results;
 
     if mode == SearchMode::Semantic
@@ -3556,6 +3611,9 @@ fn handle_semantic_or_hybrid_search(
         "structuredContent".to_string(),
         engine_ranking.structured_content,
     );
+    if let Some(audit) = engine_ranking.recall_audit {
+        extras.insert("recall_audit".to_string(), audit);
+    }
 
     search_response(
         req,
@@ -4468,6 +4526,29 @@ fn search_index_ready_with_budget(
         }
         std::thread::sleep(remaining.min(SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL));
     }
+}
+
+/// Ranks every semantic chunk against `query_vector` with no enumeration
+/// limit, for the recall audit's per-target semantic coverage. It applies the
+/// same test-file filter as the live lane so ranks are comparable with it.
+fn recall_audit_full_semantic(
+    ctx: &AppContext,
+    project_root: &Path,
+    include_tests: bool,
+    query_vector: &[f32],
+) -> Result<Vec<recall_audit::AuditChunk>, String> {
+    let guard = try_read_with_budget(ctx.semantic_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+        .ok_or_else(|| "semantic index remained busy".to_string())?;
+    let index = guard
+        .as_ref()
+        .ok_or_else(|| "semantic index is not loaded".to_string())?;
+    Ok(index
+        .search_filtered(query_vector, usize::MAX, |file| {
+            path_allowed_by_include_tests(file, project_root, include_tests)
+        })
+        .iter()
+        .map(recall_audit::AuditChunk::from_result)
+        .collect())
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {

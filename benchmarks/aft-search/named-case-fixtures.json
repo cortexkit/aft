@@ -1,0 +1,150 @@
+{
+  "schema_version": 1,
+  "source": "Named aft_search cases for failure modes the real-query gate has no row for. Each row names its case class, its expected answer (or that it has none), and how that was verified. Report-only: run_recall_audit.py replays them and records where each answer was lost; no runner fails on their outcome.",
+  "repos": {
+    "aft-evidence": "The pinned AFT evidence tree the real-query gate uses (commit 30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17), provisioned by provision_evidence.py and verified against its tree digest.",
+    "prefrontal": "prefrontal at the commit pinned in corpus/prefrontal.toml, provisioned by provision_corpus.py --corpus corpus/prefrontal.toml."
+  },
+  "case_classes": {
+    "punctuated_prose": "A natural-language question that contains a comma or a parenthesis. The router currently treats either character as code syntax and removes the semantic lane.",
+    "mixed_prose_exact_fragment": "Prose that carries one exact identifier or literal fragment next to the words that say what is wanted.",
+    "op_string_dispatch": "The handler of an operation string. The code that answers it is a match arm keyed on the string, not a function named after it.",
+    "partial_anchor_outranks_answer": "One query fragment matches verbatim in many files that do not answer the query, and the answer is found by the rest of the query.",
+    "validated_no_answer": "Nothing in the pinned tree answers the query. Verified by searching the tree for each content word and phrase and reading every hit."
+  },
+  "relevance_scale": "2 = the code that answers the query; 1 = supporting code a reader would also accept. Line ranges are 1-based and inclusive, read at the pinned commit.",
+  "tasks": [
+    {
+      "id": "named-punct-size-limit",
+      "repo": "aft-evidence",
+      "case_class": "punctuated_prose",
+      "query": "when a file is larger than the size limit, does the search index skip it (and where is that check)?",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "Read crates/aft/src/search_index.rs at the pin: prepare_search_path returns Unindexed when metadata.size > max_file_size (cold build), update_file_with_canonicalization_memo tracks the file as unindexed on the same comparison (incremental update), and DEFAULT_MAX_FILE_SIZE is the 1 MiB default.",
+      "ground_truth": [
+        {"file_path": "crates/aft/src/search_index.rs", "line_start": 2930, "line_end": 2957, "relevance": 2, "symbol": "prepare_search_path"},
+        {"file_path": "crates/aft/src/search_index.rs", "line_start": 1436, "line_end": 1444, "relevance": 2, "symbol": "size check in update_file_with_canonicalization_memo"},
+        {"file_path": "crates/aft/src/search_index.rs", "line_start": 36, "line_end": 36, "relevance": 1, "symbol": "DEFAULT_MAX_FILE_SIZE"}
+      ]
+    },
+    {
+      "id": "named-punct-exact-tier-order",
+      "repo": "aft-evidence",
+      "case_class": "punctuated_prose",
+      "query": "how are exact tier results ranked, and why",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "This is the unquoted half of the router asymmetry the code-literal misroute investigation recorded (the quoted form routes natural_language, this one code_literal). Read crates/aft/src/commands/semantic_search/comparator.rs at the pin: compare_fields_1_to_6 documents and implements the exact-tier order, and r3_cmp documents why exact candidates are score-free and always precede non-exact ones.",
+      "ground_truth": [
+        {"file_path": "crates/aft/src/commands/semantic_search/comparator.rs", "line_start": 94, "line_end": 174, "relevance": 2, "symbol": "compare_fields_1_to_6"},
+        {"file_path": "crates/aft/src/commands/semantic_search/comparator.rs", "line_start": 217, "line_end": 282, "relevance": 2, "symbol": "r3_cmp"}
+      ]
+    },
+    {
+      "id": "named-mixed-exact-phrase",
+      "repo": "aft-evidence",
+      "case_class": "mixed_prose_exact_fragment",
+      "query": "exact_phrase: how the verbatim phrase is normalized before the exact pass compares it",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "Read crates/aft/src/commands/semantic_search/exact_lane.rs at the pin: exact_phrase strips one balanced pair of quotes and normalize_exact_phrase collapses whitespace and lowercases; both sit at lines 50-71.",
+      "ground_truth": [
+        {"file_path": "crates/aft/src/commands/semantic_search/exact_lane.rs", "line_start": 50, "line_end": 71, "relevance": 2, "symbol": "exact_phrase and normalize_exact_phrase"}
+      ]
+    },
+    {
+      "id": "named-mixed-board-lane-cap",
+      "repo": "prefrontal",
+      "case_class": "mixed_prose_exact_fragment",
+      "query": "BOARD_LANE_CAP: what happens when a board.lanes update asks for more lanes than the cap",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "Read crates/prefrontal-core-store/src/rooms.rs at the pin: the board.lanes update refuses a new lane with a Validation error once live_lanes reaches BOARD_LANE_CAP (3295-3299); the constant and its rationale are at 71-74.",
+      "ground_truth": [
+        {"file_path": "crates/prefrontal-core-store/src/rooms.rs", "line_start": 3295, "line_end": 3299, "relevance": 2, "symbol": "lane cap refusal in board.lanes update"},
+        {"file_path": "crates/prefrontal-core-store/src/rooms.rs", "line_start": 71, "line_end": 74, "relevance": 1, "symbol": "BOARD_LANE_CAP"}
+      ]
+    },
+    {
+      "id": "named-dispatch-semantic-search",
+      "repo": "aft-evidence",
+      "case_class": "op_string_dispatch",
+      "query": "semantic_search command handler",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "Read crates/aft/src/main.rs at the pin: the \"semantic_search\" arm of the command match (973-979) waits for the semantic index and then calls handle_semantic_search, defined at crates/aft/src/commands/semantic_search/mod.rs 316-462.",
+      "ground_truth": [
+        {"file_path": "crates/aft/src/main.rs", "line_start": 973, "line_end": 979, "relevance": 2, "symbol": "\"semantic_search\" dispatch arm"},
+        {"file_path": "crates/aft/src/commands/semantic_search/mod.rs", "line_start": 316, "line_end": 462, "relevance": 2, "symbol": "handle_semantic_search"}
+      ]
+    },
+    {
+      "id": "named-dispatch-mark-auto-proceeded",
+      "repo": "prefrontal",
+      "case_class": "op_string_dispatch",
+      "query": "ask.mark_auto_proceeded handler",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "Read at the pin: the \"mark_auto_proceeded\" arm in crates/prefrontal-core-module/src/dispatch.rs (12602-12610) handles the op after the ask. prefix is split off; the op is registered at 11469; the store write it calls is AskStore::mark_auto_proceeded in crates/prefrontal-core-store/src/ask.rs 1750-1760. No function is named after the dotted op string.",
+      "ground_truth": [
+        {"file_path": "crates/prefrontal-core-module/src/dispatch.rs", "line_start": 12602, "line_end": 12610, "relevance": 2, "symbol": "\"mark_auto_proceeded\" match arm"},
+        {"file_path": "crates/prefrontal-core-module/src/dispatch.rs", "line_start": 11469, "line_end": 11469, "relevance": 1, "symbol": "op(\"ask.mark_auto_proceeded\", Mutate) registration"},
+        {"file_path": "crates/prefrontal-core-store/src/ask.rs", "line_start": 1750, "line_end": 1760, "relevance": 1, "symbol": "mark_auto_proceeded store write"}
+      ]
+    },
+    {
+      "id": "named-partial-anchor-include-tests",
+      "repo": "aft-evidence",
+      "case_class": "partial_anchor_outranks_answer",
+      "query": "where is include_tests applied before top-k selection in the semantic lane",
+      "include_tests": false,
+      "expect_no_answer": false,
+      "verification": "include_tests occurs verbatim in hundreds of files in the pinned tree, almost none of which answer this. Read crates/aft/src/semantic_index.rs at the pin: search_filtered (3496-3591) applies the include predicate to every entry before the top-k selection, and its doc comment says why; path_allowed_by_include_tests in crates/aft/src/commands/semantic_search/mod.rs (1269-1271) is the predicate passed to it.",
+      "ground_truth": [
+        {"file_path": "crates/aft/src/semantic_index.rs", "line_start": 3496, "line_end": 3591, "relevance": 2, "symbol": "search_filtered"},
+        {"file_path": "crates/aft/src/commands/semantic_search/mod.rs", "line_start": 1269, "line_end": 1271, "relevance": 1, "symbol": "path_allowed_by_include_tests"}
+      ]
+    },
+    {
+      "id": "named-no-answer-payment-webhook",
+      "repo": "aft-evidence",
+      "case_class": "validated_no_answer",
+      "query": "stripe payment webhook signature verification",
+      "include_tests": false,
+      "expect_no_answer": true,
+      "verification": "Whole-word, case-insensitive search of the pinned tree: stripe, payment and invoice occur only in crates/aft-tokenizer/src/claude_data.rs (tokenizer vocabulary data) and benchmark fixtures or reports; webhook occurs in release workflows (Discord notification) and docs; x-hub-signature does not occur. 'signature verification' occurs only in crates/aft/src/gh_shim.rs (detached signature of a downloaded manifest) and a draft; reading those hits confirms none verifies a payment webhook. The gh_shim hits are a deliberate near-miss.",
+      "ground_truth": []
+    },
+    {
+      "id": "named-no-answer-oauth-refresh",
+      "repo": "aft-evidence",
+      "case_class": "validated_no_answer",
+      "query": "OAuth2 refresh token rotation for user login sessions",
+      "include_tests": false,
+      "expect_no_answer": true,
+      "verification": "Case-insensitive search of the pinned tree: oauth2, 'refresh token', 'token rotation' and 'login session' do not occur; refresh_token occurs only in a pytest output fixture under benchmarks/compression-tokens. AFT has no user login.",
+      "ground_truth": []
+    },
+    {
+      "id": "named-no-answer-shopping-cart",
+      "repo": "prefrontal",
+      "case_class": "validated_no_answer",
+      "query": "shopping cart checkout with a discount coupon code",
+      "include_tests": false,
+      "expect_no_answer": true,
+      "verification": "Whole-word, case-insensitive search of prefrontal at the pin: shopping, cart and coupon do not occur. checkout occurs only for git checkouts and connection checkouts (routing store, cortexkit-cow, persona text, a test); discount occurs only in review prose and an API-price comment (consult/runtime.rs 8622). Reading each hit confirms none is commerce code.",
+      "ground_truth": []
+    },
+    {
+      "id": "named-no-answer-dark-mode",
+      "repo": "prefrontal",
+      "case_class": "validated_no_answer",
+      "query": "dark mode theme toggle in the settings page",
+      "include_tests": false,
+      "expect_no_answer": true,
+      "verification": "Whole-word, case-insensitive search of prefrontal at the pin: 'dark theme', 'theme toggle' and 'color scheme' do not occur; 'dark mode' occurs once, in packages/opencode/src/plugin/text-complete.ts line 2, as part of 'go-dark mode' (an agent snooze), not a UI theme. prefrontal has no settings page.",
+      "ground_truth": []
+    }
+  ]
+}

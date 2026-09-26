@@ -31,6 +31,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--summary", default=None, help="Optional Markdown summary file to append.")
     parser.add_argument("--ready-timeout", type=float, default=DEFAULT_READY_TIMEOUT_SECS)
     parser.add_argument("--check-corpus", action="store_true", help="Validate the offline corpus and exit without running AFT.")
+    parser.add_argument(
+        "--semantic",
+        action="store_true",
+        help=(
+            "Replay the same invariants with semantic search enabled on the live local model. "
+            "Report-only: the checked-in baseline was recorded with semantic search off, so this "
+            "mode prints and records failures but exits 0 unless the run itself fails."
+        ),
+    )
     return parser.parse_args(list(argv))
 
 
@@ -128,7 +137,18 @@ def load_baseline(path: Path, sample_count: int) -> JsonObject:
     return baseline
 
 
-def evaluate_fixture(client: AftClient, fixture: JsonObject, repo_path: Path) -> JsonObject:
+def plan_fields(response: JsonObject) -> JsonObject:
+    """The routing facts that say whether a semantic-mode row actually ran semantic search."""
+    plan = (response.get("structuredContent") or {}).get("plan") or {}
+    return {
+        "shape": plan.get("shape"),
+        "lanes_run": plan.get("lanes_run"),
+        "confidence": plan.get("confidence"),
+        "embedding_calls": plan.get("embedding_calls"),
+    }
+
+
+def evaluate_fixture(client: AftClient, fixture: JsonObject, repo_path: Path, record_plan: bool = False) -> JsonObject:
     family = str(fixture["family"])
     top_k = 5 if family == "sentence" else 10
     response, latency_ms = client.semantic_search(str(fixture["query"]), top_k)
@@ -152,7 +172,7 @@ def evaluate_fixture(client: AftClient, fixture: JsonObject, repo_path: Path) ->
             exact_marker = result.get("exact") is True
 
     passed = rank == 1 if family == "sentence" else rank is not None and rank <= top_k
-    return {
+    row = {
         "id": fixture["id"],
         "repo": fixture["repo"],
         "family": family,
@@ -165,6 +185,9 @@ def evaluate_fixture(client: AftClient, fixture: JsonObject, repo_path: Path) ->
         "latency_ms": round(latency_ms, 3),
         "result_files": files,
     }
+    if record_plan:
+        row["plan"] = plan_fields(response)
+    return row
 
 
 def metric(rows: Sequence[JsonObject], family: str) -> float:
@@ -231,6 +254,12 @@ def run(argv: Sequence[str]) -> int:
     rows: List[JsonObject] = []
     repo_statuses: JsonObject = {}
     protocol_version: Optional[str] = None
+    model_env: Optional[JsonObject] = None
+    if args.semantic:
+        # Imported here because run_prefrontal_search imports this module.
+        from run_prefrontal_search import ensure_local_model_env
+
+        model_env = ensure_local_model_env()
     for repo in repos:
         repo_name = str(repo["name"])
         repo_path = clone_root / repo_name
@@ -239,14 +268,21 @@ def run(argv: Sequence[str]) -> int:
             if not (repo_path / str(fixture["expected_file"])).is_file():
                 raise ValueError(f"fixture_file_missing:{fixture['id']}:{fixture['expected_file']}")
 
-        client = AftClient(binary, repo_path, args.ready_timeout, semantic_search=False)
+        # The gate disables semantic search so it can run without an embedding
+        # backend. That also means it cannot say whether routing more queries
+        # through semantic search would break these invariants; --semantic
+        # replays them with the semantic lane live to answer that.
+        client = AftClient(binary, repo_path, args.ready_timeout, semantic_search=args.semantic)
         try:
             client.configure()
             repo_statuses[repo_name] = client.wait_for_indexes(require_search=True)
             version = client.call("version", timeout_secs=10.0)
             if version.get("success"):
                 protocol_version = protocol_version or version.get("version")
-            rows.extend(evaluate_fixture(client, fixture, repo_path) for fixture in repo_fixtures)
+            rows.extend(
+                evaluate_fixture(client, fixture, repo_path, record_plan=args.semantic)
+                for fixture in repo_fixtures
+            )
         finally:
             client.close()
 
@@ -261,6 +297,7 @@ def run(argv: Sequence[str]) -> int:
             "sha256": binary_sha256(binary),
         },
         "sample_per_family_per_repo": sample_count,
+        **({"semantic_search": True, "local_model_env": model_env} if args.semantic else {}),
         "baseline": baseline,
         "metrics": metrics,
         "repo_statuses": repo_statuses,
@@ -269,6 +306,12 @@ def run(argv: Sequence[str]) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     table = markdown_table(rows, metrics, baseline)
+    if args.semantic:
+        table = table.replace(
+            "## AFT exact-recall gate",
+            "## AFT exact-recall replay with semantic search enabled (report-only)",
+            1,
+        )
     print(table)
     if args.summary:
         summary_path = Path(args.summary)
@@ -285,6 +328,8 @@ def run(argv: Sequence[str]) -> int:
     if failures:
         for row in failures:
             print(f"FAIL {row['id']}: expected {row['expected_file']} rank={row['rank']} exact={row['exact_marker']}", file=sys.stderr)
+    if args.semantic:
+        return 0
     return 1 if regressed or failures else 0
 
 
