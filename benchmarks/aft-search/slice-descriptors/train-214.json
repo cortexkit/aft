@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "cost-gate-resolution-duration"
+  ],
+  "note": "The nightly OSS cost gate gates the callgraph resolution stage on its duration instead of its share of the build. Telemetry scripts and baselines only; no ranking-fence file touched."
+}
