@@ -144,12 +144,6 @@ are ranked against a partly empty index. Two Mac replays of the pack disagreed
 with a third on 4 of 49 rows. On Linux, where CI runs, there is no such burst,
 and three replays gave byte-identical scores. Record the reference on Linux.
 
-The pack is not yet paired with a recorded reference.
-`real-query-baseline.json` still holds the hashed-vector rows, so the gate
-refuses a real-vector score (`corpus_vector_model_mismatch`,
-`reference_manifest_mismatch`) until the watcher race is fixed and the
-reference is re-recorded.
-
 When the pinned product's semantic chunk format intentionally changes, recapture
 the pack in an authoring environment that has the model cache:
 
@@ -218,6 +212,24 @@ Re-records so far:
   MRR@10 0.188760 -> 0.191473, hit@5 0.325581 -> 0.348837, census-weighted
   MRR 0.152462 -> 0.152885, `phrase_present_not_surfaced` MRR@10
   0.625 -> 0.667. Exact recall and concept recall unchanged at 1.000.
+- 2026-09-26, after the vector pack moved from hashed 8-number stand-ins to
+  real all-MiniLM-L6-v2 vectors (`real-query-vectors.bin`). Recorded with
+  `record-reference --manifest-changed` on the unchanged engine, in a Linux
+  aarch64 container (`aft 0.57.2`, binary sha256 `a348ac53d8f6...`). The old
+  score, taken on the same binary with the old pack, reproduced the old
+  reference on all 49 rows, and three new-pack runs were byte-identical. 30 of
+  49 rows changed bytes. Four moved their opened file: `followup-census:14613`
+  2 -> 3, `15174` 2 -> 3, `14964` unranked -> 8, `18091` unranked -> 2.
+  `paged` MRR@10 0.214286 -> 0.220238, hit@5 0.346939 -> 0.367347,
+  census-weighted MRR 0.158049 -> 0.162052. By mechanism,
+  `index_stale_or_missing` 0.139394 -> 0.120455 and `other` 0.100 -> 0.200;
+  every other mechanism is unchanged, including `wrong_lane_nl` at 0.328205.
+  Recorded on aarch64. Every ranking step is plain IEEE float arithmetic,
+  which gives the same bits on x86_64. The one exception is the lexical
+  lane's `ln()` of a file's trigram count (`search_index.rs`,
+  `lexical_score_from_postings`), which calls the platform's libm (glibc
+  `logf`, which has an FMA variant on x86_64). A CI-only mismatch on
+  lexical-heavy rows would point there first.
 
 ## Prefrontal search-miss rows
 
