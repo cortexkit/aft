@@ -20,12 +20,31 @@ from search_quality_lib import (
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     included_manifest_ids,
+    mean_metrics,
     total_gate,
     validate_included_row_mechanisms,
     validate_manifest_maintenance_scores,
     validate_manifest_relabels,
     validate_profile_score,
 )
+
+
+class MeanMetricsTests(unittest.TestCase):
+    """Aggregates must not depend on row order or on how a Python build sums floats.
+
+    The gate compares aggregates exactly against the reference. A reference
+    recorded by one Python differed from a CI score in the last bit
+    (0.22023809523809526 against 0.22023809523809523) over identical rows, and
+    the non-ranking gate refused it as a regression.
+    """
+
+    def test_mean_is_independent_of_row_order(self) -> None:
+        values = [1e16, 1.0, -1e16, 0.1, 0.2, 0.3]
+        rows = [{"mrr_at_10": value, "hit_at_1": 0.0, "hit_at_5": 0.0} for value in values]
+        forward = mean_metrics(rows)["mrr_at_10"]
+        backward = mean_metrics(list(reversed(rows)))["mrr_at_10"]
+        self.assertEqual(forward, backward)
+        self.assertEqual(forward, 1.6 / 6)
 
 
 class ManifestMaintenanceScoreTests(unittest.TestCase):

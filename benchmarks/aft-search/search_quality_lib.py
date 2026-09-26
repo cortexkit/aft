@@ -325,7 +325,10 @@ def row_metrics(tuples: Sequence[Any], opened_file: str) -> dict[str, float]:
 def mean_metrics(rows: Sequence[Mapping[str, float]]) -> dict[str, float]:
     if not rows:
         raise InputFault("empty_population")
-    return {metric: sum(float(row[metric]) for row in rows) / len(rows) for metric in METRICS}
+    # fsum is correctly rounded and so independent of summation order. A plain
+    # sum differs in the last bit depending on row order and Python build, and
+    # the gate compares these aggregates exactly against the reference.
+    return {metric: math.fsum(float(row[metric]) for row in rows) / len(rows) for metric in METRICS}
 
 
 def aggregate_real_query(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -339,7 +342,7 @@ def aggregate_real_query(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         by_shape[str(row["pinned_shape"])].append(row["metrics"])
         by_mechanism[str(row["mechanism"])].append(row["metrics"])
         by_stratum[str(row["census_stratum"])].append(row["metrics"])
-    weighted_mrr = sum(STRATUM_SHARES[name] * mean_metrics(values)["mrr_at_10"] for name, values in by_stratum.items())
+    weighted_mrr = math.fsum(STRATUM_SHARES[name] * mean_metrics(values)["mrr_at_10"] for name, values in sorted(by_stratum.items()))
     return {
         "family": mean_metrics(row_values),
         "shapes": {name: mean_metrics(values) for name, values in sorted(by_shape.items())},
