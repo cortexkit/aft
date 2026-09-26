@@ -1508,21 +1508,25 @@ fn memory_rollup_metrics(
 
 fn mutating_lanes_metrics(executor: &Executor) -> Value {
     match executor.try_mutating_lane_snapshots() {
-        Some(snapshots) => Value::Array(
-            snapshots
-                .into_iter()
-                .map(|snapshot| {
-                    json!({
-                        "root": snapshot.root_id.as_path().to_string_lossy(),
-                        "request_id": snapshot.request_id,
-                        "job": snapshot.command,
-                        "started_age_ms": snapshot.started_age_ms,
-                    })
-                })
-                .collect(),
-        ),
+        Some(snapshots) => render_mutating_lanes(snapshots),
         None => json!({ "scheduler_busy": true }),
     }
+}
+
+fn render_mutating_lanes(snapshots: Vec<crate::executor::MutatingLaneSnapshot>) -> Value {
+    Value::Array(
+        snapshots
+            .into_iter()
+            .map(|snapshot| {
+                json!({
+                    "root": snapshot.root_id.as_path().to_string_lossy(),
+                    "request_id": snapshot.request_id,
+                    "job": snapshot.command,
+                    "started_age_ms": snapshot.started_age_ms,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn insert_lifecycle_metrics(
@@ -1942,9 +1946,14 @@ pub(super) fn build_health_report(
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
     let lsp_children = metrics.remove("lsp_children").unwrap_or(Value::Null);
-    let mutating_lanes = metrics
-        .remove("mutating_lanes")
-        .unwrap_or_else(|| json!({ "scheduler_busy": true }));
+    // Read the Mutating lanes fresh, without waiting on the scheduler, so an
+    // operator sees what holds a root and for how long right now, not as of
+    // the last background rollup. A busy scheduler falls back to that rollup.
+    let cached_mutating_lanes = metrics.remove("mutating_lanes");
+    let mutating_lanes = match executor.try_mutating_lane_snapshots() {
+        Some(snapshots) => render_mutating_lanes(snapshots),
+        None => cached_mutating_lanes.unwrap_or_else(|| json!({ "scheduler_busy": true })),
+    };
     metrics.insert("snapshot_age_ms".to_string(), json!(snapshot_age_ms));
     metrics.insert(
         "runtime".to_string(),
@@ -2397,6 +2406,66 @@ mod tests {
         assert_eq!(
             retention["last_sweep_skip_reason"].as_str(),
             Some("opening_count_lock_budget_exhausted")
+        );
+    }
+
+    #[test]
+    fn health_reports_a_running_mutation_with_its_root_and_current_age() {
+        let (_dir, root) = test_root("health-running-mutation");
+        let executor = Executor::new();
+        assert!(executor.register_actor(
+            root.clone(),
+            Arc::new(AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config::default(),
+            )),
+        ));
+        let (started_tx, started_rx) = crossbeam_channel::bounded::<()>(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        let mutation = executor.submit_async(
+            root.clone(),
+            crate::executor::Lane::Mutating,
+            "tool-delete-held".to_string(),
+            Box::new(move |_| {
+                started_tx.send(()).expect("signal start");
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                crate::protocol::Response::success("tool-delete-held", json!({}))
+            }),
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mutation starts");
+        std::thread::sleep(Duration::from_millis(50));
+
+        // A rollup cache that has not been refreshed since the mutation began:
+        // what holds a root must not wait for the next background rollup.
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let _ = release_tx.send(());
+        let _ = mutation.blocking_recv();
+
+        let metrics = report.metrics.expect("health metrics");
+        let lanes = metrics["dispatch_path"]["mutating_lanes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("mutating lanes: {}", metrics["dispatch_path"]));
+        let lane = lanes
+            .iter()
+            .find(|lane| lane["request_id"] == "tool-delete-held")
+            .unwrap_or_else(|| panic!("running mutation missing: {lanes:?}"));
+        assert_eq!(
+            lane["root"].as_str(),
+            Some(root.as_path().to_string_lossy().as_ref())
+        );
+        assert!(
+            lane["started_age_ms"].as_u64().is_some_and(|age| age >= 50),
+            "{lane}"
         );
     }
 

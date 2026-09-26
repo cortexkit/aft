@@ -1176,7 +1176,10 @@ fn recursive_delete_refuses_tree_over_backup_budget_without_deleting() {
         "the count must stop just past the cap and say so: {message}"
     );
     assert!(message.contains("2000 files"), "names the limit: {message}");
-    assert!(message.contains("rm -rf"), "names the no-undo alternative: {message}");
+    assert!(
+        message.contains("rm -rf"),
+        "names the no-undo alternative: {message}"
+    );
     assert!(
         message.contains("smaller pieces"),
         "names the undo-preserving alternative: {message}"
