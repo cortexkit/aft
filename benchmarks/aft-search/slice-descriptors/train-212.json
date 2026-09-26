@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "cached-test-executables-all-packages",
+    "opencode2-forensics-exclude-package-caches"
+  ],
+  "note": "Test helpers reuse content-addressed fake executables across runs, and the OpenCode 2 forensic archive leaves out package-manager caches. Tests and CI only; no ranking-fence file touched."
+}
