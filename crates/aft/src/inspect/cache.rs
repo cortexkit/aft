@@ -549,6 +549,9 @@ impl InspectCache {
             )));
         }
         initialize_schema(&conn)?;
+        // Schema creation writes pages at open; credit them now so later
+        // Tier-2 samples measure only their own commits.
+        conn.sample_write_pages();
         if needs_publish {
             if !writer_lease.verify().map_err(InspectCacheError::from)? {
                 return Err(InspectCacheError::Io(std::io::Error::other(
@@ -643,6 +646,15 @@ impl InspectCache {
 
     pub fn sqlite_path(&self) -> &Path {
         &self.sqlite_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_size_for_test(&self) -> u64 {
+        self.conn
+            .lock()
+            .expect("inspect cache connection lock")
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read inspect cache page size")
     }
 
     pub fn writer_epoch_for_test(&self) -> Option<&str> {
@@ -908,6 +920,7 @@ impl InspectCache {
             params![key.category.as_str(), self.project_key, now],
         )?;
         tx.commit()?;
+        sample_committed_writes(&conn);
 
         self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash))
     }
@@ -1005,6 +1018,7 @@ impl InspectCache {
             config,
         )?;
         tx.commit()?;
+        sample_committed_writes(&conn);
         timings.transaction = transaction_started.elapsed();
 
         self.memory
@@ -1101,6 +1115,7 @@ impl InspectCache {
             params![category.as_str(), self.project_key, last_full_run],
         )?;
         tx.commit()?;
+        sample_committed_writes(&conn);
         Ok(last_full_run)
     }
 
@@ -1145,6 +1160,7 @@ impl InspectCache {
             params![key.category.as_str(), self.project_key, now],
         )?;
         tx.commit()?;
+        sample_committed_writes(&conn);
 
         self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash.to_string()))
     }
@@ -1211,6 +1227,7 @@ impl InspectCache {
                 relative_file.to_string_lossy().to_string()
             ],
         )?;
+        sample_committed_writes(&conn);
         Ok(())
     }
 
@@ -1238,6 +1255,7 @@ impl InspectCache {
                 hash_to_hex(freshness.content_hash),
             ],
         )?;
+        sample_committed_writes(&conn);
         Ok(())
     }
 
@@ -1943,6 +1961,15 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
         }
     }
     encoded
+}
+
+/// Credit the pages a just-committed write put into the WAL to the write
+/// census. The writer connection lives as long as the daemon holds the cache,
+/// so without a sample at each commit its Tier-2 writes would reach the census
+/// only when the cache closes and would read as unexplained until then. This
+/// reads SQLite's own per-connection counter; it never opens the database file.
+fn sample_committed_writes(conn: &TrackedConnection) {
+    conn.sample_write_pages();
 }
 
 fn configure_connection(conn: &Connection) -> Result<(), InspectCacheError> {

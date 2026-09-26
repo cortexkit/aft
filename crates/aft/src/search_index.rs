@@ -1563,10 +1563,16 @@ impl SearchIndex {
             return false;
         };
 
-        let was_delta = self.base.is_some();
+        // A rewrite that folds a delta into an existing base is attributed
+        // separately from a first build so the census can tell them apart.
+        let domain = if self.base.is_some() {
+            crate::write_ledger::Domain::SearchIndexDelta
+        } else {
+            crate::write_ledger::Domain::SearchIndexBuild
+        };
         let write_result = {
             let mut sources = self.compaction_record_sources(Arc::clone(&plan.id_map));
-            write_cache_file_from_sources(cache_dir, &plan, &mut sources)
+            write_cache_file_from_sources(cache_dir, &plan, &mut sources, domain)
         };
 
         match write_result {
@@ -1582,19 +1588,6 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
-                let bytes = std::fs::metadata(cache_dir.join("cache.bin"))
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                crate::write_ledger::credit(
-                    if was_delta {
-                        crate::write_ledger::Domain::SearchIndexDelta
-                    } else {
-                        crate::write_ledger::Domain::SearchIndexBuild
-                    },
-                    self.project_root.display().to_string(),
-                    bytes,
-                    0,
-                );
                 true
             }
             Err(error) => {
@@ -3504,6 +3497,10 @@ fn build_streaming_index(
         .ok();
 
     let spill_dir = create_spill_dir(cache_dir)?;
+    let spill_counter = crate::write_ledger::register(
+        crate::write_ledger::Domain::SearchIndexBuild,
+        project_root.display().to_string(),
+    );
     let mut spill_paths = Vec::new();
     let mut spill_seq = 0usize;
     let mut block: Vec<SpillRecord> = Vec::new();
@@ -3568,7 +3565,8 @@ fn build_streaming_index(
 
                 let block_bytes = block.len().saturating_mul(SPILL_RECORD_ESTIMATED_BYTES);
                 if block_bytes >= SPIMI_SOFT_LIMIT_BYTES || block_bytes >= SPIMI_HARD_LIMIT_BYTES {
-                    let path = flush_spill_segment(&spill_dir, spill_seq, &mut block)?;
+                    let path =
+                        flush_spill_segment(&spill_dir, spill_seq, &mut block, &spill_counter)?;
                     spill_paths.push(path);
                     spill_seq += 1;
                 }
@@ -3602,7 +3600,12 @@ fn build_streaming_index(
                     .collect(),
             ),
         };
-        write_cache_file_from_sources(cache_dir, &plan, &mut sources)
+        write_cache_file_from_sources(
+            cache_dir,
+            &plan,
+            &mut sources,
+            crate::write_ledger::Domain::SearchIndexBuild,
+        )
     })();
 
     let _ = fs::remove_dir_all(&spill_dir);
@@ -3631,10 +3634,15 @@ fn build_streaming_index(
     Ok((index, indexed))
 }
 
+/// Write `cache.bin` through a temp file and credit the bytes to the write
+/// census under `domain`. Crediting here, where the bytes are produced, covers
+/// every caller (cold streaming builds and base+delta rewrites alike); a build
+/// that credits nothing shows up in the census as unexplained daemon writes.
 fn write_cache_file_from_sources(
     cache_dir: &Path,
     plan: &CacheWritePlan,
     sources: &mut [Box<dyn PostingRecordSource>],
+    domain: crate::write_ledger::Domain,
 ) -> std::io::Result<BasePostings> {
     fs::create_dir_all(cache_dir)?;
     sweep_stale_search_build_dirs(cache_dir);
@@ -3691,12 +3699,21 @@ fn write_cache_file_from_sources(
 
         let lookup_blob = build_lookup_section_bytes(&lookup_entries)?;
         writer.write_all(&lookup_blob)?;
+        let file_bytes = writer.stream_position()?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);
 
         fs::rename(&tmp_cache, &cache_path)?;
         sync_parent_dir(&cache_path);
+        // The file was fsynced above, so its full length reached the device;
+        // that length is the physical credit, not an estimate.
+        crate::write_ledger::credit(
+            domain,
+            plan.project_root.display().to_string(),
+            file_bytes,
+            file_bytes,
+        );
         let file = open_cache_file_read(&cache_path)?;
         Ok(BasePostings {
             file: Arc::new(file),
@@ -3889,6 +3906,7 @@ fn flush_spill_segment(
     spill_dir: &Path,
     seq: usize,
     block: &mut Vec<SpillRecord>,
+    counter: &crate::write_ledger::Counter,
 ) -> std::io::Result<PathBuf> {
     if block.is_empty() {
         return Err(std::io::Error::other(
@@ -3923,8 +3941,13 @@ fn flush_spill_segment(
             writer.write_all(&[record.next_mask, record.loc_mask])?;
         }
     }
+    let segment_bytes = writer.stream_position()?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
+    // Spill segments are deleted once the merge finishes, but they were
+    // fsynced to disk first, so large builds write them in addition to
+    // cache.bin and the census must count them.
+    counter.credit(segment_bytes, segment_bytes);
     block.clear();
     Ok(path)
 }
