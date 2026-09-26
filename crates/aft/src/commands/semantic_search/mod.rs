@@ -3117,13 +3117,18 @@ fn handle_engine_only_search(
     // A semantic lane that is not serving because its backend cannot be
     // reached must say so; describing it as "rebuilding" asks the reader to wait
     // for a build that cannot make progress until the backend returns. A build
-    // that has not reached the backend yet has recorded nothing, so the backend
-    // is probed here as well.
-    let backend_unavailable = if semantic_status == "ready" {
-        None
+    // that has not reached the backend yet has recorded nothing, so a probe
+    // (run off this thread) supplies the answer; until it does, the reply says
+    // the backend is being checked.
+    let (backend_unavailable, backend_checking) = if semantic_status == "ready" {
+        (None, None)
     } else {
-        crate::semantic_index::probe_remote_backend_while_building(ctx);
-        semantic_backend_unavailable_disclosure(ctx)
+        let check = crate::semantic_index::check_remote_backend_while_building(ctx);
+        let checking = match check {
+            crate::semantic_index::RemoteBackendCheck::Checking { base_url } => Some(base_url),
+            _ => None,
+        };
+        (semantic_backend_unavailable_disclosure(ctx), checking)
     };
     let semantic_status = if backend_unavailable.is_some() {
         "backend_unavailable"
@@ -3165,6 +3170,10 @@ fn handle_engine_only_search(
     // mistakes a lexical-only ranking for a semantic one.
     let lane_disclosure = if backend_unavailable.is_some() {
         None
+    } else if let Some(base_url) = backend_checking {
+        Some(SemanticLaneDisclosure::new(&format!(
+            "Checking the semantic backend ({base_url})"
+        )))
     } else {
         semantic_lane_disclosure(ctx, semantic_snapshot)
     };
@@ -6491,10 +6500,15 @@ mod tests {
             config.semantic.base_url = Some(base_url.clone());
         });
 
-        let response = response_value(handle_semantic_search(
-            &semantic_request("where is the needle symbol implemented", 5),
-            &ctx,
-        ));
+        let response = poll_for_backend_verdict(
+            || {
+                response_value(handle_semantic_search(
+                    &semantic_request("where is the needle symbol implemented", 5),
+                    &ctx,
+                ))
+            },
+            |response| response["semantic_status"] == "backend_unavailable",
+        );
         let status = ctx.build_status_snapshot();
         crate::semantic_index::clear_embedding_backend_retry_status(project.path());
 
@@ -6514,6 +6528,72 @@ mod tests {
         assert!(semantic["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("tcp connect to 127.0.0.1")));
+    }
+
+    /// The backend probe answers on its own thread, so a test repeats the
+    /// request until the verdict arrives (a refused local connect takes
+    /// milliseconds) and returns the first reply that carries it, or the last
+    /// reply after a few seconds so the caller's assertion shows what it got.
+    fn poll_for_backend_verdict(
+        mut request: impl FnMut() -> serde_json::Value,
+        arrived: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let reply = request();
+            if arrived(&reply) || std::time::Instant::now() >= deadline {
+                return reply;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A backend address that silently drops packets (a VPN address, a
+    /// firewalled port) must not make `status` or `search` wait: both read the
+    /// cached probe result and say the backend is being checked while the
+    /// probe is still out.
+    #[test]
+    fn blackholed_backend_never_blocks_status_or_search() {
+        // Reserved private address with nothing behind it: a connect sits
+        // until its timeout instead of being refused.
+        let base_url = "http://10.255.255.1:1234/v1".to_string();
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx =
+            lexical_ready_context_with_semantic(project.path(), building("loading_artifacts"));
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.base_url = Some(base_url.clone());
+        });
+        let request: RawRequest =
+            serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
+                .expect("status request");
+        let bound = Duration::from_millis(200);
+
+        let started = std::time::Instant::now();
+        let status = response_value(crate::commands::status::handle_status(&request, &ctx));
+        let status_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let search = response_value(handle_semantic_search(
+            &semantic_request("where is the needle symbol implemented", 5),
+            &ctx,
+        ));
+        let search_elapsed = started.elapsed();
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+
+        assert!(status_elapsed < bound, "status took {status_elapsed:?}");
+        assert!(search_elapsed < bound, "search took {search_elapsed:?}");
+        let semantic = &status["semantic_index"];
+        assert_eq!(
+            semantic["stage"], "checking_embedding_backend",
+            "{semantic}"
+        );
+        let text = search["text"].as_str().expect("text");
+        assert!(
+            text.starts_with(&format!(
+                "Checking the semantic backend ({base_url}); lexical fallback results follow."
+            )),
+            "{text}"
+        );
     }
 
     /// The sidebar polls `status` without searching; that path must find the
@@ -6536,7 +6616,10 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
                 .expect("status request");
 
-        let status = response_value(crate::commands::status::handle_status(&request, &ctx));
+        let status = poll_for_backend_verdict(
+            || response_value(crate::commands::status::handle_status(&request, &ctx)),
+            |status| status["semantic_index"]["status"] == "backend_unavailable",
+        );
         crate::semantic_index::clear_embedding_backend_retry_status(project.path());
 
         let semantic = &status["semantic_index"];

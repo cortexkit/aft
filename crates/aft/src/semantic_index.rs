@@ -142,18 +142,53 @@ pub(crate) fn record_embedding_backend_retry_deadline(
     entry.next_retry_ms = now_ms.saturating_add(backoff_ms);
 }
 
-/// How long one reachability probe of a remote embedding backend may take.
-/// Status and search requests run the probe inline, so it must stay short; a
-/// backend that cannot accept a TCP connection in this time is not serving a
-/// build either.
-const REMOTE_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
-/// How long a probe result is reused. The sidebar polls status about once a
-/// second; without reuse an unreachable host would cost every poll the full
-/// timeout.
-const REMOTE_BACKEND_PROBE_TTL: Duration = Duration::from_secs(5);
+/// Status stage reported while the first reachability probe of a remote
+/// embedding backend is still out. Readers say the backend is being checked,
+/// neither waiting for the probe nor calling the backend reachable.
+pub const CHECKING_EMBEDDING_BACKEND_STAGE: &str = "checking_embedding_backend";
+
+/// Longest one connect attempt of the backend probe may take. The probe runs on
+/// its own thread, so this bounds how long a result takes to arrive, not how
+/// long any request waits.
+const REMOTE_BACKEND_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a finished probe result is reused before the next probe starts.
+/// The last result keeps being reported while that next probe runs.
+const REMOTE_BACKEND_PROBE_TTL: Duration = Duration::from_secs(30);
+/// A probe still out after this long is reported as a failure. Name resolution
+/// cannot be given a timeout, so a lookup that hangs would otherwise leave the
+/// backend "being checked" forever.
+const REMOTE_BACKEND_PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// What `status` and `search` may say about a remote embedding backend while
+/// the semantic index is building.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteBackendCheck {
+    /// No remote backend, no build in progress, or no URL to check.
+    NotApplicable,
+    /// The first probe for this backend has not finished. Readers say the
+    /// backend is being checked rather than wait for it or call it reachable.
+    Checking { base_url: String },
+    /// A result exists (from a probe or from the build itself) and has been
+    /// written to the backend health that status and search already read.
+    Settled,
+}
+
+/// One root's backend probe: the URL it checks, whether a probe thread is
+/// out, and the last result.
+struct RootBackendProbe {
+    base_url: String,
+    started: Instant,
+    in_flight: bool,
+    finished: Option<(Instant, Result<(), String>)>,
+}
+
+fn root_backend_probes() -> &'static Mutex<HashMap<PathBuf, RootBackendProbe>> {
+    static PROBES: OnceLock<Mutex<HashMap<PathBuf, RootBackendProbe>>> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Check that a remote embedding backend accepts connections while the
-/// semantic index is still building, and record an outage when it does not.
+/// semantic index is still building, without ever waiting on the network.
 ///
 /// The outage state that search replies and the status sidebar report
 /// ("Semantic backend unavailable (<url>): <reason>") used to come only from a
@@ -161,10 +196,16 @@ const REMOTE_BACKEND_PROBE_TTL: Duration = Duration::from_secs(5);
 /// (the artifact-load gate, the file walk, the cold-build queue, a large
 /// corpus's chunking) nothing was recorded, so a backend that was never
 /// listening read as "Semantic index is rebuilding" for as long as that took.
-/// A TCP connect to the configured URL answers the question directly. The probe
-/// never overrides what a build attempt recorded, and a later successful probe
-/// clears only an outage a probe recorded.
-pub(crate) fn probe_remote_backend_while_building(ctx: &crate::context::AppContext) {
+///
+/// `status` is polled by the sidebar and must stay cheap, and a backend behind
+/// a blackholed address or a hanging DNS lookup can take seconds to fail. So
+/// the TCP connect (and the name resolution before it) runs on a background
+/// thread, at most one per root, and callers read only the cached result. The
+/// probe never overrides an outage the build recorded, and a later successful
+/// probe clears only an outage a probe recorded.
+pub(crate) fn check_remote_backend_while_building(
+    ctx: &crate::context::AppContext,
+) -> RemoteBackendCheck {
     let building = matches!(
         &*ctx
             .semantic_index_status()
@@ -173,17 +214,17 @@ pub(crate) fn probe_remote_backend_while_building(ctx: &crate::context::AppConte
         SemanticIndexStatus::Building { .. }
     );
     if !building {
-        return;
+        return RemoteBackendCheck::NotApplicable;
     }
     let Some(root) = ctx.canonical_cache_root_opt() else {
-        return;
+        return RemoteBackendCheck::NotApplicable;
     };
     let config = ctx.config();
     if !matches!(
         config.semantic.backend,
         SemanticBackend::OpenAiCompatible | SemanticBackend::Ollama
     ) {
-        return;
+        return RemoteBackendCheck::NotApplicable;
     }
     let Some(base_url) = config
         .semantic
@@ -191,18 +232,101 @@ pub(crate) fn probe_remote_backend_while_building(ctx: &crate::context::AppConte
         .clone()
         .filter(|url| !url.trim().is_empty())
     else {
-        return;
+        return RemoteBackendCheck::NotApplicable;
     };
     drop(config);
-    probe_remote_backend_for_root(&root, &base_url);
+    check_remote_backend_for_root(&root, &base_url, probe_remote_backend)
 }
 
-fn probe_remote_backend_for_root(root: &Path, base_url: &str) {
-    let recorded_by_build = embedding_backend_build_health(root).is_some_and(|h| !h.probe_only);
-    if recorded_by_build {
-        return;
+fn check_remote_backend_for_root(
+    root: &Path,
+    base_url: &str,
+    probe: fn(&str) -> Result<(), String>,
+) -> RemoteBackendCheck {
+    // The build has reached the backend and recorded what it saw; that is
+    // better evidence than a connect, so no probe is needed.
+    if embedding_backend_build_health(root).is_some_and(|health| !health.probe_only) {
+        return RemoteBackendCheck::Settled;
     }
-    let outcome = cached_remote_backend_probe(base_url);
+    let mut probes = root_backend_probes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = probes
+        .entry(root.to_path_buf())
+        .or_insert_with(|| RootBackendProbe {
+            base_url: base_url.to_string(),
+            started: Instant::now(),
+            in_flight: false,
+            finished: None,
+        });
+    if entry.base_url != base_url {
+        // A reconfigure pointed the root at another backend; an earlier
+        // result says nothing about this one. A thread still probing the old
+        // URL finds the URL changed and discards its result.
+        *entry = RootBackendProbe {
+            base_url: base_url.to_string(),
+            started: Instant::now(),
+            in_flight: false,
+            finished: None,
+        };
+    }
+    if entry.in_flight && entry.started.elapsed() >= REMOTE_BACKEND_PROBE_DEADLINE {
+        let fresh = entry
+            .finished
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < REMOTE_BACKEND_PROBE_TTL);
+        if !fresh {
+            let outcome = Err(format!(
+                "embedding backend unreachable (connection refused or connect failure): no answer from {base_url} within {}s (name resolution or connect did not complete)",
+                REMOTE_BACKEND_PROBE_DEADLINE.as_secs()
+            ));
+            apply_remote_backend_probe_outcome(root, &outcome);
+            entry.finished = Some((Instant::now(), outcome));
+        }
+        return RemoteBackendCheck::Settled;
+    }
+    let fresh = entry
+        .finished
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < REMOTE_BACKEND_PROBE_TTL);
+    if !fresh && !entry.in_flight {
+        entry.in_flight = true;
+        entry.started = Instant::now();
+        let root = root.to_path_buf();
+        let url = base_url.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("aft-backend-probe".to_string())
+            .spawn(move || {
+                let outcome = probe(&url);
+                let mut probes = root_backend_probes()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(entry) = probes.get_mut(&root) else {
+                    return;
+                };
+                if entry.base_url != url {
+                    return;
+                }
+                entry.in_flight = false;
+                apply_remote_backend_probe_outcome(&root, &outcome);
+                entry.finished = Some((Instant::now(), outcome));
+            });
+        if spawned.is_err() {
+            entry.in_flight = false;
+        }
+    }
+    if entry.finished.is_some() {
+        RemoteBackendCheck::Settled
+    } else {
+        RemoteBackendCheck::Checking {
+            base_url: base_url.to_string(),
+        }
+    }
+}
+
+/// Write a probe result into the backend health that status and search read.
+/// An outage the build itself recorded is never replaced or cleared here.
+fn apply_remote_backend_probe_outcome(root: &Path, outcome: &Result<(), String>) {
     let mut registry = embedding_backend_build_health_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -228,36 +352,17 @@ fn probe_remote_backend_for_root(root: &Path, base_url: &str) {
                         probe_only: true,
                     });
             if entry.probe_only {
-                entry.last_error = reason;
+                entry.last_error = reason.clone();
                 entry.next_retry_ms = next_probe_ms;
             }
         }
     }
 }
 
-fn cached_remote_backend_probe(base_url: &str) -> Result<(), String> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Result<(), String>)>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some((at, outcome)) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(base_url)
-    {
-        if at.elapsed() < REMOTE_BACKEND_PROBE_TTL {
-            return outcome.clone();
-        }
-    }
-    let outcome = probe_remote_backend(base_url);
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(base_url.to_string(), (Instant::now(), outcome.clone()));
-    outcome
-}
-
-/// One TCP connect to the backend's host and port. The wording matches the
-/// build's own connect-failure message so the reader sees one vocabulary
-/// whichever side noticed first.
+/// One TCP connect to the backend's host and port, name resolution included.
+/// Runs only on the probe thread. The wording matches the build's own
+/// connect-failure message so the reader sees one vocabulary whichever side
+/// noticed first.
 fn probe_remote_backend(base_url: &str) -> Result<(), String> {
     use std::net::{TcpStream, ToSocketAddrs};
     let unreachable = |detail: String| {
@@ -279,7 +384,7 @@ fn probe_remote_backend(base_url: &str) -> Result<(), String> {
         .collect::<Vec<_>>();
     let mut last_error = None;
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, REMOTE_BACKEND_PROBE_TIMEOUT) {
+        match TcpStream::connect_timeout(&addr, REMOTE_BACKEND_PROBE_CONNECT_TIMEOUT) {
             Ok(_) => return Ok(()),
             Err(error) => last_error = Some(error),
         }
@@ -11632,6 +11737,87 @@ public class Greeter {
             classify_late_onnx_runtime(storage.path(), true),
             LateOnnxRuntime::Absent
         );
+    }
+
+    static SLOW_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn slow_refusing_probe(_url: &str) -> Result<(), String> {
+        SLOW_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(300));
+        Err(
+            "embedding backend unreachable (connection refused or connect failure): stub"
+                .to_string(),
+        )
+    }
+
+    static UNEXPECTED_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn unexpected_probe(_url: &str) -> Result<(), String> {
+        UNEXPECTED_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn backend_check_reports_checking_without_waiting_and_probes_once_per_root() {
+        let root = tempfile::tempdir().expect("root");
+        let url = "http://backend.invalid:1234/v1";
+
+        let started = Instant::now();
+        let first = check_remote_backend_for_root(root.path(), url, slow_refusing_probe);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            first,
+            RemoteBackendCheck::Checking {
+                base_url: url.to_string()
+            }
+        );
+        // A second request while the probe is out neither waits nor starts
+        // another probe.
+        assert_eq!(
+            check_remote_backend_for_root(root.path(), url, slow_refusing_probe),
+            RemoteBackendCheck::Checking {
+                base_url: url.to_string()
+            }
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while check_remote_backend_for_root(root.path(), url, slow_refusing_probe)
+            != RemoteBackendCheck::Settled
+        {
+            assert!(Instant::now() < deadline, "probe result never arrived");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let health = embedding_backend_build_health(root.path()).expect("probe outage");
+        assert!(health.probe_only);
+        assert!(health.last_error.ends_with("stub"), "{}", health.last_error);
+        assert_eq!(SLOW_PROBE_CALLS.load(Ordering::SeqCst), 1);
+        clear_embedding_backend_retry_status(root.path());
+    }
+
+    #[test]
+    fn a_probe_never_overrides_an_outage_the_build_recorded() {
+        let root = tempfile::tempdir().expect("root");
+        record_embedding_backend_build_failure(root.path(), "HTTP 503 from the backend");
+
+        // With the build's own evidence present no probe is started at all.
+        assert_eq!(
+            check_remote_backend_for_root(root.path(), "http://127.0.0.1:1/v1", unexpected_probe),
+            RemoteBackendCheck::Settled
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(UNEXPECTED_PROBE_CALLS.load(Ordering::SeqCst), 0);
+
+        // And a probe result arriving late neither clears nor rewrites it.
+        apply_remote_backend_probe_outcome(root.path(), &Ok(()));
+        apply_remote_backend_probe_outcome(root.path(), &Err("probe: refused".to_string()));
+        let health = embedding_backend_build_health(root.path()).expect("build outage kept");
+        assert!(!health.probe_only);
+        assert_eq!(health.last_error, "HTTP 503 from the backend");
+        clear_embedding_backend_retry_status(root.path());
     }
 
     #[test]

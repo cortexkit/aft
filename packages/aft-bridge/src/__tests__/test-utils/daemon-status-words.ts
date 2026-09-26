@@ -56,11 +56,18 @@ export function daemonMissingRuntimePrefix(): string {
 
 /** Build stage the daemon reports while it waits for the ONNX Runtime download. */
 export function daemonWaitingForOnnxDownloadStage(): string {
-  const match = readDaemonSource().match(
-    /WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE: &str = "([^"]+)"/,
-  );
+  return daemonStageConstant("WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE");
+}
+
+/** Stage the daemon reports while it checks a remote embedding backend. */
+export function daemonCheckingBackendStage(): string {
+  return daemonStageConstant("CHECKING_EMBEDDING_BACKEND_STAGE");
+}
+
+function daemonStageConstant(name: string): string {
+  const match = readDaemonSource().match(new RegExp(`${name}: &str = "([^"]+)"`));
   if (!match) {
-    throw new Error("WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE not found in the daemon source");
+    throw new Error(`${name} not found in the daemon source`);
   }
   return match[1];
 }

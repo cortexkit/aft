@@ -32,10 +32,21 @@ impl From<CompressionAggregate> for CompressionAggregateSerde {
 
 pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
     // A remote embedding backend that a building index has not reached yet
-    // has no outage recorded; probe it so the status names the outage rather
-    // than reporting an index that looks like it is progressing.
-    crate::semantic_index::probe_remote_backend_while_building(ctx);
+    // has no outage recorded. The probe that finds out runs on its own thread
+    // (status is polled and must never wait on the network); until its first
+    // result arrives the stage says the backend is being checked.
+    let backend_check = crate::semantic_index::check_remote_backend_while_building(ctx);
     let mut snapshot = ctx.build_status_snapshot_for_session(req.session());
+    if matches!(
+        backend_check,
+        crate::semantic_index::RemoteBackendCheck::Checking { .. }
+    ) && matches!(
+        snapshot["semantic_index"]["status"].as_str(),
+        Some("loading" | "building")
+    ) {
+        snapshot["semantic_index"]["stage"] =
+            serde_json::json!(crate::semantic_index::CHECKING_EMBEDDING_BACKEND_STAGE);
+    }
     if let Some(removal) = removal_health_for_status(req) {
         snapshot["removal"] = removal;
     }

@@ -40,6 +40,15 @@ const WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE = "waiting_for_onnx_runtime_downlo
 const WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_LABEL = "waiting for ONNX Runtime download";
 
 /**
+ * Stage the daemon reports while its first reachability check of a remote
+ * embedding backend is still out (`CHECKING_EMBEDDING_BACKEND_STAGE` in
+ * crates/aft/src/semantic_index.rs). The check runs off the status path, so
+ * until it answers the honest reading is "being checked", not "building".
+ */
+const CHECKING_EMBEDDING_BACKEND_STAGE = "checking_embedding_backend";
+const CHECKING_EMBEDDING_BACKEND_LABEL = "checking the backend";
+
+/**
  * How a reader should treat each status word the daemon can emit.
  *
  * `progress` means an attempt is under way and waiting is the right response;
@@ -157,6 +166,13 @@ export function formatSemanticIndexStatus(
     stage === WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE
   ) {
     return WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_LABEL;
+  }
+  if (
+    semanticIndexStatusKind(status) === "progress" &&
+    stage === CHECKING_EMBEDDING_BACKEND_STAGE
+  ) {
+    const url = backend?.backendUrl?.trim();
+    return url ? `${CHECKING_EMBEDDING_BACKEND_LABEL} (${url})` : CHECKING_EMBEDDING_BACKEND_LABEL;
   }
   return status;
 }

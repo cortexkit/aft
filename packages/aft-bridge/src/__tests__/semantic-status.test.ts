@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { formatSemanticIndexStatus, semanticIndexStatusKind } from "../semantic-status.js";
 import {
+  daemonCheckingBackendStage,
   daemonMissingRuntimePrefix,
   daemonSemanticStatusWords,
   daemonWaitingForOnnxDownloadStage,
@@ -56,6 +57,14 @@ describe("formatSemanticIndexStatus", () => {
       expect(label).toBe("waiting for ONNX Runtime download");
       expect(label).not.toContain("doctor --fix");
     }
+  });
+
+  test("a remote backend still being checked is not reported as building or reachable", () => {
+    const stage = daemonCheckingBackendStage();
+    expect(formatSemanticIndexStatus("loading", stage)).toBe("checking the backend");
+    expect(
+      formatSemanticIndexStatus("loading", stage, null, { backendUrl: "http://localhost:1234/v1" }),
+    ).toBe("checking the backend (http://localhost:1234/v1)");
   });
 
   test("a missing runtime carried in the build stage is not progress", () => {
