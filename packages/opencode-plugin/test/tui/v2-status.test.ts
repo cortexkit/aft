@@ -117,4 +117,15 @@ describe("V2 TUI status presentation", () => {
       health: "E1 W2 ~D3 U4 C5 T6",
     });
   });
+
+  test("a Mac without developer tools is titled git features off, not DEGRADED", () => {
+    const gitOff = {
+      ...snapshot(),
+      degraded: true,
+      degraded_reasons: ["git features are off: macOS developer tools are not installed."],
+    };
+    expect(summarizeAftSidebar(gitOff).title).toBe("AFT · ⚠ git features off");
+    const homeRoot = { ...snapshot(), degraded: true, degraded_reasons: ["home_root"] };
+    expect(summarizeAftSidebar(homeRoot).title).toBe("AFT · DEGRADED");
+  });
 });

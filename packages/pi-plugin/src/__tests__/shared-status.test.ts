@@ -58,6 +58,17 @@ describe("shared status helpers", () => {
     expect(formatStatusDialogMessage(status)).toContain("callgraph_store: disabled");
   });
 
+  test("git off on a Mac without developer tools is headed calmly, with the explanation kept", () => {
+    const reason =
+      "git features are off: macOS developer tools are not installed. Install them with `xcode-select --install`.";
+    const status = coerceAftStatus({ degraded: true, degraded_reasons: [reason] });
+    for (const text of [formatStatusDialogMessage(status), formatStatusMarkdown(status)]) {
+      expect(text).toContain("Git features off");
+      expect(text).not.toContain("Degraded mode");
+      expect(text).toContain(reason);
+    }
+  });
+
   test("pi_status_snapshot_includes_compression_passthrough", () => {
     const status = coerceAftStatus({
       compression: {

@@ -1,4 +1,4 @@
-import type { AftStatusSnapshot, StatusBar } from "../shared/status";
+import { type AftStatusSnapshot, degradedHeaderMarker, type StatusBar } from "../shared/status";
 
 function count(value: number | undefined): string {
   return value === undefined ? "?" : String(value);
@@ -80,7 +80,9 @@ export function summarizeAftSidebar(status: AftStatusSnapshot | null): AftSideba
     ? `${status.semantic_index.status} (${status.semantic_index.stage})`
     : status.semantic_index.status;
   return {
-    title: status.degraded ? "AFT · DEGRADED" : "AFT",
+    title: status.degraded
+      ? `AFT · ${degradedHeaderMarker(status.degraded_reasons ?? []).text}`
+      : "AFT",
     version: status.version || undefined,
     search: status.search_index.status,
     semantic,

@@ -14,6 +14,7 @@
 import { createMemo, createSignal, onCleanup } from "solid-js";
 import {
   type AftStatusSnapshot,
+  degradedHeaderMarker,
   formatSemanticIndexLabel,
   formatSemanticRefreshing,
   NOT_STARTED_STATUS_TEXT,
@@ -216,10 +217,16 @@ const StatRow = (props: {
     }
   });
 
+  // The label never shrinks and the value wraps in the space left beside it:
+  // left to flexbox, a long value (a semantic index that is unavailable, with
+  // its reason) squeezed the label and drew over it, so "Status" came out as
+  // "Statu" followed by the value.
   return (
     <box width="100%" flexDirection="row" justifyContent="space-between">
-      <text fg={props.palette.textMuted}>{props.label}</text>
-      <text fg={fg()}>
+      <text fg={props.palette.textMuted} flexShrink={0}>
+        {props.label}
+      </text>
+      <text fg={fg()} flexShrink={1} marginLeft={1} wrapMode="word">
         <b>{props.value}</b>
       </text>
     </box>
@@ -463,7 +470,14 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
               </b>
             </text>
           </box>
-          {s()?.degraded && (
+          {s()?.degraded && degradedHeaderMarker(s()?.degraded_reasons ?? []).calm && (
+            <box marginLeft={1}>
+              <text fg={props.palette.warning}>
+                {degradedHeaderMarker(s()?.degraded_reasons ?? []).text}
+              </text>
+            </box>
+          )}
+          {s()?.degraded && !degradedHeaderMarker(s()?.degraded_reasons ?? []).calm && (
             <box
               paddingLeft={1}
               paddingRight={1}
@@ -471,7 +485,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
               backgroundColor={props.palette.warning}
             >
               <text fg={badgeForeground(props.palette.warning, props.palette.background)}>
-                <b>DEGRADED</b>
+                <b>{degradedHeaderMarker(s()?.degraded_reasons ?? []).text}</b>
               </text>
             </box>
           )}

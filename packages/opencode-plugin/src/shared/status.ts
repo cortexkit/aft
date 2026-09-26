@@ -480,9 +480,39 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
   return lines.join("\n");
 }
 
+/**
+ * Opening words of the reason the engine reports when it has turned git off
+ * because Apple's developer tools are missing (MISSING_DEVELOPER_TOOLS_REASON
+ * in crates/aft/src/developer_tools.rs).
+ */
+const GIT_OFF_REASON_PREFIX = "git features are off";
+
+/**
+ * How a surface should head the degraded state. A Mac without developer tools
+ * is the normal state of a fresh machine and everything except git-backed
+ * features works, so that case gets a calm warning mark naming what is off
+ * instead of a capitalised DEGRADED next to the product name, which read as
+ * broken. Any other reason (home directory as project root, too many files)
+ * switches off heavy features and keeps the stronger wording.
+ */
+export function degradedHeaderMarker(reasons: readonly string[]): {
+  /** Short header text: "⚠ git features off" or "DEGRADED". */
+  text: string;
+  /** Section heading for the status dialog. */
+  heading: string;
+  /** True for the git-only case, drawn as plain warning text rather than a badge. */
+  calm: boolean;
+} {
+  if (reasons.length > 0 && reasons.every((reason) => reason.startsWith(GIT_OFF_REASON_PREFIX))) {
+    return { text: "⚠ git features off", heading: "Git features off", calm: true };
+  }
+  return { text: "DEGRADED", heading: "Degraded mode", calm: false };
+}
+
 function appendDegradedStatus(lines: string[], status: AftStatusSnapshot, markdown: boolean): void {
   if (!status.degraded || status.degraded_reasons.length === 0) return;
-  lines.push("", markdown ? "### Degraded mode" : "Degraded mode");
+  const { heading } = degradedHeaderMarker(status.degraded_reasons);
+  lines.push("", markdown ? `### ${heading}` : heading);
   for (const reason of status.degraded_reasons) {
     const detail =
       reason === "home_root"
