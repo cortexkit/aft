@@ -794,9 +794,11 @@ describe("OpenCode doctor generation and load path", () => {
     });
     expect(code).toBe(0);
     expect(calls).toEqual([["setup", "--plan", "--harness", "opencode"]]);
-    expect(lines.join("\n")).toContain(
-      "indexes.trigram: unavailable — configured on (default); reason: default; unavailable: runtime_not_observed",
-    );
+    // Doctor cannot observe a running session, so an enabled index reads as
+    // on, never as "unavailable: runtime_not_observed".
+    const text = lines.join("\n");
+    expect(text).toContain("Indexes: all 1 on");
+    expect(text).not.toContain("runtime_not_observed");
 
     lines = captureOutput();
     const rejected = await runDoctor({

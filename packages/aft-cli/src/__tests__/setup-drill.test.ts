@@ -29,7 +29,12 @@ import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js"
 import type { NativeResult, PlanFeature, SetupPlan } from "../lib/feature-plan.js";
 import { describePermissionProblem, type PermissionFacts } from "../lib/fs-errors.js";
 import { getSelfVersion } from "../lib/self-version.js";
-import { type FeatureRow, promptFeatureList, renderRowLines } from "../setup/feature-list.js";
+import {
+  type FeatureRow,
+  promptFeatureList,
+  renderFeatureList,
+  renderRowLines,
+} from "../setup/feature-list.js";
 import { runFeatureWizard, type WizardIO } from "../setup/feature-wizard.js";
 import type { OpenCodeHostDetection } from "../setup/host-generation.js";
 
@@ -650,8 +655,129 @@ describe("U6-U8: the feature list at 80 and 120 columns", () => {
         expect(line.length).toBeLessThanOrEqual(columns);
         // Every body line keeps the guide bar and a tree column: a group
         // header, a branch, or a description indented under its branch.
-        expect(line).toMatch(/^│ {2}(◻ |◼ |│ |└ | {4})/);
+        expect(line).toMatch(/^│ {2}(◻ |◼ |◧ |│ |└ | {4})/);
       }
     }
+  });
+});
+
+describe("a partly selected feature group", () => {
+  const groups: Record<string, FeatureRow[]> = {
+    Editing: [
+      { value: "read", label: "read", description: "Read files." },
+      { value: "aft_move", label: "aft_move", description: "Move files." },
+      { value: "aft_delete", label: "aft_delete", description: "Delete files." },
+    ],
+    Shell: [{ value: "bash", label: "bash", description: "Run commands." }],
+  };
+
+  test("is drawn with its own mark, not as an empty group", () => {
+    const frame = renderFeatureList("Choose", groups, new Set(["read"]), 80);
+    expect(frame).toContain("│  ◧ Editing");
+    expect(frame).toContain("│  ◻ Shell");
+    expect(renderFeatureList("Choose", groups, new Set(["read", "bash"]), 80)).toContain(
+      "│  ◼ Shell",
+    );
+  });
+
+  test("space on a partial group checks every row in it", async () => {
+    const output = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    }) as Writable & { columns: number; rows: number; isTTY: boolean };
+    output.columns = 80;
+    output.rows = 60;
+    output.isTTY = true;
+    const input = new PassThrough() as PassThrough & { isTTY: boolean; setRawMode: () => void };
+    input.isTTY = true;
+    input.setRawMode = () => {};
+    const done = promptFeatureList(
+      "Choose",
+      groups,
+      ["read"],
+      () => {
+        throw new Error("cancelled");
+      },
+      { input, output },
+    );
+    // The cursor starts on the Editing group header.
+    input.write(" ");
+    input.write("\r");
+    expect((await done).sort()).toEqual(["aft_delete", "aft_move", "read"]);
+  });
+});
+
+describe("doctor on a machine with GitHub read on but no gh, and no developer tools", () => {
+  function githubPlan(): SetupPlan {
+    return {
+      plan_version: 1,
+      features: [
+        feature("aft_conflicts", { order: 1 }),
+        feature("github.read", {
+          order: 2,
+          configured: true,
+          proposed: true,
+          source: "config",
+          effective: "ready",
+          reason: "configured",
+        }),
+        feature("github.write", { order: 3, configured: false, proposed: false, effective: "off" }),
+      ],
+    };
+  }
+
+  async function doctorOutput(
+    git: { available: boolean; reason?: string },
+    gh: "ready" | "missing",
+    plan: SetupPlan = githubPlan(),
+  ): Promise<{ code: number; text: string }> {
+    const fixture = doctorFixture(join(sandbox, "doctor"));
+    fixture.report.binaryVersion = getSelfVersion();
+    const output = captureOutput();
+    const code = await runDoctor({
+      clear: false,
+      fix: false,
+      force: false,
+      issue: false,
+      argv: [],
+      resolveAdapters: async () => [fixture.adapter],
+      collectDiagnostics: async () => fixture.report,
+      collectRemovalHealth: async () => ({ available: false, message: "fixture", git }),
+      detectOpenCodeHost: v1,
+      runNative: () => ({ ok: true, stdout: JSON.stringify(plan), stderr: "", status: 0 }),
+      checkGh: () => gh,
+    });
+    return { code, text: output.join("") };
+  }
+
+  test("GitHub read is reported unavailable with the fix, and the run is not called good", async () => {
+    const { code, text } = await doctorOutput({ available: true }, "missing");
+    expect(code).toBe(1);
+    expect(text).toContain("github.read: unavailable — the GitHub CLI (gh) is not on PATH");
+    expect(text).toContain("`gh auth login`");
+    expect(text).not.toMatch(/github\.read: ready/);
+    expect(text).not.toContain("Everything looks good");
+  });
+
+  test("git off is reported with the features it affects and the sidebar's remedy", async () => {
+    const { code, text } = await doctorOutput(
+      { available: false, reason: "macos_developer_tools_missing" },
+      "ready",
+    );
+    expect(code).toBe(0);
+    expect(text).toContain("git: off — macOS developer tools are not installed");
+    expect(text).toContain("aft_conflicts");
+    expect(text).toContain("`xcode-select --install`");
+    expect(text).toContain("No problems found; see the notes above.");
+    expect(text).not.toContain("Everything looks good");
+  });
+
+  test("with gh ready and git on, the run is good and the header is the command", async () => {
+    const { code, text } = await doctorOutput({ available: true }, "ready");
+    expect(code).toBe(0);
+    expect(text).toContain("npx @cortexkit/aft doctor");
+    expect(text).toContain("GitHub: read on (config), write off");
+    expect(text).toContain("Everything looks good.");
   });
 });

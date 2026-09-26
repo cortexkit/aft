@@ -179,6 +179,14 @@ export function featureListGroups(plan: SetupPlan): Record<string, FeatureRow[]>
 const GITHUB_READ_PROMPT =
   "Let the agent read GitHub issues and pull requests? (uses the GitHub CLI, gh, signed in to your account)";
 
+/**
+ * GitHub write, asked in the same question form as read. It is asked only
+ * after read is answered yes: write needs read, so offering it after a "no"
+ * would either be pointless or silently turn read back on.
+ */
+const GITHUB_WRITE_PROMPT =
+  "Also let the agent post comments on GitHub issues and pull requests? (uses the same gh account)";
+
 export type GhStatus = "ready" | "missing" | "signed_out";
 
 /** Whether `gh` is on PATH and signed in. Called at most once per wizard run. */
@@ -228,10 +236,7 @@ export async function runFeatureWizard(
     github = setGithubRead(setGithubWrite(github, false), false);
   } else {
     if (write) {
-      github = setGithubWrite(
-        github,
-        await io.confirm(`${write.label}: ${write.description}`, github.write),
-      );
+      github = setGithubWrite(github, await io.confirm(GITHUB_WRITE_PROMPT, github.write));
     }
     // With write off, read stands on its own and must be saved as chosen.
     if (!github.write) github = setGithubRead(github, true);
@@ -349,16 +354,4 @@ function describeNativeFailure(stderr: string): string {
   if (!text) return "";
   const permission = text.split("\n").find((line) => isPermissionError(line));
   return permission ? formatFsError(new Error(permission)) : withCliCommands(text);
-}
-
-/** Doctor lines for every plan row, straight from the plan. */
-export function renderFeatureStatus(plan: SetupPlan): string[] {
-  return plan.features.map((feature) => {
-    const parts = [
-      `configured ${feature.configured ? "on" : "off"} (${feature.source})`,
-      `reason: ${feature.reason ?? "none"}`,
-    ];
-    if (feature.unavailable_reason) parts.push(`unavailable: ${feature.unavailable_reason}`);
-    return `${feature.id}: ${feature.effective} — ${parts.join("; ")}`;
-  });
 }

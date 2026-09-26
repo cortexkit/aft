@@ -67,10 +67,25 @@ export function wrapWords(text: string, width: number): string[] {
 
 export type RowState = "active" | "selected" | "active-selected" | "inactive";
 
-function checkbox(state: RowState): string {
+/**
+ * A group checkbox's state. `partial` is a group with some rows checked and
+ * some not: clack draws it the same as an empty group, which made a mostly-on
+ * group (say Editing with only aft_move and aft_delete off) look switched off.
+ */
+export type GroupState = RowState | "partial" | "active-partial";
+
+/**
+ * Clack has no partial checkbox, so this follows its own convention: a
+ * Unicode symbol where its checkboxes use Unicode, an ASCII one otherwise.
+ */
+const S_CHECKBOX_PARTIAL = S_CHECKBOX_SELECTED === "[+]" ? "[~]" : "◧";
+
+function checkbox(state: GroupState): string {
   if (state === "active-selected" || state === "selected") {
     return styleText("green", S_CHECKBOX_SELECTED);
   }
+  if (state === "partial") return styleText("green", S_CHECKBOX_PARTIAL);
+  if (state === "active-partial") return styleText("cyan", S_CHECKBOX_PARTIAL);
   if (state === "active") return styleText("cyan", S_CHECKBOX_ACTIVE);
   return dim(S_CHECKBOX_INACTIVE);
 }
@@ -100,9 +115,20 @@ export function renderRowLines(
   return lines;
 }
 
-/** A group header: the group name with a checkbox that reflects all its rows. */
-export function renderGroupLine(name: string, state: RowState): string {
+/**
+ * A group header: the group name with a checkbox that reflects its rows (all,
+ * some or none checked). Pressing space on a partial group checks every row,
+ * which is clack's toggle for any group that is not fully checked.
+ */
+export function renderGroupLine(name: string, state: GroupState): string {
   return `${checkbox(state)} ${state === "inactive" ? dim(name) : name}`;
+}
+
+/** The header state for a group given how many of its rows are checked. */
+export function groupState(active: boolean, checked: number, total: number): GroupState {
+  if (total > 0 && checked === total) return active ? "active-selected" : "selected";
+  if (checked > 0) return active ? "active-partial" : "partial";
+  return active ? "active" : "inactive";
 }
 
 /**
@@ -119,8 +145,10 @@ export function renderFeatureList(
 ): string {
   const out = [S_BAR, `${symbol("active")}  ${message}`];
   for (const [group, rows] of Object.entries(groups)) {
-    const groupSelected = rows.length > 0 && rows.every((row) => selected.has(row.value));
-    out.push(`${GUIDE}${renderGroupLine(group, rowState(group === cursor, groupSelected))}`);
+    const checked = rows.filter((row) => selected.has(row.value)).length;
+    out.push(
+      `${GUIDE}${renderGroupLine(group, groupState(group === cursor, checked, rows.length))}`,
+    );
     rows.forEach((row, index) => {
       const state = rowState(row.value === cursor, selected.has(row.value));
       for (const line of renderRowLines(row, state, index === rows.length - 1, columns)) {
@@ -187,7 +215,9 @@ export async function promptFeatureList(
       const styled = (option: PromptOption, active: boolean) => {
         if (option.group === true) {
           const name = String(option.value);
-          return renderGroupLine(name, rowState(active, this.isGroupSelected(name)));
+          const items = this.getGroupItems(name);
+          const checked = items.filter((item) => values.includes(item.value)).length;
+          return renderGroupLine(name, groupState(active, checked, items.length));
         }
         const entry = rowsByValue.get(option.value);
         if (!entry) return option.label;

@@ -13,7 +13,6 @@ import {
   groupRows,
   initialGithubChoice,
   initialSelections,
-  renderFeatureStatus,
   runFeatureSetup,
   runFeatureWizard,
   setGithubRead,
@@ -178,7 +177,11 @@ describe("feature wizard rendering", () => {
     expect(asked).toHaveLength(2);
     expect(asked[0]).toContain("read GitHub issues and pull requests");
     expect(asked[0]).not.toContain("issue://");
-    expect(asked[1]).toBe("github.write: github.write description");
+    expect(asked[1]).toBe(
+      "Also let the agent post comments on GitHub issues and pull requests? (uses the same gh account)",
+    );
+    // Both GitHub prompts are questions in the same form, not a question and a label.
+    for (const message of asked) expect(message).toMatch(/^[A-Z][^:]*\? \(uses [^)]*\)$/);
     // Write implies read, so an unedited implied read stays out of the file.
     expect(answers.selections["github.write"]).toBe(true);
     expect("github.read" in answers.selections).toBe(false);
@@ -240,22 +243,6 @@ describe("feature wizard rendering", () => {
       return "missing";
     });
     expect(checks).toBe(0);
-  });
-
-  test("doctor lines carry configured/effective/source, the reason and the cause", () => {
-    const lines = renderFeatureStatus(
-      fixturePlan({
-        "indexes.semantic": {
-          effective: "unavailable",
-          available: false,
-          unavailable_reason: "runtime_not_observed",
-        },
-      }),
-    );
-    expect(lines).toContain(
-      "indexes.semantic: unavailable — configured on (default); reason: default; unavailable: runtime_not_observed",
-    );
-    expect(lines).toContain("github.read: off — configured off (default); reason: default");
   });
 });
 

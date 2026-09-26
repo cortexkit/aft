@@ -25,6 +25,11 @@ import {
 
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter } from "../adapters/types.js";
+import {
+  type FeatureStatusFinding,
+  type GitState,
+  renderFeatureStatus,
+} from "../doctor/features.js";
 import { diagnoseOpenCodeLoad } from "../doctor/opencode.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
@@ -86,8 +91,9 @@ import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
 import {
+  checkGhStatus,
   type FeatureSetupDeps,
-  renderFeatureStatus,
+  type GhStatus,
   runFeatureSetup,
 } from "../setup/feature-wizard.js";
 import {
@@ -136,6 +142,8 @@ export interface DoctorOptions {
   features?: FeatureSetupDeps;
   /** Binary downloader for --fix (tests stub it). */
   downloadBinary?: BinaryDownloader;
+  /** GitHub CLI check for the GitHub read/write report (tests stub it). */
+  checkGh?: () => GhStatus;
 }
 
 function openCodeAdapter(adapters: HarnessAdapter[]): HarnessAdapter | undefined {
@@ -179,6 +187,11 @@ export interface RemovalHealth {
   runningBackgroundTasks?: number;
   undoHistorySessions?: number;
   message?: string;
+  /**
+   * Whether AFT may run git. The same status request that reports removal
+   * state carries it, so doctor learns it without a second binary call.
+   */
+  git?: GitState;
 }
 
 export interface CacheClearSummary {
@@ -239,7 +252,9 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     return runIssueFlow(options.argv);
   }
   installCliLogger({ verbose: options.argv.includes("--verbose") });
-  intro(`${CLI} doctor`);
+  // Name the command as it was run, flags included, so a `--fix` run is not
+  // headed as if it were a plain read-only check.
+  intro(doctorCommandLine(options.argv));
 
   if (options.reconfigure) {
     return runFeatureSetup(
@@ -323,7 +338,11 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   );
   logBuildBreakerSuspensions(report);
 
-  const featuresFailed = logFeatureStatus(options.argv, options.runNative);
+  const features = logFeatureStatus(options.argv, options.runNative, {
+    checkGh: options.checkGh ?? checkGhStatus,
+    git: removalHealth.git ?? null,
+  });
+  const featuresFailed = features.configRejected || features.problems > 0;
 
   log.step("If you remove AFT");
   for (const line of renderRemovalSection(removalHealth)) {
@@ -451,8 +470,16 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     outro("Done — some issues found.");
     return 1;
   }
-  outro("Everything looks good.");
+  // A machine fact such as git being off on a Mac without developer tools is
+  // the normal state of a fresh machine, not a fault, so it does not fail the
+  // run; the outro still points at it so the summary never contradicts it.
+  outro(features.notes > 0 ? "No problems found; see the notes above." : "Everything looks good.");
   return 0;
+}
+
+/** The doctor invocation as the user typed it, for the run's header. */
+export function doctorCommandLine(argv: string[]): string {
+  return [`${CLI} doctor`, ...argv].join(" ");
 }
 
 async function collectRemovalHealth(adapters: HarnessAdapter[]): Promise<RemovalHealth> {
@@ -484,6 +511,24 @@ async function collectRemovalHealth(adapters: HarnessAdapter[]): Promise<Removal
 }
 
 function coerceRemovalHealth(response: AftResponse): RemovalHealth {
+  const git = coerceGitState(response.git);
+  const health = coerceRemovalState(response);
+  return git ? { ...health, git } : health;
+}
+
+/** The status payload's `git` object, or undefined when an older binary omits it. */
+function coerceGitState(raw: unknown): GitState | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const git = raw as Record<string, unknown>;
+  if (typeof git.available !== "boolean") return undefined;
+  return {
+    available: git.available,
+    ...(typeof git.reason === "string" ? { reason: git.reason } : {}),
+    ...(typeof git.message === "string" ? { message: git.message } : {}),
+  };
+}
+
+function coerceRemovalState(response: AftResponse): RemovalHealth {
   if (!response.success) {
     return { available: false, message: response.message ?? response.code ?? "status failed" };
   }
@@ -1298,6 +1343,12 @@ async function runFixFlow(
     pluginUpdateSummary.errors > 0;
   const afterReport = await collect(adapters);
   const stillHasProblems = hasDoctorProblems(afterReport);
+  // Name what is still wrong, with each remedy, so the run never ends on a
+  // bare "some issues remain" that sends the user off to rerun plain doctor.
+  if (stillHasProblems) {
+    logDoctorIssues(afterReport, "Remaining issues");
+    logBuildBreakerSuspensions(afterReport);
+  }
   outro(
     hadErrors
       ? "Done — some fixes failed."
@@ -1320,24 +1371,37 @@ function logDoctorFixSummary(applied: string[], skipped: string[]): void {
 }
 
 /**
- * Report every catalog feature with the same states `aft setup --plan`
- * derives (configured/source, effective, derivation reason, unavailable
- * cause). Returns true when ordinary loading rejects the configuration; a
- * missing or older binary that cannot produce a plan is only a warning,
- * because the binary check reports it separately.
+ * Report the catalog features from `aft setup --plan`, compressed to one line
+ * per group, followed by the features that are on but cannot work here and
+ * the machine facts that switch features off. `configRejected` is true when
+ * ordinary loading rejects the configuration; a missing or older binary that
+ * cannot produce a plan is only a warning, because the binary check reports
+ * it separately.
  */
-function logFeatureStatus(argv: string[], run: NativeRunner = runNative): boolean {
+function logFeatureStatus(
+  argv: string[],
+  run: NativeRunner = runNative,
+  context: { checkGh?: () => GhStatus; git?: GitState | null } = {},
+): { configRejected: boolean; problems: number; notes: number } {
   log.step("Features");
   const loaded = loadFeaturePlan(explicitHarness(argv), run);
   if (!loaded.ok) {
     const message = `  ${loaded.error.split("\n").join("\n  ")}`;
     if (loaded.configRejected) log.error(message);
     else log.warn(message);
-    return loaded.configRejected;
+    return { configRejected: loaded.configRejected, problems: 0, notes: 0 };
   }
   if (loaded.warnings) log.warn(`  ${loaded.warnings}`);
-  for (const line of renderFeatureStatus(loaded.plan)) log.info(`  ${line}`);
-  return false;
+  const report = renderFeatureStatus(loaded.plan, context);
+  for (const line of report.lines) log.info(`  ${line}`);
+  // Problems and notes are printed as warnings so they stand apart from the
+  // plain on/off lines above.
+  for (const finding of [...report.problems, ...report.notes]) logFinding(finding);
+  return { configRejected: false, problems: report.problems.length, notes: report.notes.length };
+}
+
+function logFinding(finding: FeatureStatusFinding): void {
+  log.warn(`  ${finding.text}${finding.remedy ? `\n    ${finding.remedy}` : ""}`);
 }
 
 /**
@@ -1404,11 +1468,11 @@ function applyConfigMigration(
   return { changed, errors };
 }
 
-function logDoctorIssues(report: DiagnosticReport): void {
+function logDoctorIssues(report: DiagnosticReport, heading?: string): void {
   const lines = formatDiagnosticIssuesSection(report);
   if (lines.length === 0) return;
 
-  log.warn(lines[0]);
+  log.warn(heading ? `${heading}:` : lines[0]);
   for (let i = 1; i < lines.length; i += 2) {
     const issue = lines[i];
     const remediation = lines[i + 1];

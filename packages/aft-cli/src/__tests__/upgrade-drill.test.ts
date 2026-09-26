@@ -378,6 +378,43 @@ describe("the config migration is planned and its changes are reported", () => {
   });
 });
 
+describe("doctor --fix ends by naming what it could not fix", () => {
+  test("a missing subc connection file is listed with its remedy, under the command actually run", async () => {
+    const connection = "~/.local/share/cortexkit/run/subc.json";
+    const { pluginLoad } = await harnessFor({
+      $schema: AFT_SCHEMA_URL,
+      subc: { connection_file: connection },
+    });
+    expect(pluginLoad?.blockers.length).toBeGreaterThan(0);
+    const adapter = fixtureAdapter();
+    mkdirSync(join(sandbox, "storage"), { recursive: true });
+    const report = fixReport(adapter, getSelfVersion());
+    report.harnesses = report.harnesses.map((harness) => ({ ...harness, pluginLoad }));
+    const output = captureOutput();
+    const code = await runDoctor({
+      clear: false,
+      fix: true,
+      force: false,
+      issue: false,
+      argv: ["--fix", "--yes"],
+      resolveAdapters: async () => [adapter],
+      collectDiagnostics: async () => report,
+      detectOpenCodeHost: v1,
+      runNative: () => ({ ok: true, stdout: '{"files":[]}', stderr: "", status: 0 }),
+    });
+    const text = output.join("");
+    expect(code).toBe(1);
+    expect(text).toContain("npx @cortexkit/aft doctor --fix --yes");
+    expect(text).toContain("Remaining issues:");
+    const tail = text.slice(text.indexOf("Remaining issues:"));
+    expect(tail).toContain("no subc connection file exists there");
+    expect(tail).toContain(
+      `remove the "subc" block (or its "connection_file" key) from ${userConfig}`,
+    );
+    expect(tail).toContain("Done — some issues remain.");
+  });
+});
+
 describe("a binary already in the versioned cache", () => {
   test("is planned as a check, not a download, and never reported as not found", async () => {
     writeUserConfig({ $schema: AFT_SCHEMA_URL });
