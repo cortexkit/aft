@@ -195,6 +195,7 @@ use self::health::{
     DeferredBashWaitGuard, DispatchPathMetrics, HealthRollupCache, HealthRollupWorker,
     ReapBlockerCensus, ResponseTaskGuard, UnboundRetention,
 };
+pub(crate) use self::manifest::is_native_plumbing_call;
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
@@ -4099,6 +4100,7 @@ where
                                 allow_native_passthrough,
                                 tool_response_body_limit,
                                 &module_drain,
+                                user_config_path.as_deref(),
                             )
                             .await
                         };
@@ -5645,7 +5647,7 @@ async fn handle_control_request(
             )
             .config
             .diagnostics_on_edit;
-            let configure_json = json!({
+            let mut configure_json = json!({
                 "id": request_id,
                 "command": "configure",
                 "project_root": bind_project_root,
@@ -5653,6 +5655,13 @@ async fn handle_control_request(
                 "session_id": bind_session.clone(),
                 "config": config_tiers,
             });
+            // Naming the user file lets configure record it, so tool calls
+            // re-read `disabled_tools` from it rather than from this bind-time
+            // copy. Configure accepts only an absolute path.
+            if let Some(path) = user_config_path.filter(|path| path.is_absolute()) {
+                configure_json["cortexkit_user_config_path"] =
+                    Value::String(path.to_string_lossy().into_owned());
+            }
             let configure_req = match serde_json::from_value::<RawRequest>(configure_json) {
                 Ok(req) => req,
                 Err(error) => {
@@ -6263,6 +6272,7 @@ async fn handle_tool_call(
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
+    user_config_path: Option<&Path>,
 ) -> Result<(), SubcError> {
     let module_draining = module_drain.is_active();
     let route_id = route_key(frame.header.channel, frame.header.epoch);
@@ -6525,6 +6535,35 @@ async fn handle_tool_call(
     }
 
     if matches!(bare_name.as_str(), "bash" | "powershell") {
+        // Bash skips the shared tool-call pipeline (and its disabled-tool
+        // refusal), and an untrusted bind would ask the consumer for
+        // permission first, so a disabled bash is refused here, from the
+        // config files as they are now.
+        let gate_source = crate::tool_gate::subc_route_source(
+            user_config_path,
+            identity.project_root.as_path(),
+            &identity.harness,
+        );
+        if let Some(response) =
+            crate::tool_gate::refusal_for_source(&gate_source, &request_id, &bare_name, &arguments)
+        {
+            let text = crate::subc_format::format_response_with_context(
+                &bare_name,
+                &response,
+                &format_context,
+            );
+            let result = ToolCallResult { text, response };
+            let response_frame = build_tool_response_frame_with_limit(
+                frame.header.ver,
+                route_id,
+                frame.header.corr,
+                frame.header.flags,
+                &result,
+                bind_trust,
+                tool_response_body_limit,
+            )?;
+            return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+        }
         if matches!(bind_trust, BindTrust::Untrusted) && module_draining {
             // A permission ask sent now would hold this call open across the
             // drain; the command has not run, so answer with the retryable

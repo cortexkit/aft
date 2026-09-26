@@ -2379,33 +2379,33 @@ fn parse_cortexkit_user_config_path(params: &serde_json::Value) -> Result<Option
     Ok(Some(path))
 }
 
-fn find_config_tier(
-    tiers: &[crate::config_resolve::ConfigTier],
-    tier_name: &str,
-) -> Option<crate::config_resolve::ConfigTier> {
-    tiers.iter().find(|tier| tier.tier == tier_name).cloned()
-}
-
+/// Select the tiers this configure resolves, and record where they came from so
+/// a tool call can re-read the same files later.
 fn resolve_config_tiers_for_configure(
     params: &serde_json::Value,
     project_root: &Path,
-) -> Result<Vec<crate::config_resolve::ConfigTier>, String> {
+    harness: &Harness,
+) -> Result<
+    (
+        Vec<crate::config_resolve::ConfigTier>,
+        crate::tool_gate::ToolGateSource,
+    ),
+    String,
+> {
     let wire_tiers = parse_config_tiers(params).unwrap_or_default();
     let user_config_path = parse_cortexkit_user_config_path(params)?;
-    let file_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
+    let tiers = crate::subc_config::select_config_tiers(
         user_config_path.as_deref(),
         project_root,
+        &wire_tiers,
     );
-
-    let mut tiers = Vec::new();
-    for tier_name in ["user", "project"] {
-        if let Some(tier) = find_config_tier(&file_tiers, tier_name) {
-            tiers.push(tier);
-        } else if let Some(tier) = find_config_tier(&wire_tiers, tier_name) {
-            tiers.push(tier);
-        }
-    }
-    Ok(tiers)
+    let source = crate::tool_gate::ToolGateSource {
+        project_root: project_root.to_path_buf(),
+        harness: Some(harness.clone()),
+        user_config_path,
+        wire_tiers,
+    };
+    Ok((tiers, source))
 }
 
 fn configure_fingerprint(
@@ -2713,10 +2713,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
-    let tiers = match resolve_config_tiers_for_configure(params, &root_path) {
-        Ok(tiers) => tiers,
-        Err(error) => return Response::error(&req.id, "invalid_request", error),
-    };
+    let (tiers, tool_gate_source) =
+        match resolve_config_tiers_for_configure(params, &root_path, &harness) {
+            Ok(resolved) => resolved,
+            Err(error) => return Response::error(&req.id, "invalid_request", error),
+        };
     let config_diagnostics =
         crate::config_resolve::resolve_config_onto_with_diagnostics_for_harness(
             &tiers,
@@ -2736,6 +2737,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             ),
         );
     }
+    // Tool calls re-read these files to enforce `disabled_tools`, so a config
+    // edit takes effect on the next call. The gate only trusts this source
+    // while it names the same root and harness as the published config, so
+    // publishing it before a later configure step fails is harmless.
+    ctx.set_tool_gate_source(tool_gate_source);
     let mut configure_warnings = config_diagnostics
         .warnings
         .into_iter()

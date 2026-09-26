@@ -281,6 +281,22 @@ pub(crate) fn prepare_tool_call(
     app_ctx: &AppContext,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> Result<PreparedToolCall, ToolCallResult> {
+    // A tool the user disabled is refused before anything else happens: no
+    // hashline registration, translation, permission preflight or backup.
+    if let Some(response) =
+        crate::tool_gate::refusal_for_call(app_ctx, &ctx.request_id, bare_name, &args)
+    {
+        if let Some(trace) = phase_trace.as_mut() {
+            trace.mark_translate_done();
+            trace.mark_execute_done();
+        }
+        let result = tool_call_result_from_response(bare_name, format_context, response, false);
+        if let Some(trace) = phase_trace.as_mut() {
+            trace.mark_format_done();
+            trace.mark_finalize_done();
+        }
+        return Err(result);
+    }
     let sanitized_args = strip_agent_preview_arg_owned(args);
     let binding_root = app_ctx
         .canonical_cache_root_opt()

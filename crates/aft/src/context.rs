@@ -2658,6 +2658,9 @@ pub struct AppContext {
     /// producer. Only explicit observation sources may mutate this state.
     alert_state: parking_lot::Mutex<AlertDeltaState>,
     repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker,
+    /// The config files the last successful configure resolved, so tool calls
+    /// can re-read `disabled_tools` from them at call time.
+    tool_gate_source: parking_lot::Mutex<Option<Arc<crate::tool_gate::ToolGateSource>>>,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
     #[cfg(unix)]
@@ -3113,6 +3116,7 @@ impl AppContext {
             status_bar_cached: RwLock::new(StatusBarCache::default()),
             alert_state: parking_lot::Mutex::new(AlertDeltaState::default()),
             repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
+            tool_gate_source: parking_lot::Mutex::new(None),
             compression_aggregates,
             bash_background,
             #[cfg(unix)]
@@ -4630,6 +4634,16 @@ impl AppContext {
     /// Return whether a tool is available to the active agent session.
     pub fn tool_enabled(&self, tool: &str) -> bool {
         !self.config().disabled_tools.iter().any(|name| name == tool)
+    }
+
+    /// Record the config files configure resolved; see [`crate::tool_gate`].
+    pub fn set_tool_gate_source(&self, source: crate::tool_gate::ToolGateSource) {
+        *self.tool_gate_source.lock() = Some(Arc::new(source));
+    }
+
+    /// The config files the last configure resolved, if any.
+    pub fn tool_gate_source(&self) -> Option<Arc<crate::tool_gate::ToolGateSource>> {
+        self.tool_gate_source.lock().clone()
     }
 
     /// Access an owned configuration snapshot.

@@ -719,10 +719,37 @@ fn configure_bridge_context(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
     let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    // Like the real configure, resolve `disabled_tools` from the bind's config
+    // tiers so tests can switch tools on or off through the user config file.
+    let tiers: Vec<aft::config_resolve::ConfigTier> = req
+        .params
+        .get("config")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(aft::config_resolve::ConfigTier {
+                        tier: entry.get("tier")?.as_str()?.to_string(),
+                        source: entry
+                            .get("source")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        doc: entry.get("doc")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let disabled_tools = aft::config_resolve::resolve_config(&tiers)
+        .config
+        .disabled_tools;
 
     ctx.update_config(|config| {
         config.project_root = Some(root.clone());
         config.harness = Some(Harness::Opencode);
+        config.disabled_tools = disabled_tools;
         config.indexes.callgraph = false;
         config.indexes.trigram = false;
         config.indexes.semantic = false;
@@ -1047,6 +1074,22 @@ fn inspect_dead_code_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
             req.id,
             "unexpected_command",
             format!("unexpected inspect convergence command: {other}"),
+        ),
+    }
+}
+
+fn tool_disabled_bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
+    match req.command.as_str() {
+        "configure" => aft::commands::configure::handle_configure(&req, ctx),
+        "delete_file" => aft::commands::delete_file::handle_delete_file(&req, ctx),
+        "bash" => aft::commands::bash::handle(&req, ctx),
+        "bash_status" => aft::commands::bash_status::handle(&req, ctx),
+        "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
+        "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
+        other => Response::error(
+            req.id,
+            "unexpected_command",
+            format!("unexpected tool-disabled bridge command: {other}"),
         ),
     }
 }
@@ -2799,6 +2842,17 @@ fn subc_bridge_hashline_preflight_and_edit_round_route_in_production() {
         drive_hashline_edit_round_daemon,
         |_, _, _| {},
         hashline_bridge_dispatch,
+    );
+}
+
+#[test]
+fn subc_bridge_disabled_tools_are_refused_at_dispatch() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_disabled_tools_are_refused_at_dispatch",
+        Duration::from_secs(30),
+        drive_disabled_tools_daemon,
+        |_, _, _| {},
+        tool_disabled_bridge_dispatch,
     );
 }
 
@@ -10833,6 +10887,116 @@ async fn drive_hashline_edit_round_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
+    let user_config = input.user_config_path.clone();
+    std::fs::write(&user_config, r#"{ "disabled_tools": ["aft_delete"] }"#)
+        .expect("write user config");
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    let victim = root1.join("victim.txt");
+    std::fs::write(&victim, "keep me\n").expect("write delete target");
+
+    send_route_bind_with_session_and_doc(
+        &mut stream,
+        1,
+        10,
+        &root1,
+        "tool-disabled-session",
+        json!({
+            "callgraph_store": false,
+            "search_index": false,
+            "semantic_search": false,
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 10).await;
+
+    let assert_disabled = |response: &Value, entry: &str, label: &str| {
+        assert_tool_error_code(response, "tool_disabled", label);
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&format!("remove \"{entry}\" from `disabled_tools`")),
+            "{label}: refusal must name the entry to remove: {response:?}"
+        );
+    };
+
+    let delete = call_tool_response(
+        &mut stream,
+        1,
+        100,
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+        "disabled delete",
+    )
+    .await;
+    assert_disabled(&delete, "aft_delete", "disabled delete");
+    assert!(victim.exists(), "a refused delete must not touch the file");
+
+    // Mid-session edit of the user file, no rebind: the next call re-reads it.
+    std::fs::write(&user_config, r#"{ "disabled_tools": ["bash"] }"#).expect("rewrite user config");
+    let delete = call_tool_response(
+        &mut stream,
+        1,
+        101,
+        "delete",
+        json!({ "files": ["victim.txt"] }),
+        "re-enabled delete",
+    )
+    .await;
+    assert_tool_success(&delete, "re-enabled delete");
+    assert!(!victim.exists(), "the allowed delete must run");
+
+    // With bash disabled, the agent's bash and its companions are refused
+    // before the command runs...
+    let marker = root1.join("ran.txt");
+    let bash = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "bash",
+        json!({ "command": format!("touch {}", marker.display()) }),
+        "disabled bash",
+    )
+    .await;
+    assert_disabled(&bash, "bash", "disabled bash");
+    assert!(!marker.exists(), "a refused bash must not run");
+    let status = call_tool_response(
+        &mut stream,
+        1,
+        103,
+        "bash_status",
+        json!({ "taskId": "bgb-missing" }),
+        "agent bash_status",
+    )
+    .await;
+    assert_disabled(&status, "bash", "agent bash_status");
+
+    // ...while the plugin's own completion plumbing keeps working.
+    let drain = call_tool_response(
+        &mut stream,
+        1,
+        104,
+        "bash_drain_completions",
+        json!({}),
+        "plumbing drain",
+    )
+    .await;
+    assert_tool_success(&drain, "plumbing drain");
+    let ack = call_tool_response(
+        &mut stream,
+        1,
+        105,
+        "bash_ack_completions",
+        json!({ "task_ids": [] }),
+        "plumbing ack",
+    )
+    .await;
+    assert_tool_success(&ack, "plumbing ack");
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_hashline_bash_cat_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -10882,6 +11046,11 @@ async fn drive_hashline_bash_cat_daemon(input: FakeDaemonInput) {
 }
 
 async fn drive_manifest_reachability_daemon(input: FakeDaemonInput) {
+    // `aft_delete` and `aft_move` are disabled by default and refused at
+    // dispatch; this test is about routing, so the user config enables every
+    // tool.
+    std::fs::write(&input.user_config_path, r#"{ "disabled_tools": [] }"#)
+        .expect("write user config enabling every tool");
     let FakeDaemonSession {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;

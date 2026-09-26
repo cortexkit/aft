@@ -107,6 +107,23 @@ pub fn read_local_cortexkit_config_tiers(
     )
 }
 
+/// The tiers configure resolves: for each of `user` and `project`, the file on
+/// disk wins and the plugin-relayed wire tier is only the fallback for a tier
+/// with no file. Shared by configure and by the per-call `disabled_tools`
+/// re-read so both answer from the same files in the same order.
+pub fn select_config_tiers(
+    user_config_path: Option<&Path>,
+    project_root: &Path,
+    wire_tiers: &[ConfigTier],
+) -> Vec<ConfigTier> {
+    let file_tiers = read_local_cortexkit_config_tiers(user_config_path, project_root);
+    let find = |tiers: &[ConfigTier], name: &str| tiers.iter().find(|t| t.tier == name).cloned();
+    ["user", "project"]
+        .into_iter()
+        .filter_map(|name| find(&file_tiers, name).or_else(|| find(wire_tiers, name)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
