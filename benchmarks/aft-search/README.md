@@ -114,11 +114,57 @@ executes page-size invariance plans that retrieve the same 100 rows. The harness
 sets that maximum once as `PAGE_SIZE`; a test compares it with the checked-in
 `aft_search.topK.maximum` schema so a later product-cap change fails by name
 instead of turning every replay row into an invalid request. Every request
-forwards the row's recorded `includeTests` value. When the pinned product's
-semantic chunk format intentionally changes, refresh the checked-in
-allowlist in an authoring environment with
-`python3 benchmarks/aft-search/capture_real_query_vectors.py --allow-vector-authoring`;
-normal gate execution never derives a vector on a miss.
+forwards the row's recorded `includeTests` value.
+
+### Which embeddings the gate uses
+
+The semantic lane is served by `embedding_fixture_server.py` from
+`real-query-vectors.bin`: the real all-MiniLM-L6-v2 vectors, the model behind
+AFT's default local backend, for every text AFT embeds on the pinned tree
+(27,415 chunks, queries and the index probe). They are stored as float16,
+indexed by the SHA-256 of the embedded text (`vector_pack.py`), about 22 MB.
+A text with no stored vector is refused with `vector_missing`; the server never
+makes one up.
+
+The gate serves stored vectors instead of running the model because the live
+local backend is not reproducible run to run. Three full paged replays on one
+Mac and one binary disagreed on 3 of 49 rows, and each took 8-18 minutes
+against about 6 for the pack. Serving the pack gave rows byte-identical to a
+live run, and float16 gave the same rows as float32. int8 broke page
+invariance, so it is not used. Until 2026-09 the pack held 8-number vectors
+hashed from each text, so the semantic lane's effect on every earlier MRR
+figure was deterministic noise.
+
+On macOS the replay itself is not yet repeatable. FSEvents reports the
+just-copied evidence tree to AFT's watcher about a second after the index is
+ready. The watcher invalidates every semantic file (`runtime_drain.rs`, the
+`SemanticIndex` apply phase) while the index still reports `ready`: entries
+drop from 27,476 to 0 and are re-embedded over about 20 seconds, so early rows
+are ranked against a partly empty index. Two Mac replays of the pack disagreed
+with a third on 4 of 49 rows. On Linux, where CI runs, there is no such burst,
+and three replays gave byte-identical scores. Record the reference on Linux.
+
+The pack is not yet paired with a recorded reference.
+`real-query-baseline.json` still holds the hashed-vector rows, so the gate
+refuses a real-vector score (`corpus_vector_model_mismatch`,
+`reference_manifest_mismatch`) until the watcher race is fixed and the
+reference is re-recorded.
+
+When the pinned product's semantic chunk format intentionally changes, recapture
+the pack in an authoring environment that has the model cache:
+
+```bash
+cd benchmarks/aft-search
+uv run --with onnxruntime==1.24.4 --with tokenizers==0.22.2 --with numpy \
+  python3 capture_real_query_vectors.py --allow-vector-authoring
+```
+
+`minilm_embedder.py` mirrors `crates/aft/src/local_embed.rs` step by step and
+refuses a model snapshot whose digests differ from the captured one. The
+capture starts from an empty pack and rebinds every manifest row.
+`run_real_query.py --live-model` replays the same rows on AFT's own local
+backend. That run is report-only, for checking a new pack against the live
+model, and its `model_id` carries a `:live` suffix so the gate refuses it.
 
 Run the independently named cases with, for example:
 
