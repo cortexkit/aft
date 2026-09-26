@@ -49,6 +49,8 @@ function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
     compileNativeFixture(source, cacheDir, cachedBinary);
   }
 
+  // Keep each test's resolver-visible path, without copying a new executable inode.
+  // A symlink can be unlinked and replaced by a test without changing the shared binary.
   symlinkSync(cachedBinary, path);
 }
 

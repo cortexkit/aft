@@ -19,7 +19,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import {
@@ -223,16 +223,10 @@ describe("findBinarySync versioned cache validation", () => {
     const binaryPath = writeCachedVersion("v1.2.3", "1.2.3");
     writeBinaryIdentitySidecar(binaryPath, "1.2.3", "0".repeat(64));
     // Another writer swaps different bytes in: the sidecar no longer matches.
-    // The fixtures are the same size, and on Linux the recreated file can
-    // reuse the inode and land in the same coarse timestamp tick, which would
-    // make the swap invisible to a stat comparison. Real cache writers replace
-    // by temp file and rename, so they always change the inode; here the
-    // replacement's mtime is moved explicitly so the test exercises the
-    // mismatch path instead of depending on filesystem timing.
+    // Replacing the link points the fixture at a different cached inode;
+    // never change the shared cache's contents or timestamps through the link.
     rmSync(binaryPath);
     writeCachedVersion("v1.2.3", "9.9.9");
-    const later = new Date(Date.now() + 5_000);
-    utimesSync(binaryPath, later, later);
     __setEnsureBinaryForTests(async () => "/downloaded/aft");
 
     expect(findBinarySync("1.2.3")).toBeNull();
