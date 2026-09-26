@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "real-minilm-vector-pack"
+  ],
+  "note": "Replaces the SHA-256 stand-in vectors with a float16 pack of real all-MiniLM-L6-v2 vectors and re-records the reference on the unchanged engine through the audited manifest-changed flow (old and new scores share binary and profile; every row's pack binding changed). No ranking-fence file touched."
+}
