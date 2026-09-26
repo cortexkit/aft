@@ -129,7 +129,10 @@ const TEST_REMOVE_MUTATING = "AFT_OPENCODE2_TEST_REMOVE_MUTATING_TOOL";
 const TEST_EVIDENCE = "AFT_OPENCODE2_TEST_NON_MUTATING_EVIDENCE";
 
 export const V2_SCHEMA_PROJECTION_EXCLUSIONS = {
-  projection_only: ["bash_kill", "bash_status", "bash_watch", "bash_write"],
+  // bash_watch's waiting loop lives in the OpenCode and Pi plugins, not in the
+  // module, so the subc tool-schema artifact never carries it. The other bash
+  // companions (bash_status, bash_kill, bash_write) are in the module catalog.
+  projection_only: ["bash_watch"],
   schema_only: ["powershell"],
   host_catalog_only: ["status"],
 } as const;

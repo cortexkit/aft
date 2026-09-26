@@ -910,7 +910,14 @@ describe("source-of-truth derivation", () => {
       { tool: "powershell", trajectories: powershell },
     ];
     const projection = ["read", ...projectedControls];
-    const schemas = { read: {}, powershell: {}, status: {} };
+    const schemas = {
+      read: {},
+      powershell: {},
+      status: {},
+      bash_kill: {},
+      bash_status: {},
+      bash_write: {},
+    };
     expect(() =>
       validateInventory(
         { schema_version: 1, platform: "linux", rows: requiredRows },
@@ -967,7 +974,7 @@ describe("source-of-truth derivation", () => {
     };
 
     expect(validateInventory(matrix, schemas, "linux", projection)).toEqual(inventory);
-    const schemaWithProjectedControl = { ...schemas, bash_status: {} };
+    const schemaWithProjectedControl = { ...schemas, bash_watch: {} };
     expect(() => validateInventory(matrix, schemaWithProjectedControl, "linux", projection)).toThrow(
       "projection-only tools do not match the explicit exclusion table",
     );

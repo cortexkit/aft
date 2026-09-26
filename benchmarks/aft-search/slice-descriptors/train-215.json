@@ -9,7 +9,8 @@
     "catalog-bash-companions",
     "session-kind-fixes",
     "session-kind-inventory",
-    "umbrella-sessions-design"
+    "umbrella-sessions-design",
+    "search-recall-audit"
   ],
-  "note": "The only ranking-fence file touched is the subc tool-schema artifact: the catalog gains bash_status, bash_kill and bash_write, and the catalog bash description stops naming bash_watch. No search tool schema, ranking, fusion, lane or truncation code changed, so rows should be byte-equal to the reference."
+  "note": "The ranking-fence files touched are the subc tool-schema artifact (the catalog gains bash_status, bash_kill and bash_write, and the catalog bash description stops naming bash_watch) and the benchmark-only recall audit in semantic_search/mod.rs and search_index.rs, which runs only when AFT_SEARCH_RECALL_AUDIT=1 and leaves results, text and plan unchanged otherwise. No ranking, fusion, lane or truncation behaviour changed, so rows should be byte-equal to the reference."
 }
