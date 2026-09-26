@@ -2068,8 +2068,9 @@ describe("OpenCode bash adapter — subagent gating", () => {
       ),
     );
     expect(result as string).toContain("Background task started: bash-sub-bg");
-    // The note must not name a watch timeout: a subagent's bash_watch already
-    // defaults to the configured maximum, and any smaller number shortens it.
+    // The bash_watch call suggested to the subagent must omit timeoutMs: a
+    // subagent's watch defaults to the configured maximum, and any smaller
+    // value only makes it return sooner.
     expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg" })');
     expect(result as string).toContain("without timeoutMs it waits up to 120000 ms");
     expect(result as string).not.toContain("timeoutMs: 60000");

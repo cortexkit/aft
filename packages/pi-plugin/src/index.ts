@@ -823,7 +823,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // startup) does not apply here, so eager warmup is the correct trade for Pi:
   // it removes first-tool-call latency without the bridge-storm downside.
   // The $HOME guard below is the only case we skip. See the home-dir note.
-  // (pi-magic-context subagents also skip it; see skipsEagerStartup.)
+  // pi-magic-context children also skip eager warmup because they are
+  // short-lived and rarely call an AFT tool; see skipsEagerStartup.
   void (async () => {
     try {
       if (skipEagerStartup) return;
