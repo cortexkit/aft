@@ -2068,7 +2068,11 @@ describe("OpenCode bash adapter — subagent gating", () => {
       ),
     );
     expect(result as string).toContain("Background task started: bash-sub-bg");
-    expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg", timeoutMs: 60000 })');
+    // The note must not name a watch timeout: a subagent's bash_watch already
+    // defaults to the configured maximum, and any smaller number shortens it.
+    expect(result as string).toContain('bash_watch({ taskId: "bash-sub-bg" })');
+    expect(result as string).toContain("without timeoutMs it waits up to 120000 ms");
+    expect(result as string).not.toContain("timeoutMs: 60000");
     expect(calls.find((c) => c.command === "bash")?.params.background).toBe(true);
     expect(calls.find((c) => c.command === "bash")?.params.notify_on_completion).toBe(true);
   });
@@ -2094,9 +2098,8 @@ describe("OpenCode bash adapter — subagent gating", () => {
       ),
     );
     expect(result as string).toContain("promoted to background: bash-sub-promote");
-    expect(result as string).toContain(
-      'bash_watch({ taskId: "bash-sub-promote", timeoutMs: 60000 })',
-    );
+    expect(result as string).toContain('bash_watch({ taskId: "bash-sub-promote" })');
+    expect(result as string).not.toContain("timeoutMs: 60000");
     expect(calls.map((c) => c.command)).toEqual(["bash"]);
   });
 });

@@ -548,7 +548,9 @@ export function createBashTool(
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
         let rendered = (data.output as string | undefined) ?? "";
-        if (isSubagent && allowSubagentBg) rendered += subagentGuidance(taskId);
+        if (isSubagent && allowSubagentBg) {
+          rendered += subagentGuidance(taskId, bashCfg.watch_sync_max_ms);
+        }
         const metadataPayload = { description, output: rendered, status: "running", taskId };
         metadata?.(metadataPayload);
         return { output: rendered, title: uiTitle, metadata: metadataPayload };
@@ -701,10 +703,16 @@ function preview(output: string): string {
   return output.length <= METADATA_PREVIEW_LIMIT ? output : output.slice(-METADATA_PREVIEW_LIMIT);
 }
 
-function subagentGuidance(taskId: string): string {
+/**
+ * Appended when a subagent's command goes to the background. The suggested
+ * bash_watch call passes no timeout on purpose: a subagent's watch already
+ * defaults to the configured maximum (`bash.watch_sync_max_ms`), so naming any
+ * smaller number would only make it wake and re-watch more often.
+ */
+function subagentGuidance(taskId: string, watchSyncMaxMs: number): string {
   return `
 
-NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}", timeoutMs: 60000 }) to wait for completion before returning to the parent. Subagents don't survive turn-end and won't receive the completion reminder.`;
+NOTE (subagent session): Continue with other work if you have it. If you don't, call bash_watch({ taskId: "${taskId}" }) to wait for completion before returning to the parent; without timeoutMs it waits up to ${watchSyncMaxMs} ms, the maximum. Subagents don't survive turn-end and won't receive the completion reminder.`;
 }
 
 function foregroundMetadata(
