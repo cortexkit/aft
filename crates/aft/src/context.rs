@@ -5785,30 +5785,37 @@ impl AppContext {
             }
         }
 
+        // A build publishes its generation pointer and then does store-wide
+        // housekeeping (old-generation GC, orphan sweeps) before it hands its
+        // store to this context. During that time the published generation is
+        // ready on disk, and any other reader already opens it, so serve it too
+        // instead of answering `Building` for a store that is not building.
+        // The build's own completion event is still adopted when it arrives. A
+        // forced rebuild is excluded: until it publishes, the pointer names the
+        // store it is replacing.
+        if build_in_flight && force_token.is_none() {
+            if let Ok(Some(store)) =
+                CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone())
+            {
+                return self.install_readonly_callgraph_store(
+                    store,
+                    operation_generation,
+                    &project_root,
+                    &callgraph_dir,
+                );
+            }
+        }
+
         if !build_in_flight {
             if force_token.is_none() {
                 match CallGraphStore::open_readonly(callgraph_dir.clone(), project_root.clone()) {
                     Ok(Some(store)) => {
-                        let store = Arc::new(store);
-                        let installed =
-                            self.run_if_subc_bound_generation(operation_generation, || {
-                                let mut guard = self
-                                    .callgraph_store
-                                    .write()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                *guard = Some(Arc::clone(&store));
-                                Arc::clone(&store)
-                            });
-                        let Some(store) = installed else {
-                            return CallgraphStoreAccess::Unavailable;
-                        };
-                        self.clear_callgraph_store_build_denied();
-                        self.schedule_legacy_callgraph_migration_if_needed(
-                            store.as_ref(),
-                            project_root.clone(),
-                            callgraph_dir.clone(),
+                        return self.install_readonly_callgraph_store(
+                            store,
+                            operation_generation,
+                            &project_root,
+                            &callgraph_dir,
                         );
-                        return CallgraphStoreAccess::Ready(store);
                     }
                     Ok(None) => {
                         if !self.callgraph_writer() {
@@ -5992,6 +5999,37 @@ impl AppContext {
             }
         }
         CallgraphStoreAccess::Building
+    }
+
+    /// Make a store opened through the published pointer the resident store
+    /// and answer `Ready` with it, unless the root was rebound since
+    /// `operation_generation`.
+    fn install_readonly_callgraph_store(
+        &self,
+        store: ReadonlyCallGraphStore,
+        operation_generation: u64,
+        project_root: &Path,
+        callgraph_dir: &Path,
+    ) -> CallgraphStoreAccess {
+        let store = Arc::new(store);
+        let installed = self.run_if_subc_bound_generation(operation_generation, || {
+            let mut guard = self
+                .callgraph_store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *guard = Some(Arc::clone(&store));
+            Arc::clone(&store)
+        });
+        let Some(store) = installed else {
+            return CallgraphStoreAccess::Unavailable;
+        };
+        self.clear_callgraph_store_build_denied();
+        self.schedule_legacy_callgraph_migration_if_needed(
+            store.as_ref(),
+            project_root.to_path_buf(),
+            callgraph_dir.to_path_buf(),
+        );
+        CallgraphStoreAccess::Ready(store)
     }
 
     fn schedule_legacy_callgraph_migration_if_needed(

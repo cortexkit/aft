@@ -4226,6 +4226,54 @@ mod tests {
     }
 
     #[test]
+    fn a_published_callgraph_store_is_served_while_its_build_is_still_settling() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn marker() {}\n").unwrap();
+        let project_root = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(project_root.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(project_root.clone());
+        let project_key = crate::search_index::artifact_cache_key(&project_root);
+        crate::root_cache::configure_artifact_access(&project_root, &project_key, false);
+        // The build has published its generation pointer but has not yet sent
+        // its completion event: its receiver is still in flight and empty.
+        let (store, _stats) = CallGraphStore::cold_build_with_lease_chunked(
+            ctx.callgraph_store_dir(),
+            project_root,
+            &[source],
+            1,
+        )
+        .unwrap();
+        drop(store);
+        let generation = ctx.configure_generation();
+        let (tx, rx) = crossbeam_channel::unbounded::<CallGraphStoreBuildEvent>();
+        ctx.note_callgraph_store_rx_generation(generation);
+        ctx.next_callgraph_store_rx_epoch();
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+
+        assert!(
+            matches!(
+                ctx.callgraph_store_for_ops(),
+                crate::context::CallgraphStoreAccess::Ready(_)
+            ),
+            "a generation published ready on disk must be served, not reported as building"
+        );
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some(),
+            "the build's own completion event is still adopted by the drain"
+        );
+        drop(tx);
+    }
+
+    #[test]
     fn failed_forced_callgraph_build_preserves_durable_demand() {
         let root = tempfile::tempdir().unwrap();
         let ctx = AppContext::new(
