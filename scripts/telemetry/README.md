@@ -79,7 +79,10 @@ All compared numbers come from the runner sampler or structured telemetry; no
 human-readable log message is used as a gate input.
 
 - Search and callgraph cold `build_ready` elapsed time, first-query latency,
-  and the callgraph resolution-stage share come from `index_event` records.
+  and the callgraph resolution stage's duration (`callgraph_resolution_ms`)
+  come from `index_event` records. The resolution stage's share of the build is
+  printed on the `OBSERVED` line marked `(ungated)`; see
+  [resolution is gated on its duration](#resolution-is-gated-on-its-duration).
 - Peak RSS and CPU seconds come from the runner's process sampler.
 - `waiting_on.<cause>` is the breakdown emitted in the runner CSV from
   structured `slow tool_call` records whose total is greater than two seconds.
@@ -114,13 +117,43 @@ and resource values from flapping. All metrics are lower-is-better.
 
 A metric can also be recorded without being compared, by setting `gated: false`
 and an `ungated_reason` beside it. The gate refuses a baseline that excludes a
-metric without writing down why. `synthetic-24k`'s
-`callgraph_resolution_share_pct` is the only current one: that corpus holds a
-single Rust file, its callgraph build takes about 10 ms, and the resolution
-stage rounds to 1 ms, so the metric can only ever report 1/9 through 1/14 — a
-smallest possible step of about eight percentage points inside a twenty percent
-tolerance band. No baseline value survives a metric whose quantum exceeds its
-tolerance. The timing metrics it is derived from are still gated.
+metric without writing down why. No metric is ungated at present.
+
+### Resolution is gated on its duration
+
+The gate used to compare `callgraph_resolution_share_pct`, the resolution
+stage's share of the callgraph build. A share rises when resolution slows down
+and rises just as much when the stages around it speed up, so it cannot tell a
+regression from an improvement. It proved that on 2026-09-24: cold-build
+extraction stopped doing quadratic per-file cleanup, and the gate failed
+`typescript-eslint`, `jupyterlab` and `hugo` for three nights running although
+resolution itself had not moved. From the per-repository AFT logs in the
+uploaded artifacts (run 1 / run 2, milliseconds):
+
+| Repo | Night | Build | Extraction | Resolution | Share % |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `redox` | 09-23 | 4355 / 4303 | 1712 / 1675 | 2344 / 2325 | 53.8 / 54.0 |
+| `redox` | 09-26 | 4222 / 4128 | 1293 / 1241 | 2615 / 2578 | 61.9 / 62.5 |
+| `typescript-eslint` | 09-23 | 49118 / 48481 | 29495 / 28830 | 18905 / 18943 | 38.5 / 39.1 |
+| `typescript-eslint` | 09-26 | 32802 / 33069 | 12906 / 12840 | 19159 / 19480 | 58.4 / 58.9 |
+| `jupyterlab` | 09-23 | 98930 / 99851 | 65041 / 65812 | 31954 / 32101 | 32.3 / 32.1 |
+| `jupyterlab` | 09-26 | 53552 / 54001 | 19965 / 20303 | 31559 / 31725 | 58.9 / 58.7 |
+| `hugo` | 09-23 | 38704 / 38733 | 22155 / 22189 | 15309 / 15306 | 39.6 / 39.5 |
+| `hugo` | 09-26 | 25667 / 25485 | 8983 / 8872 | 15394 / 15354 | 60.0 / 60.2 |
+
+So `callgraph_resolution_ms` is gated instead, with a 20% tolerance and a
+500 ms floor. The floor is below the 3,000 ms of the other timings because the
+interval is measured inside the process and carries no startup or first-poll
+cost; it only keeps `synthetic-24k`'s 1 ms stage from paging on one tick,
+which also retires the exclusion that metric needed as a share. The self-test
+holds both directions with the numbers above: the 09-26 `hugo` runs pass, and a
+resolution stage 27% slower with extraction unchanged fails on
+`callgraph_resolution_ms` alone while the whole build, 11% slower, still fits
+inside its own band.
+
+Results written before the matrix had a `callgraph_resolution_ms` column are
+read by multiplying the build time by the share, which is exact only when both
+cells describe one build; with more than one build nothing is derived.
 
 ### Where the floor binds, and where the tolerance does
 

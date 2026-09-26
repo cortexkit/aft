@@ -167,6 +167,7 @@ class RootStats:
     waiting_on: Counter[str] = field(default_factory=Counter)
     index_progress: DefaultDict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
     index_resolution_share_pct: list[float] = field(default_factory=list)
+    index_resolution_ms: list[int] = field(default_factory=list)
 
 
 def apply_index_event(stats: RootStats, fields: dict[str, str]) -> None:
@@ -190,6 +191,9 @@ def apply_index_event(stats: RootStats, fields: dict[str, str]) -> None:
                 start_elapsed = progress[first_index - 1][1] if first_index else first_elapsed
                 duration_ms = max(0, last_elapsed - start_elapsed)
                 stats.index_resolution_share_pct.append(100.0 * duration_ms / elapsed_ms)
+                # The share alone cannot tell a slower resolution stage from
+                # faster stages around it, so the duration is kept as well.
+                stats.index_resolution_ms.append(duration_ms)
     elif kind == "first_query" and "ready_to_first_query_ms" in fields:
         stats.index_ready_to_first_query_ms[plane].append(int(fields["ready_to_first_query_ms"]))
     elif kind == "build_superseded":
@@ -489,7 +493,7 @@ def write_csv(path: Path, infos: list[RootInfo], stats: dict[str, RootStats]) ->
         "tier2_deferred", "breaker_or_suspension_hits",
         "index_search_start_to_ready_ms_n_p50_max", "index_search_ready_to_first_query_ms_n_p50_max",
         "index_callgraph_start_to_ready_ms_n_p50_max", "index_callgraph_ready_to_first_query_ms_n_p50_max",
-        "index_callgraph_resolution_share_pct_n_p50_max",
+        "index_callgraph_resolution_share_pct_n_p50_max", "index_callgraph_resolution_ms_n_p50_max",
         "index_semantic_start_to_ready_ms_n_p50_max", "index_semantic_ready_to_first_query_ms_n_p50_max",
         "index_search_superseded", "index_search_failed", "index_search_suspended",
         "index_callgraph_superseded", "index_callgraph_failed", "index_callgraph_suspended",
@@ -539,6 +543,7 @@ def write_csv(path: Path, infos: list[RootInfo], stats: dict[str, RootStats]) ->
                 "index_callgraph_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["callgraph"]),
                 "index_callgraph_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["callgraph"]),
                 "index_callgraph_resolution_share_pct_n_p50_max": fmt_compact_pct(root_stats.index_resolution_share_pct),
+                "index_callgraph_resolution_ms_n_p50_max": fmt_compact_ms(root_stats.index_resolution_ms),
                 "index_semantic_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["semantic"]),
                 "index_semantic_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["semantic"]),
                 "index_search_superseded": root_stats.index_superseded["search"],
@@ -859,6 +864,7 @@ def self_test() -> None:
     assert proj.index_superseded["callgraph"] == 1, proj.index_superseded
     assert proj.index_failed["semantic"] == 1, proj.index_failed
     assert proj.index_resolution_share_pct == [40.0], proj.index_resolution_share_pct
+    assert proj.index_resolution_ms == [40], proj.index_resolution_ms
     assert proj.waiting_on["build"] == 1, proj.waiting_on
     other = by_root["/tmp/other"]
     assert other.index_suspended["callgraph"] == 1, other.index_suspended

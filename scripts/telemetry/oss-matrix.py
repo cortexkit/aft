@@ -33,7 +33,7 @@ PLANES = ("search", "callgraph")
 CSV_FIELDS = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
     "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
-    "callgraph_first_query_ms", "callgraph_resolution_share_pct", "search_superseded", "search_failed", "search_suspended",
+    "callgraph_first_query_ms", "callgraph_resolution_share_pct", "callgraph_resolution_ms", "search_superseded", "search_failed", "search_suspended",
     "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
     "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
 )
@@ -844,6 +844,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         "callgraph_wall_ms": metrics.get("index_callgraph_start_to_ready_ms_n_p50_max", "n/a"),
         "callgraph_first_query_ms": metrics.get("index_callgraph_ready_to_first_query_ms_n_p50_max", "n/a"),
         "callgraph_resolution_share_pct": metrics.get("index_callgraph_resolution_share_pct_n_p50_max", "n/a"),
+        "callgraph_resolution_ms": metrics.get("index_callgraph_resolution_ms_n_p50_max", "n/a"),
         "search_superseded": metrics.get("index_search_superseded", "n/a"),
         "search_failed": metrics.get("index_search_failed", "n/a"),
         "search_suspended": metrics.get("index_search_suspended", "n/a"),

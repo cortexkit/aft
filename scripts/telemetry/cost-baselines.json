@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated_at": "2026-09-21T10:37:04Z",
+  "generated_at": "2026-09-26T08:18:42Z",
   "binary": {
     "sha256": "95e1970cf0c3219debc74a2a1523e9ebf9e404eba4e713eee107c35899b3279c",
     "source_commit": "84907c391b51e0bd826c71d2150cea785402a9b3",
@@ -8,7 +8,7 @@
   },
   "measured_on": {
     "platform": "linux-x86_64",
-    "provenance": "nightly workflow run 35497655316, 2026-09-20, github-hosted ubuntu-24.04 runner image 20260907.300.1, head 7a936156c9495aca8d04acb56f872b853371d4d5; two-run minimum from the uploaded oss-matrix CSVs"
+    "provenance": "nightly workflow run 35497655316, 2026-09-20, github-hosted ubuntu-24.04 runner image 20260907.300.1, head 7a936156c9495aca8d04acb56f872b853371d4d5; two-run minimum from the uploaded oss-matrix CSVs; callgraph_resolution_ms (which replaced callgraph_resolution_share_pct) from nightly workflow run 36227460581, 2026-09-26, github-hosted ubuntu-24.04 runner image 20260920.314.1, head 6daa82facdbb792951ca443e6cd19da01fcbf998, two-run minimum, each run's value derived from its single build's time and resolution share"
   },
   "repos": {
     "redox": {
@@ -26,10 +26,10 @@
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_resolution_share_pct": {
-          "value": 53.263,
+        "callgraph_resolution_ms": {
+          "value": 2578.0,
           "tolerance_pct": 20.0,
-          "absolute_floor": 5.0
+          "absolute_floor": 500.0
         },
         "cpu_seconds": {
           "value": 8.0,
@@ -98,10 +98,10 @@
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_resolution_share_pct": {
-          "value": 38.682,
+        "callgraph_resolution_ms": {
+          "value": 19159.0,
           "tolerance_pct": 20.0,
-          "absolute_floor": 5.0
+          "absolute_floor": 500.0
         },
         "cpu_seconds": {
           "value": 67.0,
@@ -170,10 +170,10 @@
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_resolution_share_pct": {
-          "value": 32.546,
+        "callgraph_resolution_ms": {
+          "value": 31559.0,
           "tolerance_pct": 20.0,
-          "absolute_floor": 5.0
+          "absolute_floor": 500.0
         },
         "cpu_seconds": {
           "value": 119.0,
@@ -242,10 +242,10 @@
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_resolution_share_pct": {
-          "value": 39.523,
+        "callgraph_resolution_ms": {
+          "value": 15354.0,
           "tolerance_pct": 20.0,
-          "absolute_floor": 5.0
+          "absolute_floor": 500.0
         },
         "cpu_seconds": {
           "value": 49.0,
@@ -313,12 +313,10 @@
           "tolerance_pct": 25.0,
           "absolute_floor": 3000.0
         },
-        "callgraph_resolution_share_pct": {
-          "value": 7.692,
+        "callgraph_resolution_ms": {
+          "value": 1.0,
           "tolerance_pct": 20.0,
-          "absolute_floor": 5.0,
-          "gated": false,
-          "ungated_reason": "The synthetic tree holds one Rust file, so its callgraph build finishes in about 10 ms and the resolution stage rounds to 1 ms. The share is then 1 divided by the whole build, and every value this metric has reported on this corpus is one of 1/9, 1/10, 1/11, 1/12, 1/13 or 1/14 - a smallest possible step of roughly 8 percentage points against a 20 percent tolerance band. The 2026-09-04 capture read 1/58 only because that machine took 58 ms for the same build. No baseline value survives a metric whose quantum is larger than its tolerance, so the number is recorded and not compared; the timing metrics it is derived from stay gated."
+          "absolute_floor": 500.0
         },
         "cpu_seconds": {
           "value": 3.0,

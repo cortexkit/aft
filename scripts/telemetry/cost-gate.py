@@ -60,7 +60,14 @@ FIXED_REPOSITORIES = {
 DEFAULT_METRICS: dict[str, tuple[float, float]] = {
     "search_build_ready_ms": (25.0, 3_000.0),
     "callgraph_build_ready_ms": (25.0, 3_000.0),
-    "callgraph_resolution_share_pct": (20.0, 5.0),
+    # The resolution stage's own duration, not its share of the build. A share
+    # rises when resolution slows down and equally when the stages around it
+    # speed up, so a gate on it pages on an extraction speed-up as if it were a
+    # resolution regression. The floor is lower than the other timings because
+    # this interval is measured inside the process and carries no startup or
+    # first-poll cost; it only has to keep a stage of a few milliseconds (the
+    # synthetic tree) from paging on one tick.
+    "callgraph_resolution_ms": (20.0, 500.0),
     "peak_rss_mb": (20.0, 128.0),
     "cpu_seconds": (25.0, 1.0),
     "search_first_query_ms": (25.0, 3_000.0),
@@ -288,7 +295,7 @@ def row_metrics(row: dict[str, str]) -> dict[str, float]:
     fields = {
         "search_build_ready_ms": "search_wall_ms",
         "callgraph_build_ready_ms": "callgraph_wall_ms",
-        "callgraph_resolution_share_pct": "callgraph_resolution_share_pct",
+        "callgraph_resolution_ms": "callgraph_resolution_ms",
         "search_first_query_ms": "search_first_query_ms",
         "callgraph_first_query_ms": "callgraph_first_query_ms",
         "peak_rss_mb": "peak_rss_mb",
@@ -296,11 +303,44 @@ def row_metrics(row: dict[str, str]) -> dict[str, float]:
     }
     metrics: dict[str, float] = {}
     for metric, field in fields.items():
-        parsed = compact_p50(row.get(field)) if field.endswith("_ms") or field == "callgraph_resolution_share_pct" else scalar(row.get(field))
+        parsed = compact_p50(row.get(field)) if field.endswith("_ms") else scalar(row.get(field))
         if parsed is not None:
             metrics[metric] = parsed
+    if "callgraph_resolution_ms" not in metrics and "callgraph_resolution_ms" not in row:
+        derived = resolution_ms_from_share(row)
+        if derived is not None:
+            metrics["callgraph_resolution_ms"] = derived
     metrics.update(waiting_metrics(row.get("waiting_on")))
     return metrics
+
+
+def compact_count(value: str | None) -> int | None:
+    """The observation count of an ``n/p50/max`` cell."""
+    if not value:
+        return None
+    head = value.strip().split("/", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def resolution_ms_from_share(row: dict[str, str]) -> float | None:
+    """Recover the resolution duration from a CSV written before it had a column.
+
+    Results captured before the matrix recorded ``callgraph_resolution_ms``
+    still carry the build time and the resolution share, and blessing a
+    baseline from an already-uploaded workflow artifact needs those results to
+    be readable. The product of the two is the duration only when each cell
+    describes the same single build; with several builds the two medians can
+    come from different builds, so nothing is derived.
+    """
+    wall_cell = row.get("callgraph_wall_ms")
+    share_cell = row.get("callgraph_resolution_share_pct")
+    if compact_count(wall_cell) != 1 or compact_count(share_cell) != 1:
+        return None
+    wall = compact_p50(wall_cell)
+    share = compact_p50(share_cell)
+    if wall is None or share is None:
+        return None
+    return float(round(wall * share / 100.0))
 
 
 def read_run_csv(path: Path) -> list[RunData]:
@@ -765,6 +805,13 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
     hwm = [run.row.get("peak_rss_hwm_mb", "n/a") or "n/a" for run in runs if run.ready]
     if any(value != "n/a" for value in hwm):
         parts.append(f"peak_rss_hwm_mb(ungated)={'/'.join(hwm)}")
+    # The resolution share stays visible as a description of where build time
+    # went, but it is not a budget: it cannot tell a slower resolution stage
+    # from faster stages around it.
+    shares = [compact_p50(run.row.get("callgraph_resolution_share_pct")) for run in runs if run.ready]
+    if any(value is not None for value in shares):
+        rendered = "/".join("n/a" if value is None else f"{value:g}" for value in shares)
+        parts.append(f"callgraph_resolution_share_pct(ungated)={rendered}")
     return f"OBSERVED {repo}: " + " ".join(parts)
 
 
@@ -842,25 +889,26 @@ def assert_rejected(payload: dict[str, Any], fragment: str) -> None:
 def self_test() -> int:
     """Test CSV extraction, two-run minimum selection, tolerances, and floors."""
     temporary = Path(tempfile.mkdtemp(prefix="aft-cost-gate-self-test-"))
+    declared_bands = dict(BIMODAL_BANDS)
     try:
         csv_path = temporary / "synthetic.csv"
         fields = [
             "repo", "outcome", "search_wall_ms", "callgraph_wall_ms",
-            "callgraph_resolution_share_pct", "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s",
+            "callgraph_resolution_share_pct", "callgraph_resolution_ms", "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s",
             "search_first_query_ms", "callgraph_first_query_ms", "waiting_on", "log_path",
         ]
         rows = [
             {
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/140/140",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
-                "peak_rss_mb": "119", "peak_rss_hwm_mb": "171", "hwm_by_phase": "extraction/ready=+80.0",
+                "callgraph_resolution_ms": "1/110/110", "peak_rss_mb": "119", "peak_rss_hwm_mb": "171", "hwm_by_phase": "extraction/ready=+80.0",
                 "cpu_s": "13", "search_first_query_ms": "1/126/126",
                 "callgraph_first_query_ms": "1/90/90", "waiting_on": "build=1", "log_path": "",
             },
             {
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/130/130",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
-                "peak_rss_mb": "118", "peak_rss_hwm_mb": "170", "hwm_by_phase": "extraction/ready=+60.0",
+                "callgraph_resolution_ms": "1/110/110", "peak_rss_mb": "118", "peak_rss_hwm_mb": "170", "hwm_by_phase": "extraction/ready=+60.0",
                 "cpu_s": "12", "search_first_query_ms": "1/127/127",
                 "callgraph_first_query_ms": "1/91/91", "waiting_on": "build=1", "log_path": "",
             },
@@ -873,7 +921,7 @@ def self_test() -> int:
             "metrics": {
                 "search_build_ready_ms": {"value": 100, "tolerance_pct": 25, "absolute_floor": 130},
                 "callgraph_build_ready_ms": {"value": 100, "tolerance_pct": 25, "absolute_floor": 1},
-                "callgraph_resolution_share_pct": {"value": 10, "tolerance_pct": 20, "absolute_floor": 5},
+                "callgraph_resolution_ms": {"value": 100, "tolerance_pct": 20, "absolute_floor": 1},
                 "peak_rss_mb": {"value": 100, "tolerance_pct": 20, "absolute_floor": 1},
                 "cpu_seconds": {"value": 10, "tolerance_pct": 25, "absolute_floor": 1},
                 "search_first_query_ms": {"value": 100, "tolerance_pct": 25, "absolute_floor": 1},
@@ -941,10 +989,72 @@ def self_test() -> int:
         assert "hwm_by_phase" not in blessed, sorted(blessed)
         assert phase_line("fixture", []) is None
 
+        # Resolution is gated on its own duration. The numbers are hugo's cold
+        # callgraph build on the nightly runner before and after cold-build
+        # extraction became cheaper (runs 35833321498 and 36227460581):
+        # extraction fell from 22.2 s to 8.9 s while resolution stayed at
+        # about 15.3 s, which lifted resolution's share of the build from 39.5%
+        # to 60.2% with no change in resolution itself.
+        hugo_baseline = {
+            "metrics": {
+                "callgraph_build_ready_ms": {"value": 38704, "tolerance_pct": 25, "absolute_floor": 3000},
+                "callgraph_resolution_ms": {"value": 15306, "tolerance_pct": 20, "absolute_floor": 500},
+            },
+            "index_events": {},
+        }
+        resolution_fields = ["repo", "outcome", "callgraph_wall_ms", "callgraph_resolution_share_pct", "callgraph_resolution_ms"]
+
+        def hugo_runs(name: str, rows: list[tuple[int, int]], *, with_column: bool = True) -> list[RunData]:
+            path = temporary / f"{name}.csv"
+            fields = resolution_fields if with_column else resolution_fields[:-1]
+            with path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                for wall, resolution in rows:
+                    share = 100.0 * resolution / wall
+                    row = {
+                        "repo": "hugo", "outcome": "ready",
+                        "callgraph_wall_ms": f"1/{wall}/{wall}",
+                        "callgraph_resolution_share_pct": f"1/{share:.3f}/{share:.3f}",
+                        "callgraph_resolution_ms": f"1/{resolution}/{resolution}",
+                    }
+                    writer.writerow({key: row[key] for key in fields})
+            return read_run_csv(path)
+
+        # Faster extraction, unchanged resolution: nothing to report, although
+        # the share went past the 47.43% limit the share gate used to page at.
+        faster_extraction = hugo_runs("faster-extraction", [(25667, 15394), (25485, 15354)])
+        assert compare_repo("hugo", hugo_baseline, faster_extraction) == []
+        assert min(compact_p50(run.row["callgraph_resolution_share_pct"]) for run in faster_extraction) > 39.523 * 1.2
+        # A resolution stage 27% slower with extraction untouched. The whole
+        # build grows by only 11%, inside its own 25% band, so without a
+        # resolution budget of its own this slowdown would pass.
+        slower_resolution = hugo_runs("slower-resolution", [(42898, 19500), (42900, 19480)])
+        assert [failure.metric for failure in compare_repo("hugo", hugo_baseline, slower_resolution)] == [
+            "callgraph_resolution_ms"
+        ]
+        # Results uploaded before the matrix wrote the duration column still
+        # yield it, from one build's time and share, so they can be blessed.
+        legacy = hugo_runs("legacy", [(25485, 15354)], with_column=False)
+        assert legacy[0].metrics["callgraph_resolution_ms"] == 15354, legacy[0].metrics
+        # With several builds the two medians need not describe the same build.
+        assert resolution_ms_from_share({"callgraph_wall_ms": "2/25485/25667", "callgraph_resolution_share_pct": "2/60.0/60.2"}) is None
+        # A present but empty column is a measurement gap, not a legacy file.
+        assert "callgraph_resolution_ms" not in row_metrics({
+            "callgraph_wall_ms": "1/25485/25485", "callgraph_resolution_share_pct": "1/60.247/60.247",
+            "callgraph_resolution_ms": "0/n/a/n/a",
+        })
+        # The share is still printed, marked as outside the gate.
+        assert "callgraph_resolution_share_pct(ungated)=59.976/60.247" in observation_line("hugo", faster_extraction)
+
         # A metric with two recorded states cannot be read off a two-run
         # minimum. The straddling pair here is a real night -- 597.9 and 678.1,
         # dispatch 35629011191 -- whose minimum sits inside every tolerance and
-        # whose maximum is 82 MB above the baseline.
+        # whose maximum is 82 MB above the baseline. That band was later
+        # deleted from BIMODAL_BANDS because the metric lost its second state,
+        # so it is installed here as a fixture: the rules have to keep working
+        # while no band is declared.
+        BIMODAL_BANDS[("jupyterlab", "peak_rss_mb")] = (606.1, 668.0, "self-test fixture")
         jupyterlab_baseline = {
             "metrics": {"peak_rss_mb": {"value": 596.3, "tolerance_pct": 20, "absolute_floor": 128.0}},
             "index_events": {},
@@ -983,6 +1093,8 @@ def self_test() -> int:
         return 0
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
+        BIMODAL_BANDS.clear()
+        BIMODAL_BANDS.update(declared_bands)
 
 
 def parse_args() -> argparse.Namespace:
