@@ -1486,11 +1486,11 @@
     },
     {
       "path": "crates/aft/tests/integration/safety_test.rs",
-      "line": 2220,
+      "line": 2292,
       "column": 29,
       "token": "filePath",
       "text": "\"arguments\": { \"filePath\": written, \"content\": \"after write\" },",
-      "location": "line 2220, column 29",
+      "location": "line 2292, column 29",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
