@@ -3712,13 +3712,14 @@ fn refresh_writable_dead_code_store(
     match store.refresh_files(refresh_paths) {
         Ok(stats) => {
             crate::slog_info!(
-                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={} skipped_out_of_root={} root={} {}",
+                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={} skipped_out_of_root={} skipped_undecodable={} root={} {}",
                 callgraph_dir.display(),
                 refresh_paths.len(),
                 stats.changed_files.len(),
                 stats.deleted_files.len(),
                 stats.refreshed_own_files,
                 stats.skipped_out_of_root.len(),
+                stats.undecodable_files.len(),
                 store.project_root().display(), io.finish()
             );
         }
@@ -5754,6 +5755,61 @@ mod guard_tests {
         let mut job = snapshot_job(&root, &inspect_dir, true);
         job.callgraph_writer = false;
         (dir, root, inspect_dir, job)
+    }
+
+    /// Encoding test fixtures such as php_codesniffer's byte-order-mark files
+    /// are deliberately not UTF-8. One of them in the project must not make
+    /// the call graph (and so dead code) unavailable.
+    #[test]
+    fn dead_code_projection_survives_an_undecodable_source_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        write_projection_cache_file(
+            &root.join("src/main.ts"),
+            "import { firstTarget } from './target';\nexport function main() { firstTarget(); }\n",
+        );
+        write_projection_cache_file(
+            &root.join("src/target.ts"),
+            "export function firstTarget() {}\nexport function neverCalled() {}\n",
+        );
+        let undecodable = root.join("src/ByteOrderMark.php");
+        std::fs::write(&undecodable, b"\xff\xfe<\x00?\x00p\x00h\x00p\x00")
+            .expect("write undecodable file");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        assert!(
+            files.contains(&undecodable),
+            "the walk must reach the undecodable file for this test to mean anything"
+        );
+        let (store, _) =
+            CallGraphStore::cold_build_with_lease(callgraph_dir.clone(), root.clone(), &files)
+                .expect("publish initial generation");
+        drop(store);
+
+        let job = snapshot_job(&root, &inspect_dir, true);
+        let manager = InspectManager::new();
+        // A watcher event for the undecodable file must not fail the refresh.
+        let snapshot = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[undecodable])
+            .expect("dead-code projection must be available");
+        assert!(
+            snapshot
+                .exported_symbols
+                .iter()
+                .any(|export| export.symbol == "neverCalled"),
+            "dead-code inputs must include the decodable files"
+        );
+
+        let store = CallGraphStore::open_ready_no_rebuild(callgraph_dir, root.clone())
+            .expect("open store")
+            .expect("ready store");
+        let census = store.stale_path_census().expect("census");
+        assert_eq!(census.stale, 0);
+        assert_eq!(census.undecodable, 1, "the skipped file must be reported");
     }
 
     #[test]

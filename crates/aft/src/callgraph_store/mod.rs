@@ -2473,6 +2473,10 @@ pub struct ColdBuildStats {
     pub refs: usize,
     pub edges: usize,
     pub failed_files: Vec<String>,
+    /// Files left out of the graph because their bytes are not valid UTF-8
+    /// (encoding test fixtures, legacy-encoded sources). Unlike failed files
+    /// they do not block dead-code projection.
+    pub undecodable_files: Vec<String>,
     pub elapsed_ms: u128,
 }
 
@@ -2493,6 +2497,9 @@ pub struct IncrementalStats {
     pub resolution_config_changes: Vec<String>,
     /// Files re-resolved because such a change can move their imports.
     pub resolution_importers: Vec<String>,
+    /// Inputs skipped because their bytes are not valid UTF-8; see
+    /// [`ColdBuildStats::undecodable_files`].
+    pub undecodable_files: Vec<String>,
 }
 
 /// What [`CallGraphStore::reconcile_with_disk`] examined and what differs.
@@ -2538,6 +2545,9 @@ pub struct StalePathCensus {
     pub stale: usize,
     pub absent: usize,
     pub unreadable: usize,
+    /// Files recorded as skipped because they are not valid UTF-8. They are
+    /// not stale and do not block projection; this only reports them.
+    pub undecodable: usize,
 }
 
 /// Phase timings for the copy-based incremental refresh benchmark.
@@ -2736,6 +2746,33 @@ pub struct StoreImpactResult {
 struct ExtractFailure {
     rel_path: String,
     freshness: Option<FileFreshness>,
+    /// The file is not valid UTF-8. It is recorded as skipped rather than
+    /// stale, because retrying cannot succeed until its bytes change.
+    undecodable: bool,
+}
+
+/// `backend_file_state.status` for a file the graph leaves out because its
+/// bytes are not valid UTF-8. Only `'stale'` rows block dead-code projection,
+/// so a project that contains such a file (encoding test fixtures are the
+/// usual case) still gets a usable graph.
+const BACKEND_STATUS_UNDECODABLE: &str = "undecodable";
+
+/// Whether extraction failed only because the source is not valid UTF-8.
+/// `build_file_extract` reads with `read_to_string`, which reports that as
+/// `InvalidData`.
+fn is_undecodable_source(error: &CallGraphStoreError) -> bool {
+    matches!(
+        error,
+        CallGraphStoreError::Io(error) if error.kind() == std::io::ErrorKind::InvalidData
+    )
+}
+
+fn log_undecodable_source(project_root: &Path, rel_path: &str) {
+    crate::slog_info!(
+        "callgraph store: skipping {} in {}: stream did not contain valid UTF-8",
+        rel_path,
+        project_root.display()
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -4560,7 +4597,11 @@ impl CallGraphStore {
                                 .freshness
                                 .as_ref()
                                 .map(|freshness| &freshness.content_hash),
-                            "stale",
+                            if failure.undecodable {
+                                BACKEND_STATUS_UNDECODABLE
+                            } else {
+                                "stale"
+                            },
                         )?;
                     }
                 }
@@ -4748,13 +4789,23 @@ impl CallGraphStore {
         // resolution changed (None: unknown), and files created by this batch.
         let mut surface_changes: Vec<(String, Option<BTreeSet<String>>)> = Vec::new();
         let mut created = BTreeSet::new();
+        // Inputs left out because they are not valid UTF-8, with the content
+        // hash recorded for them.
+        let mut undecodable: BTreeMap<String, Option<blake3::Hash>> = BTreeMap::new();
 
         // Watchers cannot be the only source of deletions: a root can be
         // unbound, idle, or restarted while a delete occurs, so that event is
         // never delivered. Every refresh therefore resolves stale rows that a
         // strict stat proves are now absent, even when this batch is empty or
-        // none of its paths are adopted.
-        for rel_path in stale_backend_file_paths(&conn, &self.project_root, true)? {
+        // none of its paths are adopted. Rows for skipped undecodable files are
+        // cleaned up the same way so a deleted fixture stops being reported.
+        let mut leftover_state_paths = stale_backend_file_paths(&conn, &self.project_root, true)?;
+        leftover_state_paths.extend(backend_file_paths_with_status(
+            &conn,
+            &self.project_root,
+            BACKEND_STATUS_UNDECODABLE,
+        )?);
+        for rel_path in leftover_state_paths {
             if stale_path_status(&self.project_root, &rel_path) != StalePathStatus::Absent {
                 continue;
             }
@@ -4871,7 +4922,43 @@ impl CallGraphStore {
             }
 
             let started = Instant::now();
-            let extract = build_file_extract(&self.project_root, &abs_path)?;
+            let extract = match build_file_extract(&self.project_root, &abs_path) {
+                Ok(extract) => extract,
+                // One file that is not UTF-8 must not fail the whole batch.
+                // A failed batch is marked stale, every later refresh retries
+                // the same file and fails again, and dead code stays
+                // unavailable for good. The file is left out of the graph and
+                // recorded as undecodable instead.
+                Err(error) if is_undecodable_source(&error) => {
+                    profile.parse += started.elapsed();
+                    log_undecodable_source(&self.project_root, &rel_path);
+                    if old_row.is_some() && deleted.insert(rel_path.clone()) {
+                        // Its stored rows describe bytes that are gone. Drop
+                        // them the way a deletion does so callers re-resolve.
+                        surface_changed.insert(rel_path.clone());
+                        let started = Instant::now();
+                        surface_changes.push((
+                            rel_path.clone(),
+                            ExportSurface::stored(&conn, &rel_path)?
+                                .changed_names(&ExportSurface::default()),
+                        ));
+                        let dependent_refs =
+                            ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                        profile.dependency_selection += started.elapsed();
+                        record_dependent_refs(
+                            &mut selected_ref_ids,
+                            &mut selected_refs_by_caller,
+                            dependent_refs,
+                        );
+                    }
+                    let content_hash = cache_freshness::collect(&abs_path)
+                        .ok()
+                        .map(|freshness| freshness.content_hash);
+                    undecodable.insert(rel_path, content_hash);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             profile.parse += started.elapsed();
             let surface_is_changed = old_row
                 .as_ref()
@@ -4995,7 +5082,16 @@ impl CallGraphStore {
             let abs_path = self.project_root.join(rel_path);
             if abs_path.exists() {
                 let started = Instant::now();
-                let extract = build_file_extract(&self.project_root, &abs_path)?;
+                let extract = match build_file_extract(&self.project_root, &abs_path) {
+                    Ok(extract) => extract,
+                    // A dependent that no longer decodes keeps its stored
+                    // rows until its own change event refreshes it.
+                    Err(error) if is_undecodable_source(&error) => {
+                        log_undecodable_source(&self.project_root, rel_path);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 profile.dependent_parse += started.elapsed();
                 caller_extracts.insert(rel_path.clone(), extract);
             }
@@ -5052,6 +5148,26 @@ impl CallGraphStore {
             clear_backend_state_for_file(&tx, &self.project_root, rel_path)?;
             profile.row_deletes += started.elapsed();
         }
+        // After the deletion pass, which clears backend state for files whose
+        // rows were dropped because they stopped decoding.
+        for (rel_path, content_hash) in &undecodable {
+            mark_backend_state(
+                &tx,
+                &self.project_root,
+                rel_path,
+                content_hash.as_ref(),
+                BACKEND_STATUS_UNDECODABLE,
+            )?;
+        }
+        let undecodable_files: Vec<String> = undecodable.keys().cloned().collect();
+        // Files dropped only because they stopped decoding are reported as
+        // undecodable, not as deleted.
+        let reported_deleted = |deleted: BTreeSet<String>| -> Vec<String> {
+            deleted
+                .into_iter()
+                .filter(|rel_path| !undecodable.contains_key(rel_path))
+                .collect()
+        };
 
         log_skipped_out_of_root_refresh_paths(&self.project_root, &skipped_out_of_root);
 
@@ -5086,7 +5202,7 @@ impl CallGraphStore {
                 IncrementalStats {
                     changed_files: changed,
                     surface_changed: surface_changed.into_iter().collect(),
-                    deleted_files: deleted.into_iter().collect(),
+                    deleted_files: reported_deleted(deleted),
                     dependency_selected_refs,
                     refreshed_own_files: 0,
                     unchanged_extract_files: 0,
@@ -5097,6 +5213,7 @@ impl CallGraphStore {
                         .map(|update| update.rel_path.clone())
                         .collect(),
                     resolution_importers: resolution_importers.into_iter().collect(),
+                    undecodable_files,
                 },
                 profile,
             ));
@@ -5252,7 +5369,7 @@ impl CallGraphStore {
             IncrementalStats {
                 changed_files: changed,
                 surface_changed: surface_changed.into_iter().collect(),
-                deleted_files: deleted.into_iter().collect(),
+                deleted_files: reported_deleted(deleted),
                 dependency_selected_refs,
                 refreshed_own_files: own_refresh.len(),
                 unchanged_extract_files: unchanged_extracts,
@@ -5263,6 +5380,7 @@ impl CallGraphStore {
                     .map(|update| update.rel_path.clone())
                     .collect(),
                 resolution_importers: resolution_importers.into_iter().collect(),
+                undecodable_files,
             },
             profile,
         ))
@@ -8846,14 +8964,16 @@ fn cold_build_stats_from_connection(conn: &Connection, started: Instant) -> Resu
     let nodes = query_count(conn, "SELECT COUNT(*) FROM nodes")? as usize;
     let refs = query_count(conn, "SELECT COUNT(*) FROM refs")? as usize;
     let edges = query_count(conn, "SELECT COUNT(*) FROM edges")? as usize;
-    let failed_files = staged_failed_files(conn)?;
+    let failed_files = staged_files_with_status(conn, "stale")?;
+    let undecodable_files = staged_files_with_status(conn, BACKEND_STATUS_UNDECODABLE)?;
     let elapsed_ms = started.elapsed().as_millis();
     crate::slog_info!(
-        "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} committed_extracted_bytes={} ms={}",
+        "perf callgraph_store bounded cold_build: files={} nodes={} refs={} edges={} undecodable_skipped={} committed_extracted_bytes={} ms={}",
         files,
         nodes,
         refs,
         edges,
+        undecodable_files.len(),
         staged_u64(conn, STAGED_COMMITTED_EXTRACTED_BYTES)?,
         elapsed_ms
     );
@@ -8863,15 +8983,16 @@ fn cold_build_stats_from_connection(conn: &Connection, started: Instant) -> Resu
         refs,
         edges,
         failed_files,
+        undecodable_files,
         elapsed_ms,
     })
 }
 
-fn staged_failed_files(conn: &Connection) -> Result<Vec<String>> {
+fn staged_files_with_status(conn: &Connection, status: &str) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
-        "SELECT DISTINCT file_path FROM backend_file_state WHERE status = 'stale' ORDER BY file_path",
+        "SELECT DISTINCT file_path FROM backend_file_state WHERE status = ?1 ORDER BY file_path",
     )?;
-    let rows = statement.query_map([], |row| row.get(0))?;
+    let rows = statement.query_map([status], |row| row.get(0))?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -9924,14 +10045,20 @@ fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtra
                 normalize_file_path(project_root, path).unwrap_or_else(|_| path.to_path_buf());
             let rel_path = relative_path(project_root, &abs_path);
             let freshness = cache_freshness::collect(&abs_path).ok();
-            log::debug!(
-                "callgraph store: skipping {} during cold build: {}",
-                abs_path.display(),
-                error
-            );
+            let undecodable = is_undecodable_source(&error);
+            if undecodable {
+                log_undecodable_source(project_root, &rel_path);
+            } else {
+                log::debug!(
+                    "callgraph store: skipping {} during cold build: {}",
+                    abs_path.display(),
+                    error
+                );
+            }
             Err(ExtractFailure {
                 rel_path,
                 freshness,
+                undecodable,
             })
         }
     };
@@ -15433,8 +15560,38 @@ fn stale_backend_file_paths(
         .map_err(Into::into)
 }
 
+fn backend_file_paths_with_status(
+    conn: &Connection,
+    project_root: &Path,
+    status: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT file_path FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND status = ?3
+         ORDER BY file_path",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            BACKEND_TREESITTER,
+            project_root.display().to_string(),
+            status
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn stale_path_census(conn: &Connection, project_root: &Path) -> Result<StalePathCensus> {
-    let mut census = StalePathCensus::default();
+    let mut census = StalePathCensus {
+        undecodable: backend_file_paths_with_status(
+            conn,
+            project_root,
+            BACKEND_STATUS_UNDECODABLE,
+        )?
+        .len(),
+        ..StalePathCensus::default()
+    };
     for rel_path in stale_backend_file_paths(conn, project_root, false)? {
         census.stale += 1;
         match stale_path_status(project_root, &rel_path) {
@@ -23201,5 +23358,106 @@ mod refresh_index_load_log_tests {
         assert!(!index_load_is_notable(&profile(249, 49_999)));
         assert!(index_load_is_notable(&profile(250, 0)));
         assert!(index_load_is_notable(&profile(0, 50_000)));
+    }
+}
+
+#[cfg(test)]
+mod undecodable_source_tests {
+    use super::*;
+
+    /// A UTF-16 byte-order mark followed by UTF-16 text: not valid UTF-8, like
+    /// the encoding fixtures php_codesniffer ships under `vendor/`.
+    const UNDECODABLE: &[u8] = b"\xff\xfe<\x00?\x00p\x00h\x00p\x00";
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
+        std::fs::create_dir_all(root.join("src")).expect("src dir");
+        std::fs::write(
+            root.join("src/main.ts"),
+            "import { target } from './target';\nexport function main() { target(); }\n",
+        )
+        .expect("main");
+        std::fs::write(
+            root.join("src/target.ts"),
+            "export function target() {}\nexport function neverCalled() {}\n",
+        )
+        .expect("target");
+        (dir, root)
+    }
+
+    fn exported(store: &CallGraphStore) -> BTreeSet<String> {
+        project_dead_code_snapshot(store.sqlite_path())
+            .expect("dead-code projection must be available")
+            .exported_symbols
+            .iter()
+            .map(|export| format!("{}::{}", export.file.display(), export.symbol))
+            .collect()
+    }
+
+    #[test]
+    fn cold_build_skips_undecodable_file_and_stays_projectable() {
+        let (_dir, root) = fixture();
+        let bom = root.join("src/ByteOrderMark.php");
+        std::fs::write(&bom, UNDECODABLE).expect("undecodable file");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        assert!(
+            files.contains(&bom),
+            "the walk must reach the undecodable file"
+        );
+
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
+        let stats = store.cold_build(&files).expect("cold build");
+
+        assert!(stats.failed_files.is_empty(), "{:?}", stats.failed_files);
+        assert_eq!(stats.undecodable_files, vec!["src/ByteOrderMark.php"]);
+        assert!(store.stale_files().expect("stale files").is_empty());
+        assert_eq!(store.stale_path_census().expect("census").undecodable, 1);
+        assert!(exported(&store)
+            .iter()
+            .any(|name| name.ends_with("::neverCalled")));
+    }
+
+    #[test]
+    fn refresh_skips_undecodable_file_and_recovers_when_it_decodes_again() {
+        let (_dir, root) = fixture();
+        let legacy = root.join("src/legacy.ts");
+        std::fs::write(&legacy, "export function legacyHelper() {}\n").expect("legacy");
+        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let store = CallGraphStore::open(root.join(".store"), root.clone()).expect("open store");
+        store.cold_build(&files).expect("cold build");
+        assert!(exported(&store)
+            .iter()
+            .any(|name| name.ends_with("::legacyHelper")));
+
+        // The file stops decoding: the refresh must skip it rather than fail,
+        // and its old graph rows must go because they no longer match disk.
+        std::fs::write(&legacy, UNDECODABLE).expect("undecodable legacy");
+        let created = root.join("src/ByteOrderMark.php");
+        std::fs::write(&created, UNDECODABLE).expect("undecodable created file");
+        let stats = store
+            .refresh_files(&[legacy.clone(), created.clone()])
+            .expect("refresh must not fail on undecodable files");
+        assert_eq!(
+            stats.undecodable_files,
+            vec!["src/ByteOrderMark.php", "src/legacy.ts"]
+        );
+        assert!(stats.deleted_files.is_empty(), "{:?}", stats.deleted_files);
+        assert!(store.stale_files().expect("stale files").is_empty());
+        assert_eq!(store.stale_path_census().expect("census").undecodable, 2);
+        let names = exported(&store);
+        assert!(!names.iter().any(|name| name.ends_with("::legacyHelper")));
+        assert!(names.iter().any(|name| name.ends_with("::neverCalled")));
+
+        // Once it decodes again it is indexed like any other file.
+        std::fs::write(&legacy, "export function legacyHelper() {}\n").expect("legacy again");
+        std::fs::remove_file(&created).expect("remove created");
+        store
+            .refresh_files(&[legacy, created])
+            .expect("refresh after fix");
+        assert_eq!(store.stale_path_census().expect("census").undecodable, 0);
+        assert!(exported(&store)
+            .iter()
+            .any(|name| name.ends_with("::legacyHelper")));
     }
 }

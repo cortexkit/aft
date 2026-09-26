@@ -1835,6 +1835,12 @@ fn build_health_diagnostic_rollup(
                         "resident_callgraph_unreadable_stale_backend_rows".to_string(),
                         json!(census.unreadable),
                     );
+                    // Files the call graph left out because they are not
+                    // valid UTF-8; reported so a missing file is explainable.
+                    object.insert(
+                        "resident_callgraph_undecodable_files".to_string(),
+                        json!(census.undecodable),
+                    );
                 }
                 if let Some(watcher) = candidate.watcher {
                     object.insert("watcher".to_string(), json!(watcher));
