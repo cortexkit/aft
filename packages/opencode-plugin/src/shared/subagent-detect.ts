@@ -15,7 +15,8 @@
  *   2. Disable auto-promotion: the foreground poll window extends to the
  *      task's full hard-kill timeout instead of the default 5s.
  *
- * Detection is via the OpenCode SDK `client.session.get`. The result is
+ * Detection is via the OpenCode SDK `client.session.get` on OpenCode 1 and
+ * via the plugin context's `session.get` Effect on OpenCode 2. The result is
  * cached per sessionID for the lifetime of the plugin process — subagent
  * identity is sticky (parentID never changes after session creation), so
  * the cache never needs invalidation.
@@ -27,6 +28,8 @@
  *
  * Mirrors the pattern in `session-directory.ts`.
  */
+import { Effect } from "effect";
+
 import { sessionLog, sessionWarn } from "../logger.js";
 
 interface SessionInfo {
@@ -78,6 +81,8 @@ export async function resolveIsSubagent(
     cache.set(sessionId, cached);
     return cached.isSubagent;
   }
+
+  if (isV2PluginContext(client)) return resolveV2(client, sessionId);
 
   const c = client as OpenCodeClientShape;
   const sessionApi = c?.session;
@@ -131,6 +136,56 @@ export async function resolveIsSubagent(
     return false;
   }
 
+  setCache(sessionId, isSubagent);
+  return isSubagent;
+}
+
+/**
+ * The OpenCode 2 runtime passes its plugin context where the V1 plugin passes
+ * the SDK client (see `entry/server-runtime.mjs`). That context has no SDK
+ * client at all; its `session.get` takes `{ sessionID }` and returns an Effect
+ * that resolves to the bare session record. Calling it the V1 way builds an
+ * Effect that never runs, and awaiting that Effect yields the Effect itself, so
+ * no `parentID` is ever read and every OpenCode 2 session would be cached as
+ * primary. The context is recognised by its `location`, the same capability
+ * the runtime checks before booting.
+ */
+interface V2PluginContextShape {
+  location: { directory: string };
+  session: {
+    get(input: { sessionID: string }): Effect.Effect<SessionInfo | undefined, unknown>;
+  };
+}
+
+function isV2PluginContext(client: unknown): client is V2PluginContextShape {
+  if (!client || typeof client !== "object") return false;
+  const candidate = client as { location?: { directory?: unknown }; session?: { get?: unknown } };
+  return (
+    typeof candidate.location?.directory === "string" &&
+    typeof candidate.session?.get === "function"
+  );
+}
+
+async function resolveV2(context: V2PluginContextShape, sessionId: string): Promise<boolean> {
+  let session: SessionInfo | undefined;
+  try {
+    session = await Effect.runPromise(
+      context.session.get({ sessionID: sessionId }) as Effect.Effect<SessionInfo | undefined>,
+    );
+  } catch (err) {
+    // Same policy as the V1 path: a failed lookup is not cached, and the call
+    // is treated as primary for now so the next tool call can retry.
+    sessionWarn(
+      sessionId,
+      `[subagent-detect] OpenCode 2 session lookup failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+  const isSubagent = typeof session?.parentID === "string" && session.parentID.length > 0;
+  sessionLog(
+    sessionId,
+    `[subagent-detect] OpenCode 2 session parentID=${JSON.stringify(session?.parentID)} → isSubagent=${isSubagent}`,
+  );
   setCache(sessionId, isSubagent);
   return isSubagent;
 }

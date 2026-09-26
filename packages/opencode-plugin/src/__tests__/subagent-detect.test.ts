@@ -1,5 +1,6 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
+import { Effect } from "effect";
 import { _resetSubagentCacheForTest, resolveIsSubagent } from "../shared/subagent-detect.js";
 
 afterEach(() => {
@@ -161,6 +162,53 @@ describe("subagent-detect", () => {
     };
     const result = await resolveIsSubagent(client, "ses_nil", "/cwd");
     expect(result).toBe(false);
+  });
+
+  describe("OpenCode 2 plugin context", () => {
+    // The OpenCode 2 runtime hands tools the plugin context itself as
+    // `client`. That context has no SDK `client`; it has a `location` and a
+    // `session` domain whose `get` takes `{ sessionID }` and returns an Effect
+    // resolving to the bare session record. This double carries only those
+    // capabilities, so a detector that still speaks the V1 SDK shape cannot
+    // pass by accident.
+    function v2Context(records: Record<string, { id: string; parentID?: string }>) {
+      const inputs: unknown[] = [];
+      const context = {
+        location: { directory: "/cwd" },
+        session: {
+          get: (input: { sessionID?: string }) => {
+            inputs.push(input);
+            const record = input?.sessionID ? records[input.sessionID] : undefined;
+            return record
+              ? Effect.succeed(record)
+              : Effect.fail(new Error(`session ${JSON.stringify(input?.sessionID)} not found`));
+          },
+        },
+      };
+      return { context, inputs };
+    }
+
+    test("classifies a child session as a subagent", async () => {
+      const { context, inputs } = v2Context({
+        ses_child: { id: "ses_child", parentID: "ses_parent" },
+      });
+      expect(await resolveIsSubagent(context, "ses_child", "/cwd")).toBe(true);
+      expect(inputs).toEqual([{ sessionID: "ses_child" }]);
+    });
+
+    test("classifies a root session as primary", async () => {
+      const { context } = v2Context({ ses_root: { id: "ses_root" } });
+      expect(await resolveIsSubagent(context, "ses_root", "/cwd")).toBe(false);
+    });
+
+    test("a failed lookup is not cached, so the next call can still find the parent", async () => {
+      const records: Record<string, { id: string; parentID?: string }> = {};
+      const { context, inputs } = v2Context(records);
+      expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(false);
+      records.ses_late = { id: "ses_late", parentID: "ses_parent" };
+      expect(await resolveIsSubagent(context, "ses_late", "/cwd")).toBe(true);
+      expect(inputs).toHaveLength(2);
+    });
   });
 
   test("caches negative result (primary session) so repeat calls are O(1)", async () => {
