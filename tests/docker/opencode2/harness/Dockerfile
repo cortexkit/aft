@@ -72,6 +72,8 @@ RUN test -n "$OPENCODE2_VERSION" && test -n "$OPENCODE1_VERSION" && \
       "@opencode/cli@$OPENCODE2_VERSION" \
       "@opencode/cli-linux-x64@$OPENCODE2_VERSION" && \
     npm install --prefix /opt/opencode1 --no-audit --no-fund "opencode-ai@$OPENCODE1_VERSION" && \
+    npm install --prefix /opt/opencode1-config-deps --no-audit --no-fund --save-exact \
+      "@opencode-ai/plugin@$OPENCODE1_VERSION" && \
     mkdir -p /home/harness && chmod 1777 /home/harness
 ENV PATH="/opt/aft/bin:$PATH"
 ENV HOME=/home/harness
@@ -87,4 +89,10 @@ ENV AFT_OPENCODE2_PLUGIN_TARBALL=/opt/aft/packages/aft-opencode.tgz
 ENV AFT_OPENCODE2_PLUGIN_DIRECTORY=/opt/aft/plugin/node_modules/@cortexkit/aft-opencode
 ENV OPENCODE2_BIN=/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode
 ENV OPENCODE1_BIN=/opt/opencode1/node_modules/.bin/opencode
+# The V1 host npm-installs @opencode-ai/plugin into its config directory on
+# every start and loads no plugin until that finishes; each scenario has a
+# fresh config directory, so on CI that download cost most of a row's host
+# budget. The harness seeds each V1 config directory from this install, which
+# the host then recognises as already done (see seedHostConfigDependencies).
+ENV OPENCODE1_CONFIG_DEPENDENCIES=/opt/opencode1-config-deps
 ENTRYPOINT ["bun", "tests/docker/opencode2/harness/driver.ts"]

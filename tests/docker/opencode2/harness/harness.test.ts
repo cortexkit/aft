@@ -383,6 +383,76 @@ describe("scenario isolation and liveness", () => {
     expect(serverWrapper).toContain("plugin.effect");
   });
 
+  test("a V1 config directory starts with the host's own dependency install already done", async () => {
+    const parent = await root();
+    const tarball = join(parent, "plugin.tgz");
+    await writeFile(tarball, "pack");
+    const pluginDirectory = join(parent, "installed-plugin");
+    await mkdir(join(pluginDirectory, "dist", "entry"), { recursive: true });
+    await writeFile(join(pluginDirectory, "dist", "index.js"), "export default {};\n");
+    await writeFile(join(pluginDirectory, "dist", "entry", "server.js"), "export default {};\n");
+    // The files `npm install --save-exact @opencode-ai/plugin@<version>` leaves
+    // behind: a manifest, a lock whose root lists the package, and the package.
+    const template = join(parent, "config-deps");
+    await mkdir(join(template, "node_modules", "@opencode-ai", "plugin"), { recursive: true });
+    await writeFile(
+      join(template, "node_modules", "@opencode-ai", "plugin", "package.json"),
+      `${JSON.stringify({ name: "@opencode-ai/plugin", version: "1.18.30" })}\n`,
+    );
+    const manifest = { dependencies: { "@opencode-ai/plugin": "1.18.30" } };
+    await writeFile(join(template, "package.json"), `${JSON.stringify(manifest)}\n`);
+    await writeFile(
+      join(template, "package-lock.json"),
+      `${JSON.stringify({ name: "opencode", lockfileVersion: 3, packages: { "": manifest } })}\n`,
+    );
+    const isolate = (hostGeneration: "v1" | "v2", hostDependencies: string, id: string) =>
+      createScenarioIsolation({
+        parent: join(parent, "runs"),
+        scenarioId: id,
+        pluginTarball: tarball,
+        pluginDirectory,
+        pluginVersion: "1.2.3-test",
+        hostGeneration,
+        mockBaseUrl: "http://127.0.0.1:1234",
+        providerConfig: {},
+        providerConfigKey: hostGeneration === "v1" ? "provider" : "providers",
+        hostDependencies,
+      });
+
+    const legacy = await isolate("v1", template, "bash/T7/happy");
+    const configDirectory = join(legacy.config, "opencode");
+    // The V1 host skips its per-start npm install only when all of this holds
+    // (opencode-ai 1.18.30, Npm.install): node_modules exists, and the lock's
+    // root lists every dependency of package.json plus the package it adds.
+    expect((await stat(join(configDirectory, "node_modules"))).isDirectory()).toBe(true);
+    expect(
+      await readFile(
+        join(configDirectory, "node_modules", "@opencode-ai", "plugin", "package.json"),
+        "utf8",
+      ),
+    ).toContain("1.18.30");
+    const seededManifest = JSON.parse(await readFile(join(configDirectory, "package.json"), "utf8"));
+    const seededLock = JSON.parse(
+      await readFile(join(configDirectory, "package-lock.json"), "utf8"),
+    );
+    const locked = Object.keys(seededLock.packages[""].dependencies);
+    for (const name of [...Object.keys(seededManifest.dependencies), "@opencode-ai/plugin"]) {
+      expect(locked).toContain(name);
+    }
+    // Seeding does not displace the opencode.json the harness writes into the
+    // same directory.
+    expect(JSON.parse(await readFile(legacy.host_config, "utf8")).provider).toEqual({});
+
+    // V2 does not run that install, so its config directory is left alone.
+    const current = await isolate("v2", template, "bash/T1/happy");
+    expect(await readdir(join(current.config, "opencode"))).toEqual(["opencode.json"]);
+
+    // An image whose install is incomplete would bring the slow start back
+    // without a word; it is refused instead.
+    await rm(join(template, "node_modules"), { recursive: true });
+    await expectCode(() => isolate("v1", template, "bash/T7/broken"), "host_failed");
+  });
+
   test("the scenario client uses the provider contract model", async () => {
     const parent = await root();
     const executable = await cachedExecutable(CAPTURE_ARGUMENTS_SCRIPT);

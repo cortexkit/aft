@@ -1,4 +1,4 @@
-import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { copyFile, cp, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { basename, join, resolve } from "node:path";
 
@@ -39,6 +39,74 @@ function materializeProviderConfig(value: unknown, mockBaseUrl: string): unknown
   return value;
 }
 
+/** The package the V1 host installs into every config directory it loads. */
+export const HOST1_CONFIG_DEPENDENCY = "@opencode-ai/plugin";
+
+async function readJsonObject(path: string): Promise<Record<string, unknown> | undefined> {
+  try {
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function dependencyNames(manifest: Record<string, unknown> | undefined): string[] {
+  const dependencies = manifest?.dependencies;
+  return dependencies && typeof dependencies === "object" ? Object.keys(dependencies) : [];
+}
+
+/**
+ * Gives the V1 host's config directory the dependency install it would
+ * otherwise run itself at every start.
+ *
+ * On each start the V1 host (opencode-ai 1.18.x) forks an npm install of
+ * `@opencode-ai/plugin` into every config directory it loads, and its plugin
+ * loader waits for that install before importing any plugin. Each scenario
+ * has a fresh XDG_CONFIG_HOME, so every V1 start downloaded the package again:
+ * on CI that took 25-30 s of the row's 45 s host budget, and a row that needed
+ * a little more than the rest (bash/T7/happy) was killed just after its first
+ * tool call, which read like the host freezing around the plugin's bash path.
+ *
+ * The host skips the install when the directory already has a node_modules
+ * and a package-lock.json whose root lists every dependency its package.json
+ * and its own request name. So the image installs the package once, and each
+ * scenario gets its manifest and lock copied and its node_modules linked to
+ * that install. The link is never written through: if the host ever decided
+ * the directory was dirty, its install would fail on the read-only target and
+ * the host logs "background dependency install failed" instead of hanging.
+ */
+export async function seedHostConfigDependencies(
+  configDirectory: string,
+  template: string,
+): Promise<void> {
+  const manifest = await readJsonObject(join(template, "package.json"));
+  const lock = await readJsonObject(join(template, "package-lock.json"));
+  const lockRoot = (lock?.packages as Record<string, Record<string, unknown>> | undefined)?.[""];
+  const installed = await readJsonObject(
+    join(template, "node_modules", HOST1_CONFIG_DEPENDENCY, "package.json"),
+  );
+  // Anything short of all three and the host would reinstall anyway; saying so
+  // here keeps a broken image from quietly bringing the slow start back.
+  if (
+    !dependencyNames(manifest).includes(HOST1_CONFIG_DEPENDENCY) ||
+    !dependencyNames(lockRoot).includes(HOST1_CONFIG_DEPENDENCY) ||
+    !installed
+  ) {
+    fail(
+      "host_failed",
+      `${template} is not an installed ${HOST1_CONFIG_DEPENDENCY}: it needs package.json and package-lock.json listing it, and node_modules holding it`,
+      { template },
+      true,
+    );
+  }
+  await Promise.all([
+    copyFile(join(template, "package.json"), join(configDirectory, "package.json")),
+    copyFile(join(template, "package-lock.json"), join(configDirectory, "package-lock.json")),
+    symlink(join(template, "node_modules"), join(configDirectory, "node_modules"), "dir"),
+  ]);
+}
+
 export async function createScenarioIsolation(options: {
   parent: string;
   scenarioId: string;
@@ -54,6 +122,11 @@ export async function createScenarioIsolation(options: {
   providerConfig: Record<string, unknown>;
   /** The opencode.json key that provider object goes under. */
   providerConfigKey: string;
+  /**
+   * A directory holding the host's own config-directory dependencies, already
+   * installed (see seedHostConfigDependencies). Only the V1 host uses it.
+   */
+  hostDependencies?: string;
 }): Promise<ScenarioIsolation> {
   const safeId = options.scenarioId.replaceAll(/[^a-zA-Z0-9_.-]+/g, "-");
   await mkdir(options.parent, { recursive: true });
@@ -157,6 +230,9 @@ export async function createScenarioIsolation(options: {
   const providerConfig = materializeProviderConfig(options.providerConfig, options.mockBaseUrl);
   const opencodeDir = join(paths.config, "opencode");
   await mkdir(opencodeDir, { recursive: true });
+  if (options.hostGeneration === "v1" && options.hostDependencies) {
+    await seedHostConfigDependencies(opencodeDir, options.hostDependencies);
+  }
   const hostConfig = join(opencodeDir, "opencode.json");
   await writeFile(
     hostConfig,

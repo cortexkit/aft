@@ -104,6 +104,8 @@ interface DriverConfig {
   nativeExecutable: string;
   hostExecutable: string;
   v1HostExecutable?: string;
+  /** The V1 host's config-directory dependencies, installed once in the image. */
+  v1HostDependencies?: string;
   pluginTarball: string;
   pluginDirectory: string;
   runRoot: string;
@@ -138,6 +140,9 @@ async function configuration(): Promise<DriverConfig> {
     nativeExecutable: resolve(requiredEnvironment("AFT_E2E_NATIVE_BINARY_PATH")),
     hostExecutable: resolve(requiredEnvironment("OPENCODE2_BIN")),
     v1HostExecutable: process.env.OPENCODE1_BIN ? resolve(process.env.OPENCODE1_BIN) : undefined,
+    v1HostDependencies: process.env.OPENCODE1_CONFIG_DEPENDENCIES
+      ? resolve(process.env.OPENCODE1_CONFIG_DEPENDENCIES)
+      : undefined,
     pluginTarball: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_TARBALL")),
     pluginDirectory: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_DIRECTORY")),
     runRoot,
@@ -780,6 +785,7 @@ async function runOneScenario(options: {
       projectConfig: scenario.project_config,
       providerConfig: options.providerConfig,
       providerConfigKey: options.providerConfigKey,
+      hostDependencies: config.v1HostDependencies,
     });
     if (transportDeadWindow) {
       transportDeadStub = await makeTransportDeadStub(isolation.root, config.nativeExecutable);
