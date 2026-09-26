@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "opencode2-harness-seed-v1-config-dependencies"
+  ],
+  "note": "The OpenCode 2 end-to-end harness seeds the OpenCode 1 host config dependency install once per image. Harness only; no ranking-fence file touched."
+}
