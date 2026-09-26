@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "log-levels-plumbing-slow-calls"
+  ],
+  "note": "Daemon log lines carry their level after the [aft] tag, and slow background plumbing calls log at debug instead of warn. Logging and subc tracing only; no ranking-fence file touched."
+}
