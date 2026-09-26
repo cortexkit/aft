@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "router-fence-and-punctuated-prose-rows",
+    "symbol-cache-oversized-entries-and-undecodable-callgraph-files"
+  ],
+  "note": "Adds crates/aft/src/search_b2/ to the ranking fence and six wrong_lane_nl rows, with the reference re-recorded on the unchanged engine (the 43 existing rows byte-equal). The symbol cache and call graph fixes touch no ranking-fence file; the 1 KiB signature cap sits above the semantic embed text's own signature cap, so chunk texts are unchanged."
+}
