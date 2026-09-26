@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "rerecord-reference-after-data-file-demotion"
+  ],
+  "note": "Re-records the real-query reference after the data-file demotion landed in train 209, so later trains compare against the ranking that is now on main. No code change."
+}
