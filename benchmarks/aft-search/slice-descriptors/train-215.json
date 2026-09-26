@@ -10,7 +10,10 @@
     "session-kind-fixes",
     "session-kind-inventory",
     "umbrella-sessions-design",
-    "search-recall-audit"
+    "search-recall-audit",
+    "onnx-late-arrival",
+    "drill-ux-polish",
+    "delete-backup-budget"
   ],
-  "note": "The ranking-fence files touched are the subc tool-schema artifact (the catalog gains bash_status, bash_kill and bash_write, and the catalog bash description stops naming bash_watch) and the benchmark-only recall audit in semantic_search/mod.rs and search_index.rs, which runs only when AFT_SEARCH_RECALL_AUDIT=1 and leaves results, text and plan unchanged otherwise. No ranking, fusion, lane or truncation behaviour changed, so rows should be byte-equal to the reference."
+  "note": "Ranking-fence files touched: the subc tool-schema artifact (catalog bash companions; aft_delete description), the benchmark-only recall audit (runs only with AFT_SEARCH_RECALL_AUDIT=1), semantic_index.rs and semantic_search/mod.rs for the ONNX Runtime late-arrival wait and the semantic-lane disclosure text, and trailer.rs plus the telemetry engine fixture: a complete exhausted page no longer prints a `shown N of N (walk)` trailer. No ranking, fusion, lane admission or truncation changed, so ranked rows should be byte-equal to the reference."
 }

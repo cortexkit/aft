@@ -69,6 +69,7 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/generation_token.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/mod.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/plan_table.rs"),
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/recall_audit.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_comparator_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_lint_test.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_plan_table_test.rs"),
@@ -84,6 +85,7 @@ fn slices() -> Vec<Slice> {
                 "crates/aft/src/commands/semantic_search/generation_token.rs",
                 "crates/aft/src/commands/semantic_search/mod.rs",
                 "crates/aft/src/commands/semantic_search/plan_table.rs",
+                "crates/aft/src/commands/semantic_search/recall_audit.rs",
                 "crates/aft/tests/engine_comparator_test.rs",
                 "crates/aft/tests/engine_lint_test.rs",
                 "crates/aft/tests/engine_plan_table_test.rs",
@@ -443,7 +445,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        18,
+        19,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {
