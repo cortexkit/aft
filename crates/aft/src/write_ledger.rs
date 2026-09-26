@@ -1198,11 +1198,16 @@ mod tests {
             1024 * 1024,
             &cache_dir,
         );
-        assert!(index.ready, "the fixture build must take the streaming path");
+        assert!(
+            index.ready,
+            "the fixture build must take the streaming path"
+        );
 
         // The expected value comes from the filesystem, not from the writer's
         // own bookkeeping: the finished cache file is what the build wrote.
-        let written = std::fs::metadata(cache_dir.join("cache.bin")).unwrap().len();
+        let written = std::fs::metadata(cache_dir.join("cache.bin"))
+            .unwrap()
+            .len();
         assert!(written > 0);
         let credited = pending_for_test(Domain::SearchIndexBuild, &root)
             .1
@@ -1231,9 +1236,8 @@ mod tests {
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let root = project.display().to_string();
-        let cache =
-            crate::inspect::InspectCache::open(dir.path().join("inspect"), project.clone())
-                .unwrap();
+        let cache = crate::inspect::InspectCache::open(dir.path().join("inspect"), project.clone())
+            .unwrap();
         let page_size = cache.page_size_for_test();
         // WAL growth is read with a metadata stat only: opening another
         // descriptor on a live SQLite file set would drop this process's
