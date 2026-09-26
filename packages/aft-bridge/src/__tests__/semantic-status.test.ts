@@ -111,6 +111,6 @@ describe("formatSemanticIndexStatus", () => {
       (word) => semanticIndexStatusKind(word) === "progress",
     );
 
-    expect(progress).toEqual(["building", "loading"]);
+    expect(progress).toEqual(["building", "loading", "refreshing"]);
   });
 });

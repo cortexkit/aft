@@ -685,6 +685,49 @@ pub fn watcher_path_is_semantic_source(path: &Path) -> bool {
     crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
+/// Pair each watcher-reported semantic path with the file record the index
+/// holds for it, so the disk comparison in
+/// [`crate::semantic_index::files_with_changed_content`] can run after the
+/// index lock is released.
+///
+/// Paths the current ignore rules exclude get no record, which sends them
+/// down the invalidation path unconditionally: their vectors must go whether
+/// or not the bytes changed.
+fn semantic_paths_with_recorded_freshness(
+    ctx: &AppContext,
+    index: &crate::semantic_index::SemanticIndex,
+    paths: Vec<PathBuf>,
+) -> Vec<(PathBuf, Option<crate::cache_freshness::FileFreshness>)> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let record = if watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+                None
+            } else {
+                index.recorded_file_freshness(&path)
+            };
+            (path, record)
+        })
+        .collect()
+}
+
+/// The watcher-reported semantic paths whose vectors are really stale.
+///
+/// A watcher event says a path was touched, not that its content changed.
+/// Events for files whose bytes still match what the index embedded (a copied
+/// tree, a checkout restoring the same content, a touch storm, FSEvents
+/// replaying events from before the watcher started) must not mask their
+/// vectors or queue them for re-embedding.
+fn semantic_paths_with_changed_content(
+    ctx: &AppContext,
+    index: &crate::semantic_index::SemanticIndex,
+    paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    crate::semantic_index::files_with_changed_content(semantic_paths_with_recorded_freshness(
+        ctx, index, paths,
+    ))
+}
+
 pub fn mark_semantic_corpus_refresh_success(ctx: &AppContext) {
     ctx.clear_all_semantic_refresh_retry_attempts();
     ctx.reset_semantic_refresh_circuit_after_success();
@@ -1033,6 +1076,10 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                             .into_iter()
                             .filter(|path| watcher_path_is_semantic_source(path))
                             .collect::<Vec<_>>();
+                        // Events that arrived during the build only matter for
+                        // files whose content moved past what the build read.
+                        let refresh_paths =
+                            semantic_paths_with_changed_content(ctx, &index, refresh_paths);
                         index.invalidate_files(&refresh_paths);
                         let corpus_refresh = ctx.take_pending_semantic_corpus_refresh()
                             && !ctx.shared_artifacts_read_only();
@@ -1615,16 +1662,16 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                         total_processed
                     );
                 }
-                let pending_paths = ctx.take_pending_semantic_index_paths();
-                let mut invalidated_paths = Vec::new();
-                for path in pending_paths {
-                    if !aft::runtime_drain::watcher_path_is_semantic_source(&path) {
-                        continue;
-                    }
-                    if !aft::runtime_drain::watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+                let pending_paths = ctx
+                    .take_pending_semantic_index_paths()
+                    .into_iter()
+                    .filter(|path| aft::runtime_drain::watcher_path_is_semantic_source(path))
+                    .collect::<Vec<_>>();
+                let invalidated_paths = semantic_paths_with_changed_content(ctx, &index, pending_paths);
+                for path in &invalidated_paths {
+                    if !aft::runtime_drain::watcher_path_is_ignored_by_current_matcher(ctx, path) {
                         replay_refresh_paths.push(path.clone());
                     }
-                    invalidated_paths.push(path);
                 }
                 index.invalidate_files(&invalidated_paths);
                 *ctx.semantic_index()
@@ -2646,6 +2693,30 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     // Invalidate all semantic paths processed in this slice under
                     // one write lock so a multi-file edit scans the index once.
                     let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                        // Read the index's file records under a read lock, then
+                        // compare them with disk after releasing it: the
+                        // comparison can hash files, and a burst of a thousand
+                        // paths must not hold off queries while it runs.
+                        let recorded = ctx
+                            .semantic_index()
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_ref()
+                            .map(|index| {
+                                semantic_paths_with_recorded_freshness(
+                                    ctx,
+                                    index,
+                                    std::mem::take(&mut invalidated_paths),
+                                )
+                            });
+                        let Some(recorded) = recorded else {
+                            return;
+                        };
+                        let invalidated_paths =
+                            crate::semantic_index::files_with_changed_content(recorded);
+                        if invalidated_paths.is_empty() {
+                            return;
+                        }
                         let invalidated = {
                             let mut semantic_index_ref = ctx
                                 .semantic_index()
@@ -3896,6 +3967,11 @@ mod tests {
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        // Invalidation now skips files whose content still matches the index,
+        // so every file really changes here to exercise the batched removal.
+        for (ordinal, file) in files.iter().enumerate() {
+            std::fs::write(file, format!("pub fn source_{ordinal}_edited() {{}}\n")).unwrap();
+        }
         watcher_tx
             .send(WatcherDispatchEvent::Paths(files.clone()))
             .unwrap();
@@ -3911,6 +3987,163 @@ mod tests {
         let index = index.as_ref().unwrap();
         assert_eq!(index.entry_count(), 0);
         assert_eq!(index.removal_retain_passes_for_test(), 1);
+    }
+
+    /// A burst of watcher events for files whose bytes still match the index
+    /// (a copied tree, a checkout restoring the same content, FSEvents replaying
+    /// events from before the watcher started) must leave every vector in place,
+    /// queue nothing for re-embedding, and leave the status `ready`.
+    #[test]
+    fn watcher_burst_for_unchanged_files_keeps_vectors_and_queues_no_refresh() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let file_count = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES + 8;
+        let files = (0..file_count)
+            .map(|ordinal| {
+                let file = root_path.join(format!("unchanged_{ordinal}.rs"));
+                std::fs::write(&file, format!("pub fn unchanged_{ordinal}() {{}}\n")).unwrap();
+                file
+            })
+            .collect::<Vec<_>>();
+        let mut embed = |texts: Vec<String>| {
+            Ok::<_, String>(texts.into_iter().map(|_| vec![1.0, 0.5]).collect())
+        };
+        let index = crate::semantic_index::SemanticIndex::build(
+            &root_path,
+            &files,
+            &mut embed,
+            files.len(),
+        )
+        .unwrap();
+        let entries_before = index.entry_count();
+        let vectors_before = index.entry_vectors_for_test();
+        assert!(entries_before >= files.len());
+
+        // Half the files are rewritten with identical bytes, so their mtime
+        // moves and the content-hash comparison is what keeps them.
+        std::thread::sleep(Duration::from_millis(20));
+        for (ordinal, file) in files.iter().enumerate().step_by(2) {
+            std::fs::write(file, format!("pub fn unchanged_{ordinal}() {{}}\n")).unwrap();
+        }
+
+        let (ctx, watcher_tx) = watcher_context(&root_path);
+        ctx.mark_subc_bound();
+        ctx.set_heavy_root_work_allowed(true);
+        ctx.set_cache_writer_capabilities(true, true);
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(files.clone()))
+            .unwrap();
+
+        let outcome = drain_watcher_events_bounded(&ctx, files.len());
+
+        assert_eq!(outcome.processed, files.len());
+        let index = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = index.as_ref().unwrap();
+        assert_eq!(index.entry_count(), entries_before);
+        assert_eq!(index.entry_vectors_for_test(), vectors_before);
+        assert_eq!(index.removal_retain_passes_for_test(), 0);
+        assert!(
+            request_rx.try_recv().is_err(),
+            "unchanged files must not be queued for re-embedding"
+        );
+        let status = ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(status.refreshing_count(), 0);
+        assert_eq!(index.status_label(&status), "ready");
+    }
+
+    /// A burst that really changes many files masks them all; status must stop
+    /// saying `ready` for as long as they are pending.
+    #[test]
+    fn watcher_burst_of_real_changes_reports_refreshing() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let file_count = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES + 8;
+        let files = (0..file_count)
+            .map(|ordinal| {
+                let file = root_path.join(format!("changed_{ordinal}.rs"));
+                std::fs::write(&file, format!("pub fn before_{ordinal}() {{}}\n")).unwrap();
+                file
+            })
+            .collect::<Vec<_>>();
+        let mut embed = |texts: Vec<String>| {
+            Ok::<_, String>(texts.into_iter().map(|_| vec![1.0, 0.5]).collect())
+        };
+        let index = crate::semantic_index::SemanticIndex::build(
+            &root_path,
+            &files,
+            &mut embed,
+            files.len(),
+        )
+        .unwrap();
+        for (ordinal, file) in files.iter().enumerate() {
+            std::fs::write(file, format!("pub fn after_edit_{ordinal}() {{}}\n")).unwrap();
+        }
+
+        let (ctx, watcher_tx) = watcher_context(&root_path);
+        ctx.mark_subc_bound();
+        ctx.set_heavy_root_work_allowed(true);
+        ctx.set_cache_writer_capabilities(true, true);
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::new(Mutex::new(None)),
+            ctx.semantic_index_rx_epoch(),
+        );
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(files.clone()))
+            .unwrap();
+
+        drain_watcher_events_bounded(&ctx, files.len());
+
+        match request_rx.try_recv().expect("changed files are queued") {
+            SemanticRefreshRequest::Files { paths } => assert_eq!(paths.len(), files.len()),
+            SemanticRefreshRequest::Corpus => panic!("unexpected corpus refresh"),
+        }
+        let mut status = ctx
+            .semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = index.as_ref().unwrap();
+        assert_eq!(index.entry_count(), 0);
+        assert_eq!(status.mass_refresh_pending(), Some(files.len()));
+        assert_eq!(index.status_label(&status), "refreshing");
+
+        for file in &files {
+            status.complete_refreshing_file(file);
+        }
+        assert_eq!(index.status_label(&status), "ready");
     }
 
     #[test]

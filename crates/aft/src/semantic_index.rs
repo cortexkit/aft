@@ -528,10 +528,17 @@ fn finish_semantic_index_build(
 ///   `loading` (a cold build in progress), `ready`, `failed`,
 ///   `backend_unavailable`, and — when an index object is already loaded —
 ///   whatever [`SemanticIndex::status_label`] reports for the daemon-held
-///   status (`disabled`, `loading`, `failed`, or `ready`).
+///   status (`disabled`, `loading`, `failed`, `ready`, or `refreshing`).
 /// - the root-health snapshot in `context.rs`: `backend_unavailable`, `ready`,
-///   `building`, `disabled`, `degraded`.
-/// - semantic search replies: `ready`, `building`, `disabled`, `unavailable`.
+///   `refreshing`, `building`, `disabled`, `degraded`.
+/// - semantic search replies: `ready`, `refreshing`, `building`, `disabled`,
+///   `unavailable`.
+///
+/// `refreshing` means the index is queryable but a large batch of files has
+/// its vectors masked while they are re-embedded, so results for those files
+/// are missing until the refresh finishes.
+/// [`crate::context::SemanticIndexStatus::mass_refresh_pending`] decides when a
+/// refresh is large enough to report.
 ///
 /// A reader that does not recognise a word has nothing to render but the raw
 /// word itself, which is how `backend_unavailable` reached users as grey
@@ -551,6 +558,7 @@ pub const SEMANTIC_INDEX_STATUS_WORDS: &[&str] = &[
     "failed",
     "loading",
     "ready",
+    "refreshing",
     "unavailable",
 ];
 
@@ -3809,6 +3817,54 @@ fn borrowed_artifact_identity(data_path: &Path) -> Result<(String, blake3::Hash)
     Ok((fingerprint, artifact_content_hash))
 }
 
+/// Whether `path` on disk still holds the content recorded in `recorded`, so
+/// the vectors embedded from it are still correct.
+///
+/// A filesystem event is not evidence of a change. Copying a tree, a checkout
+/// that rewrites files with the same bytes, `touch`, and macOS FSEvents
+/// replaying events from just before the watcher started all report paths
+/// whose content is what the index already embedded. Masking those vectors
+/// emptied a freshly built index for tens of seconds while status said ready.
+///
+/// The cheap check comes first: equal size and mtime means unchanged, and a
+/// different size means changed. Only when the size matches but the mtime moved
+/// is the file hashed against the recorded content hash. Equal metadata is
+/// trusted only when the recorded mtime has sub-second precision: on a
+/// filesystem with whole-second timestamps (HFS+, FAT, some network mounts) two
+/// same-size edits in one second leave size and mtime identical, so there the
+/// content hash is always compared.
+pub(crate) fn indexed_file_content_unchanged(path: &Path, recorded: &FileFreshness) -> bool {
+    let fine_grained_mtime = recorded
+        .mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .is_ok_and(|since_epoch| since_epoch.subsec_nanos() != 0);
+    let verdict = if fine_grained_mtime {
+        cache_freshness::verify_file(path, recorded)
+    } else {
+        cache_freshness::verify_file_strict(path, recorded)
+    };
+    matches!(
+        verdict,
+        FreshnessVerdict::HotFresh | FreshnessVerdict::ContentFresh { .. }
+    )
+}
+
+/// Of `(path, recorded record)` pairs, the paths whose vectors must be masked
+/// and re-embedded: no record, deleted, or content different from the record.
+pub(crate) fn files_with_changed_content(
+    recorded: Vec<(PathBuf, Option<FileFreshness>)>,
+) -> Vec<PathBuf> {
+    recorded
+        .into_iter()
+        .filter(|(path, record)| {
+            record
+                .as_ref()
+                .is_none_or(|record| !indexed_file_content_unchanged(path, record))
+        })
+        .map(|(path, _)| path)
+        .collect()
+}
+
 /// The semantic index — stores embeddings for all symbols in a project.
 /// Borrow-only roots retain only a root path plus an Arc to immutable relative data.
 #[derive(Debug, Clone)]
@@ -4562,6 +4618,12 @@ impl SemanticIndex {
             SemanticIndexStatus::Failed(_) => "failed",
             SemanticIndexStatus::Disabled => "disabled",
             SemanticIndexStatus::Building { .. } => "loading",
+            // Past the mass-refresh threshold a large part of the project has
+            // its vectors masked; calling that `ready` is what let a status
+            // poll read "ready" while the entry count fell to zero.
+            SemanticIndexStatus::Ready { .. } if status.mass_refresh_pending().is_some() => {
+                "refreshing"
+            }
             SemanticIndexStatus::Ready { .. } => "ready",
         }
     }
@@ -5958,6 +6020,56 @@ impl SemanticIndex {
         }
     }
 
+    /// The size, mtime and content hash recorded for `file` when its current
+    /// vectors were embedded, or `None` when the index holds no complete record
+    /// for it (never indexed, deferred, already invalidated, or recorded before
+    /// sizes were tracked).
+    ///
+    /// Watchers can report a symlinked spelling while the index recorded the
+    /// canonical one (or the reverse), so both spellings are tried, matching
+    /// the pair of keys `invalidate_files` removes.
+    pub fn recorded_file_freshness(&self, file: &Path) -> Option<FileFreshness> {
+        let lookup = |path: &Path| -> Option<FileFreshness> {
+            if let Some(base) = &self.shared_base {
+                let relative = path.strip_prefix(&self.project_root).ok()?;
+                Some(FileFreshness {
+                    mtime: *base.file_mtimes.get(relative)?,
+                    size: *base.file_sizes.get(relative)?,
+                    content_hash: *base.file_hashes.get(relative)?,
+                })
+            } else {
+                Some(FileFreshness {
+                    mtime: *self.file_mtimes.get(path)?,
+                    size: *self.file_sizes.get(path)?,
+                    content_hash: *self.file_hashes.get(path)?,
+                })
+            }
+        };
+        lookup(file).or_else(|| {
+            let canonical = canonicalize_existing_or_deleted_path(file);
+            if canonical == file {
+                None
+            } else {
+                lookup(&canonical)
+            }
+        })
+    }
+
+    /// Keep only the files whose vectors are out of date: those whose content on
+    /// disk no longer matches what this index embedded, plus deleted files and
+    /// files the index has no record of. See [`indexed_file_content_unchanged`]
+    /// for why the rest can keep their vectors.
+    pub fn retain_files_with_changed_content(&self, files: Vec<PathBuf>) -> Vec<PathBuf> {
+        let recorded = files
+            .into_iter()
+            .map(|file| {
+                let record = self.recorded_file_freshness(&file);
+                (file, record)
+            })
+            .collect::<Vec<_>>();
+        files_with_changed_content(recorded)
+    }
+
     fn backfill_missing_file_sizes(&mut self) {
         if !self.any_missing_sizes {
             return;
@@ -6020,6 +6132,38 @@ impl SemanticIndex {
     #[cfg(test)]
     pub(crate) fn uses_shared_base_for_test(&self) -> bool {
         self.shared_base.is_some()
+    }
+
+    /// Every entry as `(absolute file, symbol name, vector)`, sorted, so a test
+    /// can check that vectors survived an operation bit-for-bit.
+    #[cfg(test)]
+    pub(crate) fn entry_vectors_for_test(&self) -> Vec<(PathBuf, String, Vec<f32>)> {
+        let mut rows = match &self.shared_base {
+            Some(base) => base
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        self.project_root.join(&entry.chunk.file),
+                        entry.chunk.name.clone(),
+                        entry.vector.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            None => self
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.chunk.file.clone(),
+                        entry.chunk.name.clone(),
+                        entry.vector.clone(),
+                    )
+                })
+                .collect(),
+        };
+        rows.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        rows
     }
 
     /// Get the embedding dimension
@@ -11875,7 +12019,12 @@ public class Greeter {
         let project = tempfile::tempdir().expect("tempdir");
         let index = SemanticIndex::new(project.path().to_path_buf(), 384);
         assert_eq!(index.status_label(&SemanticIndexStatus::ready()), "ready");
-        for label in ["disabled", "failed", "loading", "ready"] {
+        let mut mass_refresh = SemanticIndexStatus::ready();
+        for ordinal in 0..crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES {
+            mass_refresh.add_refreshing_file(project.path().join(format!("file_{ordinal}.rs")));
+        }
+        assert_eq!(index.status_label(&mass_refresh), "refreshing");
+        for label in ["disabled", "failed", "loading", "ready", "refreshing"] {
             assert!(
                 SEMANTIC_INDEX_STATUS_WORDS.contains(&label),
                 "{label} is emitted but not listed"
@@ -11893,6 +12042,123 @@ public class Greeter {
             sorted.as_slice(),
             SEMANTIC_INDEX_STATUS_WORDS,
             "keep the list sorted and duplicate-free; readers parse it as a set"
+        );
+    }
+
+    /// A ready index reports `refreshing` only once enough files are masked for
+    /// the gap to matter, and goes back to `ready` as the refresh drains, so a
+    /// single edited file never flips the status.
+    #[test]
+    fn status_label_reports_refreshing_only_for_a_mass_refresh() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let index = SemanticIndex::new(project.path().to_path_buf(), 3);
+        let threshold = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES;
+        let paths = (0..threshold)
+            .map(|ordinal| project.path().join(format!("file_{ordinal}.rs")))
+            .collect::<Vec<_>>();
+
+        let mut status = SemanticIndexStatus::ready();
+        for path in &paths[..threshold - 1] {
+            status.add_refreshing_file(path.clone());
+        }
+        assert_eq!(index.status_label(&status), "ready");
+        assert_eq!(status.mass_refresh_pending(), None);
+
+        status.add_refreshing_file(paths[threshold - 1].clone());
+        assert_eq!(index.status_label(&status), "refreshing");
+        assert_eq!(status.mass_refresh_pending(), Some(threshold));
+
+        status.complete_refreshing_file(&paths[0]);
+        assert_eq!(index.status_label(&status), "ready");
+    }
+
+    /// Watcher events are filtered through the index's own file records: only
+    /// files whose bytes differ from what was embedded (or that are gone, or
+    /// were never indexed) are reported as needing invalidation.
+    #[test]
+    fn retain_files_with_changed_content_keeps_only_real_changes() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let root = project.path().canonicalize().expect("canonical root");
+        let untouched = root.join("untouched.rs");
+        let rewritten_same = root.join("rewritten_same.rs");
+        let edited = root.join("edited.rs");
+        let deleted = root.join("deleted.rs");
+        let unknown = root.join("unknown.rs");
+        for (path, body) in [
+            (&untouched, "pub fn untouched() {}\n"),
+            (&rewritten_same, "pub fn rewritten_same() {}\n"),
+            (&edited, "pub fn edited() {}\n"),
+            (&deleted, "pub fn deleted() {}\n"),
+        ] {
+            fs::write(path, body).expect("write fixture");
+        }
+        let files = vec![
+            untouched.clone(),
+            rewritten_same.clone(),
+            edited.clone(),
+            deleted.clone(),
+        ];
+        let mut embed = |texts: Vec<String>| {
+            Ok::<_, String>(texts.into_iter().map(|_| vec![1.0, 0.5, 0.25]).collect())
+        };
+        let index = SemanticIndex::build(&root, &files, &mut embed, 8).expect("build index");
+
+        // Same bytes with a new mtime: the hash comparison must keep it.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&rewritten_same, "pub fn rewritten_same() {}\n").expect("rewrite");
+        fs::write(&edited, "pub fn edited_differently() {}\n").expect("edit");
+        fs::remove_file(&deleted).expect("delete");
+        fs::write(&unknown, "pub fn unknown() {}\n").expect("write unknown");
+
+        let mut changed = index.retain_files_with_changed_content(vec![
+            untouched,
+            rewritten_same,
+            edited.clone(),
+            deleted.clone(),
+            unknown.clone(),
+        ]);
+        changed.sort();
+        let mut expected = vec![edited, deleted, unknown];
+        expected.sort();
+        assert_eq!(changed, expected);
+    }
+
+    /// On a filesystem with whole-second timestamps, a same-size edit inside
+    /// the recorded second leaves size and mtime identical. Equal metadata is
+    /// only trusted when the recorded mtime carries sub-second precision, so
+    /// this edit is still caught by the content hash.
+    #[test]
+    fn same_size_edit_with_whole_second_mtime_is_still_a_change() {
+        let project = tempfile::tempdir().expect("tempdir");
+        let root = project.path().canonicalize().expect("canonical root");
+        let file = root.join("coarse.rs");
+        let whole_second = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let set_mtime = |path: &Path| {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .expect("open for mtime")
+                .set_modified(whole_second)
+                .expect("set mtime");
+        };
+        fs::write(&file, "pub fn aaaa() {}\n").expect("write fixture");
+        set_mtime(&file);
+        let mut embed = |texts: Vec<String>| {
+            Ok::<_, String>(texts.into_iter().map(|_| vec![1.0, 0.5, 0.25]).collect())
+        };
+        let index =
+            SemanticIndex::build(&root, std::slice::from_ref(&file), &mut embed, 8).expect("build");
+        assert_eq!(
+            index.retain_files_with_changed_content(vec![file.clone()]),
+            Vec::<PathBuf>::new(),
+            "an untouched file must keep its vectors"
+        );
+
+        fs::write(&file, "pub fn bbbb() {}\n").expect("same-size edit");
+        set_mtime(&file);
+        assert_eq!(
+            index.retain_files_with_changed_content(vec![file.clone()]),
+            vec![file],
         );
     }
 

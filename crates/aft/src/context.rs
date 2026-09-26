@@ -1733,7 +1733,37 @@ impl SemanticIndexStatus {
             _ => 0,
         }
     }
+
+    /// Number of files waiting to be re-embedded when that number is large
+    /// enough that the semantic lane is materially partial, or `None` when the
+    /// index is serving (nearly) everything it holds.
+    ///
+    /// Every file in `refreshing` has had its vectors masked, so a query cannot
+    /// match it until the refresh lands. For a handful of edited files that gap
+    /// is small and short, and flipping every status surface away from `ready`
+    /// on each save would make the status flicker for no useful signal. A burst
+    /// of hundreds of files (a branch switch, a copied tree, a restore) is
+    /// different: the index keeps answering, but a large slice of the project
+    /// is missing from it, and reporting `ready` then is not honest.
+    pub fn mass_refresh_pending(&self) -> Option<usize> {
+        let pending = self.refreshing_count();
+        (pending >= SEMANTIC_MASS_REFRESH_MIN_FILES).then_some(pending)
+    }
 }
+
+/// Masked-file count at which a ready semantic index reports `refreshing`
+/// instead of `ready`, and search replies call the semantic lane partial.
+///
+/// Every masked file stays missing for at least the refresh worker's quiet
+/// window (15 s by default) plus its re-embed, so the question is not how long
+/// the gap lasts but how much of the project it hides. An ordinary edit batch
+/// (one save, an agent's multi-file edit, a small patch) touches single-digit
+/// files; reporting those would flip the status on nearly every edit. The
+/// bursts that hide a real part of the index are an order of magnitude larger:
+/// the watcher already treats a batch above 256 paths as oversized, and a
+/// branch switch or copied tree reaches hundreds to thousands of files. 32 sits
+/// well clear of the first group and well below the second.
+pub const SEMANTIC_MASS_REFRESH_MIN_FILES: usize = 32;
 
 pub enum SemanticIndexEvent {
     Progress {
@@ -3296,7 +3326,14 @@ impl AppContext {
         } else {
             match &*semantic_status {
                 SemanticIndexStatus::Ready { .. } => SemanticHealthComponentSnapshot {
-                    status: "ready",
+                    // A ready index with a large slice of its files masked for
+                    // re-embedding still answers queries, but not for those
+                    // files; see `SemanticIndexStatus::mass_refresh_pending`.
+                    status: if semantic_status.mass_refresh_pending().is_some() {
+                        "refreshing"
+                    } else {
+                        "ready"
+                    },
                     reason: None,
                     since_ms: None,
                     next_retry_ms: None,

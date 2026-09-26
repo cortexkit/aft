@@ -3272,6 +3272,10 @@ fn handle_semantic_or_hybrid_search(
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
+    // A ready index can still be missing a large batch of files whose vectors
+    // are masked while they re-embed. Replies then say `refreshing` and mark
+    // the semantic lane partial instead of presenting it as complete.
+    let mass_refresh_pending = status.mass_refresh_pending();
     match status {
         SemanticIndexStatus::Disabled => {
             return semantic_unavailable_or_fallback_response(
@@ -3399,6 +3403,11 @@ fn handle_semantic_or_hybrid_search(
             );
         }
     }
+    let semantic_status = if mass_refresh_pending.is_some() {
+        "refreshing"
+    } else {
+        semantic_status
+    };
 
     let pinned_semantic_view = ctx.pinned_view_runtime().filter(|view| {
         view.manifest.as_ref().is_some_and(|manifest| {
@@ -3628,6 +3637,11 @@ fn handle_semantic_or_hybrid_search(
     if let Some(audit) = engine_ranking.recall_audit {
         extras.insert("recall_audit".to_string(), audit);
     }
+    if let Some(pending) = mass_refresh_pending {
+        let disclosure = semantic_mass_refresh_disclosure(pending);
+        text = format!("{disclosure}\n\n{text}");
+        extras.insert("note".to_string(), serde_json::json!(disclosure));
+    }
 
     search_response(
         req,
@@ -3636,8 +3650,12 @@ fn handle_semantic_or_hybrid_search(
             interpreted_as: interpreted_as_label(mode),
             query_kind: query_kind_label(shape.kind),
             semantic_status,
-            status: "ready",
-            complete: true,
+            status: if mass_refresh_pending.is_some() {
+                "partial"
+            } else {
+                "ready"
+            },
+            complete: mass_refresh_pending.is_none(),
             text,
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
@@ -4956,6 +4974,16 @@ fn semantic_lane_disclosure(
             Some(SemanticLaneDisclosure::new("Semantic index is building"))
         }
     }
+}
+
+/// The line that opens a search reply served while a large batch of files is
+/// being re-embedded. The results are real, but the semantic lane cannot match
+/// the files whose vectors are masked, so the reader is told the lane is partial
+/// and roughly how much of it is missing.
+fn semantic_mass_refresh_disclosure(pending_files: usize) -> String {
+    format!(
+        "Semantic index is refreshing {pending_files} file(s); semantic results for those files are missing until the refresh finishes, so this ranking is partial."
+    )
 }
 
 /// True when an earlier build left a persisted semantic index for this root,
@@ -7033,6 +7061,9 @@ mod tests {
                 "{label} is sent to readers but is not in the shared vocabulary"
             );
         }
+        // A ready index in a mass refresh replies `refreshing` from the
+        // semantic search path rather than from `semantic_status_label`.
+        assert!(crate::semantic_index::SEMANTIC_INDEX_STATUS_WORDS.contains(&"refreshing"));
         // A failed index must not borrow a progress word to describe itself.
         assert_eq!(
             semantic_status_label(&SemanticIndexStatus::Failed("boom".to_string())),
@@ -7979,6 +8010,90 @@ mod tests {
         assert_eq!(response["semantic_status"], "ready");
         assert!(response["results"].as_array().expect("results").is_empty());
         handle.join().expect("embedding server thread");
+    }
+
+    /// While a large batch of files has its vectors masked for re-embedding,
+    /// a search reply must not present the semantic lane as complete: it says
+    /// `refreshing`, marks the reply partial, and opens with a disclosure. Once
+    /// the refresh drains, the same query is reported ready again.
+    #[test]
+    fn mass_refresh_discloses_a_partial_semantic_lane_until_it_finishes() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let (base_url, handle) = start_mock_embedding_server();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.path().to_path_buf()),
+                semantic: SemanticBackendConfig {
+                    backend: SemanticBackend::OpenAiCompatible,
+                    model: "test-embedding".to_string(),
+                    base_url: Some(base_url),
+                    api_key_env: None,
+                    timeout_ms: 5_000,
+                    query_timeout_ms: 3_000,
+                    max_batch_size: 64,
+                    max_files: 20_000,
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+        );
+        let pending = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES + 5;
+        let paths = (0..pending)
+            .map(|ordinal| project.path().join(format!("file_{ordinal}.rs")))
+            .collect::<Vec<_>>();
+        let mut status = SemanticIndexStatus::ready();
+        for path in &paths {
+            status.add_refreshing_file(path.clone());
+        }
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(project.path().to_path_buf(), 384));
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("anything", 5),
+            &ctx,
+        ));
+        handle.join().expect("embedding server thread");
+
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["semantic_status"], "refreshing");
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["complete"], false);
+        let disclosure = semantic_mass_refresh_disclosure(pending);
+        assert!(
+            response["text"]
+                .as_str()
+                .expect("text")
+                .starts_with(&disclosure),
+            "{response:?}"
+        );
+        assert_eq!(response["note"], disclosure);
+
+        {
+            let mut status = ctx
+                .semantic_index_status()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for path in &paths {
+                status.complete_refreshing_file(path);
+            }
+        }
+        // The query vector is cached from the first call, so no second
+        // embedding request is needed.
+        let response = response_value(handle_semantic_search(
+            &semantic_request("anything", 5),
+            &ctx,
+        ));
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["semantic_status"], "ready");
+        assert_eq!(response["status"], "ready");
+        assert_eq!(response["complete"], true);
+        assert!(response.get("note").is_none(), "{response:?}");
     }
 
     #[test]

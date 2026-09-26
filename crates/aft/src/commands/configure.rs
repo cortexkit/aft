@@ -8091,6 +8091,217 @@ mod tests {
             .expect("write embedding response");
     }
 
+    /// A root with a ready semantic index embedded through `server`, a live
+    /// refresh worker using the same backend, and a watcher channel the test
+    /// feeds directly. The worker's quiet window is shortened so a refresh
+    /// lands within the test's patience.
+    fn watcher_refresh_fixture(
+        root: &Path,
+        files: &[PathBuf],
+        server: &CountingEmbeddingServer,
+    ) -> (
+        AppContext,
+        crossbeam_channel::Sender<crate::watcher_filter::WatcherDispatchEvent>,
+    ) {
+        let config = semantic_refresh_test_config(&server.base_url);
+        let mut model = crate::semantic_index::EmbeddingModel::from_config(&config)
+            .expect("construct embedding model");
+        let mut embed = |texts: Vec<String>| model.embed(texts);
+        let index = SemanticIndex::build(root, files, &mut embed, config.max_batch_size)
+            .expect("build semantic index through the counting backend");
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.to_path_buf()),
+                semantic: config.clone(),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx.mark_subc_bound();
+        ctx.set_heavy_root_work_allowed(true);
+        ctx.set_cache_writer_capabilities(true, true);
+        *ctx.semantic_index().write().unwrap() = Some(index.clone());
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::ready();
+
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let slot: crate::context::SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+        ctx.install_semantic_refresh_worker_for_build_epoch(
+            request_tx,
+            event_rx,
+            Arc::clone(&slot),
+            ctx.semantic_index_rx_epoch(),
+        );
+        let worker = super::spawn_semantic_refresh_worker(
+            root.to_path_buf(),
+            index,
+            crate::semantic_index::EmbeddingModel::from_config(&config)
+                .expect("construct refresh model"),
+            config.max_batch_size,
+            config.max_files,
+            Duration::from_millis(50),
+            true,
+            None,
+            request_rx,
+            event_tx,
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            ctx.configure_generation(),
+            super::SemanticRefreshLimiter(ctx.cold_build_limiter()),
+            None,
+        );
+        *slot.lock().unwrap() = Some(worker);
+
+        let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+        *ctx.watcher_rx().lock() = Some(watcher_rx);
+        (ctx, watcher_tx)
+    }
+
+    /// Every non-probe embedding input the server has received so far.
+    fn non_probe_inputs(server: &CountingEmbeddingServer) -> Vec<String> {
+        server
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flatten()
+            .filter(|text| text.as_str() != "semantic index fingerprint probe")
+            .cloned()
+            .collect()
+    }
+
+    /// Watcher events for files whose bytes did not change leave every vector
+    /// in place and cost the embedding backend nothing; a real edit that
+    /// follows re-embeds exactly the edited file. The backend is an
+    /// OpenAI-compatible HTTP server that only answers `/embeddings` requests,
+    /// so the count is of requests the real refresh worker actually sent.
+    #[test]
+    fn watcher_events_for_unchanged_files_cause_no_embed_calls_and_a_real_edit_embeds_one_file() {
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let files = (0..6)
+            .map(|ordinal| {
+                let file = root.join(format!("module_{ordinal}.rs"));
+                fs::write(
+                    &file,
+                    format!("pub fn stable_symbol_{ordinal}() -> u32 {{ {ordinal} }}\n"),
+                )
+                .unwrap();
+                file
+            })
+            .collect::<Vec<_>>();
+        let (ctx, watcher_tx) = watcher_refresh_fixture(&root, &files, &server);
+        let inputs_after_build = non_probe_inputs(&server).len();
+        assert!(
+            inputs_after_build >= files.len(),
+            "build embedded every file"
+        );
+        let (entries_before, vectors_before) = {
+            let index = ctx.semantic_index().read().unwrap();
+            let index = index.as_ref().unwrap();
+            (index.entry_count(), index.entry_vectors_for_test())
+        };
+
+        // Same bytes, new mtime for half the files; the rest are untouched.
+        std::thread::sleep(Duration::from_millis(20));
+        for (ordinal, file) in files.iter().enumerate().step_by(2) {
+            fs::write(
+                file,
+                format!("pub fn stable_symbol_{ordinal}() -> u32 {{ {ordinal} }}\n"),
+            )
+            .unwrap();
+        }
+        watcher_tx
+            .send(crate::watcher_filter::WatcherDispatchEvent::Paths(
+                files.clone(),
+            ))
+            .unwrap();
+        crate::runtime_drain::drain_watcher_events(&ctx);
+
+        {
+            let index = ctx.semantic_index().read().unwrap();
+            let index = index.as_ref().unwrap();
+            assert_eq!(index.entry_count(), entries_before);
+            assert_eq!(index.entry_vectors_for_test(), vectors_before);
+        }
+        assert_eq!(
+            ctx.semantic_index_status()
+                .read()
+                .unwrap()
+                .refreshing_count(),
+            0
+        );
+
+        // A real edit to one file follows inside the worker's quiet window.
+        // The embed count below cannot by itself prove the unchanged files
+        // were left alone, because the refresh worker reuses vectors for chunk
+        // text it already embedded; the entry and vector checks above and the
+        // queue check in the runtime_drain tests carry that. What it does pin
+        // is that the whole round trip costs the backend one input: the edit.
+        let edited = files[3].clone();
+        fs::write(&edited, "pub fn edited_symbol_marker() -> u32 { 99 }\n").unwrap();
+        watcher_tx
+            .send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
+                edited.clone(),
+            ]))
+            .unwrap();
+        crate::runtime_drain::drain_watcher_events(&ctx);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+            if non_probe_inputs(&server).len() > inputs_after_build
+                && ctx
+                    .semantic_index_status()
+                    .read()
+                    .unwrap()
+                    .refreshing_count()
+                    == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "refresh of the edited file did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Give a mistakenly queued batch time to reach the server too.
+        std::thread::sleep(Duration::from_millis(200));
+        crate::runtime_drain::drain_semantic_refresh_events(&ctx);
+
+        let refresh_inputs = non_probe_inputs(&server).split_off(inputs_after_build);
+        assert_eq!(
+            refresh_inputs.len(),
+            1,
+            "exactly the edited file's one symbol is re-embedded: {refresh_inputs:?}"
+        );
+        assert!(
+            refresh_inputs[0].contains("edited_symbol_marker"),
+            "{refresh_inputs:?}"
+        );
+        let index = ctx.semantic_index().read().unwrap();
+        let index = index.as_ref().unwrap();
+        assert_eq!(index.entry_count(), entries_before);
+        let vectors_after = index.entry_vectors_for_test();
+        let untouched = |rows: &[(PathBuf, String, Vec<f32>)]| {
+            rows.iter()
+                .filter(|(file, _, _)| file != &edited)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(untouched(&vectors_after), untouched(&vectors_before));
+        assert!(
+            vectors_after.iter().any(|(file, _, _)| file == &edited),
+            "the edited file's replacement entry is installed"
+        );
+    }
+
     fn wait_for_semantic_build_ready(ctx: &AppContext, timeout: Duration) {
         super::drain_deferred_configure_maintenance(ctx);
         let deadline = Instant::now() + timeout;

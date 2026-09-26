@@ -65,7 +65,10 @@ export type SemanticIndexStatusKind =
   | "inactive"
   | "unrecognized";
 
-const SEMANTIC_PROGRESS_STATUSES = new Set(["building", "loading"]);
+// `refreshing` is a queryable index with a large batch of files masked while
+// they re-embed: an attempt is under way and waiting is the right response, so
+// it is progress rather than ready or failure.
+const SEMANTIC_PROGRESS_STATUSES = new Set(["building", "loading", "refreshing"]);
 // `empty` is not in the daemon's current word list: it used to mean a loaded
 // index holding nothing, and that index now reports `ready` like any other
 // queryable one. It stays recognised here because a plugin can be talking to a
