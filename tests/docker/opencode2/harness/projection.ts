@@ -166,6 +166,109 @@ export function withoutTrailingStatusBar(text: string): string[] {
   return [before.slice(0, -1), before.slice(0, -2)];
 }
 
+/**
+ * A short line diff of two texts: the first differing line with a little
+ * context on each side, each line JSON-quoted so whitespace and a missing
+ * final newline are visible. Enough for a failure message to say what
+ * differed without dumping both outputs whole.
+ */
+export function describeTextDifference(left: string, right: string, context = 2): string {
+  const a = left.split("\n");
+  const b = right.split("\n");
+  let first = 0;
+  while (first < a.length && first < b.length && a[first] === b[first]) first += 1;
+  if (first === a.length && first === b.length) return "(texts are identical)";
+  let lastA = a.length - 1;
+  let lastB = b.length - 1;
+  while (lastA >= first && lastB >= first && a[lastA] === b[lastB]) {
+    lastA -= 1;
+    lastB -= 1;
+  }
+  const out: string[] = [`first difference at line ${first + 1}`];
+  for (let i = Math.max(0, first - context); i < first; i += 1) out.push(`  ${JSON.stringify(a[i])}`);
+  const cap = 20;
+  const removed = a.slice(first, lastA + 1);
+  const added = b.slice(first, lastB + 1);
+  for (const line of removed.slice(0, cap)) out.push(`- ${JSON.stringify(line)}`);
+  if (removed.length > cap) out.push(`- … ${removed.length - cap} more line(s)`);
+  for (const line of added.slice(0, cap)) out.push(`+ ${JSON.stringify(line)}`);
+  if (added.length > cap) out.push(`+ … ${added.length - cap} more line(s)`);
+  const after = Math.min(a.length, lastA + 1 + context);
+  for (let i = lastA + 1; i < after; i += 1) out.push(`  ${JSON.stringify(a[i])}`);
+  return out.join("\n");
+}
+
+/** A field a row may leave out of its projected cross-host comparison. */
+export interface ParityFieldException {
+  scenario: string;
+  field: string;
+}
+
+function projectionOrUndefined(
+  text: string,
+  rules: readonly ProjectionRule[],
+): Record<string, unknown> | undefined {
+  try {
+    return projectText(text, rules);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * T7: the same scenario on the OpenCode 1 and OpenCode 2 hosts must produce
+ * the same tool output. AFT's trailing status bar is left out on both sides
+ * for the reason given at `STATUS_BAR`: which host's call happens to be the
+ * first to see a count change is timing, not host behaviour. Everything else
+ * is compared as the row declares, exactly or by projection.
+ */
+export function assertDualHostParity(
+  scenario: ScenarioDefinition,
+  v1Text: string,
+  v2Text: string,
+  allowlist: readonly ParityFieldException[],
+): void {
+  if (!scenario.comparison) throw new Error(`${scenario.id}: T7 requires a declared comparison`);
+  const allowedFields = allowlist
+    .filter((entry) => entry.scenario === scenario.id)
+    .map((entry) => entry.field);
+  const v1Readings = withoutTrailingStatusBar(v1Text);
+  const v2Readings = withoutTrailingStatusBar(v2Text);
+  if (scenario.comparison.mode === "exact") {
+    if (allowedFields.length > 0) {
+      throw new Error(`${scenario.id}: exact parity cannot have field exceptions`);
+    }
+    if (!v1Readings.some((reading) => v2Readings.includes(reading))) {
+      throw new Error(
+        `${scenario.id}: exact V1/V2 parity mismatch (- V1, + V2)\n${describeTextDifference(
+          v1Readings[0],
+          v2Readings[0],
+        )}`,
+      );
+    }
+    return;
+  }
+  const rules = scenario.comparison.rules;
+  const shapesOf = (readings: string[]): string[] =>
+    readings.flatMap((reading) => {
+      const shape = projectionOrUndefined(reading, rules);
+      if (!shape) return [];
+      for (const field of allowedFields) delete shape[field];
+      return [JSON.stringify(shape)];
+    });
+  const v1Shapes = shapesOf(v1Readings);
+  const v2Shapes = shapesOf(v2Readings);
+  // A text no reading of which projects gets the projection's own error, which
+  // names the line the rules could not parse.
+  if (v1Shapes.length === 0) projectText(v1Readings[0], rules);
+  if (v2Shapes.length === 0) projectText(v2Readings[0], rules);
+  if (!v1Shapes.some((shape) => v2Shapes.includes(shape))) {
+    throw new Error(
+      `${scenario.id}: projected V1/V2 parity mismatch\nV1 ${v1Shapes[0]}\nV2 ${v2Shapes[0]}`,
+    );
+  }
+}
+
 export function assertComparison(actual: string, comparison: ScenarioComparison): void {
   const readings = withoutTrailingStatusBar(actual);
   if (comparison.mode === "exact") {

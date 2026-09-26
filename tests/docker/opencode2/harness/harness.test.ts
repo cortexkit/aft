@@ -55,7 +55,9 @@ import {
 } from "./mock-server.js";
 import {
   assertComparison,
+  assertDualHostParity,
   assertT6Trailer,
+  describeTextDifference,
   projectText,
   TRUNCATION_TRAILER_PATTERN,
 } from "./projection.js";
@@ -2385,6 +2387,73 @@ describe("comparing tool output that carries AFT's status bar", () => {
     expect(() =>
       assertComparison("[AFT E? W? | D? U? C? | T0]\n\n1: alpha\n2: beta\n", exact),
     ).toThrow(/exact comparison failed/);
+  });
+});
+
+describe("cross-host parity with AFT's status bar on one side", () => {
+  const scenario = (comparison: unknown) =>
+    ({ id: "read/T7/happy", comparison }) as never;
+  const exact = scenario({ mode: "exact", expected: "1: alpha\n2: beta\n" });
+
+  test("a status bar on only one host's output is not a parity difference", () => {
+    expect(() =>
+      assertDualHostParity(
+        exact,
+        "1: alpha\n2: beta\n",
+        "1: alpha\n2: beta\n\n[AFT E? W? | ~D? U? C? | T0]",
+        [],
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertDualHostParity(
+        exact,
+        "1: alpha\n2: beta\n\n[AFT E0 W0 | D0 U0 C0 | T1]",
+        "1: alpha\n2: beta\n",
+        [],
+      ),
+    ).not.toThrow();
+  });
+
+  test("a real difference still fails and the message shows it", () => {
+    let message = "";
+    try {
+      assertDualHostParity(
+        exact,
+        "1: alpha\n2: beta\n",
+        "1: alpha\n2: gamma\n\n[AFT E? W? | ~D? U? C? | T0]",
+        [],
+      );
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("exact V1/V2 parity mismatch");
+    expect(message).toContain('- "2: beta"');
+    expect(message).toContain('+ "2: gamma"');
+    // A trailing newline difference is a difference too.
+    expect(() => assertDualHostParity(exact, "1: alpha\n", "1: alpha", [])).toThrow(
+      /exact V1\/V2 parity mismatch/,
+    );
+  });
+
+  test("projected parity also leaves the status bar out", () => {
+    const projected = scenario({
+      mode: "shape",
+      expected: {},
+      rules: [{ kind: "field", field: "line", pattern: "^(?<line>\\d+): .*$", max_lines: 1 }],
+    });
+    expect(() =>
+      assertDualHostParity(projected, "1: alpha", "1: alpha\n\n[AFT E? W? | D? U? C? | T0]", []),
+    ).not.toThrow();
+    expect(() =>
+      assertDualHostParity(projected, "1: alpha", "2: alpha\n\n[AFT E? W? | D? U? C? | T0]", []),
+    ).toThrow(/projected V1\/V2 parity mismatch/);
+  });
+
+  test("the difference summary names the first differing line", () => {
+    expect(describeTextDifference("a\nb\nc", "a\nx\nc")).toBe(
+      'first difference at line 2\n  "a"\n- "b"\n+ "x"\n  "c"',
+    );
+    expect(describeTextDifference("a", "a")).toBe("(texts are identical)");
   });
 });
 

@@ -53,7 +53,7 @@ import {
 } from "./process-observer.js";
 import { reportTable } from "./report.js";
 import { AftTaskProbe } from "./task-probe.js";
-import { assertComparison, assertT6Trailer, projectText } from "./projection.js";
+import { assertComparison, assertDualHostParity, assertT6Trailer } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import { filterScenarios, loadScenarios, materializeParityScenarios } from "./scenario-loader.js";
 import {
@@ -78,7 +78,6 @@ import type {
   ToolCallPlan,
 } from "./types.js";
 import {
-  type ParityAllowlistEntry,
   type ValidatedInputs,
   type VerdictExclusion,
   validateHarnessInputs,
@@ -1253,38 +1252,6 @@ function declaredExclusion(
   if (!matrix) return undefined;
   const declared = verdictExclusionFor(matrix, scenario.tool, scenario.trajectory);
   return declared?.subject === subject ? declared : undefined;
-}
-
-function assertDualHostParity(
-  scenario: ScenarioDefinition,
-  v1Text: string,
-  v2Text: string,
-  allowlist: readonly ParityAllowlistEntry[],
-): void {
-  if (!scenario.comparison) throw new Error(`${scenario.id}: T7 requires a declared comparison`);
-  const allowedFields = allowlist
-    .filter((entry) => entry.scenario === scenario.id)
-    .map((entry) => entry.field);
-  if (scenario.comparison.mode === "exact") {
-    if (allowedFields.length > 0) {
-      throw new Error(`${scenario.id}: exact parity cannot have field exceptions`);
-    }
-    if (v1Text !== v2Text) {
-      throw new Error(`${scenario.id}: exact V1/V2 parity mismatch`);
-    }
-    return;
-  }
-  const v1Shape = projectText(v1Text, scenario.comparison.rules);
-  const v2Shape = projectText(v2Text, scenario.comparison.rules);
-  for (const field of allowedFields) {
-    delete v1Shape[field];
-    delete v2Shape[field];
-  }
-  if (JSON.stringify(v1Shape) !== JSON.stringify(v2Shape)) {
-    throw new Error(
-      `${scenario.id}: projected V1/V2 parity mismatch\nV1 ${JSON.stringify(v1Shape)}\nV2 ${JSON.stringify(v2Shape)}`,
-    );
-  }
 }
 
 async function main(): Promise<void> {
