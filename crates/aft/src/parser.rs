@@ -15,6 +15,14 @@ use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 const MAX_REEXPORT_DEPTH: usize = 10;
 
+/// Upper bound on the bytes kept for one symbol's signature.
+///
+/// A signature is the first source line of the definition. In minified or
+/// generated code that line can be the rest of the file, and every nested
+/// symbol repeats it, so one file could serialize to hundreds of megabytes of
+/// symbol data. Real signatures are far shorter than this bound.
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 1024;
+
 // --- Query patterns embedded at compile time ---
 
 const TS_QUERY: &str = r#"
@@ -1717,6 +1725,34 @@ impl FileParser {
 /// Callers that already have a `tree_sitter::Tree` (e.g. callgraph::build_file_data)
 /// should use this instead of `list_symbols(path)` to avoid the redundant parse.
 pub fn extract_symbols_from_tree(
+    source: &str,
+    tree: &Tree,
+    lang: LangId,
+) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = extract_symbols_from_tree_unbounded(source, tree, lang)?;
+    for symbol in &mut symbols {
+        if let Some(signature) = symbol.signature.as_mut() {
+            truncate_signature(signature);
+        }
+    }
+    Ok(symbols)
+}
+
+/// Cut a signature to [`MAX_SIGNATURE_BYTES`] on a character boundary and mark
+/// the cut with an ellipsis so readers can tell it was shortened.
+fn truncate_signature(signature: &mut String) {
+    if signature.len() <= MAX_SIGNATURE_BYTES {
+        return;
+    }
+    let mut end = MAX_SIGNATURE_BYTES;
+    while !signature.is_char_boundary(end) {
+        end -= 1;
+    }
+    signature.truncate(end);
+    signature.push('…');
+}
+
+fn extract_symbols_from_tree_unbounded(
     source: &str,
     tree: &Tree,
     lang: LangId,
@@ -10642,6 +10678,58 @@ fn body_macros_are_not_items() {
         // Re-extract should return same results from cache
         let rs_syms2 = parser.extract_symbols(&rs_file).unwrap();
         assert_eq!(rs_syms.len(), rs_syms2.len());
+    }
+
+    /// Minified bundles put deeply nested functions on one line. A symbol's
+    /// signature is the first line of its definition, so on a single-line file
+    /// every nested symbol used to carry the whole remainder of the file and the
+    /// serialized symbol payload grew with nesting depth times file size. This
+    /// fixture is a ~410 KiB file that produced a ~20 MiB payload, larger than
+    /// the 16 MiB per-file limit of the on-disk symbol cache.
+    #[test]
+    fn single_line_nested_functions_keep_symbol_payload_linear() {
+        const DEPTH: usize = 100;
+        let padding = "x".repeat(4096);
+        let mut source = String::new();
+        for level in 0..DEPTH {
+            source.push_str(&format!("function f{level}(){{var p{level}=\"{padding}\";"));
+        }
+        for _ in 0..DEPTH {
+            source.push('}');
+        }
+        source.push('\n');
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("bundle.min.js");
+        std::fs::write(&file, &source).unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+        let payload = serde_json::to_vec(&symbols).unwrap();
+        eprintln!(
+            "single-line fixture: file={} bytes symbols={} payload={} bytes",
+            source.len(),
+            symbols.len(),
+            payload.len()
+        );
+
+        assert_eq!(
+            symbols
+                .iter()
+                .filter(|symbol| symbol.kind == SymbolKind::Function)
+                .count(),
+            DEPTH
+        );
+        assert!(symbols.iter().all(|symbol| symbol
+            .signature
+            .as_deref()
+            .is_none_or(|signature| signature.len() <= MAX_SIGNATURE_BYTES + '…'.len_utf8())));
+        assert!(
+            payload.len() < source.len(),
+            "symbol payload {} bytes should stay below the {} byte source",
+            payload.len(),
+            source.len()
+        );
     }
 
     #[test]

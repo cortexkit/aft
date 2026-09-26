@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -21,7 +21,7 @@ const FORMAT_VERSION: u32 = 3;
 /// Bump this whenever symbol-extraction logic changes: tree-sitter grammar
 /// upgrades, query updates, extractor behavior, or symbol shape changes. A
 /// mismatch rejects persisted symbols so they are regenerated on next access.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 const MAX_ENTRIES: usize = 2_000_000;
 const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -255,9 +255,27 @@ fn read_cache_file(path: &Path) -> Result<DiskSymbolCache, String> {
         let content_hash = blake3::Hash::from_bytes(hash_bytes);
         let symbol_bytes_len = read_u32(&mut reader)? as usize;
         if symbol_bytes_len > MAX_SYMBOL_BYTES {
-            return Err(format!(
-                "cached symbol payload too large: {symbol_bytes_len} bytes"
-            ));
+            // One oversized file must not cost every other file its cached
+            // symbols. Skip past this payload and let the file be re-extracted
+            // on demand. A payload shorter than its declared length is still
+            // truncation and rejects the cache below.
+            let skipped = std::io::copy(
+                &mut reader.by_ref().take(symbol_bytes_len as u64),
+                &mut std::io::sink(),
+            )
+            .map_err(|error| format!("failed to skip oversized symbol payload: {error}"))?;
+            if skipped != symbol_bytes_len as u64 {
+                return Err(format!(
+                    "truncated symbol payload: expected {symbol_bytes_len} bytes, found {skipped}"
+                ));
+            }
+            slog_warn!(
+                "skipping cached symbols for {}: payload {} bytes exceeds {} byte limit",
+                relative_path.display(),
+                symbol_bytes_len,
+                MAX_SYMBOL_BYTES
+            );
+            continue;
         }
 
         let mut symbol_bytes = vec![0u8; symbol_bytes_len];
@@ -297,16 +315,20 @@ fn write_cache_file(
     let root = project_root.to_string_lossy();
     let root_len = u32::try_from(root.len())
         .map_err(|_| std::io::Error::other("project root too large to cache"))?;
-    let entry_count = u32::try_from(entries.len())
+    // Validate the upper bound now; the count actually written can be smaller
+    // because oversized entries are left out, so it is patched in afterwards.
+    u32::try_from(entries.len())
         .map_err(|_| std::io::Error::other("too many symbol cache entries"))?;
 
     writer.write_all(MAGIC)?;
     write_u32(&mut writer, FORMAT_VERSION)?;
     write_u32(&mut writer, SCHEMA_VERSION)?;
     write_u32(&mut writer, root_len)?;
-    write_u32(&mut writer, entry_count)?;
+    let entry_count_offset = writer.stream_position()?;
+    write_u32(&mut writer, 0)?;
     writer.write_all(root.as_bytes())?;
 
+    let mut written_entries: u32 = 0;
     for (relative_path, mtime, size, content_hash, symbols) in entries {
         let path_bytes = relative_path.to_string_lossy();
         let path_len = u32::try_from(path_bytes.len())
@@ -315,6 +337,18 @@ fn write_cache_file(
         let symbol_bytes = serde_json::to_vec(symbols).map_err(|error| {
             std::io::Error::other(format!("symbol serialization failed: {error}"))
         })?;
+        // The reader refuses payloads above MAX_SYMBOL_BYTES, so writing one
+        // would only waste disk and startup time. Leave the file out; it is
+        // re-extracted when its symbols are needed.
+        if symbol_bytes.len() > MAX_SYMBOL_BYTES {
+            slog_warn!(
+                "not persisting symbols for {}: payload {} bytes exceeds {} byte limit",
+                relative_path.display(),
+                symbol_bytes.len(),
+                MAX_SYMBOL_BYTES
+            );
+            continue;
+        }
         let symbol_len = u32::try_from(symbol_bytes.len())
             .map_err(|_| std::io::Error::other("cached symbol payload too large"))?;
 
@@ -326,8 +360,11 @@ fn write_cache_file(
         writer.write_all(content_hash.as_bytes())?;
         write_u32(&mut writer, symbol_len)?;
         writer.write_all(&symbol_bytes)?;
+        written_entries += 1;
     }
 
+    writer.seek(SeekFrom::Start(entry_count_offset))?;
+    write_u32(&mut writer, written_entries)?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
     Ok(())
@@ -546,5 +583,122 @@ mod tests {
 
         let error = write_to_disk(&cache, dir.path(), "escape-project").expect_err("reject escape");
         assert!(error.to_string().contains("outside project root"));
+    }
+
+    /// A symbol whose serialized payload is just over the per-entry limit.
+    fn oversized_symbol() -> Symbol {
+        test_symbol(&"x".repeat(MAX_SYMBOL_BYTES + 1))
+    }
+
+    fn insert_file(cache: &mut SymbolCache, project: &Path, file_name: &str, symbol: Symbol) {
+        let file = project.join(file_name);
+        fs::write(&file, format!("fn {file_name}() {{}}\n")).expect("write file");
+        let metadata = fs::metadata(&file).expect("metadata");
+        cache.insert(
+            file.clone(),
+            metadata.modified().expect("mtime"),
+            metadata.len(),
+            blake3::hash(&fs::read(&file).expect("read file")),
+            vec![symbol],
+        );
+    }
+
+    /// Append one entry in the on-disk layout without going through the writer,
+    /// so a test can reproduce a cache that an older writer produced.
+    fn push_raw_entry(bytes: &mut Vec<u8>, relative_path: &str, symbols: &[Symbol]) {
+        let payload = serde_json::to_vec(symbols).expect("serialize symbols");
+        bytes.extend_from_slice(&(relative_path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(relative_path.as_bytes());
+        bytes.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&16u64.to_le_bytes());
+        bytes.extend_from_slice(blake3::hash(relative_path.as_bytes()).as_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+
+    fn raw_cache_header(entry_count: u32) -> Vec<u8> {
+        let root = "/project";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(root.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(root.as_bytes());
+        bytes
+    }
+
+    #[test]
+    fn oversized_entry_on_disk_is_skipped_without_discarding_other_entries() {
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let path = cache_path(storage.path(), "oversized-read");
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
+
+        let mut bytes = raw_cache_header(3);
+        push_raw_entry(&mut bytes, "a.rs", &[test_symbol("a")]);
+        push_raw_entry(&mut bytes, "huge.js", &[oversized_symbol()]);
+        push_raw_entry(&mut bytes, "b.rs", &[test_symbol("b")]);
+        fs::write(&path, bytes).expect("write cache");
+
+        let loaded = read_from_disk(storage.path(), "oversized-read")
+            .expect("one oversized entry must not discard the whole cache");
+        let paths: Vec<_> = loaded
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+        assert_eq!(loaded.entries[1].symbols[0].name, "b");
+    }
+
+    #[test]
+    fn oversized_entry_is_not_persisted_and_other_entries_round_trip() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project");
+        let storage = dir.path().join("storage");
+
+        let mut cache = SymbolCache::new();
+        cache.set_project_root(project.clone());
+        insert_file(&mut cache, &project, "a.rs", test_symbol("a"));
+        insert_file(&mut cache, &project, "huge.js", oversized_symbol());
+        insert_file(&mut cache, &project, "b.rs", test_symbol("b"));
+
+        write_to_disk(&cache, &storage, "oversized-write").expect("write cache");
+
+        let written = fs::metadata(cache_path(&storage, "oversized-write"))
+            .expect("cache file")
+            .len();
+        assert!(
+            written < MAX_SYMBOL_BYTES as u64,
+            "oversized payload was written to disk ({written} bytes)"
+        );
+        let loaded =
+            read_from_disk(&storage, "oversized-write").expect("cache without oversized entry");
+        let mut paths: Vec<_> = loaded
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["a.rs".to_string(), "b.rs".to_string()]);
+    }
+
+    #[test]
+    fn truncated_entry_still_rejects_the_whole_cache() {
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let path = cache_path(storage.path(), "truncated");
+        fs::create_dir_all(path.parent().expect("cache parent")).expect("create cache dir");
+
+        let mut bytes = raw_cache_header(2);
+        push_raw_entry(&mut bytes, "a.rs", &[test_symbol("a")]);
+        push_raw_entry(&mut bytes, "huge.js", &[oversized_symbol()]);
+        // Cut the oversized payload short: skipping it must notice the missing
+        // bytes instead of treating a truncated file as a valid cache.
+        bytes.truncate(bytes.len() - 10);
+        fs::write(&path, bytes).expect("write cache");
+
+        assert!(read_from_disk(storage.path(), "truncated").is_none());
     }
 }
