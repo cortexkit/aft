@@ -228,6 +228,14 @@ class EngineUnwiredGateTests(unittest.TestCase):
             derive_slice_class(["packages/pi-plugin/src/__tests__/semantic.test.ts"]), "ranking"
         )
 
+    def test_search_router_paths_are_ranking(self) -> None:
+        from search_quality_lib import derive_slice_class
+
+        # The router chooses which lanes run for a query, so a router-only
+        # diff must face the ranking gate rather than pass as non-ranking.
+        self.assertEqual(derive_slice_class(["crates/aft/src/search_b2/router.rs"]), "ranking")
+        self.assertEqual(derive_slice_class(["crates/aft/src/search_b2/lane_plan.rs"]), "ranking")
+
     def test_engine_unwired_rejects_a_non_ranking_diff_class(self) -> None:
         result = self.gate(self.score, ["scripts/telemetry/cost-gate.sh"])
         self.assertEqual(result.exit_code, 2)

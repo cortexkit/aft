@@ -198,7 +198,10 @@ def self_test() -> None:
     assert identity_delta(old_manifest,new_manifest)=={"added":["followup-census:2"],"removed":[],"changed":["followup-census:1"]}
     manifest_path=BENCH/"real-query-manifest.json"
     production=read_json(manifest_path)
-    assert production["census_unique_identities"]==6469 and production["retained_labels"]==300 and len(production["rows"])==300
+    # Rows added after the census for a specific mechanism carry row_source and
+    # sit outside the 300 retained census labels.
+    census_rows=[row for row in production["rows"] if "row_source" not in row]
+    assert production["census_unique_identities"]==6469 and production["retained_labels"]==300 and len(census_rows)==300
     assert production["mechanism_projection_sum"]==6470
 
 

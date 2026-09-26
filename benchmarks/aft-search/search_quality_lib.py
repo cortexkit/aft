@@ -58,6 +58,10 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft/src/semantic_index.rs",
     "crates/aft/src/embed/",
     "crates/aft/src/lib.rs",
+    # The shape router, lane plans and token variants decide which lanes a
+    # query runs and which candidates they produce, so a change there moves
+    # search results just as a scoring change does.
+    "crates/aft/src/search_b2/",
     # Only the plugin files that shape an aft_search request or its rendering
     # are ranking surface; the rest of each plugin (bash, read, edit, wakes)
     # cannot move a search score and must not demand a ranking descriptor.
