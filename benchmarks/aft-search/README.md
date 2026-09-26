@@ -148,17 +148,6 @@ Re-records so far:
   the same run and are unchanged at 1.000; the ignore list is copied only into
   the real-query evidence tree, and those two families score against the pinned
   external clones and the offline vector pack instead.
-- 2026-09-25, after JSON data files were demoted below source in `aft_search`
-  (source-before-data inside each exact evidence kind, and a 20-position
-  demotion in the lexical and semantic lanes). Cause established by replaying
-  the unchanged reference on the base binary first (all 43 rows byte-equal),
-  then replaying the change twice on one release build of `aft 0.57.2`: the two
-  runs are byte-equal to each other. 35 rows changed bytes; two moved their
-  opened file, both upward: `followup-census:7617` 4 -> 3 and
-  `followup-census:7956` 6 -> 5. No row's opened file moved down. `paged`
-  MRR@10 0.188760 -> 0.191473, hit@5 0.325581 -> 0.348837, census-weighted
-  MRR 0.152462 -> 0.152885, `phrase_present_not_surfaced` MRR@10
-  0.625 -> 0.667. Exact recall and concept recall unchanged at 1.000.
 
 ## Prefrontal search-miss rows
 
