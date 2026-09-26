@@ -181,6 +181,7 @@ Observations the tables support:
 
 | Case | Class | Expected | Shape | Exact | Lexical | Semantic (store) | Ranked list | Page | Lost at | Confidence | Top-5 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `followup-census:584` | not_a_search_failure | `Cargo.lock` | short | - | 279 | - | - | - | not_admitted | low | no |
 | `followup-census:832` | not_a_search_failure | `packages/aft-bridge/src/pool.ts` | short | - | 167 | 100 | 112 | - | ranked_below_page | low | no |
 | `followup-census:3184` | not_a_search_failure | `crates/aft/src/hashline/snapshot/mod.rs` | natural_language | 47 | 117 | 162 | 43 | 43 | found | low | no |
 | `followup-census:4111` | topk_cut | `README.md` | short | - | 149 | - | 152 | - | ranked_below_page | low | no |
@@ -228,6 +229,7 @@ Observations the tables support:
 
 | Case | Class | Expected | Shape | Exact | Lexical | Semantic (store) | Ranked list | Page | Lost at | Confidence | Top-5 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `followup-census:584` | not_a_search_failure | `Cargo.lock` | short | - | 279 | - | - | - | not_admitted | low | no |
 | `followup-census:832` | not_a_search_failure | `packages/aft-bridge/src/pool.ts` | short | - | 167 | 1518 | 170 | - | ranked_below_page | low | no |
 | `followup-census:3184` | not_a_search_failure | `crates/aft/src/hashline/snapshot/mod.rs` | natural_language | 47 | 117 | 851 | 43 | 43 | found | low | no |
 | `followup-census:4111` | topk_cut | `README.md` | short | - | 149 | - | 150 | - | ranked_below_page | low | no |
@@ -275,6 +277,7 @@ Observations the tables support:
 
 | Case | Class | Expected | Shape | Exact | Lexical | Semantic (store) | Ranked list | Page | Lost at | Confidence | Top-5 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `prefrontal-board-nudge-lane-cap` | generated_or_census_outranks_source | `crates/prefrontal-core-store/src/rooms.rs:71-74` | code_literal | - | 33 | not run (-) | 32 | - (file 32) | file_shown_other_span | low | no |
 | `prefrontal-consult-roster-for-class` | unclassified | `crates/prefrontal-core-module/src/consult/runtime.rs:7621-7647` | natural_language | 15 | 25 | 43 | 13 | - (file 13) | dropped_by_dedupe | low | no |
 | `prefrontal-ask-persist-answer-dispatch` | op_string_dispatch_missed | `crates/prefrontal-core-module/src/main.rs:2117-2145` | short | - | 21 | 1445 | 6 | - (file 6) | file_shown_other_span | low | no |
 | `prefrontal-spec-aggregator-repo-tools` | unclassified | `script/experiments/merge-tools-replay/tools.ts:129-171` | natural_language | 15 | 1 | 15 | 14 | 14 | found | high | no |
@@ -302,6 +305,7 @@ Per answer, from the JSON record:
 
 | Case | Class | Expected | Shape | Exact | Lexical | Semantic (store) | Ranked list | Page | Lost at | Confidence | Top-5 |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `named-punct-size-limit` | punctuated_prose | `crates/aft/src/search_index.rs:2930-2957` | code_literal | - | 88 | not run (7) | 87 | - | ranked_below_page | low | no |
 | `named-punct-exact-tier-order` | punctuated_prose | `crates/aft/src/commands/semantic_search/comparator.rs:94-174` | code_literal | 1 | 3 | not run (242) | 1 | - (file 1) | file_shown_other_span | high | no |
 | `named-mixed-exact-phrase` | mixed_prose_exact_fragment | `crates/aft/src/commands/semantic_search/exact_lane.rs:50-71` | natural_language | - | 2 | 1 | 1 | 1 | found | low | yes |
 | `named-dispatch-semantic-search` | op_string_dispatch | `crates/aft/src/commands/semantic_search/mod.rs:316-462` | short | - | 91 | 1 | 35 | 35 | found | low | no |
