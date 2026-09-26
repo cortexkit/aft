@@ -22,9 +22,52 @@ from search_quality_lib import (
     included_manifest_ids,
     total_gate,
     validate_included_row_mechanisms,
+    validate_manifest_maintenance_scores,
     validate_manifest_relabels,
     validate_profile_score,
 )
+
+
+class ManifestMaintenanceScoreTests(unittest.TestCase):
+    """The old and new scores of a manifest re-record must share binary and profile."""
+
+    def manifest(self, packs: list[str]) -> dict:
+        rows = [
+            {"episode_id": f"followup-census:{index}", "embedding_pack_sha256": pack}
+            for index, pack in enumerate(packs, 1)
+        ]
+        rows.append({"episode_id": "followup-census:99", "excluded_reason": "repo_unowned_or_unavailable"})
+        return {"rows": rows}
+
+    def score(self, model: str, binary: str = "b" * 64, profile: str = "paged") -> dict:
+        return {"model_id": model, "binary_sha256": binary, "profile": profile}
+
+    def test_same_pack_with_a_different_model_is_refused(self) -> None:
+        with self.assertRaisesRegex(InputFault, "model_changed_without_pack_change"):
+            validate_manifest_maintenance_scores(
+                self.manifest(["p", "p"]), self.manifest(["p", "p"]), self.score("old"), self.score("new")
+            )
+
+    def test_a_different_binary_is_refused_even_with_the_same_model(self) -> None:
+        with self.assertRaisesRegex(InputFault, "manifest_maintenance_binary_profile_mismatch"):
+            validate_manifest_maintenance_scores(
+                self.manifest(["p"]), self.manifest(["p"]), self.score("m"), self.score("m", binary="c" * 64)
+            )
+        with self.assertRaisesRegex(InputFault, "manifest_maintenance_binary_profile_mismatch"):
+            validate_manifest_maintenance_scores(
+                self.manifest(["p"]), self.manifest(["p"]), self.score("m"), self.score("m", profile="single_page")
+            )
+
+    def test_a_pack_change_on_every_row_allows_a_different_model(self) -> None:
+        validate_manifest_maintenance_scores(
+            self.manifest(["old", "old"]), self.manifest(["new", "new"]), self.score("fixture"), self.score("minilm")
+        )
+
+    def test_a_pack_change_on_some_rows_only_is_refused(self) -> None:
+        with self.assertRaisesRegex(InputFault, "model_changed_without_pack_change"):
+            validate_manifest_maintenance_scores(
+                self.manifest(["old", "old"]), self.manifest(["new", "old"]), self.score("fixture"), self.score("minilm")
+            )
 
 
 class ManifestMechanismTests(unittest.TestCase):

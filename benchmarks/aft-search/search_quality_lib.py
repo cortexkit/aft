@@ -484,6 +484,46 @@ def validate_manifest_relabels(
             raise InputFault(f"manifest_relabel_reason_missing:{row.get('episode_id')}")
 
 
+def validate_manifest_maintenance_scores(
+    old_manifest: Mapping[str, Any],
+    new_manifest: Mapping[str, Any],
+    old_score: Mapping[str, Any],
+    new_score: Mapping[str, Any],
+) -> None:
+    """Refuse an old/new score pair that was not measured on one binary and profile.
+
+    A manifest re-record compares the old manifest's score against the new
+    one, so both must come from the same AFT binary and the same profile. The
+    model may differ only when the manifest moved every included row to a new
+    vector pack: a score's model_id names the pack's model, so a pack change
+    changes it by design. Any other model difference means the two scores are
+    not comparable.
+    """
+    old_binary = old_score.get("binary_sha256")
+    if (
+        not old_binary
+        or old_binary != new_score.get("binary_sha256")
+        or old_score.get("profile") != new_score.get("profile")
+    ):
+        raise InputFault("manifest_maintenance_binary_profile_mismatch")
+    if old_score.get("model_id") == new_score.get("model_id"):
+        return
+    old_packs = {
+        row.get("episode_id"): row.get("embedding_pack_sha256")
+        for row in old_manifest.get("rows", [])
+        if "excluded_reason" not in row
+    }
+    new_rows = [row for row in new_manifest.get("rows", []) if "excluded_reason" not in row]
+    every_row_repacked = bool(new_rows) and all(
+        row.get("episode_id") in old_packs
+        and row.get("embedding_pack_sha256")
+        and row.get("embedding_pack_sha256") != old_packs[row.get("episode_id")]
+        for row in new_rows
+    )
+    if not every_row_repacked:
+        raise InputFault("manifest_maintenance_binary_profile_mismatch:model_changed_without_pack_change")
+
+
 def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
     rows = manifest.get("rows")
     if not isinstance(rows, list):

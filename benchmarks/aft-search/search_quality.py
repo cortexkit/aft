@@ -11,7 +11,7 @@ from search_quality_lib import (
     aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
     included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
     row_metrics, sample_plan, sha256_bytes, sha256_file, total_gate,
-    validate_manifest_relabels, validate_profile_score, validate_scored_population,
+    validate_manifest_maintenance_scores, validate_manifest_relabels, validate_profile_score, validate_scored_population,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -240,7 +240,7 @@ def run(args:argparse.Namespace)->int:
             validate_manifest_relabels(old_manifest, manifest)
             if not args.old_score: raise InputFault("manifest_maintenance_old_score_missing")
             old_score=read_json(Path(args.old_score))
-            if old_score.get("model_id")!=score.get("model_id") or old_score.get("profile")!=score.get("profile"): raise InputFault("manifest_maintenance_binary_profile_mismatch")
+            validate_manifest_maintenance_scores(old_manifest, manifest, old_score, score)
             old_descriptor_path=descriptor_path(None,args.branch); descriptor=read_json(old_descriptor_path) if old_descriptor_path else None
             old_result=total_gate(old_reference,old_score,old_manifest,descriptor,diff_paths(args.base_ref,args.head))
             if old_result.exit_code: raise InputFault("old_manifest_evaluation:"+";".join(old_result.reasons))
