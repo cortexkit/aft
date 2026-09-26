@@ -881,9 +881,21 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         ctx.with_current_callgraph_store_rx(receiver_generation, receiver_epoch, |receiver| {
             let installed = if let Some(store) = reopened {
                 ctx.clear_callgraph_store_build_denied();
-                *ctx.callgraph_store()
+                let mut resident = ctx
+                    .callgraph_store()
                     .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(store);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A query may already have installed this generation while the
+                // build was still settling. Keep that handle rather than swap in
+                // a second one for the same generation, so callers holding the
+                // resident store see it stay current.
+                let same_generation = resident
+                    .as_ref()
+                    .is_some_and(|current| current.sqlite_path() == store.sqlite_path());
+                if !same_generation {
+                    *resident = Some(store);
+                }
+                drop(resident);
                 // This take and the refresh worker's post-defer re-check form a
                 // check-then-act handoff: one site sees parked paths with a
                 // ready current store, so neither site needs to poll alone.
@@ -4259,18 +4271,35 @@ mod tests {
         ctx.next_callgraph_store_rx_epoch();
         *ctx.callgraph_store_rx().lock() = Some(rx);
 
-        assert!(
-            matches!(
-                ctx.callgraph_store_for_ops(),
-                crate::context::CallgraphStoreAccess::Ready(_)
-            ),
-            "a generation published ready on disk must be served, not reported as building"
-        );
+        let crate::context::CallgraphStoreAccess::Ready(served) = ctx.callgraph_store_for_ops()
+        else {
+            panic!("a generation published ready on disk must be served, not reported as building");
+        };
         assert!(
             ctx.callgraph_store_rx().lock().is_some(),
             "the build's own completion event is still adopted by the drain"
         );
-        drop(tx);
+
+        // When the build's completion for the same generation arrives, the
+        // store served above stays the resident one rather than being replaced
+        // by a second handle to the same generation.
+        let settling = CallGraphStore::open(
+            ctx.callgraph_store_dir(),
+            ctx.callgraph_project_root().unwrap(),
+        )
+        .unwrap();
+        tx.send(CallGraphStoreBuildEvent::Ready {
+            store: settling,
+            fulfilled_force_token: None,
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        drain_callgraph_store_events(&ctx);
+        let resident = ctx.callgraph_store().read().unwrap().as_ref().map(Arc::clone);
+        assert!(
+            resident.is_some_and(|resident| Arc::ptr_eq(&resident, &served)),
+            "the build's completion must not swap the resident store for the same generation"
+        );
     }
 
     #[test]
