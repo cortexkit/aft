@@ -1084,6 +1084,7 @@ fn handle_semantic_search_inner(
             &params,
             &shape,
             semantic_status,
+            &semantic_status_snapshot,
             warnings,
             &project_root,
             page_request,
@@ -3106,6 +3107,7 @@ fn handle_engine_only_search(
     params: &SemanticSearchParams,
     shape: &QueryShape,
     semantic_status: &'static str,
+    semantic_snapshot: &SemanticIndexStatus,
     mut warnings: Vec<String>,
     project_root: &Path,
     page_request: paging::ValidatedPageRequest,
@@ -3114,10 +3116,13 @@ fn handle_engine_only_search(
 ) -> Response {
     // A semantic lane that is not serving because its backend cannot be
     // reached must say so; describing it as "rebuilding" asks the reader to wait
-    // for a build that cannot make progress until the backend returns.
+    // for a build that cannot make progress until the backend returns. A build
+    // that has not reached the backend yet has recorded nothing, so the backend
+    // is probed here as well.
     let backend_unavailable = if semantic_status == "ready" {
         None
     } else {
+        crate::semantic_index::probe_remote_backend_while_building(ctx);
         semantic_backend_unavailable_disclosure(ctx)
     };
     let semantic_status = if backend_unavailable.is_some() {
@@ -3156,15 +3161,17 @@ fn handle_engine_only_search(
         snippets_incomplete,
         Some(ctx),
     );
+    // Every reply served without the semantic lane says why, so a reader never
+    // mistakes a lexical-only ranking for a semantic one.
+    let lane_disclosure = if backend_unavailable.is_some() {
+        None
+    } else {
+        semantic_lane_disclosure(ctx, semantic_snapshot)
+    };
     if let Some(disclosure) = backend_unavailable.as_deref() {
         text = format!("{disclosure}; lexical fallback results follow.\n\n{text}");
-    } else if semantic_status == "building" {
-        let disclosure = if ctx.shared_artifacts_read_only() {
-            BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
-        } else {
-            "Semantic index is rebuilding; lexical fallback results follow."
-        };
-        text = format!("{disclosure}\n\n{text}");
+    } else if let Some(disclosure) = lane_disclosure.as_ref() {
+        text = format!("{}\n\n{text}", disclosure.text);
     }
     if let Some(line) = ranked.confidence_line {
         text.push_str("\n\n");
@@ -3209,11 +3216,8 @@ fn handle_engine_only_search(
                 "{disclosure}; results are lexical-only fallback results from the trigram index."
             )),
         );
-    } else if semantic_status == "building" {
-        extras.insert(
-            "note".to_string(),
-            serde_json::json!(building_lexical_note(ctx.shared_artifacts_read_only())),
-        );
+    } else if let Some(disclosure) = lane_disclosure.as_ref() {
+        extras.insert("note".to_string(), serde_json::json!(disclosure.note));
     }
     search_response(
         req,
@@ -3359,6 +3363,7 @@ fn handle_semantic_or_hybrid_search(
                 &params,
                 &shape,
                 "building",
+                &status,
                 warnings,
                 project_root,
                 page_request,
@@ -4889,12 +4894,77 @@ fn semantic_backend_unavailable_disclosure(ctx: &AppContext) -> Option<String> {
     Some(disclosure)
 }
 
-fn building_lexical_note(borrowed_loading_with_results: bool) -> &'static str {
-    if borrowed_loading_with_results {
-        BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
-    } else {
-        "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
+/// Why an `aft_search` reply ran without the semantic lane, in two forms: the
+/// line that opens the reply text and the `note` field beside the results.
+struct SemanticLaneDisclosure {
+    text: String,
+    note: String,
+}
+
+impl SemanticLaneDisclosure {
+    fn new(cause: &str) -> Self {
+        Self {
+            text: format!("{cause}; lexical fallback results follow."),
+            note: format!(
+                "{cause}; results are lexical-only fallback results from the trigram index."
+            ),
+        }
     }
+}
+
+/// The disclosure for a semantic lane that is not serving, or `None` when it
+/// is ready or turned off by configuration (the user asked for that, so there
+/// is nothing to explain).
+fn semantic_lane_disclosure(
+    ctx: &AppContext,
+    status: &SemanticIndexStatus,
+) -> Option<SemanticLaneDisclosure> {
+    match status {
+        SemanticIndexStatus::Ready { .. } | SemanticIndexStatus::Disabled => None,
+        SemanticIndexStatus::Failed(error) => {
+            let error = error.trim().trim_end_matches('.');
+            Some(SemanticLaneDisclosure::new(&format!(
+                "Semantic search unavailable: {error}"
+            )))
+        }
+        SemanticIndexStatus::Building { .. } if ctx.shared_artifacts_read_only() => {
+            Some(SemanticLaneDisclosure {
+                text: BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS.to_string(),
+                note: BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS.to_string(),
+            })
+        }
+        SemanticIndexStatus::Building { stage, .. }
+            if stage == crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE =>
+        {
+            Some(SemanticLaneDisclosure::new(
+                "Semantic search is waiting for the ONNX Runtime download to finish",
+            ))
+        }
+        SemanticIndexStatus::Building { .. } if semantic_artifact_persisted(ctx) => {
+            Some(SemanticLaneDisclosure::new("Semantic index is rebuilding"))
+        }
+        SemanticIndexStatus::Building { .. } => {
+            Some(SemanticLaneDisclosure::new("Semantic index is building"))
+        }
+    }
+}
+
+/// True when an earlier build left a persisted semantic index for this root,
+/// which makes the build now running a rebuild. Without one it is the first
+/// build, and calling it "rebuilding" tells a new user something happened
+/// before that did not.
+fn semantic_artifact_persisted(ctx: &AppContext) -> bool {
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return false;
+    };
+    let Some(storage) = ctx.config().storage_dir.clone() else {
+        return false;
+    };
+    storage
+        .join("semantic")
+        .join(ctx.memoized_artifact_cache_key(&root))
+        .join("semantic.bin")
+        .is_file()
 }
 
 /// Top semantic cosine below this floor means the embedder found nothing
@@ -6275,7 +6345,13 @@ mod tests {
             .contains("lexical-only fallback"));
         let text = response["text"].as_str().expect("text");
         assert!(text.contains("lexical fallback"));
-        assert!(text.contains("Semantic index is rebuilding"));
+        // No earlier build left an index for this root, so this is the first
+        // build; "rebuilding" would tell a new user something happened before.
+        assert!(
+            text.starts_with("Semantic index is building; lexical fallback results follow."),
+            "{text}"
+        );
+        assert!(!text.contains("rebuilding"), "{text}");
         assert!(!text.contains(BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS));
         let results = response["results"].as_array().expect("results array");
         assert!(
@@ -6288,6 +6364,187 @@ mod tests {
             }),
             "expected index-backed fallback result, got {results:?}"
         );
+    }
+
+    /// Install a ready trigram index over one source file and put the semantic
+    /// lane in `status`, for the disclosure tests below.
+    fn lexical_ready_context_with_semantic(
+        project: &Path,
+        status: SemanticIndexStatus,
+    ) -> AppContext {
+        let source_file = project.join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        let source = "pub fn needle_symbol() -> bool { true }\n";
+        std::fs::write(&source_file, source).expect("write source file");
+        let ctx = test_context(project);
+        ctx.set_canonical_cache_root(project.to_path_buf());
+        let mut index = SearchIndex::new();
+        index.index_file(&source_file, source.as_bytes());
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+        ctx
+    }
+
+    fn building(stage: &str) -> SemanticIndexStatus {
+        SemanticIndexStatus::Building {
+            stage: stage.to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        }
+    }
+
+    #[test]
+    fn building_status_with_a_persisted_index_is_called_rebuilding() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let ctx = lexical_ready_context_with_semantic(project.path(), building("embedding"));
+        ctx.update_config(|config| config.storage_dir = Some(storage.path().to_path_buf()));
+        let key = ctx.memoized_artifact_cache_key(project.path());
+        let artifact_dir = storage.path().join("semantic").join(key);
+        std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
+        std::fs::write(artifact_dir.join("semantic.bin"), b"earlier build").expect("artifact");
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("needle_symbol", 5),
+            &ctx,
+        ));
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with("Semantic index is rebuilding; lexical fallback results follow."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn failed_semantic_lane_is_disclosed_in_the_reply_text() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = lexical_ready_context_with_semantic(
+            project.path(),
+            SemanticIndexStatus::Failed(
+                "ONNX Runtime not found. dlopen('libonnxruntime.dylib') failed: no such file. Run `npx @cortexkit/aft doctor --fix` to install it."
+                    .to_string(),
+            ),
+        );
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("where is the needle symbol implemented", 5),
+            &ctx,
+        ));
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with("Semantic search unavailable: ONNX Runtime not found."),
+            "{text}"
+        );
+        assert!(text.contains("lexical fallback results follow."), "{text}");
+        assert!(response["note"]
+            .as_str()
+            .expect("note")
+            .starts_with("Semantic search unavailable: ONNX Runtime not found."));
+        assert_eq!(response["semantic_status"], "unavailable");
+    }
+
+    #[test]
+    fn waiting_for_the_onnx_runtime_download_is_disclosed_as_waiting() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = lexical_ready_context_with_semantic(
+            project.path(),
+            building(crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE),
+        );
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("where is the needle symbol implemented", 5),
+            &ctx,
+        ));
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with(
+                "Semantic search is waiting for the ONNX Runtime download to finish; lexical fallback results follow."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("doctor --fix"), "{text}");
+        assert!(!text.contains("rebuilding"), "{text}");
+    }
+
+    /// A remote backend nothing listens on, before the first build attempt has
+    /// reached it: no outage is recorded yet, and the reply and the status
+    /// must still name the URL and the failure instead of "rebuilding".
+    #[test]
+    fn unreachable_backend_not_yet_reached_by_the_build_is_disclosed() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx =
+            lexical_ready_context_with_semantic(project.path(), building("loading_artifacts"));
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.base_url = Some(base_url.clone());
+        });
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request("where is the needle symbol implemented", 5),
+            &ctx,
+        ));
+        let status = ctx.build_status_snapshot();
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.starts_with(&format!(
+                "Semantic backend unavailable ({base_url}): embedding backend unreachable"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("tcp connect to 127.0.0.1"), "{text}");
+        assert!(!text.contains("rebuilding"), "{text}");
+        assert_eq!(response["semantic_status"], "backend_unavailable");
+        let semantic = &status["semantic_index"];
+        assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
+        assert_eq!(semantic["backend_url"], base_url.as_str());
+        assert!(semantic["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("tcp connect to 127.0.0.1")));
+    }
+
+    /// The sidebar polls `status` without searching; that path must find the
+    /// unreachable backend on its own.
+    #[test]
+    fn status_names_an_unreachable_backend_before_the_build_reaches_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let base_url = format!("http://127.0.0.1:{port}/v1");
+
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx =
+            lexical_ready_context_with_semantic(project.path(), building("loading_artifacts"));
+        ctx.update_config(|config| {
+            config.semantic.backend = crate::config::SemanticBackend::OpenAiCompatible;
+            config.semantic.base_url = Some(base_url.clone());
+        });
+        let request: RawRequest =
+            serde_json::from_value(serde_json::json!({ "id": "status", "command": "status" }))
+                .expect("status request");
+
+        let status = response_value(crate::commands::status::handle_status(&request, &ctx));
+        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+
+        let semantic = &status["semantic_index"];
+        assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
+        assert_eq!(semantic["backend_url"], base_url.as_str());
+        assert!(semantic["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("tcp connect to 127.0.0.1")));
     }
 
     /// A first build against an unreachable embedding backend parks in its

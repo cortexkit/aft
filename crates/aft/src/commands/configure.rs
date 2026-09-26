@@ -804,6 +804,12 @@ fn semantic_build_retry_backoff(attempt: usize) -> Duration {
     Duration::from_millis(crate::semantic_index::build_backend_retry_delay_ms(attempt))
 }
 
+/// How often a semantic build waiting on the plugin's ONNX Runtime download
+/// checks whether the runtime has been published. Each check reads one lock
+/// file and one directory, and a second of delay is invisible next to a
+/// download that takes several.
+const ONNX_RUNTIME_DOWNLOAD_POLL: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Debug)]
 struct SemanticViewBlobSource {
     storage: PathBuf,
@@ -3875,11 +3881,12 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
 }
 
 /// True when the local embedding backend already failed in this runtime
-/// because no ONNX Runtime can be loaded. The runtime a process can load is
-/// fixed for its lifetime, so scheduling another build would fail the same way;
-/// the semantic index stays unavailable with a named cause instead of retrying
-/// on every equivalent reconfigure. A configure that changes the semantic
-/// settings resets the status and gets one fresh attempt.
+/// because no ONNX Runtime can be loaded. A build only settles in that state
+/// after it found no published runtime and no download still running (it waits
+/// out a running download), so scheduling another build would fail the same
+/// way; the semantic index stays unavailable with a named cause instead of
+/// retrying on every equivalent reconfigure. A configure that changes the
+/// semantic settings resets the status and gets one fresh attempt.
 fn local_semantic_runtime_known_unavailable(ctx: &AppContext) -> bool {
     if !matches!(
         ctx.config().semantic.backend,
@@ -5081,6 +5088,8 @@ fn schedule_artifact_loads(
                 // Every exit from this loop that abandons the retry (superseded
                 // epoch, dropped receiver) clears the parked backend status so
                 // health never shows a deadline nothing will honour.
+                let mut late_onnx_runtime_retried = false;
+                let mut announced_onnx_download_wait = false;
                 let build_result = loop {
                     if semantic_build_epoch_flag.load(Ordering::SeqCst) != semantic_build_epoch {
                         crate::semantic_index::clear_embedding_backend_retry_status(&root_clone);
@@ -5089,6 +5098,61 @@ fn schedule_artifact_loads(
                     }
                     let attempt_result = catch_unwind(AssertUnwindSafe(&build_once));
                     match attempt_result {
+                        // ONNX Runtime was missing when this process started,
+                        // but the plugin may still be downloading it: a bridge
+                        // spawned by the first tool call of a fresh install
+                        // races that download. Parking in `Failed` here left
+                        // semantic search dead until the process restarted,
+                        // and on hosts whose bridge outlives the UI no restart
+                        // came. Wait for the download and load what it
+                        // publishes instead. The missing-runtime prefix comes
+                        // only from our own dlopen pre-check, which runs before
+                        // `ort` is touched, so the retry starts from a clean
+                        // `ort` state.
+                        Ok(Err(ref error))
+                            if error.starts_with(
+                                crate::semantic_index::ONNX_RUNTIME_MISSING_PREFIX,
+                            ) && semantic_storage.is_some() =>
+                        {
+                            let storage = semantic_storage.as_deref().unwrap_or(Path::new(""));
+                            match crate::semantic_index::late_onnx_runtime(storage) {
+                                crate::semantic_index::LateOnnxRuntime::Published(_)
+                                    if !late_onnx_runtime_retried =>
+                                {
+                                    late_onnx_runtime_retried = true;
+                                    continue;
+                                }
+                                crate::semantic_index::LateOnnxRuntime::Downloading => {
+                                    if !announced_onnx_download_wait {
+                                        announced_onnx_download_wait = true;
+                                        slog_info!(
+                                            "semantic index build: waiting for the ONNX Runtime download to finish"
+                                        );
+                                    }
+                                    clear_cold_seed_active();
+                                    if tx_progress
+                                        .send(SemanticIndexEvent::Progress {
+                                            stage: crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE
+                                                .to_string(),
+                                            files: None,
+                                            entries_done: None,
+                                            entries_total: None,
+                                        })
+                                        .is_err()
+                                        || tx_progress
+                                            .send(SemanticIndexEvent::ColdSeedGateCleared)
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                    thread::sleep(ONNX_RUNTIME_DOWNLOAD_POLL);
+                                    continue;
+                                }
+                                // A runtime already retried once that still
+                                // fails to load is broken, not late.
+                                _ => break attempt_result,
+                            }
+                        }
                         Ok(Err(ref error))
                             if crate::semantic_index::embedding_failure_is_transient(error) =>
                         {

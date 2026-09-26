@@ -221,6 +221,28 @@ fn shared_projection_is_the_only_trailer_grammar() {
 }
 
 #[test]
+fn exhausted_list_shown_whole_is_complete_and_renders_no_trailer() {
+    // Tool descriptions promise that a missing `shown N of M` line means the
+    // list is complete, so a complete list must not print one.
+    let trailer = SearchTrailer {
+        shown: 1,
+        total: SearchTotal::Exact(1),
+        stop_state: StopState::S2Exhausted,
+    };
+    let envelope = trailer.shared_envelope_projection();
+    assert_eq!(envelope.reason, None);
+    assert!(envelope.causes.is_empty());
+    assert_eq!(render_trailer(&envelope), None);
+
+    let empty = SearchTrailer {
+        shown: 0,
+        total: SearchTotal::Exact(0),
+        stop_state: StopState::S2Exhausted,
+    };
+    assert_eq!(render_trailer(&empty.shared_envelope_projection()), None);
+}
+
+#[test]
 fn shared_projection_serializes_reason_and_total_for_every_stop_state() {
     for (trailer, expected_reason, expected_total) in [
         (
@@ -234,7 +256,7 @@ fn shared_projection_serializes_reason_and_total_for_every_stop_state() {
         ),
         (
             SearchTrailer {
-                shown: 8,
+                shown: 3,
                 total: SearchTotal::Exact(8),
                 stop_state: StopState::S2Exhausted,
             },

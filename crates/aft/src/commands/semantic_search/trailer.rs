@@ -91,17 +91,29 @@ impl SearchTrailer {
     }
 
     /// Projects the engine stop state into the shared list-envelope grammar.
+    ///
+    /// An exhausted stop whose page holds the whole list cut nothing, so it
+    /// carries no reason and renders no trailer. Tool descriptions promise that
+    /// a missing `shown N of M` line means the list is complete; printing
+    /// `shown 1 of 1 results (walk)` under a complete reply broke that promise
+    /// and read as if a bounded filesystem walk had replaced the index.
     pub fn shared_envelope_projection(&self) -> ListEnvelope {
-        let reason = match self.stop_state {
-            StopState::S1MoreAtDepth => Reason::Cap,
-            StopState::S2Exhausted => Reason::Walk,
-            StopState::S3DepthCap => Reason::Depth,
+        let complete = self.stop_state == StopState::S2Exhausted
+            && self.total == SearchTotal::Exact(self.shown);
+        let causes = if complete {
+            Vec::new()
+        } else {
+            vec![match self.stop_state {
+                StopState::S1MoreAtDepth => Reason::Cap,
+                StopState::S2Exhausted => Reason::Walk,
+                StopState::S3DepthCap => Reason::Depth,
+            }]
         };
         ListEnvelope::new(
             self.shown,
             self.total.shared_total(),
             Unit::Results,
-            vec![reason],
+            causes,
             SEARCH_NARROW_FIELDS,
         )
     }

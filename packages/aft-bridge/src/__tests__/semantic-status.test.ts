@@ -3,6 +3,7 @@ import { formatSemanticIndexStatus, semanticIndexStatusKind } from "../semantic-
 import {
   daemonMissingRuntimePrefix,
   daemonSemanticStatusWords,
+  daemonWaitingForOnnxDownloadStage,
 } from "./test-utils/daemon-status-words.js";
 
 describe("formatSemanticIndexStatus", () => {
@@ -44,6 +45,17 @@ describe("formatSemanticIndexStatus", () => {
     // here is answered by the downloader, and `doctor --fix` is what asks it.
     expect(label).not.toContain("brew");
     expect(label).not.toContain("apt");
+  });
+
+  test("a build waiting for the ONNX Runtime download says so, not that the runtime is missing", () => {
+    // A first-run bridge can start before the plugin's download finishes. The
+    // runtime is on its way, so the reader is told to wait; `doctor --fix` is
+    // only the right advice once no download is running.
+    for (const status of ["building", "loading"]) {
+      const label = formatSemanticIndexStatus(status, daemonWaitingForOnnxDownloadStage());
+      expect(label).toBe("waiting for ONNX Runtime download");
+      expect(label).not.toContain("doctor --fix");
+    }
   });
 
   test("a missing runtime carried in the build stage is not progress", () => {

@@ -355,6 +355,22 @@ impl AftProcess {
     }
 
     fn spawn_inner(envs: &[(&str, &std::ffi::OsStr)]) -> Self {
+        Self::spawn_inner_without(envs, &[])
+    }
+
+    /// Spawn with semantic indexing left at the product default, extra
+    /// environment variables, and the named variables removed from the
+    /// environment the child would otherwise inherit from the test process.
+    pub fn spawn_with_semantic_env_without(
+        envs: &[(&str, &std::ffi::OsStr)],
+        removed: &[&str],
+    ) -> Self {
+        let mut aft = Self::spawn_inner_without(envs, removed);
+        aft.semantic_opt_in = true;
+        aft
+    }
+
+    fn spawn_inner_without(envs: &[(&str, &std::ffi::OsStr)], removed: &[&str]) -> Self {
         // Nextest remaps archive binaries into its extraction directory, so its
         // runtime variable must win over Cargo's compile-time binary path.
         let binary = std::env::var_os("AFT_TEST_AFT_BINARY")
@@ -413,6 +429,9 @@ impl AftProcess {
 
         for (key, value) in envs {
             command.env(key, value);
+        }
+        for key in removed {
+            command.env_remove(key);
         }
 
         #[cfg(windows)]

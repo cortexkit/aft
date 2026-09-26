@@ -481,8 +481,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   //
   // Instead: kick off the download as a background promise and patch
   // `_ort_dylib_dir` into the pool's configure overrides as soon as it
-  // settles. Bridges spawned AFTER the download finishes pick it up
-  // automatically. `ensureOnnxRuntime` returns null on unsupported platforms.
+  // settles. Bridges spawned AFTER the download finishes get it in their
+  // environment; a bridge spawned during the download waits for it and loads
+  // it without a restart. `ensureOnnxRuntime` returns null on unsupported
+  // platforms.
   let onnxRuntimePromise: Promise<string | null> | null = null;
   // Which sessions skip, and why a plain headless run does not, is decided in
   // session-kind.ts next to the worker signal bash and bash_watch use.
@@ -514,8 +516,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // `pi -p` run would never exit.
   let hostShutdownStarted = false;
   // _ort_dylib_dir is patched in asynchronously below once ensureOnnxRuntime
-  // settles. Bridges spawned before that resolution don't get ORT and
-  // semantic search returns "still building" until they restart.
+  // settles. A bridge spawned before that reports its semantic index as
+  // waiting for the download and builds it once the runtime is published.
 
   // ─────────────────────────── LSP auto-install ───────────────────────────
   // Mirrors the OpenCode plugin: discover relevant LSPs, surface cached bin
@@ -778,18 +780,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   };
 
   // Settle the ONNX runtime download promise (started above) and patch the
-  // resolved path into the pool's configure overrides. Bridges spawned AFTER
-  // this resolves will pass `_ort_dylib_dir` through configure and pick up
-  // the runtime; bridges already running at resolution time keep going
-  // without ORT (we don't restart them — that would discard warm
-  // trigram/semantic/LSP state). Result: semantic search becomes available
-  // for new sessions automatically once the download completes.
+  // resolved path into the pool's configure overrides so bridges spawned
+  // after this point get it in their environment. Bridges already running are
+  // not restarted (that would discard warm trigram/semantic/LSP state); one
+  // that started during the download has been waiting on the installer's lock
+  // file and loads the published runtime itself
+  // (`late_onnx_runtime` in crates/aft/src/semantic_index.rs).
   if (onnxRuntimePromise) {
     onnxRuntimePromise.then(
       (ortDylibDir) => {
         if (ortDylibDir) {
           pool.setConfigureOverride("_ort_dylib_dir", ortDylibDir);
-          log(`ONNX Runtime ready at ${ortDylibDir}; new bridges will load semantic backend.`);
+          log(
+            `ONNX Runtime ready at ${ortDylibDir}; new bridges load it at spawn and running bridges pick it up themselves.`,
+          );
         } else {
           const reason = getOnnxRuntimeInstallFailure();
           if (reason) {

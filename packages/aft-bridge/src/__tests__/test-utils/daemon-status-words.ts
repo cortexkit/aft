@@ -53,3 +53,14 @@ export function daemonMissingRuntimePrefix(): string {
   }
   return match[1];
 }
+
+/** Build stage the daemon reports while it waits for the ONNX Runtime download. */
+export function daemonWaitingForOnnxDownloadStage(): string {
+  const match = readDaemonSource().match(
+    /WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE: &str = "([^"]+)"/,
+  );
+  if (!match) {
+    throw new Error("WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE not found in the daemon source");
+  }
+  return match[1];
+}

@@ -96,7 +96,9 @@ fn registered_cause_sets_have_pinned_kind_bounds_and_units() {
         .find(|case| case.name == "search:walk")
         .expect("explicit engine exhaustion row");
     assert_eq!(search_walk.expected_reason, Reason::Walk);
-    assert_eq!(search_walk.expected_total, Total::Exact(10));
+    // A page of an exhausted list: the whole list on one page is complete and
+    // prints no trailer, so the cut row shows 10 of 20.
+    assert_eq!(search_walk.expected_total, Total::Exact(20));
 
     let search_depth = cases
         .iter()

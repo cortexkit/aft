@@ -38,7 +38,9 @@ struct ModeFixture {
     depth_tier: usize,
     lanes_exhausted: bool,
     stability_void: bool,
-    trailer: String,
+    /// The rendered `shown N of M` line, or null for a complete page: the
+    /// tool contract says a complete list prints no such line.
+    trailer: Option<String>,
     #[serde(default)]
     bounded_disclosure: Option<String>,
     stability_files: Vec<String>,
@@ -352,8 +354,7 @@ fn assert_decision_fixture(page: &SearchPage, mode: &ModeFixture, exact_pass: Ex
         .assemble_trailer(exact_pass)
         .expect("fixture trailer");
     assert_eq!(
-        aft::list_envelope::render_trailer(&trailer.shared_envelope_projection())
-            .expect("fixture envelope has a reason"),
+        aft::list_envelope::render_trailer(&trailer.shared_envelope_projection()),
         mode.trailer
     );
 }

@@ -501,8 +501,11 @@ export async function prepareBridgeEnvironment(
   // ONNX Runtime is resolved in the background: the archive is 60-80 MB and
   // awaiting it made hosts appear to hang on a slow connection. A cached or
   // system runtime resolves within a few ticks, well before the first lazy
-  // bridge spawn; a download patches `_ort_dylib_dir` in when it finishes, and
-  // only bridges spawned after that point load it.
+  // bridge spawn; a download patches `_ort_dylib_dir` in when it finishes so
+  // later spawns get it in their environment. A bridge spawned during the
+  // download does not need a restart: its semantic build waits while the
+  // installer holds its lock file and loads the runtime once it is published
+  // (see `late_onnx_runtime` in crates/aft/src/semantic_index.rs).
   let onnxRuntime: Promise<string | null> | null = null;
   const fastembed = (config.semantic?.backend ?? "fastembed") === "fastembed";
   if (resolvedIndexes(config).semantic && fastembed) {
@@ -537,7 +540,9 @@ export async function prepareBridgeEnvironment(
             warn(`ONNX Runtime ready but the bridge pool is gone: ${err}`);
             return;
           }
-          log(`ONNX Runtime ready at ${ortDylibDir}; new bridges will load semantic backend.`);
+          log(
+            `ONNX Runtime ready at ${ortDylibDir}; new bridges load it at spawn and running bridges pick it up themselves.`,
+          );
         } else if (!dependencies.isOrtAutoDownloadSupported()) {
           log(`ONNX Runtime auto-download not supported on ${process.platform}/${process.arch}.`);
           notify(`Semantic search requires ONNX Runtime.\nInstall: ${getManualInstallHint()}`);

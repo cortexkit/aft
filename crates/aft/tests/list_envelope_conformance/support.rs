@@ -301,10 +301,12 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
             build_trace_to_envelope(15, total, has(Reason::Depth), has(Reason::Budget))
         }
         ("callgraph", "trace_data") => build_trace_data_envelope(5, has(Reason::Depth)),
+        // An exhausted list is cut only when the page shows part of it; the
+        // whole list on one page is complete and carries no reason.
         ("search", "") if has(Reason::Walk) => Some(
             SearchTrailer {
                 shown: 10,
-                total: SearchTotal::Exact(10),
+                total: SearchTotal::Exact(20),
                 stop_state: StopState::S2Exhausted,
             }
             .shared_envelope_projection(),
@@ -369,7 +371,7 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
             }
         }
         ("callgraph", "trace_data") => Total::AtLeast(5),
-        ("search", "") if has(Reason::Walk) => Total::Exact(10),
+        ("search", "") if has(Reason::Walk) => Total::Exact(20),
         ("search", "") if has(Reason::Depth) => Total::AtLeast(10),
         ("search", "") => Total::AtLeast(if has(Reason::Cap) { 11 } else { 10 }),
         ("grep", "") => {

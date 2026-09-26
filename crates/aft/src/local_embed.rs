@@ -220,6 +220,7 @@ impl LocalEmbedder {
         // Fail with an actionable message instead of letting ort panic deep
         // inside dlopen on an incompatible/absent ONNX Runtime.
         pre_validate_onnx_runtime()?;
+        crate::semantic_index::bind_late_onnx_runtime()?;
 
         let (model_path, tokenizer_path) = resolve_model_files()?;
 

@@ -53,6 +53,11 @@ pub(crate) struct EmbeddingBackendBuildHealth {
     pub(crate) since_ms: u64,
     pub(crate) next_retry_ms: u64,
     failures: usize,
+    /// True while the only evidence is a reachability probe from a status or
+    /// search request (see `probe_remote_backend_while_building`). A real build
+    /// attempt replaces it, and only a probe-recorded entry may be cleared by a
+    /// later successful probe.
+    probe_only: bool,
 }
 
 fn embedding_backend_build_health_registry(
@@ -99,8 +104,10 @@ fn record_embedding_backend_build_failure(project_root: &Path, error: &str) {
             since_ms: now_ms,
             next_retry_ms: now_ms,
             failures: 0,
+            probe_only: false,
         });
     entry.last_error = clean;
+    entry.probe_only = false;
     entry.next_retry_ms = now_ms.saturating_add(build_backend_retry_delay_ms(entry.failures));
     entry.failures = entry.failures.saturating_add(1);
 }
@@ -128,9 +135,159 @@ pub(crate) fn record_embedding_backend_retry_deadline(
             since_ms: now_ms,
             next_retry_ms: now_ms,
             failures: 0,
+            probe_only: false,
         });
     entry.last_error = clean;
+    entry.probe_only = false;
     entry.next_retry_ms = now_ms.saturating_add(backoff_ms);
+}
+
+/// How long one reachability probe of a remote embedding backend may take.
+/// Status and search requests run the probe inline, so it must stay short; a
+/// backend that cannot accept a TCP connection in this time is not serving a
+/// build either.
+const REMOTE_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long a probe result is reused. The sidebar polls status about once a
+/// second; without reuse an unreachable host would cost every poll the full
+/// timeout.
+const REMOTE_BACKEND_PROBE_TTL: Duration = Duration::from_secs(5);
+
+/// Check that a remote embedding backend accepts connections while the
+/// semantic index is still building, and record an outage when it does not.
+///
+/// The outage state that search replies and the status sidebar report
+/// ("Semantic backend unavailable (<url>): <reason>") used to come only from a
+/// build attempt that had reached the backend and failed. Before that attempt
+/// (the artifact-load gate, the file walk, the cold-build queue, a large
+/// corpus's chunking) nothing was recorded, so a backend that was never
+/// listening read as "Semantic index is rebuilding" for as long as that took.
+/// A TCP connect to the configured URL answers the question directly. The probe
+/// never overrides what a build attempt recorded, and a later successful probe
+/// clears only an outage a probe recorded.
+pub(crate) fn probe_remote_backend_while_building(ctx: &crate::context::AppContext) {
+    let building = matches!(
+        &*ctx
+            .semantic_index_status()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        SemanticIndexStatus::Building { .. }
+    );
+    if !building {
+        return;
+    }
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return;
+    };
+    let config = ctx.config();
+    if !matches!(
+        config.semantic.backend,
+        SemanticBackend::OpenAiCompatible | SemanticBackend::Ollama
+    ) {
+        return;
+    }
+    let Some(base_url) = config
+        .semantic
+        .base_url
+        .clone()
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return;
+    };
+    drop(config);
+    probe_remote_backend_for_root(&root, &base_url);
+}
+
+fn probe_remote_backend_for_root(root: &Path, base_url: &str) {
+    let recorded_by_build = embedding_backend_build_health(root).is_some_and(|h| !h.probe_only);
+    if recorded_by_build {
+        return;
+    }
+    let outcome = cached_remote_backend_probe(base_url);
+    let mut registry = embedding_backend_build_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match outcome {
+        Ok(()) => {
+            if registry.get(root).is_some_and(|health| health.probe_only) {
+                registry.remove(root);
+            }
+        }
+        Err(reason) => {
+            let now_ms = unix_millis_now();
+            let next_probe_ms = now_ms.saturating_add(
+                u64::try_from(REMOTE_BACKEND_PROBE_TTL.as_millis()).unwrap_or(u64::MAX),
+            );
+            let entry =
+                registry
+                    .entry(root.to_path_buf())
+                    .or_insert_with(|| EmbeddingBackendBuildHealth {
+                        last_error: reason.clone(),
+                        since_ms: now_ms,
+                        next_retry_ms: next_probe_ms,
+                        failures: 0,
+                        probe_only: true,
+                    });
+            if entry.probe_only {
+                entry.last_error = reason;
+                entry.next_retry_ms = next_probe_ms;
+            }
+        }
+    }
+}
+
+fn cached_remote_backend_probe(base_url: &str) -> Result<(), String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, Result<(), String>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((at, outcome)) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(base_url)
+    {
+        if at.elapsed() < REMOTE_BACKEND_PROBE_TTL {
+            return outcome.clone();
+        }
+    }
+    let outcome = probe_remote_backend(base_url);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(base_url.to_string(), (Instant::now(), outcome.clone()));
+    outcome
+}
+
+/// One TCP connect to the backend's host and port. The wording matches the
+/// build's own connect-failure message so the reader sees one vocabulary
+/// whichever side noticed first.
+fn probe_remote_backend(base_url: &str) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let unreachable = |detail: String| {
+        format!("embedding backend unreachable (connection refused or connect failure): {detail}")
+    };
+    let url = Url::parse(base_url).map_err(|error| format!("invalid base_url: {error}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "invalid base_url: no host".to_string())?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "invalid base_url: no port".to_string())?;
+    let addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| unreachable(format!("cannot resolve {host}: {error}")))?
+        .collect::<Vec<_>>();
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, REMOTE_BACKEND_PROBE_TIMEOUT) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(unreachable(match last_error {
+        Some(error) => format!("tcp connect to {host}:{port} failed: {error}"),
+        None => format!("{host} resolved to no address"),
+    }))
 }
 
 /// Called on every exit path of a cold-build retry loop so a parked status
@@ -2644,6 +2801,171 @@ fn onnx_runtime_override_configured_with(
     lookup("ORT_DYLIB_PATH").is_some_and(|value| !value.is_empty())
 }
 
+/// Build stage reported while the semantic build waits for the plugin to finish
+/// downloading ONNX Runtime. Status readers (the plugin sidebar, `/aft-status`,
+/// the `aft_search` disclosure) key on this word to say "waiting for the
+/// download" instead of "ONNX Runtime missing".
+pub const WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE: &str = "waiting_for_onnx_runtime_download";
+
+/// Lock file the plugin's downloader holds for the whole install
+/// (`ONNX_LOCK_FILE` in packages/aft-bridge/src/onnx-runtime.ts). It lives in
+/// `<storage_dir>/onnxruntime/` and holds the owner's pid on its first line.
+const ONNX_INSTALL_LOCK_FILE: &str = ".aft-onnx-installing";
+
+/// Longest a lock file is believed after it was written. The downloader bounds
+/// its own work (a 300 s fetch timeout plus a 120 s extraction timeout), so a
+/// lock older than this belongs to an install that hung or whose owner's pid was
+/// reused; waiting on it would hold the index in "building" for nothing.
+const ONNX_INSTALL_LOCK_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// True while a plugin process is installing ONNX Runtime into this storage
+/// directory: the install lock exists, its owner is still running, and it is
+/// younger than `ONNX_INSTALL_LOCK_MAX_AGE`.
+///
+/// This is the one signal every host shares. OpenCode 1, the OpenCode 2
+/// background service and Pi all download through the same aft-bridge
+/// installer, which takes this lock before its first await, so a bridge started
+/// during the download sees it no matter which process spawned the bridge.
+pub fn onnx_runtime_download_in_progress(storage_dir: &Path) -> bool {
+    let lock_path = storage_dir.join("onnxruntime").join(ONNX_INSTALL_LOCK_FILE);
+    let Ok(contents) = fs::read_to_string(&lock_path) else {
+        return false;
+    };
+    let fresh = fs::metadata(&lock_path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age < ONNX_INSTALL_LOCK_MAX_AGE);
+    if !fresh {
+        return false;
+    }
+    contents
+        .lines()
+        .next()
+        .and_then(|line| line.trim().parse::<u32>().ok())
+        .is_some_and(fs_lock::process_alive)
+}
+
+/// A managed runtime found after this process started, used when the process
+/// environment names none.
+///
+/// The bridge sets `ORT_DYLIB_PATH` when it spawns the daemon, but only once the
+/// plugin's download has finished. A daemon spawned while the download was
+/// still running has no path, and setting the environment variable now would
+/// race every other thread that reads the environment. The path is kept here
+/// instead and handed to `ort` directly by `bind_late_onnx_runtime`.
+static LATE_ONNX_RUNTIME: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Pick up a runtime the plugin published after this process started, so the
+/// next load attempt uses it.
+fn adopt_late_managed_onnx_runtime(lib_path: &Path) {
+    let mut late = LATE_ONNX_RUNTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if late.as_deref() != Some(lib_path) {
+        slog_info!(
+            "ONNX Runtime published at {} after startup; retrying the semantic backend with it",
+            lib_path.display()
+        );
+        *late = Some(lib_path.to_path_buf());
+    }
+}
+
+/// Where a semantic build that failed for want of ONNX Runtime stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LateOnnxRuntime {
+    /// The plugin has published a runtime since this process started; the
+    /// next load attempt uses it.
+    Published(PathBuf),
+    /// The plugin is still downloading one; waiting is the right response.
+    Downloading,
+    /// No runtime is coming: none was published and no download is running,
+    /// or `ORT_DYLIB_PATH` names a library explicitly and a download cannot
+    /// change what that path points at.
+    Absent,
+}
+
+/// Classify a missing ONNX Runtime for a build that just failed with
+/// `ONNX_RUNTIME_MISSING_PREFIX`, adopting a published runtime for the next
+/// load attempt. An explicit `ORT_DYLIB_PATH` is the caller's choice and is
+/// never replaced.
+pub fn late_onnx_runtime(storage_dir: &Path) -> LateOnnxRuntime {
+    let explicit = onnx_runtime_override_configured_with(|name| std::env::var_os(name));
+    let state = classify_late_onnx_runtime(storage_dir, explicit);
+    if let LateOnnxRuntime::Published(path) = &state {
+        adopt_late_managed_onnx_runtime(path);
+    }
+    state
+}
+
+/// The side-effect-free half of `late_onnx_runtime`. A published runtime wins
+/// over a download still marked in progress: the installer publishes before it
+/// releases its lock, so seeing both means the download has in fact finished.
+fn classify_late_onnx_runtime(storage_dir: &Path, explicit_override: bool) -> LateOnnxRuntime {
+    if explicit_override {
+        return LateOnnxRuntime::Absent;
+    }
+    if let Some(path) = find_managed_onnx_runtime(storage_dir) {
+        return LateOnnxRuntime::Published(path);
+    }
+    if onnx_runtime_download_in_progress(storage_dir) {
+        return LateOnnxRuntime::Downloading;
+    }
+    LateOnnxRuntime::Absent
+}
+
+/// The runtime library the next load attempt uses: the process environment
+/// first, then a runtime adopted after startup.
+fn effective_onnx_runtime_path() -> Option<String> {
+    if let Some(path) = std::env::var("ORT_DYLIB_PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Some(path);
+    }
+    LATE_ONNX_RUNTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Point `ort` at a runtime adopted after startup, before its first use.
+///
+/// Without this, `ort` resolves its library from `ORT_DYLIB_PATH` alone and
+/// would dlopen the bare library name again. Only call this after
+/// `pre_validate_onnx_runtime` accepted the same path: `ort` records a failed
+/// load as permanently initialised (its `OnceLock` completes even when the
+/// loader returns an error), so a load that `ort` itself rejects can never be
+/// retried in this process. Our own pre-validation uses a plain `dlopen`, which
+/// leaves no state behind, and that is what makes waiting for a download and
+/// retrying safe.
+///
+/// The first outcome is cached for the life of the process for the same reason.
+pub(crate) fn bind_late_onnx_runtime() -> Result<(), String> {
+    static BOUND: OnceLock<Result<(), String>> = OnceLock::new();
+    if onnx_runtime_override_configured_with(|name| std::env::var_os(name)) {
+        return Ok(());
+    }
+    let Some(path) = LATE_ONNX_RUNTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return Ok(());
+    };
+    BOUND
+        .get_or_init(|| {
+            // Only the library load matters here. The returned builder carries
+            // default environment options, which `ort` also uses when no
+            // builder is committed, so it is dropped rather than committed.
+            ort::init_from(&path)
+                .map(drop)
+                .map_err(|error| format_embedding_init_error(error.to_string()))
+        })
+        .clone()
+}
+
 /// Find the highest compatible managed ONNX Runtime library under
 /// `<storage_dir>/onnxruntime/`, or None when absent/incompatible.
 ///
@@ -2719,7 +3041,7 @@ fn parse_managed_ort_version(name: &str) -> Option<(u32, u32)> {
 /// This catches broken/incompatible .so files without risking a panic in the ort crate.
 /// Also checks the runtime version via OrtGetApiBase if available.
 pub fn pre_validate_onnx_runtime() -> Result<(), String> {
-    let dylib_path = std::env::var("ORT_DYLIB_PATH").ok();
+    let dylib_path = effective_onnx_runtime_path();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -11205,6 +11527,136 @@ public class Greeter {
         assert_eq!(summary.total_processed, 1);
         assert!(!embed_called);
         assert_eq!(index.entries.len(), original_entries);
+    }
+
+    fn managed_runtime_storage() -> tempfile::TempDir {
+        let storage = tempfile::tempdir().expect("storage dir");
+        fs::create_dir_all(storage.path().join("onnxruntime")).expect("onnxruntime dir");
+        storage
+    }
+
+    fn write_install_lock(storage: &Path, pid: u32) -> PathBuf {
+        let lock = storage.join("onnxruntime").join(ONNX_INSTALL_LOCK_FILE);
+        fs::write(&lock, format!("{pid}\n2026-01-01T00:00:00.000Z\n")).expect("write lock");
+        lock
+    }
+
+    fn publish_managed_runtime(storage: &Path) -> PathBuf {
+        let version_dir = storage.join("onnxruntime").join("1.24.4");
+        fs::create_dir_all(&version_dir).expect("version dir");
+        let lib = version_dir.join(MANAGED_ORT_LIB_NAME);
+        fs::write(&lib, b"").expect("library file");
+        lib
+    }
+
+    fn exited_process_pid() -> u32 {
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                vec!["/C", "exit"]
+            } else {
+                vec![]
+            })
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        child.wait().expect("wait child");
+        pid
+    }
+
+    #[test]
+    fn install_lock_held_by_a_running_process_means_the_runtime_is_downloading() {
+        let storage = managed_runtime_storage();
+        write_install_lock(storage.path(), std::process::id());
+
+        assert!(onnx_runtime_download_in_progress(storage.path()));
+        assert_eq!(
+            classify_late_onnx_runtime(storage.path(), false),
+            LateOnnxRuntime::Downloading
+        );
+    }
+
+    #[test]
+    fn install_lock_left_by_a_dead_process_is_not_a_download() {
+        let storage = managed_runtime_storage();
+        write_install_lock(storage.path(), exited_process_pid());
+
+        assert!(!onnx_runtime_download_in_progress(storage.path()));
+        assert_eq!(
+            classify_late_onnx_runtime(storage.path(), false),
+            LateOnnxRuntime::Absent
+        );
+    }
+
+    #[test]
+    fn install_lock_older_than_any_real_install_is_not_a_download() {
+        let storage = managed_runtime_storage();
+        let lock = write_install_lock(storage.path(), std::process::id());
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .expect("open lock")
+            .set_modified(SystemTime::now() - ONNX_INSTALL_LOCK_MAX_AGE - Duration::from_secs(1))
+            .expect("age lock");
+
+        assert!(!onnx_runtime_download_in_progress(storage.path()));
+    }
+
+    #[test]
+    fn no_install_lock_and_no_runtime_means_the_runtime_is_absent() {
+        let storage = managed_runtime_storage();
+        assert_eq!(
+            classify_late_onnx_runtime(storage.path(), false),
+            LateOnnxRuntime::Absent
+        );
+    }
+
+    #[test]
+    fn a_published_runtime_wins_over_a_lock_not_yet_released() {
+        let storage = managed_runtime_storage();
+        write_install_lock(storage.path(), std::process::id());
+        let lib = publish_managed_runtime(storage.path());
+
+        assert_eq!(
+            classify_late_onnx_runtime(storage.path(), false),
+            LateOnnxRuntime::Published(lib)
+        );
+    }
+
+    #[test]
+    fn an_explicit_runtime_path_is_never_replaced_by_a_late_download() {
+        let storage = managed_runtime_storage();
+        write_install_lock(storage.path(), std::process::id());
+        publish_managed_runtime(storage.path());
+
+        assert_eq!(
+            classify_late_onnx_runtime(storage.path(), true),
+            LateOnnxRuntime::Absent
+        );
+    }
+
+    #[test]
+    fn remote_backend_probe_names_a_refused_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let error = probe_remote_backend(&format!("http://127.0.0.1:{port}/v1"))
+            .expect_err("nothing listens on a released port");
+        assert!(
+            error.starts_with("embedding backend unreachable"),
+            "{error}"
+        );
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+    }
+
+    #[test]
+    fn remote_backend_probe_accepts_a_listening_backend() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        assert_eq!(
+            probe_remote_backend(&format!("http://127.0.0.1:{port}/v1")),
+            Ok(())
+        );
     }
 
     #[test]

@@ -31,6 +31,10 @@ impl From<CompressionAggregate> for CompressionAggregateSerde {
 }
 
 pub fn handle_status(req: &RawRequest, ctx: &AppContext) -> Response {
+    // A remote embedding backend that a building index has not reached yet
+    // has no outage recorded; probe it so the status names the outage rather
+    // than reporting an index that looks like it is progressing.
+    crate::semantic_index::probe_remote_backend_while_building(ctx);
     let mut snapshot = ctx.build_status_snapshot_for_session(req.session());
     if let Some(removal) = removal_health_for_status(req) {
         snapshot["removal"] = removal;

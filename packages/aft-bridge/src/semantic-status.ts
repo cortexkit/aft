@@ -30,6 +30,16 @@ const MISSING_ONNX_RUNTIME_LABEL =
 const REBUILDING_LABEL = "Rebuilding (model changed)";
 
 /**
+ * Build stage the daemon reports while it waits for the plugin to finish
+ * downloading ONNX Runtime (`WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE` in
+ * crates/aft/src/semantic_index.rs). The runtime is absent at that moment, but
+ * it is on its way and the index builds as soon as it lands, so the reader is
+ * told to wait rather than to run `doctor --fix`.
+ */
+const WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE = "waiting_for_onnx_runtime_download";
+const WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_LABEL = "waiting for ONNX Runtime download";
+
+/**
  * How a reader should treat each status word the daemon can emit.
  *
  * `progress` means an attempt is under way and waiting is the right response;
@@ -141,6 +151,12 @@ export function formatSemanticIndexStatus(
 
   if (semanticIndexStatusKind(status) === "progress" && stage === "fingerprint_change") {
     return REBUILDING_LABEL;
+  }
+  if (
+    semanticIndexStatusKind(status) === "progress" &&
+    stage === WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE
+  ) {
+    return WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_LABEL;
   }
   return status;
 }
