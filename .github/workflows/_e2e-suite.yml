@@ -295,9 +295,12 @@ jobs:
       # Every scenario has its own AFT storage and cache, so each one that
       # starts AFT downloads its own copy of the embedding model (a ~90 MB
       # float ONNX file that barely compresses), the ONNX Runtime library, and
-      # the npm-installed language server for its fixture. Those copies are
-      # what grew the archive to about 8 GB, and none of them is evidence: they
-      # are the same public packages in every scenario. They are left out.
+      # the npm-installed language server for its fixture. Each host also
+      # installs the plugin through npm and Bun into its isolated home, leaving
+      # an npm download cache (about 6.5 GB summed over a run), a Bun cache,
+      # the host's node_modules and Node's compile cache. None of it is
+      # evidence: they are the same public packages in every scenario, so they
+      # are left out.
       # Everything else stays: forensics (streams, exchanges, failure,
       # readiness and termination records), AFT and plugin logs, the project
       # trees, AFT's index and callgraph stores, and the install metadata files
@@ -330,6 +333,10 @@ jobs:
             --exclude='*/xdg-data/cortexkit/aft/onnxruntime/*/libonnxruntime*' \
             --exclude='*/xdg-cache/aft-cache/lsp-packages/*/node_modules' \
             --exclude='*/xdg-cache/aft-cache/lsp-binaries' \
+            --exclude='*/home/.npm/_cacache' \
+            --exclude='*/xdg-cache/bun' \
+            --exclude='*/xdg-config/opencode/node_modules' \
+            --exclude='*/tmp/node-compile-cache' \
             -cf - "$AFT_E2E_RUN_ID" | zstd -T0 -3 -q -o "$RUNNER_TEMP/opencode2-forensics.tar.zst"
           ls -la "$RUNNER_TEMP/opencode2-forensics.tar.zst"
 
