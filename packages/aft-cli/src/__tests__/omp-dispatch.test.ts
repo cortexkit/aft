@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { getInstalledAdapters } from "../adapters/index.js";
@@ -21,8 +22,7 @@ beforeEach(async () => {
     writeFileSync(join(binDir, "omp.cmd"), "@echo off\r\nexit /b 0\r\n");
   } else {
     const omp = join(binDir, "omp");
-    writeFileSync(omp, "#!/bin/sh\nexit 0\n");
-    chmodSync(omp, 0o755);
+    linkCachedExecutable(omp, "#!/bin/sh\nexit 0\n");
   }
 
   releaseEnv = await acquireEnv({

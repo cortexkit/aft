@@ -1,5 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import * as bridge from "@cortexkit/aft-bridge";
 /**
  * Pi plugin init must never execute the `aft` binary on the host thread.
  *
@@ -13,19 +18,7 @@
  * purpose) is skipped by starting from the home directory, so a recorded exec
  * can only come from binary resolution.
  */
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import * as bridge from "@cortexkit/aft-bridge";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { writeBinaryIdentitySidecar } from "../../../aft-bridge/src/binary-identity.js";
 
@@ -59,6 +52,7 @@ describe.serial.skipIf(process.platform === "win32")(
         AFT_STORAGE_DIR: undefined,
         AFT_BINARY_PATH: undefined,
         PATH: "",
+        AFT_TEST_EXEC_LOG: execLog,
         HOME: home,
         // CI runners export XDG_CONFIG_HOME, which would point config reads
         // at the runner's real config instead of this test's.
@@ -71,11 +65,10 @@ describe.serial.skipIf(process.platform === "win32")(
       const versionDir = join(cacheHome, "aft", "bin", `v${PLUGIN_VERSION}`);
       mkdirSync(versionDir, { recursive: true });
       cachedAft = join(versionDir, "aft");
-      writeFileSync(
+      linkCachedExecutable(
         cachedAft,
-        `#!/bin/sh\nprintf '%s\\n' "exec $*" >> ${JSON.stringify(execLog)}\necho "aft ${PLUGIN_VERSION}"\n`,
+        `#!/bin/sh\nprintf '%s\\n' "exec $*" >> "$AFT_TEST_EXEC_LOG"\necho "aft ${PLUGIN_VERSION}"\n`,
       );
-      chmodSync(cachedAft, 0o755);
 
       mkdirSync(home, { recursive: true });
       writeUserConfig({ lsp: { auto_install: false }, semantic_search: false });

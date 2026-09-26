@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
@@ -16,6 +16,7 @@ import {
 import type { Logger, LogMeta } from "../logger.js";
 import { BridgePool } from "../pool.js";
 import { findBinarySync } from "../resolver.js";
+import { cachedExecutable, linkCachedExecutable } from "./test-utils/cached-executable.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
 let workDir: string;
@@ -28,11 +29,8 @@ afterEach(() => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-function writeExecutable(name: string, source: string): string {
-  const path = join(workDir, name);
-  writeFileSync(path, source);
-  chmodSync(path, 0o755);
-  return path;
+function writeExecutable(_name: string, source: string): string {
+  return cachedExecutable(source);
 }
 
 describe("BinaryBridge transport regressions", () => {
@@ -51,7 +49,7 @@ process.stdin.on("data", (chunk) => {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
     const req = JSON.parse(line);
-    appendFileSync(${JSON.stringify(requestsPath)}, JSON.stringify(req) + "\\n");
+    appendFileSync(require("node:path").join(process.cwd(), "abort-requests.ndjson"), JSON.stringify(req) + "\\n");
     if (req.command === "tool_call" && req.name === "search") {
       process.stdout.write(JSON.stringify({
         type: "progress",
@@ -130,7 +128,7 @@ process.stdin.on("data", (chunk) => {
     const line = buffer.slice(0, newline);
     buffer = buffer.slice(newline + 1);
     const req = JSON.parse(line);
-    appendFileSync(${JSON.stringify(requestsPath)}, JSON.stringify(req) + "\\n");
+    appendFileSync(require("node:path").join(process.cwd(), "requests.ndjson"), JSON.stringify(req) + "\\n");
     process.stdout.write(JSON.stringify({ id: req.id, success: true, text: "ok", warnings: [] }) + "\\n");
   }
 });
@@ -1238,7 +1236,10 @@ process.stdin.on("data", (chunk) => {
   }
 });
 `;
-    const binary = writeExecutable("fingerprinted.js", echoSource("first build"));
+    const binary = linkCachedExecutable(
+      join(workDir, "fingerprinted.js"),
+      echoSource("first build"),
+    );
     const bridge = new BinaryBridge(binary, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
     const internals = bridge as unknown as { spawnedBinaryFingerprint: string | null };
     try {
@@ -1253,8 +1254,9 @@ process.stdin.on("data", (chunk) => {
       expect(internals.spawnedBinaryFingerprint).toBe(spawnedHash);
       expect(bridge.maybeScheduleRespawnForUpdatedBinary(0)).toBe(false);
 
-      // A rebuild replaces the bytes in place.
-      writeFileSync(binary, echoSource("second build with different bytes"));
+      // A rebuild replaces the binary at the same path with different bytes.
+      unlinkSync(binary);
+      symlinkSync(cachedExecutable(echoSource("second build with different bytes")), binary);
       // The first check after the change only starts hashing the new bytes.
       expect(bridge.maybeScheduleRespawnForUpdatedBinary(0)).toBe(false);
       await binaryContentHash(binary);
@@ -1278,7 +1280,7 @@ process.stdin.on("data", (chunk) => {
     try {
       mkdirSync(join(workDir, "cache", "bin", "v1.0.0"), { recursive: true });
       const cached = join(workDir, "cache", "bin", "v1.0.0", "aft");
-      writeFileSync(
+      linkCachedExecutable(
         cached,
         `#!/usr/bin/env node
 process.stdin.setEncoding("utf8");
@@ -1295,7 +1297,6 @@ process.stdin.on("data", (chunk) => {
 });
 `,
       );
-      chmodSync(cached, 0o755);
       writeBinaryIdentitySidecar(cached, "1.0.0", "0".repeat(64));
 
       const resolved = findBinarySync("1.0.0");

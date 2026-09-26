@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   findAftBinary,
@@ -15,8 +16,7 @@ import {
 import { getAftBinaryName } from "./paths.js";
 
 function writeFakeAft(path: string, body: string): void {
-  writeFileSync(path, `#!/bin/sh\n${body}\n`);
-  chmodSync(path, 0o755);
+  linkCachedExecutable(path, `#!/bin/sh\n${body}\n`);
 }
 
 interface IsolatedInstall {

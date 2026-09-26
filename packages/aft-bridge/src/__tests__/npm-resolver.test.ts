@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
   resolveNpm,
   terminateNpmProcessTree,
 } from "../npm-resolver.js";
+import { linkCachedExecutable } from "./test-utils/cached-executable.js";
 
 /**
  * The resolver is dependency-injected (platform/env/home/execPath) so we can
@@ -341,8 +342,7 @@ describe("npmInvocation", () => {
         const system32 = join(systemRoot, "System32");
         const taskkill = join(system32, "taskkill.exe");
         mkdirSync(system32, { recursive: true });
-        writeFileSync(taskkill, "#!/bin/sh\nexec sleep 10\n");
-        chmodSync(taskkill, 0o755);
+        linkCachedExecutable(taskkill, "#!/bin/sh\nexec sleep 10\n");
 
         const child = new EventEmitter() as ChildProcess;
         let exitCode: number | null = null;
@@ -376,8 +376,7 @@ describe("npmInvocation", () => {
         const system32 = join(systemRoot, "System32");
         const taskkill = join(system32, "taskkill.exe");
         mkdirSync(system32, { recursive: true });
-        writeFileSync(taskkill, "#!/bin/sh\nexit 0\n");
-        chmodSync(taskkill, 0o755);
+        linkCachedExecutable(taskkill, "#!/bin/sh\nexit 0\n");
 
         const child = new EventEmitter() as ChildProcess;
         Object.defineProperties(child, {

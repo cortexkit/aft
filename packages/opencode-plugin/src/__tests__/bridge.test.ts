@@ -10,10 +10,11 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
+import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 
@@ -504,9 +505,7 @@ describe("BinaryBridge lifecycle", () => {
     // this fixture — the actual cause). Operator diagnostics belong in the
     // plugin log; the agent only needs a pointer to it. Anything else just
     // burns context on output the agent can't act on.
-    const fakeBin = join(tmpdir(), `aft-fake-crash-${Date.now()}.sh`);
-    await writeFile(
-      fakeBin,
+    const fakeBin = cachedExecutable(
       [
         "#!/bin/sh",
         'echo "fatal: semantic index corrupted" >&2',
@@ -519,7 +518,6 @@ describe("BinaryBridge lifecycle", () => {
         "exit 1",
         "",
       ].join("\n"),
-      { mode: 0o755 },
     );
 
     try {
@@ -551,7 +549,7 @@ describe("BinaryBridge lifecycle", () => {
       expect(msg).not.toContain("--- last");
       expect(msg).not.toContain("stderr lines");
     } finally {
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
@@ -560,8 +558,7 @@ describe("BinaryBridge lifecycle", () => {
     // to prove the per-request override (50ms) fires instead of the bridge
     // default (5000ms). If the override isn't honored, the bridge-wide timer
     // triggers and the test would take 5+ seconds to reject.
-    const fakeBin = join(tmpdir(), `aft-fake-slow-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     try {
       bridge = new BinaryBridge(
@@ -588,7 +585,7 @@ describe("BinaryBridge lifecycle", () => {
       // under the 5s bridge default to prove the override took effect.
       expect(elapsed).toBeLessThan(2_000);
     } finally {
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
@@ -598,8 +595,7 @@ describe("BinaryBridge lifecycle", () => {
     // process is still alive after the request rejects, so subsequent commands
     // can race through it without a respawn (and don't pay the bridge-restart
     // cost just because one bash call's response was late).
-    const fakeBin = join(tmpdir(), `aft-fake-slow-keep-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     try {
       bridge = new BinaryBridge(
@@ -651,19 +647,14 @@ describe("BinaryBridge lifecycle", () => {
       const childAfter = (bridge as unknown as { process: { killed: boolean } | null }).process;
       expect(childAfter).toBeNull();
     } finally {
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
   test("send rejects params that contain reserved id key before writing", async () => {
     const marker = join(tmpdir(), `aft-fake-id-collision-started-${Date.now()}`);
-    const fakeBin = join(tmpdir(), `aft-fake-id-collision-${Date.now()}.sh`);
-    await writeFile(
-      fakeBin,
-      ["#!/bin/sh", `touch ${JSON.stringify(marker)}`, "sleep 30", ""].join("\n"),
-      {
-        mode: 0o755,
-      },
+    const fakeBin = cachedExecutable(
+      ["#!/bin/sh", 'touch "$AFT_TEST_MARKER"', "sleep 30", ""].join("\n"),
     );
 
     try {
@@ -672,6 +663,7 @@ describe("BinaryBridge lifecycle", () => {
         projectRoot,
         isolatedBridgeOptions({
           timeoutMs: TEST_TIMEOUT_MS,
+          childEnv: { AFT_TEST_MARKER: marker },
         }),
         { harness: "opencode" },
       );
@@ -681,14 +673,12 @@ describe("BinaryBridge lifecycle", () => {
       );
       expect(existsSync(marker)).toBe(false);
     } finally {
-      await rm(fakeBin).catch(() => {});
       await rm(marker).catch(() => {});
     }
   });
 
   test("per-request transportTimeoutMs override sets the bridge timer", async () => {
-    const fakeBin = join(tmpdir(), `aft-fake-transport-timeout-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     const originalSetTimeout = globalThis.setTimeout;
     const delays: unknown[] = [];
@@ -719,7 +709,7 @@ describe("BinaryBridge lifecycle", () => {
       expect(delays).toContain(60_000);
     } finally {
       globalThis.setTimeout = originalSetTimeout;
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
@@ -750,8 +740,7 @@ describe("BinaryBridge lifecycle", () => {
   });
 
   test("stale exit from replaced child is ignored", async () => {
-    const fakeBin = join(tmpdir(), `aft-fake-stale-exit-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     let staleChild: ChildProcess | null = null;
     try {
@@ -777,7 +766,7 @@ describe("BinaryBridge lifecycle", () => {
       expect((bridge as any).configured).toBe(true);
     } finally {
       staleChild?.kill("SIGKILL");
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
@@ -786,9 +775,7 @@ describe("BinaryBridge lifecycle", () => {
     // be kept per BinaryBridge.STDERR_TAIL_MAX. The tail no longer lives in
     // agent-facing errors (operator diagnostics belong in aft-plugin.log only),
     // so we assert directly against the internal ring buffer.
-    const fakeBin = join(tmpdir(), `aft-fake-flood-${Date.now()}.sh`);
-    await writeFile(
-      fakeBin,
+    const fakeBin = cachedExecutable(
       [
         "#!/bin/sh",
         "i=0",
@@ -802,7 +789,6 @@ describe("BinaryBridge lifecycle", () => {
         "sleep 5",
         "",
       ].join("\n"),
-      { mode: 0o755 },
     );
 
     try {
@@ -839,7 +825,7 @@ describe("BinaryBridge lifecycle", () => {
       expect(ring.some((line) => line === "noise line 0")).toBe(false);
       expect(ring.some((line) => line === "noise line 100")).toBe(false);
     } finally {
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 });

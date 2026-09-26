@@ -3,7 +3,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
-  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -19,6 +18,7 @@ import { join } from "node:path";
 import { isTrustedCachedBinary, readBinaryIdentity } from "../binary-identity.js";
 import { PLATFORM_ARCH_MAP, PLATFORM_ASSET_MAP } from "../platform.js";
 import { __setOffThreadVersionProbeForTests } from "../version-probe.js";
+import { linkCachedExecutable } from "./test-utils/cached-executable.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
 const shellFixtureSkipReason =
@@ -194,8 +194,7 @@ describe("downloadBinary hardened transport", () => {
     let binaryFetches = 0;
 
     mkdirSync(versionedDir, { recursive: true });
-    writeFileSync(cachedPath, '#!/bin/sh\necho "aft 9.9.9"\n');
-    chmodSync(cachedPath, 0o755);
+    linkCachedExecutable(cachedPath, '#!/bin/sh\necho "aft 9.9.9"\n');
     expect(readBinaryVersion(cachedPath)).toBe("9.9.9");
 
     globalThis.fetch = (async (url: string | URL | Request) => {

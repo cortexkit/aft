@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { OmpAdapter } from "../adapters/omp.js";
@@ -90,8 +91,7 @@ process.exit(2);
     writeFileSync(join(binDir, "omp.cmd"), `@echo off\r\nbun "${scriptPath}" %*\r\n`);
   } else {
     const wrapper = join(binDir, "omp");
-    writeFileSync(wrapper, `#!/bin/sh\nexec bun "${scriptPath}" "$@"\n`);
-    chmodSync(wrapper, 0o755);
+    linkCachedExecutable(wrapper, '#!/bin/sh\nexec bun "$(dirname "$0")/fake-omp.js" "$@"\n');
   }
 }
 

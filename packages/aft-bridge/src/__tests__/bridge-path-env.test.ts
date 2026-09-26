@@ -1,11 +1,11 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { BinaryBridge } from "../bridge.js";
+import { cachedExecutable } from "./test-utils/cached-executable.js";
 
 let workDir: string;
 
@@ -17,13 +17,11 @@ afterEach(() => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-function writeEnvReportingBridge(outputPath: string): string {
-  const fixturePath = join(workDir, "env-reporting-bridge.cjs");
-  writeFileSync(
-    fixturePath,
+function writeEnvReportingBridge(): string {
+  return cachedExecutable(
     `#!${process.execPath}
 const { writeFileSync } = require("node:fs");
-writeFileSync(${JSON.stringify(outputPath)}, JSON.stringify(process.env));
+writeFileSync(require("node:path").join(process.cwd(), "child-env.json"), JSON.stringify(process.env));
 process.stdin.setEncoding("utf8");
 let buffer = "";
 process.stdin.on("data", (chunk) => {
@@ -37,14 +35,12 @@ process.stdin.on("data", (chunk) => {
 });
 `,
   );
-  chmodSync(fixturePath, 0o755);
-  return fixturePath;
 }
 
 describe("BinaryBridge child PATH", () => {
   test("passes one inherited path key with the managed ONNX directory prepended on Windows", async () => {
     const outputPath = join(workDir, "child-env.json");
-    const fixturePath = writeEnvReportingBridge(outputPath);
+    const fixturePath = writeEnvReportingBridge();
     const bridge = new BinaryBridge(
       fixturePath,
       workDir,

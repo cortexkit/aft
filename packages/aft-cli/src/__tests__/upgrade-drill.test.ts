@@ -1,3 +1,5 @@
+import { unlinkSync } from "node:fs";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 /// <reference path="../bun-test.d.ts" />
 
 /**
@@ -382,7 +384,7 @@ describe("a binary already in the versioned cache", () => {
     const tag = `v${getSelfVersion()}`;
     const cached = join(process.env.AFT_CACHE_DIR as string, "bin", tag, "aft");
     mkdirSync(join(process.env.AFT_CACHE_DIR as string, "bin", tag), { recursive: true });
-    writeFileSync(cached, "#!/bin/sh\n", { mode: 0o755 });
+    linkCachedExecutable(cached, "#!/bin/sh\n");
     const text = await doctorFix(
       null,
       () => ({ ok: true, stdout: '{"files":[]}', stderr: "", status: 0 }),
@@ -400,12 +402,13 @@ describe("a binary already in the versioned cache", () => {
     const dir = join(process.env.AFT_CACHE_DIR as string, "bin", tag);
     const cached = join(dir, "aft");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(cached, "#!/bin/sh\n", { mode: 0o755 });
+    linkCachedExecutable(cached, "#!/bin/sh\n");
     const text = await doctorFix(
       null,
       () => ({ ok: true, stdout: '{"files":[]}', stderr: "", status: 0 }),
       async () => {
-        writeFileSync(cached, "#!/bin/sh\necho replaced\n", { mode: 0o755 });
+        unlinkSync(cached);
+        linkCachedExecutable(cached, "#!/bin/sh\necho replaced\n");
         return cached;
       },
     );

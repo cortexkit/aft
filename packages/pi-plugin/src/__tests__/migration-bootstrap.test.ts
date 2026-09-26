@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 
 type PiPlugin = typeof import("../index.js").default;
@@ -31,11 +32,11 @@ describe.serial("Pi migration bootstrap", () => {
   let cachedAft: string;
 
   function writeFakeAft(exitCode: number): void {
-    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft ${PLUGIN_VERSION}"; exit 0; fi\nprintf "%s\\n" "$@" >> ${JSON.stringify(argsLog)}\nexit ${exitCode}\n`;
-    writeFileSync(aftPath, contents, "utf8");
-    chmodSync(aftPath, 0o755);
-    writeFileSync(cachedAft, contents, "utf8");
-    chmodSync(cachedAft, 0o755);
+    const contents = `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "aft ${PLUGIN_VERSION}"; exit 0; fi\nprintf "%s\\n" "$@" >> "$AFT_MIGRATION_ARGS_LOG"\nexit ${exitCode}\n`;
+    rmSync(aftPath, { force: true });
+    rmSync(cachedAft, { force: true });
+    linkCachedExecutable(aftPath, contents);
+    linkCachedExecutable(cachedAft, contents);
   }
 
   beforeEach(async () => {

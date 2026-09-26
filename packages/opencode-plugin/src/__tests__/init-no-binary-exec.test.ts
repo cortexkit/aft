@@ -1,5 +1,9 @@
 /// <reference path="../bun-test.d.ts" />
 
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 /**
  * Plugin init must never execute the `aft` binary on the host thread.
  *
@@ -10,18 +14,7 @@
  * with its real binary resolver against a cached stub `aft` that records every
  * time it is executed, and require that it was never run.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { writeBinaryIdentitySidecar } from "../../../aft-bridge/src/binary-identity.js";
 import {
@@ -47,16 +40,16 @@ describe.skipIf(posixOnly)("OpenCode plugin init never executes the aft binary",
     cachedAft = join(cacheDir, "bin", `v${VERSION}`, "aft");
     mkdirSync(join(cacheDir, "bin", `v${VERSION}`), { recursive: true });
     // Records every execution, whatever the arguments, then answers like aft.
-    writeFileSync(
+    linkCachedExecutable(
       cachedAft,
-      `#!/bin/sh\nprintf '%s\\n' "exec $*" >> ${JSON.stringify(execLog)}\necho "aft ${VERSION}"\n`,
+      `#!/bin/sh\nprintf '%s\\n' "exec $*" >> "$AFT_TEST_EXEC_LOG"\necho "aft ${VERSION}"\n`,
     );
-    chmodSync(cachedAft, 0o755);
     releaseEnv = await acquireEnv({
       AFT_BINARY_PATH: undefined,
       AFT_CACHE_DIR: cacheDir,
       HOME: join(root, "home"),
       PATH: "",
+      AFT_TEST_EXEC_LOG: execLog,
     });
   });
 

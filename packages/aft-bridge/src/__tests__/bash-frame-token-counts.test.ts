@@ -1,10 +1,11 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BashCompletedPayload, BinaryBridge } from "../bridge.js";
+import { cachedExecutable } from "./test-utils/cached-executable.js";
 
 let workDir: string;
 
@@ -16,11 +17,8 @@ afterEach(() => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-function writeExecutable(name: string, source: string): string {
-  const path = join(workDir, name);
-  writeFileSync(path, source);
-  chmodSync(path, 0o755);
-  return path;
+function writeExecutable(_name: string, source: string): string {
+  return cachedExecutable(source);
 }
 
 async function readPushedCompletion(frame: Record<string, unknown>): Promise<BashCompletedPayload> {

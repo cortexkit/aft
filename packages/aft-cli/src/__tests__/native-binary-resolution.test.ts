@@ -2,10 +2,11 @@
 
 import { describe, expect, test } from "bun:test";
 import { type SpawnSyncReturns, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { getAftBinaryName } from "../lib/paths.js";
 
 /** Exit code the fixture binary returns, so no other `aft` can fake a pass. */
@@ -54,8 +55,7 @@ function cacheOnlyInstall(prefix: string, versionDir: string | null): CacheOnlyI
     const versionedDir = join(cacheBinDir, versionDir);
     mkdirSync(versionedDir, { recursive: true });
     const binary = join(versionedDir, getAftBinaryName());
-    writeFileSync(binary, `#!/bin/sh\nexit ${FIXTURE_EXIT_CODE}\n`);
-    chmodSync(binary, 0o755);
+    linkCachedExecutable(binary, `#!/bin/sh\nexit ${FIXTURE_EXIT_CODE}\n`);
   }
 
   return {

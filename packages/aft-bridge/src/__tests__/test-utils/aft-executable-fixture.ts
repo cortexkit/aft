@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, renameSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { cachedExecutable } from "./cached-executable.js";
 
 export interface AftFixtureBehavior {
   stdout?: string;
@@ -36,7 +37,7 @@ function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
   // Compiling with cc at test time is the slow, flaky step on contended CI
   // runners (a single compile can blow a 5s test budget). Identical behaviors
   // produce identical sources, so compile each source once per machine into a
-  // content-keyed cache and copy the binary for every later request.
+  // content-keyed cache and link to it for every later request.
   const cacheKey = createHash("sha256")
     .update(`${process.platform}\0${source}`)
     .digest("hex")
@@ -48,8 +49,7 @@ function writeNativeFixture(path: string, behavior: AftFixtureBehavior): void {
     compileNativeFixture(source, cacheDir, cachedBinary);
   }
 
-  copyFileSync(cachedBinary, path);
-  chmodSync(path, 0o755);
+  symlinkSync(cachedBinary, path);
 }
 
 function compileNativeFixture(source: string, cacheDir: string, cachedBinary: string): void {
@@ -58,7 +58,7 @@ function compileNativeFixture(source: string, cacheDir: string, cachedBinary: st
 
   mkdirSync(cacheDir, { recursive: true });
   // Unique staging names so concurrent test files never race on the same
-  // output; the final publish is an atomic-enough copy to the keyed name.
+  // output; the final publish renames the complete binary to the keyed name.
   const staging = join(
     cacheDir,
     `stage-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -92,8 +92,7 @@ function compileNativeFixture(source: string, cacheDir: string, cachedBinary: st
   }
 
   chmodSync(staging, 0o755);
-  copyFileSync(staging, cachedBinary);
-  chmodSync(cachedBinary, 0o755);
+  renameSync(staging, cachedBinary);
 }
 
 function nativeFixtureSource(behavior: AftFixtureBehavior): string {
@@ -195,8 +194,7 @@ function writeShellFixture(path: string, behavior: AftFixtureBehavior): void {
   if (behavior.stderr) lines.push(`printf '%s' ${shellQuote(behavior.stderr)} >&2`);
   lines.push(`exit ${Math.trunc(behavior.exitCode ?? 0)}`, "");
 
-  writeFileSync(path, lines.join("\n"), "utf8");
-  chmodSync(path, 0o755);
+  symlinkSync(cachedExecutable(lines.join("\n")), path);
 }
 
 function shellQuote(value: string): string {

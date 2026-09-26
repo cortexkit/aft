@@ -14,9 +14,10 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 /** How long the process may live after its shutdown hook returned. */
 const EXIT_BOUND_MS = 5_000;
@@ -56,8 +57,10 @@ function spawnHarness(mode: "session-shutdown" | "sigterm" | "subagent") {
   mkdirSync(join(configDir, "cortexkit"), { recursive: true });
   // A stand-in for npm that records its pid and then just sits there, so the
   // LSP install is guaranteed to still be running when the session ends.
-  writeFileSync(join(binDir, "npm"), '#!/bin/sh\necho $$ > "$HARNESS_NPM_MARKER"\nexec sleep 60\n');
-  chmodSync(join(binDir, "npm"), 0o755);
+  linkCachedExecutable(
+    join(binDir, "npm"),
+    '#!/bin/sh\necho $$ > "$HARNESS_NPM_MARKER"\nexec sleep 60\n',
+  );
   // A TypeScript project makes typescript-language-server relevant; pinning
   // its version skips the registry probe so no network is needed.
   writeFileSync(join(projectDir, "a.ts"), "export const a = 1;\n");

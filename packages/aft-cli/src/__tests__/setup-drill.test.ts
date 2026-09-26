@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
@@ -257,18 +258,18 @@ function writeFakeBinary(dir: string, plan: SetupPlan): { path: string; answersF
   const answersFile = join(dir, "answers.json");
   writeFileSync(planFile, JSON.stringify(plan));
   const path = join(dir, "aft");
-  writeFileSync(
+  linkCachedExecutable(
     path,
     [
       "#!/bin/sh",
+      'dir=$(dirname "$0")',
       'case "$2" in',
-      `  --plan) cat '${planFile}' ;;`,
-      `  --answers) cat > '${answersFile}'; printf '{"written":"%s"}\\n' "$XDG_CONFIG_HOME/cortexkit/aft.jsonc" ;;`,
+      '  --plan) cat "$dir/plan.json" ;;',
+      `  --answers) cat > "$dir/answers.json"; printf '{"written":"%s"}\\n' "$XDG_CONFIG_HOME/cortexkit/aft.jsonc" ;;`,
       "  *) exit 2 ;;",
       "esac",
       "",
     ].join("\n"),
-    { mode: 0o755 },
   );
   return { path, answersFile };
 }

@@ -17,10 +17,10 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
+import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 let bridge: BinaryBridge | null = null;
 let projectRoot: string;
@@ -291,8 +291,7 @@ describe("Pi BinaryBridge", () => {
     // to prove the per-request override (50ms) fires instead of the bridge
     // default (5000ms). If the override isn't honored, the bridge-wide timer
     // triggers and the test would take 5+ seconds to reject.
-    const fakeBin = join(tmpdir(), `aft-pi-fake-slow-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     try {
       bridge = new BinaryBridge(
@@ -319,7 +318,7 @@ describe("Pi BinaryBridge", () => {
       // under the 5s bridge default to prove the override took effect.
       expect(elapsed).toBeLessThan(2_000);
     } finally {
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
@@ -350,8 +349,7 @@ describe("Pi BinaryBridge", () => {
   });
 
   test("stale exit from replaced child is ignored", async () => {
-    const fakeBin = join(tmpdir(), `aft-pi-fake-stale-exit-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     let staleChild: ChildProcess | null = null;
     try {
@@ -377,13 +375,12 @@ describe("Pi BinaryBridge", () => {
       expect((bridge as any).configured).toBe(true);
     } finally {
       staleChild?.kill("SIGKILL");
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 
   test("rejects params with reserved id before writing to the bridge", async () => {
-    const fakeBin = join(tmpdir(), `aft-pi-fake-id-collision-${Date.now()}.sh`);
-    await writeFile(fakeBin, ["#!/bin/sh", "sleep 30", ""].join("\n"), { mode: 0o755 });
+    const fakeBin = cachedExecutable("#!/bin/sh\nsleep 30\n");
 
     try {
       bridge = new BinaryBridge(
@@ -401,7 +398,7 @@ describe("Pi BinaryBridge", () => {
       );
       expect(bridge.isAlive()).toBe(false);
     } finally {
-      await rm(fakeBin).catch(() => {});
+      await bridge?.shutdown();
     }
   });
 });

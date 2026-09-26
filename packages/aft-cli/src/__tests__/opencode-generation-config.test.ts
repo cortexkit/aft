@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { hardlinkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter, HarnessConfigPaths, PluginEntryResult } from "../adapters/types.js";
@@ -65,7 +66,7 @@ function writeHostPackage(
   const packageRoot = join(root, "node_modules", ...name.split("/"));
   const executable = join(packageRoot, "bin", executableName);
   mkdirSync(join(packageRoot, "bin"), { recursive: true });
-  writeFileSync(executable, "host fixture\n", { mode: 0o755 });
+  hardlinkCachedExecutable(executable, "host fixture\n");
   writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name, version }));
   return executable;
 }
@@ -168,7 +169,7 @@ describe("OpenCode generation detection", () => {
     const root = tempRoot("aft-cli-host-ga-bare-");
     const bin = join(root, "bin", "opencode");
     mkdirSync(join(root, "bin"), { recursive: true });
-    writeFileSync(bin, "host fixture\n", { mode: 0o755 });
+    hardlinkCachedExecutable(bin, "host fixture\n");
 
     const result = detectOpenCodeHostGeneration({
       findExecutable: (name) => (name === "opencode" ? bin : null),
@@ -211,8 +212,8 @@ describe("OpenCode generation detection", () => {
     mkdirSync(binDir, { recursive: true });
     const host = join(binDir, "opencode");
     const shim = join(binDir, "opencode2");
-    writeFileSync(host, "compiled host fixture\n", { mode: 0o755 });
-    writeFileSync(shim, `#!/bin/sh\nexec "$(dirname "$0")/opencode" "$@"\n`, { mode: 0o755 });
+    hardlinkCachedExecutable(host, "compiled host fixture\n");
+    hardlinkCachedExecutable(shim, `#!/bin/sh\nexec "$(dirname "$0")/opencode" "$@"\n`);
     const probed: string[] = [];
 
     const result = detectOpenCodeHostGeneration({
@@ -243,7 +244,7 @@ describe("OpenCode generation detection", () => {
     const root = tempRoot("aft-cli-host-decorated-version-");
     const host = join(root, "bin", "opencode");
     mkdirSync(join(root, "bin"), { recursive: true });
-    writeFileSync(host, "compiled host fixture\n", { mode: 0o755 });
+    hardlinkCachedExecutable(host, "compiled host fixture\n");
     const detect = (reported: string): OpenCodeHostDetection =>
       detectOpenCodeHostGeneration({
         findExecutable: (name) => (name === "opencode" ? host : null),
@@ -291,7 +292,7 @@ describe("OpenCode generation detection", () => {
     const root = tempRoot("aft-cli-host-both-standalone-");
     const v1 = join(root, ".opencode", "bin", "opencode");
     mkdirSync(join(root, ".opencode", "bin"), { recursive: true });
-    writeFileSync(v1, "compiled host fixture\n", { mode: 0o755 });
+    hardlinkCachedExecutable(v1, "compiled host fixture\n");
     const v2 = writeHostPackage(root, "@opencode/cli", "opencode2", "2.0.11");
 
     const result = detectOpenCodeHostGeneration({
@@ -335,7 +336,7 @@ describe("OpenCode generation detection", () => {
   test("never executes opencode2 when V1 needs a fallback version probe", () => {
     const root = tempRoot("aft-cli-no-opencode2-exec-");
     const v1 = join(root, "opencode");
-    writeFileSync(v1, "fixture\n", { mode: 0o755 });
+    hardlinkCachedExecutable(v1, "fixture\n");
     const v2 = writeHostPackage(root, "@opencode-ai/cli", "opencode2", "0.0.0-beta-fixture");
     const probed: string[] = [];
 

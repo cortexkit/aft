@@ -14,6 +14,7 @@
 import { existsSync } from "node:fs";
 import { symlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { linkCachedExecutable } from "../../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import {
   configureParamsFromLegacyOverrides,
   createHarness,
@@ -229,7 +230,7 @@ export async function createFormatHarness(
   }
 
   // Step 2: Install any fake formatter shims under node_modules/.bin/.
-  const { mkdir, chmod } = await import("node:fs/promises");
+  const { mkdir } = await import("node:fs/promises");
   const binDir = harness.path("node_modules", ".bin");
   const shimmedNames = new Set(shims.map((s) => s.name));
   if (shims.length > 0) {
@@ -238,8 +239,7 @@ export async function createFormatHarness(
       const shimPath = join(binDir, shim.name);
       // Add `#!/bin/sh` if missing.
       const body = shim.script.startsWith("#!") ? shim.script : `#!/bin/sh\n${shim.script}`;
-      await writeFile(shimPath, body, "utf8");
-      await chmod(shimPath, 0o755);
+      linkCachedExecutable(shimPath, body);
     }
   }
 

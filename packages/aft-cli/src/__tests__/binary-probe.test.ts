@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { probeBinaryVersion } from "../lib/binary-probe.js";
 import { getAftBinaryName } from "../lib/paths.js";
@@ -15,8 +16,7 @@ describe("probeBinaryVersion", () => {
       const binDir = join(root, "bin", "v9.8.7");
       mkdirSync(binDir, { recursive: true });
       const binaryPath = join(binDir, getAftBinaryName());
-      writeFileSync(binaryPath, '#!/bin/sh\nprintf "aft 9.8.7\\n"\n');
-      chmodSync(binaryPath, 0o755);
+      linkCachedExecutable(binaryPath, '#!/bin/sh\nprintf "aft 9.8.7\\n"\n');
 
       expect(probeBinaryVersion("9.8.7")).toBe("9.8.7");
     });

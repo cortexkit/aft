@@ -5,30 +5,21 @@
  * binary whose version does not match the requested `expectedVersion`, and
  * that the synchronous resolver establishes identity without running anything.
  *
- * Regression case (caught during v0.23 Pi RPC e2e dogfooding): a workspace
- * upgraded to plugin v0.22.x can still have a bun-hoisted older
- * `@cortexkit/aft-<platform>` symlink in node_modules (e.g. v0.19.5). The
- * resolver would happily run that older binary, producing stale behavior
- * (in the original repro: `bgb-` task slugs instead of `bash-`).
+ * Regression case: a workspace upgraded to plugin v0.22.x can still have
+ * a bun-hoisted older
+ * `@cortexkit/aft-<platform>` symlink in node_modules (e.g. v0.19.5). The resolver could run that older binary and
+ * return behavior inconsistent with the upgraded plugin.
  *
  * No module mocking — uses a real fake binary directory and writes a small
  * executable fixture that emits a controlled `--version` output. The npm-package
  * resolution leg cannot be exercised without `node_modules/@cortexkit/aft-*`
  * present, so this test focuses on the version-check helper directly.
  */
+
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import {
@@ -47,6 +38,7 @@ import {
   __test__ as resolverTest,
 } from "../resolver.js";
 import { writeAftFixture, writeAftVersionFixture } from "./test-utils/aft-executable-fixture.js";
+import { linkCachedExecutable } from "./test-utils/cached-executable.js";
 import { acquireEnv } from "./test-utils/env-guard.js";
 
 // PATH/cargo resolution below hard-codes POSIX path layout and `aft` (without
@@ -364,11 +356,10 @@ describe.skipIf(skipPosixPathLookup)("npm platform package copy into the version
 
   function writeRecordingStub(path: string, label: string, version: string): void {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(
+    linkCachedExecutable(
       path,
-      `#!/bin/sh\nprintf '%s\\n' "${label} $*" >> ${JSON.stringify(execLog)}\necho "aft ${version}"\n`,
+      `#!/bin/sh\nprintf '%s\\n' "${label} $*" >> "$AFT_TEST_EXEC_LOG"\necho "aft ${version}"\n`,
     );
-    chmodSync(path, 0o755);
   }
 
   beforeEach(async () => {
@@ -379,6 +370,7 @@ describe.skipIf(skipPosixPathLookup)("npm platform package copy into the version
       AFT_CACHE_DIR: join(tmpDir, "cache"),
       PATH: "",
       HOME: tmpDir,
+      AFT_TEST_EXEC_LOG: execLog,
     });
     npmBinary = join(tmpDir, "node_modules", "@cortexkit", "aft-test", "bin", "aft");
     writeRecordingStub(npmBinary, "npm", "1.2.3");

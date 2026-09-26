@@ -19,9 +19,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import { sendAftRequest, sendAftRequests } from "../lib/aft-bridge.js";
 import { CLI } from "../lib/cli.js";
 
@@ -35,11 +36,8 @@ afterEach(() => {
   rmSync(workDir, { recursive: true, force: true });
 });
 
-function makeFakeBinary(name: string, body: string): string {
-  const path = join(workDir, name);
-  writeFileSync(path, `#!/bin/bash\n${body}\n`);
-  chmodSync(path, 0o755);
-  return path;
+function makeFakeBinary(_name: string, body: string): string {
+  return cachedExecutable(`#!/bin/bash\n${body}\n`);
 }
 
 describe("sendAftRequests — happy path", () => {

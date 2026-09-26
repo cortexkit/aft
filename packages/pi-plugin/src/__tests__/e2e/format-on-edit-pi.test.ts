@@ -1,9 +1,10 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { linkCachedExecutable } from "../../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 import {
   configureParamsFromLegacyOverrides,
   createHarness,
@@ -131,11 +132,10 @@ async function installPreset(
     await mkdir(binDir, { recursive: true });
     for (const shim of shims) {
       const shimPath = join(binDir, shim.name);
-      await writeFile(
+      linkCachedExecutable(
         shimPath,
         shim.script.startsWith("#!") ? shim.script : `#!/bin/sh\n${shim.script}`,
       );
-      await chmod(shimPath, 0o755);
     }
   }
   const configureParams: Record<string, unknown> = {

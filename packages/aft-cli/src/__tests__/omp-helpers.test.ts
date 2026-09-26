@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { linkCachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
 
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
@@ -18,9 +19,7 @@ let releaseEnv: (() => void) | undefined;
 
 function executable(path: string): string {
   mkdirSync(join(path, ".."), { recursive: true });
-  writeFileSync(path, "#!/bin/sh\nexit 0\n");
-  chmodSync(path, 0o755);
-  return path;
+  return linkCachedExecutable(path, "#!/bin/sh\nexit 0\n");
 }
 
 function binaryName(name: string): string {
