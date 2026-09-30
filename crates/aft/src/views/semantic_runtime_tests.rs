@@ -470,6 +470,68 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
     );
 }
 
+/// A worker superseded by a lane restart (here a model change) is held just
+/// before its final publication while the new lane publishes; when released,
+/// its publication is refused and the view still names the new producer. No
+/// wait for the old worker is involved: the fence alone keeps the old
+/// producer's manifest from ever replacing the new one.
+#[test]
+fn superseded_lane_cannot_publish_over_its_replacement() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let lane = |model: &str, slot: &Arc<CheckoutSemanticSlot>, epoch: u64| {
+        let runtime = CheckoutSemantic::new(
+            storage.path(),
+            "family",
+            "scope",
+            root.path(),
+            SemanticProducer::current(model, EmbedTextCaps::default()),
+            Arc::downgrade(slot),
+        )
+        .unwrap();
+        runtime
+            .driver()
+            .set_publish_fence(Arc::new(LaneFence::new(Arc::downgrade(slot), epoch)));
+        Arc::new(runtime)
+    };
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (old_epoch, _old_wake) = slot.begin();
+    let old = lane("old-model", &slot, old_epoch);
+    old.load().unwrap();
+
+    // The old worker's final fold, held at a barrier before it publishes.
+    let (release, barrier) = crossbeam_channel::bounded::<()>(0);
+    let final_fold = {
+        let old = Arc::clone(&old);
+        std::thread::spawn(move || {
+            barrier.recv().unwrap();
+            old.load()
+        })
+    };
+    let (new_epoch, _new_wake) = slot.begin();
+    let new = lane("new-model", &slot, new_epoch);
+    new.load().unwrap();
+    release.send(()).unwrap();
+    let refused = final_fold.join().unwrap();
+
+    let error = refused.expect_err("a superseded lane published its view");
+    assert!(
+        error.contains(super::super::first_load::SUPERSEDED_PUBLISH),
+        "{error}"
+    );
+    let registry = FamilyRegistry::open(storage.path(), "family").unwrap();
+    let view = registry.register_view("scope", root.path()).unwrap();
+    let store = view.view_store().unwrap();
+    let current = store.current_generation().unwrap().unwrap();
+    let manifest = store.load_manifest_v2(&current).unwrap();
+    assert_eq!(
+        manifest.header().producers.semantic.as_deref(),
+        Some(new.plane().semantic_producer().id().as_str()),
+        "the view names the superseded producer"
+    );
+}
+
 /// An AFT write under the root wakes the lane's worker; one elsewhere does not.
 #[test]
 fn aft_writes_wake_only_their_own_lane() {

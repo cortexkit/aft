@@ -84,6 +84,22 @@ pub const CHECKOUT_CHANGED_DURING_RECONCILE: &str =
 pub const CHECKOUT_WRITE_ACTIVE: &str = "checkout write still active during reconciliation";
 pub const CHECKOUT_CHANGED_BEFORE_INSTALL: &str = "checkout changed before snapshot installation";
 
+/// The reason a [`PublishFence`] gives when it refuses a publication.
+pub const SUPERSEDED_PUBLISH: &str = "checkout view owner superseded; publication refused";
+
+/// Decides, atomically with the pointer publication itself, whether the
+/// driver may still publish its checkout's view. A runtime that can be
+/// replaced by another owner of the same view (a lane restarted with other
+/// settings) installs one, so the replaced owner can never overwrite the
+/// replacement's publication.
+pub trait PublishFence: Send + Sync {
+    /// Runs `commit` while holding whatever makes the ownership check and
+    /// the publication one atomic step, or returns an error with reason
+    /// [`SUPERSEDED_PUBLISH`] without running it.
+    fn publish(&self, commit: &mut dyn FnMut() -> Result<(), PlaneError>)
+        -> Result<(), PlaneError>;
+}
+
 /// Derived graphs cannot be copied between checkouts until tests prove their
 /// rows contain no source-root-dependent data. Per-file blobs remain reusable.
 pub const DERIVED_CALLGRAPH_SEEDING: bool = false;
@@ -748,6 +764,7 @@ pub struct CheckoutDriver {
     walker: Arc<dyn MembershipWalker>,
     planes: Vec<Arc<dyn CompositePlane>>,
     adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>,
+    publish_fence: std::sync::RwLock<Option<Arc<dyn PublishFence>>>,
     observed: std::sync::Mutex<BTreeMap<RelPath, LiveEntry>>,
     installed: std::sync::Mutex<InstalledCheckout>,
 }
@@ -776,6 +793,7 @@ impl CheckoutDriver {
             walker,
             planes,
             adapters: Vec::new(),
+            publish_fence: std::sync::RwLock::new(None),
             observed: std::sync::Mutex::new(BTreeMap::new()),
             installed: std::sync::Mutex::new(InstalledCheckout {
                 revision: 0,
@@ -789,6 +807,15 @@ impl CheckoutDriver {
 
     /// Registers resident plane readers for atomic installation with snapshots.
     /// The driver remains opt-in; this does not change process-global routing.
+    /// Routes every pointer publication of this driver through `fence`, so
+    /// a publisher that no longer owns the checkout's view cannot publish.
+    pub fn set_publish_fence(&self, fence: Arc<dyn PublishFence>) {
+        *self
+            .publish_fence
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fence);
+    }
+
     pub fn with_adapters(mut self, adapters: Vec<Arc<dyn super::contracts::PlaneAdapter>>) -> Self {
         self.adapters = adapters;
         self
@@ -989,12 +1016,29 @@ impl FirstLoadDriver for CheckoutDriver {
         for plane in &self.planes {
             plane.finish_generation(&self.owner, &assembly_name, &name.to_string())?;
         }
-        let prepared = store
-            .prepare_v2(&name, base.as_deref(), &manifest, None)
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
-        store
-            .commit_v2(prepared, None)
-            .map_err(|error| SiblingLoader::error(error.to_string()))?;
+        let mut prepared = Some(
+            store
+                .prepare_v2(&name, base.as_deref(), &manifest, None)
+                .map_err(|error| SiblingLoader::error(error.to_string()))?,
+        );
+        let mut commit = || {
+            let prepared = prepared
+                .take()
+                .ok_or_else(|| SiblingLoader::error("publication committed twice"))?;
+            store
+                .commit_v2(prepared, None)
+                .map(|_| ())
+                .map_err(|error| SiblingLoader::error(error.to_string()))
+        };
+        let fence = self
+            .publish_fence
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match fence {
+            Some(fence) => fence.publish(&mut commit)?,
+            None => commit()?,
+        }
         self.owner
             .registry()
             .note_publish(self.owner.scope())

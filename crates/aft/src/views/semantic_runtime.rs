@@ -426,6 +426,9 @@ pub struct CheckoutSemanticSlot {
     wake: Mutex<Option<crossbeam_channel::Sender<()>>>,
     /// Worker threads currently running for this slot, of any epoch.
     workers: AtomicUsize,
+    /// Held while an epoch changes and while a lane publishes its view, so a
+    /// publication and the check that its lane is still current are atomic.
+    publish: Mutex<()>,
 }
 
 impl CheckoutSemanticSlot {
@@ -458,7 +461,12 @@ impl CheckoutSemanticSlot {
     /// receiver the new worker waits on.
     pub fn begin(&self) -> (u64, crossbeam_channel::Receiver<()>) {
         let (sender, receiver) = crossbeam_channel::unbounded();
-        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        // Under the publish lock: once this returns, no earlier epoch's
+        // publication is in flight or can start (see `LaneFence`).
+        let epoch = {
+            let _publishing = lock(&self.publish);
+            self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+        };
         *lock(&self.wake) = Some(sender);
         *self
             .state
@@ -494,7 +502,10 @@ impl CheckoutSemanticSlot {
 
     /// Forgets the lane. Its worker sees the channel close and exits.
     pub fn clear(&self) {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
+        {
+            let _publishing = lock(&self.publish);
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+        }
         *lock(&self.wake) = None;
         *self
             .state
@@ -575,16 +586,48 @@ pub(crate) const RETRY_MAX: Duration = Duration::from_secs(300);
 
 const LIMITER_KIND: &str = "semantic view fill";
 
-/// How long a new lane waits for a superseded worker of the same lane to
-/// finish before it loads anyway.
-const SUPERSEDED_WORKER_WAIT: Duration = Duration::from_secs(60);
+/// Lets a lane's driver publish its checkout's view only while the lane's
+/// epoch is current. The check and the pointer publication run under the
+/// slot's publish lock, which every epoch change also takes, so a worker
+/// superseded by a restart (a reconfigure with another model) can never
+/// publish its old producer's manifest over the replacement's: readers of
+/// the view never see the old producer again once the new lane starts.
+pub struct LaneFence {
+    slot: Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+}
 
-/// Text of the error reading a view back when its manifest names other
-/// producers than the reader's.
-const PRODUCER_MISMATCH: &str = "view producer mismatch";
+impl LaneFence {
+    pub fn new(slot: Weak<CheckoutSemanticSlot>, epoch: u64) -> Self {
+        Self { slot, epoch }
+    }
+}
 
-/// Producer mismatches tolerated during a lane's first load before it fails.
-const LOAD_MISMATCH_RETRIES: usize = 5;
+impl super::first_load::PublishFence for LaneFence {
+    fn publish(
+        &self,
+        commit: &mut dyn FnMut() -> Result<(), super::contracts::PlaneError>,
+    ) -> Result<(), super::contracts::PlaneError> {
+        let refused = || {
+            crate::slog_debug!(
+                "semantic view publication refused for superseded lane epoch {}",
+                self.epoch
+            );
+            Err(super::contracts::PlaneError {
+                plane: crate::blob_store::v2::FamilyPlane::Semantic,
+                reason: super::first_load::SUPERSEDED_PUBLISH.to_owned(),
+            })
+        };
+        let Some(slot) = self.slot.upgrade() else {
+            return refused();
+        };
+        let _publishing = lock(&slot.publish);
+        if !slot.is_current(self.epoch) {
+            return refused();
+        }
+        commit()
+    }
+}
 
 fn set_status(
     slot: &Weak<CheckoutSemanticSlot>,
@@ -683,42 +726,32 @@ pub(crate) fn run_worker(
     if !is_current(&slot, epoch) {
         return;
     }
-    // A superseded worker of this lane (the lane restarted after a
-    // reconfigure) may still be finishing a fill, and its fold publishes into
-    // the same view under the old producer. Loading now could read back that
-    // publication instead of this lane's own and fail with a producer
-    // mismatch, so wait (bounded) until this is the lane's only worker.
-    let quiesce_deadline = Instant::now() + SUPERSEDED_WORKER_WAIT;
-    while slot.upgrade().is_some_and(|slot| slot.workers() > 1) && Instant::now() < quiesce_deadline
-    {
-        if !is_current(&slot, epoch) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Publications of this lane's view pass the lane fence, so a superseded
+    // worker can no longer publish once this lane's epoch began.
+    runtime
+        .driver()
+        .set_publish_fence(Arc::new(LaneFence::new(slot.clone(), epoch)));
     // Subscribe to watcher changes and write intents before the first
     // snapshot is served, so no edit made during the load is missed.
     config.drivers.install(Arc::clone(runtime.driver()));
     let started = Instant::now();
     let mut wait = config.schedule.retry_initial;
-    let mut mismatches = 0;
     loop {
         match runtime.load() {
             Ok(_) => break,
-            // The checkout changed while it was loaded, a database was busy,
-            // or another producer's publication (a superseded worker that
-            // outlived SUPERSEDED_WORKER_WAIT) landed in this view: load again
-            // after a wait instead of failing the lane. A producer mismatch
-            // that persists past LOAD_MISMATCH_RETRIES is a real conflict and
-            // fails the lane with that error.
-            Err(error)
-                if is_transient_reason(&error)
-                    || (error.contains(PRODUCER_MISMATCH)
-                        && mismatches < LOAD_MISMATCH_RETRIES) =>
-            {
-                if error.contains(PRODUCER_MISMATCH) {
-                    mismatches += 1;
-                }
+            // This lane was superseded while it loaded; its publication was
+            // refused and the lane that replaced it owns the view.
+            Err(error) if error.contains(super::first_load::SUPERSEDED_PUBLISH) => {
+                config.drivers.clear_if(runtime.driver());
+                return;
+            }
+            // The checkout changed while it was loaded, or a database was
+            // busy: load again after a wait instead of failing the lane. A
+            // producer mismatch is not retried: with the lane fence, this
+            // process never publishes another producer into the view, so one
+            // means another process with other semantic settings publishes
+            // the same checkout, a conflict that fails the lane by name.
+            Err(error) if is_transient_reason(&error) => {
                 crate::slog_info!(
                     "semantic view load will retry root={} error={}",
                     config.root.display(),
@@ -945,6 +978,9 @@ where
                 mark_unavailable(runtime, schedule, error);
                 return FillOutcome::Settled;
             }
+            // A restart replaced this lane while it folded; its work is
+            // dropped and the replacement owns the view.
+            Err(RefreshError::Superseded) => return FillOutcome::Stop,
         }
     }
 }
@@ -972,11 +1008,15 @@ pub enum RefreshError {
     /// Needs something to change first: an unreadable or corrupt store, a
     /// refused registration or publication, a manifest that does not match.
     Unavailable(String),
+    /// The lane was replaced; the lane fence refused this publication.
+    Superseded,
 }
 
 impl RefreshError {
     fn classify(reason: String) -> Self {
-        if is_transient_reason(&reason) {
+        if reason.contains(super::first_load::SUPERSEDED_PUBLISH) {
+            Self::Superseded
+        } else if is_transient_reason(&reason) {
             Self::Transient(reason)
         } else {
             Self::Unavailable(reason)
@@ -988,6 +1028,7 @@ impl std::fmt::Display for RefreshError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Transient(reason) | Self::Unavailable(reason) => f.write_str(reason),
+            Self::Superseded => f.write_str(super::first_load::SUPERSEDED_PUBLISH),
         }
     }
 }
