@@ -169,8 +169,12 @@ pub trait PlaneAdapter: Send + Sync {
     /// Drops resident state for a generation that no snapshot holds.
     fn release_generation(&self, access: &ViewAccess, generation: &str);
 
-    /// This plane's readiness as of `snapshot`.
-    fn readiness(&self, snapshot: &Snapshot) -> PlaneReadiness;
+    /// This plane's readiness for the view `access` names, as of `snapshot`.
+    ///
+    /// The view must be named because two views can hold the same generation
+    /// (a sibling seed is shared by name) while their fills and live edits
+    /// differ; each must report its own pending and failed counts.
+    fn readiness(&self, access: &ViewAccess, snapshot: &Snapshot) -> PlaneReadiness;
 }
 
 /// What a load produced for one view.

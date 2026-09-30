@@ -759,12 +759,16 @@ impl super::contracts::PlaneAdapter for TrigramAdapter {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&(access.scope().into(), generation.into()));
     }
-    fn readiness(&self, snapshot: &Snapshot) -> super::readiness::PlaneReadiness {
+    fn readiness(
+        &self,
+        access: &super::contracts::ViewAccess,
+        snapshot: &Snapshot,
+    ) -> super::readiness::PlaneReadiness {
         let residents = self.residents.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(index) = residents
-            .iter()
-            .find_map(|((_, name), index)| (name == snapshot.generation().name()).then_some(index))
-        else {
+        let Some(index) = residents.get(&(
+            access.scope().to_owned(),
+            snapshot.generation().name().to_owned(),
+        )) else {
             return super::readiness::PlaneReadiness::Building;
         };
         let members = snapshot.membership().into_keys().collect();

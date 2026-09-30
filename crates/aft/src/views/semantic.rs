@@ -1014,15 +1014,8 @@ impl PlaneAdapter for SemanticPlane {
         self.arena(access.family()).trim();
     }
 
-    fn readiness(&self, snapshot: &Snapshot) -> PlaneReadiness {
-        let owner = lock(&self.residents)
-            .keys()
-            .find(|(_, _, generation)| generation == snapshot.generation().name())
-            .map(|(family, scope, _)| (family.clone(), scope.clone()));
-        let Some((family, scope)) = owner else {
-            return PlaneReadiness::Building;
-        };
-        self.readiness_for(&family, &scope, snapshot)
+    fn readiness(&self, access: &ViewAccess, snapshot: &Snapshot) -> PlaneReadiness {
+        self.readiness_for(access.family(), access.scope(), snapshot)
     }
 }
 
@@ -1448,7 +1441,7 @@ mod tests {
         let folded = checkout.load();
         assert!(folded.live_entries().next().is_none());
         assert_eq!(
-            plane.readiness(&folded),
+            plane.readiness(&checkout.access, &folded),
             PlaneReadiness::Ready {
                 pending: 3,
                 failed: 0
@@ -1465,7 +1458,7 @@ mod tests {
         let reopened = Checkout::open(storage.path(), "scope-a", root.path(), &reopened_plane);
         let snapshot = reopened.load();
         assert_eq!(
-            reopened_plane.readiness(&snapshot),
+            reopened_plane.readiness(&reopened.access, &snapshot),
             PlaneReadiness::Ready {
                 pending: 3,
                 failed: 0
@@ -1476,7 +1469,7 @@ mod tests {
         assert_eq!(report.installed, 3);
         let folded = reopened.load();
         assert_eq!(
-            reopened_plane.readiness(&folded),
+            reopened_plane.readiness(&reopened.access, &folded),
             PlaneReadiness::Ready {
                 pending: 0,
                 failed: 0
@@ -1631,7 +1624,7 @@ mod tests {
         let reopened = Checkout::open(storage.path(), "scope-a", root.path(), &reopened_plane);
         let snapshot = reopened.load();
         assert_eq!(
-            reopened_plane.readiness(&snapshot),
+            reopened_plane.readiness(&reopened.access, &snapshot),
             PlaneReadiness::Ready {
                 pending: 0,
                 failed: 1
@@ -1824,5 +1817,39 @@ mod tests {
             "superseded vectors of src\\alpha.rs were scored"
         );
         assert_eq!(edited.pending, vec![root.path().join("src\\alpha.rs")]);
+    }
+
+    /// Two views can hold the same generation (a seed is shared by name while
+    /// a sibling loads). Readiness is asked for one view, so each reports its
+    /// own fill state instead of whichever view happened to admit it first.
+    #[test]
+    fn readiness_is_per_view_when_views_share_a_generation() {
+        let storage = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        write_tree(first.path(), FILES);
+        write_tree(second.path(), FILES);
+        let plane = new_plane(storage.path(), "model-a");
+        let a = Checkout::open(storage.path(), "scope-a", first.path(), &plane);
+        let b = Checkout::open(storage.path(), "scope-b", second.path(), &plane);
+        let shared = a.load();
+        plane.open_generation(&b.access, shared.generation()).unwrap();
+        let unfilled = PlaneReadiness::Ready {
+            pending: 3,
+            failed: 0,
+        };
+        assert_eq!(plane.readiness(&a.access, &shared), unfilled);
+        assert_eq!(plane.readiness(&b.access, &shared), unfilled);
+
+        // Only the first view fills; the second still owes all its work.
+        assert_eq!(a.fill(&shared, &Model::default(), "model-a").installed, 3);
+        assert_eq!(
+            plane.readiness(&a.access, &shared),
+            PlaneReadiness::Ready {
+                pending: 0,
+                failed: 0
+            }
+        );
+        assert_eq!(plane.readiness(&b.access, &shared), unfilled);
     }
 }

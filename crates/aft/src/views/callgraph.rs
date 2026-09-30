@@ -226,13 +226,16 @@ impl PlaneAdapter for CallgraphPlane {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(access.scope().into(), generation.into()));
     }
-    fn readiness(&self, snapshot: &Snapshot) -> PlaneReadiness {
+    fn readiness(&self, access: &ViewAccess, snapshot: &Snapshot) -> PlaneReadiness {
         if !self
             .readers
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .any(|reader| Arc::ptr_eq(&reader.generation, snapshot.generation()))
+            .get(&(
+                access.scope().to_owned(),
+                snapshot.generation().name().to_owned(),
+            ))
+            .is_some_and(|reader| Arc::ptr_eq(&reader.generation, snapshot.generation()))
         {
             return PlaneReadiness::Building;
         }

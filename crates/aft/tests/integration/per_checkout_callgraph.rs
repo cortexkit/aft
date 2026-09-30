@@ -165,7 +165,7 @@ fn callgraph_plane_driver_attaches_materializes_and_installs_pinned_reader() {
     let (installed, gaps) = driver.installed_state(&access, FamilyPlane::Callgraph);
     assert!(gaps.is_empty());
     assert_eq!(
-        driver.plane.readiness(&installed),
+        driver.plane.readiness(&access, &installed),
         PlaneReadiness::Ready {
             pending: 0,
             failed: 0

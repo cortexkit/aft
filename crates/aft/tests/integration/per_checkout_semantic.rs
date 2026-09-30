@@ -432,7 +432,7 @@ fn embed_counts_views_and_sessions_share_identical_content() {
     let snapshot_a = a.load();
     let snapshot_b = b.load();
     assert_eq!(
-        plane_two.readiness(&snapshot_a),
+        plane_two.readiness(&a.access, &snapshot_a),
         PlaneReadiness::Ready {
             pending: 0,
             failed: 0
@@ -659,7 +659,7 @@ fn semantic_real_restart_reuses_embeddings_across_sessions() {
     let checkout = Checkout::open(storage.path(), "pool", root.path(), &plane_a);
     let snapshot = checkout.load();
     assert_eq!(
-        plane_a.readiness(&snapshot),
+        plane_a.readiness(&checkout.access, &snapshot),
         PlaneReadiness::Ready {
             pending: 0,
             failed: 0
@@ -728,7 +728,7 @@ fn semantic_forced_kill_during_fill_keeps_pending_and_stored_work() {
     );
     let snapshot = checkout.load();
     assert_eq!(
-        plane.readiness(&snapshot),
+        plane.readiness(&checkout.access, &snapshot),
         PlaneReadiness::Ready {
             pending: 3,
             failed: 0

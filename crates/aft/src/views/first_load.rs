@@ -197,7 +197,7 @@ impl SiblingLoader {
                 pending.push(error);
                 continue;
             }
-            if adapter.readiness(snapshot)
+            if adapter.readiness(access, snapshot)
                 != (super::readiness::PlaneReadiness::Ready {
                     pending: 0,
                     failed: 0,
@@ -1020,7 +1020,7 @@ impl FirstLoadDriver for CheckoutDriver {
 impl QueryState for CheckoutDriver {
     fn installed_state(
         &self,
-        _: &ViewAccess,
+        access: &ViewAccess,
         plane: FamilyPlane,
     ) -> (Snapshot, Vec<std::path::PathBuf>) {
         let installed = self
@@ -1037,7 +1037,7 @@ impl QueryState for CheckoutDriver {
         if self.adapters.iter().any(|adapter| {
             adapter.plane() == plane
                 && matches!(
-                    adapter.readiness(&snapshot),
+                    adapter.readiness(access, &snapshot),
                     super::readiness::PlaneReadiness::Absent
                         | super::readiness::PlaneReadiness::Building
                 )
@@ -1519,7 +1519,7 @@ mod callgraph_bridge_tests {
         let (snapshot, revision) = loader.reconciled(&access, own).unwrap();
         driver.install(&access, &snapshot, revision).unwrap();
         assert_eq!(
-            bridge.adapter.readiness(&snapshot),
+            bridge.adapter.readiness(&access, &snapshot),
             super::super::readiness::PlaneReadiness::Ready {
                 pending: 0,
                 failed: 0
@@ -1767,7 +1767,7 @@ mod integrated_plane_tests {
         assert_eq!(answer.matches.len(), 1);
         assert!(answer.gaps.is_empty());
         assert_eq!(
-            callgraph.adapter.readiness(&loaded.snapshot),
+            callgraph.adapter.readiness(&access, &loaded.snapshot),
             super::super::readiness::PlaneReadiness::Ready {
                 pending: 0,
                 failed: 0
