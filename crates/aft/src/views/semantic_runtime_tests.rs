@@ -309,7 +309,8 @@ fn report_resident_memory() {
         .map(PathBuf::from)
         .expect("AFT_SEMANTIC_MEMORY_ROOT");
     let root = std::fs::canonicalize(root).unwrap();
-    // A real embedding width, so byte counts are representative.
+    // Vectors as wide as the default local model's (384 floats), so the
+    // byte counts match what a real embedding run would hold.
     let wide = |text: &str| -> Vec<f32> {
         let seed = blake3::hash(text.as_bytes());
         (0..384)

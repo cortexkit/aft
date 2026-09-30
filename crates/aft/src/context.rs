@@ -5873,9 +5873,10 @@ impl AppContext {
         let head_metadata =
             crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
                 .map_err(|error| error.to_string())?;
-        // With a per-checkout semantic view the older view carries no
-        // semantic plane: its vectors came from the legacy index, which a
-        // views-on root no longer builds.
+        // With a per-checkout semantic view, the content-addressed view this
+        // function publishes (used for views-on callgraph reads) carries no
+        // semantic plane: its vectors came from the legacy semantic index,
+        // which such a root no longer builds.
         let semantic_search = self.config().indexes.semantic && !self.checkout_semantic.active();
         let semantic_keys = if semantic_search && allow_blob_put {
             let index = self

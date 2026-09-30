@@ -3802,8 +3802,8 @@ fn handle_semantic_or_hybrid_search(
         && results.is_empty()
         && lexical_ready
     {
-        // An empty semantic answer can be empty only because its files are
-        // not embedded yet; the escalated answer still names them.
+        // An empty semantic answer may be empty because some files are not
+        // embedded yet; the escalated lexical answer still names them.
         let mut escalation_extras = serde_json::Map::new();
         if let Some(gaps) = &semantic_gaps {
             let mut note = String::new();

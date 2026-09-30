@@ -587,7 +587,7 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
             "views-on return switch must reuse A's content-addressed vectors"
         );
     });
-    // SAFETY: as above.
+    // SAFETY: restored while `watcher_serial_lock` is still held.
     unsafe {
         match previous_quiet {
             Some(value) => std::env::set_var("AFT_SEMANTIC_QUIET_WINDOW_MS", value),

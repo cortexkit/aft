@@ -35,7 +35,8 @@ use super::registry::{FamilyRegistry, ViewRegistration};
 use super::semantic::{FillBudget, FillReport, SemanticPlane, SemanticProducer, SemanticQuery};
 use super::snapshot::Snapshot;
 
-/// Producer recorded for a plane this runtime does not register.
+/// Producer written into the manifest header for the trigram and callgraph
+/// planes, which this semantic-only runtime does not register.
 pub const UNREGISTERED_PRODUCER: &str = "unregistered";
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -229,7 +230,8 @@ impl CheckoutSemantic {
             .map_err(|error| error.to_string())
     }
 
-    /// The index `search` scores, for callers that need to hold it.
+    /// The resident index `search` scores for the installed snapshot, for
+    /// callers (such as the search engine's readiness snapshot) that hold it.
     pub fn index(&self) -> Result<Arc<SemanticIndex>, String> {
         self.plane
             .overlay(&self.access, &self.root, &self.installed())
