@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "per-checkout-semantic-views"
+  ],
+  "note": "Ranking fence hit is crates/aft/src/semantic_index.rs only. The frozen shared semantic base now holds its vectors as Arc-shared runs (one run for a base frozen from a root, one per file for a per-checkout view) and iterates them back to back in the original order; search_filtered and every other default-path scorer are unchanged. The new per-checkout semantic plane is opt-in and unregistered, so the views-off search path is untouched. Ranked rows must remain byte-identical to the committed reference."
+}

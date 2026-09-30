@@ -581,8 +581,10 @@ impl SemanticPlane {
                                 ready.push((item, key));
                             }
                             Ok(PutOrTouch::Quarantined) => report.failed += 1,
-                            // Another process stored this key first; its
-                            // payload is the one every view must read.
+                            // Another process stored a payload under the
+                            // same key first (a model need not be bit-stable
+                            // across calls); read the stored payload so every
+                            // view uses the same vectors for the key.
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
                                 if arena
                                     .load(&store.reader(), &key, &relative, &payload_producer)
@@ -621,8 +623,9 @@ impl SemanticPlane {
 
         let keys = ready.iter().map(|(_, key)| *key).collect::<Vec<_>>();
         protect(&view, &keys)?;
-        // A row a sweep removed before the pin covered it is not relied on:
-        // its path stays pending and the next fill stores it again.
+        // A family GC sweep can delete a blob row between the lookup above and
+        // the live-pin write. Such a key is not admitted: its path stays
+        // pending and the next fill stores the blob again.
         let swept = store
             .touch(&keys)
             .map_err(|error| plane_error(error.to_string()))?

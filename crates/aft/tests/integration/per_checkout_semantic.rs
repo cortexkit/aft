@@ -412,8 +412,9 @@ fn embed_counts_views_and_sessions_share_identical_content() {
         two_views, chunks,
         "two views embedded identical content twice"
     );
-    // The session ends before either view publishes its fills: the per-root
-    // delta of the old overlay was lost at this point.
+    // The session ends before either view publishes its fills. This is the
+    // case where the resident index's per-root in-memory changes were lost
+    // and the next session embedded the same files again.
     drop((a, b, plane_one));
 
     // Session 2 on the same pool worktrees.
@@ -487,9 +488,9 @@ fn embed_counts_views_and_sessions_share_identical_content() {
         cold(older.path(), "model-a", "read record").0
     );
 
-    // The same scenario through per-root full builds, as a root whose
-    // private delta did not survive the session embeds it; measured, not
-    // derived, with the same model and batch size.
+    // The same scenario through one full `SemanticIndex` build per checkout
+    // and session, which is what a root re-embeds when nothing it held
+    // survived; measured, not derived, with the same model and batch size.
     let per_root = |root: &Path| cold(root, "model-a", "load").1;
     let legacy_two_views = per_root(first.path()) + per_root(second.path());
     let legacy_second_session = per_root(first.path()) + per_root(second.path());
