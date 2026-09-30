@@ -4267,6 +4267,9 @@ impl AppContext {
 
     pub(crate) fn mark_subc_bound(&self) {
         self.subc_lifecycle.mark_bound();
+        // A views-on semantic lane pauses its fills while the root is unbound
+        // past the grace window; resume them now rather than at the next edit.
+        self.checkout_semantic.wake();
     }
 
     pub(crate) fn mark_subc_unbound(&self) {

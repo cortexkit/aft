@@ -249,6 +249,9 @@ pub struct SemanticPlane {
     views: Mutex<BTreeMap<ViewKey, Arc<Mutex<ViewState>>>>,
     residents: Mutex<BTreeMap<ResidentKey, Arc<Resident>>>,
     arenas: Mutex<BTreeMap<String, Arc<super::semantic_arena::SemanticArena>>>,
+    /// Scored indexes built by `overlay`, for tests that prove a path never
+    /// builds one.
+    overlay_builds: std::sync::atomic::AtomicU64,
     /// Separator of the native relative paths the overlay holds; see
     /// [`overlay_rel_path`]. Always the platform's own outside tests.
     separator: char,
@@ -282,6 +285,7 @@ impl SemanticPlane {
             views: Mutex::new(BTreeMap::new()),
             residents: Mutex::new(BTreeMap::new()),
             arenas: Mutex::new(BTreeMap::new()),
+            overlay_builds: std::sync::atomic::AtomicU64::new(0),
             separator: std::path::MAIN_SEPARATOR,
         }
     }
@@ -923,6 +927,8 @@ impl SemanticPlane {
         let index = match state.cache.as_ref() {
             Some((key, index)) if *key == cache_key => Arc::clone(index),
             _ => {
+                self.overlay_builds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let index = Arc::new(SemanticIndex::for_view(
                     root.to_path_buf(),
                     &resident.base,
@@ -946,6 +952,22 @@ impl SemanticPlane {
                 .collect(),
             unvouched,
         })
+    }
+
+    /// The index `overlay` last built for the view, whatever snapshot it was
+    /// built for. Never builds one.
+    pub fn cached_index(&self, access: &ViewAccess) -> Option<Arc<SemanticIndex>> {
+        let view = lock(&self.views)
+            .get(&(access.family().to_owned(), access.scope().to_owned()))
+            .cloned()?;
+        let state = lock(&view);
+        state.cache.as_ref().map(|(_, index)| Arc::clone(index))
+    }
+
+    /// How many scored indexes `overlay` has built.
+    pub fn overlay_builds(&self) -> u64 {
+        self.overlay_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This checkout's own resident semantic bytes: the replacement entries

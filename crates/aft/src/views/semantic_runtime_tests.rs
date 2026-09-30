@@ -264,6 +264,111 @@ fn budgeted_rounds_fold_once_when_caught_up() {
     assert!(query(&runtime, "alpha").complete());
 }
 
+fn fast_schedule(root: &Path) -> FillSchedule {
+    FillSchedule {
+        root: root.to_path_buf(),
+        quiet_window: Duration::from_millis(10),
+        retry_initial: Duration::from_millis(20),
+        retry_max: Duration::from_millis(80),
+        limiter: crate::cold_build_limiter::isolated_limiter(1),
+        paused: Box::new(|| false),
+        max_batch: 64,
+    }
+}
+
+/// A lane whose checkout is loaded and served, as the worker leaves it.
+fn served_lane(
+    storage: &Path,
+    root: &Path,
+) -> (
+    Arc<CheckoutSemanticSlot>,
+    u64,
+    crossbeam_channel::Receiver<()>,
+    Arc<CheckoutSemantic>,
+) {
+    let slot = Arc::new(CheckoutSemanticSlot::default());
+    let (epoch, wake) = slot.begin();
+    let runtime = Arc::new(
+        CheckoutSemantic::new(
+            storage,
+            "family",
+            "scope",
+            root,
+            producer(),
+            Arc::downgrade(&slot),
+        )
+        .unwrap(),
+    );
+    runtime.load().unwrap();
+    assert!(slot.install(epoch, Arc::clone(&runtime)));
+    (slot, epoch, wake, runtime)
+}
+
+/// A fill that fails because the embedding backend is down is retried on a
+/// backoff: with no edit, wake or reconfigure, the view becomes complete once
+/// the backend answers again.
+#[test]
+fn transient_embed_errors_retry_until_complete_without_a_wake() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let calls = Arc::clone(&calls);
+        let root = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let schedule = fast_schedule(&root);
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts: Vec<String>| {
+                // The backend is unreachable for the first three calls.
+                if calls.fetch_add(1, Ordering::SeqCst) < 3 {
+                    return Err("embedding backend unreachable".to_string());
+                }
+                Ok(texts.iter().map(|text| vector(text)).collect())
+            });
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let complete = loop {
+        if query(&runtime, "alpha").complete() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    slot.clear();
+    worker.join().unwrap();
+    assert!(
+        complete,
+        "a transient embed error left the view partial with no retry"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 4);
+}
+
+/// A superseded runtime of the same view (a lane restarted with the same
+/// producer) must not release the state of the runtime that replaced it.
+#[test]
+fn dropping_a_superseded_runtime_keeps_the_replacements_view() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let old = open(storage.path(), "scope", root.path());
+    let new = open(storage.path(), "scope", root.path());
+    assert!(Arc::ptr_eq(old.plane(), new.plane()));
+    refresh(&new, &Model::default());
+    drop(old);
+    let answer = new
+        .search(&vector("alpha"), 10, &|_| true)
+        .expect("the replacement lost its resident generation");
+    assert!(
+        answer.complete(),
+        "the replacement lost its fills: {answer:?}"
+    );
+}
+
 /// An AFT write under the root wakes the lane's worker; one elsewhere does not.
 #[test]
 fn aft_writes_wake_only_their_own_lane() {

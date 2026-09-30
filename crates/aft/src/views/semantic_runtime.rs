@@ -19,7 +19,7 @@
 //! path without current vectors as a gap.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -129,9 +129,11 @@ impl CheckoutSemantic {
             slot: wake,
         });
         super::intent::register_listener(&listener);
+        let access = ViewAccess::Owner(owner.clone());
+        hold_view(&plane, &access);
         Ok(Self {
             root: root.to_path_buf(),
-            access: ViewAccess::Owner(owner.clone()),
+            access,
             owner,
             driver,
             loader,
@@ -232,11 +234,19 @@ impl CheckoutSemantic {
 
     /// The resident index `search` scores for the installed snapshot, for
     /// callers (such as the search engine's readiness snapshot) that hold it.
+    /// Builds it when the cached one is out of date.
     pub fn index(&self) -> Result<Arc<SemanticIndex>, String> {
         self.plane
             .overlay(&self.access, &self.root, &self.installed())
             .map(|overlay| overlay.index)
             .map_err(|error| error.to_string())
+    }
+
+    /// The index this checkout last built, possibly for an older snapshot,
+    /// without building anything. Readiness reports use it: they run on the
+    /// search path and only need to know that an index is being served.
+    pub fn cached_index(&self) -> Option<Arc<SemanticIndex>> {
+        self.plane.cached_index(&self.access)
     }
 
     /// Resident bytes this checkout accounts for: the family arena (shared
@@ -252,7 +262,50 @@ impl CheckoutSemantic {
 
 impl Drop for CheckoutSemantic {
     fn drop(&mut self) {
-        self.plane.unbind(&self.access);
+        // A lane restarted with the same producer shares this plane and view
+        // (same family and scope). Only the last checkout runtime of a view
+        // releases its state, or a superseded worker exiting would wipe the
+        // fills and resident generations of the lane that replaced it.
+        if release_view(&self.plane, &self.access) {
+            self.plane.unbind(&self.access);
+        }
+    }
+}
+
+type LiveViewKey = (usize, String, String);
+
+fn live_views() -> &'static Mutex<std::collections::HashMap<LiveViewKey, usize>> {
+    static LIVE: OnceLock<Mutex<std::collections::HashMap<LiveViewKey, usize>>> = OnceLock::new();
+    LIVE.get_or_init(Default::default)
+}
+
+fn live_view_key(plane: &Arc<SemanticPlane>, access: &ViewAccess) -> LiveViewKey {
+    (
+        Arc::as_ptr(plane) as usize,
+        access.family().to_owned(),
+        access.scope().to_owned(),
+    )
+}
+
+fn hold_view(plane: &Arc<SemanticPlane>, access: &ViewAccess) {
+    *lock(live_views())
+        .entry(live_view_key(plane, access))
+        .or_default() += 1;
+}
+
+/// Drops one holder of the view; true when it was the last.
+fn release_view(plane: &Arc<SemanticPlane>, access: &ViewAccess) -> bool {
+    let mut live = lock(live_views());
+    let key = live_view_key(plane, access);
+    let Some(count) = live.get_mut(&key) else {
+        return true;
+    };
+    *count -= 1;
+    if *count == 0 {
+        live.remove(&key);
+        true
+    } else {
+        false
     }
 }
 
@@ -317,9 +370,17 @@ pub struct CheckoutSemanticSlot {
     state: RwLock<Option<CheckoutSemanticState>>,
     epoch: AtomicU64,
     wake: Mutex<Option<crossbeam_channel::Sender<()>>>,
+    /// Worker threads currently running for this slot, of any epoch.
+    workers: AtomicUsize,
 }
 
 impl CheckoutSemanticSlot {
+    /// Worker threads of this lane still running, including superseded ones
+    /// that have not noticed yet.
+    pub fn workers(&self) -> usize {
+        self.workers.load(Ordering::SeqCst)
+    }
+
     /// Starts a new epoch in the `Loading` state and returns it with the
     /// receiver the new worker waits on.
     pub fn begin(&self) -> (u64, crossbeam_channel::Receiver<()>) {
@@ -406,17 +467,38 @@ pub(crate) struct WorkerConfig {
     pub family: String,
     pub scope: String,
     pub semantic: crate::config::SemanticBackendConfig,
-    pub quiet_window: Duration,
     /// The root's semantic status, which every status and readiness surface
     /// reads. The worker keeps it in step with the lane.
     pub status: Arc<RwLock<crate::context::SemanticIndexStatus>>,
     /// The root's installed checkout driver, which receives watcher changes.
     pub drivers: InstalledDriver,
+    pub schedule: FillSchedule,
+}
+
+/// When and under what admission the worker fills.
+pub(crate) struct FillSchedule {
+    pub root: PathBuf,
+    /// How long wakes must stop arriving before a fill runs, so a burst of
+    /// edits is embedded once.
+    pub quiet_window: Duration,
+    /// First and longest wait before retrying a fill that left work behind
+    /// because of a transient error (an unreachable or failing embedding
+    /// backend, a checkout that changed during reconciliation). The wait
+    /// doubles after each retry that makes no progress and starts over after
+    /// one that does, so a backend that comes back is used again without
+    /// any edit or reconfigure.
+    pub retry_initial: Duration,
+    pub retry_max: Duration,
     pub limiter: Arc<crate::cold_build_limiter::ColdBuildLimiter>,
     /// True while the root has been unbound past the abandon grace window;
     /// refreshes wait for a rebind instead of loading the embedder.
     pub paused: Box<dyn Fn() -> bool + Send>,
+    pub max_batch: usize,
 }
+
+/// Production retry waits for fills that hit a transient error.
+pub(crate) const RETRY_INITIAL: Duration = Duration::from_secs(5);
+pub(crate) const RETRY_MAX: Duration = Duration::from_secs(300);
 
 const LIMITER_KIND: &str = "semantic view fill";
 
@@ -433,9 +515,33 @@ fn set_status(
     }
 }
 
+fn is_current(slot: &Weak<CheckoutSemanticSlot>, epoch: u64) -> bool {
+    slot.upgrade().is_some_and(|slot| slot.is_current(epoch))
+}
+
+/// Counts a running worker on its slot for as long as it lives.
+struct WorkerGuard(Weak<CheckoutSemanticSlot>);
+
+impl WorkerGuard {
+    fn enter(slot: &Weak<CheckoutSemanticSlot>) -> Self {
+        if let Some(slot) = slot.upgrade() {
+            slot.workers.fetch_add(1, Ordering::SeqCst);
+        }
+        Self(slot.clone())
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0.upgrade() {
+            slot.workers.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// Runs a root's views-on semantic lane: starts the embedding model,
-/// registers and loads the checkout, then fills it now and after every
-/// quiet window that follows a wake.
+/// registers and loads the checkout, then fills it now and whenever
+/// [`serve_fills`] decides to.
 ///
 /// The worker holds the slot only weakly, so it stops when the root's
 /// context is dropped or the lane is cleared.
@@ -445,6 +551,12 @@ pub(crate) fn run_worker(
     wake: crossbeam_channel::Receiver<()>,
     config: WorkerConfig,
 ) {
+    let _counted = WorkerGuard::enter(&slot);
+    // A lane cleared or restarted before this worker began (two quick
+    // configures) does nothing at all: no model, no registration.
+    if !is_current(&slot, epoch) {
+        return;
+    }
     let fail = |reason: String| {
         crate::slog_warn!(
             "semantic view unavailable root={} reason={}",
@@ -470,6 +582,9 @@ pub(crate) fn run_worker(
         Err(error) => return fail(format!("embedding model: {error}")),
     };
     let producer = SemanticProducer::current(fingerprint.as_string(), fingerprint.embed_text_caps);
+    if !is_current(&slot, epoch) {
+        return;
+    }
     let runtime = match CheckoutSemantic::new(
         &config.storage,
         &config.family,
@@ -481,7 +596,7 @@ pub(crate) fn run_worker(
         Ok(runtime) => Arc::new(runtime),
         Err(error) => return fail(format!("view registration: {error}")),
     };
-    if !slot.upgrade().is_some_and(|slot| slot.is_current(epoch)) {
+    if !is_current(&slot, epoch) {
         return;
     }
     // Subscribe to watcher changes and write intents before the first
@@ -492,6 +607,9 @@ pub(crate) fn run_worker(
         config.drivers.clear_if(runtime.driver());
         return fail(format!("view load: {error}"));
     }
+    // Build the index queries score before the lane is served, so neither
+    // the first query nor a readiness sample has to build it.
+    let _ = runtime.index();
     crate::slog_info!(
         "semantic view loaded root={} family={} scope={} load_ms={}",
         config.root.display(),
@@ -512,28 +630,135 @@ pub(crate) fn run_worker(
         &config.status,
         crate::context::SemanticIndexStatus::ready(),
     );
+    drop(runtime);
+    serve_fills(&slot, epoch, &wake, &config.schedule, &mut |texts| {
+        model.embed(texts)
+    });
+}
 
+/// What one catch-up left behind.
+enum FillOutcome {
+    /// Nothing more to do until the next wake.
+    Settled,
+    /// Work is left because of a transient error or a paused root; retry
+    /// after a wait. `progress` is whether this attempt got anything done.
+    Retry { progress: bool },
+    /// The lane is no longer this worker's.
+    Stop,
+}
+
+/// Fills the lane's installed checkout now, then again after the quiet
+/// window following each wake, and after a backoff when a fill left work
+/// behind because of a transient error. Returns when the lane is cleared,
+/// restarted or dropped.
+pub(crate) fn serve_fills<F>(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    wake: &crossbeam_channel::Receiver<()>,
+    schedule: &FillSchedule,
+    embed: &mut F,
+) where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
     let budget = FillBudget {
-        max_batch: config.semantic.max_batch_size.max(1),
+        max_batch: schedule.max_batch.max(1),
         ..FillBudget::default()
     };
-    let mut embed = |texts: Vec<String>| model.embed(texts);
-    let current = || slot.upgrade().is_some_and(|slot| slot.is_current(epoch));
-    let mut fill_until_done = |runtime: &CheckoutSemantic| loop {
-        let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
-            &config.limiter,
-            LIMITER_KIND,
-            &config.root,
-            current,
-        ) else {
-            return;
+    let mut backoff = schedule.retry_initial;
+    let mut retry_after = None;
+    let mut first = true;
+    loop {
+        if !first {
+            let woke = match retry_after {
+                Some(wait) => match wake.recv_timeout(wait) {
+                    Ok(()) => true,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                },
+                None => match wake.recv() {
+                    Ok(()) => true,
+                    Err(_) => return,
+                },
+            };
+            if woke && !wait_quiet(wake, schedule.quiet_window) {
+                return;
+            }
+        }
+        first = false;
+        let outcome = if (schedule.paused)() {
+            FillOutcome::Retry { progress: false }
+        } else {
+            match slot
+                .upgrade()
+                .filter(|slot| slot.is_current(epoch))
+                .and_then(|slot| slot.runtime())
+            {
+                Some(runtime) => catch_up(slot, epoch, &runtime, schedule, budget, embed),
+                None => FillOutcome::Stop,
+            }
         };
-        match runtime.refresh(budget, &mut embed) {
+        match outcome {
+            FillOutcome::Stop => return,
+            FillOutcome::Settled => {
+                backoff = schedule.retry_initial;
+                retry_after = None;
+            }
+            FillOutcome::Retry { progress } => {
+                if progress {
+                    backoff = schedule.retry_initial;
+                }
+                retry_after = Some(backoff);
+                backoff = (backoff * 2).min(schedule.retry_max);
+            }
+        }
+    }
+}
+
+/// Waits until wakes stop arriving for `quiet_window`. False when the lane's
+/// wake channel closed.
+fn wait_quiet(wake: &crossbeam_channel::Receiver<()>, quiet_window: Duration) -> bool {
+    let mut deadline = Instant::now() + quiet_window;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return true;
+        };
+        match wake.recv_timeout(remaining) {
+            Ok(()) => deadline = Instant::now() + quiet_window,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => return true,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+        }
+    }
+}
+
+/// Fills `runtime` in budgeted rounds until no budgeted work remains or a
+/// round makes no progress.
+fn catch_up<F>(
+    slot: &Weak<CheckoutSemanticSlot>,
+    epoch: u64,
+    runtime: &CheckoutSemantic,
+    schedule: &FillSchedule,
+    budget: FillBudget,
+    embed: &mut F,
+) -> FillOutcome
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    let mut progress = false;
+    loop {
+        let Some(_permit) = crate::cold_build_limiter::acquire_blocking_while_for_root_with_limiter(
+            &schedule.limiter,
+            LIMITER_KIND,
+            &schedule.root,
+            || is_current(slot, epoch),
+        ) else {
+            return FillOutcome::Stop;
+        };
+        match runtime.refresh(budget, embed) {
             Ok(report) => {
                 if report.model_calls > 0 || report.installed > 0 || !report.errors.is_empty() {
                     crate::slog_info!(
                         "semantic view fill root={} queued={} deferred={} embedded_keys={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={}",
-                        config.root.display(),
+                        schedule.root.display(),
                         report.queued,
                         report.deferred,
                         report.embedded_keys,
@@ -546,49 +771,40 @@ pub(crate) fn run_worker(
                         report.errors.len()
                     );
                 }
-                // Work beyond the budget continues at once; a fill that made
-                // no progress waits for the next wake instead of spinning.
-                if report.deferred == 0 || (report.installed == 0 && report.failed == 0) {
-                    return;
+                let advanced = report.installed > 0 || report.failed > 0;
+                progress |= advanced;
+                if !report.errors.is_empty() {
+                    crate::slog_warn!(
+                        "semantic view fill left work for a retry root={} error={}",
+                        schedule.root.display(),
+                        report.errors[0]
+                    );
+                    warm_index(runtime);
+                    return FillOutcome::Retry { progress };
+                }
+                // Work beyond the budget continues at once; a round that made
+                // no progress without an error has nothing it can do now.
+                if report.deferred == 0 || !advanced {
+                    warm_index(runtime);
+                    return FillOutcome::Settled;
                 }
             }
             Err(error) => {
                 crate::slog_warn!(
                     "semantic view refresh failed root={} error={}",
-                    config.root.display(),
+                    schedule.root.display(),
                     error
                 );
-                return;
+                return FillOutcome::Retry { progress };
             }
         }
-    };
-
-    fill_until_done(&runtime);
-    drop(runtime);
-    while wake.recv().is_ok() {
-        let mut deadline = Instant::now() + config.quiet_window;
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                break;
-            };
-            match wake.recv_timeout(remaining) {
-                Ok(()) => deadline = Instant::now() + config.quiet_window,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-            }
-        }
-        if (config.paused)() {
-            continue;
-        }
-        let Some(runtime) = slot
-            .upgrade()
-            .filter(|slot| slot.is_current(epoch))
-            .and_then(|slot| slot.runtime())
-        else {
-            return;
-        };
-        fill_until_done(&runtime);
     }
+}
+
+/// Rebuilds the scored index after a fill, on the worker rather than on the
+/// next query.
+fn warm_index(runtime: &CheckoutSemantic) {
+    let _ = runtime.index();
 }
 
 #[cfg(test)]

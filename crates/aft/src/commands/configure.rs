@@ -5780,12 +5780,18 @@ fn start_checkout_semantic_lane(
         storage: crate::bash_background::storage_dir(storage_dir),
         family: family.to_owned(),
         scope: crate::path_identity::project_scope_key(root),
-        semantic,
-        quiet_window: semantic_refresh_quiet_window(),
         status: ctx.semantic_index_status_handle(),
         drivers: ctx.installed_checkout_driver(),
-        limiter: ctx.cold_build_limiter(),
-        paused: Box::new(move || lifecycle.unbound_past_grace()),
+        schedule: crate::views::semantic_runtime::FillSchedule {
+            root: root.to_path_buf(),
+            quiet_window: semantic_refresh_quiet_window(),
+            retry_initial: crate::views::semantic_runtime::RETRY_INITIAL,
+            retry_max: crate::views::semantic_runtime::RETRY_MAX,
+            limiter: ctx.cold_build_limiter(),
+            paused: Box::new(move || lifecycle.unbound_past_grace()),
+            max_batch: semantic.max_batch_size,
+        },
+        semantic,
     };
     let weak_slot = Arc::downgrade(slot);
     let session_id = log_ctx::current_session();
@@ -7998,6 +8004,104 @@ mod tests {
         let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
         let digest = serde_json::to_value(digest).unwrap();
         assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
+    }
+
+    /// While a views-on root is unbound past the grace window its semantic
+    /// lane embeds nothing; after the rebind it resumes on its own and embeds
+    /// only what changed, reusing every stored vector.
+    #[test]
+    fn semantic_view_pauses_while_unbound_and_resumes_after_rebind() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
+        let server = CountingEmbeddingServer::start();
+        server.release_responses();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let root = project.path().canonicalize().unwrap();
+        for index in 0..6 {
+            fs::write(
+                root.join(format!("module_{index}.rs")),
+                format!("pub fn stored_function_{index}(value: u32) -> u32 {{\n    value + {index}\n}}\n"),
+            )
+            .unwrap();
+        }
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let request = configure_semantic_views(&root, storage.path(), &server.base_url);
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let complete = |ctx: &AppContext| {
+            ctx.checkout_semantic_runtime().is_some_and(|runtime| {
+                runtime
+                    .search(&[1.0, 0.0, 0.0], 1_000, &|_| true)
+                    .is_ok_and(|answer| answer.complete())
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !complete(&ctx) {
+            assert!(Instant::now() < deadline, "the semantic view never filled");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let stored = server.non_probe_input_count();
+        assert!(stored >= 6);
+
+        ctx.set_unbound_build_abandon_grace_for_test(Duration::from_millis(10));
+        ctx.mark_subc_unbound();
+        std::thread::sleep(Duration::from_millis(50));
+        let edited = root.join("module_0.rs");
+        fs::write(
+            &edited,
+            "pub fn resumed_after_rebind(value: u32) -> u32 {\n    value * 2\n}\n",
+        )
+        .unwrap();
+        ctx.record_checkout_watcher_change(&edited);
+        // Several quiet windows pass while unbound: nothing is embedded.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            server.non_probe_input_count(),
+            stored,
+            "the lane embedded while its root was unbound past grace"
+        );
+        assert!(!complete(&ctx), "the unreconciled edit must stay a gap");
+
+        // No further edit or wake: the rebind alone resumes the lane, well
+        // before the first transient-retry wait (five seconds) would.
+        ctx.mark_subc_bound();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let names = |ctx: &AppContext| {
+            ctx.checkout_semantic_runtime()
+                .unwrap()
+                .search(&[1.0, 0.0, 0.0], 1_000, &|_| true)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|result| result.name)
+                .collect::<Vec<_>>()
+        };
+        while !(complete(&ctx)
+            && names(&ctx)
+                .iter()
+                .any(|name| name == "resumed_after_rebind"))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the lane did not resume after the rebind"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let resumed = server.non_probe_input_count() - stored;
+        assert!(
+            (1..=2).contains(&resumed),
+            "the rebind re-embedded stored content: {resumed} text(s)"
+        );
     }
 
     /// Callgraph view publication never waits on semantic embedding. With

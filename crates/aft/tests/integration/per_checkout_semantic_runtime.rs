@@ -134,10 +134,15 @@ fn serve(stream: &mut TcpStream, texts: &AtomicUsize) -> std::io::Result<()> {
             .count(),
         Ordering::SeqCst,
     );
+    // Vectors depend on the model too, so vectors of one model never rank
+    // like another's: a test can tell which model's vectors were scored.
+    let model = body["model"].as_str().unwrap_or_default().to_owned();
     let data = inputs
         .iter()
         .enumerate()
-        .map(|(index, input)| json!({ "embedding": vector(input), "index": index }))
+        .map(|(index, input)| {
+            json!({ "embedding": vector(&format!("{model}\u{0}{input}")), "index": index })
+        })
         .collect::<Vec<_>>();
     let body = json!({ "data": data }).to_string();
     write!(
@@ -220,11 +225,27 @@ fn request(value: Value) -> RawRequest {
     serde_json::from_value(value).unwrap()
 }
 
+const MODEL: &str = "views-semantic-mock";
+
 fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
         Config::default(),
     ));
+    send_configure(&ctx, root, storage, server, views, MODEL);
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    ctx
+}
+
+/// Sends one configure request without running its deferred maintenance.
+fn send_configure(
+    ctx: &AppContext,
+    root: &Path,
+    storage: &Path,
+    server: &MockEmbedder,
+    views: bool,
+    model: &str,
+) {
     let configured = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-views-semantic",
@@ -239,7 +260,7 @@ fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) ->
                 "views": { "enabled": views },
                 "semantic": {
                     "backend": "openai_compatible",
-                    "model": "views-semantic-mock",
+                    "model": model,
                     "base_url": server.base_url,
                     "timeout_ms": 5_000,
                     "max_batch_size": 64,
@@ -247,11 +268,9 @@ fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) ->
                 }
             }))
         })),
-        &ctx,
+        ctx,
     );
     assert!(configured.success, "configure failed: {configured:?}");
-    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-    ctx
 }
 
 fn drain(ctx: &AppContext) {
@@ -398,6 +417,145 @@ fn views_on_worktrees_and_sessions_embed_each_chunk_once() {
         server.texts(),
         embedded,
         "a later session re-embedded content its family already holds"
+    );
+}
+
+/// The model fingerprint of the root's served semantic view, if any.
+fn served_model(ctx: &AppContext) -> Option<String> {
+    ctx.checkout_semantic_runtime().map(|runtime| {
+        runtime
+            .plane()
+            .semantic_producer()
+            .model_fingerprint
+            .clone()
+    })
+}
+
+/// Waits until exactly one lane worker is left for the root and no other
+/// starts within a short settle time.
+fn wait_single_worker(ctx: &AppContext) {
+    let deadline = Instant::now() + DEADLINE;
+    while ctx.checkout_semantic().workers() != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "lane workers never settled to one: {}",
+            ctx.checkout_semantic().workers()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(ctx.checkout_semantic().workers(), 1);
+}
+
+/// Reconfiguring a views-on root with another embedding model restarts its
+/// semantic lane with the new producer: every chunk is embedded again under
+/// that model, one worker is left, and the answers rank exactly like a
+/// views-off root on the new model (the mock's vectors depend on the model,
+/// so any vector of the old model would change them).
+#[test]
+fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    let ctx = configure(&repo.main, storage.path(), &server, true);
+    wait_views_filled(&ctx);
+    let old_model = served_model(&ctx).unwrap();
+    assert_eq!(server.texts(), chunks);
+
+    send_configure(
+        &ctx,
+        &repo.main,
+        storage.path(),
+        &server,
+        true,
+        "views-semantic-mock-2",
+    );
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    let deadline = Instant::now() + DEADLINE;
+    while served_model(&ctx).is_none_or(|model| model == old_model) {
+        drain(&ctx);
+        assert!(Instant::now() < deadline, "the lane never restarted");
+        thread::sleep(Duration::from_millis(20));
+    }
+    wait_views_filled(&ctx);
+    wait_single_worker(&ctx);
+    assert_eq!(
+        server.texts(),
+        2 * chunks,
+        "the new model must embed every chunk once, reusing nothing of the old one"
+    );
+
+    let legacy_storage = tempfile::tempdir().unwrap();
+    let legacy = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    send_configure(
+        &legacy,
+        &repo.main,
+        legacy_storage.path(),
+        &server,
+        false,
+        "views-semantic-mock-2",
+    );
+    aft::runtime_drain::drain_deferred_configure_maintenance(&legacy);
+    wait_legacy_ready(&legacy);
+    for query in [
+        "evict the oldest cache entry",
+        "exponential backoff between retries",
+    ] {
+        let expected = ranked(&repo.main, &search(&legacy, query));
+        let actual = search(&ctx, query);
+        assert_eq!(actual["complete"], true, "{actual:#}");
+        assert_eq!(
+            ranked(&repo.main, &actual),
+            expected,
+            "views-on after a model change ranks differently for {query:?}"
+        );
+    }
+}
+
+/// Two configures in quick succession leave one lane worker, serving the
+/// second configure's model; the superseded lane embeds nothing.
+#[test]
+fn views_on_back_to_back_configures_leave_one_worker() {
+    let server = MockEmbedder::start();
+    let repo = repository();
+    let storage = tempfile::tempdir().unwrap();
+    let chunks = unique_chunks(&repo.main);
+    let ctx = Arc::new(AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config::default(),
+    ));
+    send_configure(
+        &ctx,
+        &repo.main,
+        storage.path(),
+        &server,
+        true,
+        "first-model",
+    );
+    send_configure(
+        &ctx,
+        &repo.main,
+        storage.path(),
+        &server,
+        true,
+        "second-model",
+    );
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    wait_views_filled(&ctx);
+    wait_single_worker(&ctx);
+    assert!(
+        served_model(&ctx).is_some_and(|model| model.contains("second-model")),
+        "the lane serves {:?}",
+        served_model(&ctx)
+    );
+    assert_eq!(
+        server.texts(),
+        chunks,
+        "the superseded lane embedded content"
     );
 }
 

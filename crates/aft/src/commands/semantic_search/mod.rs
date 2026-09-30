@@ -440,12 +440,16 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
         ) {
             Some(status) => {
                 let status = status.clone();
-                // A views-on root scores its checkout view's resident index;
-                // views-off roots never have one.
+                // A views-on root reports its checkout view's last built
+                // index. A readiness sample runs on the search path, so it
+                // never builds one: the fill worker builds it before the
+                // lane is served and after every fill, and a search builds
+                // it if it is still out of date. Views-off roots never have
+                // a checkout view.
                 let checkout_index = matches!(status, SemanticIndexStatus::Ready { .. })
                     .then(|| self.ctx.checkout_semantic_runtime())
                     .flatten()
-                    .and_then(|runtime| runtime.index().ok());
+                    .and_then(|runtime| runtime.cached_index());
                 if let Some(index) = checkout_index {
                     SemanticReadiness {
                         status,
@@ -6217,6 +6221,63 @@ mod tests {
                 ..Config::default()
             },
         )
+    }
+
+    /// A readiness sample runs on the search path, so it reports the views-on
+    /// checkout index the worker last built and never builds one, even when
+    /// that index is out of date for the installed snapshot.
+    #[test]
+    fn readiness_sample_never_builds_the_checkout_semantic_index() {
+        use extensions::ReadinessSource as _;
+        let project = tempfile::tempdir().expect("project");
+        let storage = tempfile::tempdir().expect("storage");
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lib.rs"), "pub fn needle() -> u8 {\n    1\n}\n").unwrap();
+        let ctx = test_context(&root);
+        let slot = ctx.checkout_semantic();
+        let (epoch, _wake) = slot.begin();
+        let runtime = Arc::new(
+            crate::views::semantic_runtime::CheckoutSemantic::new(
+                storage.path(),
+                "family",
+                "scope",
+                &root,
+                crate::views::semantic::SemanticProducer::current(
+                    "readiness-model",
+                    crate::semantic_index::EmbedTextCaps::default(),
+                ),
+                Arc::downgrade(slot),
+            )
+            .unwrap(),
+        );
+        runtime.load().unwrap();
+        runtime
+            .refresh(
+                crate::views::semantic::FillBudget::default(),
+                &mut |texts: Vec<String>| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
+            )
+            .unwrap();
+        runtime.index().unwrap();
+        assert!(slot.install(epoch, Arc::clone(&runtime)));
+        *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::ready();
+
+        // An edit the driver has recorded makes the built index out of date.
+        std::fs::write(root.join("lib.rs"), "pub fn moved() {}\n").unwrap();
+        runtime
+            .driver()
+            .record_absolute_change(&root.join("lib.rs"));
+        let builds = runtime.plane().overlay_builds();
+        let source = RuntimeReadinessSource { ctx: &ctx };
+        let observation = source.sample();
+        assert!(
+            observation.semantic.snapshot.is_some(),
+            "a served checkout view must report as ready"
+        );
+        assert_eq!(
+            runtime.plane().overlay_builds(),
+            builds,
+            "a readiness sample built the checkout semantic index"
+        );
     }
 
     /// Mark the semantic lane ready with an empty resident index, so a test
