@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "per-checkout-semantic-views"
+  ],
+  "note": "semantic_index.rs gains Arc-shared runs for the shared base (order-preserving, default path unchanged); views stay opt-in. Ranked rows must stay byte-identical."
+}
