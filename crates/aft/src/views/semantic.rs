@@ -249,6 +249,27 @@ pub struct SemanticPlane {
     views: Mutex<BTreeMap<ViewKey, Arc<Mutex<ViewState>>>>,
     residents: Mutex<BTreeMap<ResidentKey, Arc<Resident>>>,
     arenas: Mutex<BTreeMap<String, Arc<super::semantic_arena::SemanticArena>>>,
+    /// Separator of the native relative paths the overlay holds; see
+    /// [`overlay_rel_path`]. Always the platform's own outside tests.
+    separator: char,
+}
+
+/// Converts a view path into the relative path the semantic overlay holds.
+///
+/// View keys, manifests and fill maps name files by `RelPath`: bytes with `/`
+/// separators on every platform. The overlay is a `SemanticIndex`, whose
+/// chunk paths, tombstones and search results use the platform's native form,
+/// the form a full build produces from walker paths (`src\a.rs` on Windows).
+/// That native form also appears in the text that is embedded, so view
+/// vectors, tombstones and results only agree with a full build when every
+/// view path is converted here, once, as it enters the overlay. Nothing in
+/// the overlay compares a `RelPath` with a native path.
+pub(crate) fn overlay_rel_path(rel_path: &RelPath, separator: char) -> Option<PathBuf> {
+    if separator == '/' {
+        return rel_path_to_os(rel_path).ok();
+    }
+    let text = std::str::from_utf8(rel_path.as_bytes()).ok()?;
+    Some(PathBuf::from(text.replace('/', &separator.to_string())))
 }
 
 impl SemanticPlane {
@@ -261,7 +282,21 @@ impl SemanticPlane {
             views: Mutex::new(BTreeMap::new()),
             residents: Mutex::new(BTreeMap::new()),
             arenas: Mutex::new(BTreeMap::new()),
+            separator: std::path::MAIN_SEPARATOR,
         }
+    }
+
+    /// Lets a test on any platform run the overlay with Windows' separator.
+    /// The arena caches runs with their overlay paths, so a plane with another
+    /// separator must use its own storage root.
+    #[cfg(test)]
+    pub(crate) fn with_path_separator(mut self, separator: char) -> Self {
+        self.separator = separator;
+        self
+    }
+
+    fn overlay_path(&self, rel_path: &RelPath) -> Option<PathBuf> {
+        overlay_rel_path(rel_path, self.separator)
     }
 
     pub fn semantic_producer(&self) -> &SemanticProducer {
@@ -335,9 +370,9 @@ impl SemanticPlane {
                         let loaded = match (
                             crate::blob_store::v2::parse_hex32(key),
                             store.as_ref(),
-                            rel_path_to_os(path),
+                            self.overlay_path(path),
                         ) {
-                            (Some(bytes), Some(store), Ok(relative)) => arena
+                            (Some(bytes), Some(store), Some(relative)) => arena
                                 .load(
                                     store,
                                     &FamilyKey::new(FamilyPlane::Semantic, bytes),
@@ -477,10 +512,15 @@ impl SemanticPlane {
         let mut prepared = Vec::new();
         let mut by_path = BTreeMap::new();
         for item in items {
-            let Ok(relative) = rel_path_to_os(&item.rel_path) else {
+            // The file is read through the OS path; `relative` is the overlay
+            // form its chunks and embedded text carry.
+            let (Ok(source), Some(relative)) = (
+                rel_path_to_os(&item.rel_path),
+                self.overlay_path(&item.rel_path),
+            ) else {
                 continue;
             };
-            match std::fs::read(root.join(&relative)) {
+            match std::fs::read(root.join(&source)) {
                 Ok(bytes) if ContentHash::of(&bytes) == item.content => {
                     prepared.push(PreparedWork {
                         rel_path: item.rel_path.as_bytes().to_vec(),
@@ -744,13 +784,14 @@ fn walked_members(root: &Path) -> BTreeSet<RelPath> {
         .collect()
 }
 
-fn absolute(root: &Path, path: &RelPath) -> PathBuf {
-    rel_path_to_os(path)
-        .map(|relative| root.join(relative))
-        .unwrap_or_else(|_| root.to_path_buf())
-}
-
 impl SemanticPlane {
+    /// A gap path named to the user, in the same native form as results.
+    fn absolute(&self, root: &Path, path: &RelPath) -> PathBuf {
+        self.overlay_path(path)
+            .map(|relative| root.join(relative))
+            .unwrap_or_else(|| root.to_path_buf())
+    }
+
     /// Scores `query_vector` against the checkout `snapshot` describes.
     ///
     /// Only current members are scored, each with the vectors of its current
@@ -834,7 +875,7 @@ impl SemanticPlane {
             .members
             .keys()
             .filter(|path| !via_base.contains(*path))
-            .filter_map(|path| rel_path_to_os(path).ok())
+            .filter_map(|path| self.overlay_path(path))
             .collect::<HashSet<_>>();
         let mut sorted_tombstones = tombstones.iter().collect::<Vec<_>>();
         sorted_tombstones.sort();
@@ -866,8 +907,14 @@ impl SemanticPlane {
         let results = index.search_filtered(query_vector, top_k, include);
         Ok(SemanticQuery {
             results,
-            pending: pending.iter().map(|path| absolute(root, path)).collect(),
-            failed: failed.iter().map(|path| absolute(root, path)).collect(),
+            pending: pending
+                .iter()
+                .map(|path| self.absolute(root, path))
+                .collect(),
+            failed: failed
+                .iter()
+                .map(|path| self.absolute(root, path))
+                .collect(),
             unvouched,
         })
     }
@@ -1703,5 +1750,79 @@ mod tests {
         let texts = model.texts();
         assert_eq!(fill(&model).queued, 0);
         assert_eq!(model.texts(), texts);
+    }
+
+    #[test]
+    fn overlay_converts_view_paths_once_to_the_native_form() {
+        assert_eq!(
+            overlay_rel_path(&RelPath::new(b"src/module_2.rs".to_vec()).unwrap(), '\\'),
+            Some(PathBuf::from("src\\module_2.rs"))
+        );
+    }
+
+    /// Windows' path form, simulated on every platform. A full build names
+    /// files `src\alpha.rs` there, in chunk paths, results and embedded text;
+    /// a view must use the same form everywhere in its overlay, or superseded
+    /// vectors escape their tombstones and scores differ from a full build.
+    #[test]
+    fn backslash_overlay_paths_hide_superseded_vectors_and_match_native_results() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        let plane = Arc::new(
+            SemanticPlane::new(
+                storage.path().to_path_buf(),
+                SemanticProducer::current("model-a", EmbedTextCaps::default()),
+            )
+            .with_path_separator('\\'),
+        );
+        let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
+        let snapshot = checkout.load();
+        let texts = Mutex::new(Vec::new());
+        let current = snapshot.clone();
+        plane
+            .fill(
+                &checkout.owner,
+                &snapshot,
+                FillBudget::default(),
+                &mut |batch| {
+                    texts.lock().unwrap().extend(batch.iter().cloned());
+                    Ok(batch.iter().map(|text| vector("model-a", text)).collect())
+                },
+                &move || current.clone(),
+            )
+            .unwrap();
+        let texts = texts.into_inner().unwrap();
+        assert!(texts.iter().any(|text| text.contains("file:src\\alpha.rs")));
+        assert!(
+            texts.iter().all(|text| !text.contains("file:src/")),
+            "embedded text used the view key form: {texts:?}"
+        );
+        let generation = checkout.load();
+        let answer = checkout.query(&generation, "model-a", "alpha total");
+        let files = rows(root.path(), &answer.results)
+            .into_iter()
+            .map(|row| row.0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            files,
+            BTreeSet::from([
+                "src\\alpha.rs".to_owned(),
+                "src\\beta.rs".to_owned(),
+                "src\\gamma.rs".to_owned()
+            ])
+        );
+
+        write_tree(root.path(), &[("src/alpha.rs", "pub fn omega() {}\n")]);
+        let mut delta = LiveDelta::new(Arc::clone(generation.generation()));
+        crate::views::live_delta::reconcile(&mut delta, root.path(), &trigram_policy());
+        let edited = checkout.query(&delta.snapshot(), "model-a", "alpha total");
+        assert!(
+            rows(root.path(), &edited.results)
+                .iter()
+                .all(|row| row.0 != "src\\alpha.rs"),
+            "superseded vectors of src\\alpha.rs were scored"
+        );
+        assert_eq!(edited.pending, vec![root.path().join("src\\alpha.rs")]);
     }
 }

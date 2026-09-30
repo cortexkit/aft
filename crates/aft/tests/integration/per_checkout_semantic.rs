@@ -298,7 +298,15 @@ fn semantic_parity_with_cold_rebuild_across_edit_schedules() {
             let members = parity_harness::walker_membership(root.path())
                 .unwrap()
                 .into_keys()
-                .map(|path| String::from_utf8(path.as_bytes().to_vec()).unwrap())
+                // Rows carry native paths; compare in that form.
+                .map(|path| {
+                    std::str::from_utf8(path.as_bytes())
+                        .unwrap()
+                        .split('/')
+                        .collect::<PathBuf>()
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect::<BTreeSet<_>>();
             let (cold_rows, _) = cold(root.path(), "model-a", "schedule base value");
             // The first query after an ignore-file edit, before any reconcile
