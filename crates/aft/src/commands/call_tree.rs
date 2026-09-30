@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
     call_tree_result, index_refusal_response, note_callgraph_served, serialized_response,
     store_error_response,
@@ -9,6 +10,12 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle a `call_tree` request.
 pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
+    let mut response = answer_call_tree(req, ctx);
+    disclose_borrowed_answer(ctx, &mut response, SymbolLookup::Graph);
+    response
+}
+
+fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {

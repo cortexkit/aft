@@ -383,6 +383,11 @@ pub struct SearchIndex {
 struct DeltaState {
     postings: HashMap<u32, Vec<Posting>>,
     superseded: HashSet<u32>,
+    /// Paths of the superseded base files. Removing a file clears its entry's
+    /// path, so without this record an edited base file could not be told
+    /// apart from a deleted one when counting how far the delta has moved this
+    /// index away from the snapshot it loaded.
+    superseded_paths: HashSet<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -1564,7 +1569,16 @@ impl SearchIndex {
         };
 
         if file_id < self.base_file_count {
-            Arc::make_mut(&mut self.delta).superseded.insert(file_id);
+            let superseded_path = self
+                .files
+                .get(file_id as usize)
+                .map(|entry| entry.path.clone())
+                .filter(|path| !path.as_os_str().is_empty());
+            let delta = Arc::make_mut(&mut self.delta);
+            delta.superseded.insert(file_id);
+            if let Some(path) = superseded_path {
+                delta.superseded_paths.insert(path);
+            }
         }
 
         if let Some(trigrams) = self.delta_file_trigrams.remove(&file_id) {
@@ -2155,6 +2169,34 @@ impl SearchIndex {
 
     pub fn stored_git_head(&self) -> Option<&str> {
         self.git_head.as_deref()
+    }
+
+    /// Number of distinct files whose served content no longer comes from the
+    /// loaded snapshot: base files edited or deleted since the load, plus files
+    /// the snapshot never had. For a borrowed snapshot reconciled with this
+    /// checkout (see `reconcile_borrowed_snapshot_with_disk`) this is how many
+    /// files here differ from what the owning checkout indexed. It only reads
+    /// the in-RAM delta, never the disk. Git metadata is not counted: a linked
+    /// worktree's `.git` pointer file is indexed as a file the owner's snapshot
+    /// lacks, yet git never tracks a `.git` path, so it is no content change.
+    pub(crate) fn overlay_changed_file_count(&self) -> usize {
+        // Only the final component is checked: a checkout may itself live
+        // under a directory named `.git`, and its files must still count.
+        let is_git_metadata = |path: &Path| path.file_name().is_some_and(|name| name == ".git");
+        let mut changed: HashSet<&Path> = self
+            .delta
+            .superseded_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .filter(|path| !is_git_metadata(path))
+            .collect();
+        for entry in self.files.iter().skip(self.base_file_count as usize) {
+            // A removed delta file keeps its slot with an empty path.
+            if !entry.path.as_os_str().is_empty() && !is_git_metadata(&entry.path) {
+                changed.insert(entry.path.as_path());
+            }
+        }
+        changed.len()
     }
 
     /// Count source files whose current stat no longer matches this persisted
@@ -8160,6 +8202,51 @@ mod tests {
             expected
         });
         assert!(!ids.contains(&old_a_id));
+    }
+
+    #[test]
+    fn overlay_changed_file_count_counts_each_edited_deleted_or_added_file_once() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let project = fs::canonicalize(project).expect("canonicalize project");
+        let edited = project.join("edited.txt");
+        let deleted = project.join("deleted.txt");
+        let kept = project.join("kept.txt");
+        fs::write(&edited, "abc old").expect("write edited");
+        fs::write(&deleted, "abc gone").expect("write deleted");
+        fs::write(&kept, "abc kept").expect("write kept");
+
+        let mut built = SearchIndex::build(&project);
+        let cache_dir = dir.path().join("cache");
+        assert!(built.write_to_disk(&cache_dir, None));
+        let mut index = SearchIndex::read_from_disk(&cache_dir, &project).expect("load base");
+        assert_eq!(index.overlay_changed_file_count(), 0);
+
+        // Editing a file twice supersedes its base entry and then its first
+        // delta entry; it is still one changed file.
+        fs::write(&edited, "abc new").expect("edit once");
+        index.update_file(&edited);
+        fs::write(&edited, "abc newer").expect("edit twice");
+        index.update_file(&edited);
+        assert_eq!(index.overlay_changed_file_count(), 1);
+
+        fs::remove_file(&deleted).expect("delete file");
+        index.remove_file(&deleted);
+        assert_eq!(index.overlay_changed_file_count(), 2);
+
+        let added = project.join("added.txt");
+        fs::write(&added, "abc added").expect("write added");
+        index.update_file(&added);
+        assert_eq!(index.overlay_changed_file_count(), 3);
+
+        // A linked worktree's `.git` pointer file is git metadata, not a
+        // changed file.
+        let pointer = project.join(".git");
+        fs::write(&pointer, "gitdir: /elsewhere/.git/worktrees/linked\n").expect("write .git");
+        index.update_file(&pointer);
+        assert!(index.path_to_id.contains_key(&pointer));
+        assert_eq!(index.overlay_changed_file_count(), 3);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, SymbolLookup};
 use crate::commands::callgraph_store_adapter::{
     ensure_symbol_resolves, index_refusal_response, note_callgraph_served, serialized_response,
     serialized_value, store_error_response, trace_to_symbol_candidates, trace_to_symbol_result,
@@ -10,6 +11,12 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle a `trace_to_symbol` request.
 pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
+    let mut response = answer_trace_to_symbol(req, ctx);
+    disclose_borrowed_answer(ctx, &mut response, SymbolLookup::Graph);
+    response
+}
+
+fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {

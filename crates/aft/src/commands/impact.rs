@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::commands::callgraph_borrowed::{disclose_borrowed_answer, SymbolLookup};
 use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::{
     impact_result, index_refusal_response, note_callgraph_served, store_error_response,
@@ -9,6 +10,12 @@ use crate::protocol::{RawRequest, Response};
 
 /// Handle an `impact` request.
 pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
+    let mut response = answer_impact(req, ctx);
+    disclose_borrowed_answer(ctx, &mut response, SymbolLookup::Graph);
+    response
+}
+
+fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {

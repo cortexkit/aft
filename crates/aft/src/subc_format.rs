@@ -2508,7 +2508,19 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         "impact" => format_impact_sections(record),
         _ => format_trace_data_sections(record),
     };
-    sections.join("\n")
+    let body = sections.join("\n");
+    // A checkout that reads another checkout's callgraph gets a one-line
+    // notice that the callers and line numbers below may not match its own
+    // files. The notice goes first rather than last because a list cut short
+    // must end with its "shown N of M" line.
+    match record
+        .get("borrowed_callgraph")
+        .and_then(Value::as_object)
+        .and_then(|borrowed| string_field(borrowed, "message"))
+    {
+        Some(disclosure) => format!("{disclosure}\n{body}"),
+        None => body,
+    }
 }
 
 fn missing_callgraph_collection(
@@ -3886,6 +3898,21 @@ mod callgraph_format_tests {
 
         assert!(rendered.starts_with("1 path · 1 entry point"));
         assert!(!rendered.contains("at least"));
+    }
+
+    #[test]
+    fn borrowed_callgraph_disclosure_is_the_first_line_and_absent_otherwise() {
+        let plain = json!({ "total_callers": 0, "callers": [] });
+        let rendered = format_callgraph("callers", &plain, false);
+        assert_eq!(rendered, "0 callers · 0 file groups");
+
+        let mut borrowed = plain.clone();
+        borrowed["complete"] = json!(false);
+        borrowed["borrowed_callgraph"] = json!({ "message": "callgraph: borrowed from /owner" });
+        assert_eq!(
+            format_callgraph("callers", &borrowed, false),
+            "callgraph: borrowed from /owner\n0 callers · 0 file groups"
+        );
     }
 }
 
