@@ -3722,9 +3722,56 @@ fn take_test_skipped_row_warnings() -> Vec<String> {
     TEST_SKIPPED_ROW_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
 }
 
+/// A run of embedded chunks that several indexes can hold by `Arc` without
+/// copying vectors. A base frozen out of one root's index is a single run over
+/// all of its files. A per-checkout view base is one run per file, taken from
+/// the family's resident arena, so every view that names the same content key
+/// points at the same vectors. Chunk paths inside a run are relative to the
+/// root that reads them.
+#[derive(Debug, Default)]
+pub struct SemanticVectors {
+    entries: Vec<EmbeddingEntry>,
+}
+
+impl SemanticVectors {
+    /// Number of embedded chunks in this run.
+    pub fn chunk_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Vector dimension, when the run holds at least one chunk.
+    pub fn dimension(&self) -> Option<usize> {
+        self.entries.first().map(|entry| entry.vector.len())
+    }
+
+    /// Bytes held by the vectors and chunk text of this run. The arena counts
+    /// each run once however many views reference it.
+    pub fn resident_bytes(&self) -> u64 {
+        self.entries.iter().fold(0u64, |bytes, entry| {
+            let chunk = &entry.chunk;
+            bytes
+                .saturating_add(
+                    crate::memory::usize_to_u64(entry.vector.len())
+                        .saturating_mul(std::mem::size_of::<f32>() as u64),
+                )
+                .saturating_add(crate::memory::path_bytes(&chunk.file))
+                .saturating_add(crate::memory::usize_to_u64(chunk.name.len()))
+                .saturating_add(crate::memory::usize_to_u64(
+                    chunk.qualified_name.as_ref().map_or(0, String::len),
+                ))
+                .saturating_add(crate::memory::usize_to_u64(chunk.embed_text.len()))
+                .saturating_add(crate::memory::usize_to_u64(chunk.snippet.len()))
+                .saturating_add(std::mem::size_of::<EmbeddingEntry>() as u64)
+        })
+    }
+}
+
 #[derive(Debug)]
 struct SharedSemanticBase {
-    entries: Vec<EmbeddingEntry>,
+    /// Runs in iteration order; `entries()` walks them back to back, so a
+    /// single-run base iterates exactly like the vector it was frozen from.
+    segments: Vec<Arc<SemanticVectors>>,
+    entry_count: usize,
     /// Files with embedding rows, including those lacking recorded mtimes.
     /// Membership must not require scanning every row during invalidation.
     entry_files: HashSet<PathBuf>,
@@ -3801,14 +3848,20 @@ static SHARED_SEMANTIC_BASE_LOADS: AtomicUsize = AtomicUsize::new(0);
 static SHARED_SEMANTIC_BASE_HITS: AtomicUsize = AtomicUsize::new(0);
 
 impl SharedSemanticBase {
+    fn entries(&self) -> impl Iterator<Item = &EmbeddingEntry> {
+        self.segments
+            .iter()
+            .flat_map(|segment| segment.entries.iter())
+    }
+
     fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        let vector_bytes = self.entries.iter().fold(0u64, |bytes, entry| {
+        let vector_bytes = self.entries().fold(0u64, |bytes, entry| {
             bytes.saturating_add(
                 crate::memory::usize_to_u64(entry.vector.len())
                     .saturating_mul(std::mem::size_of::<f32>() as u64),
             )
         });
-        let text_bytes = self.entries.iter().fold(0u64, |bytes, entry| {
+        let text_bytes = self.entries().fold(0u64, |bytes, entry| {
             bytes
                 .saturating_add(crate::memory::path_bytes(&entry.chunk.file))
                 .saturating_add(crate::memory::usize_to_u64(entry.chunk.name.len()))
@@ -3823,7 +3876,7 @@ impl SharedSemanticBase {
                 .saturating_add(crate::memory::usize_to_u64(entry.chunk.embed_text.len()))
                 .saturating_add(crate::memory::usize_to_u64(entry.chunk.snippet.len()))
         });
-        let metadata_bytes = crate::memory::usize_to_u64(self.entries.len())
+        let metadata_bytes = crate::memory::usize_to_u64(self.entry_count)
             .saturating_mul(std::mem::size_of::<EmbeddingEntry>() as u64)
             .saturating_add(
                 self.file_mtimes
@@ -3852,7 +3905,7 @@ impl SharedSemanticBase {
                 .saturating_add(text_bytes)
                 .saturating_add(metadata_bytes),
         )
-        .count("entries", self.entries.len())
+        .count("entries", self.entry_count)
         .count("indexed_files", self.file_mtimes.len())
         .count_u64("vector_bytes", vector_bytes)
         .count_u64("text_bytes", text_bytes)
@@ -3890,7 +3943,7 @@ pub(crate) fn shared_semantic_bases_memory() -> crate::memory::MemoryEstimate {
     crate::memory::MemoryEstimate::estimated(bytes)
         .count("bases", bases.len())
         .count("frozen_owner_bases", frozen_owner_bases)
-        .count("entries", bases.iter().map(|base| base.entries.len()).sum())
+        .count("entries", bases.iter().map(|base| base.entry_count).sum())
         .count_u64("vector_bytes", count_bytes("vector_bytes"))
         .count_u64("text_bytes", count_bytes("text_bytes"))
         .count_u64("metadata_bytes", count_bytes("metadata_bytes"))
@@ -4542,7 +4595,10 @@ impl SemanticIndex {
                 .iter()
                 .map(|entry| entry.chunk.file.clone())
                 .collect(),
-            entries: self.entries,
+            entry_count: self.entries.len(),
+            segments: vec![Arc::new(SemanticVectors {
+                entries: self.entries,
+            })],
             file_mtimes,
             file_sizes,
             any_missing_sizes: self.any_missing_sizes,
@@ -4560,7 +4616,7 @@ impl SemanticIndex {
     fn live_entries(&self) -> impl Iterator<Item = (std::borrow::Cow<'_, Path>, &EmbeddingEntry)> {
         self.shared_base
             .iter()
-            .flat_map(|base| base.entries.iter())
+            .flat_map(|base| base.entries())
             .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
             .map(|entry| {
                 (
@@ -4674,7 +4730,7 @@ impl SemanticIndex {
     pub fn entry_count(&self) -> usize {
         self.shared_base
             .iter()
-            .flat_map(|base| &base.entries)
+            .flat_map(|base| base.entries())
             .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
             .count()
             + self.entries.len()
@@ -4695,9 +4751,7 @@ impl SemanticIndex {
                 .count("entries", self.entry_count())
                 .count(
                     "shared_base_entries",
-                    self.shared_base
-                        .as_ref()
-                        .map_or(0, |base| base.entries.len()),
+                    self.shared_base.as_ref().map_or(0, |base| base.entry_count),
                 )
                 .count("overlay_entries", 0)
                 .count("dimensions", self.dimension)
@@ -4774,9 +4828,7 @@ impl SemanticIndex {
         .count("entries", self.entry_count())
         .count(
             "shared_base_entries",
-            self.shared_base
-                .as_ref()
-                .map_or(0, |base| base.entries.len()),
+            self.shared_base.as_ref().map_or(0, |base| base.entry_count),
         )
         .count("overlay_entries", self.entries.len())
         .count("tombstoned_files", self.tombstones.len())
@@ -4964,7 +5016,7 @@ impl SemanticIndex {
         let requested: HashSet<PathBuf> = files.iter().cloned().collect();
         let mut reuse_map: ChunkReuseMap = HashMap::new();
         if let Some(base) = &self.shared_base {
-            for entry in &base.entries {
+            for entry in base.entries() {
                 #[cfg(test)]
                 crate::search_hot_path_measurements::record(|counts| {
                     counts.refresh_entry_visits += 1
@@ -6294,7 +6346,7 @@ impl SemanticIndex {
         let entries = self
             .shared_base
             .iter()
-            .flat_map(|base| &base.entries)
+            .flat_map(|base| base.entries())
             .filter(|entry| !self.tombstones.contains(&entry.chunk.file))
             .map(|entry| (entry, true))
             .chain(self.entries.iter().map(|entry| (entry, false)))
@@ -8998,6 +9050,362 @@ fn symbols_to_chunks_with_caps(
     }
 
     chunks
+}
+
+// Per-checkout view support.
+//
+// A per-checkout view stores one embedded run per (content, path, producer)
+// key in the family blob store and keeps it resident, decoded once, in the
+// family's arena. A checkout is read through the same shared-base overlay a
+// frozen root uses: the runs its generation names form the base, and edits
+// since that generation are local replacement entries plus tombstones that
+// hide the superseded base files. Scoring is therefore `search_filtered`, the
+// scorer every other semantic query uses.
+
+/// The three producer stamps a view payload records. The blob key hashes the
+/// same three strings, so a payload is only ever read under its own producer.
+#[derive(Clone, Copy, Debug)]
+pub struct ViewPayloadProducer<'a> {
+    pub chunker_version: &'a str,
+    pub template_version: &'a str,
+    pub model_fingerprint: &'a str,
+}
+
+/// View payloads use the encoding the legacy importer writes
+/// (`migration::encode_imported_payload`), so imported blobs read the same way.
+const VIEW_PAYLOAD_VERSION: u8 = 1;
+
+fn push_view_field(output: &mut Vec<u8>, bytes: &[u8]) {
+    output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    output.extend_from_slice(bytes);
+}
+
+fn take_view_slice<'a>(
+    payload: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], String> {
+    let end = cursor
+        .checked_add(length)
+        .filter(|end| *end <= payload.len())
+        .ok_or_else(|| "semantic view payload is truncated".to_string())?;
+    let bytes = &payload[*cursor..end];
+    *cursor = end;
+    Ok(bytes)
+}
+
+fn take_view_u32(payload: &[u8], cursor: &mut usize) -> Result<u32, String> {
+    let bytes = take_view_slice(payload, cursor, 4)?;
+    Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+}
+
+fn take_view_bytes<'a>(payload: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], String> {
+    let length = take_view_u32(payload, cursor)? as usize;
+    take_view_slice(payload, cursor, length)
+}
+
+fn take_view_string(payload: &[u8], cursor: &mut usize) -> Result<String, String> {
+    String::from_utf8(take_view_bytes(payload, cursor)?.to_vec())
+        .map_err(|_| "semantic view payload holds invalid UTF-8".to_string())
+}
+
+impl SemanticVectors {
+    /// Encodes this run as the payload stored under its view key.
+    pub(crate) fn encode_view_payload(&self, producer: &ViewPayloadProducer<'_>) -> Vec<u8> {
+        let mut payload = vec![VIEW_PAYLOAD_VERSION];
+        push_view_field(&mut payload, producer.chunker_version.as_bytes());
+        push_view_field(&mut payload, producer.template_version.as_bytes());
+        push_view_field(&mut payload, producer.model_fingerprint.as_bytes());
+        payload.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            let chunk = &entry.chunk;
+            push_view_field(&mut payload, chunk.name.as_bytes());
+            push_view_field(
+                &mut payload,
+                chunk
+                    .qualified_name
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            payload.push(symbol_kind_to_u8(&chunk.kind));
+            payload.extend_from_slice(&chunk.start_line.to_le_bytes());
+            payload.extend_from_slice(&chunk.end_line.to_le_bytes());
+            payload.push(u8::from(chunk.exported));
+            push_view_field(&mut payload, chunk.snippet.as_bytes());
+            push_view_field(&mut payload, chunk.embed_text.as_bytes());
+            let vector = entry
+                .vector
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            push_view_field(&mut payload, &vector);
+        }
+        payload
+    }
+
+    /// Decodes a stored view payload for `rel_path`. A payload stamped by any
+    /// other producer is refused rather than read as current vectors.
+    ///
+    /// The embedded text is not kept: views reuse whole runs by key, never
+    /// single chunks by text, and dropping it keeps the resident arena close to
+    /// the vectors themselves.
+    pub(crate) fn decode_view_payload(
+        payload: &[u8],
+        rel_path: &Path,
+        producer: &ViewPayloadProducer<'_>,
+    ) -> Result<Self, String> {
+        let mut cursor = 0usize;
+        let version = take_view_slice(payload, &mut cursor, 1)?[0];
+        if version != VIEW_PAYLOAD_VERSION {
+            return Err(format!(
+                "unsupported semantic view payload version {version}"
+            ));
+        }
+        for (field, expected) in [
+            ("chunker", producer.chunker_version),
+            ("template", producer.template_version),
+            ("model", producer.model_fingerprint),
+        ] {
+            if take_view_bytes(payload, &mut cursor)? != expected.as_bytes() {
+                return Err(format!(
+                    "semantic view payload was produced by another {field}"
+                ));
+            }
+        }
+        let count = take_view_u32(payload, &mut cursor)? as usize;
+        let mut entries = Vec::with_capacity(count.min(payload.len()));
+        let mut dimension = None;
+        for _ in 0..count {
+            let name = take_view_string(payload, &mut cursor)?;
+            let qualified_name = take_view_string(payload, &mut cursor)?;
+            let kind = u8_to_symbol_kind(take_view_slice(payload, &mut cursor, 1)?[0]);
+            let start_line = take_view_u32(payload, &mut cursor)?;
+            let end_line = take_view_u32(payload, &mut cursor)?;
+            let exported = take_view_slice(payload, &mut cursor, 1)?[0] != 0;
+            let snippet = take_view_string(payload, &mut cursor)?;
+            let _embed_text = take_view_bytes(payload, &mut cursor)?;
+            let vector_bytes = take_view_bytes(payload, &mut cursor)?;
+            if vector_bytes.len() % 4 != 0 {
+                return Err("semantic view vector has an invalid byte length".to_string());
+            }
+            let vector = vector_bytes
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+                .collect::<Vec<_>>();
+            match dimension {
+                None => dimension = Some(vector.len()),
+                Some(expected) if expected != vector.len() => {
+                    return Err("semantic view payload mixes vector dimensions".to_string());
+                }
+                Some(_) => {}
+            }
+            entries.push(EmbeddingEntry::new(
+                SemanticChunk {
+                    file: rel_path.to_path_buf(),
+                    name,
+                    qualified_name: (!qualified_name.is_empty()).then_some(qualified_name),
+                    kind,
+                    start_line,
+                    end_line,
+                    exported,
+                    embed_text: String::new(),
+                    snippet,
+                },
+                vector,
+            ));
+        }
+        if cursor != payload.len() {
+            return Err("semantic view payload has trailing bytes".to_string());
+        }
+        Ok(Self { entries })
+    }
+
+    /// Drops the embedded text after a fill stored this run, so a run a fill
+    /// installs holds exactly what a run decoded from the store holds.
+    pub(crate) fn strip_embed_text(&mut self) {
+        for entry in &mut self.entries {
+            entry.chunk.embed_text = String::new();
+        }
+    }
+}
+
+/// Chunks one checkout file for a view fill, from the very bytes whose hash
+/// names the work. It mirrors what a full build does for the same file, so a
+/// view and a cold rebuild embed the same texts: `Ok(None)` for a file that is
+/// not a semantic source, no chunks for an oversized file, and an error for
+/// bytes a build could not read or parse (the fill records it as failed).
+/// Chunk paths are left relative to the checkout root.
+pub(crate) fn chunk_view_file(
+    project_root: &Path,
+    rel_path: &Path,
+    bytes: &[u8],
+    embed_text_caps: EmbedTextCaps,
+) -> Result<Option<Vec<SemanticChunk>>, String> {
+    let file = project_root.join(rel_path);
+    if !is_semantic_indexed_extension(&file) {
+        return Ok(None);
+    }
+    let Some(lang) = detect_language(&file) else {
+        return Ok(None);
+    };
+    if bytes.len() as u64 > MAX_SEMANTIC_FILE_BYTES {
+        return Ok(Some(Vec::new()));
+    }
+    let source = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let mut chunks = collect_file_chunks_from_source_timed(
+        project_root,
+        &file,
+        lang,
+        source,
+        embed_text_caps,
+        &mut SemanticCollectPhaseTimings::default(),
+    )?;
+    for chunk in &mut chunks {
+        chunk.file = rel_path.to_path_buf();
+    }
+    Ok(Some(chunks))
+}
+
+/// Embeds several files' chunks in shared batches of `max_batch_size` texts and
+/// returns one run per file, in input order. Rows the backend skips are dropped
+/// exactly as a full build drops them.
+pub(crate) fn embed_view_files<F>(
+    files: Vec<Vec<SemanticChunk>>,
+    embed_fn: &mut F,
+    max_batch_size: usize,
+) -> Result<Vec<SemanticVectors>, String>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    let mut runs = files
+        .iter()
+        .map(|chunks| Vec::with_capacity(chunks.len()))
+        .collect::<Vec<Vec<EmbeddingEntry>>>();
+    let pending = files
+        .into_iter()
+        .enumerate()
+        .flat_map(|(file, chunks)| chunks.into_iter().map(move |chunk| (file, chunk)))
+        .collect::<Vec<_>>();
+    let mut dimension = None;
+    for batch in pending.chunks(max_batch_size.max(1)) {
+        let texts = batch
+            .iter()
+            .map(|(_, chunk)| chunk.embed_text.clone())
+            .collect();
+        let rows = execute_build_embedding_batch(texts, embed_fn)?;
+        for ((file, chunk), row) in batch.iter().zip(rows) {
+            let mut chunk = chunk.clone();
+            match row {
+                BuildEmbeddingRow::Embedded {
+                    embedded_text,
+                    vector,
+                } => {
+                    match dimension {
+                        None => dimension = Some(vector.len()),
+                        Some(expected) if expected != vector.len() => {
+                            return Err(format!(
+                                "embedding dimension changed during a view fill: expected {expected}, got {}",
+                                vector.len()
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                    chunk.embed_text = embedded_text;
+                    runs[*file].push(EmbeddingEntry::new(chunk, vector));
+                }
+                BuildEmbeddingRow::Skipped {
+                    embedded_text,
+                    reason,
+                } => log_skipped_row_warning(&chunk, &embedded_text, &reason),
+            }
+        }
+    }
+    Ok(runs
+        .into_iter()
+        .map(|entries| SemanticVectors { entries })
+        .collect())
+}
+
+/// The immutable semantic base of one view generation: the arena runs its
+/// manifest names, each holding chunk paths relative to the checkout. It is a
+/// `SharedSemanticBase` whose runs are shared with every other view naming
+/// the same keys, so it costs one pointer per file, not a copy of vectors.
+#[derive(Clone, Debug)]
+pub struct ViewSemanticBase {
+    base: Arc<SharedSemanticBase>,
+}
+
+impl ViewSemanticBase {
+    pub(crate) fn new(runs: Vec<Arc<SemanticVectors>>) -> Self {
+        let dimension = runs
+            .iter()
+            .find_map(|run| run.dimension())
+            .unwrap_or(DEFAULT_DIMENSION);
+        let entry_files = runs
+            .iter()
+            .flat_map(|run| run.entries.iter().map(|entry| entry.chunk.file.clone()))
+            .collect();
+        Self {
+            base: Arc::new(SharedSemanticBase {
+                entry_count: runs.iter().map(|run| run.entries.len()).sum(),
+                segments: runs,
+                entry_files,
+                file_mtimes: HashMap::new(),
+                file_sizes: HashMap::new(),
+                any_missing_sizes: false,
+                file_hashes: HashMap::new(),
+                dimension,
+                fingerprint: None,
+                deferred_files: HashSet::new(),
+                skipped_rows: 0,
+                persistence: Arc::new(Mutex::new(None)),
+            }),
+        }
+    }
+
+    /// Chunks in the base, before any tombstone.
+    pub fn chunk_count(&self) -> usize {
+        self.base.entry_count
+    }
+
+    /// Runs the base references; each is also held by the family arena.
+    pub fn runs(&self) -> &[Arc<SemanticVectors>] {
+        &self.base.segments
+    }
+}
+
+impl SemanticIndex {
+    /// Reads a checkout through the overlay: `base` supplies the generation's
+    /// shared runs, `tombstones` (paths relative to `project_root`) hide the
+    /// base files that are superseded, deleted or no longer members, and
+    /// `replacements` become this checkout's own entries. Only the
+    /// replacements are copied, so private memory grows with edits, not with
+    /// the size of the checkout.
+    pub(crate) fn for_view(
+        project_root: PathBuf,
+        base: &ViewSemanticBase,
+        tombstones: HashSet<PathBuf>,
+        replacements: &[Arc<SemanticVectors>],
+    ) -> Self {
+        let mut index = Self::from_shared_base(project_root, Arc::clone(&base.base));
+        index.tombstones = tombstones;
+        index.entries = replacements
+            .iter()
+            .flat_map(|run| run.entries.iter())
+            .map(|entry| {
+                let mut entry = entry.clone();
+                entry.chunk.file = index.project_root.join(&entry.chunk.file);
+                entry
+            })
+            .collect();
+        if base.base.entry_count == 0 {
+            if let Some(dimension) = replacements.iter().find_map(|run| run.dimension()) {
+                index.dimension = dimension;
+            }
+        }
+        index
+    }
 }
 
 fn semantic_score_order(a: &(f32, usize), b: &(f32, usize)) -> std::cmp::Ordering {
@@ -12569,7 +12977,7 @@ public class Greeter {
         // bytes vary with the platform's path forms (the base came out at
         // well under half the private estimate on Windows CI), so compare the
         // vector payload, which does not.
-        assert_eq!(base.entries.len(), 16);
+        assert_eq!(base.entry_count, 16);
         assert!(
             base_bytes >= vector_bytes as u64,
             "{base_bytes} vs vector payload {vector_bytes}"
