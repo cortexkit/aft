@@ -216,6 +216,54 @@ fn watcher_and_aft_edits_reach_the_fill() {
     );
 }
 
+fn pending_semantic(runtime: &CheckoutSemantic) -> usize {
+    runtime
+        .installed()
+        .generation()
+        .manifest()
+        .entries()
+        .filter(|(_, entry)| {
+            entry
+                .plane_state(crate::blob_store::v2::FamilyPlane::Semantic)
+                .is_some_and(|state| state.is_pending())
+        })
+        .count()
+}
+
+/// A catch-up that takes several budgeted rounds serves each round's vectors
+/// at once but publishes them in one fold at the end, because every fold
+/// re-walks the whole checkout.
+#[test]
+fn budgeted_rounds_fold_once_when_caught_up() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let runtime = open(storage.path(), "scope", root.path());
+    let model = Model::default();
+    let one_file = FillBudget {
+        max_files: 1,
+        ..FillBudget::default()
+    };
+    assert_eq!(pending_semantic(&runtime), 3);
+    let first = runtime
+        .refresh(one_file, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!((first.installed, first.deferred), (1, 2));
+    let generation = runtime.installed().generation().name().to_owned();
+    assert_eq!(pending_semantic(&runtime), 3, "folded before catching up");
+    assert_eq!(query(&runtime, "alpha").pending.len(), 2);
+    runtime
+        .refresh(one_file, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!(runtime.installed().generation().name(), generation);
+    let last = runtime
+        .refresh(one_file, &mut |texts| model.embed(texts))
+        .unwrap();
+    assert_eq!((last.installed, last.deferred), (1, 0));
+    assert_eq!(pending_semantic(&runtime), 0, "caught up but never folded");
+    assert!(query(&runtime, "alpha").complete());
+}
+
 /// An AFT write under the root wakes the lane's worker; one elsewhere does not.
 #[test]
 fn aft_writes_wake_only_their_own_lane() {

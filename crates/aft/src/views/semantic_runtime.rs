@@ -19,7 +19,7 @@
 //! path without current vectors as a gap.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -80,6 +80,8 @@ pub struct CheckoutSemantic {
     /// Serializes reload, fill and fold, so two refreshes never interleave
     /// their publications.
     refresh: Mutex<()>,
+    /// Fills installed since the last fold into a published generation.
+    unfolded: AtomicBool,
     /// Wakes the fill worker after an AFT write to this checkout. It is held
     /// here because the intent registry keeps only weak references.
     _wake_on_write: Arc<dyn WriteIntentListener>,
@@ -134,6 +136,7 @@ impl CheckoutSemantic {
             loader,
             plane,
             refresh: Mutex::new(()),
+            unfolded: AtomicBool::new(false),
             _wake_on_write: listener,
         })
     }
@@ -172,9 +175,12 @@ impl CheckoutSemantic {
     ///
     /// The checkout is reloaded first when the installed snapshot carries
     /// edits it has not reconciled (a watcher change or an AFT write records
-    /// an intent), so the fill sees the current bytes. Completions the fill
-    /// installs are then folded into a newly published generation, which
-    /// keeps them across restarts and lets sibling checkouts seed from them.
+    /// an intent), so the fill sees the current bytes. Once no budgeted work
+    /// remains (or a round makes no progress), the completions are folded
+    /// into a newly published generation, which keeps them across restarts
+    /// and lets sibling checkouts seed from them. Folding once per catch-up
+    /// rather than per round matters: each fold re-walks the whole checkout.
+    /// Until then the fill map serves them and the live pin protects them.
     pub fn refresh<F>(&self, budget: FillBudget, embed: &mut F) -> Result<FillReport, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -192,7 +198,14 @@ impl CheckoutSemantic {
             })
             .map_err(|error| error.to_string())?;
         if report.installed > 0 || report.failed > 0 {
-            self.load()?;
+            self.unfolded.store(true, Ordering::SeqCst);
+        }
+        let caught_up = report.deferred == 0 || (report.installed == 0 && report.failed == 0);
+        if caught_up && self.unfolded.swap(false, Ordering::SeqCst) {
+            if let Err(error) = self.load() {
+                self.unfolded.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
         }
         Ok(report)
     }
