@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/tests/integration/per_checkout_semantic_runtime.rs"
+  ],
+  "slices": [
+    "per-checkout-semantic-views",
+    "views-on-semantic-runtime",
+    "borrowed-callgraph-disclosure"
+  ],
+  "note": "Semantic views slice 3 and its views-on runtime: views stay opt-in, the default path is unchanged (engine_unwired). semantic_search/mod.rs changes affect only views-on routing. The borrowed-callgraph disclosure touches no ranking code. Ranked rows must stay byte-identical."
+}
