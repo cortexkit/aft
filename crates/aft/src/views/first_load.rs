@@ -1565,6 +1565,51 @@ impl MembershipWalker for ConfiguredMembershipWalker {
     }
 }
 
+/// A root's installed checkout driver, shared so that the worker which loads
+/// a checkout can install its driver from another thread. Installing
+/// subscribes the driver to AFT write intents; the watcher drain forwards
+/// every changed path to whatever driver is installed.
+#[derive(Clone, Default)]
+pub struct InstalledDriver(Arc<std::sync::RwLock<Option<Arc<CheckoutDriver>>>>);
+
+impl InstalledDriver {
+    pub fn install(&self, driver: Arc<CheckoutDriver>) {
+        driver.register_write_intent();
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(driver);
+    }
+
+    /// Removes `driver` unless another one replaced it meanwhile.
+    pub fn clear_if(&self, driver: &Arc<CheckoutDriver>) {
+        let mut installed = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if installed
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, driver))
+        {
+            *installed = None;
+        }
+    }
+
+    pub fn clear(&self) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    pub fn get(&self) -> Option<Arc<CheckoutDriver>> {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 pub struct TrigramBridge {
     pub adapter: Arc<super::trigram::TrigramAdapter>,
     policy: crate::blob_store::v2::TrigramPolicy,
@@ -1626,6 +1671,16 @@ impl CompositePlane for TrigramBridge {
 }
 
 impl CheckoutDriver {
+    /// The snapshot last installed for this checkout, without computing the
+    /// per-plane gaps `installed_state` reports.
+    pub fn installed_snapshot(&self) -> Snapshot {
+        self.installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .clone()
+    }
+
     pub fn record_absolute_change(&self, absolute: &std::path::Path) {
         if let Ok(relative) = absolute.strip_prefix(self.owner.root()) {
             if let Ok(path) = RelPath::from_os_path(relative) {

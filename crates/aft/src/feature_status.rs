@@ -311,7 +311,7 @@ fn observe_semantic(ctx: &AppContext) -> IndexObservation {
         Ok(guard) => guard.is_some(),
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
         Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
-    };
+    } || ctx.checkout_semantic_runtime().is_some();
     match status {
         SemanticIndexStatus::Ready { .. } if resident => IndexObservation::ready(),
         SemanticIndexStatus::Building { .. } => IndexObservation::building(),

@@ -38,6 +38,7 @@ pub mod live_delta;
 pub mod query_wait;
 pub mod semantic;
 pub mod semantic_arena;
+pub mod semantic_runtime;
 pub mod trigram;
 
 #[cfg(test)]

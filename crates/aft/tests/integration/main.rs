@@ -117,6 +117,7 @@ mod per_checkout_callgraph;
 mod per_checkout_first_load;
 mod per_checkout_registry;
 mod per_checkout_semantic;
+mod per_checkout_semantic_runtime;
 mod per_checkout_trigram;
 mod pins_gc_test;
 mod powershell_refusal_test;

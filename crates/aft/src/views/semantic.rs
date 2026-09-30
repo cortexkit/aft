@@ -784,6 +784,15 @@ fn walked_members(root: &Path) -> BTreeSet<RelPath> {
         .collect()
 }
 
+/// The scorable index of one checkout snapshot, and the paths it cannot score.
+#[derive(Clone, Debug)]
+pub struct SemanticOverlay {
+    pub index: Arc<SemanticIndex>,
+    pub pending: Vec<PathBuf>,
+    pub failed: Vec<PathBuf>,
+    pub unvouched: bool,
+}
+
 impl SemanticPlane {
     /// A gap path named to the user, in the same native form as results.
     fn absolute(&self, root: &Path, path: &RelPath) -> PathBuf {
@@ -810,6 +819,27 @@ impl SemanticPlane {
         top_k: usize,
         include: &dyn Fn(&Path) -> bool,
     ) -> Result<SemanticQuery, PlaneError> {
+        let overlay = self.overlay(access, root, snapshot)?;
+        // Scoring is the resident index's own `search_filtered`, the same
+        // function the legacy semantic lane calls, so cosine scores and the
+        // exported-symbol multiplier are identical for identical vectors.
+        let results = overlay.index.search_filtered(query_vector, top_k, include);
+        Ok(SemanticQuery {
+            results,
+            pending: overlay.pending,
+            failed: overlay.failed,
+            unvouched: overlay.unvouched,
+        })
+    }
+
+    /// The index `search` scores for `snapshot`, built from resident runs
+    /// only and cached until the snapshot's vector shape or fills change.
+    pub fn overlay(
+        &self,
+        access: &ViewAccess,
+        root: &Path,
+        snapshot: &Snapshot,
+    ) -> Result<SemanticOverlay, PlaneError> {
         let resident = self
             .resident(access, snapshot.generation().name())
             .ok_or_else(|| plane_error("semantic generation not resident"))?;
@@ -904,9 +934,8 @@ impl SemanticPlane {
             }
         };
         drop(state);
-        let results = index.search_filtered(query_vector, top_k, include);
-        Ok(SemanticQuery {
-            results,
+        Ok(SemanticOverlay {
+            index,
             pending: pending
                 .iter()
                 .map(|path| self.absolute(root, path))
@@ -1833,7 +1862,9 @@ mod tests {
         let a = Checkout::open(storage.path(), "scope-a", first.path(), &plane);
         let b = Checkout::open(storage.path(), "scope-b", second.path(), &plane);
         let shared = a.load();
-        plane.open_generation(&b.access, shared.generation()).unwrap();
+        plane
+            .open_generation(&b.access, shared.generation())
+            .unwrap();
         let unfilled = PlaneReadiness::Ready {
             pending: 3,
             failed: 0,

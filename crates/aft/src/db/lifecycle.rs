@@ -228,11 +228,6 @@ pub const SQLITE_UNINSTRUMENTED_OPENERS: &[SqliteUninstrumentedOpener] = &[
         class: UninstrumentedOpenerClass::Unmeasurable,
         reason: "the raw rollback-journal connection exposes no pager byte counter",
     },
-    SqliteUninstrumentedOpener {
-        seam: "commands::semantic_search::view_semantic_search",
-        class: UninstrumentedOpenerClass::NoWrites,
-        reason: "the connection is opened read-only and executes only search queries",
-    },
 ];
 
 pub(crate) fn uninstrumented_opener(seam: &str) -> Option<SqliteUninstrumentedOpener> {
@@ -1369,10 +1364,6 @@ mod tests {
                 (
                     "path_status::PathStatusStore::open_at",
                     UninstrumentedOpenerClass::Unmeasurable
-                ),
-                (
-                    "commands::semantic_search::view_semantic_search",
-                    UninstrumentedOpenerClass::NoWrites
                 ),
             ]
         );

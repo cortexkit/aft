@@ -3787,6 +3787,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     SemanticIndexStatus::Disabled;
+                // The views-on lane was started for the previous semantic
+                // settings; the scheduling below starts it again.
+                ctx.checkout_semantic().clear();
             }
             ctx.clear_semantic_refresh_worker();
             *ctx.semantic_embedding_model().lock() = None;
@@ -3953,7 +3956,9 @@ fn adopt_resident_semantic_index_if_available(
     project_key: &str,
     semantic_config: &SemanticBackendConfig,
 ) -> bool {
-    if !semantic_search || !ctx.shared_artifacts_read_only() {
+    // A views-on root serves semantic search from its own checkout view, so
+    // it never adopts another root's legacy index.
+    if !semantic_search || !ctx.shared_artifacts_read_only() || ctx.config().views.enabled {
         return false;
     }
     let Some(mut index) = ctx.app().adopt_resident_semantic_index(
@@ -4056,6 +4061,9 @@ fn missing_artifact_loads(ctx: &AppContext) -> ArtifactLoadNeeds {
         && !local_semantic_runtime_known_unavailable(ctx)
         && semantic_not_building
         && semantic_receiver_missing
+        // A started views-on lane owns semantic search for this root in every
+        // state, including a named failure: nothing retries it per query.
+        && !ctx.checkout_semantic().active()
         && (semantic_index_missing || semantic_refresh_missing);
 
     ArtifactLoadNeeds {
@@ -4717,6 +4725,22 @@ fn schedule_artifact_loads(
             });
         });
     }
+
+    // With views enabled, this checkout's own view serves semantic search
+    // (see `views::semantic_runtime`); the legacy index is not built, so
+    // identical content in sibling worktrees is embedded once per family.
+    let load_semantic = if load_semantic && views_enabled && ctx.heavy_root_work_allowed() {
+        semantic_artifact_load_start = Some(start_checkout_semantic_lane(
+            ctx,
+            &canonical_cache_root,
+            &project_key,
+            storage_dir.as_deref(),
+            semantic_config.clone(),
+        ));
+        false
+    } else {
+        load_semantic
+    };
 
     // The read-only semantic arm has the same bounded-open shape as search and
     // likewise never enters the owner refresh/rebuild path below.
@@ -5724,6 +5748,68 @@ fn schedule_artifact_loads(
     }
 
     (search_artifact_load_start, semantic_artifact_load_start)
+}
+
+/// Starts the views-on semantic lane of this root on its own worker thread.
+///
+/// The worker waits for the same start signal as a legacy semantic load, so
+/// the callgraph build still starts first, then loads the embedding model,
+/// registers and loads the checkout view and fills it. Queries meanwhile see
+/// the lane as building. The returned sender releases the worker.
+fn start_checkout_semantic_lane(
+    ctx: &AppContext,
+    root: &Path,
+    family: &str,
+    storage_dir: Option<&Path>,
+    semantic: SemanticBackendConfig,
+) -> crossbeam_channel::Sender<()> {
+    let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
+    let slot = ctx.checkout_semantic();
+    let (epoch, wake) = slot.begin();
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+        stage: "loading_checkout_view".to_string(),
+        files: None,
+        entries_done: None,
+        entries_total: None,
+    };
+    let lifecycle = ctx.subc_lifecycle_admission();
+    let config = crate::views::semantic_runtime::WorkerConfig {
+        root: root.to_path_buf(),
+        storage: crate::bash_background::storage_dir(storage_dir),
+        family: family.to_owned(),
+        scope: crate::path_identity::project_scope_key(root),
+        semantic,
+        quiet_window: semantic_refresh_quiet_window(),
+        status: ctx.semantic_index_status_handle(),
+        drivers: ctx.installed_checkout_driver(),
+        limiter: ctx.cold_build_limiter(),
+        paused: Box::new(move || lifecycle.unbound_past_grace()),
+    };
+    let weak_slot = Arc::downgrade(slot);
+    let session_id = log_ctx::current_session();
+    let gate_root = root.to_path_buf();
+    let spawned = thread::Builder::new()
+        .name("aft-semantic-view".to_string())
+        .spawn(move || {
+            log_ctx::with_session(session_id, || {
+                // A superseded configure drops the start signal without
+                // sending it. The lane belongs to its slot epoch rather than
+                // to that configure, so it starts either way; a newer lane
+                // replaces it through the epoch check.
+                let _ = wait_for_semantic_artifact_start(&start_rx, &gate_root);
+                crate::views::semantic_runtime::run_worker(weak_slot, epoch, wake, config);
+            });
+        });
+    if let Err(error) = spawned {
+        slot.fail(epoch, format!("worker thread: {error}"));
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SemanticIndexStatus::Failed(format!("semantic: unavailable: worker thread: {error}"));
+    }
+    start_tx
 }
 
 /// Account for a finished artifact load at its hand-off to the receiver.

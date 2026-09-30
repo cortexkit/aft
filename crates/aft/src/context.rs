@@ -2782,7 +2782,9 @@ pub struct AppContext {
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
     view_runtime: RwLock<Option<ViewRuntimeState>>,
-    checkout_driver: RwLock<Option<Arc<crate::views::first_load::CheckoutDriver>>>,
+    checkout_driver: crate::views::first_load::InstalledDriver,
+    /// The views-on semantic lane of this root (see `views::semantic_runtime`).
+    checkout_semantic: Arc<crate::views::semantic_runtime::CheckoutSemanticSlot>,
     checkout_query_runtime: RwLock<Option<Arc<crate::views::query_wait::CheckoutQueryRuntime>>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_force_demand: Arc<crate::callgraph_maintenance::CallgraphForceDemand>,
@@ -2838,7 +2840,7 @@ pub struct AppContext {
     semantic_pending_install: Arc<PendingInstallSlot>,
     semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     semantic_persist_lock: Arc<parking_lot::Mutex<()>>,
-    semantic_index_status: RwLock<SemanticIndexStatus>,
+    semantic_index_status: Arc<RwLock<SemanticIndexStatus>>,
     /// Present only while a cold semantic build is running. Its counters are
     /// read by status and health without taking the worker's batch-loop locks.
     semantic_build_progress: RwLock<Option<SemanticBuildProgress>>,
@@ -3317,7 +3319,8 @@ impl AppContext {
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             view_runtime: RwLock::new(None),
-            checkout_driver: RwLock::new(None),
+            checkout_driver: crate::views::first_load::InstalledDriver::default(),
+            checkout_semantic: Arc::default(),
             checkout_query_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_force_demand: Arc::default(),
@@ -3360,7 +3363,7 @@ impl AppContext {
             semantic_pending_install: Arc::default(),
             semantic_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             semantic_persist_lock: Arc::new(parking_lot::Mutex::new(())),
-            semantic_index_status: RwLock::new(SemanticIndexStatus::Disabled),
+            semantic_index_status: Arc::new(RwLock::new(SemanticIndexStatus::Disabled)),
             semantic_build_progress: RwLock::new(None),
             semantic_build_epoch: Arc::new(AtomicU64::new(0)),
             artifact_reload_lock: parking_lot::Mutex::new(()),
@@ -5727,10 +5730,8 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
-        *self
-            .checkout_driver
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.checkout_driver.clear();
+        self.checkout_semantic.clear();
         *self
             .checkout_query_runtime
             .write()
@@ -5872,7 +5873,10 @@ impl AppContext {
         let head_metadata =
             crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
                 .map_err(|error| error.to_string())?;
-        let semantic_search = self.config().indexes.semantic;
+        // With a per-checkout semantic view the older view carries no
+        // semantic plane: its vectors came from the legacy index, which a
+        // views-on root no longer builds.
+        let semantic_search = self.config().indexes.semantic && !self.checkout_semantic.active();
         let semantic_keys = if semantic_search && allow_blob_put {
             let index = self
                 .semantic_index
@@ -6425,22 +6429,35 @@ impl AppContext {
     /// Binds watcher invalidation and synchronous write intent to the same driver.
     /// Called explicitly alongside query activation, never by legacy configure.
     pub fn install_checkout_driver(&self, driver: Arc<crate::views::first_load::CheckoutDriver>) {
-        driver.register_write_intent();
-        *self
-            .checkout_driver
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(driver);
+        self.checkout_driver.install(driver);
+    }
+
+    /// The shared handle a worker thread uses to install this root's driver
+    /// with the same wiring as `install_checkout_driver`.
+    pub(crate) fn installed_checkout_driver(&self) -> crate::views::first_load::InstalledDriver {
+        self.checkout_driver.clone()
+    }
+
+    /// This root's views-on semantic lane.
+    pub fn checkout_semantic(&self) -> &Arc<crate::views::semantic_runtime::CheckoutSemanticSlot> {
+        &self.checkout_semantic
+    }
+
+    /// The loaded views-on semantic view, when this root serves semantic
+    /// search from one.
+    pub fn checkout_semantic_runtime(
+        &self,
+    ) -> Option<Arc<crate::views::semantic_runtime::CheckoutSemantic>> {
+        self.checkout_semantic.runtime()
     }
 
     pub(crate) fn record_checkout_watcher_change(&self, path: &Path) {
-        let driver = self
-            .checkout_driver
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        if let Some(driver) = driver {
+        if let Some(driver) = self.checkout_driver.get() {
             driver.record_absolute_change(path);
         }
+        // The driver only records the change; the semantic view resolves it
+        // on its worker after the quiet window.
+        self.checkout_semantic.wake();
     }
 
     /// Activates a supplied, already loaded checkout runtime for this root.
@@ -8343,7 +8360,13 @@ impl AppContext {
     }
 
     pub fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
-        &self.semantic_index_status
+        self.semantic_index_status.as_ref()
+    }
+
+    /// Shared handle on the semantic status, for a worker thread that keeps
+    /// it in step with the views-on semantic lane.
+    pub(crate) fn semantic_index_status_handle(&self) -> Arc<RwLock<SemanticIndexStatus>> {
+        Arc::clone(&self.semantic_index_status)
     }
 
     pub(crate) fn set_semantic_build_progress(&self, progress: Option<SemanticBuildProgress>) {
