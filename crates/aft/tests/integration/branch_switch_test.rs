@@ -541,35 +541,103 @@ fn wait_for_views_branch(ctx: &AppContext, root: &Path, branch: char) {
 #[test]
 fn views_round_trip_reuses_semantic_blobs_without_embedding() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
-    let server = MockEmbeddingServer::start();
-    let repo = RepoFixture::new(40, 20);
-    let storage = tempfile::tempdir().unwrap();
-    let ctx = configure_context_with_views(&repo.root, storage.path(), &server, false, true);
+    let previous_quiet = std::env::var_os("AFT_SEMANTIC_QUIET_WINDOW_MS");
+    // SAFETY: changed only while watcher_serial_lock is held, and restored
+    // below before the lock is released.
+    unsafe { std::env::set_var("AFT_SEMANTIC_QUIET_WINDOW_MS", "50") };
+    let result = std::panic::catch_unwind(|| {
+        let server = MockEmbeddingServer::start();
+        let repo = RepoFixture::new(40, 20);
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = configure_context_with_views(&repo.root, storage.path(), &server, false, true);
 
-    wait_for_views_branch(&ctx, &repo.root, 'A');
-    let family = aft::search_index::artifact_cache_key(&repo.root);
-    let semantic_blobs = aft::blob_store::BlobStore::open(
-        storage.path(),
-        family,
-        aft::blob_store::BlobPlane::Semantic,
-    )
-    .expect("open semantic blob store");
-    assert!(
-        semantic_blobs.usage().expect("semantic blob usage").rows > 0,
-        "initial views publication must persist A's semantic vectors"
-    );
-    drop(semantic_blobs);
-    git(&repo.root, &["checkout", "-q", "B"]);
-    wait_for_views_branch(&ctx, &repo.root, 'B');
-    let before_return = server.batch_count();
-    git(&repo.root, &["checkout", "-q", "A"]);
-    wait_for_views_branch(&ctx, &repo.root, 'A');
+        wait_for_views_branch(&ctx, &repo.root, 'A');
+        wait_for_semantic_view(&ctx);
+        // Views-on semantic vectors live in the checkout's per-checkout view:
+        // its published generation names them as ready.
+        let ready = ctx
+            .checkout_semantic_runtime()
+            .expect("views-on semantic view")
+            .installed()
+            .generation()
+            .manifest()
+            .entries()
+            .filter(|(_, entry)| {
+                matches!(
+                    entry.plane_state(aft::blob_store::v2::FamilyPlane::Semantic),
+                    Some(aft::views::readiness::PlaneState::Ready { .. })
+                )
+            })
+            .count();
+        assert!(
+            ready > 0,
+            "initial views publication must persist A's semantic vectors"
+        );
+        git(&repo.root, &["checkout", "-q", "B"]);
+        wait_for_views_branch(&ctx, &repo.root, 'B');
+        wait_for_semantic_view(&ctx);
+        let before_return = server.batch_count();
+        git(&repo.root, &["checkout", "-q", "A"]);
+        wait_for_views_branch(&ctx, &repo.root, 'A');
+        wait_for_semantic_view(&ctx);
 
-    assert_eq!(
-        server.batch_count().saturating_sub(before_return),
-        0,
-        "views-on return switch must reuse A's content-addressed vectors"
-    );
+        assert_eq!(
+            server.batch_count().saturating_sub(before_return),
+            0,
+            "views-on return switch must reuse A's content-addressed vectors"
+        );
+    });
+    // SAFETY: as above.
+    unsafe {
+        match previous_quiet {
+            Some(value) => std::env::set_var("AFT_SEMANTIC_QUIET_WINDOW_MS", value),
+            None => std::env::remove_var("AFT_SEMANTIC_QUIET_WINDOW_MS"),
+        }
+    }
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Waits until the views-on semantic view has current vectors for every
+/// semantic file of the checkout as it is on disk.
+fn wait_for_semantic_view(ctx: &AppContext) {
+    let deadline = Instant::now() + ROW_DEADLINE;
+    loop {
+        aft::runtime_drain::drain_watcher_events(ctx);
+        let runtime = ctx.checkout_semantic_runtime();
+        let complete = runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .search(&[1.0, 0.0, 0.0], 1, &|_| true)
+                .is_ok_and(|answer| answer.complete())
+        });
+        // A switch the watcher has not delivered yet looks complete for the
+        // previous branch; the reconciled snapshot must match the disk too.
+        // Fills are folded into a published generation right after they
+        // land; wait for that too, so the generation names every vector.
+        let current = runtime.is_some_and(|runtime| {
+            let snapshot = runtime.installed();
+            snapshot.pending_intent().next().is_none()
+                && snapshot.live_entries().next().is_none()
+                && !snapshot
+                    .generation()
+                    .manifest()
+                    .entries()
+                    .any(|(_, entry)| {
+                        entry
+                            .plane_state(aft::blob_store::v2::FamilyPlane::Semantic)
+                            .is_some_and(|state| state.is_pending())
+                    })
+        });
+        if complete && current {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "views-on semantic view never caught up"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]

@@ -8000,11 +8000,17 @@ mod tests {
         assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
     }
 
+    /// Callgraph view publication never waits on semantic embedding. With
+    /// views enabled, semantic vectors belong to the root's per-checkout
+    /// semantic view, so the older view publishes callgraph data with no
+    /// semantic plane at all, even while the semantic view's first fill is
+    /// stuck at the embedding server.
     #[test]
-    fn callgraph_view_publishes_while_semantic_refresh_batch_is_held() {
+    fn callgraph_view_publishes_while_semantic_view_fill_is_held() {
         let _artifact_guard = artifact_owner_test_lock();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let _quiet_window = EnvVarGuard::set("AFT_SEMANTIC_QUIET_WINDOW_MS", "50");
         let server = CountingEmbeddingServer::start();
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -8022,12 +8028,16 @@ mod tests {
         assert!(handle_configure_for_test(&request, &ctx).success);
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(
-            server.wait_for_non_probe_request_count(1, Duration::from_secs(5)),
-            "initial semantic build did not reach the embedding server"
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(10)),
+            "the semantic view's first fill did not reach the embedding server"
         );
-        server.release_response();
-        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
-        ctx.publish_view_paths(BTreeSet::new(), true).unwrap();
+        assert!(
+            ctx.semantic_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a views-on root must not build the legacy semantic index"
+        );
 
         let second_source =
             "pub fn newly_visible() {}\npub fn invokes_new() { newly_visible(); }\n";
@@ -8046,45 +8056,19 @@ mod tests {
                 "commit",
                 "--quiet",
                 "-m",
-                "semantic refresh change",
+                "callgraph change while semantic is held",
             ])
             .status()
             .unwrap()
             .success());
         ctx.update_config(|config| config.indexes.callgraph = true);
-        let semantic_fingerprint = ctx
-            .semantic_index()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .unwrap()
-            .fingerprint()
-            .cloned()
-            .unwrap();
-        ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_mut()
-            .unwrap()
-            .invalidate_files(std::slice::from_ref(&source));
-        let mut held_model =
-            crate::semantic_index::EmbeddingModel::from_config(&ctx.config().semantic)
-                .expect("held refresh embedding model");
-        let held_batch = std::thread::spawn(move || {
-            held_model.embed(vec!["watcher semantic refresh batch".to_owned()])
-        });
-        assert!(
-            server.wait_for_non_probe_request_count(2, Duration::from_secs(5)),
-            "watcher refresh did not reach its held embedding batch"
-        );
-
         let callgraph_report = ctx
             .publish_view_paths(BTreeSet::from([b"tracked.rs".to_vec()]), true)
             .unwrap();
         assert!(callgraph_report.published);
-        assert_eq!(
-            callgraph_report.pending_paths,
-            BTreeSet::from([b"tracked.rs".to_vec()])
+        assert!(
+            callgraph_report.pending_paths.is_empty(),
+            "the older view must not wait for semantic vectors it no longer carries"
         );
         match ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(store) => {
@@ -8099,30 +8083,27 @@ mod tests {
             _ => panic!("callgraph plane was not readable while embedding was held"),
         }
 
-        let callgraph_generation = callgraph_report.generation.unwrap();
-        server.release_response();
-        held_batch.join().unwrap().unwrap();
-        let mut replacement = SemanticIndex::build(
-            &canonical_root,
-            std::slice::from_ref(&source),
-            &mut |texts| Ok(texts.into_iter().map(|_| vec![1.0, 1.1, 1.2]).collect()),
-            64,
-        )
-        .unwrap();
-        replacement.set_fingerprint(semantic_fingerprint);
-        *ctx.semantic_index()
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(replacement);
-        let semantic_report = ctx
-            .publish_view_paths(BTreeSet::from([b"tracked.rs".to_vec()]), true)
-            .unwrap();
-        assert!(semantic_report.published);
-        assert!(semantic_report.pending_paths.is_empty());
-        assert_ne!(
-            semantic_report.generation.as_deref(),
-            Some(callgraph_generation.as_str())
-        );
-        assert_eq!(semantic_report.blob_puts, 0);
+        server.release_responses();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut polls = 0u32;
+        while !ctx.checkout_semantic_runtime().is_some_and(|runtime| {
+            runtime
+                .search(&[1.0, 0.0, 0.0], 10, &|_| true)
+                .is_ok_and(|answer| answer.complete())
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "the semantic view never finished after the held fill was released"
+            );
+            // A fill that timed out while held waits for the next wake; wake
+            // it now and then, never so often that its quiet window restarts
+            // before it ends.
+            polls += 1;
+            if polls % 20 == 0 {
+                ctx.checkout_semantic().wake();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
