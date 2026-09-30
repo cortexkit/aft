@@ -472,10 +472,17 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
         "views-semantic-mock-2",
     );
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-    let deadline = Instant::now() + DEADLINE;
+    let started = Instant::now();
+    let deadline = started + DEADLINE;
     while served_model(&ctx).is_none_or(|model| model == old_model) {
         drain(&ctx);
-        assert!(Instant::now() < deadline, "the lane never restarted");
+        assert!(
+            Instant::now() < deadline,
+            "the lane never restarted after {:?}: lane={} status={:?}",
+            started.elapsed(),
+            ctx.checkout_semantic().describe(),
+            ctx.semantic_index_status().read().unwrap()
+        );
         thread::sleep(Duration::from_millis(20));
     }
     wait_views_filled(&ctx);

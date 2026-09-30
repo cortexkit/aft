@@ -193,8 +193,12 @@ pub struct FillReport {
     pub dropped: usize,
     /// Items recorded as deterministic failures.
     pub failed: usize,
-    /// Transient errors; their items stay pending.
+    /// Transient errors (the embedding call failed, or the store was busy);
+    /// their items stay pending and a later fill retries them.
     pub errors: Vec<String>,
+    /// Store errors other than busy: the store refused what was embedded.
+    /// Their items stay pending, but retrying on a timer would not help.
+    pub store_errors: Vec<String>,
 }
 
 /// A semantic answer for one snapshot. Paths without current vectors are
@@ -207,11 +211,17 @@ pub struct SemanticQuery {
     /// True when membership or content could not be vouched for (the watcher
     /// was not healthy); membership was re-walked, but vectors may lag disk.
     pub unvouched: bool,
+    /// Why this checkout's vectors cannot currently be brought up to date,
+    /// when the reason is not one a timed retry would fix.
+    pub unavailable: Option<String>,
 }
 
 impl SemanticQuery {
     pub fn complete(&self) -> bool {
-        self.pending.is_empty() && self.failed.is_empty() && !self.unvouched
+        self.pending.is_empty()
+            && self.failed.is_empty()
+            && !self.unvouched
+            && self.unavailable.is_none()
     }
 }
 
@@ -255,6 +265,22 @@ pub struct SemanticPlane {
     /// Separator of the native relative paths the overlay holds; see
     /// [`overlay_rel_path`]. Always the platform's own outside tests.
     separator: char,
+    /// Unique in the process and never reused, unlike the plane's address.
+    id: u64,
+}
+
+static NEXT_PLANE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// SQLite reports that another connection holds the database for a moment.
+fn store_error_is_busy(error: &crate::blob_store::v2::StoreError) -> bool {
+    matches!(
+        error,
+        crate::blob_store::v2::StoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _))
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 /// Converts a view path into the relative path the semantic overlay holds.
@@ -286,6 +312,7 @@ impl SemanticPlane {
             residents: Mutex::new(BTreeMap::new()),
             arenas: Mutex::new(BTreeMap::new()),
             overlay_builds: std::sync::atomic::AtomicU64::new(0),
+            id: NEXT_PLANE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             separator: std::path::MAIN_SEPARATOR,
         }
     }
@@ -301,6 +328,11 @@ impl SemanticPlane {
 
     fn overlay_path(&self, rel_path: &RelPath) -> Option<PathBuf> {
         overlay_rel_path(rel_path, self.separator)
+    }
+
+    /// This plane's process-unique id.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn semantic_producer(&self) -> &SemanticProducer {
@@ -639,7 +671,10 @@ impl SemanticPlane {
                                     ready.push((item, key));
                                 }
                             }
-                            Err(error) => report.errors.push(error.to_string()),
+                            Err(error) if store_error_is_busy(&error) => {
+                                report.errors.push(error.to_string())
+                            }
+                            Err(error) => report.store_errors.push(error.to_string()),
                         }
                         // Releasing the claim wakes views waiting on the key.
                         drop(claim);
@@ -833,6 +868,7 @@ impl SemanticPlane {
             pending: overlay.pending,
             failed: overlay.failed,
             unvouched: overlay.unvouched,
+            unavailable: None,
         })
     }
 

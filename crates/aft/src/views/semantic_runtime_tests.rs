@@ -369,6 +369,107 @@ fn dropping_a_superseded_runtime_keeps_the_replacements_view() {
     );
 }
 
+/// Every `CheckoutSemantic::new` holds its view once and every drop releases
+/// it once, keyed by the plane's never-reused id rather than its address.
+#[test]
+fn live_view_holders_match_runtimes_and_planes_have_unique_ids() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let first = open(storage.path(), "holders", root.path());
+    let plane = Arc::clone(first.plane());
+    let access = first.access().clone();
+    assert_eq!(live_holders(&plane, &access), 1);
+    let second = open(storage.path(), "holders", root.path());
+    assert_eq!(live_holders(&plane, &access), 2);
+    drop(first);
+    assert_eq!(live_holders(&plane, &access), 1);
+    drop(second);
+    assert_eq!(live_holders(&plane, &access), 0);
+
+    let id = plane.id();
+    drop(plane);
+    // A plane built after the previous one was freed, possibly at the same
+    // address, still gets an id of its own.
+    let replacement = shared_plane(storage.path(), producer());
+    assert_ne!(replacement.id(), id);
+}
+
+#[test]
+fn only_busy_and_checkout_races_are_transient_load_errors() {
+    for transient in [
+        super::super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
+        super::super::first_load::CHECKOUT_WRITE_ACTIVE,
+        super::super::first_load::CHECKOUT_CHANGED_BEFORE_INSTALL,
+        "trigram plane: database is locked",
+    ] {
+        assert!(is_transient_reason(transient), "{transient}");
+    }
+    for permanent in [
+        "semantic plane: file is not a database",
+        "trigram plane: Permission denied (os error 13)",
+        "semantic plane: semantic producer mismatch",
+        "unsupported persisted format: written by a newer build",
+    ] {
+        assert!(!is_transient_reason(permanent), "{permanent}");
+    }
+}
+
+/// A refresh error no timed retry would fix (here the view store cannot be
+/// written) becomes the checkout's unavailable reason after one attempt;
+/// the worker does not retry it on the backoff. An embedding failure, by contrast, is
+/// retried (`transient_embed_errors_retry_until_complete_without_a_wake`).
+#[cfg(unix)]
+#[test]
+fn store_errors_name_the_gap_without_a_retry_loop() {
+    use std::os::unix::fs::PermissionsExt;
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
+    // An edit makes the next refresh reload, which publishes into the view
+    // directory; a read-only directory refuses that publication.
+    std::fs::write(root.path().join("src/gamma.rs"), "pub fn gamma_edit() {}\n").unwrap();
+    runtime
+        .driver()
+        .record_absolute_change(&root.path().join("src/gamma.rs"));
+    let view_dir = crate::views::registry::view_dir(storage.path(), "scope").unwrap();
+    let original = std::fs::metadata(&view_dir).unwrap().permissions();
+    std::fs::set_permissions(&view_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let worker = {
+        let weak = Arc::downgrade(&slot);
+        let root = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let schedule = fast_schedule(&root);
+            serve_fills(&weak, epoch, &wake, &schedule, &mut |texts: Vec<String>| {
+                Ok(texts.iter().map(|text| vector(text)).collect())
+            });
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while runtime.unavailable_reason().is_none() {
+        assert!(Instant::now() < deadline, "the store error was never named");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The backoff (20 ms doubling to 80 ms) would allow several refresh
+    // attempts in this wait if the error were treated as transient.
+    std::thread::sleep(Duration::from_millis(500));
+    let attempts = runtime.refresh_attempts();
+    let answer = query(&runtime, "gamma");
+    std::fs::set_permissions(&view_dir, original).unwrap();
+    slot.clear();
+    worker.join().unwrap();
+    assert_eq!(attempts, 1, "a store error was retried on the backoff");
+    assert!(!answer.complete());
+    assert!(
+        answer
+            .unavailable
+            .as_deref()
+            .is_some_and(|reason| reason.contains("Permission denied")),
+        "{answer:?}"
+    );
+}
+
 /// An AFT write under the root wakes the lane's worker; one elsewhere does not.
 #[test]
 fn aft_writes_wake_only_their_own_lane() {

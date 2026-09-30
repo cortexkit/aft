@@ -2343,7 +2343,7 @@ impl CheckoutSemanticGaps {
             pending: answer.pending.clone(),
             failed: answer.failed.clone(),
             unvouched: answer.unvouched,
-            unavailable: None,
+            unavailable: answer.unavailable.clone(),
         }
     }
 

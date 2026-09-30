@@ -77,6 +77,13 @@ pub trait QueryState: Send + Sync {
     ) -> (Snapshot, Vec<std::path::PathBuf>);
 }
 
+/// Load failures caused by the checkout changing while it was loaded. They
+/// clear by themselves on the next attempt, so callers retry them.
+pub const CHECKOUT_CHANGED_DURING_RECONCILE: &str =
+    "checkout changed during strict reconciliation; retry load";
+pub const CHECKOUT_WRITE_ACTIVE: &str = "checkout write still active during reconciliation";
+pub const CHECKOUT_CHANGED_BEFORE_INSTALL: &str = "checkout changed before snapshot installation";
+
 /// Derived graphs cannot be copied between checkouts until tests prove their
 /// rows contain no source-root-dependent data. Per-file blobs remain reusable.
 pub const DERIVED_CALLGRAPH_SEEDING: bool = false;
@@ -185,9 +192,7 @@ impl SiblingLoader {
             }
             return Ok((delta.snapshot(), checkout.revision));
         }
-        Err(Self::error(
-            "checkout changed during strict reconciliation; retry load",
-        ))
+        Err(Self::error(CHECKOUT_CHANGED_DURING_RECONCILE))
     }
 
     fn open_planes(&self, access: &ViewAccess, snapshot: &Snapshot) -> Vec<PlaneError> {
@@ -841,9 +846,7 @@ impl FirstLoadDriver for CheckoutDriver {
     fn reconcile(&self, access: &ViewAccess) -> Result<ReconciledCheckout, PlaneError> {
         self.check_owner(access)?;
         if super::intent::active(self.owner.root()) {
-            return Err(SiblingLoader::error(
-                "checkout write still active during reconciliation",
-            ));
+            return Err(SiblingLoader::error(CHECKOUT_WRITE_ACTIVE));
         }
         let revision = self.revision(access);
         let mut entries = BTreeMap::new();
@@ -886,9 +889,7 @@ impl FirstLoadDriver for CheckoutDriver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if revision != installed.revision {
-            return Err(SiblingLoader::error(
-                "checkout changed before snapshot installation",
-            ));
+            return Err(SiblingLoader::error(CHECKOUT_CHANGED_BEFORE_INSTALL));
         }
         let own_installed =
             installed.prepared_generation.as_deref() == Some(snapshot.generation().name());

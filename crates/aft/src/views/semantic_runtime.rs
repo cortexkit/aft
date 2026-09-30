@@ -83,6 +83,11 @@ pub struct CheckoutSemantic {
     refresh: Mutex<()>,
     /// Fills installed since the last fold into a published generation.
     unfolded: AtomicBool,
+    refresh_attempts: AtomicUsize,
+    /// Why this checkout's vectors cannot be brought up to date, when a
+    /// refresh failed in a way that retrying on a timer would not fix. Searches
+    /// report it as `semantic: unavailable: <reason>`.
+    unavailable: Mutex<Option<String>>,
     /// Wakes the fill worker after an AFT write to this checkout. It is held
     /// here because the intent registry keeps only weak references.
     _wake_on_write: Arc<dyn WriteIntentListener>,
@@ -130,7 +135,7 @@ impl CheckoutSemantic {
         });
         super::intent::register_listener(&listener);
         let access = ViewAccess::Owner(owner.clone());
-        hold_view(&plane, &access);
+        hold_view(plane.as_ref(), &access);
         Ok(Self {
             root: root.to_path_buf(),
             access,
@@ -140,6 +145,8 @@ impl CheckoutSemantic {
             plane,
             refresh: Mutex::new(()),
             unfolded: AtomicBool::new(false),
+            refresh_attempts: AtomicUsize::new(0),
+            unavailable: Mutex::new(None),
             _wake_on_write: listener,
         })
     }
@@ -184,14 +191,20 @@ impl CheckoutSemantic {
     /// and lets sibling checkouts seed from them. Folding once per catch-up
     /// rather than per round matters: each fold re-walks the whole checkout.
     /// Until then the fill map serves them and the live pin protects them.
-    pub fn refresh<F>(&self, budget: FillBudget, embed: &mut F) -> Result<FillReport, String>
+    ///
+    /// Errors are classified: [`RefreshError::Transient`] for failures that
+    /// can clear by themselves (see [`is_transient_reason`]), and
+    /// [`RefreshError::Unavailable`] for everything else. A fill that could
+    /// not store what it embedded reports the store errors in its report.
+    pub fn refresh<F>(&self, budget: FillBudget, embed: &mut F) -> Result<FillReport, RefreshError>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         let _serial = lock(&self.refresh);
+        self.refresh_attempts.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = self.installed();
         if needs_reload(&snapshot) {
-            snapshot = self.load()?;
+            snapshot = self.load().map_err(RefreshError::classify)?;
         }
         let driver = Arc::clone(&self.driver);
         let report = self
@@ -199,7 +212,7 @@ impl CheckoutSemantic {
             .fill(&self.owner, &snapshot, budget, embed, &move || {
                 driver.installed_snapshot()
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| RefreshError::classify(error.to_string()))?;
         if report.installed > 0 || report.failed > 0 {
             self.unfolded.store(true, Ordering::SeqCst);
         }
@@ -207,10 +220,35 @@ impl CheckoutSemantic {
         if caught_up && self.unfolded.swap(false, Ordering::SeqCst) {
             if let Err(error) = self.load() {
                 self.unfolded.store(true, Ordering::SeqCst);
-                return Err(error);
+                return Err(RefreshError::classify(error));
             }
         }
         Ok(report)
+    }
+
+    /// How many times `refresh` has run, successful or not.
+    pub fn refresh_attempts(&self) -> usize {
+        self.refresh_attempts.load(Ordering::SeqCst)
+    }
+
+    /// Why the checkout's vectors cannot be brought up to date, when a
+    /// refresh hit an error that retrying on a timer would not fix.
+    pub fn unavailable_reason(&self) -> Option<String> {
+        lock(&self.unavailable).clone()
+    }
+
+    /// Stores why the checkout's vectors cannot be brought up to date. True
+    /// when the reason changed, so the caller logs it once rather than on
+    /// every attempt.
+    fn set_unavailable(&self, reason: String) -> bool {
+        let mut unavailable = lock(&self.unavailable);
+        let changed = unavailable.as_deref() != Some(reason.as_str());
+        *unavailable = Some(reason);
+        changed
+    }
+
+    fn clear_unavailable(&self) {
+        *lock(&self.unavailable) = None;
     }
 
     /// Scores `query_vector` against the installed snapshot.
@@ -220,7 +258,8 @@ impl CheckoutSemantic {
         top_k: usize,
         include: &dyn Fn(&Path) -> bool,
     ) -> Result<SemanticQuery, String> {
-        self.plane
+        let mut answer = self
+            .plane
             .search(
                 &self.access,
                 &self.root,
@@ -229,7 +268,9 @@ impl CheckoutSemantic {
                 top_k,
                 include,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        answer.unavailable = self.unavailable_reason();
+        Ok(answer)
     }
 
     /// The resident index `search` scores for the installed snapshot, for
@@ -266,38 +307,51 @@ impl Drop for CheckoutSemantic {
         // (same family and scope). Only the last checkout runtime of a view
         // releases its state, or a superseded worker exiting would wipe the
         // fills and resident generations of the lane that replaced it.
-        if release_view(&self.plane, &self.access) {
+        if release_view(self.plane.as_ref(), &self.access) {
             self.plane.unbind(&self.access);
         }
     }
 }
 
-type LiveViewKey = (usize, String, String);
+/// A view of one plane: the plane's process-unique id (never reused, unlike
+/// its address after it is freed), the family and the scope.
+type LiveViewKey = (u64, String, String);
 
 fn live_views() -> &'static Mutex<std::collections::HashMap<LiveViewKey, usize>> {
     static LIVE: OnceLock<Mutex<std::collections::HashMap<LiveViewKey, usize>>> = OnceLock::new();
     LIVE.get_or_init(Default::default)
 }
 
-fn live_view_key(plane: &Arc<SemanticPlane>, access: &ViewAccess) -> LiveViewKey {
+fn live_view_key(plane: &SemanticPlane, access: &ViewAccess) -> LiveViewKey {
     (
-        Arc::as_ptr(plane) as usize,
+        plane.id(),
         access.family().to_owned(),
         access.scope().to_owned(),
     )
 }
 
-fn hold_view(plane: &Arc<SemanticPlane>, access: &ViewAccess) {
+/// How many live `CheckoutSemantic`s hold the view `access` names on `plane`.
+pub fn live_holders(plane: &SemanticPlane, access: &ViewAccess) -> usize {
+    lock(live_views())
+        .get(&live_view_key(plane, access))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn hold_view(plane: &SemanticPlane, access: &ViewAccess) {
     *lock(live_views())
         .entry(live_view_key(plane, access))
         .or_default() += 1;
 }
 
 /// Drops one holder of the view; true when it was the last.
-fn release_view(plane: &Arc<SemanticPlane>, access: &ViewAccess) -> bool {
+fn release_view(plane: &SemanticPlane, access: &ViewAccess) -> bool {
     let mut live = lock(live_views());
     let key = live_view_key(plane, access);
     let Some(count) = live.get_mut(&key) else {
+        // Every `CheckoutSemantic::new` holds exactly once and every drop
+        // releases exactly once, so a missing entry is a bookkeeping bug.
+        debug_assert!(false, "released a semantic view that was never held");
         return true;
     };
     *count -= 1;
@@ -379,6 +433,25 @@ impl CheckoutSemanticSlot {
     /// that have not noticed yet.
     pub fn workers(&self) -> usize {
         self.workers.load(Ordering::SeqCst)
+    }
+
+    /// One line describing the lane, for diagnostics.
+    pub fn describe(&self) -> String {
+        let state = match self.state() {
+            None => "none".to_owned(),
+            Some(CheckoutSemanticState::Loading) => "loading".to_owned(),
+            Some(CheckoutSemanticState::Ready(runtime)) => format!(
+                "ready producer={} unavailable={:?}",
+                runtime.plane().semantic_producer().id(),
+                runtime.unavailable_reason()
+            ),
+            Some(CheckoutSemanticState::Unavailable(reason)) => format!("unavailable: {reason}"),
+        };
+        format!(
+            "{state} epoch={} workers={}",
+            self.epoch.load(Ordering::SeqCst),
+            self.workers()
+        )
     }
 
     /// Starts a new epoch in the `Loading` state and returns it with the
@@ -502,6 +575,17 @@ pub(crate) const RETRY_MAX: Duration = Duration::from_secs(300);
 
 const LIMITER_KIND: &str = "semantic view fill";
 
+/// How long a new lane waits for a superseded worker of the same lane to
+/// finish before it loads anyway.
+const SUPERSEDED_WORKER_WAIT: Duration = Duration::from_secs(60);
+
+/// Text of the error reading a view back when its manifest names other
+/// producers than the reader's.
+const PRODUCER_MISMATCH: &str = "view producer mismatch";
+
+/// Producer mismatches tolerated during a lane's first load before it fails.
+const LOAD_MISMATCH_RETRIES: usize = 5;
+
 fn set_status(
     slot: &Weak<CheckoutSemanticSlot>,
     epoch: u64,
@@ -599,13 +683,59 @@ pub(crate) fn run_worker(
     if !is_current(&slot, epoch) {
         return;
     }
+    // A superseded worker of this lane (the lane restarted after a
+    // reconfigure) may still be finishing a fill, and its fold publishes into
+    // the same view under the old producer. Loading now could read back that
+    // publication instead of this lane's own and fail with a producer
+    // mismatch, so wait (bounded) until this is the lane's only worker.
+    let quiesce_deadline = Instant::now() + SUPERSEDED_WORKER_WAIT;
+    while slot.upgrade().is_some_and(|slot| slot.workers() > 1) && Instant::now() < quiesce_deadline
+    {
+        if !is_current(&slot, epoch) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     // Subscribe to watcher changes and write intents before the first
     // snapshot is served, so no edit made during the load is missed.
     config.drivers.install(Arc::clone(runtime.driver()));
     let started = Instant::now();
-    if let Err(error) = runtime.load() {
-        config.drivers.clear_if(runtime.driver());
-        return fail(format!("view load: {error}"));
+    let mut wait = config.schedule.retry_initial;
+    let mut mismatches = 0;
+    loop {
+        match runtime.load() {
+            Ok(_) => break,
+            // The checkout changed while it was loaded, a database was busy,
+            // or another producer's publication (a superseded worker that
+            // outlived SUPERSEDED_WORKER_WAIT) landed in this view: load again
+            // after a wait instead of failing the lane. A producer mismatch
+            // that persists past LOAD_MISMATCH_RETRIES is a real conflict and
+            // fails the lane with that error.
+            Err(error)
+                if is_transient_reason(&error)
+                    || (error.contains(PRODUCER_MISMATCH)
+                        && mismatches < LOAD_MISMATCH_RETRIES) =>
+            {
+                if error.contains(PRODUCER_MISMATCH) {
+                    mismatches += 1;
+                }
+                crate::slog_info!(
+                    "semantic view load will retry root={} error={}",
+                    config.root.display(),
+                    error
+                );
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(config.schedule.retry_max);
+                if !is_current(&slot, epoch) {
+                    config.drivers.clear_if(runtime.driver());
+                    return;
+                }
+            }
+            Err(error) => {
+                config.drivers.clear_if(runtime.driver());
+                return fail(format!("view load: {error}"));
+            }
+        }
     }
     // Build the index queries score before the lane is served, so neither
     // the first query nor a readiness sample has to build it.
@@ -755,9 +885,13 @@ where
         };
         match runtime.refresh(budget, embed) {
             Ok(report) => {
-                if report.model_calls > 0 || report.installed > 0 || !report.errors.is_empty() {
+                if report.model_calls > 0
+                    || report.installed > 0
+                    || !report.errors.is_empty()
+                    || !report.store_errors.is_empty()
+                {
                     crate::slog_info!(
-                        "semantic view fill root={} queued={} deferred={} embedded_keys={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={}",
+                        "semantic view fill root={} queued={} deferred={} embedded_keys={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={}",
                         schedule.root.display(),
                         report.queued,
                         report.deferred,
@@ -768,11 +902,20 @@ where
                         report.resident_hits,
                         report.installed,
                         report.failed,
-                        report.errors.len()
+                        report.errors.len(),
+                        report.store_errors.len()
                     );
                 }
                 let advanced = report.installed > 0 || report.failed > 0;
                 progress |= advanced;
+                // A store that refuses what was embedded will refuse it again
+                // on a timer: record it as the checkout's unavailable reason
+                // and wait for the next wake.
+                if let Some(error) = report.store_errors.first() {
+                    mark_unavailable(runtime, schedule, format!("semantic store: {error}"));
+                    warm_index(runtime);
+                    return FillOutcome::Settled;
+                }
                 if !report.errors.is_empty() {
                     crate::slog_warn!(
                         "semantic view fill left work for a retry root={} error={}",
@@ -782,6 +925,7 @@ where
                     warm_index(runtime);
                     return FillOutcome::Retry { progress };
                 }
+                runtime.clear_unavailable();
                 // Work beyond the budget continues at once; a round that made
                 // no progress without an error has nothing it can do now.
                 if report.deferred == 0 || !advanced {
@@ -789,16 +933,82 @@ where
                     return FillOutcome::Settled;
                 }
             }
-            Err(error) => {
+            Err(RefreshError::Transient(error)) => {
                 crate::slog_warn!(
-                    "semantic view refresh failed root={} error={}",
+                    "semantic view refresh will retry root={} error={}",
                     schedule.root.display(),
                     error
                 );
                 return FillOutcome::Retry { progress };
             }
+            Err(RefreshError::Unavailable(error)) => {
+                mark_unavailable(runtime, schedule, error);
+                return FillOutcome::Settled;
+            }
         }
     }
+}
+
+/// Records a refresh error that retrying on a timer would not fix as the
+/// checkout's unavailable reason, logging it once. The next wake (an edit, a rebind, a reconfigure)
+/// tries again, and a clean refresh clears it.
+fn mark_unavailable(runtime: &CheckoutSemantic, schedule: &FillSchedule, reason: String) {
+    if runtime.set_unavailable(reason.clone()) {
+        crate::slog_warn!(
+            "semantic view unavailable root={} reason={}",
+            schedule.root.display(),
+            reason
+        );
+    }
+}
+
+/// A failed refresh, by whether waiting can fix it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RefreshError {
+    /// Clears by itself: the checkout changed or was being written while it
+    /// was loaded, or a SQLite database was busy or locked by another
+    /// connection.
+    Transient(String),
+    /// Needs something to change first: an unreadable or corrupt store, a
+    /// refused registration or publication, a manifest that does not match.
+    Unavailable(String),
+}
+
+impl RefreshError {
+    fn classify(reason: String) -> Self {
+        if is_transient_reason(&reason) {
+            Self::Transient(reason)
+        } else {
+            Self::Unavailable(reason)
+        }
+    }
+}
+
+impl std::fmt::Display for RefreshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(reason) | Self::Unavailable(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// Whether a load or store failure clears by itself. Embedding failures
+/// never reach this: a fill reports them in `FillReport::errors`, which are
+/// always retried. The only store failure retried is SQLite's busy/locked
+/// (another connection holds the database for a moment); every other store
+/// error is surfaced as the checkout's named gap.
+pub fn is_transient_reason(reason: &str) -> bool {
+    [
+        super::first_load::CHECKOUT_CHANGED_DURING_RECONCILE,
+        super::first_load::CHECKOUT_WRITE_ACTIVE,
+        super::first_load::CHECKOUT_CHANGED_BEFORE_INSTALL,
+        // SQLITE_BUSY and SQLITE_LOCKED, as rusqlite renders them.
+        "database is locked",
+        "database table is locked",
+        "database is busy",
+    ]
+    .iter()
+    .any(|marker| reason.contains(marker))
 }
 
 /// Rebuilds the scored index after a fill, on the worker rather than on the
