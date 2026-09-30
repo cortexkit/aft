@@ -1652,4 +1652,53 @@ mod tests {
         drop(generation);
         assert_eq!(arena.memory().runs, 0, "unbind left runs resident");
     }
+
+    /// A fold may install a generation built from a cut taken before a fill
+    /// landed. Installed completions that generation does not record stay in
+    /// the fill map: the work is neither lost nor done again.
+    #[test]
+    fn semantic_installed_fills_survive_a_fold_that_does_not_carry_them() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), FILES);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = ready_checkout(storage.path(), root.path(), &plane);
+        let generation = checkout.installed();
+        write_tree(
+            root.path(),
+            &[(
+                "src/alpha.rs",
+                "pub fn alpha_rewritten() -> u8 {\n    7\n}\n",
+            )],
+        );
+        let mut delta = LiveDelta::new(Arc::clone(generation.generation()));
+        crate::views::live_delta::reconcile(&mut delta, root.path(), &trigram_policy());
+        let model = Model::default();
+        let snapshot = delta.snapshot();
+        let fill = |model: &Model| {
+            plane
+                .fill(
+                    &checkout.owner,
+                    &snapshot,
+                    FillBudget::default(),
+                    &mut |texts| model.embed("model-a", texts),
+                    &|| snapshot.clone(),
+                )
+                .unwrap()
+        };
+        assert_eq!(fill(&model).installed, 1);
+        // Install a generation that still names alpha.rs's previous content.
+        plane
+            .open_generation(&checkout.access, generation.generation())
+            .unwrap();
+        let answer = checkout.query(&snapshot, "model-a", "alpha rewritten");
+        assert!(answer.complete(), "installed work was lost: {answer:?}");
+        assert_eq!(
+            rows(root.path(), &answer.results),
+            cold(root.path(), "model-a", "alpha rewritten")
+        );
+        let texts = model.texts();
+        assert_eq!(fill(&model).queued, 0);
+        assert_eq!(model.texts(), texts);
+    }
 }
