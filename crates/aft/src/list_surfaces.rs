@@ -286,6 +286,15 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    // The views-on semantic gap note names its first few missing files in the
+    // response text; every missing file is listed in the JSON `semantic_gap`
+    // field, and the text says how many more there are.
+    ExclusionEntry {
+        file: "commands/semantic_search/mod.rs",
+        enclosing_item: "disclose",
+        location_or_primitive: "semantic gap note take",
+        reason: "summary line naming the first few files a views-on semantic answer is missing, with its own '(+N more)' count; the full list is in the semantic_gap JSON field",
+    },
     // The unanalyzed-macro note on `callers` is one summary line, not a list
     // the agent pages through: it states how many mentions exist (or that the
     // count is a lower bound) and says how many of them it spells out.
