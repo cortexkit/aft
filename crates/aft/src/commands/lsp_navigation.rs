@@ -203,7 +203,9 @@ fn defer_lsp_navigation(
 
     // Cold initialization and its first query run after the scheduler job returns,
     // so an LSP handshake cannot serialize unrelated work on the same root.
+    let completion_wake = crate::response_finalize::deferred_completion_wake();
     std::thread::spawn(move || {
+        let _completion_wake = completion_wake;
         #[cfg(test)]
         let _worker = DeferredNavigationWorkerGuard::new();
         let _config_pin = ctx.pin_config_to(admitted_config);

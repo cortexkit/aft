@@ -174,9 +174,8 @@ const _: () = assert!(
 /// long-running reminders that arrive after their reliable completion event.
 const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
 
-/// Bash foreground orchestration polls detached tasks with short read-lane jobs.
-/// The sleep between polls is outside the executor so no read or write worker is
-/// pinned while a foreground command is still running.
+/// Navigation's overall deadline remains independently polled even if its
+/// producer gets stuck. Normal deferred completions wake the loop directly.
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Host elicitation asks fail closed if the MCP facade does not answer promptly.
@@ -428,10 +427,34 @@ struct ResolvedSubcResponse {
 #[derive(Default)]
 struct PendingSubcResponses {
     entries: Vec<PendingSubcResponse>,
+    dirty: bool,
+    wake_generation: u64,
+    next_deadline_poll: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct DeferredResponseSender {
+    entries: mpsc::UnboundedSender<PendingSubcResponse>,
+    wake: crate::response_finalize::DeferredResponseWake,
+}
+
+impl DeferredResponseSender {
+    fn send(
+        &self,
+        pending: PendingSubcResponse,
+    ) -> Result<(), mpsc::error::SendError<PendingSubcResponse>> {
+        self.entries.send(pending)
+    }
 }
 
 impl PendingSubcResponses {
     fn register(&mut self, pending: PendingSubcResponse) {
+        self.dirty = true;
+        if crate::commands::lsp_navigation::is_lsp_navigation_command(&pending.bare_name)
+            && self.next_deadline_poll.is_none()
+        {
+            self.next_deadline_poll = Some(Instant::now() + PENDING_POLL_INTERVAL);
+        }
         self.entries.retain(|entry| {
             let keep = entry.route != pending.route || entry.corr != pending.corr;
             if !keep {
@@ -442,6 +465,38 @@ impl PendingSubcResponses {
             keep
         });
         self.entries.push(pending);
+    }
+
+    fn poll_if_woken(
+        &mut self,
+        executor: &Executor,
+        wake: &crate::response_finalize::DeferredResponseWake,
+    ) -> Vec<ResolvedSubcResponse> {
+        if self.needs_deadline_poll()
+            && self
+                .next_deadline_poll
+                .is_some_and(|due| Instant::now() >= due)
+        {
+            // Check at the top of each turn so sustained control traffic cannot
+            // starve navigation's independent deadline check in biased select.
+            self.dirty = true;
+            self.next_deadline_poll = Some(Instant::now() + PENDING_POLL_INTERVAL);
+        }
+        let generation = wake.generation();
+        if !self.dirty && self.wake_generation == generation {
+            return Vec::new();
+        }
+        // Capture before polling: a producer that completes during this pass
+        // increments the generation and is therefore observed on the next turn.
+        self.wake_generation = generation;
+        self.dirty = false;
+        self.poll_ready(executor)
+    }
+
+    fn needs_deadline_poll(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            crate::commands::lsp_navigation::is_lsp_navigation_command(&entry.bare_name)
+        })
     }
 
     fn poll_ready(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
@@ -540,6 +595,7 @@ impl PendingSubcResponses {
         resolved
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -4165,17 +4221,26 @@ where
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
     let mut root_presence = RootPresenceProbe::new();
-    let standing_actor =
-        standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor));
+    let standing_actor = Arc::new(standing::StandingActor::new(
+        Arc::clone(&shared_app),
+        Arc::clone(&executor),
+    ));
     // Startup reconciliation is intentionally direct; subsequent passes use
     // this existing maintenance timer arm and never create a standing timer.
     standing_actor.reconcile_at_startup();
+    let standing_for_worker = Arc::clone(&standing_actor);
+    let standing_worker = standing::StandingWorker::start(move || standing_for_worker.tick());
     let mut next_standing_pass_at = tokio::time::Instant::now();
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
     let (deferred_response_tx, mut deferred_response_rx) =
         mpsc::unbounded_channel::<PendingSubcResponse>();
+    let deferred_wake = crate::response_finalize::DeferredResponseWake::default();
+    let deferred_response_tx = DeferredResponseSender {
+        entries: deferred_response_tx,
+        wake: deferred_wake.clone(),
+    };
     let (bash_poll_touch_tx, mut bash_poll_touch_rx) = mpsc::channel::<ProjectRootId>(256);
     let (control_completion_tx, mut control_completion_rx) =
         mpsc::channel::<RouteBindCompletion>(256);
@@ -4236,7 +4301,7 @@ where
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
         dispatch_path_metrics.mark_frame_loop_tick();
-        let ready_inspects = pending_responses.poll_ready(executor.as_ref());
+        let ready_inspects = pending_responses.poll_if_woken(executor.as_ref(), &deferred_wake);
         for resolved in ready_inspects {
             if let Err(error) = deliver_resolved_subc_response(
                 &writer_tx,
@@ -5066,9 +5131,12 @@ where
                     );
                 }
             }
-            _ = tokio::time::sleep(PENDING_POLL_INTERVAL), if !pending_responses.is_empty() => {
-                // The next loop turn polls detached inspect completions. Keeping
-                // the timer here lets already-ready control frames run first.
+            _ = deferred_wake.notified() => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                pending_responses.next_deadline_poll.unwrap_or_else(Instant::now)
+            )), if pending_responses.needs_deadline_poll() => {
+                // Only navigation's deadline needs a fallback timer. Inspect
+                // terminals (including timeout/failure) are producer-woken.
             }
             _ = tokio::time::sleep_until(next_drain_at) => {
                 // Wakes an otherwise-idle loop so the pre-turn drain check
@@ -5163,7 +5231,7 @@ where
                     &dispatch_path_metrics,
                 );
                 if tokio::time::Instant::now() >= next_standing_pass_at {
-                    standing_actor.tick();
+                    standing_worker.request();
                     next_standing_pass_at = tokio::time::Instant::now()
                         + standing::STANDING_MAINTENANCE_INTERVAL;
                 }
@@ -7185,7 +7253,7 @@ async fn handle_tool_call(
     bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
-    deferred_response_tx: &mpsc::UnboundedSender<PendingSubcResponse>,
+    deferred_response_tx: &DeferredResponseSender,
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
@@ -7844,8 +7912,10 @@ async fn handle_tool_call(
         let format_context_for_run = format_context.clone();
         let bare_name_for_run = bare_name.clone();
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
+        let completion_wake = deferred_response_tx.wake.clone();
         phase_trace.mark_executor_submitted();
         let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
+            let _deferred_wake_scope = completion_wake.install();
             phase_trace.mark_job_admitted();
             // Admission for this deferred tool call: pin the config so the
             // preflight and the deferred worker share one snapshot.
@@ -9128,6 +9198,147 @@ pub(crate) mod test_support {
             registry.poll_ready(executor.as_ref()).is_empty(),
             "a cancelled navigation must not leak a reply"
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_navigation_producer_notifies_completion() {
+        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let (dir, _) = test_root("navigation-producer-wake");
+        let (ctx, source) = cold_navigation_context(dir.path());
+        let (started_rx, release_tx) =
+            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let _scope = wake.install();
+        let DispatchOutcome::Deferred(mut pending) =
+            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
+                &navigation_request("nav-wake", &source),
+                Arc::clone(&ctx),
+                true,
+            )
+        else {
+            panic!("cold navigation must defer")
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer starts");
+        pending.cancellation.as_ref().unwrap().request_cancel();
+        release_tx.send(()).expect("release producer");
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("navigation completion wake");
+        assert_eq!(wake.generation(), 1);
+        assert!(
+            !(pending.poll)(&ctx)
+                .expect("terminal ready before wake")
+                .success
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_inspect_producer_notifies_completion() {
+        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let (dir, _) = test_root("inspect-producer-wake");
+        std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
+        let ctx = inspect_context(dir.path());
+        let (started_rx, release_tx) =
+            crate::commands::inspect::install_deferred_inspect_stat_gate_for_test();
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let _scope = wake.install();
+        let DispatchOutcome::Deferred(mut pending) =
+            crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                &inspect_request("inspect-wake"),
+                Arc::clone(&ctx),
+                true,
+            )
+        else {
+            panic!("inspect must defer")
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("producer starts");
+        release_tx.send(()).expect("release producer");
+        tokio::time::timeout(Duration::from_secs(10), wake.notified())
+            .await
+            .expect("inspect completion wake");
+        assert_eq!(wake.generation(), 1);
+        assert!((pending.poll)(&ctx)
+            .expect("terminal ready before wake")
+            .data
+            .get("inspect_terminal")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn deferred_registry_idle_turns_do_not_repoll_and_completion_wakes() {
+        let executor = Executor::new();
+        let (dir, root) = test_root("deferred-wake-counter");
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config::default(),
+        ));
+        executor.register_actor(root.clone(), ctx);
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&polls);
+        let mut pending = PendingSubcResponses::default();
+        pending.register(PendingSubcResponse {
+            route: RouteChannel {
+                channel: 17,
+                epoch: 1,
+            },
+            corr: 71,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "session".into(),
+            bare_name: "inspect".into(),
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "inspect",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending: PendingResponse {
+                request_id: "wake".into(),
+                session_id: "session".into(),
+                attach_command: "inspect".into(),
+                poll: Box::new(move |_| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    rx.try_recv().ok()
+                }),
+                cancellation: None,
+                on_shutdown: None,
+            },
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        assert!(pending.poll_if_woken(&executor, &wake).is_empty());
+        let initial = polls.load(Ordering::Relaxed);
+        for _ in 0..12 {
+            assert!(pending.poll_if_woken(&executor, &wake).is_empty());
+        }
+        assert_eq!(
+            polls.load(Ordering::Relaxed) - initial,
+            0,
+            "idle completion polls"
+        );
+        assert!(!pending.needs_deadline_poll());
+        let _scope = wake.install();
+        let completion_wake = crate::response_finalize::deferred_completion_wake();
+        std::thread::spawn(move || {
+            let _completion_wake = completion_wake;
+            tx.send(Response::success("wake", json!({"done": true})))
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("completion wake");
+        let ready = pending.poll_if_woken(&executor, &wake);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].response.data, json!({"done": true}));
+        assert!(pending.is_empty());
     }
 
     #[test]
@@ -14853,6 +15064,10 @@ mod tests {
             let (bash_tx, mut bash_rx) = mpsc::channel(8);
             let (touch_tx, _touch_rx) = mpsc::channel(8);
             let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+            let deferred_tx = DeferredResponseSender {
+                entries: deferred_tx,
+                wake: crate::response_finalize::DeferredResponseWake::default(),
+            };
             tokio::time::timeout(
                 Duration::from_millis(500),
                 handle_tool_call(

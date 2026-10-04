@@ -1,6 +1,7 @@
 //! The v1 catalog and admission boundary, separate from plugin tool forwarding.
 
 use std::collections::BTreeMap;
+use std::sync::{LazyLock, OnceLock};
 
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
@@ -15,6 +16,11 @@ use serde_json::{json, Value};
 use subc_protocol::ErrorBody;
 
 use super::manifest;
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RouteRole {
@@ -174,10 +180,52 @@ pub(super) fn tools_for(
     disabled: &[String],
     powershell_available: bool,
 ) -> Vec<CatalogTool> {
-    let manifest = manifest::filter_manifest_tools(
-        manifest::build_manifest_for_host(powershell_available),
-        disabled,
-    );
+    served_tools(preset)
+        .iter()
+        .filter(|tool| powershell_available || tool.catalog.name != "powershell")
+        .filter(|tool| crate::tool_gate::catalog_keeps(&tool.catalog.name, disabled))
+        .filter(|tool| {
+            tool.catalog.name != "bash_watch" || crate::tool_gate::catalog_keeps("bash", disabled)
+        })
+        .map(|tool| tool.catalog.clone())
+        .collect()
+}
+
+// Schemas and semantics are embedded in the executable. Host availability and
+// disabled-tool policy select from this immutable catalog; they do not change
+// its schemas, so neither digests nor validators need request-scoped rebuilding.
+struct ServedTool {
+    catalog: CatalogTool,
+    validator: OnceLock<jsonschema::Validator>,
+}
+
+static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
+    CatalogPreset::ALL.map(|preset| {
+        build_tools(preset)
+            .into_iter()
+            .map(|catalog| ServedTool {
+                catalog,
+                validator: OnceLock::new(),
+            })
+            .collect()
+    })
+});
+
+fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
+    &SERVED_TOOLS[match preset {
+        CatalogPreset::Head => 0,
+        CatalogPreset::Worker => 1,
+        CatalogPreset::Reader => 2,
+    }]
+}
+
+fn build_tools(preset: CatalogPreset) -> Vec<CatalogTool> {
+    #[cfg(test)]
+    ADMISSION_WORK.with(|count| {
+        let (catalogs, validators) = count.get();
+        count.set((catalogs + 1, validators));
+    });
+    let manifest = manifest::build_manifest_for_host(true);
     let mut served: Vec<(String, Value, Option<String>)> = manifest
         .provides
         .into_iter()
@@ -202,9 +250,7 @@ pub(super) fn tools_for(
             // `bash_watch` waits on the task ids `bash` hands back, so it sits
             // beside `bash_status` and is served only where its own disable
             // key and `bash` both leave it reachable.
-            if crate::tool_gate::catalog_keeps("bash_watch", disabled)
-                && served.iter().any(|(name, _, _)| name == "bash")
-            {
+            if served.iter().any(|(name, _, _)| name == "bash") {
                 let (schema, description) = manifest::preset_tool(preset.name(), "bash_watch")
                     .expect("the worker preset artifact carries bash_watch");
                 let at = served
@@ -486,10 +532,11 @@ fn admit_as(
     }
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
-    let tool = tools_for(CatalogPreset::Worker, &[], powershell_available)
-        .into_iter()
-        .find(|tool| tool.name == call.name)
+    let served = served_tools(CatalogPreset::Worker)
+        .iter()
+        .find(|tool| tool.catalog.name == call.name)
         .expect("admitted tool has a schema");
+    let tool = &served.catalog;
     if let Some(encoded) = &call.schema_pin {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
@@ -520,8 +567,15 @@ fn admit_as(
             return Err(errors::invalid_request(key, "host-only argument"));
         }
     }
-    let validator = jsonschema::validator_for(&tool.input_schema)
-        .expect("embedded schemas are valid JSON schemas");
+    let validator = served.validator.get_or_init(|| {
+        #[cfg(test)]
+        ADMISSION_WORK.with(|count| {
+            let (catalogs, validators) = count.get();
+            count.set((catalogs, validators + 1));
+        });
+        jsonschema::validator_for(&tool.input_schema)
+            .expect("embedded schemas are valid JSON schemas")
+    });
     if let Some(error) = validator.iter_errors(&call.arguments).next() {
         let field = error.instance_path.to_string();
         return Err(errors::invalid_request(
@@ -632,6 +686,22 @@ mod tests {
 
     fn call(name: &str, arguments: Value) -> cortexkit_role_tool_provider::call::ToolCallRequest {
         serde_json::from_value(json!({"name": name, "arguments": arguments})).unwrap()
+    }
+
+    #[test]
+    fn warm_admission_does_not_rebuild_catalog_or_validator() {
+        let request = call("read", json!({"filePath": "src/main.rs", "limit": 200}));
+        admit(&request, &[], true, "session", true).unwrap();
+        ADMISSION_WORK.with(|count| count.set((0, 0)));
+        for _ in 0..12 {
+            admit(&request, &[], true, "session", true).unwrap();
+        }
+        let work = ADMISSION_WORK.with(std::cell::Cell::get);
+        assert_eq!(
+            work,
+            (0, 0),
+            "catalog builds, validator compilations: {work:?}"
+        );
     }
 
     #[test]
@@ -1719,6 +1789,10 @@ mod route_tests {
         let (bash_tx, _bash_rx) = mpsc::channel(8);
         let (touch_tx, _touch_rx) = mpsc::channel(8);
         let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
+        let deferred_tx = super::super::DeferredResponseSender {
+            entries: deferred_tx,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        };
         handle_tool_call(
             &writer,
             &frame,

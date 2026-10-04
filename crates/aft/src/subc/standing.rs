@@ -20,6 +20,28 @@ use crate::standing_roots::{StandingRootEntry, StandingRoots};
 /// drives `due_maintenance_jobs`; no standing timer or scheduler is created.
 pub(super) const STANDING_MAINTENANCE_INTERVAL: std::time::Duration = super::DRAIN_TICK_PERIOD;
 
+pub(super) struct StandingWorker {
+    requests: std::sync::mpsc::SyncSender<()>,
+}
+
+impl StandingWorker {
+    pub(super) fn start(mut work: impl FnMut() + Send + 'static) -> Self {
+        let (requests, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            while rx.recv().is_ok() {
+                work();
+            }
+        });
+        Self { requests }
+    }
+
+    pub(super) fn request(&self) {
+        // At most one follow-up pass is queued while a reconciliation is busy.
+        // Resolution remains live on each pass, with no stale identity cache.
+        let _ = self.requests.try_send(());
+    }
+}
+
 #[cfg(test)]
 static LAST_STANDING_VERIFY_STRATEGY: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
@@ -73,6 +95,7 @@ pub(super) struct StandingActor {
     app: Arc<App>,
     executor: Arc<Executor>,
     roots: StandingRoots,
+    reconciliation: Mutex<()>,
     observed_config: Mutex<Config>,
     reconciliation_failures: Mutex<ReconciliationFailureLog>,
     /// Root ids registered solely to host unbound standing work. Session actors
@@ -86,6 +109,7 @@ impl StandingActor {
             app,
             executor,
             roots: StandingRoots::default(),
+            reconciliation: Mutex::new(()),
             observed_config: Mutex::new(Config::default()),
             reconciliation_failures: Mutex::new(ReconciliationFailureLog::default()),
             owned_actors: Mutex::new(HashMap::new()),
@@ -95,6 +119,7 @@ impl StandingActor {
     /// Startup reconciliation is intentionally direct and empty until subc has
     /// observed a user-tier configuration snapshot from a successful RouteBind.
     pub(super) fn reconcile_at_startup(&self) {
+        let _reconciliation = self.reconciliation.lock();
         if let Err(error) = self.roots.reconcile(&Config::default()) {
             log::warn!("standing roots startup reconciliation failed: {error}");
         }
@@ -130,6 +155,7 @@ impl StandingActor {
     /// not a timer or scheduler, and stale standing publication remains fenced
     /// even if a worker reaches its checkpoint late.
     pub(super) fn begin_session_bind(&self, ctx: &AppContext) {
+        let _reconciliation = self.reconciliation.lock();
         let snapshot = ctx.config();
         let snapshot = snapshot.as_ref().clone();
         if let Err(error) = self.roots.reconcile(&snapshot) {
@@ -166,6 +192,7 @@ impl StandingActor {
     /// Entry order and `search`, `semantic`, `callgraph` kind order are retained
     /// by `StandingRoots::entries` and `IndexKind::ALL` respectively.
     pub(super) fn tick(&self) {
+        let _reconciliation = self.reconciliation.lock();
         self.observe_config_snapshot();
         let snapshot = self.observed_config.lock().clone();
         let report = match self.roots.reconcile(&snapshot) {
@@ -500,6 +527,29 @@ fn root_fingerprint(root: &std::path::Path) -> Option<(u64, Option<u128>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standing_tick_requests_do_no_frame_thread_reconciliation() {
+        let frame_thread = std::thread::current().id();
+        let on_frame = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&on_frame);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = super::StandingWorker::start(move || {
+            if std::thread::current().id() == frame_thread {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let _ = tx.send(());
+        });
+        for _ in 0..12 {
+            worker.request();
+        }
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("standing pass executes");
+        assert_eq!(
+            on_frame.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "frame-thread reconciliation passes"
+        );
+    }
     use super::*;
 
     #[test]

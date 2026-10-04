@@ -898,7 +898,9 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let (tx, rx) = mpsc::sync_channel(1);
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
+    let completion_wake = crate::response_finalize::deferred_completion_wake();
     std::thread::spawn(move || {
+        let _completion_wake = completion_wake;
         let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));

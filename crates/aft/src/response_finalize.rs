@@ -208,6 +208,62 @@ pub enum DispatchOutcome {
 pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response> + Send>;
 pub type PendingResponseShutdown = Box<dyn FnMut(&AppContext) -> Response + Send>;
 
+/// Completion-only wake shared by a subc connection. Generation accounting
+/// coalesces bursts without losing a completion that races a registry poll.
+#[derive(Clone, Default)]
+pub(crate) struct DeferredResponseWake(std::sync::Arc<DeferredWakeState>);
+
+#[derive(Default)]
+struct DeferredWakeState {
+    generation: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+thread_local! {
+    static DEFERRED_WAKE: std::cell::RefCell<Option<DeferredResponseWake>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct DeferredWakeScope(Option<DeferredResponseWake>);
+
+impl Drop for DeferredWakeScope {
+    fn drop(&mut self) {
+        DEFERRED_WAKE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+pub(crate) struct DeferredCompletionWake(Option<DeferredResponseWake>);
+
+impl Drop for DeferredCompletionWake {
+    fn drop(&mut self) {
+        if let Some(wake) = &self.0 {
+            wake.0
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            wake.0.notify.notify_one();
+        }
+    }
+}
+
+impl DeferredResponseWake {
+    pub(crate) fn install(&self) -> DeferredWakeScope {
+        DeferredWakeScope(DEFERRED_WAKE.with(|slot| slot.replace(Some(self.clone()))))
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.0.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) async fn notified(&self) {
+        self.0.notify.notified().await;
+    }
+}
+
+/// Capture before spawning, and keep the guard inside the producer until after
+/// sending its response. Drop also wakes the transport when a producer panics.
+pub(crate) fn deferred_completion_wake() -> DeferredCompletionWake {
+    DeferredCompletionWake(DEFERRED_WAKE.with(|slot| slot.borrow().clone()))
+}
+
 pub struct PendingResponse {
     pub request_id: String,
     pub session_id: String,

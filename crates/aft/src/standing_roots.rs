@@ -323,12 +323,20 @@ impl StandingRoots {
         let mut replaced = Vec::new();
 
         for entry in &entries {
-            let resolved = resolve_standing_root(&entry.literal_path)?;
+            // resolve_entries already captured this live identity. Resolving
+            // again would spawn git twice more and could mix two filesystem
+            // observations in one durable record.
             let record = StandingRootRecord {
                 literal_path: entry.literal_path.clone(),
-                resolved_target: resolved.resolved_target,
-                resolved_git_toplevel: resolved.resolved_git_toplevel,
-                scoped_relative_path: resolved.scoped_relative_path,
+                resolved_target: entry.resolved_target.to_string_lossy().into_owned(),
+                resolved_git_toplevel: entry
+                    .resolved_git_toplevel
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                scoped_relative_path: entry
+                    .scoped_relative_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
             };
             standing_roots::ensure_standing_root(&mut conn, &record, &entry.indexes)?;
 
@@ -617,12 +625,25 @@ impl StandingRoots {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn counted_resolve_standing_root(
+    path: &str,
+) -> Result<ResolvedStandingRoot, crate::scoped_key::ScopedKeyError> {
+    #[cfg(test)]
+    ROOT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+    resolve_standing_root(path)
+}
+
 fn resolve_entries(config: &Config) -> Result<Vec<StandingRootEntry>, StandingRootsError> {
     let resolved = config
         .index
         .roots
         .iter()
-        .map(|root| resolve_standing_root(&root.path))
+        .map(|root| counted_resolve_standing_root(&root.path))
         .collect::<Result<Vec<ResolvedStandingRoot>, _>>()?;
     reject_duplicate_artifact_keys(&resolved)?;
     Ok(config
@@ -717,6 +738,30 @@ mod tests {
     use super::*;
     use crate::config::{IndexConfig, IndexRootConfig};
     use tempfile::tempdir;
+
+    #[test]
+    fn reconciliation_resolves_each_live_root_once() {
+        let storage = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success());
+        let roots = StandingRoots::default();
+        let snapshot = config(
+            storage.path(),
+            vec![root(project.path(), vec![IndexKind::Search])],
+        );
+        ROOT_RESOLUTIONS.with(|count| count.set(0));
+        roots.reconcile(&snapshot).unwrap();
+        assert_eq!(
+            ROOT_RESOLUTIONS.with(std::cell::Cell::get),
+            1,
+            "git-root resolutions"
+        );
+    }
 
     fn config(storage: &Path, roots: Vec<IndexRootConfig>) -> Config {
         Config {
