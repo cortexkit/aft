@@ -347,7 +347,7 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], &[], None, None)
+    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], &[], None, None, None)
 }
 
 /// Resolve the language servers an inspect should start, within the request
@@ -395,6 +395,7 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
         &[],
         &[],
         Some(&phase_log),
+        None,
         None,
     )
 }
@@ -472,6 +473,7 @@ fn handle_inspect_payload(
     indexing_gaps: &[(ServerKey, String)],
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
+    observed_stats: Option<&InspectRootStatSnapshot>,
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -516,13 +518,18 @@ fn handle_inspect_payload(
         None
     };
     let manager = ctx.inspect_manager();
-    let checkout_store = if snapshot.config.views.enabled && !checkout_routed {
-        manager.current_checkout_view(&snapshot)
-    } else {
-        checkout_store
-    };
-    let use_checkout_view =
-        snapshot.config.views.enabled && (checkout_routed || checkout_store.is_some());
+    // A writer-backed unscoped request must retain contribution reuse. Only
+    // requests the legacy scanner cannot serve need an ephemeral view scan.
+    let needs_ephemeral_view = scope_was_provided || !ctx.inspect_writer();
+    let checkout_store =
+        if needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed {
+            manager.current_checkout_view(&snapshot, observed_stats.map(|stats| stats.0.as_slice()))
+        } else {
+            checkout_store
+        };
+    let use_checkout_view = needs_ephemeral_view
+        && snapshot.config.views.enabled
+        && (checkout_routed || checkout_store.is_some());
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -1285,6 +1292,7 @@ fn run_blocking_inspect_body(
         &indexing_gaps,
         Some(&phase_log),
         Some(deadline),
+        Some(&initial_stats),
     );
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -5921,6 +5929,7 @@ mod deferred_terminal_tests {
             &[],
             Some(&phase_log),
             Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
+            None,
         );
 
         assert!(response.success);

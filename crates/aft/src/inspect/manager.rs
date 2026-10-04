@@ -517,6 +517,12 @@ fn cached_tier2_aggregate_usable(
     true
 }
 
+struct CheckoutViewVerification {
+    root: PathBuf,
+    ticket: u64,
+    files: BTreeMap<PathBuf, crate::views::read::VerifiedCallgraphFile>,
+}
+
 pub struct InspectManager {
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     request_tx: Sender<InspectJob>,
@@ -544,6 +550,7 @@ pub struct InspectManager {
     /// fall back to the waiter map if the registry is empty.
     builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
     completed_build_durations: Mutex<HashMap<InspectCategory, Duration>>,
+    checkout_view_verification: Mutex<Option<CheckoutViewVerification>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
@@ -558,6 +565,7 @@ pub struct InspectManager {
     /// Test observability for distinguishing queued reuse work from a worker that
     /// has actually begun executing it.
     reuse_starts: AtomicU64,
+    source_scan_files: AtomicU64,
     /// Project roots whose latest dead-code pass found the analysis
     /// unavailable because the root is borrow-only. That result is not stored
     /// in the inspect cache, so status readers consult this set instead of a
@@ -651,12 +659,14 @@ impl InspectManager {
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Mutex::new(HashMap::new()),
             completed_build_durations: Mutex::new(HashMap::new()),
+            checkout_view_verification: Mutex::new(None),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
             reuse_completions: AtomicU64::new(0),
             successful_reuse_completions: AtomicU64::new(0),
             reuse_starts: AtomicU64::new(0),
+            source_scan_files: AtomicU64::new(0),
         }
     }
 
@@ -959,19 +969,24 @@ impl InspectManager {
     pub(crate) fn current_checkout_view(
         &self,
         snapshot: &InspectSnapshot,
+        observed_stats: Option<&[(PathBuf, u64, SystemTime)]>,
     ) -> Option<Arc<ReadonlyCallGraphStore>> {
         if !snapshot.config.views.enabled || !snapshot.config.indexes.callgraph {
             return None;
         }
-        let files = scope_files(
-            &snapshot.project_root,
-            &JobScope::for_project(snapshot.project_root.clone()),
-        );
+        let files = observed_stats
+            .map(|files| files.iter().map(|(path, _, _)| path.clone()).collect())
+            .unwrap_or_else(|| {
+                scope_files(
+                    &snapshot.project_root,
+                    &JobScope::for_project(snapshot.project_root.clone()),
+                )
+            });
         let (store, generation) = current_view_projection_store(
             &snapshot.project_root,
             &snapshot.inspect_dir,
             &snapshot.config,
-            &files,
+            &[],
         )?;
         let storage = snapshot.config.storage_dir.as_ref()?;
         let view = crate::views::ViewStore::open(
@@ -1000,13 +1015,31 @@ impl InspectManager {
             matches!(entry, crate::views::ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
                 .then(|| crate::views::segment_store::rel_path_to_os(path).ok().map(|path| snapshot.project_root.join(path)))
         }).collect::<Option<Vec<_>>>()?;
-        if !crate::views::read::callgraph_paths_match(
+        let ticket = crate::cache_freshness::capture_verify_ticket(&snapshot.project_root);
+        let mut verification = self.checkout_view_verification.lock().ok()?;
+        if verification
+            .as_ref()
+            .is_none_or(|cached| cached.root != snapshot.project_root || cached.ticket != ticket)
+        {
+            *verification = Some(CheckoutViewVerification {
+                root: snapshot.project_root.clone(),
+                ticket,
+                files: BTreeMap::new(),
+            });
+        }
+        if !crate::views::read::callgraph_paths_match_cached(
             &manifest,
             &snapshot.project_root,
             &manifest_paths,
+            observed_stats,
+            &mut verification.as_mut()?.files,
         )
         .ok()?
         {
+            return None;
+        }
+        if crate::cache_freshness::capture_verify_ticket(&snapshot.project_root) != ticket {
+            *verification = None;
             return None;
         }
         Some(Arc::new(store))
@@ -1552,6 +1585,9 @@ impl InspectManager {
             caches.clear();
         }
         self.clear_callgraph_projection();
+        if let Ok(mut verified) = self.checkout_view_verification.lock() {
+            *verified = None;
+        }
         if let Ok(mut facts) = self.oxc_facts_cache.lock() {
             *facts = OxcFactsCache::new();
         }
@@ -1994,6 +2030,8 @@ impl InspectManager {
         files: &[PathBuf],
         force_reparse_files: &[PathBuf],
     ) -> Result<Option<OxcEngineResult>, String> {
+        self.source_scan_files
+            .fetch_add(files.len() as u64, Ordering::Relaxed);
         if !category_uses_oxc(job.category) {
             return Ok(None);
         }
@@ -2122,7 +2160,19 @@ impl InspectManager {
         // temporary no-legacy-fallback config would also poison cache identity.
         let outcome = match result.outcome {
             Ok(success) => JobOutcome::Fresh {
-                payload: success.aggregate,
+                // Scope full contributions before capping rows, just like the
+                // persisted read path. Otherwise out-of-scope rows can exhaust
+                // the project-wide cap and hide all of this scope's findings.
+                payload: if scope.is_project_wide() {
+                    success.aggregate
+                } else {
+                    let full =
+                        roll_up_tier2_contributions_with_limit(&job, &success.contributions, None);
+                    cap_payload_drill_down(
+                        filter_payload_for_scope(full, &scope),
+                        MAX_DRILL_DOWN_ITEMS,
+                    )
+                },
             },
             Err(message) => JobOutcome::Failed { message },
         };
@@ -3578,6 +3628,11 @@ impl InspectManager {
     #[doc(hidden)]
     pub fn reuse_start_count_for_test(&self) -> u64 {
         self.reuse_starts.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn source_scan_files_for_test(&self) -> u64 {
+        self.source_scan_files.load(Ordering::Relaxed)
     }
 
     fn completion_outcome(&self, result: InspectResult) -> JobOutcome {

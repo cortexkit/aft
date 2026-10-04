@@ -1403,9 +1403,15 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
             text.contains("building") && text.contains("estimate"),
             "{text}"
         );
+        let reason = summary["gaps"][0]["reason"].as_str().unwrap();
         assert!(
-            !text.contains("retry aft_inspect")
-                && !text.contains("no analyzed files under this scope"),
+            !reason.contains("retry")
+                && !reason.contains("inspect_phase")
+                && !reason.contains("tier2_rescan"),
+            "{reason}"
+        );
+        assert!(
+            !text.contains("no analyzed files under this scope"),
             "{text}"
         );
         if has_previous {
@@ -1435,6 +1441,13 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         "import { used } from './target';\nused();\n",
     );
     write_file(&owner, "target.ts", "export function used() {}\n");
+    write_file(
+        &owner,
+        "a_outside.ts",
+        &(0..110)
+            .map(|i| format!("export function outside_{i}() {{}}\n"))
+            .collect::<String>(),
+    );
     let git = |root: &Path, args: &[&str]| {
         let output = std::process::Command::new("git")
             .current_dir(root)
@@ -1569,6 +1582,124 @@ fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
         "{pending:#}"
     );
     assert!(pending["details"]["dead_code"].is_null(), "{pending:#}");
+}
+
+#[test]
+fn inspect_views_owner_persists_and_reuses_tier2_contributions() {
+    let _env_lock = env_serial_lock();
+    crate::helpers::disable_in_process_file_watcher();
+    let (temp, root) = fixture_project();
+    write_file(
+        &root,
+        "main.ts",
+        "import { used } from './target';\nused();\n",
+    );
+    write_file(
+        &root,
+        "target.ts",
+        "export function used() {}\nexport function dead() {}\n",
+    );
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(&root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let storage = temp.path().join("storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let configured = handle_configure(
+        &request(json!({
+            "id": "configure-owner", "command": "configure", "harness": "opencode", "project_root": root, "storage_dir": storage,
+            "config": crate::helpers::user_config(json!({ "search_index": false, "semantic_search": false, "callgraph_store": true, "views": {"enabled": true} }))
+        })),
+        &ctx,
+    );
+    assert!(configured.success, "{configured:?}");
+    assert!(ctx.inspect_writer());
+    ctx.inspect_manager()
+        .set_automatic_tier2_refresh_allowed(false);
+    let publish = aft::views::assembly::AssemblyRequest {
+        storage,
+        project_root: root.clone(),
+        family: aft::search_index::artifact_cache_key(&root),
+        scope: aft::path_identity::project_scope_key(&root),
+        desired_head: aft::views::assembly::head_tree_fingerprint(
+            &aft::alias::head_tree_entries(&root).unwrap(),
+        ),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    aft::views::assembly::publish_checkout(&publish).unwrap();
+    configure_fake_scope_lsp(&ctx);
+    let first = inspect_tool_call(
+        &ctx,
+        json!({"id": "owner-first", "command": "inspect", "sections": ["dead_code"]}),
+    );
+    assert_eq!(first["success"], true, "{first:#}");
+    let cache = InspectCache::open_readonly(ctx.inspect_dir(), root.clone())
+        .unwrap()
+        .expect("writer-backed owner cache");
+    let contributions = cache
+        .load_tier2_contributions(InspectCategory::DeadCode)
+        .unwrap();
+    assert_eq!(
+        contributions.len(),
+        2,
+        "owner inspect must persist source contributions"
+    );
+    assert!(cache
+        .last_full_run(InspectCategory::DeadCode)
+        .unwrap()
+        .is_some());
+    let scanned_before = ctx.inspect_manager().source_scan_files_for_test();
+    assert!(scanned_before > 0, "first request must reach the scanner");
+    let second = inspect_tool_call(
+        &ctx,
+        json!({"id": "owner-second", "command": "inspect", "sections": ["dead_code"]}),
+    );
+    assert_eq!(second["success"], true, "{second:#}");
+    assert_eq!(dead_code_items(&first), dead_code_items(&second));
+    assert_eq!(
+        ctx.inspect_manager().source_scan_files_for_test(),
+        scanned_before,
+        "unchanged owner inspect must quick-reuse contributions without scanning source files"
+    );
+    assert_eq!(
+        cache
+            .load_tier2_contributions(InspectCategory::DeadCode)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        ctx.inspect_manager().reuse_start_count_for_test() >= 10,
+        "both requests must use the contribution reuse pipeline"
+    );
 }
 
 #[test]

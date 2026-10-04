@@ -233,13 +233,6 @@ pub(crate) fn run_diagnostics_category(
             .map(|gap| gap.file.clone())
             .collect::<HashSet<_>>();
         let mut payload = collection.into_payload(snapshot);
-        // Scope cardinality is the diagnostics corpus, regardless of whether a
-        // scanner finished or a language server was available to open files.
-        // Every candidate is either authoritative or named in the gap list.
-        payload["coverage"] = serde_json::json!({
-            "files": candidates.len(),
-            "authoritative": candidates.iter().filter(|file| !uncovered.contains(*file)).count(),
-        });
         if let Some(sweep) = sweep.as_mut() {
             // Files with authoritative diagnostics, counted the same way the
             // gap list is built, so the coverage line and the gap lines

@@ -78,6 +78,52 @@ fn views_tier2_published_plane_never_refreshes_legacy() {
 }
 
 #[test]
+fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
+    let (_project, _storage, mut job, mut request) = view_projection_fixture();
+    for i in 0..3000 {
+        write_projection_cache_file(&job.project_root.join(format!("source_{i}.ts")), &format!("export function source_{i}() {{ return {i}; }}\n"));
+    }
+    for args in [vec!["add", "."], vec!["-c", "user.name=AFT", "-c", "user.email=aft@example.com", "commit", "--quiet", "-m", "large fixture"]] {
+        let mut git = std::process::Command::new("git");
+        crate::test_env::apply_hermetic_git_env(git.current_dir(&job.project_root));
+        assert!(git.args(args).status().unwrap().success());
+    }
+    request.desired_head = crate::views::assembly::head_tree_fingerprint(&crate::alias::head_tree_entries(&job.project_root).unwrap());
+    crate::views::assembly::publish_checkout(&request).unwrap();
+    job.scope_files = crate::callgraph::walk_project_files(&job.project_root).collect();
+    let snapshot = InspectSnapshot::new_with_capabilities(job.project_root.clone(), job.inspect_dir.clone(), job.config.clone(), job.symbol_cache.clone(), false, false);
+    let manager = InspectManager::new();
+    let stats = job.scope_files.iter().map(|path| {
+        let metadata = std::fs::metadata(path).unwrap();
+        (path.clone(), metadata.len(), metadata.modified().unwrap())
+    }).collect::<Vec<_>>();
+    crate::views::read::take_verification_io();
+    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_some());
+    let cold = crate::views::read::take_verification_io();
+    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_some());
+    let warm = crate::views::read::take_verification_io();
+    eprintln!("inspect_view_verification fixture_files={} cold={cold:?} warm={warm:?}", job.scope_files.len());
+    assert_eq!(warm.files_read, 0, "unchanged view verification reread source files: {warm:?}");
+    assert_eq!(warm.bytes_hashed, 0, "unchanged view verification rehashed source bytes: {warm:?}");
+    assert_eq!(warm.files_statd, 0, "blocking inspection must reuse the root stats it already collected");
+    assert_eq!(cold.files_read, 3002, "first verification must actually read the entire source set");
+    assert!(manager.current_checkout_view(&snapshot, None).is_some());
+    let standalone = crate::views::read::take_verification_io();
+    eprintln!("inspect_view_verification standalone={standalone:?}");
+    assert_eq!(standalone.files_statd, 3002);
+    assert_eq!(standalone.files_read, 0);
+    // A watcher event must defeat the memo even if an external writer preserved
+    // both size and mtime. The known root stats deliberately remain unchanged.
+    let edited = job.project_root.join("source_0.ts");
+    let modified = std::fs::metadata(&edited).unwrap().modified().unwrap();
+    std::fs::write(&edited, "export function source_0() { return 9; }\n").unwrap();
+    std::fs::File::open(&edited).unwrap().set_modified(modified).unwrap();
+    crate::cache_freshness::invalidate_verify_memo(&job.project_root);
+    assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_none());
+    assert!(crate::views::read::take_verification_io().files_read > 0);
+}
+
+#[test]
 fn views_tier2_pending_plane_never_falls_back_to_legacy() {
     let (_project, _storage, job, _request) = view_projection_fixture();
     let before = LEGACY_VIEW_REFRESHES.with(std::cell::Cell::get);
