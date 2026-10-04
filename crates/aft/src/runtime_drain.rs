@@ -3179,6 +3179,7 @@ fn rebuild_gitignore_for_drain(
 }
 
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
+    let _in_flight = ctx.watcher_drain_guard();
     let started = Instant::now();
     let configure_generation = ctx.configure_generation();
     let content_generation = ctx.configure_content_generation();
@@ -3632,8 +3633,9 @@ fn lsp_params_for_log(params: Option<serde_json::Value>) -> String {
 pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
     let drained = {
         let Some(mut lsp) = ctx.try_lsp() else {
-            // Keep the demand alive: a request must not wait for a producer's
-            // round trip, and a later maintenance turn can drain its events.
+            // Keep demand alive without waiting for a producer's round trip.
+            // Maintenance must retry zero progress on its next tick, not in
+            // an immediate completion/requeue loop while this lock is held.
             return DrainBatchOutcome {
                 processed: 0,
                 has_more: true,
@@ -4617,6 +4619,40 @@ mod tests {
             "configure must install the ignore matcher before pending paths replay"
         );
         ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    fn watcher_query_reports_in_flight_changes_until_application_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let source = root.join("changed.rs");
+        std::fs::write(&source, "fn pending_marker() {}\n").unwrap();
+        let (ctx, watcher_tx) = watcher_context(&root);
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::new());
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(vec![source.clone()]))
+            .unwrap();
+        let ctx = Arc::new(ctx);
+        let (reached_rx, release_tx) = install_watcher_phase_commit_gate_for_test(source);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || {
+            while drain_watcher_events_bounded(&drain_ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
+        });
+        let reached = reached_rx.recv_timeout(Duration::from_secs(5));
+        let pending = ctx.watcher_query_has_pending_changes();
+        let continuation_taken = ctx.watcher_drain_slice().lock().is_none();
+        release_tx.send(()).unwrap();
+        drain.join().unwrap();
+        reached.expect("watcher apply barrier");
+        assert!(continuation_taken, "the active apply owns the continuation");
+        assert!(
+            pending,
+            "an empty continuation slot must not hide in-flight changes"
+        );
+        assert!(
+            !ctx.watcher_query_has_pending_changes(),
+            "completed application retires the active demand"
+        );
     }
 
     #[test]

@@ -140,6 +140,7 @@ mod read_freshness_test;
 mod refresh_watcher_path_status_test;
 mod rename_delete_migration_test;
 mod repeat_breaker_test;
+mod request_watcher_pending_test;
 mod rollback_safety_test;
 mod root_keyed_adversarial_test;
 mod safety_test;

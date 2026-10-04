@@ -1276,6 +1276,14 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) path_slice_count: usize,
 }
 
+pub(crate) struct WatcherDrainGuard<'a>(&'a AtomicUsize);
+
+impl Drop for WatcherDrainGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Pending watcher-derived reconciliation state taken out of the context for
 /// a transactional TTL teardown: committed (dropped) once eviction succeeds,
 /// restored when a secondary blocker aborts the eviction.
@@ -1647,7 +1655,11 @@ fn status_debounce_loop(
                     let Some(context) = context.upgrade() else {
                         continue;
                     };
-                    context.build_status_snapshot()
+                    let Some(snapshot) = context.try_build_status_snapshot() else {
+                        // Keep the previous bar; the next producer signal retries.
+                        continue;
+                    };
+                    snapshot
                 }
             };
             sender(PushFrame::StatusChanged(StatusChangedFrame::new(
@@ -3055,6 +3067,7 @@ pub struct AppContext {
     watcher: parking_lot::Mutex<Option<RecommendedWatcher>>,
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
+    watcher_drains_in_flight: AtomicUsize,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
     watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
@@ -3545,7 +3558,9 @@ impl AppContext {
         } else {
             // Stack-owned contexts are supported by the library API. Transport
             // roots register their owning Arc before serving any requests.
-            self.status_emitter().signal(self.build_status_snapshot());
+            if let Some(snapshot) = self.try_build_status_snapshot() {
+                self.status_emitter().signal(snapshot);
+            }
         }
     }
 
@@ -3702,6 +3717,7 @@ impl AppContext {
             watcher: parking_lot::Mutex::new(None),
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
+            watcher_drains_in_flight: AtomicUsize::new(0),
             watcher_thread: parking_lot::Mutex::new(None),
             watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
@@ -3775,17 +3791,14 @@ impl AppContext {
     /// checked before project scoping or tsconfig-membership work, so a cache hit
     /// faithfully reuses each category's presence or absence.
     pub fn status_bar_count_values(&self) -> StatusBarCountValues {
-        let tier2 = self
-            .status_bar_tier2
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let tsconfig_generation = self.tsconfig_membership.lock().generation();
-        let Some(lsp) = self.lsp_manager.try_lock() else {
-            // A busy producer cannot prove current diagnostic counts. Keep the
-            // independently published Tier-2 values, omit E/W, and do not cache
-            // this temporary gap as an authoritative observation.
-            return StatusBarCountValues {
+        self.try_status_bar_count_values().unwrap_or_else(|| {
+            // Explicit status reads may still report independent Tier-2
+            // categories. Publishers use the try accessor and skip contention.
+            let tier2 = self
+                .status_bar_tier2
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            StatusBarCountValues {
                 errors: None,
                 warnings: None,
                 dead_code: tier2.dead_code,
@@ -3793,8 +3806,20 @@ impl AppContext {
                 duplicates: tier2.duplicates,
                 todos: tier2.todos,
                 tier2_stale: tier2.stale,
-            };
-        };
+            }
+        })
+    }
+
+    /// A busy manager is not a missing diagnostic producer. Publishers must
+    /// leave their previous bar untouched and retry on a later signal.
+    pub(crate) fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
+        let tier2 = self
+            .status_bar_tier2
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let tsconfig_generation = self.tsconfig_membership.lock().generation();
+        let lsp = self.lsp_manager.try_lock()?;
         let diagnostics_generation = lsp.diagnostics_generation();
         let root = self
             .canonical_cache_root_opt()
@@ -3818,12 +3843,12 @@ impl AppContext {
                 && cached.tier2_generation == tier2.generation
                 && cached.tsconfig_generation == tsconfig_generation
             {
-                return mask_failed(
+                return Some(mask_failed(
                     cached
                         .counts
                         .clone()
                         .expect("a valid status-count cache carries truthful values"),
-                );
+                ));
             }
         }
 
@@ -3877,7 +3902,7 @@ impl AppContext {
             tsconfig_generation,
             counts: Some(counts.clone()),
         };
-        mask_failed(counts)
+        Some(mask_failed(counts))
     }
 
     /// Provides legacy numeric status-bar fields to callers that still require
@@ -4774,6 +4799,17 @@ impl AppContext {
             // Contended: the manager is busy, so events may be queuing.
             None => true,
         }
+    }
+
+    /// A drain takes its continuation out of the slot while applying it, so
+    /// an empty slot alone does not prove that indexed answers are current.
+    pub fn watcher_query_has_pending_changes(&self) -> bool {
+        self.watcher_drains_in_flight.load(Ordering::Acquire) > 0 || self.watcher_drain_has_work()
+    }
+
+    pub(crate) fn watcher_drain_guard(&self) -> WatcherDrainGuard<'_> {
+        self.watcher_drains_in_flight.fetch_add(1, Ordering::AcqRel);
+        WatcherDrainGuard(&self.watcher_drains_in_flight)
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
@@ -14121,20 +14157,85 @@ mod status_emitter_tests {
     fn status_counts_do_not_acquire_a_held_lsp_manager() {
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
-            Config::default(),
+            Config {
+                project_root: Some(PathBuf::from("/proj")),
+                ..Config::default()
+            },
         ));
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.lsp().diagnostics_store_mut_for_test().publish(
+            crate::lsp::roots::ServerKey {
+                kind: crate::lsp::registry::ServerKind::Rust,
+                root: PathBuf::from("/proj"),
+            },
+            PathBuf::from("/proj/main.rs"),
+            vec![],
+        );
+        let (client, mut fleet_rx) = crate::fleet_status::FleetStatusClient::dial_channel(2);
+        ctx.install_fleet_status_client(Some(client));
+        let mut first = String::from("first");
+        let mut response = crate::protocol::Response::success("status", serde_json::json!({}));
+        crate::response_finalize::finalize_tool_response(
+            &mut response,
+            &mut first,
+            &ctx,
+            "s",
+            "read",
+            false,
+        );
+        assert!(first.contains("D1 U2 C3"));
+        assert!(first.contains("E0 W0"));
+        fleet_rx
+            .try_recv()
+            .expect("initial fleet publish")
+            .complete_unavailable();
+        ctx.update_status_bar_tier2(Some(9), Some(2), Some(3), Some(4), false);
         let held = ctx.lsp();
         let worker_ctx = Arc::clone(&ctx);
         let (tx, rx) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            tx.send(worker_ctx.status_bar_count_values()).unwrap();
+            let counts_unavailable = worker_ctx.try_status_bar_count_values().is_none();
+            let push_unavailable = worker_ctx.try_build_status_snapshot().is_none();
+            let mut text = String::from("file contents");
+            crate::response_finalize::finalize_tool_response(
+                &mut response,
+                &mut text,
+                &worker_ctx,
+                "s",
+                "read",
+                false,
+            );
+            tx.send((text, counts_unavailable, push_unavailable))
+                .unwrap();
         });
         let values = rx.recv_timeout(Duration::from_secs(5));
         drop(held);
         worker.join().unwrap();
-        let values = values.expect("status counts must not acquire a contended manager");
-        assert_eq!(values.errors, None);
-        assert_eq!(values.warnings, None);
+        let (text, counts_unavailable, push_unavailable) =
+            values.expect("status counts must not acquire a contended manager");
+        assert!(counts_unavailable && push_unavailable);
+        assert!(
+            fleet_rx.try_recv().is_err(),
+            "a contended publish must not clear the fleet segment"
+        );
+        assert_eq!(
+            text, "file contents",
+            "contention must leave the previous bar alone"
+        );
+        let mut retry = String::from("next signal");
+        let mut response = crate::protocol::Response::success("retry", serde_json::json!({}));
+        crate::response_finalize::finalize_tool_response(
+            &mut response,
+            &mut retry,
+            &ctx,
+            "s",
+            "read",
+            false,
+        );
+        assert!(
+            retry.contains("D9 U2 C3"),
+            "a skipped emission must not consume the change"
+        );
     }
 
     fn ctx_with_frame_rx() -> (AppContext, mpsc::Receiver<PushFrame>) {

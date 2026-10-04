@@ -6,6 +6,12 @@ the changes: debounce before census, bound request work, avoid control-path lock
 waits, move live reconciliation off the frame thread, reuse immutable schema
 work, and wake deferred consumers from their producers.
 
+The interrupted slice's three commits were replayed onto main
+`2772a315f207a1787be34fba3557ad2013d0f565`. The catalog-cache conflict was
+resolved by retaining main's head/worker/reader presets and their live disable
+and host filters, with one immutable catalog per preset. Admission continues
+to validate against the worker superset, as main did before caching.
+
 ## High findings: measured and fixed
 
 The counts below came from executable tests, not wall-clock comparisons. The
@@ -18,7 +24,7 @@ guard, not a latency benchmark. New producer-wake tests were also mutation-teste
 | --- | --- | --- | --- |
 | 6.1 Status census before debounce | confirmed; fixed | 12 default-session snapshot builds per burst → 1 | `status_signal_burst_builds_one_snapshot` |
 | 6.2 Request watcher drain exhausts queue | confirmed; fixed | 4,097 applied deletion paths per request → at most 2,048 (one existing budgeted slice); all 4,097 eventually applied | `request_watcher_drain_applies_at_most_one_slice` |
-| 6.3 LSP mutex on request drain/status bar | confirmed; fixed | 1 blocking manager acquisition in each API → 0; a contended drain preserves pending demand, counts omit unproven E/W | `request_lsp_drain_defers_a_held_manager_without_waiting`, `status_counts_do_not_acquire_a_held_lsp_manager` |
+| 6.3 LSP mutex on request drain/status bar | confirmed; fixed | 1 blocking manager acquisition in each API → 0; contended drains retain demand for the next scheduling turn without an immediate zero-progress requeue; bar publication skips the turn | `request_lsp_drain_defers_a_held_manager_without_waiting`, `contended_lsp_maintenance_does_not_requeue_without_progress`, `status_counts_do_not_acquire_a_held_lsp_manager` |
 | 7.1 Standing reconciliation on frame loop | confirmed; fixed on hot path | 12 frame-thread reconciliation callbacks per 12 tick submissions → 0; real git-root fixture: 2 live root resolutions per reconciliation → 1 | `standing_tick_requests_do_no_frame_thread_reconciliation`, `reconciliation_resolves_each_live_root_once` |
 | 7.2 Catalog/digests and schema compilation per admission | confirmed; fixed | 12 full catalog builds + 12 validator compilations per 12 warm `read` admissions → 0 + 0 | `warm_admission_does_not_rebuild_catalog_or_validator` |
 | 7.3 Deferred completion polling | confirmed; fixed for completion discovery | 12 idle polls after registration → 0; each real inspect/navigation producer emits 1 completion wake | `deferred_registry_idle_turns_do_not_repoll_and_completion_wakes`, `deferred_inspect_producer_notifies_completion`, `deferred_navigation_producer_notifies_completion` |
@@ -35,9 +41,12 @@ guard, not a latency benchmark. New producer-wake tests were also mutation-teste
   legitimately no longer exist on disk. The test checks both the per-request
   bound and complete eventual application. The existing path/time budgets and
   continuation machinery are unchanged; no visible result list cap was added.
-- Contended diagnostic counts are unknown, not fabricated zeros or silently
-  cached stale counts. Tier-2 counts remain independently available. With no
-  contention, status payloads retain their existing shape and values.
+- Contended diagnostic counts are unknown, not fabricated zeros. Explicit
+  status requests can still report independent Tier-2 values, but bar publishers
+  skip a contended observation entirely: they neither clear the fleet's last
+  segment nor emit a temporary `E? W?` bar nor consume the emission fingerprint.
+  Status-change pushes retry on the next signal. Normal missing-producer values
+  still use `?`; genuine absence is not confused with temporary lock contention.
 - Standing work uses one worker per connection with one queued follow-up slot,
   not a thread per tick or a new timer. Startup reconciliation remains direct.
   Bind and background reconciliation are serialized. A pass still resolves live
@@ -64,6 +73,78 @@ guard, not a latency benchmark. New producer-wake tests were also mutation-teste
   Existing signature, trust rotation, rollback and captured wire goldens pass.
 - No ranking-fenced search files, parser, LSP round-trip implementation, durability
   policy, tool arguments, manifests, or lockfiles were changed.
+
+## Read behavior during an unapplied watcher burst
+
+The request path applies at most one 2,048-path slice, including its existing
+time budget. Remaining paths stay in the watcher continuation for maintenance
+or the next request. A ready producer does not mean that it has reflected that
+continuation. The admission-time pending observation is retained through response
+rendering even if maintenance finishes concurrently.
+
+| Read tool | What it can answer before the rest is applied |
+| --- | --- |
+| `read` | Reads live file bytes (or directory entries), independent of watcher invalidation. It does not need a pending-index gap. |
+| `grep` | Ready trigram candidates can omit newly matching/new files; candidate contents are verified from disk, which cannot repair an omitted candidate. The filesystem fallback is live but conservatively carries the same gap while a burst is pending. |
+| `glob` | A ready index can omit new paths; its on-disk presence check only removes deleted paths. A filesystem fallback remains live. |
+| `search` | Lexical and semantic producers may still reflect earlier contents or corpus membership. |
+| `outline`, `zoom` | Parse/read the requested files, but symbol caches and project discovery have not necessarily been invalidated for remaining paths. |
+| `callgraph` | Cached graph or published checkout generation may omit remaining changes; the checkout query wait knows only paths already recorded by the drain. |
+| `inspect` | Fresh scans and LSP observations may complete while derived Tier-2 producers/graph inputs still omit remaining changes. Deferred inspect retains its admission observation too. |
+| `conflicts`, `ast_search` | Git conflict discovery and direct AST file scans use live inputs, not the deferred indexes. |
+
+Index/cache-backed reads carry `complete: false`, a `watcher_pending` gap, and
+the agent-visible trailer “Watcher changes pending” while the admission observed
+unapplied changes. This is a freshness gap, not a result-list cut; it invents
+neither a path count nor a completion deadline. The integration fixture builds
+a real index, then creates a new file beyond the first slice: grep/glob miss it
+and disclose that gap; read returns its live bytes; after full application both
+indexed tools find it and the trailer disappears.
+
+LSP contention originally produced `processed: 0, has_more: true`, which the
+maintenance completion unconditionally requeued. A held manager therefore
+spun the lane without progress. Immediate LSP requeue now requires progress;
+the ordinary scheduling probe still retries on the next maintenance tick.
+No event is removed on contention, and successful partial drains still requeue.
+
+### Revision counts and non-vacuity checks
+
+| Boundary | Before → after | Executable proof |
+| --- | --- | --- |
+| Burst freshness | 0 disclosures for ready-index false negatives → all 7 index/cache-backed read tools disclose a gap; the raced grep response retains its gap after maintenance finishes | `request_watcher_burst_discloses_unapplied_index_changes`: 4,097 paths, at most 2,048 applied on admission; grep/glob each miss the new file before application and each find it afterwards; read returns live bytes throughout |
+| In-flight continuation | Empty slot hides active application → pending remains visible until the active drain finishes | `watcher_query_reports_in_flight_changes_until_application_finishes` parks a real apply phase after dequeue |
+| Zero-progress LSP completion | 1 immediate LSP requeue → 0, with 1 retry admitted on the next scheduling turn | `contended_lsp_maintenance_does_not_requeue_without_progress`: all 257 queued events survive contention, then drain as 256 + 1; the progressing first batch still requests 1 continuation |
+| Contended bar/fleet publication | 1 temporary unknown bar/quiet fleet clear → 0 publications; the changed D count is emitted on retry | `status_counts_do_not_acquire_a_held_lsp_manager`: starts from E0/W0, holds the mutex through a separate thread's count, snapshot and publisher calls, then observes D9 after release |
+
+All three requested regressions failed before the fixes. Four temporary
+implementation breaks then failed only their exact-name selected tests:
+suppressed watcher disclosure, hidden active-drain demand, unconditional LSP
+requeue, and restored contended bar/fleet publication. The existing bounded
+watcher and nonblocking LSP tests remained green in that same mutated build.
+The staged live state was restored with checkout and touch; unstaged diff stats
+were empty both before mutation and after restore (three files, 10 insertions
+and 7 deletions while mutated).
+
+The status source seam fences needed to recognize two truthful accessor sites:
+the agent bar still renders only in `status_bar_line`, but the fleet publisher
+now also distinguishes a busy observation from missing producers before taking
+the legacy projection. The old source spelling asserted a legacy accessor
+instead. Their transport/formatter/inspect exclusion and projection claims
+remain intact. A fifth break inserted an actual third count read in response
+finalization: only
+`truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seams`
+failed, while the other three seam tests stayed green. That two-line mutation
+was restored to an empty unstaged diff too.
+
+Final current-main verification passed 717 scoped lib tests (10 ignored), 121
+binary tests, 172 list-envelope tests, 11 request/read/status integrations, 6
+real-provider conformance tests (including all presets), 3 standing acceptance
+tests, 13 captured gh wire goldens, and 4 status seam tests. One real-daemon
+provider e2e remains explicitly ignored without `AFT_E2E_SUBC_BIN`. Strict
+Windows compilation of all configured test targets and rustfmt passed.
+Rust-analyzer inspection reported unknown diagnostics after its indexing budget;
+Cargo supplied the authoritative compile checks. macOS linkers warned that the
+large pre-existing test binaries' unwind tables exceed the compact-unwind limit.
 
 ## Remaining findings: current-code verdicts and scope decisions
 

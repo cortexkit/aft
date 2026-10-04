@@ -829,6 +829,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     ctx: Arc<AppContext>,
     force_restrict: bool,
 ) -> DispatchOutcome {
+    let watcher_pending = crate::response_finalize::watcher_query_pending(&ctx, "inspect");
     let request_id = req.id.clone();
     let phase_log = InspectPhaseLog::for_request(request_id.clone());
     let deadline = InspectRequestDeadline::from_config(&ctx.config());
@@ -926,6 +927,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
             ),
         };
         crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
+        crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
         let _ = tx.send(response);
     });
     DispatchOutcome::Deferred(PendingResponse {

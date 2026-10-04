@@ -103,6 +103,23 @@ impl AppContext {
     }
 
     pub fn build_status_snapshot_for_session(&self, session_id: &str) -> StatusPayload {
+        self.build_status_snapshot_with_counts(session_id, self.status_bar_count_values())
+    }
+
+    pub(crate) fn try_build_status_snapshot(&self) -> Option<StatusPayload> {
+        let counts = self.try_status_bar_count_values()?;
+        #[cfg(test)]
+        self.status_emitter()
+            .snapshot_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(self.build_status_snapshot_with_counts(DEFAULT_SESSION_ID, counts))
+    }
+
+    fn build_status_snapshot_with_counts(
+        &self,
+        session_id: &str,
+        status_bar_values: crate::context::StatusBarCountValues,
+    ) -> StatusPayload {
         let config = self.config();
 
         // Search index status. Status is a control-path snapshot, so lock
@@ -399,7 +416,6 @@ impl AppContext {
         // agents get. `None` until the Tier-2 cache is populated at least once
         // (so we never render fabricated zeros) — emitted as JSON null then,
         // and the sidebar hides the section.
-        let status_bar_values = self.status_bar_count_values();
         let status_bar = match status_bar_values.legacy_projection() {
             Some(counts) => serde_json::json!({
                 "errors": counts.errors,

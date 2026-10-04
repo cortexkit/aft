@@ -580,12 +580,15 @@ pub fn run_tool_call(
                     .as_deref()
                     .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
             );
+            let watcher_pending =
+                crate::response_finalize::watcher_query_pending(app_ctx, &prepared.request.command);
             let mut response = if prepared.request.command == "inspect" {
                 crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
             } else {
                 dispatch(prepared.request, app_ctx)
             };
             crate::response_finalize::attach_checkout_query_gaps(&mut response, app_ctx);
+            crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
             if response.success && response.data.get("backup_skipped_reason").is_none() {
                 let session = ctx
                     .session_id

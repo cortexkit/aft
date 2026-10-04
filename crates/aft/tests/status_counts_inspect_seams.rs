@@ -36,18 +36,22 @@ fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seam
 
     // The agent-visible AFT bar renders the truthful values (a category with no
     // value shows `?`, never 0), and it does so in exactly one place: the
-    // finalizer's `status_bar_line`. Formatting, transport dispatch and the
-    // inspect payload must not bypass it.
+    // finalizer's `status_bar_line`. The fleet publisher also needs a truthful
+    // observation so it can skip contention rather than clear its last segment.
+    // Formatting, transport dispatch and inspect must not bypass these publishers.
     assert_eq!(
-        response_finalize.matches("status_bar_count_values").count(),
-        1,
-        "response finalization reads the truthful counts at a single site"
+        response_finalize
+            .matches("ctx.try_status_bar_count_values()")
+            .count(),
+        2,
+        "only the bar and fleet publishers may read the truthful counts"
     );
     let bar_line = response_finalize
         .find("fn status_bar_line")
         .expect("status_bar_line exists");
-    let values_read = response_finalize
-        .find("status_bar_count_values")
+    let values_read = response_finalize[bar_line..]
+        .find("ctx.try_status_bar_count_values()")
+        .map(|offset| bar_line + offset)
         .expect("status_bar_line reads the truthful counts");
     let next_fn = response_finalize[bar_line + 1..]
         .find("\nfn ")
@@ -55,7 +59,7 @@ fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seam
         .unwrap_or(response_finalize.len());
     assert!(
         (bar_line..next_fn).contains(&values_read),
-        "only status_bar_line may read the truthful counts"
+        "the agent-visible bar must read its values in status_bar_line"
     );
     assert!(
         !subc_format.contains("status_bar_count_values"),
@@ -113,7 +117,8 @@ fn inspect_outcomes_continue_to_feed_the_fleet_segment_without_freezing_text() {
         .unwrap_or(response_finalize.len());
     let publish_body = &response_finalize[publish..publish_end];
     assert!(
-        publish_body.contains(".status_bar_counts()")
+        publish_body.contains("ctx.try_status_bar_count_values()")
+            && publish_body.contains(".legacy_projection()")
             && publish_body.contains(".map(aft_status_segment)"),
         "the fleet segment must still receive the values projection"
     );

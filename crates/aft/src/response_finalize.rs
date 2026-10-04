@@ -517,8 +517,11 @@ fn publish_fleet_status(
         .map(crate::harness::Harness::wire_label)
         .unwrap_or_else(|| "unknown".to_string());
     // The holder composes complete segments only: a partial set is published as quiet text.
-    let aft_text = ctx
-        .status_bar_counts()
+    let Some(values) = ctx.try_status_bar_count_values() else {
+        return FleetStatusPublish::Suppressed;
+    };
+    let aft_text = values
+        .legacy_projection()
         .as_ref()
         .map(aft_status_segment)
         .unwrap_or_default();
@@ -552,7 +555,7 @@ fn status_bar_line(
             reader_renders: false,
         } => {}
     }
-    let values = ctx.status_bar_count_values();
+    let values = ctx.try_status_bar_count_values()?;
     let nothing_known = [
         values.errors,
         values.warnings,
@@ -778,6 +781,68 @@ pub fn attach_checkout_query_gaps(response: &mut Response, ctx: &AppContext) {
                 }
             }
         }
+    }
+}
+
+pub const WATCHER_PENDING_NOTICE: &str = "Watcher changes pending: indexed or cached results may omit unapplied file changes. Retry after maintenance catches up; a missing result is not evidence of absence.";
+
+/// Capture before execution: finishing maintenance cannot make an already
+/// computed index-backed answer fresh retroactively. Live disk reads are exempt.
+pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
+    matches!(
+        command,
+        "grep"
+            | "glob"
+            | "search"
+            | "semantic_search"
+            | "outline"
+            | "zoom"
+            | "inspect"
+            | "callgraph"
+            | "callers"
+            | "call_tree"
+            | "impact"
+            | "trace_to"
+            | "trace_to_symbol"
+            | "trace_data"
+    ) && ctx.watcher_query_has_pending_changes()
+}
+
+pub fn attach_watcher_query_gap(response: &mut Response, pending: bool) {
+    if !pending || !response.success {
+        return;
+    }
+    if let Some(data) = response.data.as_object_mut() {
+        data.insert("complete".into(), Value::Bool(false));
+        let gap = serde_json::json!({"kind":"watcher_pending", "reason":"file changes not yet applied to indexed or cached producers"});
+        let gaps = data
+            .entry("gaps")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(gaps) = gaps.as_array_mut() {
+            if !gaps.contains(&gap) {
+                gaps.push(gap);
+            }
+        }
+        if let Some(Value::String(text)) = data.get_mut("text") {
+            if !text.contains(WATCHER_PENDING_NOTICE) {
+                append_trailing_line(text, WATCHER_PENDING_NOTICE);
+            }
+        }
+    }
+}
+
+pub(crate) fn append_watcher_query_notice(text: &mut String, response: &Response) {
+    if response
+        .data
+        .get("gaps")
+        .and_then(Value::as_array)
+        .is_some_and(|gaps| {
+            gaps.iter()
+                .any(|gap| gap.get("kind").and_then(Value::as_str) == Some("watcher_pending"))
+        })
+        && !text.contains(WATCHER_PENDING_NOTICE)
+    {
+        append_trailing_line(text, WATCHER_PENDING_NOTICE);
     }
 }
 

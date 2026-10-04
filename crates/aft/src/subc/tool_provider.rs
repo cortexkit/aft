@@ -691,10 +691,10 @@ mod tests {
     #[test]
     fn warm_admission_does_not_rebuild_catalog_or_validator() {
         let request = call("read", json!({"filePath": "src/main.rs", "limit": 200}));
-        admit(&request, &[], true, "session", true).unwrap();
+        admit(&request, false, &[], true, "session", true).unwrap();
         ADMISSION_WORK.with(|count| count.set((0, 0)));
         for _ in 0..12 {
-            admit(&request, &[], true, "session", true).unwrap();
+            admit(&request, false, &[], true, "session", true).unwrap();
         }
         let work = ADMISSION_WORK.with(std::cell::Cell::get);
         assert_eq!(

@@ -8363,7 +8363,10 @@ fn submit_maintenance_job(
                 MaintenanceJobOutcome {
                     empty_bg_sessions: Vec::new(),
                     unacked_bg_keys: None,
-                    requeue_kind: drained.has_more.then_some(kind),
+                    // Contention has more possible work but no progress. The
+                    // next maintenance tick probes again; only a successful
+                    // partial batch needs an immediate continuation.
+                    requeue_kind: (drained.has_more && drained.processed > 0).then_some(kind),
                     diagnostics_on_edit: None,
                 }
             }
@@ -13499,6 +13502,102 @@ mod tests {
         }
         assert!(!meta.maintenance_pending);
         assert_eq!(meta.maintenance_jobs_in_flight, 0);
+    }
+
+    #[tokio::test]
+    async fn contended_lsp_maintenance_does_not_requeue_without_progress() {
+        let (_dir, root) = test_root("lsp-contention-requeue");
+        let ctx = Arc::new(AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        ));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, mut rx) = mpsc::channel(4);
+        let held = ctx.lsp();
+        let total = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP + 1;
+        for _ in 0..total {
+            held.enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
+                server_kind: crate::lsp::registry::ServerKind::Rust,
+                root: root.as_path().to_path_buf(),
+                method: "custom/pending".into(),
+                params: None,
+            });
+        }
+        submit_maintenance_job(
+            &executor,
+            root.clone(),
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let completion = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        drop(held);
+        let completion = completion.expect("a contended drain must finish").unwrap();
+        assert!(completion.response.success);
+        assert_eq!(
+            completion.requeue_kind, None,
+            "zero progress must not immediately spin the maintenance lane"
+        );
+        assert_eq!(
+            ctx.lsp().pending_event_count_for_test(),
+            total,
+            "contention consumes no events"
+        );
+
+        // A fresh scheduling turn, rather than a completion-driven loop, is
+        // still allowed to retry the source. No events have been lost or taken.
+        let held = ctx.lsp();
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let (due, _) = due_maintenance_jobs(
+            &mut live_roots,
+            Some(&executor),
+            &BgSubsBySession::new(),
+            &BgWakePending::new(),
+            usize::MAX,
+            &HashSet::new(),
+        );
+        assert_eq!(
+            due.iter()
+                .filter(|(_, kind)| *kind == MaintenanceDrainKind::Lsp)
+                .count(),
+            1
+        );
+        drop(held);
+        submit_maintenance_job(
+            &executor,
+            root.clone(),
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let partial = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partial.requeue_kind,
+            Some(MaintenanceDrainKind::Lsp),
+            "a progressing partial batch requeues"
+        );
+        assert_eq!(ctx.lsp().pending_event_count_for_test(), 1);
+        submit_maintenance_job(
+            &executor,
+            root,
+            MaintenanceDrainKind::Lsp,
+            Vec::new(),
+            &tx,
+            &metrics,
+        );
+        let final_batch = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_batch.requeue_kind, None);
+        assert_eq!(ctx.lsp().pending_event_count_for_test(), 0);
     }
 
     #[test]
