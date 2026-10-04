@@ -90,6 +90,9 @@ struct DiagnosticsCollection {
     /// scoped file can be attributed to the failure of the server for its own
     /// workspace root.
     producer_failures_by_key: HashMap<ServerKey, String>,
+    /// Applicable files for unscoped failures, for display only. They do not
+    /// change the warm working set's diagnostics authority rules.
+    producer_failure_files: HashMap<ServerKey, Vec<PathBuf>>,
     producer_notes: BTreeSet<String>,
     /// Servers with a root marker but no file to analyze, keyed by server id.
     /// Informational only: an inapplicable server is neither a failure nor a
@@ -215,6 +218,9 @@ pub(crate) fn run_diagnostics_category(
         );
     }
     collection.record_producer_failures(producer_failures, &snapshot.project_root);
+    if scoped.is_none() && !collection.producer_failures_by_key.is_empty() {
+        collection.record_unscoped_failure_files(snapshot, scope);
+    }
     collection.not_applicable = not_applicable
         .iter()
         .map(|server| (server.server_id.clone(), server.reason()))
@@ -529,12 +535,38 @@ impl DiagnosticsCollection {
                 reason.push_str("; ");
                 reason.push_str(&hint);
             }
+            if failure.server_key.kind == ServerKind::Dockerfile
+                && matches!(
+                    failure.result,
+                    ServerAttemptResult::BinaryNotInstalled { .. }
+                )
+            {
+                // Both plugins register this package in their npm auto-install
+                // table. The CLI has a doctor, not an `lsp install` command.
+                reason.push_str("; AFT plugins auto-install dockerfile-language-server-nodejs with lsp.auto_install enabled (user config) into <AFT cache>/lsp-packages/dockerfile-language-server-nodejs/node_modules/.bin; diagnose with `npx @cortexkit/aft doctor lsp <file>`");
+            }
             self.producer_failures_by_key
                 .entry(failure.server_key.clone())
                 .or_insert_with(|| reason.clone());
             self.producer_failures
                 .entry(server_id(&failure.server_key))
                 .or_insert(reason);
+        }
+    }
+
+    fn record_unscoped_failure_files(&mut self, snapshot: &InspectSnapshot, scope: &JobScope) {
+        let mut membership = TsconfigMembershipCache::new();
+        let candidates =
+            scoped_coverage_candidates(snapshot, scope, &snapshot.config, &mut membership);
+        for file in candidates {
+            for key in producer_keys_for_file(&file, &snapshot.config, &snapshot.project_root) {
+                if self.producer_failures_by_key.contains_key(&key) {
+                    self.producer_failure_files
+                        .entry(key)
+                        .or_default()
+                        .push(file.clone());
+                }
+            }
         }
     }
 
@@ -765,12 +797,19 @@ impl DiagnosticsCollection {
         let mut gaps: Vec<Value> = failures
             .into_iter()
             .map(|(server, reason)| {
-                serde_json::json!({
+                let mut gap = serde_json::json!({
                     "kind": "failed_producer",
                     "producer": server_id(server),
                     "root": display_root(snapshot, &server.root),
                     "reason": reason,
-                })
+                });
+                if let Some(files) = self.producer_failure_files.get(server) {
+                    gap["affected_files"] = serde_json::json!(files
+                        .iter()
+                        .map(|file| display_path(snapshot, file))
+                        .collect::<Vec<_>>());
+                }
+                gap
             })
             .collect();
         // A failure recorded only under its server id (not under a server
@@ -1345,6 +1384,80 @@ mod payload_count_tests {
             "typescript-language-server is unavailable; no node_modules in web: the project's \
              dependencies are not installed; run your package manager's install"
         );
+    }
+
+    #[test]
+    fn inspect_noise_missing_docker_server_names_files_and_install_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project = crate::inspect::job::canonicalize_normalized(temp.path());
+        std::fs::create_dir_all(project.join("images")).unwrap();
+        std::fs::write(project.join("Dockerfile"), "FROM scratch\n").unwrap();
+        // Plain Dockerfile is a root marker, not a registered extension. Keep
+        // the affected list aligned with the existing producer routing.
+        std::fs::write(project.join("images/base.dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(project.join("images/app.dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(project.join("images/ignored.dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(project.join(".aftignore"), "images/ignored.dockerfile\n").unwrap();
+        let snapshot = InspectSnapshot::new(
+            project.clone(),
+            project.join(".aft"),
+            Arc::new(Config::default()),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let failure = ApplicableServerFailure {
+            server_key: ServerKey {
+                kind: ServerKind::Dockerfile,
+                root: project.clone(),
+            },
+            result: ServerAttemptResult::BinaryNotInstalled {
+                binary: "docker-langserver".into(),
+            },
+        };
+        let run = |scope: &JobScope, scoped| {
+            let super::JobOutcome::Fresh { payload } = super::run_diagnostics_category(
+                &ctx,
+                &snapshot,
+                scope,
+                scoped,
+                false,
+                std::slice::from_ref(&failure),
+                &[],
+                &[],
+                &[],
+                None,
+            ) else {
+                panic!("missing producer must return a named gap")
+            };
+            payload
+        };
+        let payload = run(&JobScope::for_project(&project), false);
+        assert_eq!(payload["complete"], false);
+        assert_eq!(payload["errors"], serde_json::Value::Null);
+        let gap = &payload["gaps"][0];
+        assert_eq!(
+            gap["affected_files"],
+            serde_json::json!(["images/app.dockerfile", "images/base.dockerfile"])
+        );
+        let reason = gap["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("dockerfile-language-server-nodejs"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("lsp-packages/dockerfile-language-server-nodejs/node_modules/.bin"),
+            "{reason}"
+        );
+        let scope = JobScope::from_roots(&project, vec![project.join("images/app.dockerfile")]);
+        let scoped = run(&scope, true);
+        assert_eq!(scoped["complete"], false);
+        // Scoped requests already name their uncovered paths: no second list.
+        assert!(scoped["gaps"][0].get("affected_files").is_none());
+        assert_eq!(scoped["gaps"].as_array().unwrap().len(), 2);
+        assert_eq!(scoped["gaps"][1]["file"], "images/app.dockerfile");
     }
 
     #[test]

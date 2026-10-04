@@ -1,0 +1,22 @@
+[
+  {
+    "name": "single-project-sdk",
+    "inspect_terminal": "fresh",
+    "text": "FRESH\nDuplicates: 1 (top by cost):\nCyclomatic complexity: 1 functions >= 10 (worst: src/complex.rs::hot 12)\nDead code: 1:\nUnused exports: 1:\nTODOs: 1\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints"
+  },
+  {
+    "name": "multiple-sdks",
+    "inspect_terminal": "fresh",
+    "text": "FRESH\nDuplicates: 1 (top by cost):\nCyclomatic complexity: 1 functions >= 10 (worst: src/complex.rs::hot 12)\nDead code: 1:\nUnused exports: 1:\nTODOs: 1\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints\nTypeScript 5.9.3: project installation (/repo/node_modules/typescript/lib/tsserver.js)\nTypeScript 5.4.0: project installation (/repo/web/node_modules/typescript/lib/tsserver.js)"
+  },
+  {
+    "name": "fallback-sdk",
+    "inspect_terminal": "fresh",
+    "text": "FRESH\nDuplicates: 1 (top by cost):\nCyclomatic complexity: 1 functions >= 10 (worst: src/complex.rs::hot 12)\nDead code: 1:\nUnused exports: 1:\nTODOs: 1\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints\nTypeScript 5.9.3: AFT cache fallback; not the project's pinned TypeScript (/cache/typescript/lib/tsserver.js)"
+  },
+  {
+    "name": "missing-docker-server",
+    "inspect_terminal": "partial",
+    "text": "PARTIAL — diagnostics unknown: dockerfile @ .: docker-langserver is unavailable; AFT plugins auto-install dockerfile-language-server-nodejs with lsp.auto_install enabled (user config) into <AFT cache>/lsp-packages/dockerfile-language-server-nodejs/node_modules/.bin; diagnose with `npx @cortexkit/aft doctor lsp <file>` (2 files); retry aft_inspect.\nAffected files:\n  images/app.dockerfile\nshown 1 of 2 items (cap) · narrow: topK, scope, sections\nDuplicates: 1 (top by cost):\nCyclomatic complexity: 1 functions >= 10 (worst: src/complex.rs::hot 12)\nDead code: 1:\nUnused exports: 1:\nTODOs: 1"
+  }
+]

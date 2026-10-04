@@ -966,9 +966,17 @@ impl Default for DiagnosticsStore {
 pub fn from_lsp_diagnostics(
     file: PathBuf,
     lsp_diagnostics: Vec<lsp_types::Diagnostic>,
+    server: &ServerKind,
 ) -> Vec<StoredDiagnostic> {
     lsp_diagnostics
         .into_iter()
+        // rust-analyzer publishes cfg greying as diagnostics, but code excluded
+        // by the active build configuration is not a finding. Use the producer
+        // and protocol code: messages can change, and source is optional in LSP.
+        .filter(|diagnostic| {
+            !(*server == ServerKind::Rust
+                && matches!(&diagnostic.code, Some(lsp_types::NumberOrString::String(code)) if code == "inactive-code"))
+        })
         .map(|diagnostic| StoredDiagnostic {
             file: file.clone(),
             line: diagnostic.range.start.line + 1,
@@ -1062,6 +1070,7 @@ mod tests {
                 tags: None,
                 data: None,
             }],
+            &ServerKind::Rust,
         );
 
         assert_eq!(diagnostics.len(), 1);
@@ -1072,6 +1081,61 @@ mod tests {
         assert_eq!(diagnostics[0].end_column, 5);
         assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Error);
         assert_eq!(diagnostics[0].code.as_deref(), Some("E1"));
+    }
+
+    #[test]
+    fn inspect_noise_inactive_code_is_filtered_at_ingestion() {
+        let file = PathBuf::from("/tmp/cfg.rs");
+        let inactive = Diagnostic {
+            severity: Some(LspDiagnosticSeverity::HINT),
+            code: Some(NumberOrString::String("inactive-code".into())),
+            source: Some("rust-analyzer".into()),
+            // The code, not the wording, identifies editor-only cfg greying.
+            message: "arbitrary wording".into(),
+            ..Diagnostic::default()
+        };
+        let stored = from_lsp_diagnostics(file.clone(), vec![inactive.clone()], &ServerKind::Rust);
+        assert!(
+            stored.is_empty(),
+            "cfg greying must not enter the diagnostic store: {stored:?}"
+        );
+        let mut store = DiagnosticsStore::new();
+        store.publish(server_key(ServerKind::Rust), file.clone(), stored);
+        assert!(store.has_authoritative_report_for_file(&file));
+        assert!(store.all().is_empty());
+
+        let real_hint = Diagnostic {
+            code: Some(NumberOrString::String("other-code".into())),
+            message: "code is inactive due to #[cfg] directives: windows is disabled".into(),
+            ..inactive.clone()
+        };
+        let tagged = Diagnostic {
+            severity: None,
+            code: None,
+            source: Some("typescript".into()),
+            tags: Some(vec![
+                lsp_types::DiagnosticTag::UNNECESSARY,
+                lsp_types::DiagnosticTag::DEPRECATED,
+            ]),
+            message: "unused or deprecated declaration".into(),
+            ..Diagnostic::default()
+        };
+        let kept = from_lsp_diagnostics(file.clone(), vec![real_hint, tagged], &ServerKind::Rust);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].severity, DiagnosticSeverity::Hint);
+        assert_eq!(kept[1].severity, DiagnosticSeverity::Warning);
+
+        let without_source = Diagnostic {
+            source: None,
+            ..inactive.clone()
+        };
+        assert!(
+            from_lsp_diagnostics(file.clone(), vec![without_source], &ServerKind::Rust).is_empty()
+        );
+        assert_eq!(
+            from_lsp_diagnostics(file, vec![inactive], &ServerKind::TypeScript).len(),
+            1
+        );
     }
 
     #[test]

@@ -775,27 +775,56 @@ fn handle_inspect_payload(
     } else {
         ctx.lsp().runtime_notes()
     };
+    append_inspect_runtime_notes(&mut payload, &runtime_notes);
+    Response::success(&req.id, payload)
+}
+
+fn append_inspect_runtime_notes(payload: &mut Value, runtime_notes: &[String]) {
     if !runtime_notes.is_empty() {
-        if let Some(text) = payload.get_mut("text") {
+        let rendered_notes = collapse_runtime_notes(runtime_notes);
+        if let Some(text) = payload
+            .get_mut("text")
+            .filter(|_| !rendered_notes.is_empty())
+        {
             if let Some(existing) = text.as_str() {
-                *text = serde_json::Value::String(format!(
-                    "{existing}\n{}",
-                    collapse_runtime_notes(&runtime_notes).join("\n")
-                ));
+                *text =
+                    serde_json::Value::String(format!("{existing}\n{}", rendered_notes.join("\n")));
             }
         }
         payload["lsp_runtime_notes"] = serde_json::json!(runtime_notes);
     }
-    Response::success(&req.id, payload)
 }
 
 /// Collapse runtime notes that differ only in their trailing parenthesized
 /// path, such as one "TypeScript 5.9.3: project installation (<tsserver>)"
 /// per TypeScript server, into one line with a count and the first path.
-/// Distinct notes keep their first-seen order.
+/// Distinct notes keep their first-seen order. A single known project SDK is
+/// routine; keep SDK notes when selection is uncertain, falls back, or names
+/// multiple installations (even when those installations have the same version).
 fn collapse_runtime_notes(notes: &[String]) -> Vec<String> {
+    let typescript_notes = notes
+        .iter()
+        .filter(|note| note.starts_with("TypeScript ") || note.starts_with("TypeScript:"))
+        .collect::<std::collections::HashSet<_>>();
+    let routine_sdk = if typescript_notes.len() == 1 {
+        typescript_notes.iter().next().copied().filter(|note| {
+            note.strip_prefix("TypeScript ")
+                .and_then(|note| note.split_once(": "))
+                .is_some_and(|(version, source)| {
+                    version != "unknown"
+                        && (source.starts_with("project installation (")
+                            || source
+                                .starts_with("native language server (project installation) ("))
+                })
+        })
+    } else {
+        None
+    };
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for note in notes {
+        if Some(note) == routine_sdk {
+            continue;
+        }
         let (head, detail) = match note
             .strip_suffix(')')
             .and_then(|rest| rest.rsplit_once(" ("))
@@ -1694,10 +1723,17 @@ fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
             let reason = cause["reason"]
                 .as_str()
                 .unwrap_or("no authoritative report");
+            let files = if uncovered {
+                1
+            } else {
+                gap.get("affected_files")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len)
+            };
             if let Some(existing) = causes.iter_mut().find(|entry| {
                 entry.0 == producer && (entry.1 == root || entry.1.is_empty() || root.is_empty())
             }) {
-                existing.3 += usize::from(uncovered);
+                existing.3 += files;
                 if existing.1.is_empty() {
                     existing.1 = root.to_string();
                 }
@@ -1706,7 +1742,7 @@ fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
                     producer.to_string(),
                     root.to_string(),
                     reason.to_string(),
-                    usize::from(uncovered),
+                    files,
                 ));
             }
         }
@@ -3833,6 +3869,18 @@ struct UncoveredFileGroup<'a> {
 fn uncovered_file_groups(gaps: &[Value]) -> Vec<UncoveredFileGroup<'_>> {
     let mut groups: BTreeMap<(Option<&str>, Option<&str>, &str), Vec<&str>> = BTreeMap::new();
     for gap in gaps {
+        // Unscoped failures carry the applicable paths as display metadata,
+        // without introducing scoped per-file authority claims.
+        if let Some(files) = gap.get("affected_files").and_then(Value::as_array) {
+            groups
+                .entry((
+                    gap["root"].as_str(),
+                    gap["producer"].as_str(),
+                    gap["reason"].as_str().unwrap_or("unavailable"),
+                ))
+                .or_default()
+                .extend(files.iter().filter_map(Value::as_str));
+        }
         if gap.get("kind").and_then(Value::as_str) != Some("uncovered_file") {
             continue;
         }
@@ -5371,6 +5419,85 @@ mod fresh_payload_tests {
                 "rust-analyzer warning: proc macros unavailable",
             ]
         );
+    }
+
+    #[test]
+    fn inspect_noise_single_project_typescript_note_is_omitted() {
+        let ordinary =
+            "TypeScript 5.9.3: project installation (/r/node_modules/typescript/lib/tsserver.js)"
+                .to_string();
+        let mut payload = serde_json::json!({"text": "FRESH\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints"});
+        append_inspect_runtime_notes(&mut payload, std::slice::from_ref(&ordinary));
+        assert_eq!(
+            payload["text"],
+            "FRESH\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints"
+        );
+        assert!(collapse_runtime_notes(&[ordinary.clone(), ordinary]).is_empty());
+        let native = "TypeScript 7.0.2: native language server (project installation) (/r/node_modules/@typescript/typescript-darwin-arm64/lib/tsc)".to_string();
+        assert!(collapse_runtime_notes(&[native]).is_empty());
+    }
+
+    #[test]
+    fn inspect_noise_actionable_typescript_notes_are_retained() {
+        let notes = [
+            "TypeScript 5.9.3: project installation (/r/a/lib/tsserver.js)",
+            "TypeScript 5.9.3: project installation (/r/b/lib/tsserver.js)",
+        ]
+        .map(String::from);
+        assert_eq!(
+            collapse_runtime_notes(&notes),
+            vec!["TypeScript 5.9.3: project installation ×2 (first: /r/a/lib/tsserver.js)"]
+        );
+        for note in [
+            "TypeScript 5.9.3: AFT cache fallback; not the project's pinned TypeScript (/cache/lib/tsserver.js)",
+            "TypeScript: server-managed SDK resolution (version not reported by AFT)",
+            "TypeScript: explicit tsserver.path override (version managed by configuration)",
+            "TypeScript unknown: project installation (/r/lib/tsserver.js)",
+            "TypeScript 5.9.3: version mismatch (expected 5.4.0)",
+            "rust-analyzer warning: proc macros unavailable",
+        ] {
+            assert_eq!(collapse_runtime_notes(&[note.to_string()]), vec![note]);
+        }
+    }
+
+    #[test]
+    fn daemon_noise_renderer_golden() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let clean =
+            serde_json::json!({"errors": 0, "warnings": 0, "info": 0, "hints": 0, "items": []});
+        let ordinary = "TypeScript 5.9.3: project installation (/repo/node_modules/typescript/lib/tsserver.js)";
+        let scenarios = [
+            ("single-project-sdk", clean.clone(), vec![ordinary]),
+            ("multiple-sdks", clean.clone(), vec![ordinary, "TypeScript 5.4.0: project installation (/repo/web/node_modules/typescript/lib/tsserver.js)"]),
+            ("fallback-sdk", clean, vec!["TypeScript 5.9.3: AFT cache fallback; not the project's pinned TypeScript (/cache/typescript/lib/tsserver.js)"]),
+            ("missing-docker-server", serde_json::json!({
+                "complete": false, "errors": null, "warnings": null, "info": null, "hints": null,
+                "items": [], "by_producer": {}, "gaps": [{"kind": "failed_producer", "producer": "dockerfile", "root": ".",
+                    "reason": "docker-langserver is unavailable; AFT plugins auto-install dockerfile-language-server-nodejs with lsp.auto_install enabled (user config) into <AFT cache>/lsp-packages/dockerfile-language-server-nodejs/node_modules/.bin; diagnose with `npx @cortexkit/aft doctor lsp <file>`",
+                    "affected_files": ["images/app.dockerfile", "images/base.dockerfile"]
+                }]
+            }), vec![]),
+        ];
+        let rendered = scenarios.into_iter().map(|(name, diagnostics, notes)| {
+            let mut payloads = fresh_payloads_for_all_categories();
+            payloads.insert(InspectCategory::Diagnostics, diagnostics);
+            let mut payload = build_inspect_payload(&snapshot(), &payloads, &Sections::summary_only(), 1, &ctx, None);
+            append_inspect_runtime_notes(&mut payload, &notes.into_iter().map(String::from).collect::<Vec<_>>());
+            let log = InspectPhaseLog::default();
+            let response = build_inspect_terminal(name, &log, InspectTerminal::Fresh(payload));
+            serde_json::json!({"name": name, "inspect_terminal": response.data["inspect_terminal"],
+                "text": crate::subc_format::format_inspect_for_test(&response)})
+        }).collect::<Vec<_>>();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/inspect/noise-renderer.json");
+        let actual = serde_json::to_string_pretty(&rendered).unwrap() + "\n";
+        if std::env::var_os("UPDATE_INSPECT_NOISE_GOLDEN").is_some() {
+            std::fs::write(&path, &actual).unwrap();
+        }
+        assert_eq!(actual, std::fs::read_to_string(path).unwrap());
     }
 
     /// A producer whose workspace failed to load (rust-analyzer run with

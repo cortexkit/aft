@@ -3888,6 +3888,7 @@ impl LspManager {
                         let stored = from_lsp_diagnostics(
                             file.clone(),
                             full.full_document_diagnostic_report.items.clone(),
+                            &server_key.kind,
                         );
                         self.diagnostics.publish_with_result_id(
                             server_key.clone(),
@@ -3965,6 +3966,7 @@ impl LspManager {
                 let stored = from_lsp_diagnostics(
                     canonical_path.to_path_buf(),
                     full.full_document_diagnostic_report.items.clone(),
+                    &key.kind,
                 );
                 let count = stored.len();
                 let provisional = self
@@ -4649,7 +4651,7 @@ impl LspManager {
                 .unwrap_or_else(|| "none".to_string()),
             diagnostic_count
         );
-        let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics);
+        let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
         let mut stored = stored;
         if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {

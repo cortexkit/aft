@@ -1,7 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
@@ -101,6 +101,23 @@ function freshTerminal() {
 }
 
 describe("aft_inspect tool", () => {
+  test("preserves daemon-generated noise renderer snapshots byte for byte", async () => {
+    const fixtures = JSON.parse(
+      readFileSync(
+        new URL(
+          "../../../../crates/aft/tests/fixtures/inspect/noise-renderer.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as Array<{ name: string; inspect_terminal: string; text: string }>;
+    expect(fixtures).toHaveLength(4);
+    for (const fixture of fixtures) {
+      const { tools, toolCallCalls } = createInspectHarness(() => ({ success: true, ...fixture }));
+      expect(await tools.aft_inspect.execute({}, createMockSdkContext())).toBe(fixture.text);
+      expect(toolCallCalls).toHaveLength(1);
+    }
+  });
   test("keeps terminal phases structured but never renders phase vocabulary", () => {
     const payload = freshTerminal();
     const terminal = parseInspectTerminal(payload)!;

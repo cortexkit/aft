@@ -50,6 +50,30 @@ function freshTerminal() {
 }
 
 describe("Pi aft_inspect surface", () => {
+  test("preserves daemon-generated noise renderer snapshots byte for byte", async () => {
+    const fixtures = JSON.parse(
+      readFileSync(
+        new URL(
+          "../../../../crates/aft/tests/fixtures/inspect/noise-renderer.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ) as Array<{ name: string; inspect_terminal: string; text: string }>;
+    expect(fixtures).toHaveLength(4);
+    for (const fixture of fixtures) {
+      const { api, tools } = makeMockApi();
+      const { bridge, calls } = makeMockBridge(() => ({ success: true, ...fixture }));
+      registerInspectTool(api, makePluginContext(bridge));
+      const result = await executeTool(
+        tools.get("aft_inspect")!,
+        {},
+        makeExtContext(projectRoot, "pi-session"),
+      );
+      expect(resultText(result)).toBe(fixture.text);
+      expect(calls).toHaveLength(1);
+    }
+  });
   test("uses the server status once and retains phases only in structured data", () => {
     const terminal = parseInspectTerminal(freshTerminal())!;
     expect(terminal.phases).toHaveLength(2);
