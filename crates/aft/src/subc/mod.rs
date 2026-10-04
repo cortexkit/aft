@@ -9272,6 +9272,73 @@ pub(crate) mod test_support {
     }
 
     #[tokio::test]
+    async fn deferred_bash_watch_producer_notifies_completion() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        use crate::bash_background::BgTaskStatus;
+
+        let (dir, _) = test_root("bash-watch-producer-wake");
+        let session = "watch-session";
+        let task_id = "bash-0123456789abcdef";
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            storage_dir: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+        let storage = crate::bash_background::task_storage_dir(&ctx);
+        let task = create_task_layout(&storage, session, task_id).expect("task layout");
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "echo watched-done".into(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            None,
+            false,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        write_task_at(&task, &metadata).expect("terminal task");
+        std::fs::write(&task.paths.stdout, "watched-done\n").expect("task stdout");
+        std::fs::write(&task.paths.stderr, "").expect("task stderr");
+        ctx.bash_background()
+            .replay_session(&storage, session)
+            .expect("restore terminal task");
+
+        let request = serde_json::from_value(json!({
+            "id": "watch-wake",
+            "command": "bash_watch",
+            "session_id": session,
+            "task_id": task_id,
+            "worker_session": true,
+        }))
+        .expect("watch request");
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let mut pending = {
+            let _scope = wake.install();
+            let DispatchOutcome::Deferred(pending) =
+                crate::commands::bash_watch::handle_deferred(&request, Arc::clone(&ctx))
+            else {
+                panic!("bash watch must defer")
+            };
+            pending
+        };
+        // Await only the producer's wake, not a timer or registry poll: periodic
+        // polling would hide a missing completion signal on an idle connection.
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("bash watch completion wake");
+        assert_eq!(wake.generation(), 1);
+        let response = (pending.poll)(&ctx).expect("terminal queued before wake");
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["status"], "completed");
+        assert_eq!(response.data["waited"]["reason"], "exited");
+        assert!((pending.poll)(&ctx).is_none(), "terminal is delivered once");
+    }
+
+    #[tokio::test]
     async fn deferred_registry_idle_turns_do_not_repoll_and_completion_wakes() {
         let executor = Executor::new();
         let (dir, root) = test_root("deferred-wake-counter");
