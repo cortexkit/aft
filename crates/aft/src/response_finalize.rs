@@ -787,7 +787,9 @@ pub fn attach_checkout_query_gaps(response: &mut Response, ctx: &AppContext) {
 pub const WATCHER_PENDING_NOTICE: &str = "Watcher changes pending: indexed or cached results may omit unapplied file changes. Retry after maintenance catches up; a missing result is not evidence of absence.";
 
 /// Capture before execution: finishing maintenance cannot make an already
-/// computed index-backed answer fresh retroactively. Live disk reads are exempt.
+/// computed index-backed answer fresh retroactively. Live disk reads are exempt,
+/// and so are `outline` and `zoom`: they parse the file on disk, and the symbol
+/// cache they consult is checked against each file's current mtime and size.
 pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
     matches!(
         command,
@@ -795,8 +797,6 @@ pub fn watcher_query_pending(ctx: &AppContext, command: &str) -> bool {
             | "glob"
             | "search"
             | "semantic_search"
-            | "outline"
-            | "zoom"
             | "inspect"
             | "callgraph"
             | "callers"

@@ -140,9 +140,21 @@ fn request_watcher_burst_discloses_unapplied_index_changes() {
     assert!(read.text.contains("burst_marker"));
     assert!(read.response.data.get("gaps").is_none());
 
+    // Outline and zoom parse the file on disk (the symbol cache is checked
+    // against its mtime and size), so a watcher backlog cannot make them stale.
     for (name, arguments) in [
         ("outline", json!({"target":root.join("old.rs")})),
         ("zoom", json!({"path":root.join("old.rs"), "symbols":"old"})),
+    ] {
+        let result = call(&ctx, name, arguments);
+        assert!(
+            !result.text.contains("Watcher changes pending"),
+            "{name}: {}",
+            result.text
+        );
+    }
+
+    for (name, arguments) in [
         ("search", json!({"pattern":"old"})),
         (
             "callgraph",
