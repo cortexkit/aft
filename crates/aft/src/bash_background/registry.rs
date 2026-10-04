@@ -86,6 +86,19 @@ pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 const KILL_IN_FLIGHT_WAIT: Duration =
     Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 2);
 
+/// Bound the ConPTY close/output drain after the child has exited. A stuck
+/// conhost or reader must not keep the task running forever or claim that all
+/// output was captured.
+#[cfg(any(windows, test))]
+const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(any(windows, test))]
+enum PtyOutputDrainPoll {
+    Pending,
+    Ready,
+    Incomplete(&'static str),
+}
+
 /// What a kill does after it releases the task's state lock. See
 /// [`BgTaskRegistry::kill_with_status_reason`].
 enum KillSignalPlan {
@@ -104,6 +117,10 @@ enum KillSignalPlan {
     },
     /// The task had already exited; close its retired PTY runtime, if any.
     RetirePty(Option<PtyRuntime>),
+    /// A Windows PTY has an exit marker, but its reader must drain before a
+    /// natural completion can be published, even when observed by a kill.
+    #[cfg(any(windows, test))]
+    DrainPty,
     /// Signal a PTY task's process group, then close its pseudoterminal so
     /// the PTY reader reaches end-of-file.
     Pty {
@@ -134,8 +151,7 @@ fn terminate_piped_task(pgid: Option<i32>, child_pid: Option<u32>, child: Option
     }
 }
 
-/// Signal a PTY task's process group (Unix) or process tree (Windows).
-/// Close a killed PTY's pseudoterminal so its reader reaches end-of-file and
+/// Close a PTY's pseudoterminal so its reader reaches end-of-file and
 /// the task can finalize. On Windows, ConPTY's reader sees end-of-file only
 /// once the pseudoconsole is closed, and closing it can wait for conhost to
 /// flush; it runs on its own thread so no caller (or lock) waits on that.
@@ -144,16 +160,22 @@ fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
         return;
     };
     #[cfg(windows)]
-    {
-        let spawned = std::thread::Builder::new()
-            .name("aft-pty-close".to_owned())
-            .spawn(move || drop(master));
-        if let Err(error) = spawned {
-            crate::slog_warn!("[pty-kill] could not close the pseudoconsole off-thread: {error}");
-        }
-    }
+    close_pty_master_off_thread(Some(master));
     #[cfg(not(windows))]
     drop(master);
+}
+
+#[cfg(any(windows, test))]
+fn close_pty_master_off_thread(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
+    let Some(master) = master else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("aft-pty-close".to_owned())
+        .spawn(move || drop(master));
+    if let Err(error) = spawned {
+        crate::slog_warn!("[pty-close] could not close the pseudoconsole off-thread: {error}");
+    }
 }
 
 fn terminate_pty_group(pid: u32) {
@@ -5468,13 +5490,9 @@ impl BgTaskRegistry {
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
         if let Ok(state) = task.state.lock() {
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
-                // On Windows ConPTY, the reader may not observe EOF while the
-                // master handle is still held in `PtyRuntime`. The waiter writes
-                // the authoritative exit marker before setting `exit_observed`,
-                // so once exit is observed we can finalize from that marker and
-                // drop the runtime, which lets the reader finish. Waiting for
-                // `reader_done && exit_observed` wedges completed PTY tasks on
-                // Windows.
+                // The Windows wrapper can write the marker before the child
+                // actually exits. Only the waiter makes it safe to close the
+                // pseudoconsole; finalization then waits for output capture.
                 if !pty.exit_observed.load(Ordering::SeqCst) {
                     return Ok(());
                 }
@@ -6025,32 +6043,51 @@ impl BgTaskRegistry {
                     _ => KillSignalPlan::Nothing,
                 }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
-                state.metadata =
-                    terminal_metadata_from_marker(state.metadata.clone(), marker, reason.clone());
+                #[cfg(any(windows, test))]
+                let needs_pty_drain = matches!(&state.runtime, TaskRuntime::Pty(Some(pty))
+                    if pty.output_drain.is_some() && !pty.was_killed.load(Ordering::SeqCst));
+                #[cfg(not(any(windows, test)))]
+                let needs_pty_drain = false;
+                if needs_pty_drain {
+                    #[cfg(any(windows, test))]
+                    {
+                        KillSignalPlan::DrainPty
+                    }
+                    #[cfg(not(any(windows, test)))]
+                    {
+                        unreachable!()
+                    }
+                } else {
+                    state.metadata = terminal_metadata_from_marker(
+                        state.metadata.clone(),
+                        marker,
+                        reason.clone(),
+                    );
 
-                state.pending_terminal_override = None;
-                task.mark_terminal_now();
-                match &mut state.runtime {
-                    // Exit marker already present: the child finished on its
-                    // own before this kill observed it. Reap it rather than
-                    // dropping the handle so it doesn't become a zombie
-                    // (issue #91). The active-kill branch below already
-                    // `wait()`s after signaling, so this is the only kill
-                    // path that needed the explicit reap.
-                    TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
-                    TaskRuntime::Pty(_) => {}
+                    state.pending_terminal_override = None;
+                    task.mark_terminal_now();
+                    match &mut state.runtime {
+                        // Exit marker already present: the child finished on its
+                        // own before this kill observed it. Reap it rather than
+                        // dropping the handle so it doesn't become a zombie
+                        // (issue #91). The active-kill branch below already
+                        // `wait()`s after signaling, so this is the only kill
+                        // path that needed the explicit reap.
+                        TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
+                        TaskRuntime::Pty(_) => {}
+                    }
+                    // Move the PTY runtime out of the task while holding the lock;
+                    // it is closed after the lock is released.
+                    let retired_pty = match &mut state.runtime {
+                        TaskRuntime::Pty(runtime) => runtime.take(),
+                        TaskRuntime::Piped(_) => None,
+                    };
+                    state.detached = true;
+                    self.persist_task_locked(&task, &state.metadata, &mut db)
+                        .map_err(|e| format!("failed to persist terminal state: {e}"))?;
+                    terminalized = true;
+                    KillSignalPlan::RetirePty(retired_pty)
                 }
-                // Move the PTY runtime out of the task while holding the lock;
-                // it is closed after the lock is released.
-                let retired_pty = match &mut state.runtime {
-                    TaskRuntime::Pty(runtime) => runtime.take(),
-                    TaskRuntime::Piped(_) => None,
-                };
-                state.detached = true;
-                self.persist_task_locked(&task, &state.metadata, &mut db)
-                    .map_err(|e| format!("failed to persist terminal state: {e}"))?;
-                terminalized = true;
-                KillSignalPlan::RetirePty(retired_pty)
             } else if state.kill_in_flight {
                 KillSignalPlan::AwaitOtherKill
             } else {
@@ -6106,6 +6143,8 @@ impl BgTaskRegistry {
 
         match plan {
             KillSignalPlan::Nothing => {}
+            #[cfg(any(windows, test))]
+            KillSignalPlan::DrainPty => self.poll_task(&task)?,
             KillSignalPlan::RetirePty(runtime) => {
                 if let Some(mut runtime) = runtime {
                     close_pty_master(runtime.master.take());
@@ -6302,12 +6341,72 @@ impl BgTaskRegistry {
         let _ = task.wait_for_kill_settled(KILL_IN_FLIGHT_WAIT);
     }
 
+    /// Start the normal-exit ConPTY close independently of terminal publication.
+    /// Closing can block while conhost flushes, so retain the reader's state and
+    /// let subsequent polls (or its completion wake) observe EOF or the deadline.
+    #[cfg(any(windows, test))]
+    fn poll_windows_pty_output_drain(
+        &self,
+        task: &Arc<BgTask>,
+    ) -> Result<PtyOutputDrainPoll, String> {
+        let (master, outcome) = {
+            let mut state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if state.metadata.status.is_terminal() {
+                return Ok(PtyOutputDrainPoll::Ready);
+            }
+            let TaskRuntime::Pty(Some(pty)) = &mut state.runtime else {
+                return Ok(PtyOutputDrainPoll::Ready);
+            };
+            if pty.was_killed.load(Ordering::SeqCst) {
+                return Ok(PtyOutputDrainPoll::Ready);
+            }
+            let Some(drain) = &mut pty.output_drain else {
+                return Ok(PtyOutputDrainPoll::Ready);
+            };
+            if !pty.exit_observed.load(Ordering::SeqCst) {
+                return Ok(PtyOutputDrainPoll::Pending);
+            }
+            let deadline = *drain
+                .deadline
+                .get_or_insert_with(|| Instant::now() + PTY_OUTPUT_DRAIN_TIMEOUT);
+            let outcome = if pty.reader_done.load(Ordering::SeqCst) {
+                if pty.reader_eof.load(Ordering::SeqCst) {
+                    PtyOutputDrainPoll::Ready
+                } else {
+                    PtyOutputDrainPoll::Incomplete(
+                        "PTY output may be incomplete: output capture failed before EOF",
+                    )
+                }
+            } else if Instant::now() >= deadline {
+                PtyOutputDrainPoll::Incomplete(
+                    "PTY output may be incomplete: output drain deadline expired before EOF",
+                )
+            } else {
+                PtyOutputDrainPoll::Pending
+            };
+            (pty.master.take(), outcome)
+        };
+        close_pty_master_off_thread(master);
+        Ok(outcome)
+    }
+
     fn finalize_from_marker(
         &self,
         task: &Arc<BgTask>,
         marker: ExitMarker,
         reason: Option<String>,
     ) -> Result<(), String> {
+        #[cfg(any(windows, test))]
+        let output_incomplete = match self.poll_windows_pty_output_drain(task)? {
+            PtyOutputDrainPoll::Pending => return Ok(()),
+            PtyOutputDrainPoll::Ready => None,
+            PtyOutputDrainPoll::Incomplete(reason) => Some(reason),
+        };
+        #[cfg(not(any(windows, test)))]
+        let output_incomplete: Option<&str> = None;
         let mut pty_reader_done = None;
         // The PTY runtime leaves the task under the lock and is dropped after
         // it is released: dropping it closes the pseudoterminal, which on
@@ -6332,9 +6431,14 @@ impl BgTaskRegistry {
             let pending_override = state.pending_terminal_override.take();
             let is_pty = state.metadata.mode == BgMode::Pty;
             let reason = reason.or_else(|| state.metadata.status_reason.clone());
+            let reason = match (reason, output_incomplete) {
+                (Some(reason), Some(incomplete)) => Some(format!("{reason}; {incomplete}")),
+                (None, Some(incomplete)) => Some(incomplete.to_owned()),
+                (reason, None) => reason,
+            };
             let updated = self
                 .update_task_metadata_locked(task, &mut db, |metadata| {
-                    let new_metadata = if is_pty && marker == ExitMarker::Killed {
+                    let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
                         let mut metadata = metadata.clone();
                         let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
                         let exit_code = terminal_exit_code_for_status(&target_status);
@@ -6343,6 +6447,16 @@ impl BgTaskRegistry {
                     } else {
                         terminal_metadata_from_marker(metadata.clone(), marker, reason.clone())
                     };
+                    if output_incomplete.is_some() {
+                        // A successful child exit is not a successful task if
+                        // its output could not be captured. Keep the actual
+                        // exit code, and persist the warning for status/reminders.
+                        new_metadata.mark_terminal(
+                            BgTaskStatus::Failed,
+                            new_metadata.exit_code,
+                            reason.clone(),
+                        );
+                    }
                     *metadata = new_metadata;
                 })
                 .map_err(|e| format!("failed to persist terminal state: {e}"))?;
@@ -6359,6 +6473,17 @@ impl BgTaskRegistry {
                 TaskRuntime::Pty(runtime) => {
                     pty_reader_done = runtime
                         .as_ref()
+                        .filter(|runtime| {
+                            #[cfg(any(windows, test))]
+                            {
+                                runtime.output_drain.is_none()
+                            }
+                            #[cfg(not(any(windows, test)))]
+                            {
+                                let _ = runtime;
+                                true
+                            }
+                        })
                         .map(|runtime| Arc::clone(&runtime.reader_done));
                     retired_pty_runtime = runtime.take();
                 }
@@ -8816,6 +8941,10 @@ fn random_slug() -> String {
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     format!("bash-{hex}")
 }
+
+#[cfg(test)]
+#[path = "pty_completion_test.rs"]
+mod pty_completion_tests;
 
 #[cfg(test)]
 mod tests {

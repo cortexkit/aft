@@ -182,6 +182,7 @@ fn try_spawn_pty(
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
 
     let reader_done = Arc::new(AtomicBool::new(false));
+    let reader_eof = Arc::new(AtomicBool::new(false));
     let exit_observed = Arc::new(AtomicBool::new(false));
     let was_killed = Arc::new(AtomicBool::new(false));
     let coordinator = Arc::new(CompletionCoordinator::new(
@@ -201,6 +202,7 @@ fn try_spawn_pty(
         reader,
         spill,
         Arc::clone(&reader_done),
+        Arc::clone(&reader_eof),
         Arc::clone(&coordinator),
         Some(Arc::clone(&writer)),
     );
@@ -218,9 +220,12 @@ fn try_spawn_pty(
         killer,
         child_pid,
         reader_done,
+        reader_eof,
         exit_observed,
         was_killed,
         coordinator,
+        #[cfg(any(windows, test))]
+        output_drain: cfg!(windows).then(super::pty_runtime::PtyOutputDrain::default),
     })
 }
 
@@ -233,6 +238,7 @@ pub(crate) fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     mut file: std::fs::File,
     reader_done: Arc<AtomicBool>,
+    reader_eof: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
     writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
 ) {
@@ -268,7 +274,7 @@ pub(crate) fn spawn_reader(
             }
             Ok(())
         })();
-        if let Err(error) = result {
+        if let Err(ref error) = result {
             crate::slog_warn!(
                 "PTY reader for {}:{} stopped with error: {error}",
                 coordinator.session_id,
@@ -277,6 +283,7 @@ pub(crate) fn spawn_reader(
         }
         #[cfg(test)]
         wait_on_pty_reader_gate_for_test(&coordinator.task_id);
+        reader_eof.store(result.is_ok(), Ordering::SeqCst);
         reader_done.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
     });

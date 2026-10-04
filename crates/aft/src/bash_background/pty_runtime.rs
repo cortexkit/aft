@@ -9,9 +9,21 @@ pub(crate) struct PtyRuntime {
     pub(crate) killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pub(crate) child_pid: Option<u32>,
     pub(crate) reader_done: Arc<AtomicBool>,
+    pub(crate) reader_eof: Arc<AtomicBool>,
     pub(crate) exit_observed: Arc<AtomicBool>,
     pub(crate) was_killed: Arc<AtomicBool>,
     pub(crate) coordinator: Arc<CompletionCoordinator>,
+    /// ConPTY needs an explicit close before its output pipe can reach EOF.
+    /// Unix runtimes leave this unset; tests can exercise the Windows policy
+    /// with a channel-controlled reader on any host.
+    #[cfg(any(windows, test))]
+    pub(crate) output_drain: Option<PtyOutputDrain>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct PtyOutputDrain {
+    pub(crate) deadline: Option<std::time::Instant>,
 }
 
 pub struct CompletionCoordinator {
