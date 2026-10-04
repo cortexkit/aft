@@ -516,6 +516,13 @@ fn handle_inspect_payload(
         None
     };
     let manager = ctx.inspect_manager();
+    let checkout_store = if snapshot.config.views.enabled && !checkout_routed {
+        manager.current_checkout_view(&snapshot)
+    } else {
+        checkout_store
+    };
+    let use_checkout_view =
+        snapshot.config.views.enabled && (checkout_routed || checkout_store.is_some());
     let blocking_tier1_deadline = phase_log.map(|_| {
         request_deadline.map_or_else(
             || Instant::now() + inspect_request_timeout(snapshot.config.as_ref()),
@@ -546,7 +553,7 @@ fn handle_inspect_payload(
         .copied()
         .filter(|category| category.is_tier2())
     {
-        if scope_was_provided || !ctx.inspect_writer() {
+        if (scope_was_provided || !ctx.inspect_writer()) && !use_checkout_view {
             continue;
         }
         if request_deadline.is_some_and(|deadline| !deadline.has_work_budget()) {
@@ -590,7 +597,7 @@ fn handle_inspect_payload(
         let cancellation = crate::executor::current_job_cancellation();
         std::thread::spawn(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-            let outcome = if checkout_routed {
+            let outcome = if use_checkout_view {
                 manager.tier2_run_with_pinned_view(snapshot, category, scope, checkout_store)
             } else if force_root_diagnostics {
                 manager.tier2_run_with_reuse_blocking_fresh(snapshot, category, scope)
@@ -686,20 +693,26 @@ fn handle_inspect_payload(
     // than reading as zero.
     refresh_status_bar_counts(ctx, &outcomes);
 
-    // Scoped inspection never schedules or joins project-wide Tier-2 work.
-    // Missing or stale cached results are gaps, not verified zero counts.
+    // Scoped inspection may compute from its own immutable view, but never
+    // schedules or joins a legacy project-wide build. Missing cache rows are gaps.
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
-                    JobOutcome::Stale { .. } => "cached analysis could not be stat-verified".into(),
+                    JobOutcome::Stale { .. } => "cached source contributions, file set, or analysis configuration changed; freshness could not be verified".into(),
+                    _ if snapshot.config.views.enabled => "checkout call graph view is not ready; no legacy or borrowed analysis was substituted".into(),
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
                 *outcome = JobOutcome::Fresh {
-                    payload: serde_json::json!({"unavailable": true, "complete": false,
-                        "gaps": [{"kind": "tier2_unavailable", "reason": reason}]}),
+                    payload: manager.tier2_incomplete_payload(
+                        &snapshot,
+                        *category,
+                        &scope,
+                        "tier2_unavailable",
+                        reason,
+                    ),
                 };
             }
         }
@@ -720,12 +733,21 @@ fn handle_inspect_payload(
                 } else {
                     format!("{} scanner", category.as_str())
                 };
-                *outcome = JobOutcome::Fresh {
-                    payload: serde_json::json!({
+                let payload = if category.is_tier2() {
+                    manager.tier2_incomplete_payload(
+                        &snapshot,
+                        *category,
+                        &scope,
+                        "analysis_incomplete",
+                        reason,
+                    )
+                } else {
+                    serde_json::json!({
                         "unavailable": true, "complete": false,
                         "gaps": [{"kind": "analysis_incomplete", "producer": producer, "reason": format!("{reason}; retry aft_inspect") }]
-                    }),
+                    })
                 };
+                *outcome = JobOutcome::Fresh { payload };
             }
         }
     }
@@ -2281,9 +2303,16 @@ fn build_inspect_payload(
 ) -> Value {
     let scope_files = scope_roots.map(|_| {
         payloads
-            .get(&InspectCategory::Metrics)
-            .and_then(|payload| payload.get("files"))
+            .get(&InspectCategory::Diagnostics)
+            .and_then(|payload| payload.get("coverage"))
+            .and_then(|coverage| coverage.get("files"))
             .and_then(Value::as_u64)
+            .or_else(|| {
+                payloads
+                    .get(&InspectCategory::Metrics)
+                    .and_then(|payload| payload.get("files"))
+                    .and_then(Value::as_u64)
+            })
             .unwrap_or(0)
     });
     let no_files_matched_scope = scope_files == Some(0);
@@ -2310,6 +2339,11 @@ fn build_inspect_payload(
                     "unavailable": true, "complete": false, "gaps": category_gaps,
                 }),
             );
+            for key in ["building", "last_complete"] {
+                if let Some(value) = payload.get(key) {
+                    summary.get_mut(category.as_str()).unwrap()[key] = value.clone();
+                }
+            }
             if sections.includes(*category) {
                 details.insert(category.as_str().to_string(), Value::Null);
             }
@@ -4824,6 +4858,37 @@ mod fresh_payload_tests {
         );
         assert!(payload.get("topK").is_none());
         assert!(payload.get("top_k").is_none());
+    }
+
+    #[test]
+    fn scoped_inspect_file_accounting_survives_unfinished_metrics() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::Metrics, serde_json::json!({
+            "unavailable": true, "complete": false, "gaps": [{"kind": "analysis_incomplete", "reason": "metrics still scanning"}]
+        }));
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["coverage"] = serde_json::json!({
+            "files": 606, "authoritative": 606, "examined": 606, "not_examined": 0
+        });
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            20,
+            &ctx,
+            Some(&[PathBuf::from("/repo/packages")]),
+        );
+        assert_eq!(payload["scope_files"], 606, "{payload:#}");
+        assert!(
+            payload.get("no_files_matched_scope").is_none(),
+            "{payload:#}"
+        );
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.starts_with("scope: 1 root, 606 files\n"), "{text}");
+        assert!(text.contains("606 of 606 scoped files"), "{text}");
     }
 
     #[test]

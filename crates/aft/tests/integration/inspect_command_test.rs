@@ -1329,6 +1329,249 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
 }
 
 #[test]
+fn scoped_inspect_building_discloses_progress_and_last_complete() {
+    let _env_lock = env_serial_lock();
+    let (temp, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    configure_fake_scope_lsp(&ctx);
+    let ready = temp.path().join("ready");
+    let release = temp.path().join("release");
+    let _root = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_ROOT", &root.to_string_lossy());
+    let _ready = EnvVarGuard::set("AFT_TEST_TIER2_REUSE_GATE_READY", &ready.to_string_lossy());
+    let _release = EnvVarGuard::set(
+        "AFT_TEST_TIER2_REUSE_GATE_RELEASE",
+        &release.to_string_lossy(),
+    );
+    for has_previous in [false, true] {
+        if has_previous {
+            fs::remove_file(&ready).unwrap();
+            fs::remove_file(&release).unwrap();
+            write_file(&root, "src/foo.ts", alternate_duplicate_fixture_source());
+        }
+        let manager = ctx.inspect_manager();
+        let snapshot = tier2_snapshot(&root, &ctx.inspect_dir());
+        let scope = JobScope::for_project(root.clone());
+        let worker = thread::spawn(move || {
+            manager.tier2_run_with_reuse_blocking(snapshot, InspectCategory::Duplicates, scope)
+        });
+        wait_for_path_event(&ready, "Tier-2 gate");
+        let response = inspect_tool_call(
+            &ctx,
+            json!({
+                "id": "building", "command": "inspect", "scope": "src", "sections": "duplicates"
+            }),
+        );
+        let unscoped = if !has_previous {
+            Some(inspect_tool_call(
+                &ctx,
+                json!({
+                    "id": "building-unscoped", "command": "inspect", "sections": "duplicates"
+                }),
+            ))
+        } else {
+            None
+        };
+        // Always release before assertions: a regression must not strand the worker.
+        fs::write(&release, b"release").unwrap();
+        worker.join().unwrap();
+        if let Some(unscoped) = unscoped {
+            assert_eq!(unscoped["success"], true, "{unscoped:#}");
+            assert_eq!(
+                unscoped["summary"]["duplicates"]["building"]["state"], "building",
+                "{unscoped:#}"
+            );
+            assert!(
+                !unscoped["summary"]["duplicates"]["gaps"][0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("retry"),
+                "{unscoped:#}"
+            );
+        }
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(response["scope_files"], 1, "{response:#}");
+        let summary = &response["summary"]["duplicates"];
+        assert_eq!(summary["building"]["state"], "building", "{response:#}");
+        assert!(summary["building"]["progress"].is_string(), "{response:#}");
+        assert!(
+            summary["building"].get("estimated_remaining_ms").is_some(),
+            "{response:#}"
+        );
+        let text = response["text"].as_str().unwrap();
+        assert!(
+            text.contains("building") && text.contains("estimate"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("retry aft_inspect")
+                && !text.contains("no analyzed files under this scope"),
+            "{text}"
+        );
+        if has_previous {
+            assert_eq!(summary["last_complete"]["stale"], true, "{response:#}");
+            assert!(
+                summary["last_complete"]["age_s"].is_number(),
+                "{response:#}"
+            );
+            assert!(
+                summary["last_complete"]["payload"]["items"].is_array(),
+                "{response:#}"
+            );
+            assert!(text.contains("last complete result is stale"), "{text}");
+        } else {
+            assert!(summary.get("last_complete").is_none(), "{response:#}");
+        }
+    }
+}
+
+#[test]
+fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
+    let _env_lock = env_serial_lock();
+    let (temp, owner) = fixture_project();
+    write_file(
+        &owner,
+        "main.ts",
+        "import { used } from './target';\nused();\n",
+    );
+    write_file(&owner, "target.ts", "export function used() {}\n");
+    let git = |root: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    };
+    git(&owner, &["init", "--quiet"]);
+    git(&owner, &["add", "."]);
+    git(
+        &owner,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+    );
+    let linked = temp.path().join("linked");
+    git(
+        &owner,
+        &["worktree", "add", "--detach", linked.to_str().unwrap()],
+    );
+    write_file(
+        &linked,
+        "target.ts",
+        "export function used() {}\nexport function checkoutOnlyDead() {}\n",
+    );
+    let storage = temp.path().join("storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let configured = handle_configure(
+        &request(json!({
+            "id": "configure-view", "command": "configure", "harness": "opencode",
+            "project_root": linked, "storage_dir": storage,
+            "config": crate::helpers::user_config(json!({
+                "search_index": false, "semantic_search": false, "callgraph_store": true,
+                "views": {"enabled": true}
+            }))
+        })),
+        &ctx,
+    );
+    assert!(configured.success, "{configured:?}");
+    assert!(
+        !ctx.callgraph_writer(),
+        "worktree must remain borrow-only for legacy artifacts"
+    );
+    let publish = aft::views::assembly::AssemblyRequest {
+        storage,
+        project_root: linked.clone(),
+        family: aft::search_index::artifact_cache_key(&linked),
+        scope: aft::path_identity::project_scope_key(&linked),
+        desired_head: aft::views::assembly::head_tree_fingerprint(
+            &aft::alias::head_tree_entries(&linked).unwrap(),
+        ),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+        callgraph: true,
+    };
+    aft::views::assembly::publish_checkout(&publish).unwrap();
+    configure_fake_scope_lsp(&ctx);
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "worktree-dead", "command": "inspect", "scope": "target.ts",
+            "sections": ["dead_code", "unused_exports"]
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    assert!(
+        response["summary"]["dead_code"]
+            .get("unavailable")
+            .is_none(),
+        "{response:#}"
+    );
+    assert!(
+        response["wait_stamp"]["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase["id"] == "callgraph_ready"),
+        "{response:#}"
+    );
+    assert!(
+        dead_code_items(&response)
+            .iter()
+            .any(|(_, symbol)| symbol == "checkoutOnlyDead"),
+        "{response:#}"
+    );
+    assert!(
+        !dead_code_items(&response)
+            .iter()
+            .any(|(_, symbol)| symbol == "used"),
+        "{response:#}"
+    );
+    assert!(
+        unused_export_items(&response)
+            .iter()
+            .any(|(_, symbol)| symbol == "checkoutOnlyDead"),
+        "{response:#}"
+    );
+    assert!(!fs::read_to_string(owner.join("target.ts"))
+        .unwrap()
+        .contains("checkoutOnlyDead"));
+    // A view that predates another edit must not be passed off as this checkout.
+    write_file(
+        &linked,
+        "target.ts",
+        "export function used() {}\nexport function nextDead() {}\n",
+    );
+    let pending = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "worktree-view-stale", "command": "inspect", "scope": "target.ts", "sections": "dead_code"
+        }),
+    );
+    assert_eq!(
+        pending["summary"]["dead_code"]["unavailable"], true,
+        "{pending:#}"
+    );
+    assert!(pending["details"]["dead_code"].is_null(), "{pending:#}");
+}
+
+#[test]
 fn inspect_blocking_reuse_waits_for_slow_category_completion() {
     let _env_lock = env_serial_lock();
     let (_temp_dir, root) = fixture_project();

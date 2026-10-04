@@ -274,6 +274,7 @@ struct BuilderStateEntry {
     attempt_count: u64,
     last_failure: Option<String>,
     suspension: Option<crate::build_breaker::BuildSuspension>,
+    progress: String,
 }
 
 impl BuilderStateEntry {
@@ -287,6 +288,7 @@ impl BuilderStateEntry {
             attempt_count: 0,
             last_failure: None,
             suspension: None,
+            progress: "checking cached analysis".into(),
         }
     }
 
@@ -541,6 +543,7 @@ pub struct InspectManager {
     /// both surfaces treat a category as busy when it has an entry here, and
     /// fall back to the waiter map if the registry is empty.
     builder_states: Mutex<HashMap<JobKey, BuilderStateEntry>>,
+    completed_build_durations: Mutex<HashMap<InspectCategory, Duration>>,
     automatic_tier2_refresh_allowed: AtomicBool,
     automatic_tier2_skip_logged: AtomicBool,
     automatic_tier2_schedule_count: AtomicU64,
@@ -647,6 +650,7 @@ impl InspectManager {
             #[cfg(test)]
             interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Mutex::new(HashMap::new()),
+            completed_build_durations: Mutex::new(HashMap::new()),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
@@ -865,6 +869,147 @@ impl InspectManager {
 
     pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
+    }
+
+    fn record_build_progress(&self, key: &JobKey, progress: impl Into<String>) {
+        if let Ok(mut states) = self.builder_states.lock() {
+            if let Some(entry) = states.get_mut(key) {
+                entry.progress = progress.into();
+            }
+        }
+    }
+
+    /// Keep unfinished analysis separate from current findings. Cached rows are
+    /// shown only inside a labelled stale result, never as a verified count.
+    pub(crate) fn tier2_incomplete_payload(
+        &self,
+        snapshot: &InspectSnapshot,
+        category: InspectCategory,
+        scope: &JobScope,
+        kind: &str,
+        mut reason: String,
+    ) -> Value {
+        let key = JobKey::for_project_category(category);
+        let mut payload = serde_json::json!({"unavailable": true, "complete": false});
+        if let Ok(states) = self.builder_states.lock() {
+            if let Some(entry) = states.get(&key).filter(|entry| entry.is_in_flight()) {
+                let estimate = self
+                    .completed_build_durations
+                    .lock()
+                    .ok()
+                    .and_then(|durations| durations.get(&category).copied())
+                    .map(|duration| {
+                        duration
+                            .saturating_sub(entry.started_at.elapsed())
+                            .as_millis() as u64
+                    });
+                let estimate_text = estimate.map_or_else(
+                    || "estimate unavailable (no completed build in this session)".to_string(),
+                    |ms| format!("estimated remaining {ms}ms (based on the last completed build; not a deadline)"),
+                );
+                reason = format!(
+                    "{}; progress: {}; {estimate_text}",
+                    entry.detail_at(unix_millis_now()),
+                    entry.progress
+                );
+                payload["building"] = serde_json::json!({
+                    "state": entry.state.unwrap().as_str(), "started_at": entry.started_unix,
+                    "elapsed_ms": entry.started_at.elapsed().as_millis() as u64,
+                    "progress": entry.progress, "estimated_remaining_ms": estimate,
+                    "estimate_basis": "last completed build in this session; unavailable on cold start"
+                });
+            }
+        }
+        // This cache belongs to the checkout, not its artifact owner. Do not
+        // substitute a sibling checkout's aggregate when it is absent.
+        if let Ok(Some(cache)) =
+            InspectCache::open_readonly(snapshot.inspect_dir.clone(), snapshot.project_root.clone())
+        {
+            if let Ok(Some(cached)) = cache.latest_aggregate_any_hash(category) {
+                if cached.get("callgraph_available").and_then(Value::as_bool) != Some(false) {
+                    let generated_at = cache.last_full_run(category).ok().flatten();
+                    let age =
+                        generated_at.map(|at| unix_now_secs().saturating_sub(at.max(0) as u64));
+                    let cached = filter_outcome_for_scope_with_contributions(
+                        JobOutcome::Fresh { payload: cached },
+                        snapshot,
+                        category,
+                        &cache,
+                        scope,
+                    )
+                    .payload()
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                    payload["last_complete"] = serde_json::json!({
+                        "stale": true, "generated_at": generated_at, "age_s": age, "payload": cached
+                    });
+                    reason.push_str(&format!(
+                        "; last complete result is stale (age_s={})",
+                        age.map_or_else(|| "unknown".into(), |age| age.to_string())
+                    ));
+                }
+            }
+        }
+        payload["gaps"] = serde_json::json!([{"kind": kind, "reason": reason}]);
+        payload
+    }
+
+    /// Open only this checkout's published view and prove its source keys still
+    /// describe the files used by the scan. This does not acquire a legacy writer.
+    pub(crate) fn current_checkout_view(
+        &self,
+        snapshot: &InspectSnapshot,
+    ) -> Option<Arc<ReadonlyCallGraphStore>> {
+        if !snapshot.config.views.enabled || !snapshot.config.indexes.callgraph {
+            return None;
+        }
+        let files = scope_files(
+            &snapshot.project_root,
+            &JobScope::for_project(snapshot.project_root.clone()),
+        );
+        let (store, generation) = current_view_projection_store(
+            &snapshot.project_root,
+            &snapshot.inspect_dir,
+            &snapshot.config,
+            &files,
+        )?;
+        let storage = snapshot.config.storage_dir.as_ref()?;
+        let view = crate::views::ViewStore::open(
+            storage,
+            &crate::path_identity::project_scope_key(&snapshot.project_root),
+        )
+        .ok()?;
+        let manifest = view.load_manifest(&generation).ok()?;
+        // The graph must cover the complete source set, not merely the files
+        // that still exist. Deletions and untracked additions can change liveness.
+        if files
+            .iter()
+            .filter(|path| callgraph_store_indexes_path(path))
+            .any(|path| {
+                let Ok(relative) = path.strip_prefix(&snapshot.project_root) else {
+                    return true;
+                };
+                crate::views::RelPath::from_os_path(relative)
+                    .ok()
+                    .is_none_or(|relative| manifest.get(&relative).is_none())
+            })
+        {
+            return None;
+        }
+        let manifest_paths = manifest.entries().filter_map(|(path, entry)| {
+            matches!(entry, crate::views::ManifestEntry::Regular { planes, .. } if planes.callgraph.is_some())
+                .then(|| crate::views::segment_store::rel_path_to_os(path).ok().map(|path| snapshot.project_root.join(path)))
+        }).collect::<Option<Vec<_>>>()?;
+        if !crate::views::read::callgraph_paths_match(
+            &manifest,
+            &snapshot.project_root,
+            &manifest_paths,
+        )
+        .ok()?
+        {
+            return None;
+        }
+        Some(Arc::new(store))
     }
 
     pub(crate) fn tier2_builder_state_detail_at(
@@ -1944,11 +2089,22 @@ impl InspectManager {
         scope: JobScope,
         store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
     ) -> JobOutcome {
-        let projected = store.as_ref().and_then(|store| {
-            crate::callgraph_store::project_dead_code_snapshot_from_view(store)
-                .ok()
-                .map(|(_, snapshot, _, _)| Arc::new(snapshot))
-        });
+        if let Err(outcome) = validate_tier2_read_category(category) {
+            return outcome;
+        }
+        if !self.heavy_root_work_allowed() {
+            return JobOutcome::Failed {
+                message: Self::heavy_root_work_block_message(category),
+            };
+        }
+        let projected = store
+            .as_ref()
+            .filter(|_| category == InspectCategory::DeadCode)
+            .and_then(|store| {
+                crate::callgraph_store::project_dead_code_snapshot_from_view(store)
+                    .ok()
+                    .map(|(_, snapshot, _, _)| Arc::new(snapshot))
+            });
         let mut config = (*snapshot.config).clone();
         config.indexes.callgraph = false;
         snapshot.config = Arc::new(config);
@@ -1957,8 +2113,20 @@ impl InspectManager {
             &job.project_root,
             &JobScope::for_project(job.project_root.clone()),
         );
-        let result = run_tier2_scan(&job, None);
-        filter_outcome_for_scope(self.completion_outcome(result), &scope)
+        let oxc = match self.oxc_result_for_scan(&job, &job.scope_files, &[]) {
+            Ok(oxc) => oxc,
+            Err(message) => return JobOutcome::Failed { message },
+        };
+        let result = run_tier2_scan(&job, oxc.as_ref());
+        // A view projection needs no inspect writer either. Persisting with the
+        // temporary no-legacy-fallback config would also poison cache identity.
+        let outcome = match result.outcome {
+            Ok(success) => JobOutcome::Fresh {
+                payload: success.aggregate,
+            },
+            Err(message) => JobOutcome::Failed { message },
+        };
+        filter_outcome_for_scope(outcome, &scope)
     }
 
     /// Run a Tier-2 category to a terminal outcome for an explicit inspect.
@@ -2382,7 +2550,12 @@ impl InspectManager {
         }
 
         let project_scope = JobScope::for_project(job.project_root.clone());
+        self.record_build_progress(&job.key, "enumerating checkout source files");
         job.scope_files = scope_files(&job.project_root, &project_scope);
+        self.record_build_progress(
+            &job.key,
+            format!("checking cache for {} source files", job.scope_files.len()),
+        );
         log_tier2_benchmark_category_start(&job);
         let cache = match self.cache_for_paths(job.inspect_dir.clone(), job.project_root.clone()) {
             Ok(cache) => cache,
@@ -2622,6 +2795,13 @@ impl InspectManager {
         options: &Tier2ReuseOptions,
     ) -> Result<InspectScanSuccess, String> {
         let mut phases = Tier2PhaseTimings::default();
+        self.record_build_progress(
+            &job.key,
+            format!(
+                "verifying freshness of {} source files",
+                job.scope_files.len()
+            ),
+        );
         phases.projection_skip_reason = Some(if job.category != InspectCategory::DeadCode {
             "not_required"
         } else if job.callgraph_snapshot.is_some() {
@@ -2757,6 +2937,10 @@ impl InspectManager {
             if scan_job.category == InspectCategory::DeadCode
                 && scan_job.callgraph_snapshot.is_none()
             {
+                self.record_build_progress(
+                    &job.key,
+                    "waiting for or projecting the checkout call graph",
+                );
                 let snapshot_started = Instant::now();
                 match self.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
                     &scan_job,
@@ -2785,6 +2969,14 @@ impl InspectManager {
                 std::thread::sleep(Duration::from_millis(10));
             }
             let scan_started = Instant::now();
+            self.record_build_progress(
+                &job.key,
+                format!(
+                    "scanning {} changed files ({} source files total)",
+                    scan_files.len(),
+                    job.scope_files.len()
+                ),
+            );
             let oxc_result =
                 self.oxc_result_for_scan(&scan_job, &scan_job.scope_files, &force_reparse_files)?;
             let scan_result = run_tier2_scan(&scan_job, oxc_result.as_ref());
@@ -2819,6 +3011,7 @@ impl InspectManager {
         }
 
         let db_started = Instant::now();
+        self.record_build_progress(&job.key, "assembling and storing analysis results");
         let mut contribution_set_hash = if has_updates {
             let (hash, db_timings) = cache
                 .apply_contribution_updates_for_config(job.category, updates, job.config.as_ref())
@@ -3343,6 +3536,18 @@ impl InspectManager {
     }
 
     fn route_tier2_reuse_completion(&self, result: InspectResult) {
+        if result.outcome.as_ref().is_ok_and(|success| {
+            !success.scanned_files.is_empty()
+                && success
+                    .aggregate
+                    .get("callgraph_available")
+                    .and_then(Value::as_bool)
+                    != Some(false)
+        }) {
+            if let Ok(mut durations) = self.completed_build_durations.lock() {
+                durations.insert(result.category, result.duration);
+            }
+        }
         let outcome = match result.outcome.clone() {
             Ok(success) => JobOutcome::Fresh {
                 payload: success.aggregate,
