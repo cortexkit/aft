@@ -262,6 +262,21 @@ pub(crate) fn sweep_scoped_files(
                     waiting.push((file.clone(), key, epoch_before));
                     continue;
                 }
+                // A pull sent before rust-analyzer processes a watched-file
+                // change can succeed with the old native analysis, not only
+                // be cancelled. Request it after the current compiler check
+                // settles, when the analyzer has processed the change/save.
+                if key.kind == ServerKind::Rust
+                    && lsp.rust_check_state(&key) != RustCheckState::Current
+                {
+                    retry_pulls.push((
+                        file.clone(),
+                        key,
+                        epoch_before,
+                        "native analysis is waiting for the current cargo check".to_string(),
+                    ));
+                    continue;
+                }
                 match lsp.begin_document_pull(&key, file, deadline) {
                     Ok(pull) => in_flight.push((file.clone(), key, epoch_before, pull)),
                     Err(err) => {
@@ -356,7 +371,9 @@ pub(crate) fn sweep_scoped_files(
     }
 
     // Ask again for the pulls that failed, with whatever budget is left. A
-    // push that arrived for the file in the meantime also answers it.
+    // push normally answers the request too, but rust-analyzer in pull mode
+    // pushes only compiler results. Those cannot settle a cancelled native
+    // analysis request: retry it, or leave the file unknown if it fails again.
     for (file, key, epoch_before, first_failure) in retry_pulls {
         {
             let mut lsp = ctx.lsp();
@@ -367,7 +384,7 @@ pub(crate) fn sweep_scoped_files(
             let pushed_since = lsp
                 .diagnostic_epoch(&key, &file)
                 .is_some_and(|epoch| epoch_before.is_none_or(|before| epoch > before));
-            if pushed_since {
+            if pushed_since && key.kind != ServerKind::Rust {
                 continue;
             }
         }

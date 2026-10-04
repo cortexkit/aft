@@ -4281,6 +4281,87 @@ fn scoped_blocking_inspect_pipelined_pulls_stay_within_the_request_budget() {
     );
 }
 
+/// A compiler push after a cancelled pull does not answer rust-analyzer's
+/// native analysis request. Retry the pull and retain both sources.
+#[test]
+fn scoped_blocking_inspect_retries_cancelled_rust_pull_after_compiler_push() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cancelled-pull");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL_CANCEL", "once");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-cancelled-pull", "src/lib.rs");
+    let reported = diagnostic_sources_for(&response, "src/lib.rs");
+    for expected in [
+        ("fake-lsp".to_string(), "test pull diagnostic".to_string()),
+        ("rustc".to_string(), "fake compile error".to_string()),
+    ] {
+        assert!(
+            reported.contains(&expected),
+            "{expected:?} missing: {response:#}"
+        );
+    }
+    assert!(uncovered_files(&response).is_empty(), "{response:#}");
+    assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
+}
+
+/// When the retry is cancelled too, compiler results alone cannot certify
+/// the file's diagnostics. Keep the failed native analysis visible as a gap.
+#[test]
+fn scoped_blocking_inspect_marks_cancelled_rust_pull_unknown_despite_compiler_push() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-cancelled-pull-unknown");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_CANCEL", "always");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-cancelled-pull-unknown", "src/lib.rs");
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "{response:#}"
+    );
+    let gaps = uncovered_files(&response);
+    assert!(
+        gaps.iter().any(|(file, reason)| {
+            file == "src/lib.rs" && reason.contains("server cancelled the request")
+        }),
+        "cancelled native analysis must be unknown: {response:#}"
+    );
+}
+
+/// A successful pull before the current check can still describe the native
+/// analysis from before a watched-file change. Pull only after that check.
+#[test]
+fn scoped_blocking_inspect_waits_to_pull_native_rust_diagnostics_until_current_check_settles() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("sweep-native-after-check");
+    write_file(
+        &root,
+        "src/lib.rs",
+        "// fake_compile_error\npub fn f() {}\n",
+    );
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "600");
+    ctx.lsp()
+        .set_extra_env("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK", "1");
+
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-native-after-check", "src/lib.rs");
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    for expected in ["test pull diagnostic", "fake compile error"] {
+        assert!(
+            messages.iter().any(|message| message == expected),
+            "{expected} missing: {response:#}"
+        );
+    }
+    assert_eq!(response["inspect_terminal"], "fresh", "{response:#}");
+}
+
 /// A scope with more files than one inspect opens reports how many it
 /// examined, and names the rest with that cause instead of opening them.
 #[test]

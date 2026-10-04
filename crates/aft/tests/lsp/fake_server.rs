@@ -519,6 +519,10 @@ pub(crate) fn main() -> io::Result<()> {
     // the run begins and never ends.
     let flycheck_mode = std::env::var("AFT_FAKE_LSP_FLYCHECK").ok();
     let mut flycheck_running = false;
+    // A cancelled native-diagnostics pull followed by a compiler-only push,
+    // as rust-analyzer can send while applying a watched-file change.
+    let pull_cancel_mode = std::env::var("AFT_FAKE_LSP_PULL_CANCEL").ok();
+    let mut pull_cancelled_once = false;
     // Emulates rust-analyzer's check on save: with
     // AFT_FAKE_LSP_CHECK_ON_SAVE=<ms> the fake asks for save notifications
     // and runs a check <ms> after each trigger: becoming quiescent at
@@ -541,6 +545,7 @@ pub(crate) fn main() -> io::Result<()> {
         .then(|| std::time::Instant::now() + delay)
     };
     let mut check_begins_at: Option<std::time::Instant> = None;
+    let mut check_completed = false;
     // Open documents with their latest version and the diagnostics the fake
     // last published for them from its own analysis, for the emulated check.
     let mut open_documents: std::collections::BTreeMap<String, (Value, Value)> =
@@ -619,6 +624,7 @@ pub(crate) fn main() -> io::Result<()> {
                             )?;
                         }
                         write_flycheck_progress(&mut writer, "end")?;
+                        check_completed = true;
                     }
                     continue;
                 }
@@ -999,7 +1005,37 @@ pub(crate) fn main() -> io::Result<()> {
                         std::process::exit(1);
                     }
 
-                    if force_method_not_found || force_invalid_params {
+                    let cancel_pull = pull_cancel_mode.as_deref() == Some("always")
+                        || (pull_cancel_mode.as_deref() == Some("once") && !pull_cancelled_once);
+                    if cancel_pull {
+                        pull_cancelled_once = true;
+                        write_json_message(
+                            &mut writer,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32802,
+                                    "message": "server cancelled the request",
+                                    "data": { "retriggerRequest": true }
+                                }
+                            }),
+                        )?;
+                        let uri = document_uri(&params);
+                        let version = uri
+                            .as_str()
+                            .and_then(|uri| open_documents.get(uri))
+                            .map(|(_, version)| version.clone())
+                            .unwrap_or(Value::Null);
+                        write_flycheck_progress(&mut writer, "begin")?;
+                        write_publish_diagnostics_versioned(
+                            &mut writer,
+                            uri,
+                            json!([fake_compile_error()]),
+                            version,
+                        )?;
+                        write_flycheck_progress(&mut writer, "end")?;
+                    } else if force_method_not_found || force_invalid_params {
                         let (code, message) = if force_method_not_found {
                             (-32601, "fake-lsp: pull method not found")
                         } else {
@@ -1028,6 +1064,14 @@ pub(crate) fn main() -> io::Result<()> {
                                 }
                             }),
                         )?;
+                    } else if std::env::var("AFT_FAKE_LSP_PULL_WAIT_FOR_CHECK").ok().as_deref() == Some("1")
+                        && !check_completed
+                    {
+                        // A successful native pull can describe the old
+                        // workspace before a watched-file change is applied.
+                        write_response(&mut writer, id, json!({
+                            "kind": "full", "resultId": "old-native", "items": []
+                        }))?;
                     } else if force_unchanged {
                         write_response(
                             &mut writer,

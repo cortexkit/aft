@@ -620,6 +620,24 @@ impl DiagnosticsCollection {
                 });
                 continue;
             }
+            // In pull mode Rust pushes only compiler results. Even an
+            // authoritative push cannot answer a native analysis request that
+            // failed during this sweep, so preserve that file's obligation.
+            if let Some((key, reason)) = sweep
+                .and_then(|sweep| sweep.unanswered.get(file))
+                .filter(|(key, _)| key.kind == ServerKind::Rust)
+            {
+                self.scope_coverage_gaps.push(ScopedCoverageGap {
+                    file: file.clone(),
+                    reason: "the reporting LSP server has not answered the diagnostics request for this file",
+                    cause: CoverageCause {
+                        producer: Some(server_id(key)),
+                        root: Some(key.root.clone()),
+                        reason: reason.clone(),
+                    },
+                });
+                continue;
+            }
             let reason = match coverage {
                 ScopedFileCoverage::Covered => continue,
                 ScopedFileCoverage::NoProducer => {
