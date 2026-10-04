@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["perf-executor-subc"],
+  "note": "Executor and subc request-path work counts (status census coalescing, catalog reuse, signed-manifest verification memo, bounded request drains), watcher backlog disclosure on index-backed reads; no ranking-fence file."
+}
