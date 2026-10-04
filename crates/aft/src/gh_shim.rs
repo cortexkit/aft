@@ -3479,7 +3479,7 @@ fn platform_matches(platforms: &[String], current: &str) -> bool {
 /// contents verbatim; the verifier checks the signature over those bytes
 /// BEFORE parsing them, so the signature contract is "the signer signed the
 /// file it publishes" and no canonicalization rule exists on this side.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SignedManifest {
     artifact_id: String,
     envelope_version: u64,
@@ -3496,6 +3496,43 @@ struct SignedManifest {
 struct VerifiedManifest {
     manifest: Manifest,
     verified_by_key_id: String,
+}
+
+struct VerifiedEnvelope {
+    envelope: SignedManifest,
+    trust_set: Vec<Option<ManifestTrustKey>>,
+    verified: VerifiedManifest,
+}
+
+thread_local! {
+    // Only cryptographic verification and parsing are memoized, by exact
+    // envelope bytes and trust keys. Disk presence, rollback state, issue time,
+    // and local state repair are checked on every resolution as before.
+    static VERIFIED_ENVELOPE: std::cell::RefCell<Option<VerifiedEnvelope>> = const { std::cell::RefCell::new(None) };
+}
+
+fn verify_manifest_envelope(
+    envelope: &SignedManifest,
+    trust_set: &[Option<ManifestTrustKey>],
+) -> Result<VerifiedManifest, ManifestProblem> {
+    if let Some(verified) = VERIFIED_ENVELOPE.with(|cached| {
+        cached
+            .borrow()
+            .as_ref()
+            .filter(|cached| cached.envelope == *envelope && cached.trust_set == trust_set)
+            .map(|cached| cached.verified.clone())
+    }) {
+        return Ok(verified);
+    }
+    let verified = verify_manifest_signature_with_provenance(envelope, trust_set)?;
+    VERIFIED_ENVELOPE.with(|cached| {
+        *cached.borrow_mut() = Some(VerifiedEnvelope {
+            envelope: envelope.clone(),
+            trust_set: trust_set.to_vec(),
+            verified: verified.clone(),
+        });
+    });
+    Ok(verified)
 }
 
 #[derive(Clone, Debug)]
@@ -3649,7 +3686,7 @@ fn load_manifest_with_trust_set(
     let VerifiedManifest {
         manifest,
         verified_by_key_id,
-    } = verify_manifest_signature_with_provenance(&envelope, trust_set)?;
+    } = verify_manifest_envelope(&envelope, trust_set)?;
     manifest.validate().map_err(ManifestProblem::Invalid)?;
     if manifest.schema_floor < SCHEMA_FLOOR {
         return Err(ManifestProblem::BelowFloor {
@@ -3710,6 +3747,11 @@ fn verify_manifest_signature_with_provenance(
     envelope: &SignedManifest,
     trust_set: &[Option<ManifestTrustKey>],
 ) -> Result<VerifiedManifest, ManifestProblem> {
+    #[cfg(test)]
+    MANIFEST_WORK.with(|count| {
+        let (verifications, writes) = count.get();
+        count.set((verifications + 1, writes));
+    });
     let Some(key) = trust_set
         .iter()
         .flatten()
@@ -3740,7 +3782,7 @@ fn verify_manifest_signature_with_provenance(
 
 /// One trusted manifest signing key: a stable key id plus the Ed25519 public
 /// key bytes that id binds.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct ManifestTrustKey {
     key_id: &'static str,
     public_key: &'static [u8],
@@ -3974,6 +4016,17 @@ fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
     let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
     };
+    // Re-check the actual file, rather than remembering that a previous write
+    // succeeded. Deletion, corruption, or another process's replacement still
+    // repairs the last-valid record on the next accepted resolution.
+    if fs::read(&paths.last_valid_manifest).is_ok_and(|existing| existing == bytes) {
+        return;
+    }
+    #[cfg(test)]
+    MANIFEST_WORK.with(|count| {
+        let (verifications, writes) = count.get();
+        count.set((verifications, writes + 1));
+    });
     let _ = fs::create_dir_all(&paths.root);
     let temporary = paths.last_valid_manifest.with_extension("tmp");
     if fs::write(&temporary, bytes).is_ok() {
@@ -7251,6 +7304,53 @@ mod tests {
             "../tests/fixtures/gh_shim/initial-manifest-v1.json"
         ))
         .expect("initial manifest fixture")
+    }
+
+    #[test]
+    fn repeated_manifest_resolution_verifies_and_writes_once() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(root.path().to_path_buf());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+        VERIFIED_ENVELOPE.with(|cached| *cached.borrow_mut() = None);
+        MANIFEST_WORK.with(|count| count.set((0, 0)));
+        for _ in 0..3 {
+            load_manifest(&paths, TEST_NOW).unwrap();
+        }
+        assert_eq!(
+            MANIFEST_WORK.with(std::cell::Cell::get),
+            (1, 1),
+            "signature verifications, last-valid rewrites"
+        );
+    }
+
+    #[test]
+    fn manifest_memo_rechecks_live_bytes_rollback_and_repairs_local_state() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(root.path().to_path_buf());
+        write_signed_manifest(&paths, fixture_manifest(), TEST_NOW);
+        let bytes = fs::read(&paths.manifest).unwrap();
+        load_manifest(&paths, TEST_NOW).unwrap();
+        fs::remove_file(&paths.last_valid_manifest).unwrap();
+        load_manifest(&paths, TEST_NOW).unwrap();
+        assert!(paths.last_valid_manifest.is_file());
+        write_version_high_water(&paths, 2);
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::RolledBack { .. })
+        ));
+        write_version_high_water(&paths, 1);
+        let mut changed: SignedManifest = serde_json::from_slice(&bytes).unwrap();
+        changed.manifest_bytes.push(' ');
+        fs::write(&paths.manifest, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::Invalid(_))
+        ));
+        fs::remove_file(&paths.manifest).unwrap();
+        assert!(matches!(
+            load_manifest(&paths, TEST_NOW),
+            Err(ManifestProblem::Missing)
+        ));
     }
 
     fn v9_fixture_manifest() -> Manifest {
@@ -14891,6 +14991,11 @@ INHERITED FLAGS
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 #[cfg(test)]
