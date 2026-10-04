@@ -7094,7 +7094,7 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::Status;
         }
         ConfigureMaintenanceStage::Status => {
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            ctx.signal_status_changed();
             return ConfigureMaintenanceUnitResult::Complete;
         }
     }

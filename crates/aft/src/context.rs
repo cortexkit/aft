@@ -826,8 +826,16 @@ impl RootHealthSnapshot {
 }
 
 pub struct StatusEmitter {
-    latest: Arc<Mutex<Option<StatusPayload>>>,
+    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
     notify: mpsc::Sender<()>,
+    context: Mutex<Weak<AppContext>>,
+    #[cfg(test)]
+    pub(crate) snapshot_builds: AtomicUsize,
+}
+
+enum PendingStatusSnapshot {
+    Ready(StatusPayload),
+    Context(Weak<AppContext>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1584,12 +1592,25 @@ impl StatusEmitter {
         std::thread::spawn(move || {
             status_debounce_loop(rx, latest_for_thread, progress_sender);
         });
-        Self { latest, notify }
+        Self {
+            latest,
+            notify,
+            context: Mutex::new(Weak::new()),
+            #[cfg(test)]
+            snapshot_builds: AtomicUsize::new(0),
+        }
     }
 
     pub fn signal(&self, snapshot: StatusPayload) {
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(snapshot);
+            *latest = Some(PendingStatusSnapshot::Ready(snapshot));
+        }
+        let _ = self.notify.send(());
+    }
+
+    fn signal_context(&self, context: Weak<AppContext>) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(PendingStatusSnapshot::Context(context));
         }
         let _ = self.notify.send(());
     }
@@ -1597,7 +1618,7 @@ impl StatusEmitter {
 
 fn status_debounce_loop(
     rx: mpsc::Receiver<()>,
-    latest: Arc<Mutex<Option<StatusPayload>>>,
+    latest: Arc<Mutex<Option<PendingStatusSnapshot>>>,
     progress_sender: SharedProgressSender,
 ) {
     while rx.recv().is_ok() {
@@ -1617,6 +1638,18 @@ fn status_debounce_loop(
             .ok()
             .and_then(|sender| sender.clone());
         if let Some(sender) = sender {
+            // Census work happens only for the surviving signal, outside the
+            // emitter lock. Upgrade at emission so queued signals cannot keep a
+            // retired actor (and its watchers/servers) alive.
+            let snapshot = match snapshot {
+                PendingStatusSnapshot::Ready(snapshot) => snapshot,
+                PendingStatusSnapshot::Context(context) => {
+                    let Some(context) = context.upgrade() else {
+                        continue;
+                    };
+                    context.build_status_snapshot()
+                }
+            };
             sender(PushFrame::StatusChanged(StatusChangedFrame::new(
                 None, snapshot,
             )));
@@ -3500,6 +3533,22 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
 }
 
 impl AppContext {
+    /// Register the owning handle without making the status worker retain a root.
+    pub(crate) fn bind_status_context(self: &Arc<Self>) {
+        *self.status_emitter.context.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    pub fn signal_status_changed(&self) {
+        let context = self.status_emitter.context.lock().unwrap().clone();
+        if context.strong_count() > 0 {
+            self.status_emitter.signal_context(context);
+        } else {
+            // Stack-owned contexts are supported by the library API. Transport
+            // roots register their owning Arc before serving any requests.
+            self.status_emitter().signal(self.build_status_snapshot());
+        }
+    }
+
     pub fn new(provider: Box<dyn LanguageProvider>, config: Config) -> Self {
         Self::with_app_and_provider(App::default_shared(), provider, config)
     }
@@ -3732,7 +3781,20 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
-        let lsp = self.lsp_manager.lock();
+        let Some(lsp) = self.lsp_manager.try_lock() else {
+            // A busy producer cannot prove current diagnostic counts. Keep the
+            // independently published Tier-2 values, omit E/W, and do not cache
+            // this temporary gap as an authoritative observation.
+            return StatusBarCountValues {
+                errors: None,
+                warnings: None,
+                dead_code: tier2.dead_code,
+                unused_exports: tier2.unused_exports,
+                duplicates: tier2.duplicates,
+                todos: tier2.todos,
+                tier2_stale: tier2.stale,
+            };
+        };
         let diagnostics_generation = lsp.diagnostics_generation();
         let root = self
             .canonical_cache_root_opt()
@@ -14038,6 +14100,42 @@ mod callgraph_store_for_ops_tests {
 mod status_emitter_tests {
     use super::*;
     use crate::parser::TreeSitterProvider;
+
+    #[test]
+    fn status_signal_burst_builds_one_snapshot() {
+        let (ctx, rx) = ctx_with_frame_rx();
+        let ctx = Arc::new(ctx);
+        ctx.bind_status_context();
+        for _ in 0..12 {
+            ctx.signal_status_changed();
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("status changed");
+        assert_eq!(
+            ctx.status_emitter.snapshot_builds.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn status_counts_do_not_acquire_a_held_lsp_manager() {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config::default(),
+        ));
+        let held = ctx.lsp();
+        let worker_ctx = Arc::clone(&ctx);
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_ctx.status_bar_count_values()).unwrap();
+        });
+        let values = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        let values = values.expect("status counts must not acquire a contended manager");
+        assert_eq!(values.errors, None);
+        assert_eq!(values.warnings, None);
+    }
 
     fn ctx_with_frame_rx() -> (AppContext, mpsc::Receiver<PushFrame>) {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());

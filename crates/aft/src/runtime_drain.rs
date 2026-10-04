@@ -607,7 +607,7 @@ pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: 
                 .inspect_manager()
                 .dead_code_blocked_on_callgraph(inspect_dir, project_root);
             ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(blocked);
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            ctx.signal_status_changed();
         }
     }
 }
@@ -848,7 +848,7 @@ pub fn drain_search_index_events(ctx: &AppContext) {
     }
 
     if installed_index || disconnected {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -1013,7 +1013,7 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         let _ = ctx.request_tier2_refresh_pull();
     }
     if terminal {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -1410,7 +1410,7 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
     }
 
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -2018,7 +2018,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
     }
 
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
 }
 
@@ -2554,12 +2554,9 @@ pub fn refresh_callgraph_store_for_watcher(
 /// coalescing; this drain only reacts to compact control events and surviving
 /// paths because the cache/index state below is not Send.
 pub fn drain_watcher_events(ctx: &AppContext) {
-    loop {
-        let outcome = drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
-        if !outcome.has_more {
-            break;
-        }
-    }
+    // A request gets one slice, not one slice repeatedly until a checkout burst
+    // empties. The continuation stays queued for subsequent requests/idle turns.
+    drain_watcher_events_bounded(ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
 }
 
 fn watcher_drain_phase_name(stage: WatcherDrainApplyPhase) -> &'static str {
@@ -3052,7 +3049,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
 
     aft::slog_info!("invalidated {} files", paths.len());
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
     ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
     state.phase = WatcherDrainPhase::Collect;
@@ -3337,7 +3334,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             "project root deleted; dropping watcher to avoid delete-storm: {:?}",
             ctx.canonical_cache_root_opt()
         );
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
         return outcome;
     }
     if let Some(error) = watcher_failed {
@@ -3347,7 +3344,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             "file watcher unavailable; continuing without live external-change invalidation: {}",
             error
         );
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
         return outcome;
     }
 
@@ -3408,7 +3405,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
         if state.status_changed {
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+            ctx.signal_status_changed();
         }
         ctx.tick_tier2_refresh_scheduler(state.scheduler_changed_path_count);
         // Acknowledge the rescan only if the whole refresh sequence ran under
@@ -3478,7 +3475,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
             if paths.is_empty() {
                 if state.status_changed {
-                    ctx.status_emitter().signal(ctx.build_status_snapshot());
+                    ctx.signal_status_changed();
                 }
                 ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
                 state.status_changed = false;
@@ -3537,7 +3534,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             }
         } else if ignore_changed {
             if state.status_changed {
-                ctx.status_emitter().signal(ctx.build_status_snapshot());
+                ctx.signal_status_changed();
             }
             ctx.tick_tier2_refresh_scheduler(1);
             state.status_changed = false;
@@ -3634,7 +3631,14 @@ fn lsp_params_for_log(params: Option<serde_json::Value>) -> String {
 
 pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
     let drained = {
-        let mut lsp = ctx.lsp();
+        let Some(mut lsp) = ctx.try_lsp() else {
+            // Keep the demand alive: a request must not wait for a producer's
+            // round trip, and a later maintenance turn can drain its events.
+            return DrainBatchOutcome {
+                processed: 0,
+                has_more: true,
+            };
+        };
         lsp.drain_events_bounded(max_events)
     };
     let outcome = DrainBatchOutcome {
@@ -3682,9 +3686,38 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
         }
     }
     if status_changed {
-        ctx.status_emitter().signal(ctx.build_status_snapshot());
+        ctx.signal_status_changed();
     }
     outcome
+}
+
+#[cfg(test)]
+mod request_lsp_contention_tests {
+    use super::*;
+
+    #[test]
+    fn request_lsp_drain_defers_a_held_manager_without_waiting() {
+        let ctx = Arc::new(AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        ));
+        let held = ctx.lsp();
+        let worker_ctx = Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = drain_lsp_events_bounded(&worker_ctx, 10);
+            tx.send(outcome).unwrap();
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        let outcome = outcome.expect("request drain must not acquire a contended manager");
+        assert_eq!(outcome.processed, 0);
+        assert!(
+            outcome.has_more,
+            "contention must preserve maintenance demand"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6703,6 +6736,29 @@ mod watcher_slice_tests {
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext, ViewRuntimeSnapshot};
+
+    #[test]
+    fn request_watcher_drain_applies_at_most_one_slice() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        let total = WATCHER_PATH_DRAIN_BATCH_CAP * 2 + 1;
+        tx.send(WatcherDispatchEvent::Paths(
+            (0..total)
+                .map(|index| root.path().join(format!("changed-{index}.rs")))
+                .collect(),
+        ))
+        .unwrap();
+        drain_watcher_events(&ctx);
+        let applied = ctx.pending_tier2_paths().len();
+        assert!(
+            applied > 0 && applied <= WATCHER_PATH_DRAIN_BATCH_CAP,
+            "request applied {applied} paths (burst {total})"
+        );
+        while ctx.watcher_drain_has_work() {
+            drain_watcher_events(&ctx);
+        }
+        assert_eq!(ctx.pending_tier2_paths().len(), total);
+    }
 
     fn context_with_watcher(
         root: &Path,

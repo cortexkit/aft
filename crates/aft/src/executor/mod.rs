@@ -1047,6 +1047,7 @@ impl Executor {
     /// rather than replacing the per-root [`AppContext`]. Returns `true` when a
     /// new actor was inserted.
     pub fn register_actor(&self, root_id: ProjectRootId, ctx: Arc<AppContext>) -> bool {
+        ctx.bind_status_context();
         let memory_root = root_id.as_path().to_path_buf();
         let inserted = {
             let mut state = self.inner.state.lock();

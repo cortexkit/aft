@@ -95,6 +95,10 @@ fn removal_health_for_status(req: &RawRequest) -> Option<serde_json::Value> {
 
 impl AppContext {
     pub fn build_status_snapshot(&self) -> StatusPayload {
+        #[cfg(test)]
+        self.status_emitter()
+            .snapshot_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.build_status_snapshot_for_session(DEFAULT_SESSION_ID)
     }
 

@@ -13,6 +13,7 @@ pub struct RuntimeRegistry {
 
 impl RuntimeRegistry {
     pub fn standalone(app: Arc<App>, rt: ProjectRuntime) -> Self {
+        rt.bind_status_context();
         Self { app, single: rt }
     }
 
