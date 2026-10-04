@@ -1,0 +1,4 @@
+test_free.ts
+  E fn   greet 1:3
+  - cls  Worker 4:6
+  E var  answer 7:7

@@ -5,9 +5,10 @@
 /// <reference path="../../bun-test.d.ts" />
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { resolve } from "node:path";
 import { createHarness, type Harness, prepareBinary } from "./helpers.js";
 
 const initialBinary = await prepareBinary();
@@ -74,6 +75,27 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(text).toContain("sample.ts");
     // Go file should be included
     expect(text).toContain("sample.go");
+  });
+
+  test("outline directory and array preserve the real structure golden", async () => {
+    const fixtureRoot = resolve(
+      import.meta.dir,
+      "../../../../../crates/aft/tests/fixtures/outline_summaries",
+    );
+    const directory = harness.path("outline-summary");
+    await mkdir(directory);
+    const paths = [];
+    for (const name of ["product.rs", "members.rs", "test_free.ts"]) {
+      const path = harness.path("outline-summary", name);
+      await writeFile(path, await readFile(resolve(fixtureRoot, name), "utf8"));
+      paths.push(path);
+    }
+    const golden = await readFile(resolve(fixtureRoot, "structure.txt"), "utf8");
+    for (const target of [paths, directory]) {
+      const result = await harness.callTool("aft_outline", { target });
+      expect(harness.text(result)).toBe(golden);
+      expect(result.details).toMatchObject({ success: true, complete: true });
+    }
   });
 
   test("outline files mode lists directory file metadata", async () => {

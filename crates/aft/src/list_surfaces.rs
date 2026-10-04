@@ -221,7 +221,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Budget,
                 kind: ReasonKind::Selecting,
-                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, budget_rollups_present",
+                predicate_name: "MAX_OUTPUT_BYTES, discover_outline_files, handle_outline_files_mode, format_multi_file_tree, budget_rollups_present",
             },
             ReasonEntry {
                 reason: Reason::Walk,
@@ -440,6 +440,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "MAX_PATHS",
         location_or_primitive: "commands::delete_file::MAX_PATHS",
         reason: "error message preview of offending non-regular file paths is diagnostic formatting, not a returned list payload",
+    },
+    ExclusionEntry {
+        file: "commands/outline.rs",
+        enclosing_item: "render_top_level_entries",
+        location_or_primitive: "type member preview take",
+        reason: "a type API preview with an exact '(N more)' count; single-file outlines list every product member, and the outer file budget carries the list trailer",
     },
     ExclusionEntry {
         file: "commands/outline.rs",

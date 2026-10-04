@@ -17,6 +17,90 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
     aft.send(&request.to_string())
 }
 
+#[test]
+fn outline_directory_and_array_match_real_structure_golden() {
+    let dir = TempDir::new().unwrap();
+    let files = [
+        (
+            "product.rs",
+            include_str!("../fixtures/outline_summaries/product.rs"),
+        ),
+        (
+            "members.rs",
+            include_str!("../fixtures/outline_summaries/members.rs"),
+        ),
+        (
+            "test_free.ts",
+            include_str!("../fixtures/outline_summaries/test_free.ts"),
+        ),
+    ]
+    .map(|(name, source)| write_file(dir.path(), &format!("outline-summary/{name}"), source));
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let golden = include_str!("../fixtures/outline_summaries/structure.txt");
+    for request in [
+        json!({"id":"array-golden", "command":"outline", "files":files}),
+        json!({"id":"directory-golden", "command":"outline", "directory":dir.path().join("outline-summary")}),
+    ] {
+        let response = send(&mut aft, request);
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["complete"], true, "{response}");
+        assert_eq!(response["text"].as_str().unwrap(), golden);
+    }
+    // Summary ranges point at real source, not the number of rendered rows.
+    let zoom = send(
+        &mut aft,
+        json!({"id":"summary-drill", "command":"zoom", "file":files[0], "symbol":"checks::first"}),
+    );
+    assert_eq!(zoom["success"], true, "{zoom}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_go_test_file_filter_and_explicit_targets_keep_their_contract() {
+    let dir = TempDir::new().unwrap();
+    write_file(
+        dir.path(),
+        "product.go",
+        "package product\nfunc Product() {}\n",
+    );
+    let tests = write_file(
+        dir.path(),
+        "product_test.go",
+        "package product\nfunc TestOne() {}\nfunc helper() {}\nfunc TestTwo() {}\n",
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let default = send(
+        &mut aft,
+        json!({"id":"go-default", "command":"outline", "directory":dir.path()}),
+    );
+    assert!(!default["text"]
+        .as_str()
+        .unwrap()
+        .contains("product_test.go"));
+    let included = send(
+        &mut aft,
+        json!({"id":"go-included", "command":"outline", "directory":dir.path(), "includeTests":true}),
+    );
+    let text = included["text"].as_str().unwrap();
+    assert!(
+        text.contains("product_test.go")
+            && text.contains("tests: 2 items (lines 2-4)")
+            && text.contains("helper"),
+        "{text}"
+    );
+    let explicit = send(
+        &mut aft,
+        json!({"id":"go-explicit", "command":"outline", "files":[tests]}),
+    );
+    assert!(explicit["text"]
+        .as_str()
+        .unwrap()
+        .contains("tests: 2 items (lines 2-4)"));
+    assert!(aft.shutdown().success());
+}
+
 fn large_ts_class_source() -> String {
     let mut source = String::from(
         r#"class BigContainer {
@@ -166,7 +250,7 @@ fn outline_directory_skips_symlink_loops() {
 }
 
 #[test]
-fn outline_directory_hides_tests_and_renders_top_level_symbols_only() {
+fn outline_directory_hides_test_files_and_previews_type_members() {
     let dir = TempDir::new().unwrap();
     write_file(
         dir.path(),
@@ -217,8 +301,8 @@ export function testBeta(): void {}
         "test file should be hidden by default: {default_text}"
     );
     assert!(
-        !default_text.contains("run"),
-        "directory outline should omit nested methods: {default_text}"
+        default_text.contains("      .run(): void {} 2:2"),
+        "directory outline should preview nested methods: {default_text}"
     );
 
     let with_tests = send(
@@ -321,8 +405,8 @@ fn outline_multi_file_returns_relative_tree_text_without_signatures_for_multiple
         "Rust symbols should be present: {text}"
     );
     assert!(
-        text.contains("cls") && text.contains("Worker") && !text.contains("run"),
-        "multi-file outline should show top-level Python class without nested methods: {text}"
+        text.contains("cls") && text.contains("Worker") && text.contains(".def run(self): 2:3"),
+        "multi-file outline should preview the Python class methods: {text}"
     );
     assert!(
         text.contains(" h ") && text.contains("Title") && !text.contains("Details"),
@@ -414,13 +498,15 @@ fn outline_multi_file_truncates_when_output_exceeds_30kb() {
     assert_eq!(resp["success"], true, "outline should succeed: {:?}", resp);
     let text = resp["text"].as_str().expect("outline text");
     assert!(
-        text.contains("... truncated (") && text.contains("30KB limit"),
-        "outline should include truncation marker: {text}"
+        text.contains("shown ") && text.contains(" of 24 files (budget)"),
+        "outline should include exact file-budget trailer: {text}"
     );
     assert!(
-        text.contains("Narrow scope with a more specific directory path"),
+        text.contains("narrow: path"),
         "outline should include narrowing hint: {text}"
     );
+    assert!(text.len() <= 30 * 1024);
+    assert_eq!(resp["complete"], false);
 
     let status = aft.shutdown();
     assert!(status.success());
