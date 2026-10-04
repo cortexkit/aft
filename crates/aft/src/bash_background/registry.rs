@@ -271,6 +271,9 @@ pub struct BgCompletion {
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    /// Output capture was incomplete, without changing the command's outcome.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_incomplete: bool,
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
@@ -332,6 +335,9 @@ pub struct BgTaskSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bash_output_list_envelope: Option<ListEnvelope>,
     pub output_truncated: bool,
+    /// True when output capture stopped before EOF or exceeded its drain deadline.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_incomplete: bool,
     pub output_path: Option<String>,
     pub stderr_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5447,6 +5453,7 @@ impl BgTaskRegistry {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: snapshot.info.status_reason,
+            output_incomplete: snapshot.output_incomplete,
             live_descendants: snapshot.live_descendants,
             live_descendants_omitted: snapshot.live_descendants_omitted,
             live_descendants_summary: snapshot.live_descendants_summary,
@@ -6447,16 +6454,9 @@ impl BgTaskRegistry {
                     } else {
                         terminal_metadata_from_marker(metadata.clone(), marker, reason.clone())
                     };
-                    if output_incomplete.is_some() {
-                        // A successful child exit is not a successful task if
-                        // its output could not be captured. Keep the actual
-                        // exit code, and persist the warning for status/reminders.
-                        new_metadata.mark_terminal(
-                            BgTaskStatus::Failed,
-                            new_metadata.exit_code,
-                            reason.clone(),
-                        );
-                    }
+                    // Capture uncertainty must not turn a successful command
+                    // into a failure: retrying it could repeat side effects.
+                    new_metadata.output_incomplete |= output_incomplete.is_some();
                     *metadata = new_metadata;
                 })
                 .map_err(|e| format!("failed to persist terminal state: {e}"))?;
@@ -6616,6 +6616,7 @@ impl BgTaskRegistry {
             compressed_tokens: token_counts.compressed_tokens,
             tokens_skipped: token_counts.tokens_skipped,
             status_reason: metadata.status_reason.clone(),
+            output_incomplete: metadata.output_incomplete,
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
             live_descendants_summary: live_descendants_summary(metadata),
@@ -6984,6 +6985,7 @@ impl BgTaskRegistry {
         );
         frame.bash_output_list_envelope = completion.bash_output_list_envelope;
         frame.status_reason = completion.status_reason;
+        frame.output_incomplete = completion.output_incomplete;
         frame.live_descendants = completion.live_descendants;
         frame.live_descendants_omitted = completion.live_descendants_omitted;
         frame.live_descendants_summary = completion.live_descendants_summary;
@@ -8263,6 +8265,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         bash_output_list_envelope: None,
         output_truncated: false,
         output_path: existing_path(row.stdout_path),
+        output_incomplete: metadata.output_incomplete,
         stderr_path: existing_path(row.stderr_path),
         pty_rows: (metadata.mode == BgMode::Pty).then_some(metadata.pty_rows.unwrap_or(24)),
         pty_cols: (metadata.mode == BgMode::Pty).then_some(metadata.pty_cols.unwrap_or(80)),
@@ -8326,6 +8329,7 @@ impl BgTask {
             output_preview,
             bash_output_list_envelope: None,
             output_truncated,
+            output_incomplete: metadata.output_incomplete,
             output_path: state
                 .buffer
                 .output_path()
@@ -9028,6 +9032,7 @@ mod tests {
                 compressed_tokens: None,
                 tokens_skipped: false,
                 status_reason: None,
+                output_incomplete: false,
                 live_descendants: Some(Vec::new()),
                 live_descendants_omitted: 0,
                 live_descendants_summary: None,

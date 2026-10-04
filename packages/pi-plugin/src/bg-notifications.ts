@@ -28,6 +28,7 @@ export interface BgCompletion {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  output_incomplete?: boolean;
   live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
   live_descendants_omitted?: number;
   live_descendants_summary?: string;
@@ -1396,7 +1397,10 @@ function formatCompletion(completion: BgCompletion): string {
   const descendantWarning = completion.live_descendants_summary
     ? `    ${completion.live_descendants_summary}`
     : "";
-  return [header, previewBlock, descendantWarning].filter(Boolean).join("\n");
+  const captureWarning = completion.output_incomplete
+    ? `    [${completion.status_reason || "PTY output may be incomplete"}]`
+    : "";
+  return [header, captureWarning, previewBlock, descendantWarning].filter(Boolean).join("\n");
 }
 
 function formatOutputPreview(completion: BgCompletion): string {

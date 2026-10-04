@@ -57,6 +57,24 @@ afterEach(() => {
 });
 
 describe("Pi background notifications", () => {
+  test("PTY incomplete capture completion reminder preserves exit code and shows warning", () => {
+    const reason = "PTY output may be incomplete: output capture failed before EOF";
+    for (const exitCode of [0, 17]) {
+      const text = formatSystemReminder([
+        {
+          task_id: "bash-incomplete",
+          command: "deploy",
+          status: exitCode === 0 ? "completed" : "failed",
+          exit_code: exitCode,
+          output_incomplete: true,
+          status_reason: reason,
+        },
+      ]);
+      expect(text).toContain(`task bash-incomplete (exit ${exitCode})`);
+      expect(text).toContain(reason);
+    }
+  });
+
   test("formats system reminder bullets with status and duration", () => {
     expect(
       formatSystemReminder([

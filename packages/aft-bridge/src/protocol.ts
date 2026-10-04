@@ -97,6 +97,8 @@ export interface BashCompletedFrame {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  /** Capture was incomplete; status and exit_code still describe the command. */
+  output_incomplete?: boolean;
   live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
   live_descendants_omitted?: number;
   live_descendants_summary?: string;
@@ -164,6 +166,8 @@ export interface BgCompletion {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  /** Capture was incomplete; status and exit_code still describe the command. */
+  output_incomplete?: boolean;
   live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
   live_descendants_omitted?: number;
   live_descendants_summary?: string;

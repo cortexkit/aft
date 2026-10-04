@@ -1017,6 +1017,14 @@ fn format_bash_status(data: &Value, output_mode: Option<&str>, worker_session: b
     if let Some(summary) = data.get("live_descendants_summary").and_then(Value::as_str) {
         text.push_str(&format!(" · {summary}"));
     }
+    if data.get("output_incomplete").and_then(Value::as_bool) == Some(true) {
+        let reason = data
+            .get("status_reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or("PTY output may be incomplete");
+        text.push_str(&format!("\n[{reason}]"));
+    }
     let running = status == "running";
     if data.get("mode").and_then(Value::as_str) == Some("pty") {
         let raw = data
@@ -4289,6 +4297,25 @@ mod bash_companion_format_tests {
             Path::new("/project"),
         );
         format_response_with_context("bash_status", &Response::success("1", data), &ctx)
+    }
+
+    #[test]
+    fn pty_incomplete_capture_warning_preserves_command_status() {
+        let reason = "PTY output may be incomplete: output drain deadline expired before EOF";
+        for (exit_code, status) in [(0, "completed"), (17, "failed")] {
+            for mode in ["screen", "raw", "both"] {
+                let text = status_text(
+                    json!({
+                        "task_id": "bash-1", "mode": "pty", "status": status,
+                        "exit_code": exit_code, "output_incomplete": true,
+                        "status_reason": reason, "pty_screen": "prefix", "pty_raw": "prefix",
+                    }),
+                    Some(mode),
+                );
+                assert!(text.contains(&format!("Task bash-1: {status} (exit {exit_code})")));
+                assert!(text.contains(reason), "status text: {text}");
+            }
+        }
     }
 
     #[test]

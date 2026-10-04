@@ -1212,6 +1212,31 @@ describe("bash_status tool", () => {
     };
   }
 
+  test("PTY incomplete capture status preserves command outcome and shows warning", async () => {
+    const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
+    for (const exitCode of [0, 17]) {
+      for (const outputMode of ["screen", "raw", "both"]) {
+        const status = exitCode === 0 ? "completed" : "failed";
+        const { statusTool } = makeCtx(() => ({
+          success: true,
+          status,
+          exit_code: exitCode,
+          mode: "pty",
+          output_incomplete: true,
+          status_reason: reason,
+          pty_screen: "captured prefix",
+          pty_raw: "captured prefix",
+        }));
+        const text = await statusTool.execute(
+          { taskId: "bash-incomplete", outputMode },
+          createMockSdkContext(),
+        );
+        expect(text).toContain(`Task bash-incomplete: ${status} (exit ${exitCode})`);
+        expect(text).toContain(reason);
+      }
+    }
+  });
+
   test("default sync cap rejects 120001 with the config knob in the error", async () => {
     const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
 

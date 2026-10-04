@@ -49,13 +49,26 @@ struct Fixture {
     registry: BgTaskRegistry,
     task: Arc<BgTask>,
     release: crossbeam_channel::Sender<()>,
+    frames: Arc<Mutex<Vec<serde_json::Value>>>,
     _dir: tempfile::TempDir,
 }
 
 impl Fixture {
     fn new(fail_reader: bool) -> Self {
+        Self::with_exit_code(fail_reader, 0)
+    }
+
+    fn with_exit_code(fail_reader: bool, exit_code: i32) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let captured_frames = frames.clone();
+        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+            captured_frames
+                .lock()
+                .unwrap()
+                .push(serde_json::json!(frame));
+        }));
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
         let task_id = random_slug();
         let paths = task_paths(dir.path(), "session", &task_id).unwrap();
         fs::create_dir_all(&paths.dir).unwrap();
@@ -72,7 +85,7 @@ impl Fixture {
         metadata.mode = BgMode::Pty;
         metadata.status = BgTaskStatus::Running;
         write_task(&paths.json, &metadata).unwrap();
-        fs::write(&paths.exit, "0").unwrap();
+        fs::write(&paths.exit, exit_code.to_string()).unwrap();
         let spill = fs::File::create(&paths.pty).unwrap();
         registry
             .insert_rehydrated_task(metadata, paths, false)
@@ -126,6 +139,7 @@ impl Fixture {
             registry,
             task,
             release,
+            frames,
             _dir: dir,
         }
     }
@@ -152,14 +166,21 @@ impl Fixture {
         assert_eq!(fs::read(&self.task.paths.pty).unwrap(), b"");
     }
 
-    fn assert_incomplete(&self) {
+    fn assert_incomplete(&self, exit_code: i32) {
         let snapshot = self.task.snapshot(0);
-        assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+        let expected_status = if exit_code == 0 {
+            BgTaskStatus::Completed
+        } else {
+            BgTaskStatus::Failed
+        };
+        assert_eq!(snapshot.info.status, expected_status);
         assert_eq!(
             snapshot.exit_code,
-            Some(0),
+            Some(exit_code),
             "retain the child's actual exit code"
         );
+        let data = serde_json::json!(snapshot);
+        assert_eq!(data["output_incomplete"], true);
         assert!(snapshot
             .info
             .status_reason
@@ -168,11 +189,36 @@ impl Fixture {
             .contains("output may be incomplete"));
         let persisted = read_task(&self.task.paths.json).unwrap();
         assert_eq!(persisted.status, snapshot.info.status);
+        assert_eq!(persisted.exit_code, Some(exit_code));
+        assert_eq!(serde_json::json!(persisted)["output_incomplete"], true);
         assert_eq!(persisted.status_reason, snapshot.info.status_reason);
         let completions = self.registry.pending_completions_for_session("session");
         assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].status, BgTaskStatus::Failed);
+        assert_eq!(completions[0].status, expected_status);
+        assert_eq!(completions[0].exit_code, Some(exit_code));
+        assert_eq!(serde_json::json!(completions[0])["output_incomplete"], true);
         assert_eq!(completions[0].status_reason, snapshot.info.status_reason);
+        let text = crate::subc_format::format_response(
+            "bash_status",
+            &crate::protocol::Response::success("status", data),
+            false,
+        );
+        assert!(
+            text.contains(snapshot.info.status_reason.as_deref().unwrap()),
+            "status text: {text}"
+        );
+        let frames = self.frames.lock().unwrap();
+        let completed: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "bash_completed")
+            .collect();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0]["output_incomplete"], true);
+        assert_eq!(completed[0]["exit_code"], exit_code);
+        assert_eq!(
+            completed[0]["status_reason"],
+            snapshot.info.status_reason.unwrap()
+        );
     }
 }
 
@@ -229,24 +275,30 @@ fn conpty_completion_waits_for_output_capture() {
 
 #[test]
 fn conpty_completion_drain_deadline_reports_incomplete_output() {
-    let fixture = Fixture::new(false);
-    if let TaskRuntime::Pty(Some(pty)) = &mut fixture.task.state.lock().unwrap().runtime {
-        // Advance only the drain clock, not wall time or the task's hard kill.
-        pty.output_drain.as_mut().unwrap().deadline = Some(Instant::now() - WAIT);
+    for exit_code in [0, 17] {
+        let fixture = Fixture::with_exit_code(false, exit_code);
+        if let TaskRuntime::Pty(Some(pty)) = &mut fixture.task.state.lock().unwrap().runtime {
+            // Advance only the drain clock, not wall time or the task's hard kill.
+            pty.output_drain.as_mut().unwrap().deadline = Some(Instant::now() - WAIT);
+        }
+        fixture.registry.poll_task(&fixture.task).unwrap();
+        fixture.assert_incomplete(exit_code);
+        fixture.finish_reader();
+        fixture.registry.poll_task(&fixture.task).unwrap();
+        fixture.assert_incomplete(exit_code); // Late EOF must not rewrite the declared outcome.
     }
-    fixture.registry.poll_task(&fixture.task).unwrap();
-    fixture.assert_incomplete();
-    fixture.finish_reader();
-    fixture.registry.poll_task(&fixture.task).unwrap();
-    fixture.assert_incomplete(); // Late EOF must not rewrite the declared outcome.
 }
 
 #[test]
 fn conpty_completion_reader_error_reports_incomplete_output() {
-    let fixture = Fixture::new(true);
-    fixture.finish_reader();
-    fixture.registry.poll_task(&fixture.task).unwrap();
-    fixture.assert_incomplete();
+    for exit_code in [0, 17] {
+        let fixture = Fixture::with_exit_code(true, exit_code);
+        fixture.finish_reader();
+        fixture.registry.poll_task(&fixture.task).unwrap();
+        fixture.assert_incomplete(exit_code);
+        fixture.registry.poll_task(&fixture.task).unwrap();
+        fixture.assert_incomplete(exit_code);
+    }
 }
 
 #[test]

@@ -452,6 +452,8 @@ interface BashStatusDetails {
   exit_code?: number;
   duration_ms?: number;
   output_preview?: string;
+  output_incomplete?: boolean;
+  status_reason?: string;
   command?: string;
   mode?: string;
   output_path?: string;
@@ -1769,6 +1771,9 @@ async function formatBashStatus(
   let text = `Task ${taskId}: ${details.status}${exit}${dur}`;
   if (details.live_descendants_summary) {
     text += ` · ${details.live_descendants_summary}`;
+  }
+  if (details.output_incomplete) {
+    text += `\n[${details.status_reason || "PTY output may be incomplete"}]`;
   }
   if (details.waited)
     text += `

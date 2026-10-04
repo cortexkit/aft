@@ -852,6 +852,13 @@ async function formatBashStatusText(
   if (typeof data.live_descendants_summary === "string") {
     text += ` · ${data.live_descendants_summary}`;
   }
+  if (data.output_incomplete === true) {
+    const reason =
+      typeof data.status_reason === "string" && data.status_reason
+        ? data.status_reason
+        : "PTY output may be incomplete";
+    text += `\n[${reason}]`;
+  }
   if (data.mode === "pty") {
     // PTY output is rendered from the raw terminal spill file; never feed it
     // through the piped-output compression/line renderer.

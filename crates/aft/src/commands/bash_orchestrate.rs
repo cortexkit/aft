@@ -859,6 +859,7 @@ mod tests {
             output_preview: output_preview.to_string(),
             bash_output_list_envelope: None,
             output_truncated,
+            output_incomplete: false,
             output_path: output_path.map(str::to_string),
             stderr_path: None,
             pty_rows: None,

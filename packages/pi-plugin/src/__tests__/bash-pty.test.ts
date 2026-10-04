@@ -90,6 +90,41 @@ function text(result: unknown): string {
 }
 
 describe("Pi bash PTY layer", () => {
+  test("PTY incomplete capture status preserves command outcome and shows warning", async () => {
+    const reason = "PTY output may be incomplete: output capture failed before EOF";
+    for (const exitCode of [0, 17]) {
+      for (const outputMode of ["screen", "raw", "both"]) {
+        const status = exitCode === 0 ? "completed" : "failed";
+        const tools = new Map<string, MockToolDef>();
+        const { ctx: pluginCtx } = ctx(() => ({
+          success: true,
+          status,
+          exit_code: exitCode,
+          mode: "pty",
+          output_incomplete: true,
+          status_reason: reason,
+          pty_screen: "captured prefix",
+          pty_raw: "captured prefix",
+        }));
+        registerBashTool(api(tools), pluginCtx);
+        const result = await tools
+          .get("bash_status")!
+          .execute(
+            "call",
+            { task_id: "bash-incomplete", output_mode: outputMode },
+            undefined,
+            undefined,
+            { cwd: process.cwd() },
+          );
+        expect(text(result)).toContain(`Task bash-incomplete: ${status} (exit ${exitCode})`);
+        expect(text(result)).toContain(reason);
+        expect((result as { details: Record<string, unknown> }).details.output_incomplete).toBe(
+          true,
+        );
+      }
+    }
+  });
+
   test("pty true implies background true (no explicit flag needed)", async () => {
     const tools = new Map<string, MockToolDef>();
     const { calls, ctx: pluginCtx } = ctx(() => ({

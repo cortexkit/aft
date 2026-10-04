@@ -77,6 +77,9 @@ pub struct BashCompletedFrame {
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    /// True when capture was incomplete; status still reflects the child exit.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_incomplete: bool,
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
@@ -86,6 +89,10 @@ pub struct BashCompletedFrame {
 
 fn is_zero_usize(value: &usize) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -347,6 +354,7 @@ impl BashCompletedFrame {
             compressed_tokens,
             tokens_skipped,
             status_reason: None,
+            output_incomplete: false,
             live_descendants: None,
             live_descendants_omitted: 0,
             live_descendants_summary: None,

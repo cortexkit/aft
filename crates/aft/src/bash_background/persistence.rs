@@ -544,6 +544,9 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_temp_dir: Option<PathBuf>,
     pub status_reason: Option<String>,
+    /// Capture did not finish cleanly; independent of the command's exit status.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub output_incomplete: bool,
     /// Who started the task and the key they gave the call. Absent on records
     /// written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -616,6 +619,7 @@ impl PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            output_incomplete: false,
             call_key,
         }
     }
@@ -737,6 +741,7 @@ impl From<BashTaskRow> for PersistedTask {
             sandbox_native: false,
             sandbox_temp_dir: None,
             status_reason: None,
+            output_incomplete: false,
             call_key: None,
         }
     }

@@ -57,6 +57,24 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("bash_completed token-count push frames", () => {
+  test("bash_completed_frame_preserves_incomplete_capture_without_changing_exit", async () => {
+    const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
+    const completion = await readPushedCompletion({
+      type: "bash_completed",
+      task_id: "bash-incomplete",
+      session_id: "session-1",
+      status: "completed",
+      exit_code: 0,
+      command: "deploy",
+      output_incomplete: true,
+      status_reason: reason,
+    });
+    expect(completion.status).toBe("completed");
+    expect(completion.exit_code).toBe(0);
+    expect(completion.output_incomplete).toBe(true);
+    expect(completion.status_reason).toBe(reason);
+  });
+
   test("bash_completed_frame_passes_token_counts_through", async () => {
     const completion = await readPushedCompletion({
       type: "bash_completed",
