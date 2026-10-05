@@ -676,9 +676,64 @@ impl JobCancellation {
     /// signals and so takes `wait_lock`. Never call it while holding that lock
     /// (it is not reentrant), and keep it out of read-only observers.
     pub fn cancel_requested_before_commit(&self) -> bool {
+        let state = self.state();
+        match state {
+            JOB_CANCEL_STATE_CANCELLED => return true,
+            JOB_CANCEL_STATE_COMMITTED => return false,
+            _ => {}
+        }
+        if self.root.is_none() && self.lifecycle.is_none() {
+            return false;
+        }
+        // Every checkpoint observes explicit cancellation atomically. Disk and
+        // lifecycle probes are bounded to one per 256 checkpoints or 50ms on
+        // each worker, whichever comes first. A weak identity prevents a new
+        // token reusing an allocation from inheriting the previous job's delay.
+        // The first running checkpoint probes again after admission: setup may
+        // have blocked before the command got a chance to observe its root.
+        thread_local! {
+            static LAST_PROBE: std::cell::RefCell<Option<(std::sync::Weak<JobCancellationInner>, u8, u16, Instant)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let probe = LAST_PROBE.with(|slot| {
+            let mut last = slot.borrow_mut();
+            if let Some((identity, previous_state, items, when)) = last.as_mut() {
+                if identity.as_ptr() == Arc::as_ptr(&self.inner) && *previous_state == state {
+                    *items += 1;
+                    #[cfg(not(test))]
+                    let elapsed = when.elapsed();
+                    #[cfg(test)]
+                    let elapsed = crate::search_index::audit_cancel_elapsed(*when);
+                    if *items < 256 && elapsed < Duration::from_millis(50) {
+                        return false;
+                    }
+                    *items = 0;
+                    *when = Instant::now();
+                    return true;
+                }
+            }
+            *last = Some((Arc::downgrade(&self.inner), state, 0, Instant::now()));
+            true
+        });
+        if !probe {
+            return self.state() == JOB_CANCEL_STATE_CANCELLED;
+        }
+        #[cfg(test)]
+        crate::search_index::audit_record(|work| work.cancel_probes += 1);
         // A deleted checkout cannot publish useful work. Check here as well as
         // at admission so deletion during a batch does not wait for the reaper.
-        if self.root.as_ref().is_some_and(|root| !root.is_dir()) {
+        // Permission/transient I/O failures do not prove that it was deleted.
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| match std::fs::metadata(root.as_path()) {
+                Ok(metadata) => !metadata.is_dir(),
+                Err(error) => matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            })
+        {
             self.request_cancel();
         }
         if let Some(lifecycle) = &self.lifecycle {
@@ -751,7 +806,11 @@ pub fn current_job_cancellation() -> Option<JobCancellation> {
 }
 
 pub fn current_job_cancelled() -> bool {
-    current_job_cancellation().is_some_and(|token| token.cancel_requested_before_commit())
+    CURRENT_JOB_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(JobCancellation::cancel_requested_before_commit)
+    })
 }
 
 pub struct JobCancellationContextGuard {
