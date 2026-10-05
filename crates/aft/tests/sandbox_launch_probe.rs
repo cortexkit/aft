@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "helpers/context_storage.rs"]
+mod context_storage;
 
 #[cfg(target_os = "linux")]
 use aft::bash_background::persistence::resolve_task;

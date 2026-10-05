@@ -134,7 +134,7 @@ fn request(value: Value) -> RawRequest {
 fn configure(root: &Path, storage: &Path) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     let configured = aft::commands::configure::handle_configure(
         &request(json!({

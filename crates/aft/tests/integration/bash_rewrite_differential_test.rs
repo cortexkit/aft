@@ -345,7 +345,7 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
     fs::write(root.path().join("note.txt"), "note\n").unwrap();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.path().to_path_buf()),
             experimental_bash_rewrite: true,
             sandbox: SandboxConfig {
@@ -353,7 +353,7 @@ fn sandbox_locking_control_never_dispatches_rewrite() {
                 ..SandboxConfig::default()
             },
             ..Config::default()
-        },
+        }),
     );
     assert!(try_rewrite_for_request(
         "cat note.txt",

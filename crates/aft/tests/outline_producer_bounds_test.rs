@@ -8,10 +8,10 @@ use std::fs;
 fn outline(root: &std::path::Path) -> serde_json::Value {
     let ctx = AppContext::new(
         default_language_provider_factory(),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             ..Default::default()
-        },
+        }),
     );
     let response = handle_outline(
         &RawRequest {

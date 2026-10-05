@@ -67,7 +67,7 @@ impl Fixture {
     fn configure_with_embeddings(&self, indexes: Value, embedding_url: &str) -> Arc<AppContext> {
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
-            Config::default(),
+            crate::context_storage::isolate(Config::default()),
         ));
         let mut doc = json!({ "indexes": indexes, "views": { "enabled": false } });
         if indexes["semantic"] == true {

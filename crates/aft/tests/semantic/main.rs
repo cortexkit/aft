@@ -1,4 +1,8 @@
 // Import `test_helpers` from `semantic_disk_test` rather than compiling a
+#[path = "../helpers/context_storage.rs"]
+mod context_storage;
+
+// Import `test_helpers` from `semantic_disk_test` rather than compiling a
 // second copy of the helper tests in this target.
 use semantic_disk_test::test_helpers;
 

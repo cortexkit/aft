@@ -28,11 +28,11 @@ fn assert_validate_path_outside_root(ctx: &AppContext, path: &Path) {
 fn restricted_context(root: &Path) -> AppContext {
     AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             restrict_to_project_root: true,
             ..Config::default()
-        },
+        }),
     )
 }
 
@@ -323,11 +323,11 @@ fn validate_path_returns_canonical_path_that_write_uses() {
 
     let ctx = AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             restrict_to_project_root: true,
             ..Config::default()
-        },
+        }),
     );
 
     let validated = match ctx.validate_path("validate-path", &requested) {

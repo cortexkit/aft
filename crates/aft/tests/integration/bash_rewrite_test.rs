@@ -34,25 +34,25 @@ use crate::test_helpers::{init_test_logger, take_logs, user_config, AftProcess};
 fn context(root: &std::path::Path, enabled: bool) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             experimental_bash_rewrite: enabled,
             restrict_to_project_root: true,
             ..Config::default()
-        },
+        }),
     )
 }
 
 fn context_with_search(root: &std::path::Path, aft_search_registered: bool) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             experimental_bash_rewrite: true,
             restrict_to_project_root: true,
             aft_search_registered,
             ..Config::default()
-        },
+        }),
     )
 }
 

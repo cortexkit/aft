@@ -679,12 +679,12 @@ fn pty_write_too_large() {
     let project = tempfile::tempdir().unwrap();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             experimental_bash_background: true,
             storage_dir: Some(project.path().join("storage")),
             ..Config::default()
-        },
+        }),
     );
     let req: RawRequest = serde_json::from_value(json!({
         "id": "write-large",
@@ -708,12 +708,12 @@ fn pty_true_implies_background() {
     let project = tempfile::tempdir().unwrap();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             experimental_bash_background: true,
             storage_dir: Some(project.path().join("storage")),
             ..Config::default()
-        },
+        }),
     );
     let req: RawRequest = serde_json::from_value(json!({
         "id": "pty-implies-bg",
@@ -738,7 +738,10 @@ fn pty_status_output_mode_validation() {
     use aft::parser::TreeSitterProvider;
     use aft::protocol::RawRequest;
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     let req: RawRequest = serde_json::from_value(json!({
         "id": "bad-output-mode",
         "command": "bash_status",
@@ -758,7 +761,10 @@ fn pty_status_accepts_output_modes() {
     use aft::parser::TreeSitterProvider;
     use aft::protocol::RawRequest;
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     for output_mode in ["screen", "raw", "both"] {
         let req: RawRequest = serde_json::from_value(json!({
             "id": format!("mode-{output_mode}"),

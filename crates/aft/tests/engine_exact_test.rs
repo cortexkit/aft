@@ -716,10 +716,10 @@ fn nl_identifier_facts_join_exact_retrieval_without_rerouting_the_shape() {
 
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
-            Config {
+            crate::context_storage::isolate(Config {
                 project_root: Some(dir.path().to_path_buf()),
                 ..Config::default()
-            },
+            }),
         );
         *ctx.search_index()
             .write()
@@ -777,10 +777,10 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(dir.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     *ctx.search_index()
         .write()
@@ -864,10 +864,10 @@ fn code_literal_query_bounds_single_line_json_output_and_ranks_source_first() {
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(dir.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     *ctx.search_index()
         .write()

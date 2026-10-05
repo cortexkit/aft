@@ -31,10 +31,10 @@ fn context_with_db(project_root: &Path, harness: Harness) -> (AppContext, Arc<Mu
 fn context_without_db(project_root: &Path, harness: Harness) -> AppContext {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(harness);
     ctx

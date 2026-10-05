@@ -95,7 +95,10 @@ fn context_with_semantic_index(
         },
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
     let semantic_index = SemanticIndex::build(
@@ -141,10 +144,10 @@ fn non_semantic_public_rows_never_reach_the_embedding_boundary() {
     let (project, _) = project();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     // aft_search refuses when no index lane is ready; serve these rows from a
     // ready trigram lane.

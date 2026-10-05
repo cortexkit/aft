@@ -401,7 +401,10 @@ fn handle_grep_attaches_envelope_when_capped() {
         project_root: Some(project.path().to_path_buf()),
         ..aft::config::Config::default()
     };
-    let ctx = aft::context::AppContext::from_app(aft::context::App::default_shared(), config);
+    let ctx = aft::context::AppContext::from_app(
+        aft::context::App::default_shared(),
+        crate::context_storage::isolate(config),
+    );
 
     let req = aft::protocol::RawRequest {
         id: "grep-live-1".into(),

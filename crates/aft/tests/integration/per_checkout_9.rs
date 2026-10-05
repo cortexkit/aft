@@ -226,7 +226,7 @@ fn child_trigram_doc() -> Value {
 fn configure(root: &Path, storage: &Path, doc: Value) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     let configured = aft::commands::configure::handle_configure(
         &request(json!({
@@ -1243,7 +1243,7 @@ fn slow_discovery_never_delays_the_bind() {
     aft::views::parent::set_discovery_entry_delay(&root, Duration::from_millis(150));
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     let started = Instant::now();
     let configured = aft::commands::configure::handle_configure(

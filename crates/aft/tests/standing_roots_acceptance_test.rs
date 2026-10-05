@@ -89,11 +89,11 @@ fn run_cli_snapshot(root: &Path, config_home: &Path, storage: &Path) {
 fn session_context(project_root: &Path, storage: &Path) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),
             ..Config::default()
-        },
+        }),
     )
 }
 

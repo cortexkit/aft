@@ -1,3 +1,6 @@
+#[path = "../helpers/context_storage.rs"]
+mod context_storage;
+
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 

@@ -263,7 +263,10 @@ fn post_edit_wait_does_not_start_a_server_on_a_cold_root() {
     let file = directory.path().join("cold.ts");
     std::fs::write(directory.path().join("package.json"), "{}").unwrap();
     std::fs::write(&file, "export const value = 1;\n").unwrap();
-    let context = AppContext::from_app(App::default_shared(), Config::default());
+    let context = AppContext::from_app(
+        App::default_shared(),
+        crate::context_storage::isolate(Config::default()),
+    );
 
     let outcome = context.lsp_notify_and_collect_diagnostics(
         &file,

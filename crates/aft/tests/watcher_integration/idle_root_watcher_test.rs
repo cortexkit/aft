@@ -96,7 +96,7 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(
         app,
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(canonical_root.clone()),
             storage_dir: Some(storage.path().to_path_buf()),
             indexes: aft::config::IndexesConfig {
@@ -105,7 +105,7 @@ fn idle_reap_stops_real_watcher_releases_fd_and_rebind_forces_strict_verify() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     ));
     ctx.set_canonical_cache_root(canonical_root.clone());
 

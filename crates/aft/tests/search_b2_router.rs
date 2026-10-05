@@ -57,10 +57,10 @@ fn ready_context() -> (tempfile::TempDir, AppContext) {
     .expect("write search source");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     let index = SearchIndex::build(project.path());
     *ctx.search_index()

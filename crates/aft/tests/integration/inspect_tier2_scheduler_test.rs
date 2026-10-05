@@ -51,10 +51,10 @@ fn configured_context_with_storage(
     crate::helpers::disable_in_process_file_watcher();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     let configure = request(json!({
         "id": "configure",

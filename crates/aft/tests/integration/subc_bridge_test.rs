@@ -1664,10 +1664,10 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(roots.storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let app = ctx.app();
     let executor = Arc::new(Executor::with_config(executor_config));
@@ -1875,10 +1875,10 @@ where
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(bridge_executor_config()));
     let (events_tx, mut events_rx) = mpsc::unbounded_channel();
@@ -2814,10 +2814,10 @@ fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(ExecutorConfig {
         pool_size: 2,
@@ -3458,10 +3458,10 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(ExecutorConfig {
         pool_size: 2,
@@ -3663,10 +3663,10 @@ fn subc_registers_not_ready_and_flips_ready_when_live_roots_is_refused() {
 
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Arc::new(Executor::with_config(ExecutorConfig {
         pool_size: 2,

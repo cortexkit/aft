@@ -100,8 +100,10 @@ fn query_fixture(with_graph: bool) -> QueryFixture {
     config.storage_dir = Some(storage.path().to_path_buf());
     config.views.enabled = true;
     config.indexes.callgraph = true;
-    let ctx =
-        aft::context::AppContext::new(Box::new(aft::parser::TreeSitterProvider::new()), config);
+    let ctx = aft::context::AppContext::new(
+        Box::new(aft::parser::TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.install_checkout_query_runtime(Arc::new(
         aft::views::query_wait::CheckoutQueryRuntime::new(
             access.clone(),

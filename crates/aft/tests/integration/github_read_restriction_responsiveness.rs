@@ -210,11 +210,11 @@ fn isolated_restriction_probe() {
     );
     let ctx = AppContext::new(
         default_language_provider_factory(),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project),
             github: enabled_gh_read(),
             ..Config::default()
-        },
+        }),
     );
     if case == "untrusted-mcp" {
         ctx.set_harness(Harness::Mcp {

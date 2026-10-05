@@ -323,7 +323,7 @@ fn configure_context_with_views(
 ) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     let configure = request(json!({
         "id": "configure-branch-switch",

@@ -1475,7 +1475,7 @@ mod production {
         {
             let legacy = Arc::new(AppContext::new(
                 Box::new(TreeSitterProvider::new()),
-                Config::default(),
+                crate::context_storage::isolate(Config::default()),
             ));
             send_configure(&legacy, &root, &storage, &server.base_url, false);
             aft::runtime_drain::drain_deferred_configure_maintenance(&legacy);
@@ -1501,7 +1501,7 @@ mod production {
         // maintenance-build slot parks the import at its admission point.
         let ctx = Arc::new(AppContext::new(
             Box::new(TreeSitterProvider::new()),
-            Config::default(),
+            crate::context_storage::isolate(Config::default()),
         ));
         ctx.isolate_cold_build_limiter_for_test(1);
         let slot = ctx.take_cold_build_slot_for_test().unwrap();

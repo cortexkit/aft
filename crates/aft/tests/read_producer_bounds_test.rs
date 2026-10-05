@@ -8,10 +8,10 @@ use std::{fs, path::Path};
 fn read_response(root: &Path, file: &Path, extra: Value) -> Response {
     let ctx = AppContext::new(
         default_language_provider_factory(),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             ..Default::default()
-        },
+        }),
     );
     let mut params = extra.as_object().cloned().unwrap();
     params.insert("file".into(), json!(file));

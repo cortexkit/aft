@@ -1,4 +1,8 @@
 // Import `test_helpers` from `callgraph_store_test` rather than compiling a
+#[path = "../helpers/context_storage.rs"]
+mod context_storage;
+
+// Import `test_helpers` from `callgraph_store_test` rather than compiling a
 // second copy of the helper tests in this target.
 use callgraph_store_test::test_helpers;
 

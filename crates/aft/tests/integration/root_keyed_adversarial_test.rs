@@ -513,7 +513,7 @@ fn entry_leaf(store: &impl CallGraphRead) -> String {
 fn root_keyed_context(root: &Path, storage: &Path) -> AppContext {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),
             indexes: aft::config::IndexesConfig {
@@ -522,7 +522,7 @@ fn root_keyed_context(root: &Path, storage: &Path) -> AppContext {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.to_path_buf());

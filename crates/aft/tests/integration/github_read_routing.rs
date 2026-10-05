@@ -469,10 +469,10 @@ fn github_read_forced_restrict_refuses_before_any_filesystem_or_gh_work() {
     let project = tempfile::tempdir().expect("create restricted project");
     let ctx = AppContext::new(
         default_language_provider_factory(),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     let request = RawRequest {
         id: "restricted-github-read".to_string(),

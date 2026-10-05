@@ -277,14 +277,20 @@ fn has_fakepkg_missing_import(diagnostics: &[StoredDiagnostic]) -> bool {
 }
 
 fn app_context_with_fake_lsp() -> AppContext {
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx
 }
 
 fn app_context_with_fake_typescript_lsp() -> AppContext {
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     ctx
@@ -601,7 +607,10 @@ fn watched_config_file_event_types_follow_current_file_state() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
 
@@ -641,7 +650,10 @@ fn watched_config_file_event_types_accept_explicit_created_changed_deleted() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
 
@@ -678,7 +690,10 @@ fn write_command_reports_created_for_new_config_file() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -711,7 +726,10 @@ fn write_command_reports_created_for_new_tsconfig_file() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -745,7 +763,10 @@ fn move_file_reports_deleted_source_and_created_destination_for_config_file() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -871,7 +892,10 @@ fn custom_lsp_root_marker_edit_notifies_workspace_server() {
         }],
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp().override_binary(
         ServerKind::Custom(std::sync::Arc::from(server_id)),
         fake_server_path(),
@@ -911,7 +935,10 @@ fn write_command_reports_changed_for_existing_config_file() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -945,7 +972,10 @@ fn delete_file_command_reports_deleted_for_config_file() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     ctx.lsp()
         .override_binary(ServerKind::TypeScript, fake_server_path());
     let config_snapshot = ctx.config();
@@ -1370,7 +1400,10 @@ fn test_lsp_initialize_signal_death_names_the_signal() {
 fn test_lsp_module_not_found_hint_uses_package_manager_path_and_binary() {
     let (_temp_dir, _root, files) = typescript_workspace_with_files(&["main.ts"]);
     let file = &files[0];
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     let (_script_dir, script) = executable_crashing_lsp_script(
         "Error: Cannot find module '/Users/me/.local/share/pnpm/global/5/.pnpm/typescript-language-server@4.3.4/node_modules/typescript-language-server/lib/cli.mjs'
 code: 'MODULE_NOT_FOUND'
@@ -1551,7 +1584,10 @@ fn test_no_lsp_server_returns_honest_note() {
         ..Config::default()
     };
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "diag-noop",
@@ -1961,10 +1997,10 @@ fn watcher_external_edit_hides_stale_diagnostics_and_resyncs_lsp() {
     let file = &files[0];
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root),
             ..Config::default()
-        },
+        }),
     );
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
@@ -2278,7 +2314,10 @@ fn post_edit_rejects_publish_with_stale_version() {
     let (_temp_dir, root, files) = rust_workspace_with_files(&["main.rs"]);
     let file = &files[0];
 
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     {
         let mut lsp = ctx.lsp();
         lsp.override_binary(ServerKind::Rust, fake_server_path());
@@ -2424,7 +2463,10 @@ fn directory_mode_with_walk_truncation_reports_complete_false() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "diag-dir-truncated",
         "command": "lsp_diagnostics",
@@ -2456,7 +2498,10 @@ fn directory_mode_requires_each_matching_server_to_cover_file() {
         project_root: Some(root.clone()),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(config),
+    );
     {
         let mut lsp = ctx.lsp();
         // TypeScript and Biome both match .ts. Only Biome is allowed to start,
@@ -2748,10 +2793,10 @@ fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Val
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     let configure: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "configure",
@@ -3024,10 +3069,10 @@ fn fake_rust_server_with_watcher(
     let file = files[0].clone();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             ..Config::default()
-        },
+        }),
     );
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());

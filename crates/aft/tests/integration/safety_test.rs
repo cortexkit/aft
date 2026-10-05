@@ -2259,11 +2259,11 @@ fn force_restricted_checkpoint_restore_replaces_external_target_symlink() {
 
     let ctx = AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.path().to_path_buf()),
             restrict_to_project_root: false,
             ..Config::default()
-        },
+        }),
     );
     let create: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "force-checkpoint-external-target",

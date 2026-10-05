@@ -71,7 +71,10 @@ fn request(value: Value) -> RawRequest {
 
 fn configure(checkout: &Path, storage: &Path, views: bool) -> AppContext {
     crate::test_helpers::disable_in_process_file_watcher();
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        crate::context_storage::isolate(Config::default()),
+    );
     let response = aft::commands::configure::handle_configure(
         &request(json!({
             "id": "configure-worktree-callgraph",

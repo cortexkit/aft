@@ -23,7 +23,10 @@ fn grep_ctx(project: &Path) -> aft::context::AppContext {
         project_root: Some(project.to_path_buf()),
         ..aft::config::Config::default()
     };
-    aft::context::AppContext::from_app(aft::context::App::default_shared(), config)
+    aft::context::AppContext::from_app(
+        aft::context::App::default_shared(),
+        crate::context_storage::isolate(config),
+    )
 }
 
 /// Run grep through the command handler and the agent-facing formatter,

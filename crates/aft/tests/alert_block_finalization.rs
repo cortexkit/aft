@@ -66,10 +66,10 @@ fn finalization_appends_one_server_reminder_without_a_status_bar_envelope() {
     let root_path = root.path();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root_path.to_path_buf()),
             ..Config::default()
-        },
+        }),
     );
     let mut alerts = AlertEngine::default();
     alerts.observe_authoritative("session", root_path, "server", Vec::new());

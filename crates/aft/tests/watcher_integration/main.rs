@@ -14,6 +14,9 @@
 // are deterministic. `helpers::watcher_serial_lock` additionally serializes
 // them within this binary so at most one live watcher exists at a time.
 
+#[path = "../helpers/context_storage.rs"]
+mod context_storage;
+
 #[path = "../helpers/mod.rs"]
 mod test_helpers;
 

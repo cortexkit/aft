@@ -9,10 +9,10 @@ use aft::parser::TreeSitterProvider;
 fn compress_context(enabled: bool) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             experimental_bash_compress: enabled,
             ..Config::default()
-        },
+        }),
     )
 }
 

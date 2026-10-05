@@ -57,7 +57,7 @@ fn all_ready_context(base_url: String) -> (tempfile::TempDir, AppContext) {
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             semantic: SemanticBackendConfig {
                 backend: SemanticBackend::OpenAiCompatible,
@@ -71,7 +71,7 @@ fn all_ready_context(base_url: String) -> (tempfile::TempDir, AppContext) {
                 ..Default::default()
             },
             ..Config::default()
-        },
+        }),
     );
 
     let mut embed =
@@ -300,7 +300,7 @@ fn path_fact_context(base_url: String) -> (tempfile::TempDir, AppContext) {
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project.path().to_path_buf()),
             semantic: SemanticBackendConfig {
                 backend: SemanticBackend::OpenAiCompatible,
@@ -314,7 +314,7 @@ fn path_fact_context(base_url: String) -> (tempfile::TempDir, AppContext) {
                 ..Default::default()
             },
             ..Config::default()
-        },
+        }),
     );
     let files = [named_file.clone(), other_file.clone()];
     let mut embed =

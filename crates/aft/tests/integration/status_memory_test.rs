@@ -27,17 +27,17 @@ fn status_memory_attributes_every_registered_root_and_exposes_residual() {
     let app = App::default_shared();
     let first_ctx = Arc::new(AppContext::from_app(
         Arc::clone(&app),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(first_root.clone()),
             ..Config::default()
-        },
+        }),
     ));
     let second_ctx = Arc::new(AppContext::from_app(
         app,
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(second_root.clone()),
             ..Config::default()
-        },
+        }),
     ));
     let executor = Executor::new();
     assert!(executor.register_actor(

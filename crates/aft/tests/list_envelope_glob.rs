@@ -27,10 +27,10 @@ fn glob_request(params: Value) -> RawRequest {
 fn test_context(project_root: &Path) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             ..Config::default()
-        },
+        }),
     )
 }
 

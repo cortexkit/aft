@@ -233,7 +233,7 @@ const MODEL: &str = "views-semantic-mock";
 fn configure(root: &Path, storage: &Path, server: &MockEmbedder, views: bool) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     send_configure(&ctx, root, storage, server, views, MODEL);
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
@@ -565,7 +565,7 @@ fn views_on_model_change_restarts_the_lane_with_the_new_producer() {
     let legacy_storage = tempfile::tempdir().unwrap();
     let legacy = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     send_configure(
         &legacy,
@@ -602,7 +602,7 @@ fn views_on_back_to_back_configures_leave_one_worker() {
     let chunks = unique_chunks(&repo.main);
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config::default(),
+        crate::context_storage::isolate(Config::default()),
     ));
     send_configure(
         &ctx,

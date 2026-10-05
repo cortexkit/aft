@@ -359,10 +359,10 @@ fn trigram_import_mutator_records_intent_without_watcher() {
     let plane = index(segment(files), &delta.lock().unwrap(), files);
     let ctx = AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             ..Config::default()
-        },
+        }),
     );
     let request: RawRequest = serde_json::from_value(serde_json::json!({"id":"intent-import", "command":"add_import", "file": root.join("a.ts"), "module":"needle", "names":["thing"]})).unwrap();
     let result = aft::commands::add_import::handle_add_import(&request, &ctx);
@@ -744,10 +744,10 @@ fn trigram_write_success_and_validation_rollback_without_watcher() {
     let plane = index(segment(files), &delta.lock().unwrap(), files);
     let ctx = AppContext::new(
         Box::new(StubProvider),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             ..Config::default()
-        },
+        }),
     );
     let request = |content: &str| {
         serde_json::from_value::<RawRequest>(serde_json::json!({"id":"intent-write", "command":"write", "file":root.join("a.ts"), "content":content})).unwrap()

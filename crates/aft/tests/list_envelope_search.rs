@@ -544,10 +544,10 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
 
     let ctx = aft::context::AppContext::new(
         Box::new(aft::parser::TreeSitterProvider::new()),
-        aft::config::Config {
+        crate::context_storage::isolate(aft::config::Config {
             project_root: Some(project_root.to_path_buf()),
             ..aft::config::Config::default()
-        },
+        }),
     );
     *ctx.semantic_index_status()
         .write()

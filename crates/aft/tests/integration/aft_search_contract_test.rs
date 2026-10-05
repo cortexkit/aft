@@ -89,21 +89,21 @@ fn response_value(response: Response) -> Value {
 fn test_context(project_root: &Path) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             ..Config::default()
-        },
+        }),
     )
 }
 
 fn test_context_with_storage(project_root: &Path, storage_dir: &Path) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             storage_dir: Some(storage_dir.to_path_buf()),
             ..Config::default()
-        },
+        }),
     )
 }
 
@@ -301,7 +301,7 @@ fn persist_mismatched_semantic_index(root: &Path, source_file: &Path, storage_di
 fn openai_context(project_root: &Path, base_url: String) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             semantic: SemanticBackendConfig {
                 backend: SemanticBackend::OpenAiCompatible,
@@ -315,7 +315,7 @@ fn openai_context(project_root: &Path, base_url: String) -> AppContext {
                 ..Default::default()
             },
             ..Config::default()
-        },
+        }),
     )
 }
 
@@ -326,7 +326,7 @@ fn openai_context_with_storage(
 ) -> AppContext {
     AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(project_root.to_path_buf()),
             storage_dir: Some(storage_dir.to_path_buf()),
             semantic: SemanticBackendConfig {
@@ -341,7 +341,7 @@ fn openai_context_with_storage(
                 ..Default::default()
             },
             ..Config::default()
-        },
+        }),
     )
 }
 
@@ -901,11 +901,11 @@ fn restricted_paths_keep_same_root_local_and_refuse_external_root() {
     let (external_project, _source_file, _source) = git_project_with_needle();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(session_project.path().to_path_buf()),
             restrict_to_project_root: true,
             ..Config::default()
-        },
+        }),
     );
     *ctx.semantic_index_status()
         .write()

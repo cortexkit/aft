@@ -888,7 +888,7 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -897,7 +897,7 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
@@ -1196,7 +1196,7 @@ fn root_keyed_migration_disk_floor_skips_to_legacy_fallback_without_cold_build()
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1205,7 +1205,7 @@ fn root_keyed_migration_disk_floor_skips_to_legacy_fallback_without_cold_build()
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
@@ -1270,7 +1270,7 @@ fn root_keyed_migration_backup_budget_failure_serves_legacy_without_cold_build()
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1279,7 +1279,7 @@ fn root_keyed_migration_backup_budget_failure_serves_legacy_without_cold_build()
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
@@ -1363,7 +1363,7 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
     aft::callgraph_store::set_legacy_migration_fail_after_temp_copy_for_test(false);
     let retry_ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1372,7 +1372,7 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     retry_ctx.set_harness(Harness::Opencode);
     retry_ctx.set_canonical_cache_root(root.clone());
@@ -1452,7 +1452,7 @@ fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() 
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1461,7 +1461,7 @@ fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() 
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
@@ -1511,7 +1511,7 @@ fn app_context_revalidates_to_newer_published_generation() {
 
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1520,7 +1520,7 @@ fn app_context_revalidates_to_newer_published_generation() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
@@ -1582,7 +1582,7 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
     let storage = dir.path().join("storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(dir.path().to_path_buf()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1591,7 +1591,7 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(dir.path().to_path_buf());
@@ -1632,7 +1632,7 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
 
     let worktree_ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(dir.path().to_path_buf()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -1641,7 +1641,7 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     worktree_ctx.set_harness(Harness::Opencode);
     worktree_ctx.set_canonical_cache_root(dir.path().to_path_buf());
@@ -1656,7 +1656,7 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
     let unavailable_dir = tempdir().unwrap();
     let unavailable_ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(unavailable_dir.path().to_path_buf()),
             storage_dir: Some(unavailable_dir.path().join("storage")),
             indexes: aft::config::IndexesConfig {
@@ -1665,7 +1665,7 @@ fn app_context_demand_builds_once_and_worktree_reads_readonly() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     unavailable_ctx.set_harness(Harness::Opencode);
     unavailable_ctx.set_canonical_cache_root(unavailable_dir.path().to_path_buf());
@@ -2161,7 +2161,7 @@ fn cold_edges(root: &Path) -> BTreeSet<StoredEdge> {
 fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppContext {
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.to_path_buf()),
             storage_dir: Some(storage.to_path_buf()),
             indexes: aft::config::IndexesConfig {
@@ -2170,7 +2170,7 @@ fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppCo
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.to_path_buf());
@@ -2839,7 +2839,7 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
     let storage = root.join("storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             project_root: Some(root.clone()),
             storage_dir: Some(storage.clone()),
             indexes: aft::config::IndexesConfig {
@@ -2848,7 +2848,7 @@ fn app_context_warm_read_serves_readonly_while_writer_lease_is_held() {
                 callgraph: true,
             },
             ..Config::default()
-        },
+        }),
     );
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());

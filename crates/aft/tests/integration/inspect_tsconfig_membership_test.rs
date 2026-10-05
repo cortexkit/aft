@@ -41,10 +41,10 @@ fn configured_context(root: &Path) -> AppContext {
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     let configure = request(json!({
         "id": "configure",

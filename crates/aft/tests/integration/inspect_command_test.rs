@@ -137,10 +137,10 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     // Libtest runs these independent contexts in one process, whereas nextest
     // gives each test a process and therefore a separate production limiter.
@@ -172,10 +172,10 @@ fn configured_restricted_context(root: &Path) -> AppContext {
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
@@ -201,10 +201,10 @@ fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> 
     let storage_dir = root.join(".aft-test-storage");
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             ..Config::default()
-        },
+        }),
     );
     ctx.isolate_cold_build_limiter_for_test(2);
     let configure = request(json!({
@@ -4756,7 +4756,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
     let server_id = "needs-marker-ls";
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
-        Config {
+        crate::context_storage::isolate(Config {
             storage_dir: Some(storage_dir.clone()),
             lsp_servers: vec![aft::config::UserServerDef {
                 id: server_id.to_string(),
@@ -4769,7 +4769,7 @@ fn inspect_command_inapplicable_server_is_not_returned_as_a_zero_result() {
                 disabled: false,
             }],
             ..Config::default()
-        },
+        }),
     );
     crate::helpers::disable_in_process_file_watcher();
     let configure = request(json!({
