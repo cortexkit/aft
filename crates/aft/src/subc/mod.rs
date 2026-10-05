@@ -174,8 +174,8 @@ const _: () = assert!(
 /// long-running reminders that arrive after their reliable completion event.
 const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
 
-/// Navigation's overall deadline remains independently polled even if its
-/// producer gets stuck. Normal deferred completions wake the loop directly.
+/// The separate subc foreground-bash orchestrator checks task state and wait
+/// deadlines off executor slots at this interval.
 const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Host elicitation asks fail closed if the MCP facade does not answer promptly.
@@ -450,10 +450,9 @@ impl DeferredResponseSender {
 impl PendingSubcResponses {
     fn register(&mut self, pending: PendingSubcResponse) {
         self.dirty = true;
-        if crate::commands::lsp_navigation::is_lsp_navigation_command(&pending.bare_name)
-            && self.next_deadline_poll.is_none()
-        {
-            self.next_deadline_poll = Some(Instant::now() + PENDING_POLL_INTERVAL);
+        if let Some(interval) = pending.pending.poll_interval() {
+            let due = Instant::now() + interval;
+            self.next_deadline_poll = Some(self.next_deadline_poll.map_or(due, |old| old.min(due)));
         }
         self.entries.retain(|entry| {
             let keep = entry.route != pending.route || entry.corr != pending.corr;
@@ -478,9 +477,11 @@ impl PendingSubcResponses {
                 .is_some_and(|due| Instant::now() >= due)
         {
             // Check at the top of each turn so sustained control traffic cannot
-            // starve navigation's independent deadline check in biased select.
+            // starve state-based waits or independent deadlines in biased select.
             self.dirty = true;
-            self.next_deadline_poll = Some(Instant::now() + PENDING_POLL_INTERVAL);
+            self.next_deadline_poll = self
+                .timer_poll_interval()
+                .map(|interval| Instant::now() + interval);
         }
         let generation = wake.generation();
         if !self.dirty && self.wake_generation == generation {
@@ -494,9 +495,14 @@ impl PendingSubcResponses {
     }
 
     fn needs_deadline_poll(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            crate::commands::lsp_navigation::is_lsp_navigation_command(&entry.bare_name)
-        })
+        self.timer_poll_interval().is_some()
+    }
+
+    fn timer_poll_interval(&self) -> Option<Duration> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.pending.poll_interval())
+            .min()
     }
 
     fn poll_ready(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
@@ -5135,8 +5141,8 @@ where
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
                 pending_responses.next_deadline_poll.unwrap_or_else(Instant::now)
             )), if pending_responses.needs_deadline_poll() => {
-                // Only navigation's deadline needs a fallback timer. Inspect
-                // terminals (including timeout/failure) are producer-woken.
+                // State-based waits and overall deadlines explicitly retain a
+                // timer. Channel-only producers never need idle registry polls.
             }
             _ = tokio::time::sleep_until(next_drain_at) => {
                 // Wakes an otherwise-idle loop so the pre-turn drain check
@@ -9348,7 +9354,10 @@ pub(crate) mod test_support {
         ));
         executor.register_actor(root.clone(), ctx);
         let wake = crate::response_finalize::DeferredResponseWake::default();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = {
+            let _scope = wake.install();
+            crate::response_finalize::pending_response_channel()
+        };
         let polls = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&polls);
         let mut pending = PendingSubcResponses::default();
@@ -9369,17 +9378,16 @@ pub(crate) mod test_support {
                 dir.path(),
             ),
             bind_trust: BindTrust::FirstParty,
-            pending: PendingResponse {
-                request_id: "wake".into(),
-                session_id: "session".into(),
-                attach_command: "inspect".into(),
-                poll: Box::new(move |_| {
+            pending: PendingResponse::from_receiver(
+                "wake".into(),
+                "session".into(),
+                "inspect".into(),
+                rx,
+                move |_, completion| {
                     count.fetch_add(1, Ordering::Relaxed);
-                    rx.try_recv().ok()
-                }),
-                cancellation: None,
-                on_shutdown: None,
-            },
+                    completion.ok()
+                },
+            ),
             surface_downgraded: false,
             phase_trace: PhaseTrace::new(Instant::now()),
             held_since: Instant::now(),
@@ -9395,10 +9403,7 @@ pub(crate) mod test_support {
             "idle completion polls"
         );
         assert!(!pending.needs_deadline_poll());
-        let _scope = wake.install();
-        let completion_wake = crate::response_finalize::deferred_completion_wake();
         std::thread::spawn(move || {
-            let _completion_wake = completion_wake;
             tx.send(Response::success("wake", json!({"done": true})))
                 .unwrap();
         });
@@ -9409,6 +9414,164 @@ pub(crate) mod test_support {
         assert_eq!(ready.len(), 1);
         assert_eq!(ready[0].response.data, json!({"done": true}));
         assert!(pending.is_empty());
+    }
+
+    #[cfg(unix)]
+    async fn assert_state_based_bash_terminal_uses_timer(case: &str, expected_status: &str) {
+        let executor = Executor::new();
+        let (dir, root) = test_root("polled-bash-terminal");
+        let mut config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            storage_dir: Some(dir.path().to_path_buf()),
+            foreground_wait_window_ms: 200,
+            ..Config::default()
+        };
+        config.bash.worker_wait_max_ms = 200;
+        let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        struct ShutdownOnDrop(crate::bash_background::BgTaskRegistry);
+        impl Drop for ShutdownOnDrop {
+            fn drop(&mut self) {
+                self.0.shutdown();
+            }
+        }
+        let _cleanup = ShutdownOnDrop(ctx.bash_background().clone());
+        let task_id = ctx
+            .bash_background()
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                if case == "completion" {
+                    "while [ ! -f exit-ready ]; do sleep 0.05; done; echo terminal"
+                } else {
+                    "sleep 30"
+                },
+                "polled-bash-session".into(),
+                dir.path().to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(
+                    if case == "hard-timeout" { 2 } else { 60 },
+                )),
+                crate::bash_background::task_storage_dir(&ctx),
+                1,
+                false,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .expect("spawn controlled bash task");
+        let request = serde_json::from_value(json!({
+            "id": "polled-bash",
+            "command": "bash",
+            "session_id": "polled-bash-session",
+            "worker_session": case == "worker-cap",
+            "params": { "wait": case != "promotion", "timeout": 60_000 },
+        }))
+        .unwrap();
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let DispatchOutcome::Deferred(pending) =
+            crate::commands::bash_orchestrate::build_bash_outcome(
+                &request,
+                &ctx,
+                Response::success(
+                    "polled-bash",
+                    json!({"task_id": task_id, "status": "running"}),
+                ),
+            )
+        else {
+            panic!("running foreground task must defer")
+        };
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            route: RouteChannel {
+                channel: 17,
+                epoch: 1,
+            },
+            corr: 71,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "polled-bash-session".into(),
+            bare_name: "bash".into(),
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "bash",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        assert!(registry.poll_if_woken(&executor, &wake).is_empty());
+        assert!(
+            registry.needs_deadline_poll(),
+            "state-based bash must retain an idle timer"
+        );
+        if case == "completion" {
+            std::fs::write(dir.path().join("exit-ready"), "").unwrap();
+        } else if case == "kill" {
+            ctx.bash_background()
+                .kill(&task_id, "polled-bash-session")
+                .unwrap();
+        }
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(
+                    registry.next_deadline_poll.unwrap(),
+                ))
+                .await;
+                let ready = registry.poll_if_woken(&executor, &wake);
+                if !ready.is_empty() {
+                    break ready;
+                }
+            }
+        })
+        .await
+        .expect("state-based bash terminal without a producer wake");
+        assert_eq!(
+            wake.generation(),
+            0,
+            "the timer, not a completion wake, resolved bash"
+        );
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].response.data["status"], expected_status);
+        if expected_status == "running" {
+            assert_eq!(
+                ctx.bash_background()
+                    .observed_status(&task_id, "polled-bash-session", 0)
+                    .unwrap()
+                    .info
+                    .status,
+                crate::bash_background::BgTaskStatus::Running,
+                "hand-back must not kill the task"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_completion_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("completion", "completed").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_kill_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("kill", "killed").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_hard_timeout_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("hard-timeout", "timed_out").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_promotion_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("promotion", "running").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deferred_state_based_bash_worker_cap_uses_idle_timer() {
+        assert_state_based_bash_terminal_uses_timer("worker-cap", "running").await;
     }
 
     #[test]

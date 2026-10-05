@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Condvar, LazyLock, Mutex};
+#[cfg(test)]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Map, Value};
@@ -896,12 +898,10 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
     let root = snapshot.project_root.clone();
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
-    let completion_wake = crate::response_finalize::deferred_completion_wake();
     std::thread::spawn(move || {
-        let _completion_wake = completion_wake;
         let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
@@ -930,14 +930,17 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
         crate::response_finalize::attach_watcher_query_gap(&mut response, watcher_pending);
         let _ = tx.send(response);
     });
-    DispatchOutcome::Deferred(PendingResponse {
-        request_id: completion_request_id,
-        session_id: String::new(),
-        attach_command: String::new(),
-        poll: Box::new(move |_| rx.try_recv().ok()),
-        cancellation: Some(cancellation),
-        on_shutdown: Some(inspect_shutdown_terminal(request_id, shutdown_log)),
-    })
+    DispatchOutcome::Deferred(
+        PendingResponse::from_receiver(
+            completion_request_id,
+            String::new(),
+            String::new(),
+            rx,
+            |_, completion| completion.ok(),
+        )
+        .with_cancellation(cancellation)
+        .with_shutdown(inspect_shutdown_terminal(request_id, shutdown_log)),
+    )
 }
 
 fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
@@ -950,16 +953,15 @@ fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapsh
 }
 
 fn deferred_response(request_id: String, response: Response) -> DispatchOutcome {
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     let _ = tx.send(response);
-    DispatchOutcome::Deferred(PendingResponse {
+    DispatchOutcome::Deferred(PendingResponse::from_receiver(
         request_id,
-        session_id: String::new(),
-        attach_command: String::new(),
-        poll: Box::new(move |_| rx.try_recv().ok()),
-        cancellation: None,
-        on_shutdown: None,
-    })
+        String::new(),
+        String::new(),
+        rx,
+        |_, completion| completion.ok(),
+    ))
 }
 
 fn inspect_shutdown_terminal(

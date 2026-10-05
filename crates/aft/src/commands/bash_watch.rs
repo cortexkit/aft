@@ -275,17 +275,9 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     let thread_id = id.clone();
-    // The subc registry polls only on completion wakes, not on idle turns.
-    // Capture the connection's wake before leaving the executor thread and
-    // signal only after the result is queued (or the producer disconnects).
-    let completion_wake = crate::response_finalize::deferred_completion_wake();
     std::thread::spawn(move || {
-        let _completion_wake = completion_wake;
-        // Drop the sender before the wake guard, including on cancellation or
-        // panic, so a woken poll can observe the disconnected terminal too.
-        let tx = tx;
         let watch = WatchJob {
             registry,
             task_id,
@@ -320,15 +312,16 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
 
     let mut settled = false;
     let disconnect_id = id.clone();
-    DispatchOutcome::Deferred(PendingResponse {
-        request_id: id,
-        session_id: req.session().to_string(),
-        attach_command: "bash_watch".to_string(),
-        poll: Box::new(move |_| {
+    DispatchOutcome::Deferred(PendingResponse::from_receiver(
+        id,
+        req.session().to_string(),
+        "bash_watch".to_string(),
+        rx,
+        move |_, completion| {
             if settled {
                 return None;
             }
-            match rx.try_recv() {
+            match completion {
                 Ok(response) => {
                     settled = true;
                     Some(response)
@@ -343,10 +336,8 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
                 }
                 Err(mpsc::TryRecvError::Empty) => None,
             }
-        }),
-        cancellation: Some(cancellation),
-        on_shutdown: None,
-    })
+        },
+    ).with_cancellation(cancellation))
 }
 
 struct WatchJob {

@@ -197,15 +197,13 @@ fn defer_lsp_navigation(
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
     let timeout_cancellation = cancellation.clone();
-    let (tx, rx) = mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     // The request's admitted config, installed on the worker below.
     let admitted_config = ctx.config();
 
     // Cold initialization and its first query run after the scheduler job returns,
     // so an LSP handshake cannot serialize unrelated work on the same root.
-    let completion_wake = crate::response_finalize::deferred_completion_wake();
     std::thread::spawn(move || {
-        let _completion_wake = completion_wake;
         #[cfg(test)]
         let _worker = DeferredNavigationWorkerGuard::new();
         let _config_pin = ctx.pin_config_to(admitted_config);
@@ -223,15 +221,16 @@ fn defer_lsp_navigation(
     });
 
     let mut settled = false;
-    DispatchOutcome::Deferred(PendingResponse {
+    DispatchOutcome::Deferred(PendingResponse::from_receiver(
         request_id,
-        session_id: req.session().to_string(),
-        attach_command: command,
-        poll: Box::new(move |_| {
+        req.session().to_string(),
+        command,
+        rx,
+        move |_, completion| {
             if settled {
                 return None;
             }
-            match rx.try_recv() {
+            match completion {
                 Ok(response) => {
                     settled = true;
                     Some(response)
@@ -257,10 +256,9 @@ fn defer_lsp_navigation(
                 }
                 Err(mpsc::TryRecvError::Empty) => None,
             }
-        }),
-        cancellation: Some(cancellation),
-        on_shutdown: None,
-    })
+        },
+    ).with_cancellation(cancellation)
+        .with_poll_interval(Duration::from_millis(100)))
 }
 
 fn navigation_cancelled_response(request_id: &str, command: &str) -> Response {

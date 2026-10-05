@@ -202,10 +202,20 @@ pub struct GithubReadCompletion {
 /// loop. Poll it from `PendingResponse`; never wait on it in standalone input
 /// handling.
 pub struct GithubReadDeferred {
-    receiver: mpsc::Receiver<Result<GithubReadCompletion, GithubReadError>>,
+    receiver: crate::response_finalize::PendingResponseReceiver<
+        Result<GithubReadCompletion, GithubReadError>,
+    >,
 }
 
 impl GithubReadDeferred {
+    pub(crate) fn into_receiver(
+        self,
+    ) -> crate::response_finalize::PendingResponseReceiver<
+        Result<GithubReadCompletion, GithubReadError>,
+    > {
+        self.receiver
+    }
+
     pub fn try_complete(&self) -> Option<Result<GithubReadCompletion, GithubReadError>> {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
@@ -259,7 +269,9 @@ struct GithubReadFlightWaiter {
     selector: GithubReadSelector,
     view: GithubReadView,
     fallback: Option<GithubReadCacheEntry>,
-    sender: mpsc::SyncSender<Result<GithubReadCompletion, GithubReadError>>,
+    sender: crate::response_finalize::PendingResponseSender<
+        Result<GithubReadCompletion, GithubReadError>,
+    >,
 }
 
 /// Coordinates live GitHub fetches, durable fallback copies, single-flight work,
@@ -437,7 +449,9 @@ impl GithubReadEngine {
     ) -> GithubReadStart {
         let slot = self.flight_slot_for_request(&request);
         let fetch_request = request.clone();
-        let (sender, receiver) = mpsc::sync_channel(1);
+        // Every coalesced caller owns its own wake-bound sender. Capturing only
+        // the leader's connection would leave followers waiting on idle routes.
+        let (sender, receiver) = crate::response_finalize::pending_response_channel();
         let leader = {
             let mut state = self.state.lock();
             let waiters = state.flights.entry(slot.clone()).or_default();
@@ -1078,6 +1092,92 @@ mod tests {
             error,
             GithubReadError::FetchFailed("fixture GitHub fetch failed".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_github_read_failure_notifies_completion() {
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(FailingFetcher),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1_000)),
+        );
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let pending = {
+            let _scope = wake.install();
+            let GithubReadStart::Deferred(pending) = engine
+                .start(
+                    &enabled_gh_read(),
+                    request(None),
+                    GithubReadSelector::WholeDocument,
+                )
+                .expect("start failing read")
+            else {
+                panic!("live fetch must defer")
+            };
+            pending
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+            .await
+            .expect("GitHub read failure wake");
+        assert_eq!(wake.generation(), 1);
+        assert!(matches!(
+            pending.try_complete(),
+            Some(Err(GithubReadError::FetchFailed(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deferred_github_read_notifies_each_waiter_after_completion() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let fetcher = Arc::new(GatedFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(1_000)),
+        );
+        let first_wake = crate::response_finalize::DeferredResponseWake::default();
+        let second_wake = crate::response_finalize::DeferredResponseWake::default();
+        let start = |wake: &crate::response_finalize::DeferredResponseWake| {
+            let _scope = wake.install();
+            let GithubReadStart::Deferred(pending) = engine
+                .start(
+                    &enabled_gh_read(),
+                    request(None),
+                    GithubReadSelector::WholeDocument,
+                )
+                .expect("start deferred read")
+            else {
+                panic!("live fetch must defer")
+            };
+            pending
+        };
+        let first = start(&first_wake);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fetch starts");
+        let second = start(&second_wake);
+        release_tx.send(()).expect("release shared fetch");
+        // No polling fallback: both connections must be notified even though
+        // only the first caller started the shared producer thread.
+        for (wake, pending) in [(&first_wake, first), (&second_wake, second)] {
+            tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+                .await
+                .expect("GitHub read completion wake");
+            assert_eq!(wake.generation(), 1);
+            let completion = pending
+                .try_complete()
+                .expect("result queued before wake")
+                .unwrap();
+            assert!(completion.content.contains("fixture"));
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

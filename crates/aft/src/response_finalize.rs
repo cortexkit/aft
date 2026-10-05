@@ -264,6 +264,65 @@ pub(crate) fn deferred_completion_wake() -> DeferredCompletionWake {
     DeferredCompletionWake(DEFERRED_WAKE.with(|slot| slot.borrow().clone()))
 }
 
+/// A one-shot sender that wakes the admitted connection after its value is
+/// queued, or after disconnecting if the producer returns without a value.
+pub struct PendingResponseSender<T> {
+    // Field drop order matters: disconnect before publishing the wake.
+    sender: std::sync::mpsc::SyncSender<T>,
+    _completion_wake: DeferredCompletionWake,
+}
+
+impl<T> PendingResponseSender<T> {
+    pub fn send(self, value: T) -> Result<(), std::sync::mpsc::SendError<T>> {
+        self.sender.send(value)
+    }
+}
+
+pub struct PendingResponseReceiver<T> {
+    receiver: std::sync::mpsc::Receiver<T>,
+    wake_installed: bool,
+}
+
+impl<T> PendingResponseReceiver<T> {
+    pub fn try_recv(&self) -> Result<T, std::sync::mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+/// Capture the request's wake before transferring the sender to a producer.
+/// The receiver's type certifies that completion cannot omit that signal.
+pub fn pending_response_channel<T>() -> (PendingResponseSender<T>, PendingResponseReceiver<T>) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let completion_wake = deferred_completion_wake();
+    let wake_installed = completion_wake.0.is_some();
+    (
+        PendingResponseSender {
+            sender,
+            _completion_wake: completion_wake,
+        },
+        PendingResponseReceiver {
+            receiver,
+            wake_installed,
+        },
+    )
+}
+
+/// Deferred responses must choose a readiness mechanism: a wake-bound channel,
+/// or periodic polling for state/deadline-based producers. A raw struct literal
+/// cannot silently opt out of both mechanisms.
+///
+/// ```compile_fail
+/// use aft::response_finalize::PendingResponse;
+/// let _pending = PendingResponse {
+///     request_id: "unwoken".into(),
+///     session_id: "session".into(),
+///     attach_command: "read".into(),
+///     poll: Box::new(|_| None),
+///     cancellation: None,
+///     on_shutdown: None,
+///     poll_interval: None,
+/// };
+/// ```
 pub struct PendingResponse {
     pub request_id: String,
     pub session_id: String,
@@ -277,6 +336,79 @@ pub struct PendingResponse {
     /// shutdown. Long-running inspect uses this to avoid silently dropping its
     /// only agent-visible terminal frame.
     pub on_shutdown: Option<PendingResponseShutdown>,
+    poll_interval: Option<std::time::Duration>,
+}
+
+impl PendingResponse {
+    /// For state-based waits that can resolve on a deadline without any producer
+    /// sending a value. The transport must retain this timer even when idle.
+    pub fn polling(
+        request_id: String,
+        session_id: String,
+        attach_command: String,
+        poll: PendingResponsePoll,
+    ) -> Self {
+        Self {
+            request_id,
+            session_id,
+            attach_command,
+            poll,
+            cancellation: None,
+            on_shutdown: None,
+            poll_interval: Some(std::time::Duration::from_millis(100)),
+        }
+    }
+
+    /// Channel-backed producers cannot forget the completion wake: only the
+    /// receiver paired with a wake-bound sender can select completion-only polling.
+    pub fn from_receiver<T: Send + 'static>(
+        request_id: String,
+        session_id: String,
+        attach_command: String,
+        receiver: PendingResponseReceiver<T>,
+        mut poll: impl FnMut(&AppContext, Result<T, std::sync::mpsc::TryRecvError>) -> Option<Response>
+            + Send
+            + 'static,
+    ) -> Self {
+        // Standalone callers and callers without an admitted connection scope
+        // cannot publish this wake. Fail safe with a timer rather than trusting
+        // a channel whose sender has no transport to notify.
+        let poll_interval =
+            (!receiver.wake_installed).then_some(std::time::Duration::from_millis(100));
+        Self {
+            request_id,
+            session_id,
+            attach_command,
+            poll: Box::new(move |ctx| poll(ctx, receiver.try_recv())),
+            cancellation: None,
+            on_shutdown: None,
+            poll_interval,
+        }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: crate::executor::JobCancellation) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub fn with_shutdown(mut self, on_shutdown: PendingResponseShutdown) -> Self {
+        self.on_shutdown = Some(on_shutdown);
+        self
+    }
+
+    /// A channel-backed request may also need an independent overall deadline.
+    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
+        assert!(
+            !interval.is_zero(),
+            "pending response poll interval must be positive"
+        );
+        self.poll_interval = Some(interval);
+        self
+    }
+
+    pub fn poll_interval(&self) -> Option<std::time::Duration> {
+        self.poll_interval
+    }
 }
 
 pub struct ResolvedPending {
@@ -588,6 +720,56 @@ mod tests {
     use crate::protocol::Response;
 
     #[test]
+    fn pending_response_channel_without_connection_scope_retains_timer() {
+        let (_sender, receiver) = super::pending_response_channel::<Response>();
+        let pending = PendingResponse::from_receiver(
+            "unscoped".into(),
+            "session".into(),
+            "read".into(),
+            receiver,
+            |_, completion| completion.ok(),
+        );
+        assert_eq!(
+            pending.poll_interval(),
+            Some(std::time::Duration::from_millis(100))
+        );
+        let wake = super::DeferredResponseWake::default();
+        let (_sender, receiver) = {
+            let _scope = wake.install();
+            super::pending_response_channel::<Response>()
+        };
+        let pending = PendingResponse::from_receiver(
+            "scoped".into(),
+            "session".into(),
+            "read".into(),
+            receiver,
+            |_, completion| completion.ok(),
+        );
+        assert!(
+            pending.poll_interval().is_none(),
+            "admitted channel producers stay completion-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_response_channel_wakes_after_producer_disconnect() {
+        let wake = super::DeferredResponseWake::default();
+        let (sender, receiver) = {
+            let _scope = wake.install();
+            super::pending_response_channel::<Response>()
+        };
+        std::thread::spawn(move || drop(sender));
+        tokio::time::timeout(std::time::Duration::from_secs(5), wake.notified())
+            .await
+            .expect("disconnected producer wake");
+        assert_eq!(wake.generation(), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn only_an_opencode_session_can_have_its_bar_rendered_by_a_fleet_reader() {
         assert!(fleet_reader_renders_bar(Some(&Harness::Opencode), true));
         assert!(!fleet_reader_renders_bar(Some(&Harness::Opencode), false));
@@ -730,16 +912,17 @@ mod tests {
     fn shutdown_delivery_emits_terminal_before_removing_entry() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let mut pending = PendingResponses::default();
-        pending.register(PendingResponse {
-            request_id: "inspect-shutdown".to_string(),
-            session_id: String::new(),
-            attach_command: String::new(),
-            poll: Box::new(|_| None),
-            cancellation: None,
-            on_shutdown: Some(Box::new(|_| {
+        pending.register(
+            PendingResponse::polling(
+                "inspect-shutdown".to_string(),
+                String::new(),
+                String::new(),
+                Box::new(|_| None),
+            )
+            .with_shutdown(Box::new(|_| {
                 Response::error("inspect-shutdown", "daemon_shutdown", "shutdown")
             })),
-        });
+        );
 
         let resolved = pending.drain_on_shutdown_with(&ctx);
         assert_eq!(resolved.len(), 1);

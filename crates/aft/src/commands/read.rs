@@ -25,7 +25,7 @@ use crate::github_read::{
     SystemGithubReadClock,
 };
 use crate::protocol::{RawRequest, Response};
-use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
+use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
@@ -1014,24 +1014,34 @@ pub fn build_read_outcome(req: RawRequest, ctx: &AppContext) -> DispatchOutcome 
 
     let request_id = req.id.clone();
     let session_id = req.session().to_string();
-    let mut poll: PendingResponsePoll = Box::new(move |_| {
-        pending.try_complete().map(|completion| match completion {
+    if let Some(completion) = pending.try_complete() {
+        return DispatchOutcome::Immediate(match completion {
             Ok(completion) => github_read_response(&req, completion, start_line),
             Err(error) => Response::error(&req.id, error.code(), error.to_string()),
-        })
-    });
-    if let Some(response) = poll(ctx) {
-        return DispatchOutcome::Immediate(response);
+        });
     }
 
-    DispatchOutcome::Deferred(PendingResponse {
+    DispatchOutcome::Deferred(PendingResponse::from_receiver(
         request_id,
         session_id,
-        attach_command: "read".to_string(),
-        poll,
-        cancellation: None,
-        on_shutdown: None,
-    })
+        "read".to_string(),
+        pending.into_receiver(),
+        move |_, result| {
+            let completion = match result {
+                Ok(completion) => completion,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(crate::github_read::GithubReadError::FetchFailed(
+                        "GitHub read worker stopped before completing".to_string(),
+                    ))
+                }
+            };
+            Some(match completion {
+                Ok(completion) => github_read_response(&req, completion, start_line),
+                Err(error) => Response::error(&req.id, error.code(), error.to_string()),
+            })
+        },
+    ))
 }
 
 /// Handle a `read` request.

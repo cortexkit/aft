@@ -462,14 +462,14 @@ pub fn build_bash_outcome(
         return DispatchOutcome::Immediate(response);
     }
 
-    DispatchOutcome::Deferred(PendingResponse {
+    // This state-based producer resolves inside its poll, including hand-backs
+    // before the task exits. A task-completion wake alone cannot drive deadlines.
+    DispatchOutcome::Deferred(PendingResponse::polling(
         request_id,
         session_id,
         attach_command,
         poll,
-        cancellation: None,
-        on_shutdown: None,
-    })
+    ))
 }
 
 pub(crate) fn poll_bash_status(
