@@ -323,22 +323,33 @@ pub(crate) fn verify_files_bounded<K: Send>(
             .collect();
     }
 
-    match rayon::ThreadPoolBuilder::new()
-        .num_threads(strict_verify_pool_size())
-        .thread_name(|index| format!("aft-semantic-verify-{index}"))
-        .build()
-    {
-        Ok(pool) => pool.install(|| {
+    match strict_verify_pool() {
+        Some(pool) => pool.install(|| {
             files
                 .into_par_iter()
                 .map(|file| verify_one(file, strategy))
                 .collect()
         }),
-        Err(_) => files
+        None => files
             .into_iter()
             .map(|file| verify_one(file, strategy))
             .collect(),
     }
+}
+
+fn strict_verify_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(build_strict_verify_pool).as_ref()
+}
+
+fn build_strict_verify_pool() -> Option<rayon::ThreadPool> {
+    #[cfg(test)]
+    STRICT_VERIFY_POOL_BUILDS.fetch_add(1, Ordering::Relaxed);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(strict_verify_pool_size())
+        .thread_name(|index| format!("aft-semantic-verify-{index}"))
+        .build()
+        .ok()
 }
 
 pub(crate) fn strict_verify_pool_size() -> usize {
