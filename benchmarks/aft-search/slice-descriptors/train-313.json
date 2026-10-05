@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "outline-test-summaries-type-previews"
+  ],
+  "note": "aft_outline directory and multi-file modes collapse test code into summary lines and preview three members per type; explicit ignored targets are outlined and empty walks explain themselves; no ranking-fence file."
+}
