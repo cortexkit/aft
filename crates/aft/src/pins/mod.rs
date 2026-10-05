@@ -4,7 +4,7 @@
 //! can keep every prospective blob alive until publication finishes.
 
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -430,17 +430,10 @@ fn write_metadata(path: &Path, metadata: &PinMetadata) -> Result<(), PinError> {
 }
 
 fn create_private(path: &Path) -> io::Result<File> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        return OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path);
-    }
-    #[cfg(not(unix))]
-    OpenOptions::new().write(true).create_new(true).open(path)
+    crate::private_storage::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 fn parse_hex_key(value: &str) -> Result<[u8; 32], PinError> {

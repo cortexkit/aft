@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -903,20 +903,11 @@ fn write_marker_file(path: &Path, metadata: &ReadMarkerMetadata) -> io::Result<(
     result
 }
 
-#[cfg(unix)]
 fn open_private_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
+    crate::private_storage::options()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)
-}
-
-#[cfg(not(unix))]
-fn open_private_file(path: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
 }
 
 fn sanitize_marker_component(value: &str) -> String {

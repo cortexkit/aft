@@ -760,22 +760,11 @@ fn read_lock_metadata(path: &Path) -> Result<LockMetadata, ReadLockError> {
     serde_json::from_slice(&bytes).map_err(ReadLockError::Malformed)
 }
 
-#[cfg(unix)]
 fn open_new_lock_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = OpenOptions::new()
+    let file = crate::private_storage::options()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)?;
-    io_ledger::record(|ledger| ledger.new_files += 1);
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn open_new_lock_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new().write(true).create_new(true).open(path)?;
     io_ledger::record(|ledger| ledger.new_files += 1);
     Ok(file)
 }
