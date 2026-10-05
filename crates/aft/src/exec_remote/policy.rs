@@ -21,7 +21,7 @@ pub fn matches(policy: &RemoteExecPolicy, line: &str, pty: bool, stdin: bool) ->
     };
     !commands.is_empty()
         && commands.iter().all(|command| {
-            !matches!(command[0].as_str(), "git" | "gh" | "eval")
+            !forbidden_executable(&command[0])
                 && !command.iter().any(|word| {
                     matches!(
                         word.split('=').next().unwrap_or(""),
@@ -35,8 +35,19 @@ pub fn matches(policy: &RemoteExecPolicy, line: &str, pty: bool, stdin: bool) ->
         })
 }
 
+fn forbidden_executable(executable: &str) -> bool {
+    let basename = executable
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
+    matches!(basename, "git" | "gh" | "eval")
+}
+
 pub(super) fn valid_prefix(prefix: &str) -> bool {
     !prefix.is_empty()
+        && !forbidden_executable(prefix.split(' ').next().unwrap_or(""))
         && prefix.split(' ').all(|word| {
             !word.is_empty()
                 && word
@@ -103,6 +114,40 @@ mod tests {
             };
             assert!(!matches(&policy, line, false, false), "{line}");
         }
+    }
+
+    #[test]
+    fn path_qualified_forbidden_executables_cannot_be_allowlisted() {
+        for name in [
+            "git", "gh", "eval", "GIT", "GH", "EVAL", "git.exe", "gh.exe", "eval.exe",
+        ] {
+            for directory in ["/usr/bin/", "./tools/", "../tools/", "a/b/", ""] {
+                let executable = format!("{directory}{name}");
+                let policy = RemoteExecPolicy {
+                    enabled: true,
+                    commands: vec![executable.clone()],
+                };
+                for spelling in [
+                    executable.clone(),
+                    format!("'{executable}'"),
+                    format!("\"{executable}\""),
+                ] {
+                    assert!(
+                        !matches(&policy, &format!("{spelling} status"), false, false),
+                        "{spelling} was admitted"
+                    );
+                }
+                assert!(
+                    !valid_prefix(&executable),
+                    "forbidden executable accepted as policy prefix: {executable}"
+                );
+            }
+        }
+        let policy = RemoteExecPolicy {
+            enabled: true,
+            commands: vec!["/tools/notgit".into()],
+        };
+        assert!(matches(&policy, "/tools/notgit status", false, false));
     }
 
     #[test]
