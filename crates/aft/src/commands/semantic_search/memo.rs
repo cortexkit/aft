@@ -183,7 +183,9 @@ pub struct VerifiedExactSet {
 /// Holds memoized exact sets keyed by K = (project_root, snapshot_generation, normalized_query, include_tests).
 /// Manages epoch progression, poisoning, served-page content-digest re-check, and verifier counter.
 pub struct ExactMemoStore {
-    entries: RwLock<HashMap<MemoKey, MemoEntry>>,
+    // Readers keep the immutable verified payload alive after releasing the
+    // store lock. Only the served page needs an owned candidate copy.
+    entries: RwLock<HashMap<MemoKey, Arc<MemoEntry>>>,
     lifecycle: RwLock<HashMap<MemoKey, KeyLifecycleState>>,
     in_flight: Mutex<HashSet<(MemoKey, usize)>>,
     in_flight_changed: Condvar,
@@ -268,6 +270,8 @@ impl ExactMemoStore {
             let Some(expected_digest) = file_digests.get(&candidate.path) else {
                 continue;
             };
+            #[cfg(test)]
+            crate::search_hot_path_measurements::record_file_read();
             let live_bytes = fs::read(&candidate.path).map_err(|_| candidate.path.clone())?;
             let live_digest = compute_content_digest(&live_bytes);
             if &live_digest != expected_digest {
@@ -324,7 +328,7 @@ impl ExactMemoStore {
 
                 return Ok(ServeOutcome {
                     results: page.to_vec(),
-                    bound_disclosure: entry.bound_disclosure,
+                    bound_disclosure: entry.bound_disclosure.clone(),
                     void_disclosure: Some("content changed - page stability void".to_string()),
                     stability_void: true,
                     served_page_digest_mismatch: true,
@@ -344,7 +348,7 @@ impl ExactMemoStore {
 
             return Ok(ServeOutcome {
                 results: page.to_vec(),
-                bound_disclosure: entry.bound_disclosure,
+                bound_disclosure: entry.bound_disclosure.clone(),
                 void_disclosure,
                 stability_void: entry.stability_void || entry.poisoned,
                 served_page_digest_mismatch: false,
@@ -387,14 +391,14 @@ impl ExactMemoStore {
         self.verifier_counter.fetch_add(1, Ordering::SeqCst);
         let verified_set = verifier()?;
 
-        let entry = MemoEntry::new(
+        let entry = Arc::new(MemoEntry::new(
             verified_set.results,
             verified_set.file_digests,
             verified_set.bound_disclosure,
             verified_set.stability_void,
             epoch,
             is_poisoned,
-        );
+        ));
 
         // Publish before dropping the permit so same-key waiters observe the entry.
         self.entries.write().insert(key.clone(), entry.clone());
@@ -427,7 +431,7 @@ impl ExactMemoStore {
 
         Ok(ServeOutcome {
             results: page.to_vec(),
-            bound_disclosure: entry.bound_disclosure,
+            bound_disclosure: entry.bound_disclosure.clone(),
             void_disclosure,
             stability_void: entry.stability_void || is_poisoned,
             served_page_digest_mismatch: false,
@@ -444,6 +448,99 @@ impl ExactMemoStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_memo_hit_clones_only_the_served_page() {
+        let memo = ExactMemoStore::new();
+        let key = MemoKey::new(
+            "/project",
+            GenerationToken::new_with_str("generation"),
+            "symbol",
+            false,
+        );
+        let results = (0..8_000)
+            .map(|ordinal| {
+                CandidateResult::new_exact(
+                    PathBuf::from(format!("/project/src/file_{ordinal}.rs")),
+                    Some(SymbolOffsetRange::new(ordinal, ordinal + 1)),
+                    EvidenceDescriptor::for_e1(1, true, false),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Digests are exercised by the lifecycle integration suite. This fixture
+        // isolates payload copying from filesystem allocations on a memo hit.
+        let expected = results[100..110].to_vec();
+        memo.get_or_verify(&key, 0, 10, || {
+            Ok(VerifiedExactSet {
+                results,
+                file_digests: HashMap::new(),
+                bound_disclosure: None,
+                stability_void: false,
+            })
+        })
+        .unwrap();
+        let (outcome, allocations) = crate::test_allocations::count(|| {
+            memo.get_or_verify(&key, 100, 10, || panic!("a hit must not reverify"))
+                .unwrap()
+        });
+        assert_eq!(outcome.results, expected);
+        assert_eq!(memo.verifier_call_count(), 1);
+        let (full, full_allocations) = crate::test_allocations::count(|| {
+            memo.get_or_verify(&key, 0, usize::MAX, || panic!("a hit must not reverify"))
+                .unwrap()
+        });
+        assert_eq!(full.results.len(), 8_000);
+        assert_eq!(full.results[100..110], expected);
+        println!("SEMANTIC_WORK memo: entries=8000 page=10 allocations={allocations} full_page_allocations={full_allocations}");
+        assert!(
+            allocations < 100,
+            "memo hit copied the full payload: {allocations} allocations"
+        );
+        assert!(
+            full_allocations < 8_100,
+            "full memo payload was copied twice: {full_allocations} allocations"
+        );
+    }
+
+    #[test]
+    fn exact_memo_digest_work_still_covers_every_served_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = (0..200)
+            .map(|ordinal| {
+                let path = temp.path().join(format!("file_{ordinal}.rs"));
+                fs::write(&path, b"fn symbol() {}\n").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let file_digests = paths
+            .iter()
+            .map(|path| (path.clone(), compute_file_content_digest(path).unwrap()))
+            .collect();
+        let candidates = (0..8_000)
+            .map(|ordinal| {
+                CandidateResult::new_exact(
+                    paths[ordinal % 200].clone(),
+                    Some(SymbolOffsetRange::new(ordinal, ordinal + 1)),
+                    EvidenceDescriptor::for_e1(1, true, false),
+                )
+            })
+            .collect::<Vec<_>>();
+        for page in [&candidates[100..110], candidates.as_slice()] {
+            crate::search_hot_path_measurements::reset();
+            ExactMemoStore::check_served_page_digests(page, &file_digests).unwrap();
+            let reads = crate::search_hot_path_measurements::counts().file_reads;
+            println!(
+                "SEMANTIC_WORK memo_digests: page={} files=200 reads_and_hashes={reads}",
+                page.len()
+            );
+            assert_eq!(reads, page.len());
+        }
+        fs::write(&paths[0], b"changed").unwrap();
+        assert_eq!(
+            ExactMemoStore::check_served_page_digests(&candidates, &file_digests),
+            Err(paths[0].clone())
+        );
+    }
 
     #[test]
     fn exact_memo_resets_before_exceeding_its_entry_bound() {
