@@ -1606,9 +1606,8 @@ mod tests {
         cache.begin(began);
         cache.finished = true;
         cache.complete();
-        assert_eq!(
-            fs::read(&cache.path).unwrap(),
-            before,
+        assert!(
+            fs::read(&cache.path).unwrap() == before,
             "a check which began before the edit replaced the authoritative record"
         );
     }
@@ -1641,9 +1640,8 @@ mod tests {
         );
         cache.finished = true;
         cache.complete();
-        assert_eq!(
-            fs::read(&cache.path).unwrap(),
-            before,
+        assert!(
+            fs::read(&cache.path).unwrap() == before,
             "an input changed during the check, but its result replaced the saved record"
         );
     }
