@@ -270,7 +270,11 @@ fn tokenize_literal_word(input: &str, top_level: bool) -> Option<(String, usize)
                 '\\' => match chars.next() {
                     Some((next_idx, escaped)) => {
                         consumed = next_idx + escaped.len_utf8();
-                        token.push(escaped);
+                        // Bash removes an unquoted backslash-newline before
+                        // word recognition, including inside option spellings.
+                        if escaped != '\n' {
+                            token.push(escaped);
+                        }
                     }
                     None => token.push('\\'),
                 },

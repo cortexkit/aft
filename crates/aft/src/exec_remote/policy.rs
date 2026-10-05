@@ -106,6 +106,35 @@ mod tests {
     }
 
     #[test]
+    fn unquoted_line_continuations_cannot_hide_forbidden_flags() {
+        let policy = RemoteExecPolicy {
+            enabled: true,
+            commands: vec!["cargo test".into()],
+        };
+        for flag in ["--fix", "--run-ignored", "--ignored", "--include-ignored"] {
+            for suffix in ["", "=true"] {
+                let word = format!("{flag}{suffix}");
+                for split in 1..word.len() {
+                    let continued = format!("{}\\\n{}", &word[..split], &word[split..]);
+                    for spelling in [continued.clone(), format!("\"{continued}\"")] {
+                        let line = format!("cargo test -- {spelling}");
+                        assert!(
+                            !matches(&policy, &line, false, false),
+                            "forbidden flag escaped through {line:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(matches(
+            &policy,
+            "cargo test -- harmless\\\nargument",
+            false,
+            false
+        ));
+    }
+
+    #[test]
     fn policy_disabled_and_mixed_lines_stay_whole() {
         let mut policy = RemoteExecPolicy {
             enabled: true,
