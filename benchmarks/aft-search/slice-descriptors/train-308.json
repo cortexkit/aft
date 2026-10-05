@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "perf-audit-2-unbounded-growth"
+  ],
+  "note": "The ranking-fenced edits cache the anchored query-split regex in a LazyLock (same pattern, same split output, asserted by a test) and release a finished request's embedding-counter observations after its attribution ends (production reads all happen while the request runs). No candidate, score, fusion, paging or rendered text changes, so every row must be byte-equal to the reference."
+}
