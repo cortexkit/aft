@@ -1,15 +1,20 @@
 use rayon::prelude::*;
 #[cfg(debug_assertions)]
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CONTENT_HASH_SIZE_CAP: u64 = 4 * 1024 * 1024;
+#[cfg(debug_assertions)]
+const MAX_STRICT_VERIFY_DEBUG_PATHS: usize = 4096;
+
+#[cfg(test)]
+static STRICT_VERIFY_POOL_BUILDS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(debug_assertions)]
 static STRICT_VERIFY_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -281,10 +286,13 @@ pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdi
     #[cfg(debug_assertions)]
     {
         STRICT_VERIFY_FILE_CALLS.fetch_add(1, Ordering::Relaxed);
-        strict_verify_paths_for_debug()
+        let mut paths = strict_verify_paths_for_debug()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(path.to_path_buf());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        paths.push_back(path.to_path_buf());
+        while paths.len() > MAX_STRICT_VERIFY_DEBUG_PATHS {
+            paths.pop_front();
+        }
     }
     verify_file_inner(path, cached, true)
 }
@@ -361,9 +369,10 @@ pub(crate) fn strict_verify_pool_size() -> usize {
 }
 
 #[cfg(debug_assertions)]
-fn strict_verify_paths_for_debug() -> &'static std::sync::Mutex<Vec<PathBuf>> {
-    static STRICT_VERIFY_FILE_PATHS: OnceLock<std::sync::Mutex<Vec<PathBuf>>> = OnceLock::new();
-    STRICT_VERIFY_FILE_PATHS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn strict_verify_paths_for_debug() -> &'static std::sync::Mutex<VecDeque<PathBuf>> {
+    static STRICT_VERIFY_FILE_PATHS: OnceLock<std::sync::Mutex<VecDeque<PathBuf>>> =
+        OnceLock::new();
+    STRICT_VERIFY_FILE_PATHS.get_or_init(|| std::sync::Mutex::new(VecDeque::new()))
 }
 
 #[cfg(debug_assertions)]
@@ -685,6 +694,41 @@ mod tests {
         assert!(hash_file_if_small(&path, CONTENT_HASH_SIZE_CAP + 1)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn audit_growth_repeated_bulk_verification_builds_only_one_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for index in 0..2 {
+            let path = dir.path().join(format!("pool-{index}.rs"));
+            write(&path, b"fn pool() {}\n");
+            files.push((index, path.clone(), collect(&path).unwrap()));
+        }
+        let before = STRICT_VERIFY_POOL_BUILDS.load(Ordering::Relaxed);
+        for _ in 0..2 {
+            let results = verify_files_bounded(files.clone(), VerifyStrategy::StatFirst);
+            assert_eq!(results.len(), 2);
+        }
+        let builds = STRICT_VERIFY_POOL_BUILDS.load(Ordering::Relaxed) - before;
+        assert_eq!(builds, 1, "two calls share one Rayon pool construction");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn audit_growth_debug_strict_verify_path_history_is_bounded() {
+        const MAX_PATH_HISTORY: usize = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("debug-history.rs");
+        write(&path, b"");
+        let freshness = collect(&path).unwrap();
+        for _ in 0..(MAX_PATH_HISTORY + 8) {
+            let _ = verify_file_strict(&path, &freshness);
+        }
+        assert!(
+            verify_file_strict_count_under_for_debug(dir.path()) <= MAX_PATH_HISTORY,
+            "debug path history exceeded {MAX_PATH_HISTORY} entries"
+        );
     }
 }
 
