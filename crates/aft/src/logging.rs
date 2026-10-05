@@ -1552,9 +1552,7 @@ fn create_private_log_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        if let Some(parent) = dir.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        crate::private_storage::create_dir_all(dir)?;
         match fs::DirBuilder::new().mode(LOG_DIR_MODE).create(dir) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
@@ -1585,6 +1583,15 @@ fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
         options.mode(LOG_FILE_MODE);
     }
     options.open(path)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn write_storage_permission_fixture(dir: &Path) {
+    create_private_log_dir(dir).unwrap();
+    open_private_log_file(&dir.join("test.log"), false)
+        .unwrap()
+        .write_all(b"private log\n")
+        .unwrap();
 }
 
 /// Drop group/other permission bits from `path` when the current user owns it.

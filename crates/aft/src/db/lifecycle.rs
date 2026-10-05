@@ -482,6 +482,7 @@ impl TrackedConnection {
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
         let _guard = crate::db::file_identity::filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
         Self::from_connection_attributed(Connection::open(path)?, store, root_id)
     }
 
@@ -491,6 +492,7 @@ impl TrackedConnection {
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
         let _guard = crate::db::file_identity::filesystem_guard();
+        crate::private_storage::prepare_sqlite(Path::new(path), flags)?;
         Self::from_connection_attributed(
             Connection::open_with_flags(path, flags)?,
             store,
@@ -504,6 +506,7 @@ impl TrackedConnection {
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
         let _guard = crate::db::file_identity::filesystem_guard();
+        crate::private_storage::prepare_sqlite(path, flags)?;
         Self::from_connection_attributed(
             Connection::open_with_flags(path, flags)?,
             store,

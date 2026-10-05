@@ -587,7 +587,7 @@ pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConne
     crate::test_storage::assert_database(path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::open_root(parent)?;
         }
     }
     // Refuse a newer schema before the PRAGMAs below, which would otherwise

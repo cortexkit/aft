@@ -818,7 +818,7 @@ impl SemanticIndexLock {
         if !access.allows_write(project_key, &path) {
             return Ok(Self { _guard: None });
         }
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SEMANTIC_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("semantic cache lock acquisition mutex poisoned"))?;
@@ -6840,7 +6840,7 @@ impl SemanticIndex {
                 .as_nanos()
         ));
         let write_result = (|| -> io::Result<usize> {
-            let file = fs::File::create(&tmp_path)?;
+            let file = crate::private_storage::create(&tmp_path)?;
             let mut writer = BufWriter::new(file);
             let bytes_written = self.write_to_writer(&mut writer)?;
             writer.flush()?;
@@ -7101,7 +7101,7 @@ impl SemanticIndex {
         {
             return false;
         }
-        if let Err(error) = fs::create_dir_all(&dir) {
+        if let Err(error) = crate::private_storage::open_dir(storage_dir, &dir) {
             slog_warn!("failed to create semantic cache dir: {}", error);
             return false;
         }

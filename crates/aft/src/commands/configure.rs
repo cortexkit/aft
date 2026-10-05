@@ -2983,6 +2983,12 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     // gives every artifact lane one concrete absolute root.
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if let Err(error) = crate::private_storage::open_root(&resolved_storage_dir) {
+        log::warn!(
+            "could not open private storage {}: {error}",
+            resolved_storage_dir.display()
+        );
+    }
     // Check the reader floor (and write today's formats as its baseline)
     // before this configure reads or writes anything under the storage root,
     // so a build below the floor refuses the affected components by name.
@@ -6923,7 +6929,7 @@ fn run_configure_maintenance_unit_inner(
                 crate::format::clear_tool_cache_for_root(Some(&job.root_path));
             }
             if let Some(storage_dir) = ctx.config().storage_dir.clone() {
-                if let Err(err) = fs::create_dir_all(&storage_dir) {
+                if let Err(err) = crate::private_storage::open_root(&storage_dir) {
                     slog_warn!(
                         "failed to create storage directory {}: {}",
                         storage_dir.display(),

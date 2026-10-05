@@ -883,19 +883,13 @@ pub fn create_task_layout(
 fn create_private_task_store(session_dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     task_io_fault_for_test(false)?;
-    fs::create_dir_all(session_dir)?;
-    #[cfg(unix)]
-    {
-        let parent = session_dir.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session task directory has no bash-tasks parent",
-            )
-        })?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-        fs::set_permissions(session_dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    let root = session_dir.parent().and_then(Path::parent).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "task directory has no storage root",
+        )
+    })?;
+    crate::private_storage::open_dir(root, session_dir)
 }
 
 fn create_task_layout_from_session(

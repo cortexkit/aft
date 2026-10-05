@@ -134,6 +134,7 @@ pub mod persisted_format;
 pub mod pins;
 mod platform_tls;
 mod privacy_spawn;
+pub(crate) mod private_storage;
 pub mod process_io;
 pub mod protocol;
 pub mod pty_render;
@@ -154,6 +155,8 @@ pub mod search_index;
 pub mod semantic_index;
 pub mod setup_plan;
 pub mod standing_roots;
+#[cfg(all(test, unix))]
+mod storage_permissions_tests;
 pub mod subc;
 pub mod subc_config;
 pub mod subc_format;

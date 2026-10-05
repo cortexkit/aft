@@ -4108,7 +4108,7 @@ impl CallGraphStore {
             ));
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         // Resolve the current generation via the pointer (falling back to the
         // legacy single-file DB). If nothing is published yet, open the legacy
         // path so a brand-new store still gets a writable DB + schema.
@@ -4329,7 +4329,7 @@ impl CallGraphStore {
             )));
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         let (stats, generation) = Self::cold_build_publish_locked(
             &callgraph_dir,
             &project_root,
@@ -4370,7 +4370,7 @@ impl CallGraphStore {
             ));
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
         // Another process may have published a ready generation while we waited
         // for the lock — open it instead of rebuilding. If that generation is
@@ -4457,7 +4457,7 @@ impl CallGraphStore {
             return Ok(None);
         };
         refuse_newer_published_format(&callgraph_dir, &project_key)?;
-        std::fs::create_dir_all(&callgraph_dir)?;
+        crate::private_storage::create_dir_all(&callgraph_dir)?;
         cleanup_incomplete_migrations(&callgraph_dir, &project_key);
 
         // Another writer may have completed the migration while this worker was
@@ -4813,7 +4813,7 @@ impl CallGraphStore {
             verify_writer_lease(lease)?;
         }
         if let Some(parent) = sqlite_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            crate::private_storage::create_dir_all(parent)?;
         }
         let store = if use_wal {
             SqliteStore::CallgraphGeneration
@@ -9125,7 +9125,7 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
     let _files = crate::db::file_identity::filesystem_guard();
     ensure_sqlite_files_closed(source)?;
     if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
     for suffix in SQLITE_FILE_SET_SUFFIXES {
         let source_path = sqlite_file_set_path(source, suffix);
@@ -9133,7 +9133,7 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
             continue;
         }
         let destination_path = sqlite_file_set_path(destination, suffix);
-        std::fs::copy(&source_path, &destination_path)?;
+        crate::private_storage::copy(&source_path, &destination_path)?;
     }
     Ok(())
 }
@@ -9257,7 +9257,7 @@ fn write_migration_manifest(
     });
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&temp_path)?;
+        let mut file = crate::private_storage::create(&temp_path)?;
         file.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
         file.write_all(b"\n")?;
     }
@@ -10598,7 +10598,7 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
     ));
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         file.write_all(generation.as_bytes())?;
         file.write_all(b"\n")?;
         // Generations rebuild from source. Atomic replacement is sufficient

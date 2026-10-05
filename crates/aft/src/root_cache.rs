@@ -608,7 +608,7 @@ impl WriterLease {
                 "root-keyed writer lease",
             )?;
         }
-        fs::create_dir_all(cache_dir)?;
+        crate::private_storage::open_keyed_dir(cache_dir, domain.as_str())?;
         let guard = fs_lock::try_acquire(&writer_lease_path(cache_dir), timeout)?;
         if !guard.verify_writer_epoch()? {
             return Err(fs_lock::AcquireError::Io(io::Error::other(
@@ -676,7 +676,7 @@ impl ReadMarker {
             created_at_ms: now_ms(),
         };
         let dir = read_marker_dir(cache_dir, generation_label);
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::open_dir(cache_dir, &dir)?;
         let seq = MARKER_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
             "{}.{}.{}.{}.json",

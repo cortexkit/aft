@@ -351,7 +351,7 @@ impl CacheLock {
         if !artifact_write_allowed(project_root, cache_dir, &path) {
             return Ok(Self { _guard: None });
         }
-        fs::create_dir_all(cache_dir)?;
+        crate::private_storage::open_keyed_dir(cache_dir, "index")?;
         let _acquire_guard = CACHE_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("search cache lock acquisition mutex poisoned"))?;
@@ -4284,7 +4284,7 @@ fn build_streaming_index(
         crate::cold_build_limiter::progress::StartLog::Info,
     );
     crate::cold_build_limiter::progress::phase("enumerating", None);
-    fs::create_dir_all(cache_dir)?;
+    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let ignore_fingerprint = ignore_rules_fingerprint(&project_root);
@@ -4451,7 +4451,7 @@ fn write_cache_file_from_sources(
     sources: &mut [Box<dyn PostingRecordSource>],
     domain: crate::write_ledger::Domain,
 ) -> std::io::Result<BasePostings> {
-    fs::create_dir_all(cache_dir)?;
+    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     sweep_stale_search_build_dirs(cache_dir);
     let cache_path = cache_dir.join("cache.bin");
     let tmp_cache = cache_dir.join(format!(
@@ -4464,7 +4464,7 @@ fn write_cache_file_from_sources(
     ));
 
     let write_result = (|| -> std::io::Result<BasePostings> {
-        let raw = OpenOptions::new()
+        let raw = crate::private_storage::options()
             .write(true)
             .create_new(true)
             .open(&tmp_cache)?;
@@ -4721,7 +4721,7 @@ fn flush_spill_segment(
     }
     block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
     let path = spill_dir.join(format!("segment.{seq:06}.bin"));
-    let mut writer = BufWriter::new(File::create(&path)?);
+    let mut writer = BufWriter::new(crate::private_storage::create(&path)?);
     writer.write_all(SPILL_MAGIC)?;
     write_u32(&mut writer, INDEX_VERSION)?;
     write_u64(
@@ -4765,7 +4765,7 @@ fn create_spill_dir(cache_dir: &Path) -> std::io::Result<PathBuf> {
             .unwrap_or(Duration::ZERO)
             .as_nanos()
     ));
-    fs::create_dir_all(&dir)?;
+    crate::private_storage::create_dir_all(&dir)?;
     Ok(dir)
 }
 
@@ -4830,7 +4830,7 @@ fn transient_search_cache_build_lock(cache_dir: &Path) -> Arc<Mutex<()>> {
 /// opens cache.bin as its postings store, so its previous files must be removed
 /// only while the process-local cache lock is held.
 fn truncate_transient_search_cache_dir(cache_dir: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(cache_dir)?;
+    crate::private_storage::open_keyed_dir(cache_dir, "index")?;
     for entry in fs::read_dir(cache_dir)? {
         let entry = entry?;
         let file_type = entry.file_type()?;
@@ -6612,7 +6612,7 @@ fn write_artifact_cache_key_memo_file(
     storage_root: &Path,
     entries: &BTreeMap<String, ArtifactCacheKeyMemoEntry>,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(storage_root)?;
+    crate::private_storage::open_root(storage_root)?;
     let path = artifact_cache_key_memo_path(storage_root);
     let temp_path = storage_root.join(format!(
         ".{ARTIFACT_CACHE_KEY_MEMO_FILE}.tmp.{}.{}",
@@ -6624,7 +6624,7 @@ fn write_artifact_cache_key_memo_file(
     ));
     let bytes = serde_json::to_vec_pretty(entries).map_err(std::io::Error::other)?;
     {
-        let mut file = File::create(&temp_path)?;
+        let mut file = crate::private_storage::create(&temp_path)?;
         file.write_all(&bytes)?;
     }
     if let Err(error) = fs::rename(&temp_path, &path) {

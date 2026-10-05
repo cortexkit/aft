@@ -2026,6 +2026,7 @@ impl StatePaths {
     }
 
     fn from_root(root: PathBuf) -> Self {
+        crate::private_storage::tighten_root(&root);
         Self {
             manifest: root.join("gh-routing-manifest.json"),
             rung: root.join("rung-cache.json"),
@@ -2060,15 +2061,29 @@ fn write_last_probe_silently(paths: &StatePaths, probe: &LastProbeReport) {
     let Ok(bytes) = serde_json::to_vec(probe) else {
         return;
     };
-    let _ = fs::create_dir_all(&paths.root);
+    let _ = crate::private_storage::open_root(&paths.root);
     let temporary = paths.last_probe.with_extension("tmp");
-    if fs::write(&temporary, bytes).is_ok() {
+    if crate::private_storage::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(temporary, &paths.last_probe);
     }
 }
 
 fn read_last_probe(paths: &StatePaths) -> Option<LastProbeReport> {
     serde_json::from_slice(&fs::read(&paths.last_probe).ok()?).ok()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn write_storage_permission_fixture(root: &Path) {
+    let paths = StatePaths::from_root(root.to_path_buf());
+    write_last_probe_silently(
+        &paths,
+        &LastProbeReport {
+            stage: "connect".to_string(),
+            elapsed_ms: 1,
+            outcome: "ok".to_string(),
+        },
+    );
+    assert!(paths.last_probe.is_file());
 }
 
 /// Resolve the one process-state directory used by every gh-shim reader and
@@ -2677,9 +2692,9 @@ fn write_rung_record_silently(paths: &StatePaths, record: &RungRecord) {
     let Ok(bytes) = serde_json::to_vec(record) else {
         return;
     };
-    let _ = fs::create_dir_all(&paths.root);
+    let _ = crate::private_storage::open_root(&paths.root);
     let temporary = paths.root.join("rung-cache.json.tmp");
-    if fs::write(&temporary, bytes).is_ok() {
+    if crate::private_storage::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(temporary, &paths.rung);
     }
 }
@@ -3054,11 +3069,11 @@ fn write_numeric_ids_silently(paths: &StatePaths, ids: &BTreeMap<String, u64>) {
     let Ok(bytes) = serde_json::to_vec(ids) else {
         return;
     };
-    if fs::create_dir_all(&paths.root).is_err() {
+    if crate::private_storage::open_root(&paths.root).is_err() {
         return;
     }
     let temporary = paths.root.join("numeric-ids.json.tmp");
-    if fs::write(&temporary, bytes).is_ok() {
+    if crate::private_storage::write(&temporary, bytes).is_ok() {
         #[cfg(windows)]
         let _ = fs::remove_file(&paths.numeric_ids);
         let _ = fs::rename(temporary, &paths.numeric_ids);
@@ -4027,9 +4042,9 @@ fn write_last_valid_manifest(paths: &StatePaths, manifest: &Manifest) {
         let (verifications, writes) = count.get();
         count.set((verifications, writes + 1));
     });
-    let _ = fs::create_dir_all(&paths.root);
+    let _ = crate::private_storage::open_root(&paths.root);
     let temporary = paths.last_valid_manifest.with_extension("tmp");
-    if fs::write(&temporary, bytes).is_ok() {
+    if crate::private_storage::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(temporary, &paths.last_valid_manifest);
     }
 }
@@ -4057,9 +4072,9 @@ fn write_version_high_water(paths: &StatePaths, newest_accepted_version: u64) {
     }) else {
         return;
     };
-    let _ = fs::create_dir_all(&paths.root);
+    let _ = crate::private_storage::open_root(&paths.root);
     let temporary = paths.version_high_water.with_extension("tmp");
-    if fs::write(&temporary, bytes).is_ok() {
+    if crate::private_storage::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(temporary, &paths.version_high_water);
     }
 }
@@ -4137,7 +4152,7 @@ fn retain_manifest(paths: &StatePaths, envelope: &SignedManifest, filing_version
         return;
     }
 
-    if fs::create_dir_all(&paths.manifests_dir).is_err() {
+    if crate::private_storage::open_dir(&paths.root, &paths.manifests_dir).is_err() {
         eprintln!("gh-shim: refusing to retain manifest: could not create manifests dir");
         return;
     }
@@ -4153,7 +4168,7 @@ fn retain_manifest(paths: &StatePaths, envelope: &SignedManifest, filing_version
     };
 
     let temporary = paths.manifests_dir.join(format!(".{file_name}.tmp"));
-    if fs::write(&temporary, &bytes).is_err() {
+    if crate::private_storage::write(&temporary, &bytes).is_err() {
         eprintln!("gh-shim: refusing to retain manifest: could not write temporary file");
         return;
     }
@@ -6376,7 +6391,7 @@ fn governed_seam_state(
 }
 
 fn write_seam_state(paths: &StatePaths, state: SeamState) -> io::Result<()> {
-    fs::create_dir_all(&paths.root)?;
+    crate::private_storage::open_root(&paths.root)?;
     let bytes = serde_json::to_vec(&state).map_err(io::Error::other)?;
     let temporary = paths.seam_state.with_extension("tmp");
     let mut file = OpenOptions::new()
@@ -6712,7 +6727,7 @@ fn append_label_bypass_audit(
 }
 
 fn append_bypass_audit_record(paths: &StatePaths, record: &Value) -> io::Result<()> {
-    fs::create_dir_all(&paths.root)?;
+    crate::private_storage::open_root(&paths.root)?;
     let mut record = serde_json::to_vec(record).map_err(io::Error::other)?;
     record.push(b'\n');
     let mut file = OpenOptions::new()
@@ -7080,9 +7095,9 @@ fn record_unexpected_gh_route_advertisers(paths: &StatePaths, advertisers: &[Str
     let Ok(bytes) = serde_json::to_vec(&recorded.into_iter().collect::<Vec<_>>()) else {
         return;
     };
-    let _ = fs::create_dir_all(&paths.root);
+    let _ = crate::private_storage::open_root(&paths.root);
     let temporary = paths.unexpected_gh_route_advertisers.with_extension("tmp");
-    if fs::write(&temporary, bytes).is_ok() {
+    if crate::private_storage::write(&temporary, bytes).is_ok() {
         let _ = fs::rename(temporary, &paths.unexpected_gh_route_advertisers);
     }
 }
