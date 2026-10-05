@@ -67,7 +67,7 @@ pub fn grade_reply(reply: &Reply) -> ReplyVerdict {
             reachable: reply.server_reachable,
             has_unknown_rebuild: reply.repositories.iter().any(|repo| {
                 !matches!(
-                    repo.last_rebuild_result,
+                    &repo.last_rebuild_result,
                     None | Some(
                         RebuildResult::Building | RebuildResult::Ok | RebuildResult::Failed
                     )

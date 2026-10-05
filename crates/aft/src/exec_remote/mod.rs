@@ -76,7 +76,7 @@ pub enum Verdict {
 /// The original terminal is delivered to the sink unchanged, including null
 /// `ran`, `tree_hash`, and `workspace_changes`; changed files are never copied.
 pub fn grade(terminal: &TerminalRecord) -> Verdict {
-    match terminal.ran {
+    match &terminal.ran {
         None | Some(Ran::Remote) | Some(Ran::None) => {}
         Some(_) => return Verdict::OutcomeUnknown,
     }
@@ -92,7 +92,7 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
         Outcome::Exit { .. } | Outcome::Signal { .. } | Outcome::Cancelled => {}
         _ => return Verdict::OutcomeUnknown,
     }
-    match terminal.killed {
+    match &terminal.killed {
         Some(Killed::Deadline) => return Verdict::DeadlineKilled,
         Some(Killed::Cancel) => return Verdict::CancelKilled,
         Some(_) => return Verdict::OutcomeUnknown,
@@ -108,3 +108,5 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wire_tests;
