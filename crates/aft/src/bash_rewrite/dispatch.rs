@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
@@ -34,15 +34,36 @@ pub struct DispatchRecord {
     pub route: DispatchRoute,
 }
 
-static ROUTE_RECORDS: OnceLock<Mutex<HashMap<String, DispatchRecord>>> = OnceLock::new();
+const MAX_ROUTE_RECORDS: usize = 1024;
 
-fn route_records() -> &'static Mutex<HashMap<String, DispatchRecord>> {
-    ROUTE_RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct RouteRecordStore {
+    records: HashMap<String, DispatchRecord>,
+    oldest_first: VecDeque<String>,
+}
+
+static ROUTE_RECORDS: OnceLock<Mutex<RouteRecordStore>> = OnceLock::new();
+
+fn route_records() -> &'static Mutex<RouteRecordStore> {
+    ROUTE_RECORDS.get_or_init(|| Mutex::new(RouteRecordStore::default()))
 }
 
 fn store_record(record: DispatchRecord) {
     if let Ok(mut records) = route_records().lock() {
-        records.insert(record.request_id.clone(), record.clone());
+        if records.records.contains_key(&record.request_id) {
+            records
+                .oldest_first
+                .retain(|request_id| request_id != &record.request_id);
+        }
+        records.oldest_first.push_back(record.request_id.clone());
+        records
+            .records
+            .insert(record.request_id.clone(), record.clone());
+        while records.oldest_first.len() > MAX_ROUTE_RECORDS {
+            if let Some(expired) = records.oldest_first.pop_front() {
+                records.records.remove(&expired);
+            }
+        }
     }
 
     // The sidecar is opt-in for the differential child process. Normal AFT
@@ -60,14 +81,15 @@ pub fn route_record(request_id: &str) -> Option<DispatchRecord> {
     route_records()
         .lock()
         .ok()
-        .and_then(|records| records.get(request_id).cloned())
+        .and_then(|records| records.records.get(request_id).cloned())
 }
 
 pub fn take_route_record(request_id: &str) -> Option<DispatchRecord> {
-    route_records()
-        .lock()
-        .ok()
-        .and_then(|mut records| records.remove(request_id))
+    let mut records = route_records().lock().ok()?;
+    records
+        .oldest_first
+        .retain(|record_id| record_id != request_id);
+    records.records.remove(request_id)
 }
 
 pub fn record_native(request_id: &str, role: ControlRole, branch_id: &str, reason: &str) {
@@ -183,5 +205,37 @@ mod tests {
             }
         );
         let _ = take_route_record("route-test");
+    }
+
+    #[test]
+    fn audit_growth_route_records_are_bounded_without_losing_the_latest_pending_record() {
+        const MAX_RECORDS: usize = 1024;
+        let prefix = format!("route-growth-{}-", std::process::id());
+        for index in 0..(MAX_RECORDS + 128) {
+            record_native(
+                &format!("{prefix}{index}"),
+                ControlRole::Native,
+                "dispatch.native.no_rule",
+                "test",
+            );
+        }
+
+        let retained = route_records()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records
+            .keys()
+            .filter(|request_id| request_id.starts_with(&prefix))
+            .count();
+        assert!(retained <= MAX_RECORDS, "retained {retained} route records");
+        let latest = format!("{prefix}{}", MAX_RECORDS + 127);
+        assert!(
+            route_record(&latest).is_some(),
+            "latest record remains readable"
+        );
+        assert!(
+            take_route_record(&latest).is_some(),
+            "caller can consume its record"
+        );
     }
 }
