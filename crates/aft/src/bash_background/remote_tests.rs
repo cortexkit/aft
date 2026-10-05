@@ -241,6 +241,56 @@ async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
 }
 
 #[tokio::test]
+async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
+    let daemon = daemon(Script::Continuous, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let task = registry.task(&task_id).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if task
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .remote
+                .as_ref()
+                .unwrap()
+                .last_seq
+                .is_some_and(|s| s >= 10)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(registry.record_remote_cancel(&task).unwrap());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, body)| body["method"] == "exec.cancel")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("steady output must not defer exec.cancel until a quiet period");
+    assert_eq!(
+        terminal(&registry, &task_id).await.info.status,
+        BgTaskStatus::Killed
+    );
+}
+
+#[tokio::test]
 async fn exec_remote_bash_deadline_is_not_cancel() {
     let daemon = daemon(Script::Deadline, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();

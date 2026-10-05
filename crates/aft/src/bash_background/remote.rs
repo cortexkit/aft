@@ -529,17 +529,28 @@ impl BgTaskRegistry {
         };
         let mut cancelled = false;
         loop {
+            // Poll intent even when every stream read is immediately ready.
+            // A new sleep per read cannot provide fairness under steady output.
+            let cancel = task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.cancel_requested);
+            if cancel && !cancelled {
+                if let Some(point) = stream.resume_point() {
+                    let _ = client.cancel_job(point.job_id).await;
+                    stream = self
+                        .attach_remote(&mut client, point, &remote, &root, &task)
+                        .await?;
+                    cancelled = true;
+                }
+            }
             let result = tokio::select! {
                 result=stream.next(&mut sink)=>result,
                 _=tokio::time::sleep(Duration::from_millis(50))=>{
-                    let cancel=task.state.lock().map_err(|_|"task lock poisoned")?.metadata.remote.as_ref().is_some_and(|r|r.cancel_requested);
-                    if cancel && !cancelled {
-                        if let Some(point)=stream.resume_point() {
-                            let _ = client.cancel_job(point.job_id).await;
-                            stream=self.attach_remote(&mut client,point,&remote,&root,&task).await?;
-                            cancelled=true;
-                        }
-                    }
                     continue;
                 }
             };
