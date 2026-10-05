@@ -5169,6 +5169,86 @@ mod fresh_payload_tests {
     }
 
     #[test]
+    fn header_scoped_policy_skips_are_complete_and_disclosed_once() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        for category in InspectCategory::active()
+            .iter()
+            .filter(|category| category.is_tier2())
+        {
+            payloads.insert(*category, serde_json::json!({
+                "not_computed": true, "unavailable": true, "complete": false,
+                "gaps": [{"kind": "tier2_unavailable", "reason": "analysis not ready; scoped inspection does not wait for Tier-2"}]
+            }));
+        }
+        let response = header_response(&payloads, &Sections::all());
+        assert_header(&response, "FRESH", true);
+        assert!(response.data.get("gaps").is_none(), "{}", response.data);
+        let text = response.data["text"].as_str().unwrap();
+        let notice = "dead code, unused exports, duplicates, cycles, complexity: not computed for scoped inspects; run aft_inspect without scope";
+        assert_eq!(text.matches(notice).count(), 1, "{text}");
+        assert!(
+            !text.contains("Dead code: 0") && !text.contains("Duplicates: 0"),
+            "{text}"
+        );
+        assert_eq!(response.data["summary"]["dead_code"]["complete"], true);
+    }
+
+    #[test]
+    fn header_scoped_cached_incomplete_analysis_is_still_partial() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::DeadCode, serde_json::json!({
+            "callgraph_available": false, "callgraph_unavailable_reason": "cached callgraph unavailable"
+        }));
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            1,
+            &ctx,
+            Some(&[PathBuf::from("/repo/src")]),
+        );
+        let response = build_inspect_terminal(
+            "scoped-cached-gap",
+            &InspectPhaseLog::for_request("scoped-cached-gap"),
+            InspectTerminal::Fresh(payload),
+        );
+        assert_header(
+            &response,
+            "PARTIAL — dead code unavailable: cached callgraph unavailable; retry aft_inspect.",
+            false,
+        );
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("scope: 1 root, 2 files"));
+    }
+
+    #[test]
+    fn header_groups_categories_with_the_same_reason() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        for category in [InspectCategory::DeadCode, InspectCategory::Duplicates] {
+            payloads.insert(
+                category,
+                serde_json::json!({
+                    "unavailable": true, "complete": false, "building": {"state": "building"},
+                    "gaps": [{"kind": "analysis_incomplete", "reason": "cold build still running"}]
+                }),
+            );
+        }
+        let response = header_response(&payloads, &Sections::all());
+        assert_header(
+            &response,
+            "PARTIAL — dead code, duplicates still building; retry aft_inspect.",
+            false,
+        );
+        assert_eq!(response.data["gaps"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
     fn header_several_gaps_are_one_line_shortest_first_with_overflow_in_body() {
         let mut payloads = fresh_payloads_for_all_categories();
         payloads.insert(InspectCategory::DeadCode, serde_json::json!({
