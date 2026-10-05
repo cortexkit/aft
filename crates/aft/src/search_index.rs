@@ -1443,6 +1443,31 @@ enum PreparedSearchPath {
     Skipped,
 }
 
+/// Prepared outside the index write lock. Applying this value only changes RAM
+/// tables; path resolution, metadata, bytes, hashing and trigram extraction have
+/// already finished.
+pub(crate) struct PreparedSearchUpdate {
+    path: PathBuf,
+    file: PreparedSearchPath,
+}
+
+pub(crate) fn prepare_search_update(
+    path: &Path,
+    max_file_size: u64,
+    remove: bool,
+) -> PreparedSearchUpdate {
+    let path = canonicalize_existing_or_deleted_path_with_memo(
+        path,
+        &mut ParentCanonicalizationMemo::default(),
+    );
+    let file = if remove {
+        PreparedSearchPath::Skipped
+    } else {
+        prepare_search_path(&path, max_file_size)
+    };
+    PreparedSearchUpdate { path, file }
+}
+
 #[derive(Clone, Debug, Default)]
 struct QueryBuild {
     and_runs: Vec<Vec<u8>>,
@@ -1820,12 +1845,16 @@ impl SearchIndex {
     ) {
         let canonical_path =
             canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
+        self.remove_resolved_file(path, &canonical_path);
+    }
+
+    fn remove_resolved_file(&mut self, path: &Path, canonical_path: &Path) {
         let file_id = {
             let path_to_id = Arc::make_mut(&mut self.path_to_id);
             if let Some(file_id) = path_to_id.remove(path) {
                 file_id
-            } else if canonical_path.as_path() != path {
-                let Some(file_id) = path_to_id.remove(&canonical_path) else {
+            } else if canonical_path != path {
+                let Some(file_id) = path_to_id.remove(canonical_path) else {
                     return;
                 };
                 file_id
@@ -1894,36 +1923,28 @@ impl SearchIndex {
         // canonical key as the initial corpus build so scoped queries can see it.
         let canonical_path =
             canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
-        self.remove_file_with_canonicalization_memo(&canonical_path, canonical_parents);
+        let file = prepare_search_path(&canonical_path, self.max_file_size);
+        self.apply_search_update(PreparedSearchUpdate {
+            path: canonical_path,
+            file,
+        });
+    }
 
-        let metadata = match fs::metadata(&canonical_path) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            _ => return,
-        };
+    pub(crate) fn max_file_size(&self) -> u64 {
+        self.max_file_size
+    }
 
-        let metadata = search_file_metadata(&metadata);
-
-        if is_binary_path(&canonical_path, metadata.size) {
-            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
-            return;
+    pub(crate) fn apply_search_update(&mut self, update: PreparedSearchUpdate) {
+        self.remove_resolved_file(&update.path, &update.path);
+        match update.file {
+            PreparedSearchPath::Indexed(file) => {
+                self.index_prepared_new_file(&update.path, file);
+            }
+            PreparedSearchPath::Unindexed(metadata) => {
+                self.track_unindexed_file_with_metadata(&update.path, metadata);
+            }
+            PreparedSearchPath::Skipped => {}
         }
-
-        if metadata.size > self.max_file_size {
-            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
-            return;
-        }
-
-        let content = match fs::read(&canonical_path) {
-            Ok(content) => content,
-            Err(_) => return,
-        };
-
-        if is_binary_bytes(&content) {
-            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
-            return;
-        }
-
-        self.index_file_with_metadata(&canonical_path, &content, metadata);
     }
 
     pub fn grep(

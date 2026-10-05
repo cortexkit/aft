@@ -2815,18 +2815,27 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 |path| {
                     if heavy_root_work_allowed && apply_ram_search_updates {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
+                            let max_file_size = ctx
+                                .search_index()
+                                .read()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .as_ref()
+                                .map(crate::search_index::SearchIndex::max_file_size);
+                            let Some(max_file_size) = max_file_size else {
+                                return;
+                            };
+                            let remove = watcher_path_is_ignored_by_current_matcher(ctx, path);
+                            let update = crate::search_index::prepare_search_update(
+                                path,
+                                max_file_size,
+                                remove,
+                            );
                             let mut index_ref = ctx
                                 .search_index()
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if let Some(index) = index_ref.as_mut() {
-                                if path.exists()
-                                    && !watcher_path_is_ignored_by_current_matcher(ctx, path)
-                                {
-                                    index.update_file(path);
-                                } else {
-                                    index.remove_file(path);
-                                }
+                                index.apply_search_update(update);
                             }
                         });
                     }
@@ -3796,6 +3805,48 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn perf_audit_watcher_search_io_outside_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        *ctx.search_index().write().unwrap() = Some(crate::search_index::SearchIndex::new());
+        let ctx = Arc::new(ctx);
+        let paths = (0..16)
+            .map(|i| {
+                let path = root.join(format!("file_{i:03}.rs"));
+                std::fs::write(&path, "fn marker() {}\n").unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+        let locked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let probe_ctx = Arc::clone(&ctx);
+        let probe_reads = reads.clone();
+        let probe_locked = locked.clone();
+        crate::search_index::audit_set_io_probe(Some(Box::new(move || {
+            probe_reads.set(probe_reads.get() + 1);
+            if probe_ctx.search_index().try_read().is_err() {
+                probe_locked.set(probe_locked.get() + 1);
+            }
+        })));
+        let mut slices = 0;
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {
+            slices += 1;
+            assert!(slices < 64);
+        }
+        crate::search_index::audit_set_io_probe(None);
+        assert_eq!(
+            reads.get(),
+            16,
+            "probe must reach the real file preparation"
+        );
+        assert_eq!(locked.get(), 0, "file I/O under search-index write lock");
+        let index = ctx.search_index().read().unwrap();
+        assert_eq!(index.as_ref().unwrap().file_count(), 16);
     }
 
     struct IgnoreRuleRefreshTestReset;
