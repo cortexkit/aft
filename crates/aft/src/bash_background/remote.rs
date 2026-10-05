@@ -1,11 +1,17 @@
 //! Remote jobs use the ordinary task registry and its raw output artifacts.
+#[cfg(unix)]
 use super::*;
+use crate::exec_remote::types::*;
+#[cfg(unix)]
 use crate::exec_remote::{
-    self as exec, types::*, ExecRemoteClient, OutputSink, ResumePoint, StreamProgress, Verdict,
+    self as exec, ExecRemoteClient, OutputSink, ResumePoint, StreamProgress, Verdict,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::io::{self, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
@@ -16,10 +22,15 @@ pub(crate) struct RemoteTask {
     pub last_seq: Option<u64>,
     pub stdout_len: u64,
     pub stderr_len: u64,
+    #[serde(default)]
+    pub unknown_len: u64,
     pub cancel_requested: bool,
     pub terminal: Option<TerminalRecord>,
+    #[serde(default)]
+    pub fallback_digest: Option<String>,
 }
 
+#[cfg(unix)]
 impl RemoteTask {
     fn point(&self) -> Option<ResumePoint> {
         Some(ResumePoint {
@@ -29,13 +40,16 @@ impl RemoteTask {
     }
 }
 
+#[cfg(unix)]
 struct TaskSink {
     registry: BgTaskRegistry,
     task: Arc<BgTask>,
     stdout: fs::File,
     stderr: fs::File,
+    unknown: Option<fs::File>,
 }
 
+#[cfg(unix)]
 impl TaskSink {
     fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> io::Result<Self> {
         let remote = task
@@ -57,6 +71,7 @@ impl TaskSink {
             task,
             stdout,
             stderr,
+            unknown: None,
         })
     }
 
@@ -85,6 +100,7 @@ impl TaskSink {
     }
 }
 
+#[cfg(unix)]
 fn open_task_artifact_for_remote(task: &BgTask, artifact: TaskArtifact) -> io::Result<fs::File> {
     if let Some(handles) = &task
         .state
@@ -102,6 +118,7 @@ fn open_task_artifact_for_remote(task: &BgTask, artifact: TaskArtifact) -> io::R
         .open_file(OsStr::new(artifact.file_name()), true)
 }
 
+#[cfg(unix)]
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         self.commit(|r| r.job_id = Some(accepted.job_id))
@@ -149,8 +166,39 @@ impl OutputSink for TaskSink {
         self.registry
             .persist_task_locked(&self.task, &state.metadata, &mut db)
     }
-    fn unknown_output(&mut self, seq: u64, _bytes: &[u8]) -> io::Result<()> {
-        self.commit(|r| r.last_seq = Some(seq))
+    fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
+        let remote = self
+            .task
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("task lock poisoned"))?
+            .metadata
+            .remote
+            .clone()
+            .unwrap();
+        if !bytes.is_empty() {
+            if self.unknown.is_none() {
+                let layout = resolve_task_layout(&self.task.paths.session_dir, &self.task.task_id)?;
+                let name = OsStr::new("remote-unknown-output");
+                let file = match layout.dirs.io.open_new_file(name) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        layout.dirs.io.open_file(name, true)?
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.unknown = Some(file);
+            }
+            let file = self.unknown.as_mut().unwrap();
+            file.seek(SeekFrom::Start(remote.unknown_len))?;
+            file.write_all(bytes)?;
+            file.set_len(remote.unknown_len + bytes.len() as u64)?;
+            file.sync_all()?;
+        }
+        self.commit(|r| {
+            r.last_seq = Some(seq);
+            r.unknown_len = remote.unknown_len + bytes.len() as u64;
+        })
     }
     fn terminal(&mut self, record: &TerminalRecord, _verdict: &Verdict) -> io::Result<()> {
         self.commit(|r| {
@@ -161,6 +209,7 @@ impl OutputSink for TaskSink {
 }
 
 #[derive(Clone)]
+#[cfg(unix)]
 struct LocalFallback {
     plan: SpawnPlan,
     shell_path: PathBuf,
@@ -223,7 +272,7 @@ impl BgTaskRegistry {
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
         metadata.status = BgTaskStatus::Running;
-        metadata.execution_note = Some("ran remotely on ck-motor".into());
+        metadata.execution_note = Some("remote execution requested on ck-motor".into());
         metadata.remote = Some(RemoteTask {
             connection_file: launch.connection_file,
             harness: launch.harness,
@@ -232,8 +281,10 @@ impl BgTaskRegistry {
             last_seq: None,
             stdout_len: 0,
             stderr_len: 0,
+            unknown_len: 0,
             cancel_requested: false,
             terminal: None,
+            fallback_digest: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -244,6 +295,16 @@ impl BgTaskRegistry {
             &shell_path,
         );
         attach_sandbox_metadata(&mut metadata, &plan);
+        let digest = crate::sandbox_spawn::save_local_launch(
+            &plan,
+            root.as_deref().unwrap_or(&workdir),
+            &workdir,
+            &crate::sandbox_spawn::current_authenticated_principal(),
+            &shell_path,
+            env.get("AFT_INTERNAL_LINUX_SCOPE")
+                .is_some_and(|v| v == "1"),
+        )?;
+        metadata.remote.as_mut().unwrap().fallback_digest = Some(digest);
         let handles =
             TaskIoHandles::create(&layout, BgMode::Pipes, true).map_err(|e| e.to_string())?;
         write_task_at(&layout, &metadata).map_err(|e| e.to_string())?;
@@ -259,25 +320,65 @@ impl BgTaskRegistry {
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
         let environment = if !plan.is_native_launcher() && plan.host_shell_path().is_none() {
-            std::env::vars().chain(env.clone()).collect()
+            std::env::vars_os()
+                .chain(env.clone().into_iter().map(|(k, v)| (k.into(), v.into())))
+                .filter(|(k, _)| {
+                    !k.to_str()
+                        .is_some_and(crate::agent_child_env::is_subc_credential_env_key)
+                })
+                .map(|(k, v)| {
+                    Ok((
+                        k.into_string().map_err(|_| {
+                            exec::Error::Protocol(
+                                "shell environment contains a non-Unicode key".into(),
+                            )
+                        })?,
+                        v.into_string().map_err(|_| {
+                            exec::Error::Protocol(
+                                "shell environment contains a non-Unicode value".into(),
+                            )
+                        })?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, exec::Error>>()
         } else {
             crate::sandbox_spawn::approved_environment_for_plan(&plan, &env)
                 .into_iter()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                .collect()
+                .map(|(k, v)| {
+                    Ok((
+                        k.into_string().map_err(|_| {
+                            exec::Error::Protocol(
+                                "shell environment contains a non-Unicode key".into(),
+                            )
+                        })?,
+                        v.into_string().map_err(|_| {
+                            exec::Error::Protocol(
+                                "shell environment contains a non-Unicode value".into(),
+                            )
+                        })?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, exec::Error>>()
         };
-        let request = exec::build_request(
-            request_root,
-            &repository_root(request_root),
-            &workdir,
-            command,
-            environment,
-            Some(hard_kill.limit().as_secs().max(1)),
-            &exec::PresetParams {
-                siblings: launch.params.siblings,
-                ..Default::default()
-            },
-        );
+        let request = environment.and_then(|environment| {
+            exec::build_request(
+                request_root,
+                &repository_root(request_root),
+                &workdir,
+                command,
+                environment,
+                Some(
+                    hard_kill
+                        .limit()
+                        .as_secs()
+                        .saturating_add(u64::from(hard_kill.limit().subsec_nanos() > 0)),
+                ),
+                &exec::PresetParams {
+                    siblings: launch.params.siblings,
+                    ..Default::default()
+                },
+            )
+        });
         let fallback = LocalFallback {
             plan,
             shell_path,
@@ -339,6 +440,17 @@ impl BgTaskRegistry {
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
         if let Some(record) = remote.terminal.as_ref() {
+            if let Verdict::RunLocally { reason } = exec::grade(record) {
+                return self.restored_remote_fallback(
+                    &task,
+                    &remote,
+                    &serde_json::to_value(reason)
+                        .unwrap()
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                );
+            }
             self.remote_terminal(&task, exec::grade(record), None);
             return Ok(());
         }
@@ -346,26 +458,32 @@ impl BgTaskRegistry {
             .connection_file
             .as_ref()
             .ok_or_else(|| "daemon connection file unavailable".to_string());
-        let client = match connection {
-            Ok(path) => ExecRemoteClient::connect(
-                path,
-                subc_protocol::BindIdentity::new(
-                    root.display().to_string(),
-                    remote.harness.clone(),
-                    remote.session.clone(),
-                ),
-            )
-            .await
-            .map_err(|e| e.to_string()),
-            Err(error) => Err(error),
-        };
-        let mut client = match client {
-            Ok(c) => c,
-            Err(error) => {
-                if let Some((_, fallback)) = initial.take() {
-                    return self.remote_fallback(&task, fallback, &error);
+        let mut client = loop {
+            let result = match &connection {
+                Ok(path) => ExecRemoteClient::connect(
+                    path,
+                    subc_protocol::BindIdentity::new(
+                        root.display().to_string(),
+                        remote.harness.clone(),
+                        remote.session.clone(),
+                    ),
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                Err(error) => Err(error.clone()),
+            };
+            match result {
+                Ok(c) => break c,
+                Err(error) => {
+                    if let Some((_, fallback)) = initial.take() {
+                        return self.remote_fallback(&task, fallback, &error);
+                    }
+                    if remote.point().is_some() && remote.connection_file.is_some() {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    return Err(format!("remote outcome unknown; attach required: {error}"));
                 }
-                return Err(format!("remote outcome unknown; attach required: {error}"));
             }
         };
         let mut fallback = None;
@@ -375,9 +493,21 @@ impl BgTaskRegistry {
                 Err(error) => return self.remote_fallback(&task, local, &error.to_string()),
             };
             fallback = Some(local);
-            client.run(&request).await.map_err(|e| e.to_string())?
+            match client.run(&request).await {
+                Ok(stream) => stream,
+                Err(error) if proves_no_start(&error) => {
+                    return self.remote_fallback(
+                        &task,
+                        fallback.take().unwrap(),
+                        &error.to_string(),
+                    )
+                }
+                Err(error) => {
+                    return Err(format!("remote outcome unknown; not resubmitted: {error}"))
+                }
+            }
         } else {
-            client.attach(remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?).await.map_err(|e|e.to_string())?
+            self.attach_remote(&mut client,remote.point().ok_or("remote outcome unknown: acceptance job ID was not persisted; command was not resubmitted")?,&remote,&root,&task).await?
         };
         let mut cancelled = false;
         loop {
@@ -387,8 +517,8 @@ impl BgTaskRegistry {
                     let cancel=task.state.lock().map_err(|_|"task lock poisoned")?.metadata.remote.as_ref().is_some_and(|r|r.cancel_requested);
                     if cancel && !cancelled {
                         if let Some(point)=stream.resume_point() {
-                            client.cancel_job(point.job_id).await.map_err(|e|e.to_string())?;
-                            stream=client.attach(point).await.map_err(|e|e.to_string())?;
+                            let _ = client.cancel_job(point.job_id).await;
+                            stream=self.attach_remote(&mut client,point,&remote,&root,&task).await?;
                             cancelled=true;
                         }
                     }
@@ -409,7 +539,15 @@ impl BgTaskRegistry {
                                 .to_owned(),
                         );
                     }
-                    return Err("remote executor refused after restart; no local launch context retained; command was not run".into());
+                    return self.restored_remote_fallback(
+                        &task,
+                        &remote,
+                        &serde_json::to_value(reason)
+                            .unwrap()
+                            .as_str()
+                            .unwrap_or("unknown")
+                            .to_owned(),
+                    );
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
                     self.remote_terminal(&task, verdict, None);
@@ -421,31 +559,52 @@ impl BgTaskRegistry {
                     };
                     // A known accepted job is recovered only by attach. Never
                     // convert a lost stream into another run or local fallback.
-                    loop {
-                        match client.attach(point.clone()).await {
-                            Ok(attached) => {
-                                stream = attached;
-                                break;
-                            }
-                            Err(_) => {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
-                                if let Some(path) = &remote.connection_file {
-                                    if let Ok(reconnected) = ExecRemoteClient::connect(
-                                        path,
-                                        subc_protocol::BindIdentity::new(
-                                            root.display().to_string(),
-                                            remote.harness.clone(),
-                                            remote.session.clone(),
-                                        ),
-                                    )
-                                    .await
-                                    {
-                                        client = reconnected;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    stream = self
+                        .attach_remote(&mut client, point, &remote, &root, &task)
+                        .await?;
+                }
+            }
+        }
+    }
+
+    async fn attach_remote(
+        &self,
+        client: &mut ExecRemoteClient,
+        point: ResumePoint,
+        remote: &RemoteTask,
+        root: &Path,
+        task: &Arc<BgTask>,
+    ) -> Result<exec::RemoteStream, String> {
+        point.attach_request().map_err(|e| e.to_string())?;
+        loop {
+            let cancel = task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .remote
+                .as_ref()
+                .is_some_and(|r| r.cancel_requested);
+            if cancel {
+                let _ = client.cancel_job(point.job_id).await;
+            }
+            if let Ok(stream) = client.attach(point.clone()).await {
+                return Ok(stream);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(path) = &remote.connection_file {
+                if let Ok(reconnected) = ExecRemoteClient::connect(
+                    path,
+                    subc_protocol::BindIdentity::new(
+                        root.display().to_string(),
+                        remote.harness.clone(),
+                        remote.session.clone(),
+                    ),
+                )
+                .await
+                {
+                    *client = reconnected;
                 }
             }
         }
@@ -460,6 +619,47 @@ impl BgTaskRegistry {
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let metadata = state.metadata.clone();
+        let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
+            .map_err(|e| e.to_string())?;
+        let durable = read_task_at(&layout).map_err(|e| e.to_string())?;
+        if durable.remote.as_ref().is_some_and(|r| r.cancel_requested) {
+            if let Some(remote) = state.metadata.remote.as_mut() {
+                remote.cancel_requested = true;
+            }
+            drop(state);
+            drop(db);
+            self.remote_terminal(task,Verdict::RunLocally { reason:RefusalReason::Unknown(reason.into()) },Some("remote refused before start; local fallback skipped because cancellation was requested".into()));
+            return Ok(());
+        }
+        // Commit the switch to local before spawning. A crash before the PID
+        // write must report an uncertain local start, never submit it again.
+        state.metadata.remote = None;
+        state.metadata.local_fallback_started = true;
+        state.metadata.started_at = unix_millis();
+        let reason = reason.replace(['\n', '\r'], " ");
+        state.metadata.execution_note =
+            Some(format!("ran locally: remote executor refused ({reason})"));
+        if let Some(changes) = metadata
+            .remote
+            .as_ref()
+            .and_then(|r| r.terminal.as_ref())
+            .and_then(|t| t.workspace_changes.as_ref())
+            .filter(|c| !c.is_empty())
+        {
+            state
+                .metadata
+                .execution_note
+                .as_mut()
+                .unwrap()
+                .push_str(&format!(
+                    "\nremote workspace_changes (not copied back): {}",
+                    serde_json::to_string(changes).unwrap()
+                ));
+        }
+        self.persist_task_locked(task, &state.metadata, &mut db)
+            .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        tests::after_local_fallback_marker(&task.task_id);
         let child = spawn_detached_child(
             &local.plan,
             &metadata.command,
@@ -472,9 +672,10 @@ impl BgTaskRegistry {
             local.capture_pipeline,
             local.linux_scope,
         )?;
-        state.metadata.remote = None;
-        state.metadata.execution_note =
-            Some(format!("ran locally: remote executor refused ({reason})"));
+        #[cfg(test)]
+        if tests::simulate_crash_before_local_pid(&task.task_id) {
+            return Ok(());
+        }
         state.metadata.mark_running(child.id(), child.id() as i32);
         state.runtime = TaskRuntime::Piped(Some(child));
         state.detached = false;
@@ -482,7 +683,59 @@ impl BgTaskRegistry {
             .map_err(|e| e.to_string())
     }
 
+    fn restored_remote_fallback(
+        &self,
+        task: &Arc<BgTask>,
+        remote: &RemoteTask,
+        reason: &str,
+    ) -> Result<(), String> {
+        let restore = (|| {
+            let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
+                .map_err(|e| e.to_string())?;
+            let (plan, shell_path, env, linux_scope) = crate::sandbox_spawn::restore_local_launch(
+                &layout,
+                remote
+                    .fallback_digest
+                    .as_deref()
+                    .ok_or("local snapshot digest absent")?,
+            )?;
+            let metadata = task
+                .state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .metadata
+                .clone();
+            let capture_pipeline = should_capture_pipeline_status(
+                &plan,
+                !metadata.pipeline_segments.is_empty(),
+                &shell_path,
+            );
+            // Replay has validated handles, but no local runtime retained them.
+            let handles = TaskIoHandles::reopen(&layout).map_err(|e| e.to_string())?;
+            task.state
+                .lock()
+                .map_err(|_| "task lock poisoned")?
+                .io_handles = Some(handles);
+            self.remote_fallback(
+                task,
+                LocalFallback {
+                    plan,
+                    shell_path,
+                    env,
+                    capture_pipeline,
+                    linux_scope,
+                },
+                reason,
+            )
+        })();
+        if let Err(error) = restore {
+            self.remote_terminal(task,Verdict::RunLocally { reason:RefusalReason::Unknown(reason.into()) },Some(format!("remote refused before start; the local fallback could not be restored after restart, so the command did not run: {error}")));
+        }
+        Ok(())
+    }
+
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
+        let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let (status, code, reason) = match verdict {
             Verdict::Exited { code } => (
                 if code == 0 {
@@ -495,7 +748,7 @@ impl BgTaskRegistry {
             ),
             Verdict::Signalled { signal } => (
                 BgTaskStatus::Failed,
-                Some(128 + signal),
+                128_i32.checked_add(signal),
                 Some(format!("remote signal {signal}")),
             ),
             Verdict::DeadlineKilled => (
@@ -509,8 +762,9 @@ impl BgTaskRegistry {
             Verdict::HistoryExpired => (
                 BgTaskStatus::FateUnknown,
                 None,
-                Some("remote history_expired; command not run".into()),
+                Some("remote history_expired; prior outcome unavailable; command not rerun".into()),
             ),
+            Verdict::RunLocally { .. } => (BgTaskStatus::Failed, None, error),
             _ => (
                 BgTaskStatus::FateUnknown,
                 None,
@@ -524,6 +778,17 @@ impl BgTaskRegistry {
             };
             if state.metadata.is_terminal() {
                 return;
+            }
+            if refused {
+                state.metadata.execution_note = Some("remote executor refused before start".into());
+            } else if matches!(
+                status,
+                BgTaskStatus::Completed
+                    | BgTaskStatus::Failed
+                    | BgTaskStatus::Killed
+                    | BgTaskStatus::TimedOut
+            ) {
+                state.metadata.execution_note = Some("ran remotely on ck-motor".into());
             }
             if let Some(terminal) = state
                 .metadata
@@ -573,15 +838,25 @@ impl BgTaskRegistry {
         let _ = self.inner.wake_tx.try_send(());
     }
 
-    pub(super) fn kill_remote_task(&self, task: &Arc<BgTask>) -> Result<BgTaskSnapshot, String> {
+    fn record_remote_cancel(&self, task: &Arc<BgTask>) -> Result<bool, String> {
         {
             let mut db = DeferredDbWrites::new(self, task);
             let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
             if !state.metadata.is_terminal() {
-                state.metadata.remote.as_mut().unwrap().cancel_requested = true;
+                let Some(remote) = state.metadata.remote.as_mut() else {
+                    return Ok(false);
+                };
+                remote.cancel_requested = true;
                 self.persist_task_locked(task, &state.metadata, &mut db)
                     .map_err(|e| e.to_string())?;
             }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn kill_remote_task(&self, task: &Arc<BgTask>) -> Result<BgTaskSnapshot, String> {
+        if !self.record_remote_cancel(task)? {
+            return self.kill(&task.task_id, &task.session_id);
         }
         let state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let (state, _) = task
@@ -592,7 +867,7 @@ impl BgTaskRegistry {
             .map_err(|_| "task lock poisoned")?;
         if !state.metadata.is_terminal() {
             return Err(
-                "remote cancel sent; terminal pending; inspect bash_status (never rerun)".into(),
+                "remote cancellation requested; terminal pending; inspect bash_status (never rerun)".into(),
             );
         }
         drop(state);
@@ -600,6 +875,7 @@ impl BgTaskRegistry {
     }
 }
 
+#[cfg(unix)]
 fn repository_root(root: &Path) -> PathBuf {
     let Some(gitdir) = fs::read_to_string(root.join(".git"))
         .ok()
@@ -612,6 +888,20 @@ fn repository_root(root: &Path) -> PathBuf {
         .and_then(|s| gitdir.join(s.trim()).canonicalize().ok())
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| root.into())
+}
+
+#[cfg(unix)]
+fn proves_no_start(error: &exec::Error) -> bool {
+    matches!(
+        error,
+        exec::Error::Transport(
+            subc_client_rs::CallError::NotSent(_)
+                | subc_client_rs::CallError::StaleRouteHandle(_)
+                | subc_client_rs::CallError::CapabilityUnprovided { .. }
+                | subc_client_rs::CallError::CapabilityAmbiguous { .. }
+                | subc_client_rs::CallError::InvalidCapabilityIdentifier { .. }
+        ) | exec::Error::Protocol(_)
+    )
 }
 
 #[cfg(all(test, unix))]

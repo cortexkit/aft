@@ -23,6 +23,7 @@ pub(crate) enum Script {
     Expired,
     Utf8,
     Deadline,
+    AttachRefused,
 }
 
 pub(crate) struct Daemon {
@@ -94,11 +95,12 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                             if !attaching && !matches!(script, Script::Refused | Script::KnownRefused) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                             }
-                            let outcome = if attaching && cancelled { Outcome::Signal { signal: 15 } }
+                            let outcome = if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
+                                else if attaching && cancelled { Outcome::Signal { signal: 15 } }
                                 else { match script {
                                     Script::Lost => Outcome::OutcomeUnknown,
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
-                                    Script::KnownRefused => Outcome::RefusedBeforeStart { reason: serde_json::from_value(json!("server_unreachable")).unwrap() },
+                                    Script::KnownRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
@@ -117,7 +119,7 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                                         replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(Output::new(seq,stream,BytePayload(bytes)))).unwrap()));
                                     }
                                 }
-                                if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart) || attaching) {
+                                if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart | Script::AttachRefused) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
                                     if cancelled { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }

@@ -29,13 +29,11 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 15;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 
-// Version 14 belongs to the separately developed call ledger. This branch has
-// no migration for it; integration inserts that migration before version 15.
-const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15];
+const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 
-const MIGRATION_V15: &str = r#"
+const MIGRATION_V14: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_exec_policies (
   project_root TEXT NOT NULL, harness TEXT NOT NULL, session TEXT NOT NULL,
   principal TEXT NOT NULL, owner TEXT NOT NULL, scope_ref TEXT NOT NULL,
@@ -875,7 +873,7 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
                 |row| row.get::<_, u32>(0),
             )
             .map(|object_count| object_count == 1),
-        15 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('remote_exec_policies','idx_remote_exec_policies_used')", [], |r| r.get::<_,u32>(0)).map(|n| n == 2),
+        14 => conn.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('remote_exec_policies','idx_remote_exec_policies_used')", [], |r| r.get::<_,u32>(0)).map(|n| n == 2),
         _ => Ok(false),
     }
 }
@@ -895,7 +893,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         11 => conn.execute_batch(MIGRATION_V11),
         12 => conn.execute_batch(MIGRATION_V12),
         13 => conn.execute_batch(MIGRATION_V13),
-        15 => conn.execute_batch(MIGRATION_V15),
+        14 => conn.execute_batch(MIGRATION_V14),
         _ => Ok(()),
     }
 }

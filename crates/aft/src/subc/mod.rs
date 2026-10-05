@@ -4138,6 +4138,7 @@ where
     };
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
+    shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
     let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor, storage_dir);

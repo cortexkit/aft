@@ -552,6 +552,8 @@ pub struct PersistedTask {
     pub(crate) remote: Option<super::registry::remote::RemoteTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_note: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_fallback_started: bool,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -623,6 +625,7 @@ impl PersistedTask {
             call_key,
             remote: None,
             execution_note: None,
+            local_fallback_started: false,
         }
     }
 
@@ -746,6 +749,7 @@ impl From<BashTaskRow> for PersistedTask {
             call_key: None,
             remote: None,
             execution_note: None,
+            local_fallback_started: false,
         }
     }
 }
@@ -1341,7 +1345,12 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    atomic_replace(dir, name, &content, task.remote.is_some())
+    atomic_replace(
+        dir,
+        name,
+        &content,
+        task.remote.is_some() || task.local_fallback_started,
+    )
 }
 
 pub fn update_task_at<F>(task: &ResolvedTask, update: F) -> io::Result<PersistedTask>
@@ -1831,6 +1840,29 @@ pub struct TaskIoHandles {
 }
 
 impl TaskIoHandles {
+    /// Replay fallback retains the same validated task artifacts rather than
+    /// creating a new task or replacing its output with another set of files.
+    #[cfg(unix)]
+    pub(crate) fn reopen(task: &ResolvedTask) -> io::Result<Self> {
+        let open = |a: TaskArtifact| task.dirs.io.open_file(OsStr::new(a.file_name()), true);
+        let mut stdout = open(TaskArtifact::Stdout)?;
+        stdout.seek(SeekFrom::End(0))?;
+        let mut stderr = open(TaskArtifact::Stderr)?;
+        stderr.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            dirs: task.dirs.clone(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            exit: open(TaskArtifact::Exit)?,
+            pipeline_status: Some(open(TaskArtifact::PipelineStatus)?),
+            pty: None,
+            sandbox_unavailable: open(TaskArtifact::SandboxUnavailable)?,
+            write_counter: crate::write_ledger::register(
+                crate::write_ledger::Domain::BashTaskIo,
+                task.paths.dir.display().to_string(),
+            ),
+        })
+    }
     pub fn create(
         task: &ResolvedTask,
         mode: BgMode,

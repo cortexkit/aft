@@ -58,14 +58,14 @@ use crate::sandbox_profile::SandboxProfile;
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
 
 /// Server-authenticated trust classification for a route bind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PrincipalTrust {
     FirstParty,
     Untrusted,
 }
 
 /// Principal data supplied by the server-side transport, never by a bash body.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AuthenticatedPrincipal {
     /// Standalone NDJSON and first-party plugin bindings have no route identity.
     FirstParty,
@@ -276,6 +276,162 @@ pub enum SpawnPlan {
         message: String,
         mismatch_class: Option<&'static str>,
     },
+}
+
+#[cfg(unix)]
+#[derive(serde::Serialize, serde::Deserialize)]
+enum SavedSpawnPolicy {
+    Unsandboxed,
+    Host {
+        shell_path: PathBuf,
+    },
+    Launcher {
+        profile: SandboxProfile,
+        launcher_path: PathBuf,
+    },
+}
+
+/// Private recovery data, never serialized into agent-readable task metadata.
+/// The environment is exactly the one already in the verified private payload;
+/// memory-only shim tickets and daemon credentials are not added to it.
+#[cfg(unix)]
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedLocalLaunch {
+    policy: SavedSpawnPolicy,
+    root: PathBuf,
+    cwd: PathBuf,
+    principal: AuthenticatedPrincipal,
+    shell_path: PathBuf,
+    environment: Vec<(OsString, OsString)>,
+    command: Vec<u8>,
+    payload_digest: [u8; 32],
+    linux_scope: bool,
+}
+
+#[cfg(unix)]
+pub(crate) const REMOTE_LOCAL_LAUNCH: &str = "remote-local-launch";
+
+#[cfg(unix)]
+pub(crate) fn save_local_launch(
+    plan: &SpawnPlan,
+    root: &Path,
+    cwd: &Path,
+    principal: &AuthenticatedPrincipal,
+    shell: &Path,
+    linux_scope: bool,
+) -> Result<String, String> {
+    let prepared = plan
+        .prepared_task()
+        .ok_or("local fallback payload absent")?;
+    let policy = match plan.policy() {
+        SpawnPlan::Unsandboxed => SavedSpawnPolicy::Unsandboxed,
+        SpawnPlan::Host { shell_path, .. } => SavedSpawnPolicy::Host {
+            shell_path: shell_path.clone(),
+        },
+        SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        } => SavedSpawnPolicy::Launcher {
+            profile: profile.clone(),
+            launcher_path: launcher_path.clone(),
+        },
+        _ => return Err("refused local launch cannot be saved".into()),
+    };
+    let snapshot = SavedLocalLaunch {
+        policy,
+        root: root.into(),
+        cwd: cwd.into(),
+        principal: principal.clone(),
+        shell_path: plan.host_shell_path().unwrap_or(shell).into(),
+        environment: prepared
+            .environment()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        command: prepared.0.command_bytes.as_ref().clone(),
+        payload_digest: *prepared.0.digest.as_bytes(),
+        linux_scope,
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
+    let mut file = crate::bash_background::persistence::create_control_file(
+        &prepared.0.dirs,
+        REMOTE_LOCAL_LAUNCH,
+        &bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    use std::io::Write;
+    file.flush().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(prepared.0.paths.task_id.as_bytes());
+    hash.update(&bytes);
+    Ok(hash.finalize().to_hex().to_string())
+}
+
+/// Reopen the frozen launch policy and verify the original payload. A missing
+/// or changed snapshot refuses recovery; current configuration is never used.
+#[cfg(unix)]
+pub(crate) fn restore_local_launch(
+    task: &crate::bash_background::persistence::ResolvedTask,
+    expected: &str,
+) -> Result<(SpawnPlan, PathBuf, HashMap<String, String>, bool), String> {
+    let mut file =
+        crate::bash_background::persistence::open_control_file(task, REMOTE_LOCAL_LAUNCH)
+            .map_err(|e| e.to_string())?;
+    let bytes = read_held_payload(&mut file)?;
+    let mut hash = blake3::Hasher::new();
+    hash.update(task.paths.task_id.as_bytes());
+    hash.update(&bytes);
+    if hash.finalize().to_hex().as_str() != expected {
+        return Err("local fallback snapshot digest mismatch".into());
+    }
+    let snapshot: SavedLocalLaunch = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let environment: ChildEnvironment = snapshot.environment.into_iter().collect();
+    let plan = match snapshot.policy {
+        SavedSpawnPolicy::Unsandboxed => SpawnPlan::Unsandboxed,
+        SavedSpawnPolicy::Host { shell_path } => SpawnPlan::Host {
+            shell_path,
+            environment: environment.clone(),
+        },
+        SavedSpawnPolicy::Launcher {
+            profile,
+            launcher_path,
+        } => SpawnPlan::Launcher {
+            profile,
+            launcher_path,
+        },
+    };
+    let prepared = verify_payload(
+        crate::bash_background::persistence::ResolvedTask {
+            paths: task.paths.clone(),
+            dirs: task.dirs.clone(),
+        },
+        &snapshot.command,
+        &snapshot.root,
+        &snapshot.cwd,
+        &snapshot.principal,
+        &snapshot.shell_path,
+        &environment,
+        Some(blake3::Hash::from_bytes(snapshot.payload_digest)),
+        false,
+    )?;
+    let env = environment
+        .into_iter()
+        .map(|(k, v)| {
+            Ok((
+                k.into_string()
+                    .map_err(|_| "non-Unicode fallback environment key")?,
+                v.into_string()
+                    .map_err(|_| "non-Unicode fallback environment value")?,
+            ))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    Ok((
+        plan.with_prepared_task(prepared),
+        snapshot.shell_path,
+        env,
+        snapshot.linux_scope,
+    ))
 }
 
 impl SpawnPlan {

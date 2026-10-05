@@ -1368,6 +1368,21 @@ impl BgTaskRegistry {
         snapshot
     }
 
+    pub(crate) fn execution_note(&self, task_id: &str, session: &str) -> Option<String> {
+        self.task_for_session(task_id, session)?
+            .state
+            .lock()
+            .ok()?
+            .metadata
+            .execution_note
+            .clone()
+    }
+
+    pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
+        self.task_for_session(task_id, session)
+            .is_some_and(|t| t.state.lock().is_ok_and(|s| s.metadata.remote.is_some()))
+    }
+
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
         // When a watchdog pass is publishing this terminal state, record that
         // pass before the completion becomes visible below, so a reader that
@@ -3569,7 +3584,10 @@ impl BgTaskRegistry {
                 {
                     // Output and cursor commit to the task file together;
                     // the database mirror may lag after a process crash.
-                    if disk.remote.is_some() {
+                    if disk.remote.is_some()
+                        || disk.local_fallback_started
+                        || metadata.remote.is_some()
+                    {
                         metadata = disk;
                     }
                 }
@@ -3596,10 +3614,10 @@ impl BgTaskRegistry {
                 }
             }
             let paths = resolved.paths;
+            #[cfg(unix)]
             if metadata.remote.is_some() && !metadata.is_terminal() {
                 let task_id = metadata.task_id.clone();
                 self.insert_rehydrated_task(metadata, paths, true)?;
-                #[cfg(unix)]
                 self.resume_remote_task(&task_id)?;
                 continue;
             }
@@ -4939,10 +4957,13 @@ impl BgTaskRegistry {
         // Declared before the lock so the aft.db write runs after it is released.
         let mut db = DeferredDbWrites::new(self, &task);
         let mut state = task.state.lock().ok()?;
-        if state.metadata.status.is_terminal() {
+        if state.metadata.status.is_terminal() || state.metadata.remote.is_some() {
             return None;
         }
-        let wanted = task.started.elapsed().saturating_add(window).as_millis() as u64;
+        let wanted = task
+            .elapsed_for_metadata(&state.metadata)
+            .saturating_add(window)
+            .as_millis() as u64;
         let current = state.metadata.timeout_ms?;
         if wanted <= current {
             return None;
@@ -4986,6 +5007,9 @@ impl BgTaskRegistry {
     ) -> Option<HardKillDeadline> {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.state.lock().ok()?;
+        if state.metadata.remote.is_some() {
+            return None;
+        }
         HardKillDeadline::from_metadata(state.metadata.timeout_ms, task.hard_kill_renewable)
     }
 
@@ -6493,6 +6517,9 @@ impl BgTaskRegistry {
         let (mut output_preview, output_truncated) = render
             .map(|cache| completion_preview_for_cache(cache, metadata.exit_code))
             .unwrap_or_else(|| (String::new(), false));
+        if let Some(note) = &metadata.execution_note {
+            output_preview = format!("{note}\n{output_preview}");
+        }
         if metadata.status == BgTaskStatus::FateUnknown {
             if let Some(reason) = metadata.status_reason.as_deref() {
                 output_preview = if output_preview.is_empty() {
@@ -8190,6 +8217,15 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
 }
 
 impl BgTask {
+    pub(crate) fn elapsed_for_metadata(&self, metadata: &PersistedTask) -> Duration {
+        if metadata.local_fallback_started {
+            // The refused job's queue wait is not part of the local command's
+            // run budget. Its durable start also works after a second restart.
+            Duration::from_millis(unix_millis().saturating_sub(metadata.started_at))
+        } else {
+            self.started.elapsed()
+        }
+    }
     fn snapshot(&self, preview_bytes: usize) -> BgTaskSnapshot {
         let state = self
             .state
@@ -8204,7 +8240,7 @@ impl BgTask {
             metadata
                 .status
                 .is_terminal()
-                .then(|| self.started.elapsed().as_millis() as u64)
+                .then(|| self.elapsed_for_metadata(metadata).as_millis() as u64)
         });
         let (output_preview, output_truncated) = if metadata.mode == BgMode::Pty {
             (String::new(), false)
@@ -8257,12 +8293,13 @@ impl BgTask {
             live_descendants_summary: live_descendants_summary(metadata),
             kill_signaled: false,
             kill_reached: 0,
-            hard_kill: HardKillDeadline::from_metadata(
-                metadata.timeout_ms,
-                self.hard_kill_renewable,
-            ),
+            hard_kill: if metadata.remote.is_none() {
+                HardKillDeadline::from_metadata(metadata.timeout_ms, self.hard_kill_renewable)
+            } else {
+                None
+            },
             elapsed_ms: (!metadata.status.is_terminal())
-                .then(|| self.started.elapsed().as_millis() as u64),
+                .then(|| self.elapsed_for_metadata(metadata).as_millis() as u64),
         }
     }
 

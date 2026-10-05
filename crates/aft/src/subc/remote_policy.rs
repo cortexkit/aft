@@ -81,7 +81,13 @@ pub(super) fn catalog(
                     log::warn!(
                         "remote execution routing disabled: malformed catalog params: {error}"
                     );
-                    crate::exec_remote::FrozenParams::default()
+                    crate::exec_remote::FrozenParams {
+                        host: original
+                            .get("host")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        ..Default::default()
+                    }
                 }
             };
             let Some(db) = ctx.db() else {
@@ -128,7 +134,10 @@ pub(super) fn lookup(
     .ok()??;
     Some(crate::bash_background::RemoteLaunch {
         params: policy,
-        connection_file: ctx.config().semantic.subc_connection_file.clone(),
+        connection_file: ctx
+            .app()
+            .subc_connection_file()
+            .or_else(|| ctx.config().semantic.subc_connection_file.clone()),
         harness: key.harness.clone(),
         session: key.session.clone(),
     })

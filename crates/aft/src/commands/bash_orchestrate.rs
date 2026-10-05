@@ -121,6 +121,11 @@ pub(crate) fn kill_deadline_note(
     session_id: &str,
     worker_session: bool,
 ) -> String {
+    if let Some(note) = registry.execution_note(task_id, session_id) {
+        // Remote timeouts are enforced from run start, not queue entry; AFT
+        // cannot infer their remaining wall-clock time or renew the runner.
+        return format!("\n{note}");
+    }
     format!(
         "\n{}",
         kill_deadline_sentence(

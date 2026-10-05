@@ -168,9 +168,14 @@ async fn observe_deferred_bash_wait(
 /// Hands a held call's command to the background the way a drain detach does
 /// (the task keeps running and delivers its completion later), off the
 /// executor and off the module loop's thread: promotion writes task metadata.
-fn detach_held_bash_in_background(target: drain::BashDetachTarget) {
+pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, cancelled: bool) {
     tokio::task::spawn_blocking(move || {
-        if target.server_completion {
+        if target.server_completion
+            && (cancelled
+                || !target
+                    .registry
+                    .is_remote_task(&target.task_id, &target.session_id))
+        {
             let _ = target.registry.kill(&target.task_id, &target.session_id);
         } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
             log::warn!(
@@ -215,8 +220,22 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                     route.epoch,
                     corr,
                     target.flags,
-                    "cancelled",
-                    "server-owned call ended during module drain",
+                    if target
+                        .registry
+                        .is_remote_task(&target.task_id, &target.session_id)
+                    {
+                        "outcome_unknown_module_draining"
+                    } else {
+                        "cancelled"
+                    },
+                    &if target
+                        .registry
+                        .is_remote_task(&target.task_id, &target.session_id)
+                    {
+                        format!("remote task {} survives module drain; inspect bash_status after reconnecting, never rerun the command",target.task_id)
+                    } else {
+                        "server-owned call ended during module drain".into()
+                    },
                 )?)
             }
             (drain::BashLoopAnswer::Drain, Some(identity)) => {
@@ -252,7 +271,7 @@ pub(super) async fn answer_held_bash_calls_from_module_loop(
                 "request cancelled",
             )?),
         };
-        detach_held_bash_in_background(target);
+        detach_held_bash_in_background(target, matches!(reason, drain::BashLoopAnswer::Cancel));
         if let Some(frame) = frame {
             send_reliable_writer_frame(tx, metrics, frame, "held bash answer").await?;
         }
@@ -906,7 +925,8 @@ async fn run_deferred_bash_wait(
                     let session_id = session_id.clone();
                     let task_id = task_id.clone();
                     let _ = tokio::task::spawn_blocking(move || {
-                        if server_completion { let _ = registry.kill(&task_id, &session_id); }
+                        if server_completion && !registry.is_remote_task(&task_id,&session_id) { let _ = registry.kill(&task_id, &session_id); }
+                        else if registry.is_remote_task(&task_id,&session_id) { let _=registry.promote(&task_id,&session_id); }
                         release_wait_registration(
                             &registry,
                             &session_id,

@@ -147,6 +147,34 @@ pub fn sweep(conn: &Connection, now: u64) -> rusqlite::Result<usize> {
             removed += conn.execute("DELETE FROM remote_exec_policies WHERE rowid=?1", [rowid])?;
         }
     }
+    // Rotate a second bounded page so an absent, recently used root behind
+    // live older rows is eventually visited too. This cursor is maintenance
+    // progress only, not routing state. Keep it on the owning database so
+    // independent stores and restarts cannot interfere with the rotation.
+    let cursor = conn
+        .query_row(
+            "SELECT value FROM host_state WHERE key='remote_exec_root_sweep_cursor'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let rows = {
+        let mut stmt=conn.prepare("SELECT rowid,project_root FROM remote_exec_policies WHERE rowid>?1 ORDER BY rowid LIMIT ?2")?;
+        let rows = stmt
+            .query_map(params![cursor, POLICY_SWEEP_BATCH as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    conn.execute("INSERT INTO host_state (key,value,updated_at) VALUES ('remote_exec_root_sweep_cursor',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",params![rows.last().map_or(0,|r|r.0).to_string(),now as i64])?;
+    for (rowid, root) in rows {
+        if !std::path::Path::new(&root).exists() {
+            removed += conn.execute("DELETE FROM remote_exec_policies WHERE rowid=?1", [rowid])?;
+        }
+    }
     Ok(removed)
 }
 
@@ -218,6 +246,10 @@ mod tests {
         {
             let conn = crate::db::open(&path).unwrap();
             freeze(&conn, &key, &policy(true), 100).unwrap();
+            assert!(
+                lookup(&conn, &key, 100).unwrap().is_some(),
+                "the first process routed before restart"
+            );
         }
         let conn = crate::db::open(&path).unwrap();
         assert!(
@@ -294,13 +326,13 @@ mod tests {
 
     #[test]
     fn exec_remote_migration_from_previous_version_preserves_existing_data() {
-        for previous in [13, 14] {
+        for previous in [12, 13] {
             let mut conn = Connection::open_in_memory().unwrap();
             crate::db::run_migrations(&mut conn).unwrap();
             conn.execute_batch("DROP TABLE remote_exec_policies; CREATE TABLE unrelated (v TEXT); INSERT INTO unrelated VALUES ('keep');").unwrap();
             conn.execute("UPDATE schema_version SET version=?1", [previous])
                 .unwrap();
-            assert_eq!(crate::db::run_migrations(&mut conn).unwrap(), 15);
+            assert_eq!(crate::db::run_migrations(&mut conn).unwrap(), 14);
             assert_eq!(
                 conn.query_row("SELECT v FROM unrelated", [], |r| r.get::<_, String>(0))
                     .unwrap(),
@@ -311,5 +343,22 @@ mod tests {
             freeze(&conn, &key, &policy(true), 100).unwrap();
             assert!(lookup(&conn, &key, 200).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn exec_remote_policy_sweep_reaches_recent_deleted_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let mut key = key(dir.path());
+        for n in 0..POLICY_SWEEP_BATCH + 3 {
+            key.session = n.to_string();
+            freeze(&conn, &key, &policy(true), 100).unwrap();
+        }
+        key.project_root = dir.path().join("gone").display().to_string();
+        freeze(&conn, &key, &policy(true), 200).unwrap();
+        for _ in 0..4 {
+            sweep(&conn, 201).unwrap();
+        }
+        assert!(lookup(&conn, &key, 201).unwrap().is_none());
     }
 }

@@ -90,6 +90,15 @@ fn exec_remote_catalog_freezes_verbatim_plan_and_isolates_scope_epoch_and_sessio
     // A second route under the same bind sees the policy, but another epoch
     // or an unscoped call cannot borrow it.
     let new_epoch = identity(root.path(), "one", 8, true);
+    let mut other_principal = identity(root.path(), "one", 7, true);
+    if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut Arc::get_mut(&mut other_principal.0)
+            .unwrap()
+            .spawn_principal
+    {
+        *principal_id = Some("reserved:another-carrier".into());
+    }
+    assert!(lookup(&ctx, key(&other_principal, Some("worker")).as_ref()).is_none());
     assert!(lookup(&ctx, key(&new_epoch, Some("worker")).as_ref()).is_none());
     let unscoped = identity(root.path(), "one", 7, false);
     assert!(lookup(&ctx, key(&unscoped, Some("worker")).as_ref()).is_none());
@@ -216,6 +225,8 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
     let bind = identity(root.path(), "one", 7, true);
     let root_id = bind.root.clone();
     let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));
+    ctx.app()
+        .set_subc_connection_file(daemon.connection.clone());
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root_id.clone(), Arc::new(ctx)));
     let (writer, mut replies) = mpsc::channel(8);
@@ -240,7 +251,9 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
     // Simulate losing every in-memory route/context. The new call route opens
     // no catalog fetch; only the original persisted policy can route it.
     drop(executor);
-    let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));
+    let ctx = context(root.path(), storage.path(), None);
+    ctx.app()
+        .set_subc_connection_file(daemon.connection.clone());
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root_id.clone(), Arc::new(ctx)));
     let routes = HashMap::from([(route_key(42, 1), bind)]);
@@ -317,4 +330,144 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
         request["params"]["siblings"],
         plan("broca-worker")["tool_items"][0]["params"]["siblings"]
     );
+}
+
+#[tokio::test]
+async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
+    let ctx = test_support::test_ctx();
+    let app = ctx.app();
+    let executor = Arc::new(Executor::new());
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = dir.path().join("module-connection.json");
+    let (mut peer, module) = tokio::io::duplex(65536);
+    let (read, write) = tokio::io::split(module);
+    let peer_task = async {
+        let hello = subc_transport::read_frame(&mut peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello.header.ty, FrameType::Hello);
+        let ack = Frame::build(
+            FrameType::HelloAck,
+            control_flags(),
+            0,
+            0,
+            hello.header.corr,
+            serde_json::to_vec(&ModuleHelloAckBody {
+                negotiated_ver: PROTOCOL_VERSION,
+                subc_ops: vec![],
+                subc_capabilities: vec![],
+                storage: None,
+                machine_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        subc_transport::write_frame(&mut peer, &ack).await.unwrap();
+        let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, vec![]).unwrap();
+        subc_transport::write_frame(&mut peer, &goodbye)
+            .await
+            .unwrap();
+    };
+    let module_task = run_module_loop(
+        read,
+        write,
+        &endpoint,
+        app.clone(),
+        executor,
+        |req, _| Response::success(req.id, json!({})),
+        None,
+        false,
+        1024 * 1024,
+        None,
+        dir.path(),
+    );
+    let (result, _) = tokio::join!(module_task, peer_task);
+    result.unwrap();
+    assert_eq!(app.subc_connection_file(), Some(endpoint));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
+    for cancelled in [false, true] {
+        let daemon = crate::exec_remote::wire_tests::daemon(
+            crate::exec_remote::wire_tests::Script::Cancel,
+            "exec-remote/v1",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path(), dir.path(), Some(daemon.connection.clone()));
+        let registry = ctx.bash_background().clone();
+        let task = registry
+            .spawn_remote(
+                crate::bash_background::RemoteLaunch {
+                    params: Default::default(),
+                    connection_file: Some(daemon.connection.clone()),
+                    harness: "runner".into(),
+                    session: "session".into(),
+                },
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "cargo test",
+                crate::bash_background::registry::resolve_posix_shell(),
+                "session".into(),
+                dir.path().into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                dir.path().into(),
+                10,
+                true,
+                false,
+                Some(dir.path().into()),
+            )
+            .unwrap();
+        registry.begin_wait_mode_session("session", &task);
+        bash::detach_held_bash_in_background(
+            drain::BashDetachTarget {
+                registry: registry.clone(),
+                task_id: task.clone(),
+                session_id: "session".into(),
+                wait_mode: true,
+                worker_session: true,
+                server_completion: true,
+                request_id: "remote-drain".into(),
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                format_context: Default::default(),
+            },
+            cancelled,
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while registry.active_wait_session_count() != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let status = registry
+            .observed_status(&task, "session", 0)
+            .unwrap()
+            .info
+            .status;
+        assert_eq!(
+            status,
+            if cancelled {
+                crate::bash_background::BgTaskStatus::Killed
+            } else {
+                crate::bash_background::BgTaskStatus::Running
+            }
+        );
+        let sent = daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, b)| b["method"] == "exec.cancel");
+        assert_eq!(sent, cancelled);
+        if !cancelled {
+            tokio::task::spawn_blocking(move || registry.kill(&task, "session").unwrap())
+                .await
+                .unwrap();
+        }
+    }
 }

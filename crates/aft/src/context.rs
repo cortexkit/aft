@@ -2331,6 +2331,9 @@ pub struct App {
     /// actor points at this handle so roots do not open duplicate SQLite/WAL
     /// descriptors for the same database.
     db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<TrackedConnection>>)>>,
+    /// The authenticated module connection's endpoint, independent of model
+    /// backend configuration. Consumer routes must use this same daemon.
+    subc_connection_file: parking_lot::RwLock<Option<PathBuf>>,
     lifecycle_census: crate::lifecycle_census::LifecycleCensusCache,
     active_watchers: AtomicUsize,
     active_actor_roots: AtomicUsize,
@@ -2346,9 +2349,16 @@ pub struct App {
 }
 
 impl App {
+    pub(crate) fn set_subc_connection_file(&self, path: PathBuf) {
+        *self.subc_connection_file.write() = Some(path);
+    }
+    pub(crate) fn subc_connection_file(&self) -> Option<PathBuf> {
+        self.subc_connection_file.read().clone()
+    }
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
             db: parking_lot::Mutex::new(None),
+            subc_connection_file: parking_lot::RwLock::new(None),
             lifecycle_census: crate::lifecycle_census::LifecycleCensusCache::default(),
             active_watchers: AtomicUsize::new(0),
             active_actor_roots: AtomicUsize::new(0),
