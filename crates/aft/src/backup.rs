@@ -354,6 +354,41 @@ fn same_capture_stat(left: &std::fs::Metadata, right: &std::fs::Metadata) -> boo
     left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
+/// Version evidence for a durable blob. Include change time as well as inode,
+/// size and modification time: replacing a blob or resetting its mtime must
+/// invalidate the cached bytes. Platforms without change-time evidence take
+/// the uncached read path rather than trusting size and mtime alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiskFileVersion([u64; 7]);
+
+impl DiskFileVersion {
+    #[cfg(unix)]
+    pub(crate) fn of_path(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self([
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime() as u64,
+            meta.mtime_nsec() as u64,
+            meta.ctime() as u64,
+            meta.ctime_nsec() as u64,
+        ]))
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn of_path(_path: &Path) -> Option<Self> {
+        None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedBackupContent {
+    version: DiskFileVersion,
+    bytes: Arc<[u8]>,
+}
+
 fn read_captured_content(path: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(test)]
     {
@@ -711,6 +746,8 @@ pub struct BackupStore {
     entries: HashMap<String, HashMap<PathBuf, Vec<BackupEntry>>>,
     /// session -> path -> disk metadata
     disk_index: HashMap<String, HashMap<PathBuf, DiskMeta>>,
+    /// Shared blob bytes guarded by file version; metadata is always reloaded.
+    hydrated_entries: Mutex<HashMap<PathBuf, CachedBackupContent>>,
     /// session -> metadata
     session_meta: HashMap<String, SessionMeta>,
     counter: AtomicU64,
@@ -742,6 +779,8 @@ pub struct BackupStore {
     enforce_temp_path_policy: bool,
     #[cfg(test)]
     disk_io_count: AtomicU64,
+    #[cfg(test)]
+    history_content_reads: AtomicU64,
     #[cfg(test)]
     fail_next_disk_write: bool,
 }
@@ -783,6 +822,7 @@ impl BackupStore {
         BackupStore {
             entries: HashMap::new(),
             disk_index: HashMap::new(),
+            hydrated_entries: Mutex::new(HashMap::new()),
             session_meta: HashMap::new(),
             counter: AtomicU64::new(0),
             storage_dir: None,
@@ -801,6 +841,8 @@ impl BackupStore {
             enforce_temp_path_policy: false,
             #[cfg(test)]
             disk_io_count: AtomicU64::new(0),
+            #[cfg(test)]
+            history_content_reads: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_disk_write: false,
         }
@@ -901,6 +943,10 @@ impl BackupStore {
             namespaces.clear();
         }
         self.entries.clear();
+        self.hydrated_entries
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.disk_index.clear();
         self.session_meta.clear();
         self.skipped_backups.clear();
@@ -3752,18 +3798,42 @@ impl BackupStore {
         index: usize,
     ) -> Result<BackupEntry, String> {
         let kind = entry_kind_from_meta(Some(entry_meta));
-        let content_bytes = if kind.has_content_file() {
+        let content_file = if kind.has_content_file() {
+            Some(dir.join(content_path_from_meta(entry_meta)?))
+        } else {
+            None
+        };
+        let version = content_file.as_deref().and_then(DiskFileVersion::of_path);
+        let cached_bytes = if let (Some(path), Some(version)) = (&content_file, version) {
+            let cache = self
+                .hydrated_entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .get(path)
+                .filter(|cached| cached.version == version)
+                .map(|cached| Arc::clone(&cached.bytes))
+        } else {
+            None
+        };
+        let content_bytes: Arc<[u8]> = if let Some(bytes) = cached_bytes {
+            bytes
+        } else if kind.has_content_file() {
             let content_path = content_path_from_meta(entry_meta)?;
             let path = dir.join(content_path);
-            std::fs::read(&path).map_err(|error| {
-                format!(
-                    "failed to read v2 backup content {}: {}",
-                    path.display(),
-                    error
-                )
-            })?
+            #[cfg(test)]
+            self.history_content_reads.fetch_add(1, Ordering::Relaxed);
+            std::fs::read(&path)
+                .map_err(|error| {
+                    format!(
+                        "failed to read v2 backup content {}: {}",
+                        path.display(),
+                        error
+                    )
+                })?
+                .into()
         } else {
-            Vec::new()
+            Arc::from([])
         };
         let entry = entry_from_meta(Some(entry_meta), index, kind, content_bytes);
         if kind == BackupEntryKind::HardLink && entry.link_to.is_none() {
@@ -3771,6 +3841,21 @@ impl BackupStore {
                 "v2 backup entry {} is a hard link without link_to",
                 entry.backup_id
             ));
+        }
+        if let (Some(path), Some(version)) = (content_file, version) {
+            // A concurrent change during the read cannot seed a cache entry.
+            if DiskFileVersion::of_path(&path) == Some(version) {
+                self.hydrated_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        path,
+                        CachedBackupContent {
+                            version,
+                            bytes: Arc::clone(&entry.content_bytes),
+                        },
+                    );
+            }
         }
         Ok(entry)
     }
@@ -3928,6 +4013,16 @@ impl BackupStore {
                 message: error.to_string(),
             }
         })?;
+        self.hydrated_entries
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|path, _| {
+                path.parent() != Some(dir.as_path())
+                    || path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| referenced_content.contains(name))
+            });
         crate::write_ledger::credit(
             crate::write_ledger::Domain::Backups,
             key.display().to_string(),
@@ -4119,6 +4214,13 @@ impl BackupStore {
     }
 
     fn remove_disk_backups_locked(&mut self, session: &str, key: &Path) -> Result<(), AftError> {
+        if let Some(session_dir) = self.session_dir(session) {
+            let dir = session_dir.join(Self::path_hash(key));
+            self.hydrated_entries
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|path, _| path.parent() != Some(dir.as_path()));
+        }
         // Failures are logged inside; disk stays authoritative for this caller.
         let _ = self.remove_db_backups(session, key);
         let removed = self.disk_index.get_mut(session).and_then(|s| s.remove(key));
@@ -5040,8 +5142,9 @@ fn entry_from_meta(
     entry_meta: Option<&serde_json::Value>,
     index: usize,
     kind: BackupEntryKind,
-    content_bytes: Vec<u8>,
+    content_bytes: impl Into<Arc<[u8]>>,
 ) -> BackupEntry {
+    let content_bytes = content_bytes.into();
     let backup_id = entry_backup_id(entry_meta, index);
     let timestamp = entry_meta
         .and_then(|meta| meta.get("timestamp"))
@@ -5474,6 +5577,64 @@ mod tests {
             if cfg!(unix) { 3 } else { 2 },
             "{next:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_history_reads_only_uncached_content() {
+        let (mut store, _storage, path) = durability_store();
+        let session = "history-work-count";
+        let bytes = vec![0xff; 256 * 1024];
+        std::fs::write(&path, &bytes).unwrap();
+        for _ in 0..20 {
+            store
+                .snapshot(session, &path, "large binary baseline")
+                .unwrap();
+        }
+        store.history_content_reads.store(0, Ordering::Relaxed);
+        store
+            .snapshot(session, &path, "steady-depth append")
+            .unwrap();
+        let reads = store.history_content_reads.load(Ordering::Relaxed);
+        assert_eq!(reads, 1, "steady-depth history content reads");
+        for entry in store.history(session, &path) {
+            assert_eq!(&*entry.content_bytes, &bytes);
+            assert_eq!(entry.content, String::from_utf8_lossy(&bytes));
+        }
+        std::fs::write(&path, b"edited").unwrap();
+        store.restore_latest(session, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_backup_content_reloads_changed_blob_with_preserved_mtime() {
+        let (mut store, _storage, path) = durability_store();
+        store.snapshot("cache-change", &path, "baseline").unwrap();
+        let key = canonicalize_key(&path);
+        let first = store
+            .read_stack_from_disk_unlocked("cache-change", &key)
+            .unwrap()
+            .unwrap();
+        let dir = store
+            .session_dir("cache-change")
+            .unwrap()
+            .join(BackupStore::path_hash(&key));
+        let blob = dir.join(content_filename_for_entry(&first[0]).unwrap());
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&blob).unwrap());
+        let changed = vec![b'x'; first[0].content_bytes.len()];
+        std::fs::write(&blob, &changed).unwrap();
+        filetime::set_file_mtime(&blob, mtime).unwrap();
+        let reloaded = store
+            .read_stack_from_disk_unlocked("cache-change", &key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*reloaded[0].content_bytes, changed);
+        std::fs::remove_file(&blob).unwrap();
+        assert!(store
+            .read_stack_from_disk_unlocked("cache-change", &key)
+            .is_err());
     }
 
     #[cfg(unix)]
