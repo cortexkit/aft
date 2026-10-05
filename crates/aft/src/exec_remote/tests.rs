@@ -7,6 +7,37 @@ fn job_id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
+#[test]
+fn accepted_021_vector_and_single_locked_contract_are_pinned() {
+    use sha2::{Digest, Sha256};
+    let canonical = include_bytes!("fixtures/frames/accepted.jcs");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(canonical)),
+        include_str!("fixtures/frames/accepted.sha256")
+    );
+    let mut value: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/frames/accepted.json")).unwrap();
+    // This vector contains only ASCII strings and small integers. Sorting its
+    // object keys is the independent JCS step, regardless of serde map order.
+    value.as_object_mut().unwrap().sort_keys();
+    assert_eq!(serde_json::to_vec(&value).unwrap(), canonical);
+    let record: StreamRecord = serde_json::from_value(value).unwrap();
+    let StreamRecord::Accepted(accepted) = record else {
+        panic!("accepted vector must decode as acceptance")
+    };
+    assert_eq!(accepted.env_not_forwarded, Some(Vec::new()));
+    let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+    let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
+    let packages: Vec<_> = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
+        .collect();
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.1"));
+}
+
 // Resolve the locked, published package rather than a second copy of its corpus.
 // Metadata runs offline, so these tests cannot silently download new goldens.
 fn vectors() -> &'static std::path::Path {
@@ -30,7 +61,7 @@ fn vectors() -> &'static std::path::Path {
             .filter(|p| p["name"] == "cortexkit-exec-remote-types")
             .collect();
         assert_eq!(packages.len(), 1, "exactly one caller contract version");
-        assert_eq!(packages[0]["version"], "0.2.0");
+        assert_eq!(packages[0]["version"], "0.2.1");
         PathBuf::from(packages[0]["manifest_path"].as_str().unwrap())
             .parent()
             .unwrap()

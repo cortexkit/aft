@@ -28,6 +28,8 @@ pub(crate) struct RemoteTask {
     pub terminal: Option<TerminalRecord>,
     #[serde(default)]
     pub fallback_digest: Option<String>,
+    #[serde(default)]
+    pub env_not_forwarded: Option<Vec<String>>,
 }
 
 #[cfg(unix)]
@@ -121,7 +123,21 @@ fn open_task_artifact_for_remote(task: &BgTask, artifact: TaskArtifact) -> io::R
 #[cfg(unix)]
 impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
-        self.commit(|r| r.job_id = Some(accepted.job_id))
+        self.commit(|r| {
+            r.job_id = Some(accepted.job_id);
+            if accepted.env_not_forwarded.is_some() {
+                r.env_not_forwarded = accepted.env_not_forwarded.clone();
+            }
+        })?;
+        let mut db = DeferredDbWrites::new(&self.registry, &self.task);
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("task lock poisoned"))?;
+        append_executor_environment_disclosure(&mut state.metadata);
+        self.registry
+            .persist_task_locked(&self.task, &state.metadata, &mut db)
     }
     fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> io::Result<()> {
         let remote = self
@@ -303,6 +319,7 @@ impl BgTaskRegistry {
             cancel_requested: false,
             terminal: None,
             fallback_digest: None,
+            env_not_forwarded: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -948,6 +965,7 @@ fn repository_root(root: &Path) -> PathBuf {
 #[cfg(unix)]
 fn append_output_loss(metadata: &mut PersistedTask) {
     append_environment_disclosure(metadata);
+    append_executor_environment_disclosure(metadata);
     for (first, last) in &metadata.incomplete_output {
         let warning = format!(
             "output lost between seq {first} and {last}: the executor no longer retained it"
@@ -970,6 +988,36 @@ fn append_environment_disclosure(metadata: &mut PersistedTask) {
         "AFT stripped env names: {}",
         serde_json::to_string(&metadata.stripped_env_names).unwrap()
     );
+    let note = metadata
+        .execution_note
+        .get_or_insert_with(|| "remote execution on ck-motor".into());
+    if !note.contains(&disclosure) {
+        note.push_str(&format!("; {disclosure}"));
+    }
+}
+
+#[cfg(unix)]
+fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
+    let Some(names) = metadata
+        .remote
+        .as_ref()
+        .and_then(|r| r.env_not_forwarded.as_ref())
+        .filter(|n| !n.is_empty())
+    else {
+        return;
+    };
+    let shown = names.len().min(10);
+    let mut disclosure = format!(
+        "the remote job does not receive: {}",
+        names[..shown]
+            .iter()
+            .map(|name| name.escape_default().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if names.len() > shown {
+        disclosure.push_str(&format!("; +{} more", names.len() - shown));
+    }
     let note = metadata
         .execution_note
         .get_or_insert_with(|| "remote execution on ck-motor".into());

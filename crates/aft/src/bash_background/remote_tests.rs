@@ -257,6 +257,66 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
 }
 
 #[tokio::test]
+async fn exec_remote_bash_executor_env_disclosure_survives_reattach_and_caps_names() {
+    let StreamRecord::Accepted(base) =
+        serde_json::from_str(include_str!("../exec_remote/fixtures/frames/accepted.json")).unwrap()
+    else {
+        panic!("accepted vector")
+    };
+    let names: Vec<String> = (0..13).map(|n| format!("VAR_{n:02}")).collect();
+    for dropped in [base.env_not_forwarded.clone(), None, Some(names.clone())] {
+        let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let (original, task_id, paths) = persist_accepted_with_snapshot(
+            dir.path(),
+            daemon.connection.clone(),
+            "printf must-not-run",
+        );
+        let task = original.task(&task_id).unwrap();
+        let mut sink = TaskSink::new(&original, task).unwrap();
+        let mut accepted = base.clone();
+        accepted.env_not_forwarded = dropped.clone();
+        sink.accepted(&accepted).unwrap();
+        drop(sink);
+        drop(original);
+        let restarted = registry();
+        restarted.replay_session(dir.path(), "session").unwrap();
+        let done = terminal(&restarted, &task_id).await;
+        let line = "the remote job does not receive:";
+        if dropped.as_ref().is_some_and(|names| !names.is_empty()) {
+            assert!(
+                done.output_preview
+                    .contains(&format!("{line} {}; +3 more", names[..10].join(", "))),
+                "{done:?}"
+            );
+            assert!(!done.output_preview.contains("VAR_10"));
+        } else {
+            assert!(!done.output_preview.contains(line), "{done:?}");
+        }
+        assert!(!done.output_preview.contains("all forwarded"));
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.json).unwrap()).unwrap();
+        assert_eq!(
+            json["remote"]["env_not_forwarded"],
+            serde_json::to_value(&dropped).unwrap()
+        );
+        let replay = registry();
+        replay.replay_session(dir.path(), "session").unwrap();
+        let done = terminal(&replay, &task_id).await;
+        assert_eq!(
+            done.output_preview.contains(line),
+            dropped.as_ref().is_some_and(|names| !names.is_empty())
+        );
+        assert!(!daemon
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, b)| b["method"] == "exec.run"));
+    }
+}
+
+#[tokio::test]
 async fn exec_remote_bash_kill_sends_cancel_and_reports_terminal() {
     let daemon = daemon(Script::Cancel, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -403,6 +463,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         cancel_requested: false,
         terminal: None,
         fallback_digest: None,
+        env_not_forwarded: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -553,6 +614,7 @@ fn persist_accepted_with_snapshot(
         cancel_requested: false,
         terminal: None,
         fallback_digest: Some(digest),
+        env_not_forwarded: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
