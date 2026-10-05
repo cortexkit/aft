@@ -2563,8 +2563,13 @@ fn build_inspect_payload(
     let scope_files = scope_roots.map(|_| {
         payloads
             .get(&InspectCategory::Diagnostics)
-            .and_then(|payload| payload.get("coverage"))
-            .and_then(|coverage| coverage.get("files"))
+            .and_then(|payload| {
+                payload.get("scope_files").or_else(|| {
+                    payload
+                        .get("coverage")
+                        .and_then(|coverage| coverage.get("files"))
+                })
+            })
             .and_then(Value::as_u64)
             .or_else(|| {
                 payloads
@@ -5539,6 +5544,39 @@ mod fresh_payload_tests {
         let text = payload["text"].as_str().unwrap();
         assert!(text.contains("\nscope: 1 root, 606 files\n"), "{text}");
         assert!(text.contains("606 of 606 scoped files"), "{text}");
+    }
+
+    #[test]
+    fn scoped_inspect_file_accounting_survives_no_diagnostics_sweep() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::Metrics, serde_json::json!({
+            "unavailable": true, "complete": false, "gaps": [{"kind": "analysis_incomplete", "reason": "metrics still scanning"}]
+        }));
+        // Warm scoped collection inventories files without opening them. It has
+        // no sweep coverage, and an unfinished metrics scan has no file count.
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["scope_files"] =
+            serde_json::json!(1);
+        let payload = build_inspect_payload(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            20,
+            &ctx,
+            Some(&[PathBuf::from("/repo/src")]),
+        );
+        assert_eq!(payload["scope_files"], 1, "{payload:#}");
+        assert!(
+            payload.get("no_files_matched_scope").is_none(),
+            "{payload:#}"
+        );
+        assert!(payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("scope: 1 root, 1 file"));
     }
 
     #[test]

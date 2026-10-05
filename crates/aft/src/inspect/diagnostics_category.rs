@@ -239,6 +239,10 @@ pub(crate) fn run_diagnostics_category(
             .map(|gap| gap.file.clone())
             .collect::<HashSet<_>>();
         let mut payload = collection.into_payload(snapshot);
+        // File inventory is independent of analysis: warm collection performs
+        // no sweep, and another scanner may exhaust its budget before reporting
+        // a count. Keep uncovered files from being mistaken for an empty scope.
+        payload["scope_files"] = serde_json::json!(candidates.len());
         if let Some(sweep) = sweep.as_mut() {
             // Files with authoritative diagnostics, counted the same way the
             // gap list is built, so the coverage line and the gap lines
@@ -1472,6 +1476,11 @@ mod payload_count_tests {
         let scope = JobScope::from_roots(&project, vec![project.join("images/app.dockerfile")]);
         let scoped = run(&scope, true);
         assert_eq!(scoped["complete"], false);
+        assert_eq!(scoped["scope_files"], 1);
+        assert!(
+            scoped.get("coverage").is_none(),
+            "warm collection must not claim a sweep"
+        );
         // Scoped requests already name their uncovered paths: no second list.
         assert!(scoped["gaps"][0].get("affected_files").is_none());
         assert_eq!(scoped["gaps"].as_array().unwrap().len(), 2);
