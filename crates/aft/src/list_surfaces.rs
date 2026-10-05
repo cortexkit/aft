@@ -503,6 +503,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "subc_format.rs",
+        enclosing_item: "structure_outline_trailer_stays_last_after_skips",
+        location_or_primitive: "walk_truncated",
+        reason: "test-only response fixture proving that an integrated structure-map trailer remains last after skipped-file diagnostics; production outline walk and budget cuts are registered on the outline surface",
+    },
+    ExclusionEntry {
+        file: "subc_format.rs",
         enclosing_item: "directory_outline_preserves_walk_truncation_footer, files_outline_uses_the_counting_walk_limit_in_partial_footer",
         location_or_primitive: "subc_format walk truncation footer tests",
         reason: "test assertions verifying legacy walk truncation footer",
