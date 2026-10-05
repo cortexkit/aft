@@ -1293,7 +1293,11 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
                 "{response:#}"
             );
             assert_eq!(
-                response["summary"]["duplicates"]["complete"], false,
+                response["summary"]["duplicates"]["complete"], true,
+                "{response:#}"
+            );
+            assert_eq!(
+                response["summary"]["duplicates"]["not_computed"], true,
                 "{response:#}"
             );
             assert!(
@@ -1317,7 +1321,10 @@ fn scoped_inspect_does_not_wait_for_blocked_tier2() {
             );
             let text = response["text"].as_str().unwrap();
             assert!(
-                text.contains("Incomplete duplicates: Tier-2 unavailable"),
+                text.contains("duplicates")
+                    && text.contains(
+                        "not computed for scoped inspects; run aft_inspect without scope"
+                    ),
                 "{text}"
             );
             assert!(
@@ -1403,7 +1410,7 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
             text.contains("building") && text.contains("estimate"),
             "{text}"
         );
-        let reason = summary["gaps"][0]["reason"].as_str().unwrap();
+        let reason = summary["background_reason"].as_str().unwrap();
         assert!(
             !reason.contains("retry")
                 && !reason.contains("inspect_phase")
@@ -1813,7 +1820,7 @@ fn inspect_command_ignores_retired_tier2_deadline_overrides() {
     );
 
     assert_eq!(response["success"], true, "response: {response:#}");
-    assert!(response.get("complete").is_none());
+    assert_eq!(response["complete"], true, "response: {response:#}");
     assert!(response["summary"]["duplicates"].get("status").is_none());
 }
 
@@ -2898,7 +2905,7 @@ fn inspect_tool_call_empty_analyzed_scope_uses_zero_denominator() {
     assert_eq!(response["summary"]["duplicates"]["total_analyzed_lines"], 0);
     let text = response["text"].as_str().expect("rendered inspect text");
     assert!(
-        text.starts_with("scope: 1 root, 0 files (no analyzed files under this scope)\n"),
+        text.starts_with("FRESH\nscope: 1 root, 0 files (no analyzed files under this scope)\n"),
         "response: {response:#}"
     );
     assert!(
@@ -6266,8 +6273,15 @@ fn unscoped_inspect_names_an_unfinished_cargo_check() {
         "{response:#}"
     );
     let text = response["text"].as_str().expect("rendered text");
+    // An unscoped request also reports incomplete dead-code analysis. The
+    // diagnostic cause must remain in the same status line, not necessarily first.
     assert!(
-        text.starts_with("PARTIAL — diagnostics unknown: rust-analyzer @ .: cargo check still running; retry aft_inspect."),
+        text.lines()
+            .next()
+            .is_some_and(|line| line.starts_with("PARTIAL — ")
+                && line
+                    .contains("diagnostics unknown: rust-analyzer @ .: cargo check still running")
+                && line.ends_with("; retry aft_inspect.")),
         "{text}"
     );
     assert!(!text.contains("producer rust failed"), "{text}");

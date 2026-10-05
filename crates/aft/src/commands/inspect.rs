@@ -703,8 +703,9 @@ fn handle_inspect_payload(
     // than reading as zero.
     refresh_status_bar_counts(ctx, &outcomes);
 
-    // Scoped inspection may compute from its own immutable view, but never
-    // schedules or joins a legacy project-wide build. Missing cache rows are gaps.
+    // A cache-only scoped request deliberately skips missing or unverified
+    // Tier-2 results. A view scan that actually ran, or an incomplete result
+    // served from cache, still contributes real gaps to request completion.
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
@@ -715,15 +716,17 @@ fn handle_inspect_payload(
                     _ if ctx.is_worktree_bridge() => "analysis not available in this worktree; scoped inspection does not run Tier-2".into(),
                     _ => "analysis not ready; scoped inspection does not wait for Tier-2".into(),
                 };
-                *outcome = JobOutcome::Fresh {
-                    payload: manager.tier2_incomplete_payload(
-                        &snapshot,
-                        *category,
-                        &scope,
-                        "tier2_unavailable",
-                        reason,
-                    ),
-                };
+                let mut payload = manager.tier2_incomplete_payload(
+                    &snapshot,
+                    *category,
+                    &scope,
+                    "tier2_unavailable",
+                    reason,
+                );
+                if !use_checkout_view {
+                    payload["not_computed"] = Value::Bool(true);
+                }
+                *outcome = JobOutcome::Fresh { payload };
             }
         }
     }
@@ -1790,6 +1793,9 @@ fn set_inspect_completion(payload: &mut Map<String, Value>) {
 }
 
 fn category_is_incomplete(value: &Value) -> bool {
+    if value.get("not_computed").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
     value.get("complete").and_then(Value::as_bool) == Some(false)
         || value.get("unavailable").and_then(Value::as_bool) == Some(true)
         || value.get("callgraph_available").and_then(Value::as_bool) == Some(false)
@@ -1851,16 +1857,16 @@ fn incomplete_category_gaps(category: InspectCategory, value: &Value) -> Vec<Val
 /// Short scanner explanations precede verbose diagnostic producer explanations.
 /// Diagnostic causes retain first-seen order, including their scoped roots.
 fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<(bool, String)> {
-    let mut parts = Vec::new();
+    let mut groups = Vec::<(String, Vec<String>)>::new();
     for (category, value) in summary {
         if category == "diagnostics" || !category_is_incomplete(value) {
             continue;
         }
         let label = category.replace('_', " ");
         let reason = match value.pointer("/building/state").and_then(Value::as_str) {
-            Some("building") => format!("{label} still building"),
-            Some("rebuilding") => format!("{label} still rebuilding"),
-            Some(state) => format!("{label} still building ({})", state.replace('_', " ")),
+            Some("building") => "still building".to_string(),
+            Some("rebuilding") => "still rebuilding".to_string(),
+            Some(state) => format!("still building ({})", state.replace('_', " ")),
             None => {
                 let reason = value
                     .get("gaps")
@@ -1875,11 +1881,20 @@ fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<(bool, String)>
                     } else {
                         "incomplete"
                     };
-                format!("{label} {status}: {reason}")
+                format!("{status}: {reason}")
             }
         };
-        parts.push((false, compact_inspect_reason(&reason)));
+        let reason = compact_inspect_reason(&reason);
+        if let Some((_, labels)) = groups.iter_mut().find(|(cause, _)| cause == &reason) {
+            labels.push(label);
+        } else {
+            groups.push((reason, vec![label]));
+        }
     }
+    let mut parts = groups
+        .into_iter()
+        .map(|(reason, labels)| (false, format!("{} {reason}", labels.join(", "))))
+        .collect::<Vec<_>>();
     parts.sort_by_key(|(_, reason)| reason.len());
     if let Some(causes) = summary
         .get("diagnostics")
@@ -2569,6 +2584,27 @@ fn build_inspect_payload(
         let payload = payloads
             .get(category)
             .expect("all active categories have a fresh inspect payload");
+        if payload.get("not_computed").and_then(Value::as_bool) == Some(true) {
+            let mut category_summary = serde_json::json!({
+                "not_computed": true, "complete": true,
+                "reason": "not computed for scoped inspects; run aft_inspect without scope"
+            });
+            for key in ["building", "last_complete"] {
+                if let Some(value) = payload.get(key) {
+                    category_summary[key] = value.clone();
+                }
+            }
+            if category_summary.get("building").is_some()
+                || category_summary.get("last_complete").is_some()
+            {
+                category_summary["background_reason"] = payload["gaps"][0]["reason"].clone();
+            }
+            summary.insert(category.as_str().to_string(), category_summary);
+            if sections.includes(*category) {
+                details.insert(category.as_str().to_string(), Value::Null);
+            }
+            continue;
+        }
         if payload.get("unavailable").and_then(Value::as_bool) == Some(true) {
             let category_gaps = incomplete_category_gaps(*category, payload);
             gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
@@ -2781,6 +2817,40 @@ fn render_inspect_text(
         ));
     }
 
+    let skipped = summary
+        .iter()
+        .filter(|(_, value)| value["not_computed"] == true)
+        .collect::<Vec<_>>();
+    if !skipped.is_empty() {
+        let labels = skipped
+            .iter()
+            .map(|(category, _)| category.replace('_', " "))
+            .collect::<Vec<_>>();
+        let mut line = format!(
+            "{}: not computed for scoped inspects; run aft_inspect without scope",
+            labels.join(", ")
+        );
+        let background = skipped
+            .iter()
+            .filter_map(|(category, value)| {
+                value["background_reason"].as_str().map(|reason| {
+                    format!(
+                        "{}: {}",
+                        category.replace('_', " "),
+                        compact_inspect_reason(reason)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !background.is_empty() {
+            line.push_str(&format!(
+                " (background analysis: {})",
+                background.join("; ")
+            ));
+        }
+        lines.push(line);
+    }
+
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary, details);
@@ -2788,7 +2858,10 @@ fn render_inspect_text(
     // is their only output.
     let available_summary = summary
         .iter()
-        .filter(|(_, value)| value.get("unavailable").and_then(Value::as_bool) != Some(true))
+        .filter(|(_, value)| {
+            value.get("unavailable").and_then(Value::as_bool) != Some(true)
+                && value["not_computed"] != true
+        })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<String, Value>>();
     let summary = &available_summary;
