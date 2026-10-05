@@ -117,7 +117,8 @@ fn inspect_checkout_view_warm_verification_does_not_rehash_corpus() {
     let edited = job.project_root.join("source_0.ts");
     let modified = std::fs::metadata(&edited).unwrap().modified().unwrap();
     std::fs::write(&edited, "export function source_0() { return 9; }\n").unwrap();
-    std::fs::File::open(&edited).unwrap().set_modified(modified).unwrap();
+    // Windows requires write access to change a file's timestamps.
+    std::fs::OpenOptions::new().write(true).open(&edited).unwrap().set_modified(modified).unwrap();
     crate::cache_freshness::invalidate_verify_memo(&job.project_root);
     assert!(manager.current_checkout_view(&snapshot, Some(&stats)).is_none());
     assert!(crate::views::read::take_verification_io().files_read > 0);
