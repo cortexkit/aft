@@ -2495,13 +2495,22 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
 
     let phase_two_cache = tempfile::tempdir().unwrap();
     let phase_two_ready = project.path().join("phase-two-configured");
-    let mut phase_two = Command::new(env!("CARGO_BIN_EXE_aft"))
+    let mut phase_two_command = Command::new(env!("CARGO_BIN_EXE_aft"));
+    phase_two_command
+        .env_remove("AFT_STORAGE_DIR")
         .env("AFT_CACHE_DIR", phase_two_cache.path())
+        .env("HOME", phase_two_cache.path().join("home"))
+        .env("USERPROFILE", phase_two_cache.path().join("home"))
+        .env("XDG_CONFIG_HOME", phase_two_cache.path().join("config"))
+        .env("XDG_DATA_HOME", phase_two_cache.path().join("data"))
+        .env("XDG_CACHE_HOME", phase_two_cache.path().join("cache"))
         .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
         .env("AFT_TEST_RAW_PATH", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    crate::test_helpers::assert_child_storage_isolated(&phase_two_command);
+    let mut phase_two = phase_two_command
         .spawn()
         .expect("spawn unread re-arm process");
     {

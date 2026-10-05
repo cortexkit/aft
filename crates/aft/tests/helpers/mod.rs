@@ -397,10 +397,26 @@ impl AftProcess {
         let diag_enabled =
             std::env::var_os("AFT_TEST_DIAG").as_deref() == Some(std::ffi::OsStr::new("1"));
         let cache_dir = tempfile::tempdir().expect("create aft test cache dir");
+        let home = cache_dir.path().join("home");
+        let config = cache_dir.path().join("config");
+        let data = cache_dir.path().join("data");
+        let cache = cache_dir.path().join("cache");
+        for directory in [&home, &config, &data, &cache] {
+            std::fs::create_dir_all(directory).expect("create isolated host directory");
+        }
         let mut command = Command::new(binary);
         command
             .envs(hermetic_git_env())
+            // The child's retained cache root is authoritative. An outer
+            // worker override would otherwise hide its fixture namespaces.
+            // Explicit envs below may still select AFT_STORAGE_DIR themselves.
+            .env_remove("AFT_STORAGE_DIR")
             .env("AFT_CACHE_DIR", cache_dir.path())
+            .env("HOME",&home)
+            .env("USERPROFILE",&home)
+            .env("XDG_CONFIG_HOME",&config)
+            .env("XDG_DATA_HOME",&data)
+            .env("XDG_CACHE_HOME",&cache)
             // Keep the embedding model cache inside this process's temp
             // directory so no test reads or writes the real ~/.cache/fastembed.
             .env("FASTEMBED_CACHE_DIR", cache_dir.path().join("fastembed"))
@@ -449,6 +465,7 @@ impl AftProcess {
         for key in removed {
             command.env_remove(key);
         }
+        assert_child_storage_isolated(&command);
 
         #[cfg(windows)]
         let mut child = {
@@ -989,6 +1006,46 @@ impl AftProcess {
             Err(_) => "io error: try_read_next_timeout panicked; see stdout trace".to_string(),
         }
     }
+}
+
+pub(crate) fn assert_child_storage_isolated(command: &Command) {
+    let explicit = |name: &str| {
+        command
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(name))
+            .and_then(|(_, v)| v)
+    };
+    let root = explicit("AFT_STORAGE_DIR")
+        .filter(|v| !v.is_empty())
+        .or_else(|| explicit("AFT_CACHE_DIR").filter(|v| !v.is_empty()))
+        .or_else(|| explicit("XDG_DATA_HOME").filter(|v| !v.is_empty()))
+        .or_else(|| explicit("HOME").filter(|v| !v.is_empty()))
+        .expect("test child must have explicit isolated storage or host directories");
+    let path = Path::new(root)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(root));
+    let temporary = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    assert!(
+        path.starts_with(&temporary)
+            || path.starts_with(&target)
+            || path.starts_with("/tmp")
+            || path.starts_with("/private/tmp"),
+        "test child cannot resolve storage to a real/default root: {}",
+        path.display()
+    );
+}
+
+#[test]
+#[should_panic(expected = "test child cannot resolve storage to a real/default root")]
+fn child_storage_guard_rejects_non_temporary_roots() {
+    let mut command = Command::new("unused");
+    command.env("AFT_STORAGE_DIR", "/not-a-temporary-root/cortexkit/aft");
+    assert_child_storage_isolated(&command);
 }
 
 fn spawn_stdout_capture_thread(

@@ -1003,14 +1003,20 @@ impl ModuleProcess {
             .arg("--subc")
             .arg(conn_path)
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+            .env_remove("AFT_STORAGE_DIR")
+            .env_remove("AFT_CACHE_DIR")
+            .env("HOME", config_home.join("home"))
+            .env("USERPROFILE", config_home.join("home"))
             .env("XDG_CONFIG_HOME", config_home)
             .env("XDG_DATA_HOME", data_home)
+            .env("XDG_CACHE_HOME", data_home.join("cache"))
             .env_remove("SUBC_MODULE_ID")
             .env_remove("SUBC_LAUNCH_NONCE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command.envs(env.iter().copied());
+        crate::test_helpers::assert_child_storage_isolated(&command);
         // Own process group, so Drop can kill the module and any bash children.
         unsafe {
             command.pre_exec(|| {
