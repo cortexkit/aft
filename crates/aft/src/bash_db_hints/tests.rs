@@ -222,6 +222,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
     std::fs::write(&launcher, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n# Real launchers report unenforceable rules on stderr; that must not cost the hint.\necho 'sandbox-launch: unenforced=[socket_deny]' >&2\n[ \"$1\" = sandbox-launch ] || exit 1\nshift 3\n[ \"$1\" = -- ] || exit 1\nshift\nexec \"$@\"\n", record.display())).unwrap();
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
     let profile = SandboxProfile {
+        data_policy: Default::default(),
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
         writable_roots: vec![dir.path().to_path_buf()],
         write_deny: vec![],

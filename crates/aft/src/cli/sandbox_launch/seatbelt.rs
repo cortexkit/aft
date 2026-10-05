@@ -60,6 +60,35 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
             escape_path(path)?
         ));
     }
+    render_data_denies(
+        &mut source,
+        "file-write*",
+        &profile.data_policy.deny,
+        &profile.data_policy.write_allow,
+    )?;
+    render_data_denies(
+        &mut source,
+        "file-read*",
+        &profile.data_policy.deny,
+        &profile.data_policy.read_allow,
+    )?;
+    // Git resolves the cwd by statting each ancestor. Permit metadata on the
+    // exact exception's ancestor chain, not directory contents or sibling data.
+    for allow in &profile.data_policy.read_allow {
+        for ancestor in allow.ancestors().skip(1) {
+            if profile
+                .data_policy
+                .deny
+                .iter()
+                .any(|deny| ancestor.starts_with(deny))
+            {
+                source.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escape_path(ancestor)?
+                ));
+            }
+        }
+    }
     for path in &profile.read_deny {
         source.push_str(&format!(
             "(deny file-read* ({} \"{}\"))\n",
@@ -75,6 +104,34 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     }
 
     Ok(source)
+}
+
+fn render_data_denies(
+    source: &mut String,
+    operation: &str,
+    denies: &[std::path::PathBuf],
+    allows: &[std::path::PathBuf],
+) -> Result<(), String> {
+    for deny in denies {
+        // Exclude only strict descendants. An enclosing project or write_allow
+        // must not turn the whole CortexKit store into an exception.
+        source.push_str(&format!(
+            "(deny {operation} (require-all (subpath \"{}\")",
+            escape_path(deny)?
+        ));
+        for allow in allows
+            .iter()
+            .filter(|allow| *allow != deny && allow.starts_with(deny))
+        {
+            source.push_str(&format!(
+                " (require-not ({} \"{}\"))",
+                read_path_filter(allow),
+                escape_path(allow)?
+            ));
+        }
+        source.push_str("))\n");
+    }
+    Ok(())
 }
 
 fn read_path_filter(path: &Path) -> &'static str {
@@ -121,6 +178,7 @@ mod tests {
         std::fs::create_dir_all(&task_temp).expect("task temp directory");
         let profile = SandboxProfile {
             v: 1,
+            data_policy: Default::default(),
             writable_roots: vec![project],
             write_deny: Vec::new(),
             write_deny_nested: vec![nested_deny],

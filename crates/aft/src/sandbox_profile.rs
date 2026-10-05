@@ -3,13 +3,60 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-pub const SANDBOX_PROFILE_VERSION: u32 = 2;
+pub const SANDBOX_PROFILE_VERSION: u32 = 3;
+
+/// Private stores with narrowly scoped exceptions. These exceptions apply only
+/// to these trees, never to the credential floor or user-supplied read denies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxDataPolicy {
+    pub deny: Vec<PathBuf>,
+    pub read_allow: Vec<PathBuf>,
+    pub write_allow: Vec<PathBuf>,
+}
+
+impl SandboxDataPolicy {
+    fn canonicalize(self) -> Result<Self, SandboxProfileError> {
+        Ok(Self {
+            deny: canonicalize_optional_paths(self.deny, "data_policy.deny", &mut HashMap::new())?,
+            read_allow: canonicalize_required_paths(self.read_allow, "data_policy.read_allow")?,
+            write_allow: canonicalize_required_dirs(self.write_allow, "data_policy.write_allow")?,
+        })
+    }
+
+    /// Landlock grants are additive: no emitted rule may encompass private data
+    /// or sit inside it unless the entire rule is inside an explicit exception.
+    pub fn validate_grants<'a>(
+        &self,
+        grants: impl IntoIterator<Item = &'a Path>,
+        exceptions: &[PathBuf],
+    ) -> Result<(), SandboxProfileError> {
+        for grant in grants {
+            for deny in &self.deny {
+                if (grant.starts_with(deny) || deny.starts_with(grant))
+                    && !exceptions.iter().any(|allow| {
+                        grant.starts_with(allow) && allow.starts_with(deny) && allow != deny
+                    })
+                {
+                    return Err(SandboxProfileError::new(format!(
+                        "Landlock grant {} overlaps private store {} outside an exact carve-out",
+                        grant.display(),
+                        deny.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Versioned policy transferred to `aft sandbox-launch` by descriptor or private task file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
     pub v: u32,
+    #[serde(default)]
+    pub data_policy: SandboxDataPolicy,
     pub writable_roots: Vec<PathBuf>,
     /// Mandatory write-deny paths for backends that support nested exclusions.
     #[serde(default)]
@@ -46,6 +93,7 @@ impl SandboxProfile {
         let mut deny_paths = HashMap::new();
         Ok(Self {
             v: SANDBOX_PROFILE_VERSION,
+            data_policy: SandboxDataPolicy::default(),
             writable_roots: canonicalize_required_dirs(writable_roots, "writable_roots")?,
             write_deny: canonicalize_optional_paths(write_deny, "write_deny", &mut deny_paths)?,
             write_deny_nested: canonicalize_optional_paths(
@@ -76,6 +124,7 @@ impl SandboxProfile {
         let mut deny_paths = HashMap::new();
         Ok(Self {
             v: self.v,
+            data_policy: self.data_policy.canonicalize()?,
             writable_roots: canonicalize_required_dirs(self.writable_roots, "writable_roots")?,
             write_deny: canonicalize_optional_paths(
                 self.write_deny,
@@ -291,6 +340,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_store_grants_require_exact_descendant_carve_outs() {
+        let base = tempfile::tempdir().unwrap();
+        let store = base.path().join("cortexkit");
+        let own = store.join("worktrees/own");
+        let io = store.join("aft/tasks/own/io");
+        let hooks = store.join("aft/git-hooks/current");
+        let policy = SandboxDataPolicy {
+            deny: vec![store.clone()],
+            read_allow: vec![own.clone(), io.clone(), hooks.clone()],
+            write_allow: vec![own.clone(), io.clone()],
+        };
+        for allowed in [&own, &io, &own.join("new-file"), &io.join("temp")] {
+            policy
+                .validate_grants([allowed.as_path()], &policy.read_allow)
+                .unwrap();
+            policy
+                .validate_grants([allowed.as_path()], &policy.write_allow)
+                .unwrap();
+        }
+        policy
+            .validate_grants([hooks.as_path()], &policy.read_allow)
+            .unwrap();
+        for denied in [
+            store.clone(),
+            base.path().to_path_buf(),
+            store.join("worktrees/other"),
+            store.join("aft/tasks/other/io"),
+            hooks,
+        ] {
+            assert!(
+                policy
+                    .validate_grants([denied.as_path()], &policy.write_allow)
+                    .is_err(),
+                "{}",
+                denied.display()
+            );
+        }
+        assert!(
+            policy
+                .validate_grants([store.as_path()], &[store.clone()])
+                .is_err(),
+            "a whole-store exception must fail closed"
+        );
+    }
+
+    #[test]
     fn native_credential_floor_normalizes_each_path_once_per_profile() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
@@ -443,7 +538,7 @@ mod tests {
             .expect_err("new launcher must reject a v1 profile");
         assert!(error
             .to_string()
-            .contains("unsupported sandbox profile version 1; expected 2"));
+            .contains("unsupported sandbox profile version 1; expected 3"));
 
         let current = SandboxProfile::build(
             vec![root.clone()],
@@ -459,8 +554,8 @@ mod tests {
         let error = serde_json::from_value::<LegacyProfile>(
             serde_json::to_value(current).expect("serialize current profile"),
         )
-        .expect_err("v1 launcher shape must reject read_allow");
-        assert!(error.to_string().contains("unknown field `read_allow`"));
+        .expect_err("v1 launcher shape must reject the current profile fields");
+        assert!(error.to_string().contains("unknown field `data_policy`"));
     }
 
     #[test]
@@ -469,6 +564,7 @@ mod tests {
         let root = root.path().canonicalize().expect("canonical root");
         let profile = SandboxProfile {
             v: SANDBOX_PROFILE_VERSION,
+            data_policy: SandboxDataPolicy::default(),
             writable_roots: vec![root.clone()],
             write_deny: vec![root.join("missing-write-deny")],
             write_deny_nested: vec![root.join("missing-nested")],

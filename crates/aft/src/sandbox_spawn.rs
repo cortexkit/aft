@@ -53,6 +53,8 @@ use std::time::{Duration, Instant};
 use portable_pty::CommandBuilder;
 
 use crate::context::AppContext;
+#[cfg(unix)]
+use crate::sandbox_profile::SandboxDataPolicy;
 use crate::sandbox_profile::SandboxProfile;
 
 pub const SANDBOX_UNAVAILABLE_EXIT_CODE: i32 = 78;
@@ -1007,8 +1009,8 @@ pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<S
 /// Resolve policy for an agent-command process.
 ///
 /// `task_bundle_dir` must be the already-created directory that owns the task's
-/// capture files. The native builder creates a fresh private temp directory
-/// beneath it and includes both directories in the profile.
+/// capture files. The native builder grants a fresh private temp directory
+/// beneath it; capture files themselves use pre-opened descriptors.
 pub fn resolve_sandbox_spawn(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
@@ -1243,7 +1245,6 @@ fn build_native_profile(
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
         let mut writable_roots = project_roots.clone();
-        writable_roots.push(task_io_dir.clone());
         writable_roots.extend(
             ctx.config()
                 .sandbox
@@ -1252,7 +1253,7 @@ fn build_native_profile(
                 .map(|path| expand_home(path, &home)),
         );
 
-        let secret_floor = vec![
+        let mut secret_floor = vec![
             home.join(".ssh"),
             home.join(".aws"),
             home.join(".gnupg"),
@@ -1260,11 +1261,27 @@ fn build_native_profile(
             home.join(".azure"),
             home.join(".config/cortexkit"),
         ];
+        // The resolver retains the trusted user-tier subc setting here even
+        // when semantic search is disabled. Match the bridge's HOME-relative
+        // expansion, not the command's cwd. Deny missing files too.
+        if let Some(path) = &ctx.config().semantic.subc_connection_file {
+            let path = expand_home(path, &home);
+            secret_floor.push(if path.is_absolute() {
+                path
+            } else {
+                home.join(path)
+            });
+        }
+        if let Some(path) = crate::environment::non_empty_os_var("SUBC_CONNECTION_FILE") {
+            secret_floor.push(PathBuf::from(path));
+        }
+        if let Some(path) = crate::environment::non_empty_os_var("XDG_RUNTIME_DIR") {
+            secret_floor.push(PathBuf::from(path).join("subc-connection.json"));
+        }
+        secret_floor.push(home.join(".local/share/cortexkit/run/subc-connection.json"));
         // The credential floor denies both read and write. Linux rejects any
         // writable overlap because Landlock cannot subtract write rights.
-        let write_deny = secret_floor.clone();
-        #[cfg(target_os = "macos")]
-        let mut write_deny = write_deny;
+        let mut write_deny = secret_floor.clone();
         let mut write_deny_nested = Vec::new();
         let mut read_deny = secret_floor;
         for (root, git_policy) in project_roots.iter().zip(&git_policies) {
@@ -1288,6 +1305,45 @@ fn build_native_profile(
                 .iter()
                 .map(|path| expand_home(path, &home)),
         );
+
+        let storage = ctx.storage_dir();
+        let mut data_deny = vec![
+            home.join(".local/share/cortexkit"),
+            home.join(".local/state/cortexkit"),
+            storage.clone(),
+            session_store.clone(),
+        ];
+        for variable in ["XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            if let Some(path) = crate::environment::non_empty_os_var(variable) {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    data_deny.push(path.join("cortexkit"));
+                }
+            }
+        }
+        let mut data_read_allow = project_roots.clone();
+        data_read_allow.push(temp_dir.clone());
+        // Native launches disable path-based pipeline-status capture. stdout,
+        // stderr and markers use pre-opened descriptors, so only the private
+        // TMPDIR needs path access, not the containing io or session directory.
+        let mut data_write_allow = project_roots.clone();
+        data_write_allow.push(temp_dir.clone());
+        let mut managed_paths = Vec::new();
+        if ctx.config().github.shim {
+            managed_paths.push(storage.join(crate::agent_child_env::SHIMS_DIR_NAME));
+            managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
+        }
+        if ctx.config().git.co_author != "off" {
+            managed_paths.push(crate::agent_child_env::managed_git_hooks_dir(&storage));
+            if ctx.config().git.co_author == "auto" {
+                managed_paths.push(crate::agent_child_env::shim_binary(&ctx.config())?);
+            }
+        }
+        // Governance injection materializes these before resolving a spawn.
+        // Do not grant a missing shim directory or a broad binary parent.
+        managed_paths.retain(|path| path.exists());
+        write_deny.extend(managed_paths.iter().cloned());
+        data_read_allow.extend(managed_paths);
 
         let mut cache_roots = vec![
             home.join(".cargo/registry"),
@@ -1327,13 +1383,14 @@ fn build_native_profile(
             temp_dir.clone(),
         )
         .map_err(|error| error.to_string())?;
-        // Seatbelt starts from allow-all reads, so it must deny the complete
-        // store. Landlock instead omits the store while splitting read grants,
-        // then adds only the prepared task's exact payload files.
-        #[cfg(target_os = "macos")]
-        if !profile.read_deny.contains(&session_store) {
-            profile.read_deny.push(session_store.clone());
-        }
+        profile.data_policy = SandboxDataPolicy {
+            deny: data_deny,
+            read_allow: data_read_allow,
+            write_allow: data_write_allow,
+        };
+        profile = profile
+            .canonicalize_for_launch()
+            .map_err(|error| error.to_string())?;
         refuse_store_overlap(&profile, &session_store, &task_io_dir)?;
 
         #[cfg(target_os = "linux")]
@@ -1342,12 +1399,7 @@ fn build_native_profile(
                 .iter()
                 .flat_map(|policy| policy.read_roots.iter().cloned())
                 .collect::<Vec<_>>();
-            profile.read_allow = build_linux_read_allow(
-                &profile,
-                &home,
-                &git_read_roots,
-                std::slice::from_ref(&session_store),
-            )?;
+            profile.read_allow = build_linux_read_allow(&profile, &home, &git_read_roots, &[])?;
             profile = profile
                 .canonicalize_for_launch()
                 .map_err(|error| error.to_string())?;
@@ -1727,6 +1779,13 @@ fn build_linux_read_allow(
 ) -> Result<Vec<PathBuf>, String> {
     let mandatory_floor = &profile.write_deny;
     validate_mandatory_floor_overlap(profile.write_allow_roots(), mandatory_floor)?;
+    profile
+        .data_policy
+        .validate_grants(
+            profile.write_allow_roots(),
+            &profile.data_policy.write_allow,
+        )
+        .map_err(|error| error.to_string())?;
 
     let mut intended = Vec::new();
     for path in [
@@ -1801,11 +1860,39 @@ fn build_linux_read_allow(
     let split_denies = profile
         .read_deny
         .iter()
+        .chain(&profile.data_policy.deny)
         .chain(omitted_roots)
         .cloned()
         .collect::<Vec<_>>();
     let mut lister = SecureReadDirectoryLister;
-    split_read_grants(&intended, &split_denies, &mut lister)
+    let mut grants = split_read_grants(&intended, &split_denies, &mut lister)?;
+    // Reintroduce only explicit private-tree exceptions, still split around
+    // ordinary denies (including the connection file and repository hooks).
+    let exceptions = profile
+        .data_policy
+        .read_allow
+        .iter()
+        .map(|path| IntendedReadGrant {
+            path: path.clone(),
+            force_children: false,
+            mandatory: false,
+        })
+        .collect::<Vec<_>>();
+    grants.extend(split_read_grants(
+        &exceptions,
+        &profile.read_deny,
+        &mut lister,
+    )?);
+    grants.sort_unstable();
+    grants.dedup();
+    profile
+        .data_policy
+        .validate_grants(
+            grants.iter().map(PathBuf::as_path),
+            &profile.data_policy.read_allow,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(grants)
 }
 
 #[cfg(target_os = "linux")]
@@ -1831,12 +1918,24 @@ fn add_linux_payload_read_grants(
         .collect::<Result<Vec<_>, String>>()?;
     let mut lister = SecureReadDirectoryLister;
     let payload_grants = split_read_grants(&intended, &profile.read_deny, &mut lister)?;
+    // Payload files are exact, daemon-verified objects, not directory grants.
+    profile
+        .data_policy
+        .read_allow
+        .extend(payload_grants.iter().cloned());
 
     let mut final_read_allow = profile.read_allow.clone();
     final_read_allow.extend(payload_grants);
     final_read_allow.sort_unstable();
     final_read_allow.dedup();
     validate_final_read_rules(&final_read_allow, &profile.read_deny)?;
+    profile
+        .data_policy
+        .validate_grants(
+            final_read_allow.iter().map(PathBuf::as_path),
+            &profile.data_policy.read_allow,
+        )
+        .map_err(|error| error.to_string())?;
     assert!(
         validate_final_read_rules(&final_read_allow, &profile.read_deny).is_ok(),
         "final Landlock read grants overlap a denied path after adding payload files"

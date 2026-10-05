@@ -8606,9 +8606,9 @@ fn spawn_detached_child(
             .map_err(|e| format!("failed to inherit sandbox failure marker handle: {e}"))?;
         let shell_path = spawn_plan.host_shell_path().unwrap_or(shell_path);
         let pipeline_shell = super::process::pipeline_shell_kind(shell_path).unwrap_or("");
-        // build_native_profile includes this task's io directory in its write
-        // roots. Publishing here requires no new sandbox write grant, and the
-        // wrapper opens the status file only after the user's pipeline exits.
+        // Native launchers disable path-based pipeline capture. Ordinary/host
+        // children can publish in io after the user's pipeline exits without
+        // giving native shells a path grant to their capture files.
         let pipeline_status_path = if capture_pipeline_status {
             paths.pipeline_status.as_os_str().to_owned()
         } else {
@@ -8850,6 +8850,7 @@ mod tests {
     fn launcher_plans_disable_pipeline_status_capture() {
         let launcher = SpawnPlan::launcher_for_test(
             crate::sandbox_profile::SandboxProfile {
+                data_policy: Default::default(),
                 v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
                 writable_roots: Vec::new(),
                 write_deny: Vec::new(),

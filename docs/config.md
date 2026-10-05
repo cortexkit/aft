@@ -571,10 +571,17 @@ Set `sandbox.enabled` to route first-party bash and PTY commands through Seatbel
 
 The mandatory credential floor is `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.azure`, `~/.config/gcloud`, and `~/.config/cortexkit`. Linux canonicalizes these paths and constructs a read allowlist that omits them. A writable project, cache, temporary directory, or `write_allow` path that overlaps this floor is refused because Landlock cannot subtract write rights. Ordinary `read_deny` paths inside writable roots are supported: writes remain allowed while read grants are split around the denied path.
 
+The floor also denies CortexKit's data and state trees (`~/.local/share/cortexkit/` and `~/.local/state/cortexkit/`, plus absolute XDG data/state locations and AFT's resolved storage). The daemon connection file is separately denied wherever the trusted `subc.connection_file` resolves, including outside those trees; `~` and relative settings resolve against HOME. Environment-selected connection files and the default runtime/production connection paths are denied too. These paths hold daemon authentication and other agents' snapshots, output, and undo history, not just the current project's data.
+
+Only the session's project roots and the current task's private temporary directory get read/write exceptions within private trees. Other worktrees, tasks, modules, and state remain hidden. The active `gh` shim directory and its resolved executable, and the active content-keyed managed Git hooks directory, get read/execute access but never write access. Seatbelt excludes these narrow exceptions from the tree denies and allows only ancestor metadata needed for path traversal. Landlock omits the private trees from ordinary read grants and reintroduces the exact exceptions; it does not grant their parents. If a Linux writable grant encompasses a private tree, crosses the connection-file deny, or would make managed executables writable, setup fails closed with `sandbox_unavailable` explaining the overlap. This restructures the allow set rather than attempting an unsupported nested Landlock deny.
+
+Background stdout/stderr and exit markers use descriptors opened before confinement. Native launches already disable path-based pipeline-status capture, so the shell needs no path grant to the capture files or the whole `io/` directory. Only the private temporary directory beneath `io/` is readable/writable. Linux also retains the existing exact read grants for the daemon-verified command, wrapper, and environment payload files, never their control-directory parent. `gh --status` still executes through the shim, but reports unavailable private state rather than receiving a state-directory exception.
+
 | Protection | macOS Seatbelt | Linux Landlock |
 | --- | --- | --- |
 | Credential floor reads and writes | Denied | Denied by omission; overlapping writable roots are refused |
-| Project, task artifact, cache, and private task-temp access | Read/write | Read/write |
+| CortexKit data/state and daemon connection file | Denied except exact project/task temp and read-only managed executables | Denied by omission with the same exact exceptions; unrepresentable writable overlaps are refused |
+| Project, cache, and private task-temp access | Read/write | Read/write |
 | Other existing HOME children | Readable; HOME remains unwritable | Readable only when present at launch; new children are denied until the next launch |
 | System files | Readable; unwritable | Curated read-only roots; `/proc` is readable, `/sys` is limited, `/run/user`, `/var/run`, `/dev/shm`, `/dev/kmsg`, and shared `/tmp` are omitted |
 | Git metadata | Writable so `git add` and `git commit` work | Writable inside project roots |

@@ -24,6 +24,45 @@ pub(super) struct AppliedLandlock {
 }
 
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
+    // Recheck after launcher canonicalization: a changed symlink must not turn
+    // the configured connection-file deny into an additive Landlock grant.
+    for (grants, denies) in [
+        (
+            profile
+                .read_allow
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>(),
+            &profile.read_deny,
+        ),
+        (profile.write_allow_roots(), &profile.write_deny),
+    ] {
+        for grant in grants {
+            for deny in denies {
+                if grant.starts_with(deny) || deny.starts_with(grant) {
+                    return Err(format!(
+                        "Landlock grant {} overlaps mandatory deny {}",
+                        grant.display(),
+                        deny.display()
+                    ));
+                }
+            }
+        }
+    }
+    profile
+        .data_policy
+        .validate_grants(
+            profile.read_allow.iter().map(PathBuf::as_path),
+            &profile.data_policy.read_allow,
+        )
+        .map_err(|error| error.to_string())?;
+    profile
+        .data_policy
+        .validate_grants(
+            profile.write_allow_roots(),
+            &profile.data_policy.write_allow,
+        )
+        .map_err(|error| error.to_string())?;
     let yama_same_uid_exposed = yama_same_uid_exposed();
     close_inherited_fds()?;
     // Git and other standard tools open /dev/null read-write; granting only
