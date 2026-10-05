@@ -1142,6 +1142,9 @@ fn boot_time_secs() -> Option<u64> {
     cached_boot_time_secs(&BOOT_TIME_SECS, read_boot_time_secs)
 }
 
+/// Read once per process: boot time cannot change while the process runs.
+/// Shared with the platform-independent test that proves the reader runs once.
+#[cfg(any(target_os = "linux", test))]
 fn cached_boot_time_secs(
     cache: &OnceLock<Option<u64>>,
     reader: impl FnOnce() -> Option<u64>,
