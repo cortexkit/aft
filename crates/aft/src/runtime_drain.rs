@@ -469,7 +469,7 @@ impl StandaloneConfigureMaintenance {
 
     pub fn drain_one(&mut self, ctx: &Arc<AppContext>) -> bool {
         let _scope = crate::executor::install_standalone_scope(Arc::clone(ctx));
-        crate::commands::configure::drain_deferred_configure_maintenance_unit(ctx, &mut self.inner)
+        crate::commands::configure::drain_standalone_configure_unit(ctx, &mut self.inner)
     }
 }
 

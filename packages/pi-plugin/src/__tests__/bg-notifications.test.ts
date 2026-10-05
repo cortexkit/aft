@@ -245,6 +245,23 @@ describe("Pi background notifications", () => {
     expect(content).toBeUndefined();
   });
 
+  test("completion replay uses a bounded non-killing transport poll", async () => {
+    const send = mock(async (_command: string, _params: unknown, _options: unknown) => ({
+      success: true,
+      bg_completions: [],
+    }));
+    const ctx = {
+      pool: { getActiveBridgeForRoot: () => ({ send }), getBridge: () => ({ send }) },
+      config: {},
+      storageDir: "/tmp/aft-test",
+    } as unknown as PluginContext;
+    await appendToolResultBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, [
+      { type: "text", text: "tool output" },
+    ]);
+    expect(send.mock.calls[0][0]).toBe("bash_drain_completions");
+    expect(send.mock.calls[0][2]).toMatchObject({ timeoutMs: 15000, keepBridgeOnTimeout: true });
+  });
+
   test("forced drain delivers replayed completion even when task is not tracked", async () => {
     const send = mock(async (command: string) =>
       command === "bash_drain_completions"

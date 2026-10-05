@@ -1360,6 +1360,186 @@ fn standalone_view_publication_never_blocks_requests() {
     assert!(aft.shutdown().success());
 }
 
+/// Pi uses this stdin/stdout loop, not a daemon actor. Opening the view's
+/// stores and reading its manifest is startup work too, even when publication
+/// and the semantic worker are already detached.
+#[cfg(feature = "test-timing-hooks")]
+#[test]
+fn standalone_view_open_never_blocks_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("repo");
+    let storage = base.join("storage");
+    let started_file = base.join("view-open.started");
+    let sweep_started = base.join("view-sweep.started");
+    let names = (0..500)
+        .map(|i| format!("src/file{i}.rs"))
+        .collect::<Vec<_>>();
+    let files = names
+        .iter()
+        .map(|name| (name.as_str(), "pub fn marker() {}\n".to_owned()))
+        .collect::<Vec<_>>();
+    init_repo(&root, &files);
+    let mut aft = crate::helpers::AftProcess::spawn_with_env(&[
+        ("AFT_TEST_VIEW_OPEN_DELAY_MS", std::ffi::OsStr::new("3000")),
+        ("AFT_TEST_VIEW_OPEN_START_FILE", started_file.as_os_str()),
+        ("AFT_TEST_VIEW_SWEEP_DELAY_MS", std::ffi::OsStr::new("3000")),
+        ("AFT_TEST_VIEW_SWEEP_START_FILE", sweep_started.as_os_str()),
+    ]);
+    assert_eq!(aft.send(&json!({
+        "id": "cfg", "command": "configure", "harness": "pi",
+        "project_root": root, "storage_dir": storage,
+        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: false }, None)),
+    }).to_string())["success"], true);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !started_file.exists() {
+        assert!(Instant::now() < deadline, "view open seam never reached");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut latencies = Vec::new();
+    for req in [
+        json!({"id": "read", "command": "tool_call", "name": "read", "arguments": {"filePath": root.join("src/file0.rs")}}),
+        json!({"id": "drain", "command": "bash_drain_completions", "session_id": "startup"}),
+        json!({"id": "status", "command": "status"}),
+    ] {
+        let sent = Instant::now();
+        let response = aft.send(&req.to_string());
+        latencies.push(sent.elapsed().as_millis());
+        assert_eq!(response["success"], true, "{response:#}");
+    }
+    eprintln!("500-file standalone view-open I/O delay=3000ms: tool_call/drain/status latencies={latencies:?}ms");
+    assert!(
+        latencies.iter().all(|ms| *ms < 1000),
+        "requests waited on view startup: {latencies:?}ms"
+    );
+    let sent = Instant::now();
+    let graph = aft.send(&json!({"id": "graph", "command": "callers", "file": root.join("src/file0.rs"), "symbol": "marker"}).to_string());
+    assert_eq!(graph["code"], "callgraph_building", "{graph:#}");
+    assert!(
+        sent.elapsed() < Duration::from_secs(1),
+        "a loading graph waited for startup"
+    );
+    while !sweep_started.exists() {
+        assert!(Instant::now() < deadline, "view sweep seam never reached");
+        thread::sleep(Duration::from_millis(150));
+    }
+    let sent = Instant::now();
+    assert_eq!(
+        aft.send(&json!({"id": "sweep-drain", "command": "bash_drain_completions"}).to_string())
+            ["success"],
+        true
+    );
+    eprintln!(
+        "standalone completion drain during 3000ms view sweep: {}ms",
+        sent.elapsed().as_millis()
+    );
+    assert!(
+        sent.elapsed() < Duration::from_secs(1),
+        "completion drain waited for the view sweep"
+    );
+    assert!(aft.shutdown().success());
+}
+
+/// The 30 s callgraph start backstop and the semantic view disk load are on
+/// the semantic worker, not stdin. Hold the manifest open past that backstop
+/// to sample real requests in both phases, without a local model download.
+#[cfg(feature = "test-timing-hooks")]
+#[test]
+fn standalone_semantic_grace_and_load_never_block_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("repo");
+    let storage = base.join("storage");
+    let open_started = base.join("open.started");
+    let load_started = base.join("semantic.started");
+    let names = (0..500)
+        .map(|i| format!("src/file{i}.rs"))
+        .collect::<Vec<_>>();
+    let files = names
+        .iter()
+        .map(|name| (name.as_str(), "pub fn marker() {}\n".to_owned()))
+        .collect::<Vec<_>>();
+    init_repo(&root, &files);
+    let embedder = MockEmbedder::start();
+    let mut aft = crate::helpers::AftProcess::spawn_with_semantic_env(&[
+        ("AFT_TEST_VIEW_OPEN_DELAY_MS", std::ffi::OsStr::new("35000")),
+        ("AFT_TEST_VIEW_OPEN_START_FILE", open_started.as_os_str()),
+        (
+            "AFT_TEST_SEMANTIC_VIEW_LOAD_DELAY_MS",
+            std::ffi::OsStr::new("5000"),
+        ),
+        (
+            "AFT_TEST_SEMANTIC_VIEW_LOAD_START_FILE",
+            load_started.as_os_str(),
+        ),
+    ]);
+    let started = Instant::now();
+    assert_eq!(aft.send(&json!({
+        "id": "cfg", "command": "configure", "harness": "pi",
+        "project_root": root, "storage_dir": storage,
+        "config": crate::helpers::user_config(config_doc(true, Planes { trigram: true, callgraph: true, semantic: true }, Some(&embedder))),
+    }).to_string())["success"], true);
+    let mut grace_max = 0;
+    let mut load_max = 0;
+    let mut grace_samples = 0;
+    let mut load_samples = 0;
+    while !load_started.exists() || load_samples < 3 {
+        assert!(
+            started.elapsed() < Duration::from_secs(50),
+            "semantic load seam never reached"
+        );
+        let loading = load_started.exists();
+        for req in [
+            json!({"id": "read", "command": "tool_call", "name": "read", "arguments": {"filePath": root.join("src/file0.rs")}}),
+            json!({"id": "drain", "command": "bash_drain_completions", "session_id": "startup"}),
+            json!({"id": "status", "command": "status"}),
+        ] {
+            let sent = Instant::now();
+            let response = aft.send(&req.to_string());
+            let ms = sent.elapsed().as_millis();
+            assert_eq!(response["success"], true, "{response:#}");
+            if loading {
+                load_max = load_max.max(ms);
+            } else {
+                grace_max = grace_max.max(ms);
+            }
+            if req["command"] == "status" {
+                assert_eq!(
+                    response["semantic_index"]["status"], "loading",
+                    "{response:#}"
+                );
+            }
+        }
+        if loading {
+            load_samples += 1;
+        } else {
+            grace_samples += 1;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    assert!(open_started.exists());
+    assert!(grace_samples > 0 && load_samples >= 3);
+    assert!(
+        started.elapsed() >= Duration::from_secs(30),
+        "production grace was not exercised"
+    );
+    eprintln!("500-file standalone: 30s grace {grace_samples} samples max={grace_max}ms; 5000ms semantic disk load {load_samples} samples max={load_max}ms");
+    assert!(grace_max < 1000 && load_max < 1000);
+    // The lane must eventually be usable, not merely hidden forever as loading.
+    loop {
+        let response = aft.send(&json!({"id": "ready", "command": "status"}).to_string());
+        if response["semantic_index"]["status"] == "ready" {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "semantic lane never became ready: {response:#}"
+        );
+        thread::sleep(Duration::from_millis(150));
+    }
+    assert!(aft.shutdown().success());
+}
+
 /// A view generation published with the call graph off holds no call graph.
 /// Every reader of a view's call graph reports it unavailable, by name, never
 /// as zero callers: here the call graph tools (and zoom's call graph field)

@@ -34,6 +34,86 @@ function writeExecutable(_name: string, source: string): string {
 }
 
 describe("BinaryBridge transport regressions", () => {
+  test("timeout respawn cannot repeat startup kills before a tool recovers", async () => {
+    const script = writeExecutable(
+      "startup-hang.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", chunk => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const req = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (["configure", "version", "recovered"].includes(req.command)) {
+      process.stdout.write(JSON.stringify({id: req.id, success: true, version: "99.0.0", warnings: []}) + "\\n");
+    }
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, {
+      timeoutMs: 1000,
+      hangThreshold: 1,
+      maxRestarts: 0,
+    });
+    try {
+      await bridge.send("configure", {}, { timeoutMs: 5000 });
+      await expect(bridge.send("silent", {}, { timeoutMs: 30 })).rejects.toThrow("timed out");
+      expect(bridge.isAlive()).toBe(false);
+      // A successful configure/version on the replacement does not prove that
+      // its tools have made it past the same index startup work.
+      await bridge.send("configure", {}, { timeoutMs: 5000 });
+      await bridge.send("version");
+      for (let i = 0; i < 3; i++) {
+        await expect(bridge.send("silent", {}, { timeoutMs: 30 })).rejects.toThrow(
+          "automatic timeout restart already attempted",
+        );
+        expect(bridge.isAlive()).toBe(true);
+      }
+      await bridge.send("recovered");
+      await expect(bridge.send("silent", {}, { timeoutMs: 30 })).rejects.toThrow("timed out");
+      expect(bridge.isAlive()).toBe(false);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("completion drain timeouts never escalate into a startup kill", async () => {
+    const script = writeExecutable(
+      "drain-hang.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", chunk => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const req = JSON.parse(buffer.slice(0, newline));
+    buffer = buffer.slice(newline + 1);
+    if (req.command === "configure") process.stdout.write(JSON.stringify({id: req.id, success: true, warnings: []}) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, {
+      timeoutMs: 1000,
+      hangThreshold: 1,
+      maxRestarts: 0,
+    });
+    try {
+      await bridge.send("configure", {}, { timeoutMs: 5000 });
+      for (let i = 0; i < 3; i++) {
+        await expect(bridge.send("bash_drain_completions", {}, { timeoutMs: 30 })).rejects.toThrow(
+          "timed out",
+        );
+        expect(bridge.isAlive()).toBe(true);
+      }
+    } finally {
+      await bridge.shutdown();
+    }
+  });
   test("aborting a standalone request sends cancel_request for its wire id", async () => {
     const requestsPath = join(workDir, "abort-requests.ndjson");
     const script = writeExecutable(

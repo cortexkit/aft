@@ -870,7 +870,12 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     const bridge = bridgeForDrain(drainContext);
     const params = drainContext.sessionID ? { session_id: drainContext.sessionID } : {};
     const response = await withBgHopTimeout(
-      bridge.send("bash_drain_completions", params, { timeoutMs: bgHopTimeoutMs }),
+      // Replay is a poll, not proof that a bridge is hung. Its deadline stays
+      // bounded, but a slow startup must not be restarted by the delivery hook.
+      bridge.send("bash_drain_completions", params, {
+        timeoutMs: bgHopTimeoutMs,
+        keepBridgeOnTimeout: true,
+      }),
       "bash_drain_completions",
     );
     if (response.success === false) {

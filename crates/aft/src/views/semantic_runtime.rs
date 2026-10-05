@@ -743,6 +743,8 @@ pub(crate) fn run_worker(
     // snapshot is served, so no edit made during the load is missed.
     config.drivers.install(Arc::clone(runtime.driver()));
     let started = Instant::now();
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    delay_startup_io_for_test("SEMANTIC_VIEW_LOAD");
     let mut wait = config.schedule.retry_initial;
     loop {
         match runtime.load() {
@@ -816,6 +818,21 @@ enum FillOutcome {
     Retry { progress: bool },
     /// The lane is no longer this worker's.
     Stop,
+}
+
+/// Simulate a slow storage read, not CPU contention. Child-process tests get
+/// an observation file before the delay so requests can target this exact phase.
+#[cfg(any(test, feature = "test-timing-hooks"))]
+pub(crate) fn delay_startup_io_for_test(phase: &str) {
+    if let Some(path) = std::env::var_os(format!("AFT_TEST_{phase}_START_FILE")) {
+        std::fs::write(path, b"started").expect("startup I/O observation");
+    }
+    if let Some(ms) = std::env::var(format!("AFT_TEST_{phase}_DELAY_MS"))
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
 }
 
 #[cfg(test)]
