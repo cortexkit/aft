@@ -161,6 +161,7 @@ mod tests {
 
     #[test]
     fn bash_kill_replay_filters_same_session_by_project_root() {
+        let _storage_env = crate::test_env::without_storage_override();
         let project_a = tempfile::tempdir().unwrap();
         let project_b = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();

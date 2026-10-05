@@ -73,6 +73,31 @@ pub(crate) fn process_env_lock() -> ProcessEnvLockGuard {
     ProcessEnvLockGuard
 }
 
+pub(crate) struct StorageOverrideGuard {
+    previous: Option<OsString>,
+    _lock: ProcessEnvLockGuard,
+}
+impl Drop for StorageOverrideGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            std::env::set_var("AFT_STORAGE_DIR", value);
+        } else {
+            std::env::remove_var("AFT_STORAGE_DIR");
+        }
+    }
+}
+/// Fixtures with explicit temporary namespaces must not inherit a worker's
+/// process-wide override when testing their configured-path behavior.
+pub(crate) fn without_storage_override() -> StorageOverrideGuard {
+    let lock = process_env_lock();
+    let previous = std::env::var_os("AFT_STORAGE_DIR");
+    std::env::remove_var("AFT_STORAGE_DIR");
+    StorageOverrideGuard {
+        previous,
+        _lock: lock,
+    }
+}
+
 struct ScopedEnvVar {
     key: &'static str,
     previous: Option<OsString>,

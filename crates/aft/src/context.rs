@@ -14745,6 +14745,7 @@ mod harness_path_tests {
 
     #[test]
     fn bash_tasks_dir_uses_hash_session() {
+        let _storage_env = crate::test_env::without_storage_override();
         let storage = PathBuf::from("/tmp/cortexkit/aft");
         let ctx = ctx_with_storage_and_harness(storage.clone(), Harness::Opencode);
 
