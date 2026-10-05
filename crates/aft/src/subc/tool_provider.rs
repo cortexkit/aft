@@ -2215,7 +2215,7 @@ mod route_tests {
         let ctx = runner_restore_context(&root);
         let request: crate::protocol::RawRequest = serde_json::from_value(json!({
             "id": "runner-start", "command": "bash", "session_id": "runner-restore",
-            "params": { "command": "printf 'stdout before restart\\n'; printf 'stderr before restart\\n' >&2; while [ ! -f release ]; do sleep 0.05; done; printf 'stdout after restart\\n'; printf 'stderr after restart\\n' >&2; sleep 60",
+            "params": { "command": "printf 'stdout before restart\\n'; printf 'stderr before restart\\n' >&2; while [ ! -f release ]; do sleep 0.05; done; printf 'stdout after restart\\n'; printf 'stderr after restart\\n' >&2; while [ ! -f finish ]; do sleep 0.05; done",
                 "background": true, "compressed": true },
         })).unwrap();
         let response = crate::sandbox_spawn::with_authenticated_principal(
@@ -2224,6 +2224,33 @@ mod route_tests {
         );
         assert!(response.success, "{:?}", response.data);
         let task_id = response.data["task_id"].as_str().unwrap();
+        let paths = crate::bash_background::persistence::resolve_task(
+            &root.join("storage/runner"),
+            "runner-restore",
+            task_id,
+        )
+        .unwrap()
+        .paths;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&paths.stderr)
+            .unwrap()
+            .contains("stderr before restart")
+        {
+            assert!(Instant::now() < deadline, "fixture produced no output");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+            "id": "runner-initial-output", "command": "bash_status", "session_id": "runner-restore",
+            "params": { "task_id": task_id, "output_offset": 0, "stderr_offset": 0 },
+        }))
+        .unwrap();
+        let initial = crate::commands::bash_status::handle(&request, &ctx);
+        assert!(initial.success, "{:?}", initial.data);
+        std::fs::write(
+            root.join("initial-status.json"),
+            serde_json::to_vec(&initial.data).unwrap(),
+        )
+        .unwrap();
         std::fs::write(root.join("task-id"), task_id).unwrap();
         ctx.bash_background().detach();
     }
@@ -2231,7 +2258,8 @@ mod route_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runner_tool_provider_restore_preserves_minted_task_output_across_processes() {
-        use crate::bash_background::persistence::{read_task, resolve_task, TaskArtifact};
+        use crate::bash_background::persistence::{read_exit_marker, read_task, resolve_task};
+        use base64::Engine;
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let project = root.join("project");
@@ -2251,6 +2279,20 @@ mod route_tests {
             String::from_utf8_lossy(&child.stderr)
         );
         let task_id = std::fs::read_to_string(root.join("task-id")).unwrap();
+        let initial: Value =
+            serde_json::from_slice(&std::fs::read(root.join("initial-status.json")).unwrap())
+                .unwrap();
+        assert_eq!(initial["status"], "running");
+        for stream in ["stdout", "stderr"] {
+            assert!(
+                initial["output_preview"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("{stream} before restart")),
+                "{initial}"
+            );
+        }
+        let mut offsets = [0, 0];
         let task_storage = root.join("storage/runner");
         let task = resolve_task(&task_storage, "runner-restore", &task_id).unwrap();
         let metadata = read_task(&task.paths.json).unwrap();
@@ -2325,18 +2367,75 @@ mod route_tests {
             for stream in ["stdout", "stderr"] {
                 let expected = format!("{stream} {phase} restart");
                 assert!(output.contains(&expected), "{reply}");
+            }
+            // Piped status text deliberately hides running previews to avoid
+            // encouraging polling. The structured reply still retains them.
+            assert_eq!(
+                reply["content"][0]["text"],
+                format!("Task {task_id}: running\nTo wait for it, call bash_watch; don't poll.")
+            );
+            // Range reads are native protocol fields, not tool-provider
+            // catalog arguments. Verify that cursors acquired by the old
+            // process can resume exactly at the new bytes after adoption.
+            let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+                "id": "runner-resumed-output", "command": "bash_status", "session_id": "runner-restore",
+                "params": { "task_id": task_id, "output_offset": offsets[0], "stderr_offset": offsets[1] },
+            })).unwrap();
+            let resumed = crate::commands::bash_status::handle(&request, &ctx);
+            assert!(resumed.success, "{:?}", resumed.data);
+            for (index, (stream, chunk, cursor)) in [
+                ("stdout", "output_chunk_base64", "output_next_offset"),
+                ("stderr", "stderr_chunk_base64", "stderr_next_offset"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(resumed.data[chunk].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(bytes, format!("{stream} {phase} restart\n").as_bytes());
+                let next = resumed.data[cursor].as_u64().unwrap();
+                assert_eq!(next, offsets[index] + bytes.len() as u64);
+                if phase == "before" {
+                    assert_eq!(resumed.data[chunk], initial[chunk]);
+                    assert_eq!(resumed.data[cursor], initial[cursor]);
+                }
+                offsets[index] = next;
+            }
+        }
+        std::fs::write(project.join("finish"), "go").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_exit_marker(&task.paths).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "fixture did not complete");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reply = exchange_with_actor(
+            json!({"name": "bash_status", "arguments": {"taskId": task_id}, "preset": "worker"}),
+            identity,
+            ctx.clone(),
+            &Arc::new(DispatchPathMetrics::new()),
+            |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+        )
+        .await;
+        let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(reply["structuredContent"]["status"], "completed", "{reply}");
+        let text = reply["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!("Task {task_id}: completed (exit 0)")),
+            "{text}"
+        );
+        for stream in ["stdout", "stderr"] {
+            for phase in ["before", "after"] {
+                let expected = format!("{stream} {phase} restart");
                 assert!(
-                    reply["content"][0]["text"]
+                    reply["structuredContent"]["output_preview"]
                         .as_str()
                         .unwrap()
                         .contains(&expected),
                     "{reply}"
                 );
+                assert!(text.contains(&expected), "{text}");
             }
-            assert!(ctx
-                .bash_background()
-                .read_artifact(&task_id, "runner-restore", TaskArtifact::Stdout)
-                .is_ok());
         }
         ctx.bash_background().detach();
     }
