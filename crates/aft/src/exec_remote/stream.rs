@@ -198,9 +198,9 @@ impl StreamConsumer {
                 break;
             };
             match record {
-                Pending::Output(output) => match output.stream {
+                Pending::Output(output) => match &output.stream {
                     OutputStream::Stdout | OutputStream::Stderr => {
-                        sink.output(next, output.stream, &output.bytes.0)?
+                        sink.output(next, output.stream.clone(), &output.bytes.0)?
                     }
                     _ => sink.unknown_output(next, &output.bytes.0)?,
                 },

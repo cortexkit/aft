@@ -73,7 +73,8 @@ fn published_outcomes_have_explicit_grades() {
             panic!("{name}")
         };
         let expected = match name.as_str() {
-            "exit" | "pipestatus" => Verdict::Exited { code: 0 },
+            "exit" => Verdict::Exited { code: 0 },
+            "pipestatus" => Verdict::Exited { code: 1 },
             "exit-nonzero" => Verdict::Exited { code: 100 },
             "signal" => Verdict::Signalled { signal: 15 },
             "cancelled" => Verdict::Cancelled,
@@ -158,9 +159,9 @@ fn control_history_expired_never_reruns() {
 }
 
 #[derive(Default)]
-struct MemorySink {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(super) struct MemorySink {
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
     seqs: Vec<u64>,
     terminals: Vec<Verdict>,
     truncations: Vec<u64>,
