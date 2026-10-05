@@ -723,7 +723,9 @@ fn handle_inspect_payload(
                     "tier2_unavailable",
                     reason,
                 );
-                if !use_checkout_view {
+                // Enabling checkout views requests real scoped Tier-2 analysis.
+                // A missing or stale view is a gap, not an intentional skip.
+                if !snapshot.config.views.enabled {
                     payload["not_computed"] = Value::Bool(true);
                 }
                 *outcome = JobOutcome::Fresh { payload };

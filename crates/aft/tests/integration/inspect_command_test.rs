@@ -1820,7 +1820,23 @@ fn inspect_command_ignores_retired_tier2_deadline_overrides() {
     );
 
     assert_eq!(response["success"], true, "response: {response:#}");
-    assert_eq!(response["complete"], true, "response: {response:#}");
+    // This fixture disables the callgraph. Its unavailable dead-code analysis
+    // makes an unscoped result PARTIAL, independently of the retired deadline.
+    assert_eq!(response["complete"], false, "response: {response:#}");
+    assert_eq!(
+        response["inspect_terminal"], "partial",
+        "response: {response:#}"
+    );
+    assert_eq!(
+        response["summary"]["dead_code"]["reason"],
+        "call graph is disabled (indexes.callgraph=false)"
+    );
+    assert!(
+        response["summary"]["duplicates"]["count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the retired deadline must not prevent duplicate analysis: {response:#}"
+    );
     assert!(response["summary"]["duplicates"].get("status").is_none());
 }
 
