@@ -585,6 +585,8 @@ pub(crate) enum OpenMode {
 }
 
 pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
+    #[cfg(test)]
+    crate::test_storage::assert_database(path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;

@@ -629,6 +629,26 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     )
 }
 
+/// The environment-less default is forbidden to test-built contexts and DB
+/// writers even when an outer test runner also supplies a safe override.
+#[cfg(test)]
+pub(crate) fn storage_dir_without_overrides_for_test() -> PathBuf {
+    let lookup = |name: &str| {
+        if matches!(name, "AFT_STORAGE_DIR" | "AFT_CACHE_DIR") {
+            None
+        } else {
+            std::env::var_os(name)
+        }
+    };
+    storage_dir_from(
+        None,
+        &lookup,
+        StoragePlatform::current(),
+        std::env::home_dir().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
 fn storage_dir_from(
     configured: Option<&std::path::Path>,
     lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,

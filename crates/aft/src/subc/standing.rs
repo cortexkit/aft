@@ -82,11 +82,14 @@ pub(super) struct StandingActor {
 
 impl StandingActor {
     pub(super) fn new(app: Arc<App>, executor: Arc<Executor>) -> Self {
+        let config = Config::default();
+        #[cfg(test)]
+        let config = app.isolate_test_config(config);
         Self {
             app,
             executor,
             roots: StandingRoots::default(),
-            observed_config: Mutex::new(Config::default()),
+            observed_config: Mutex::new(config),
             reconciliation_failures: Mutex::new(ReconciliationFailureLog::default()),
             owned_actors: Mutex::new(HashMap::new()),
         }
@@ -95,7 +98,10 @@ impl StandingActor {
     /// Startup reconciliation is intentionally direct and empty until subc has
     /// observed a user-tier configuration snapshot from a successful RouteBind.
     pub(super) fn reconcile_at_startup(&self) {
-        if let Err(error) = self.roots.reconcile(&Config::default()) {
+        let config = Config::default();
+        #[cfg(test)]
+        let config = self.app.isolate_test_config(config);
+        if let Err(error) = self.roots.reconcile(&config) {
             log::warn!("standing roots startup reconciliation failed: {error}");
         }
     }

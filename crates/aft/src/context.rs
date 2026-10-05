@@ -2341,6 +2341,8 @@ pub struct App {
     /// Weak actor references let status attribute process RSS across roots
     /// without making the process-global App own per-root caches.
     memory_contexts: parking_lot::Mutex<BTreeMap<PathBuf, Weak<AppContext>>>,
+    #[cfg(test)]
+    test_storage: tempfile::TempDir,
 }
 
 impl App {
@@ -2355,6 +2357,11 @@ impl App {
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
             memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            test_storage: tempfile::Builder::new()
+                .prefix("aft-test-context-")
+                .tempdir()
+                .expect("private test storage"),
         }
     }
 
@@ -2369,6 +2376,21 @@ impl App {
 
     pub fn create_provider(&self) -> Box<dyn LanguageProvider> {
         (self.provider_factory)()
+    }
+
+    /// All context constructors and publications share this default, including
+    /// helpers in other modules. The owning App keeps the directory alive.
+    #[cfg(test)]
+    pub(crate) fn isolate_test_config(&self, mut config: Config) -> Config {
+        if config
+            .storage_dir
+            .as_ref()
+            .is_none_or(|p| p.as_os_str().is_empty())
+        {
+            config.storage_dir = Some(self.test_storage.path().to_path_buf());
+        }
+        crate::test_storage::assert_context(&config);
+        config
     }
 
     pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
@@ -3514,6 +3536,8 @@ impl AppContext {
         provider: Box<dyn LanguageProvider>,
         config: Config,
     ) -> Self {
+        #[cfg(test)]
+        let config = app.isolate_test_config(config);
         let bash_compress_enabled = config.experimental_bash_compress;
         let watcher_counters = config
             .project_root
@@ -5837,6 +5861,8 @@ impl AppContext {
             let Some(next) = built else {
                 return false;
             };
+            #[cfg(test)]
+            let next = self.app.isolate_test_config(next);
             let next = Arc::new(next);
             // Compare the configured spelling, not a normalized equivalent:
             // that spelling is the memo key for containment-root resolution.

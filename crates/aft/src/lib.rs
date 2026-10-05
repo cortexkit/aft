@@ -161,6 +161,8 @@ pub mod symbol_cache_disk;
 pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
+#[cfg(test)]
+pub(crate) mod test_storage;
 pub mod tool_gate;
 pub mod tool_path;
 pub mod url_fetch;
