@@ -68,24 +68,24 @@ fn configure_with_backup_disabled(aft: &mut AftProcess, root: &str) {
     );
 }
 
-/// Use the installed compiler, not a diagnostic stub, so an incomplete project
-/// really produces TS2305 and a final type mismatch really produces TS2322.
 #[cfg(unix)]
-fn full_validation_case(command: &str, broken: bool) -> (tempfile::TempDir, serde_json::Value) {
-    full_validation_case_with_failure(command, broken, false)
+#[derive(Clone, Copy)]
+enum ValidationChecker {
+    Real,
+    ProjectState,
 }
 
+/// Both checkers observe the project at invocation time. The deterministic
+/// checker models the fixture's imports and number-to-string mismatch without
+/// needing Node or an installed TypeScript compiler on the Unix CI legs.
 #[cfg(unix)]
-fn full_validation_case_with_failure(
+fn full_validation_case(
     command: &str,
     broken: bool,
     fail: bool,
+    checker: ValidationChecker,
 ) -> (tempfile::TempDir, serde_json::Value) {
     use std::os::unix::fs::PermissionsExt;
-    let tsc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../node_modules/typescript/bin/tsc")
-        .canonicalize()
-        .expect("bun install before the measurement");
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(
@@ -106,9 +106,49 @@ fn full_validation_case_with_failure(
         write_file(&root.join("dest.js"), "export const existing = 1;\n");
     }
     let stub = root.join("node_modules/.bin/tsc");
-    write_file(&stub, &format!(
+    match checker {
+        ValidationChecker::Real => {
+            let tsc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../node_modules/typescript/bin/tsc")
+                .canonicalize()
+                .expect("bun install before the real-compiler checks");
+            write_file(&stub, &format!(
             "#!/bin/sh\nprintf 'run\\n' >> '{0}/checker-count'\nout='{0}/checker-output-'$(wc -l < '{0}/checker-count' | tr -d ' ')\nnode '{1}' \"$@\" > \"$out\" 2>&1\ncode=$?\ncat \"$out\"\nexit $code\n",
             root.display(), tsc.display()));
+        }
+        ValidationChecker::ProjectState => write_file(
+            &stub,
+            r#"#!/bin/sh
+set -eu
+count=0
+if [ -f checker-count ]; then
+    while IFS= read -r run; do
+        count=$((count + 1))
+    done < checker-count
+fi
+printf 'run\n' >> checker-count
+out=checker-output-$((count + 1))
+status=0
+{
+    for name in moved renamed; do
+        if grep -F -q "import { $name } from './source';" consumer.ts &&
+           ! grep -F -q "export function $name(" source.ts; then
+            printf "consumer.ts(1,10): error TS2305: Module './source' has no exported member '%s'.\n" "$name"
+            status=1
+        fi
+    done
+    if grep -F -q -e ': string = renamed(1)' -e ': string = moved(1)' consumer.ts; then
+        printf "consumer.ts(2,14): error TS2322: Type 'number' is not assignable to type 'string'.\n"
+        status=1
+    fi
+} > "$out"
+while IFS= read -r line; do
+    printf '%s\n' "$line"
+done < "$out"
+exit "$status"
+"#,
+        ),
+    }
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut aft = AftProcess::spawn();
     let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
@@ -166,8 +206,19 @@ fn validation_entries<'a>(
 #[test]
 #[ignore = "requires the repository's installed TypeScript compiler"]
 fn multi_file_full_validation_runs_once_per_checker() {
+    assert_full_validation_runs_once_per_checker(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_runs_once_per_checker() {
+    assert_full_validation_runs_once_per_checker(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_runs_once_per_checker(checker: ValidationChecker) {
     for command in ["apply_patch", "move_symbol"] {
-        let (dir, _response) = full_validation_case(command, false);
+        let (dir, _response) = full_validation_case(command, false, false, checker);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("checker-count"))
                 .unwrap()
@@ -183,8 +234,19 @@ fn multi_file_full_validation_runs_once_per_checker() {
 #[test]
 #[ignore = "requires the repository's installed TypeScript compiler"]
 fn multi_file_full_validation_reports_real_error_in_touched_file() {
+    assert_full_validation_reports_error_in_touched_file(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_reports_error_in_touched_file() {
+    assert_full_validation_reports_error_in_touched_file(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_reports_error_in_touched_file(checker: ValidationChecker) {
     for command in ["apply_patch", "move_symbol"] {
-        let (_dir, response) = full_validation_case(command, true);
+        let (_dir, response) = full_validation_case(command, true, false, checker);
         let entries = validation_entries(command, &response);
         assert_eq!(entries.len(), 3, "{response}");
         for entry in entries {
@@ -220,7 +282,7 @@ fn multi_file_full_validation_reports_real_error_in_touched_file() {
             response["output"]
                 .as_str()
                 .unwrap()
-                .contains("type check: 1 errors in 1 of 3 files (tsc)"),
+                .contains("type check: 1 error in 1 of 3 files (tsc)"),
             "{response}"
         );
     }
@@ -230,9 +292,20 @@ fn multi_file_full_validation_reports_real_error_in_touched_file() {
 #[test]
 #[ignore = "requires the repository's installed TypeScript compiler"]
 fn multi_file_full_validation_ignores_intermediate_only_errors() {
+    assert_full_validation_ignores_intermediate_only_errors(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_ignores_intermediate_only_errors() {
+    assert_full_validation_ignores_intermediate_only_errors(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_ignores_intermediate_only_errors(checker: ValidationChecker) {
     for command in ["apply_patch", "move_symbol"] {
-        let (dir, response) = full_validation_case(command, false);
-        // Inspect every invocation's real compiler output as well as the response:
+        let (dir, response) = full_validation_case(command, false, false, checker);
+        // Inspect every invocation's checker output as well as the response:
         // merely dropping intermediate diagnostics must not make this test pass.
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let path = entry.unwrap().path();
@@ -267,8 +340,19 @@ fn multi_file_full_validation_ignores_intermediate_only_errors() {
 #[test]
 #[ignore = "requires the repository's installed TypeScript compiler"]
 fn multi_file_full_validation_does_not_run_on_failure_or_rollback() {
+    assert_full_validation_does_not_run_on_failure_or_rollback(ValidationChecker::Real);
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_file_full_validation_ci_does_not_run_on_failure_or_rollback() {
+    assert_full_validation_does_not_run_on_failure_or_rollback(ValidationChecker::ProjectState);
+}
+
+#[cfg(unix)]
+fn assert_full_validation_does_not_run_on_failure_or_rollback(checker: ValidationChecker) {
     for command in ["apply_patch", "move_symbol"] {
-        let (dir, response) = full_validation_case_with_failure(command, false, true);
+        let (dir, response) = full_validation_case(command, false, true, checker);
         assert!(
             !dir.path().join("checker-count").exists(),
             "{command} ran a checker: {response}"

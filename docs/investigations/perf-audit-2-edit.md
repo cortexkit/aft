@@ -82,7 +82,7 @@ of the approved contract, not an optimization-compatible invariant.
 | --- | --- | --- | --- |
 | Three-file `apply_patch`, rename an export and its consumer | 3 compiler runs | 1 compiler run | TS2305 exists only in the intermediate project; all final per-file arrays are empty |
 | `move_symbol`, source + destination + consumer | 3 compiler runs | 1 compiler run | Not-yet-rewritten source import is never checked; completed project is clean |
-| Either command, consumer assigns a returned number to `string` | Diagnostics discarded by handler | TS2322 on consumer entry only | Real compiler line 2 diagnostic plus `type check: 1 errors in 1 of 3 files (tsc)` |
+| Either command, consumer assigns a returned number to `string` | Diagnostics discarded by handler | TS2322 on consumer entry only | Real compiler line 2 diagnostic plus `type check: 1 error in 1 of 3 files (tsc)` |
 | Partial patch / syntax-rolled-back symbol move | Could run during earlier writes | 0 compiler runs | Counter file absent; symbol move restores original source/destination bytes |
 
 Three independent regression tests were observed red before implementation:
@@ -107,6 +107,28 @@ the real `CARGO_HOME` and `RUSTUP_HOME` retained and `AFT_STORAGE_DIR` unset:
 ```
 cargo test -p agent-file-tools --test integration -- multi_file_full_validation --ignored --nocapture
 ```
+
+The four `multi_file_full_validation_ci_*` twins run normally on Linux and macOS
+without Node or TypeScript. Their checker uses only POSIX shell builtins and
+`grep`: it reads the fixture's source exports and consumer import at invocation
+time, emits TS2305 for an import whose export has not yet been updated, and emits
+TS2322 at consumer line 2 for its number-to-string assignment. Every run is
+counted and its output captured. The twins share assertions with the optional
+real-compiler tests, including checking every captured output for intermediate
+errors. Disabling coalescing, discarding diagnostics and re-enabling per-write
+checks each redden the corresponding CI-running twin; this coverage is not
+conditional on an ignored test being selected. Summary nouns use singular forms
+for one error, one touched file and one unchecked file.
+
+```
+cargo test -p agent-file-tools --test integration -- multi_file_full_validation_ci_
+```
+
+The CI-coverage revision adds a six-case summary test for zero, one and multiple
+errors/files, including singular and plural unchecked-file counts. Its old
+always-plural output was observed red before the correction. The CI twins and
+the optional real-compiler tests each pass all four shared scenarios; the
+format-library suite now contains 65 passing tests.
 
 ## Remaining claims checked in current source
 

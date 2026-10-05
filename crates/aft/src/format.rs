@@ -1773,14 +1773,17 @@ impl BatchValidation {
                 .filter(|error| error.severity == "error")
                 .count()
         };
+        let errors = self.files.iter().map(error_count).sum::<usize>();
+        let suffix = |count| if count == 1 { "" } else { "s" };
         let mut summary = format!(
-            "type check: {} errors in {} of {} files ({})",
-            self.files.iter().map(error_count).sum::<usize>(),
+            "type check: {errors} error{} in {} of {} file{} ({})",
+            suffix(errors),
             self.files
                 .iter()
                 .filter(|file| error_count(file) > 0)
                 .count(),
             self.files.len(),
+            suffix(self.files.len()),
             if self.checkers.is_empty() {
                 "none".to_string()
             } else {
@@ -1801,7 +1804,8 @@ impl BatchValidation {
             reasons.sort_unstable();
             reasons.dedup();
             summary.push_str(&format!(
-                "; {skipped} files unchecked ({})",
+                "; {skipped} file{} unchecked ({})",
+                suffix(skipped),
                 reasons.join(", ")
             ));
         }
@@ -2882,8 +2886,33 @@ mod tests {
         assert!(validation.files[1].skipped_reason.is_none());
         assert_eq!(
             validation.summary(),
-            "type check: 1 errors in 1 of 2 files (tsc)"
+            "type check: 1 error in 1 of 2 files (tsc)"
         );
+    }
+
+    #[test]
+    fn batch_validation_summary_pluralizes_errors_and_files() {
+        for (files, errors, skipped, expected) in [
+            (0, 0, 0, "type check: 0 errors in 0 of 0 files (tsc)"),
+            (1, 0, 0, "type check: 0 errors in 0 of 1 file (tsc)"),
+            (1, 1, 0, "type check: 1 error in 1 of 1 file (tsc)"),
+            (2, 2, 0, "type check: 2 errors in 1 of 2 files (tsc)"),
+            (1, 0, 1, "type check: 0 errors in 0 of 1 file (tsc); 1 file unchecked (no_checker_configured)"),
+            (2, 0, 2, "type check: 0 errors in 0 of 2 files (tsc); 2 files unchecked (no_checker_configured)"),
+        ] {
+            let validation = BatchValidation {
+                checkers: vec!["tsc".to_string()],
+                files: (0..files).map(|index| FileValidation {
+                    path: PathBuf::from(format!("{index}.ts")),
+                    errors: (0..if index == 0 { errors } else { 0 }).map(|_| ValidationError {
+                        file: format!("{index}.ts"), line: 1, column: 1,
+                        message: "type mismatch".to_string(), severity: "error".to_string(),
+                    }).collect(),
+                    skipped_reason: (index < skipped).then(|| "no_checker_configured".to_string()),
+                }).collect(),
+            };
+            assert_eq!(validation.summary(), expected);
+        }
     }
 
     /// Serializes tests that mutate the global TOOL_RESOLUTION_CACHE /
