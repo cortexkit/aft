@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "inspect-worktrees-noise-partial-header",
+    "rust-analyzer-false-complete",
+    "windows-pty-drain"
+  ],
+  "note": "aft_inspect Tier-2 in worktrees, noise cut, rust-analyzer false-complete fix, PARTIAL header rules, and Windows PTY output drain; no ranking-fence file."
+}
