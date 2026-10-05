@@ -1009,6 +1009,7 @@ impl CompletedRustCheck {
             return;
         }
         self.finished = false;
+        let started = self.started.take();
         let Some(pending) = self.pending.take() else {
             return;
         };
@@ -1053,7 +1054,7 @@ impl CompletedRustCheck {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            duration_seconds: self.started.map_or(0, |start| start.elapsed().as_secs()),
+            duration_seconds: started.map_or(0, |start| start.elapsed().as_secs()),
         };
         let Ok(bytes) = serde_json::to_vec(&record) else {
             return;
@@ -1115,6 +1116,7 @@ impl CompletedRustCheck {
     pub(crate) fn abort(&mut self) {
         self.pending = None;
         self.finished = false;
+        self.started = None;
     }
 
     #[cfg(test)]
@@ -1666,6 +1668,21 @@ mod tests {
             started.elapsed() < Duration::from_millis(150),
             "inspect waited past the validation budget"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ended_check_does_not_supply_elapsed_time_for_a_later_expected_check() {
+        let (_temp, mut cache) = live_fixture();
+        assert!(cache.running_reason().is_none());
+        cache.begin(SystemTime::now());
+        assert!(cache.running_reason().is_some());
+        cache.finished = true;
+        cache.complete();
+        assert!(cache.running_reason().is_none());
+        cache.begin(SystemTime::now());
+        cache.abort();
+        assert!(cache.running_reason().is_none());
     }
 
     #[test]
