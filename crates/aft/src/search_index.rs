@@ -702,6 +702,12 @@ impl SearchIndex {
 }
 
 impl SearchIndexSnapshot {
+    pub(crate) fn file_modified(&self, path: &Path) -> Option<SystemTime> {
+        self.path_to_id
+            .get(path)
+            .and_then(|id| self.files.get(*id as usize))
+            .map(|file| file.modified)
+    }
     /// Number of unique trigrams in the combined base index and delta postings.
     pub fn trigram_count(&self) -> usize {
         let base_count = self.base.as_ref().map_or(0, |base| base.lookup.len());
@@ -5718,6 +5724,8 @@ fn io_error_means_missing_on_disk(error: &std::io::Error) -> bool {
 /// Whether `path` is known to be absent from disk. One `stat`; an unreadable
 /// path counts as present.
 pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
+    #[cfg(test)]
+    audit_record(|work| work.presence_checks += 1);
     fs::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
 }
 
@@ -5950,7 +5958,7 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 /// Metadata and display keys are snapshotted before sorting: the comparator must
 /// remain a total order even if files change or disappear during the sort.
 pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true);
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, None);
 }
 
 /// Sort paths emitted by one filesystem walk without resolving every path again.
@@ -5960,29 +5968,47 @@ pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path
 /// `canonicalize` for every match only repeats filesystem lookups the walk just
 /// performed.
 pub(crate) fn sort_walked_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
-    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, false);
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, false, None);
+}
+
+/// Indexed paths already have canonical keys and mtimes. Unindexed roots still
+/// use the disk-backed ordering, so mixed-root glob retains the same contract.
+pub(crate) fn sort_paths_by_cached_mtime_desc(
+    paths: &mut [PathBuf],
+    stable_root: &Path,
+    mtimes: &HashMap<PathBuf, SystemTime>,
+) {
+    sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, Some(mtimes));
 }
 
 fn sort_paths_by_mtime_desc_with_key_normalization(
     paths: &mut [PathBuf],
     stable_root: &Path,
     canonicalize_paths: bool,
+    cached_mtimes: Option<&HashMap<PathBuf, SystemTime>>,
 ) {
     use std::collections::HashMap;
     let stable_root = crate::inspect::job::canonicalize_normalized(stable_root);
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
     for path in paths.iter() {
-        mtimes
-            .entry(path.clone())
-            .or_insert_with(|| path_modified_time(path));
+        mtimes.entry(path.clone()).or_insert_with(|| {
+            cached_mtimes
+                .and_then(|times| times.get(path))
+                .copied()
+                .or_else(|| path_modified_time(path))
+        });
         display_paths.entry(path.clone()).or_insert_with(|| {
             let resolved = if path.is_absolute() {
                 path.clone()
             } else {
                 stable_root.join(path)
             };
-            let comparison_path = if canonicalize_paths {
+            let comparison_path = if canonicalize_paths
+                && !cached_mtimes.is_some_and(|times| times.contains_key(path))
+            {
+                #[cfg(test)]
+                audit_record(|work| work.sort_canonicalizes += 1);
                 crate::inspect::job::canonicalize_normalized(&resolved)
             } else {
                 crate::inspect::job::normalize_path(&resolved)
@@ -7265,6 +7291,8 @@ fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn path_modified_time(path: &Path) -> Option<SystemTime> {
+    #[cfg(test)]
+    audit_record(|work| work.sort_stats += 1);
     #[cfg(test)]
     cache_freshness::record_metadata_call(path);
     fs::metadata(path)

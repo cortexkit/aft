@@ -1,18 +1,21 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::context::AppContext;
 use crate::grep_executor::bounded_fallback_walk_files;
 use crate::protocol::{RawRequest, Response};
-use crate::search_index::{build_path_filters, resolve_search_scope, sort_paths_by_mtime_desc};
+use crate::search_index::{
+    build_path_filters, resolve_search_scope, sort_paths_by_cached_mtime_desc,
+};
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
 
 #[derive(Debug)]
 struct GlobDiscovery {
     files: Vec<PathBuf>,
+    indexed_mtimes: HashMap<PathBuf, SystemTime>,
     walk_truncated: bool,
     source: &'static str,
     entries_visited: usize,
@@ -84,6 +87,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     }
     let total_started = Instant::now();
     let mut parent_gaps = Vec::new();
+    let mut indexed_mtimes = HashMap::new();
     let (
         mut files,
         walk_truncated,
@@ -114,6 +118,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
             pattern,
             DEFAULT_MAX_RESULTS + 1,
         );
+        indexed_mtimes = discovery.indexed_mtimes;
         (
             discovery.files,
             discovery.walk_truncated,
@@ -140,6 +145,14 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
         } else {
             "mixed/fallback"
         };
+        for discovery in &discoveries {
+            indexed_mtimes.extend(
+                discovery
+                    .indexed_mtimes
+                    .iter()
+                    .map(|(path, time)| (path.clone(), *time)),
+            );
+        }
         let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
         (
             files,
@@ -162,7 +175,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     // Glob's public contract is newest-first. Sort before truncating so the cap
     // keeps the most recently modified matches instead of the lexically first.
-    sort_paths_by_mtime_desc(&mut files, &project_root);
+    sort_paths_by_cached_mtime_desc(&mut files, &project_root, &indexed_mtimes);
     // Backstop against a stale index (for example a borrowed snapshot that
     // still lists another checkout's files): only paths present on disk in this
     // checkout are returned. Only the page is checked, and the page is refilled
@@ -288,9 +301,18 @@ fn glob_root(
     let indexed = indexed_snapshot.map(|snapshot| {
         let (files, scope_has_files, entries_visited) =
             snapshot.glob_profiled(pattern, &search_scope.root, false);
+        let indexed_mtimes = files
+            .iter()
+            .filter_map(|path| {
+                snapshot
+                    .file_modified(path)
+                    .map(|time| (path.clone(), time))
+            })
+            .collect();
         GlobDiscovery {
             entries_visited,
             files,
+            indexed_mtimes,
             walk_truncated: false,
             source: "index",
             walk_time: Duration::ZERO,
@@ -328,6 +350,7 @@ fn glob_root(
                     let scope_has_files = !outcome.files.is_empty() || outcome.walk_truncated;
                     return GlobDiscovery {
                         files: outcome.files,
+                        indexed_mtimes: HashMap::new(),
                         walk_truncated: outcome.walk_truncated,
                         source: "fallback",
                         entries_visited: outcome.entries_visited,
@@ -375,6 +398,7 @@ fn fallback_glob(
         !outcome.files.is_empty() || outcome.walk_truncated || outcome.skipped_foreign_mounts > 0;
     GlobDiscovery {
         files: outcome.files,
+        indexed_mtimes: HashMap::new(),
         walk_truncated: outcome.walk_truncated,
         source: "fallback",
         entries_visited: outcome.entries_visited,
@@ -514,6 +538,61 @@ fn format_directory_label(directory: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perf_audit_glob_only_touches_returned_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        for i in 0..1000 {
+            let path = project.join(format!("file_{i:04}.rs"));
+            std::fs::write(&path, format!("fn marker_{i}() {{}}\n")).unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(1_700_000_000 + i, 0),
+            )
+            .unwrap();
+        }
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project.clone()),
+                ..Default::default()
+            },
+        );
+        *ctx.search_index().write().unwrap() =
+            Some(crate::search_index::SearchIndex::build(&project));
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "audit", "command": "glob", "pattern": "*.rs"
+        }))
+        .unwrap();
+        crate::search_index::audit_work_reset();
+        let response = handle_glob(&request, &ctx);
+        let body = serde_json::to_value(response).unwrap();
+        assert_eq!(body["files"].as_array().unwrap().len(), 100);
+        assert_eq!(body["total"], 1000);
+        let expected = (900..1000)
+            .rev()
+            .map(|i| project.join(format!("file_{i:04}.rs")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            serde_json::to_vec(&body["files"]).unwrap(),
+            serde_json::to_vec(
+                &expected
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            body["text"],
+            format_glob_text(&expected, "*.rs", &project, true)
+        );
+        let work = crate::search_index::audit_work();
+        assert_eq!(work.sort_stats, 0, "{work:?}");
+        assert_eq!(work.sort_canonicalizes, 0, "{work:?}");
+        assert_eq!(work.presence_checks, 100, "{work:?}");
+    }
 
     fn files(paths: &[&str]) -> Vec<PathBuf> {
         paths.iter().map(PathBuf::from).collect()
