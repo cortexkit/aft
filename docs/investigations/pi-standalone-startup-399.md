@@ -60,9 +60,9 @@ and that case is not fixed here.
   worker read a new root's semantic producer/config. Superseded results are
   discarded. The daemon's maintenance path keeps its existing synchronous API.
 * View generation/blob sweeps, like standalone storage sweeps, run separately.
-* A views-on Git checkout with no installed graph reports `callgraph_building`
+* A standalone views-on Git checkout with no installed graph reports `callgraph_building`
   instead of opening/building a second legacy graph during view startup.
-  Non-Git legacy navigation keeps its old fallback.
+  Non-Git legacy navigation and daemon/in-process warmers keep their old fallback.
 * The bridge treats completion replay as a bounded, non-killing poll; Pi also
   explicitly requests that behavior at its 15-second delivery hop.
 * The shared bridge permits one timeout-triggered replacement until a successful
@@ -106,6 +106,8 @@ Commands:
 ```
 cargo test -p agent-file-tools --features test-timing-hooks --test integration standalone_ -- --nocapture
 cargo test -p agent-file-tools --lib commands::configure::tests:: -- --test-threads=4
+cargo test -p agent-file-tools --lib -- commands::configure::tests:: context::callgraph_store_for_ops_tests:: runtime_drain::tests:: views::semantic_runtime::
+cargo test -p agent-file-tools --features test-timing-hooks --test integration -- per_checkout_9:: standalone_search_deferred_test::
 bun run --cwd packages/aft-bridge build
 bun run --cwd packages/aft-bridge typecheck
 bun run --cwd packages/pi-plugin typecheck
@@ -115,9 +117,25 @@ bun run lint
 ```
 
 The first native run passed 30 standalone integration tests. Configure lib:
-146 passed, 3 ignored. Final TypeScript runs: bridge 764 passed/3 skipped/0
+146 passed, 3 ignored. After all mutation restorations, the configure,
+runtime-drain and semantic-runtime lib filters passed 212 tests (4 ignored).
+The final lib run, including the graph-access module and the narrowed
+standalone policy, passed **253 tests** (4 ignored). The final views/standalone
+integration run passed **25 tests**, including the existing parent fixture.
+Final TypeScript runs: bridge 764 passed/3 skipped/0
 failed; Pi 798 passed/0 failed. TypeScript 5.9.3 typechecks exited 0; Biome 2.4.7
 checked 684 files. Broader final native checks are recorded in the delivery.
+
+The broader integration run initially failed the existing
+`parent_callgraph_reads_child_views_and_protects_served_generation` fixture
+(24 passed, 1 failed): its second child generation did not publish. That
+in-process fixture must retain its legacy warmer; the new loading refusal was
+therefore narrowed to standalone/daemonless mode, rather than changing the
+fixture's expectations or the daemon's fallback contract.
+The final combined native command also hit its 30-minute deadline while the
+integration compile queued for shared slots, after the lib suite passed. A
+single integration-only continuation finished and passed; no Windows gate was
+run concurrently with it.
 
 The required strict Windows check did **not** finish. A 30-minute attempt and
 its 120-minute continuation repeatedly queued behind the machine's six shared

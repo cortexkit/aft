@@ -7234,10 +7234,12 @@ impl AppContext {
                     };
                 }
             }
-            // The detached view publication owns this graph. A query arriving
-            // before its manifest is installed must disclose loading, not open
-            // or cold-build a second legacy index on the request loop.
-            if self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some() {
+            // The detached standalone view publication owns this graph. A query
+            // before installation must disclose loading, not start a legacy
+            // graph on stdin. Daemon and in-process warmers keep their fallback.
+            if self.daemonless_query_mode()
+                && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some())
+            {
                 return CallgraphStoreAccess::Building;
             }
         }
