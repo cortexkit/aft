@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "exec-remote-client"
+  ],
+  "note": "crates/aft/src/lib.rs only registers the new exec_remote module (remote executor client, not wired to any tool). No search code, input or rendered text changes, so every row must be byte-equal to the reference."
+}
