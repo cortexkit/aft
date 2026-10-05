@@ -181,6 +181,9 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     expect(response.walk_truncated).toBe(true);
     expect(Array.isArray(response.skipped_files)).toBe(true);
     expect(harness.text(result)).toContain("file-000.ts");
+    expect(harness.text(result).trimEnd().split("\n").at(-1)).toMatch(
+      /^shown \d+ of ≥200 files \(walk\) · narrow: path$/,
+    );
   });
 
   test("zoom into single symbol returns source (symbols as string)", async () => {

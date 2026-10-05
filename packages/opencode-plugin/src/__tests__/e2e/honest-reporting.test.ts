@@ -150,7 +150,10 @@ export function runHonestReportingSuite(
       // Truncation is disclosed in the plain-text partial-result footer.
       expect(() => JSON.parse(output)).toThrow();
       expect(output).toContain("file-000.ts");
-      expect(output).toContain("⚠ Partial result: walk truncated at 200 files.");
+      expect(output).toContain(" files (walk) · narrow: path");
+      expect(output.trimEnd().split("\n").at(-1)).toMatch(
+        /^shown \d+ of ≥200 files \(walk\) · narrow: path$/,
+      );
     });
 
     test("aft_outline single file target keeps text output behavior", async () => {

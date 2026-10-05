@@ -124,6 +124,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
                 "complete": !walk_incomplete && !rendered.truncated,
                 "output_truncated": rendered.truncated,
                 "files_shown": rendered.shown,
+                "structure_footer": rendered.footer,
                 "walk_truncated": discovery.walk_truncated,
                 "collection_truncated": discovery.collection_truncated,
                 "skipped_foreign_mounts": discovery.skipped_foreign_mounts,
@@ -161,6 +162,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
                 "complete": skipped_files.is_empty() && !rendered.truncated,
                 "output_truncated": rendered.truncated,
                 "files_shown": rendered.shown,
+                "structure_footer": rendered.footer,
                 "skipped_files": skipped_files,
             }),
         );
@@ -2631,10 +2633,11 @@ struct RenderedOutline {
     text: String,
     truncated: bool,
     shown: usize,
+    footer: String,
 }
 
 fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool) -> String {
-    use crate::list_envelope::{render_trailer, ListEnvelope, Reason, Total, Unit};
+    use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
     let mut causes = Vec::new();
     if walk {
         causes.push(Reason::Walk);
@@ -2650,7 +2653,7 @@ fn outline_structure_footer(shown: usize, total: usize, budget: bool, walk: bool
     } else {
         Total::Exact(total)
     };
-    render_trailer(&ListEnvelope::new(
+    crate::subc_format::render_envelope_trailer(&ListEnvelope::new(
         shown,
         total,
         Unit::Files,
@@ -2741,6 +2744,7 @@ fn format_multi_file_tree(
         text: output,
         truncated,
         shown: files_shown,
+        footer,
     }
 }
 

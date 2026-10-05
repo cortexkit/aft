@@ -1967,6 +1967,16 @@ fn format_outline(response: &Response, mode: OutlineMode) -> String {
 // Mirrors packages/opencode-plugin/src/tools/reading.ts formatOutlineFilesText.
 fn format_outline_files_text(data: &Value) -> String {
     let text = format_outline_text(data);
+    // Structure maps already carry their file-budget/walk trailer. Appending
+    // the legacy partial-result footer would bury that trailer and duplicate
+    // the incomplete-discovery warning.
+    if data
+        .get("structure_footer")
+        .and_then(Value::as_str)
+        .is_some_and(|footer| !footer.is_empty())
+    {
+        return text;
+    }
     let envelope = data
         .get("files_list_envelope")
         .and_then(|v| serde_json::from_value::<crate::list_envelope::ListEnvelope>(v.clone()).ok());
@@ -2053,6 +2063,19 @@ fn format_outline_files_text(data: &Value) -> String {
 
 fn format_outline_text(data: &Value) -> String {
     let text = data.get("text").and_then(Value::as_str).unwrap_or("");
+    if let Some(footer) = data
+        .get("structure_footer")
+        .and_then(Value::as_str)
+        .filter(|footer| !footer.is_empty())
+    {
+        if let Some(body) = text.strip_suffix(&format!("\n{footer}")) {
+            let mut without_footer = data.clone();
+            without_footer["text"] = Value::String(body.to_string());
+            without_footer["structure_footer"] = Value::Null;
+            // Genuine skipped-file gaps belong before the final list trailer.
+            return format!("{}\n{footer}", format_outline_text(&without_footer));
+        }
+    }
     let skipped = data.get("skipped_files").and_then(Value::as_array);
     let Some(skipped) = skipped.filter(|s| !s.is_empty()) else {
         return text.to_string();
@@ -4215,6 +4238,29 @@ mod outline_format_tests {
         let formatted = format_outline(&response, OutlineMode::DirectoryJson);
         assert!(formatted.contains("src/\n  a.rs (rs)"));
         assert!(formatted.contains("⚠ Partial result: walk truncated at 200 files. Some files in this directory were not indexed."));
+    }
+
+    #[test]
+    fn structure_outline_trailer_stays_last_after_skips() {
+        let footer = "shown 1 of ≥200 files (walk) · narrow: path";
+        let response = Response::success(
+            "1",
+            json!({
+                "text": format!("src/\n  a.rs\n\n{footer}"),
+                "structure_footer": footer,
+                "complete": false,
+                "walk_truncated": true,
+                "discovered": true,
+                "skipped_files": [{"file":"src/b.rs", "reason":"parse_error"}],
+            }),
+        );
+        for mode in [OutlineMode::Text, OutlineMode::DirectoryJson] {
+            let formatted = format_outline(&response, mode);
+            assert!(formatted.contains("src/b.rs — parse_error"), "{formatted}");
+            assert!(formatted.ends_with(footer), "{formatted}");
+            assert_eq!(formatted.matches(footer).count(), 1, "{formatted}");
+            assert!(!formatted.contains("⚠ Partial result"), "{formatted}");
+        }
     }
 
     #[test]
