@@ -736,7 +736,7 @@ fn outline_structure_entries(
             // product API or bypass the project's path restrictions.
             match ctx.validate_path(req_id, &included) {
                 Ok(included) => {
-                    let count = match outline_skip_reason(&included, Some(parser)) {
+                    let count = match outline_skip_reason(&included, Some(&mut *parser)) {
                         Some(reason) => Err(reason),
                         None => parser.extract_symbols(&included)
                             .map(|symbols| symbols.len())
