@@ -131,7 +131,7 @@ fn published_outcomes_have_explicit_grades() {
 }
 
 #[test]
-fn control_outcome_unknown_never_reruns() {
+fn control_known_outcome_unknown_never_reruns() {
     assert_eq!(
         grade(&TerminalRecord::new(
             job_id(),
@@ -145,7 +145,7 @@ fn control_outcome_unknown_never_reruns() {
 }
 
 #[test]
-fn control_history_expired_never_reruns() {
+fn control_known_history_expired_never_reruns() {
     assert_eq!(
         grade(&TerminalRecord::new(
             job_id(),
@@ -165,11 +165,13 @@ pub(super) struct MemorySink {
     seqs: Vec<u64>,
     terminals: Vec<Verdict>,
     truncations: Vec<u64>,
+    unknown: Vec<(u64, Vec<u8>)>,
 }
 
 impl OutputSink for MemorySink {
-    fn unknown_output(&mut self, seq: u64, _bytes: &[u8]) -> std::io::Result<()> {
+    fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> std::io::Result<()> {
         self.seqs.push(seq);
+        self.unknown.push((seq, bytes.to_vec()));
         Ok(())
     }
     fn accepted(&mut self, _accepted: &Accepted) -> std::io::Result<()> {
@@ -205,7 +207,7 @@ fn terminal(outcome: Outcome) -> StreamRecord {
 }
 
 #[test]
-fn control_split_utf8_is_reassembled_as_exact_bytes() {
+fn control_known_split_utf8_is_reassembled_as_exact_bytes() {
     let mut consumer = StreamConsumer::new();
     let mut sink = MemorySink::default();
     consumer.consume(accepted(), &mut sink).unwrap();
@@ -226,7 +228,7 @@ fn control_split_utf8_is_reassembled_as_exact_bytes() {
 }
 
 #[test]
-fn control_seq_dedupe_keeps_first_record_in_sorted_order() {
+fn control_known_seq_dedupe_keeps_first_record_in_sorted_order() {
     let mut consumer = StreamConsumer::new();
     let mut sink = MemorySink::default();
     consumer.consume(accepted(), &mut sink).unwrap();
@@ -564,4 +566,144 @@ fn multiple_terminals_and_cross_job_records_are_rejected() {
         .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
         .is_err());
     assert_eq!(sink.terminals.len(), 1);
+}
+
+#[test]
+fn control_unknown_ran_never_proves_no_start() {
+    let mut wire = serde_json::to_value(TerminalRecord::new(
+        job_id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unreachable,
+        },
+        0,
+        0,
+        0,
+    ))
+    .unwrap();
+    wire["ran"] = serde_json::json!("future_location");
+    let terminal: TerminalRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn control_unknown_record_seq_advances_resume() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume_bytes(
+            br#"{"type":"future_record","seq":0,"future":true}"#,
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        1
+    );
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+        .unwrap();
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 0 });
+    assert_eq!(sink.stdout, b"B");
+    assert_eq!(sink.unknown, [(0, vec![])]);
+}
+
+#[test]
+fn unknown_killed_is_not_an_ordinary_signal_or_cancel() {
+    let mut wire = serde_json::to_value(TerminalRecord::new(
+        job_id(),
+        Outcome::Signal { signal: 15 },
+        1,
+        0,
+        0,
+    ))
+    .unwrap();
+    wire["killed"] = serde_json::json!("future_kill");
+    let terminal: TerminalRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn unknown_output_stream_preserves_bytes_and_sequence_without_misattribution() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume_bytes(
+            br#"{"type":"output","seq":0,"stream":"future_fd","bytes":"/w=="}"#,
+            &mut sink,
+        )
+        .unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stderr, b"error"), &mut sink)
+        .unwrap();
+    assert_eq!(sink.unknown, [(0, vec![255])]);
+    assert!(sink.stdout.is_empty());
+    assert_eq!(sink.stderr, b"error");
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        2
+    );
+}
+
+#[test]
+fn unknown_prepare_outcome_does_not_establish_a_workspace() {
+    let bytes = serde_json::to_vec(
+        &serde_json::json!({"transfer_id":job_id(), "outcome":{"type":"future_prepare"}}),
+    )
+    .unwrap();
+    let reply = decode_reply("workspace.prepare", &bytes).unwrap();
+    assert_eq!(
+        grade_reply(&reply),
+        ReplyVerdict::WorkspaceUnprepared { reason: None }
+    );
+}
+
+#[test]
+fn unknown_rebuild_result_is_not_a_successful_warm_generation() {
+    let bytes = serde_json::to_vec(&serde_json::json!({"queue_depth":0,"running_jobs":[],"server_reachable":true,"rustc_version":"rustc test",
+        "repositories":[{"repository_root":"/src/repo", "warm_target_age_s":null,"published_commit":null,"last_rebuild_result":"future_rebuild"}]})).unwrap();
+    let reply = decode_reply("exec.status", &bytes).unwrap();
+    assert_eq!(
+        grade_reply(&reply),
+        ReplyVerdict::Status {
+            reachable: true,
+            has_unknown_rebuild: true
+        }
+    );
+}
+
+#[test]
+fn unknown_records_without_a_terminal_require_recovery() {
+    let mut consumer = StreamConsumer::resume(ResumePoint {
+        job_id: job_id(),
+        last_seq: None,
+    });
+    let mut sink = MemorySink::default();
+    consumer
+        .consume_bytes(br#"{"type":"future_terminal","seq":0}"#, &mut sink)
+        .unwrap();
+    assert!(matches!(
+        consumer.finish(),
+        Err(Error::RecoveryRequired {
+            resume: Some(ResumePoint {
+                last_seq: Some(0),
+                ..
+            }),
+            ..
+        })
+    ));
 }
