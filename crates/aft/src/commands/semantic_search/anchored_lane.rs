@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+#[cfg(test)]
+static VARIABLE_SPAN_REGEX_COMPILATIONS: AtomicUsize = AtomicUsize::new(0);
 
 use super::comparator::{score_free_r3_cmp, CandidateResult};
 use super::evidence_descriptor::EvidenceDescriptor;
@@ -158,10 +165,10 @@ pub struct QuerySplitResult {
     pub denominator: usize,
 }
 
-pub fn split_query(query: &str) -> QuerySplitResult {
-    // These spans are values supplied when a format string is rendered. Keeping
-    // them would charge evidence for text that cannot occur in the source.
-    let variable_spans = Regex::new(
+fn compile_variable_span_pattern() -> Regex {
+    #[cfg(test)]
+    VARIABLE_SPAN_REGEX_COMPILATIONS.fetch_add(1, AtomicOrdering::Relaxed);
+    Regex::new(
         r##"(?x)
         \b(?i:INFO|WARN|ERROR|DEBUG|TRACE|FATAL|panicked)\b
         | \[\d+\]
@@ -175,11 +182,17 @@ pub fn split_query(query: &str) -> QuerySplitResult {
         | \b\d{2,}\b
         "##,
     )
-    .expect("compile anchored variable-span regex");
+    .expect("compile anchored variable-span regex")
+}
 
+static VARIABLE_SPAN_PATTERN: LazyLock<Regex> = LazyLock::new(compile_variable_span_pattern);
+
+pub fn split_query(query: &str) -> QuerySplitResult {
+    // These spans are values supplied when a format string is rendered. Keeping
+    // them would charge evidence for text that cannot occur in the source.
     let mut retained_runs = Vec::new();
     let mut last_end = 0;
-    for span in variable_spans.find_iter(query) {
+    for span in VARIABLE_SPAN_PATTERN.find_iter(query) {
         retain_literal_run(&query[last_end..span.start()], &mut retained_runs);
         last_end = span.end();
     }
@@ -706,6 +719,31 @@ impl SearchLane for AnchoredLane {
 #[cfg(test)]
 mod hot_path_tests {
     use super::*;
+
+    #[test]
+    fn audit_growth_repeated_query_splitting_compiles_the_fixed_pattern_once() {
+        let before = VARIABLE_SPAN_REGEX_COMPILATIONS.load(AtomicOrdering::Relaxed);
+        let first = split_query("AlphaSymbol {} BetaSymbol");
+        let second = split_query("GammaSymbol {} DeltaSymbol");
+        assert_eq!(
+            first,
+            QuerySplitResult {
+                retained_runs: vec!["AlphaSymbol".to_owned(), "BetaSymbol".to_owned()],
+                retained_run_lengths: vec![11, 10],
+                denominator: 21,
+            }
+        );
+        assert_eq!(
+            second,
+            QuerySplitResult {
+                retained_runs: vec!["GammaSymbol".to_owned(), "DeltaSymbol".to_owned()],
+                retained_run_lengths: vec![11, 11],
+                denominator: 22,
+            }
+        );
+        let compilations = VARIABLE_SPAN_REGEX_COMPILATIONS.load(AtomicOrdering::Relaxed) - before;
+        assert_eq!(compilations, 1, "fixed split pattern should compile once");
+    }
 
     #[test]
     fn anchored_regex_compilations_scale_with_runs_not_files() {
