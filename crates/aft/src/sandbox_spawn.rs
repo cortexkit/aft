@@ -2801,6 +2801,7 @@ fn sandboxed_child_environment(
         // code OUTSIDE confinement, so those keys are dropped even though they
         // arrived through the (otherwise honored) request environment.
         if is_preexec_hijack_env_key(key.as_str())
+            || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
             || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
         {
@@ -2887,6 +2888,21 @@ pub(crate) fn apply_sandbox_environment(
             command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
         }
     }
+}
+
+/// Install after all environment/session/fd adapters and before spawning.
+#[cfg(unix)]
+pub(crate) fn disclaim_command_for_plan(
+    plan: &SpawnPlan,
+    command: &mut Command,
+    environment: &HashMap<String, String>,
+) -> Result<(), String> {
+    command.env_remove(crate::privacy_spawn::CONTROL_ENV);
+    crate::privacy_spawn::install(
+        command,
+        crate::privacy_spawn::requested(environment),
+        isolated_environment_for_plan(plan, environment).is_some(),
+    )
 }
 
 /// The gh shim ticket is kept out of the isolated environment above because
@@ -2999,6 +3015,7 @@ pub(crate) fn probe_command_for_plan(
     crate::agent_child_env::apply_to_command(&mut command, env);
     apply_sandbox_environment(plan, &mut command, env);
     crate::bash_background::process::start_new_session(&mut command);
+    disclaim_command_for_plan(plan, &mut command, env)?;
     Ok(command)
 }
 

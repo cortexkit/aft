@@ -1821,6 +1821,7 @@ fn build_health_diagnostic_rollup(
         // making dead-code findings disappear rather than raising an error.
         resident_callgraph_stale_backend_rows: Option<crate::callgraph_store::StalePathCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
+        disclaim_privacy: Option<bool>,
         standing: Option<StandingHealthEntry>,
     }
 
@@ -1933,6 +1934,7 @@ fn build_health_diagnostic_rollup(
             repair_entries_60s,
             resident_callgraph_stale_backend_rows,
             watcher: Some(ctx.watcher_counters().snapshot()),
+            disclaim_privacy: Some(ctx.config().bash.disclaim_privacy),
             standing,
         });
     }
@@ -1946,6 +1948,7 @@ fn build_health_diagnostic_rollup(
         let health = unhosted_standing_health_snapshot(&standing);
         candidates.push(RootCandidate {
             root_label: health.project_root.clone(),
+            disclaim_privacy: None,
             health,
             busy: false,
             fully_ready: false,
@@ -2024,6 +2027,15 @@ fn build_health_diagnostic_rollup(
                 );
             }
             if let Some(object) = value.as_object_mut() {
+                if let Some(configured) = candidate.disclaim_privacy {
+                    object.insert(
+                        "bash".to_owned(),
+                        json!({
+                            "disclaim_privacy": configured,
+                            "privacy_disclaim_effective": configured && cfg!(target_os = "macos"),
+                        }),
+                    );
+                }
                 if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
                     object.insert(
                         "resident_callgraph_stale_backend_rows".to_string(),
@@ -3215,6 +3227,56 @@ mod tests {
 
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+    }
+
+    #[test]
+    fn health_exposes_the_live_privacy_disclaim_setting_per_root() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-privacy-disclaim");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        for enabled in [true, false] {
+            ctx.update_config(|config| config.bash.disclaim_privacy = enabled);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let report = test_health_report(
+                    &executor,
+                    &HashMap::new(),
+                    &DispatchPathMetrics::new(),
+                    &crate::context::App::default_shared(),
+                );
+                if let Some(roots) = report
+                    .metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics["roots"].as_array())
+                {
+                    if let Some(snapshot) = roots.iter().find(|snapshot| {
+                        snapshot["project_root"].as_str() == root.as_path().to_str()
+                    }) {
+                        assert_eq!(snapshot["bash"]["disclaim_privacy"], enabled);
+                        assert_eq!(
+                            snapshot["bash"]["privacy_disclaim_effective"],
+                            enabled && cfg!(target_os = "macos")
+                        );
+                        break;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "{report:?}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

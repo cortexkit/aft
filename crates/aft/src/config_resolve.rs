@@ -436,6 +436,7 @@ pub struct RawBashFeatures {
     #[serde(deserialize_with = "deserialize_opt_worker_wait_max_ms")]
     pub worker_wait_max_ms: Option<u64>,
     pub linux_scope: Option<bool>,
+    pub disclaim_privacy: Option<bool>,
     pub powershell_tool: Option<bool>,
 }
 
@@ -1481,6 +1482,8 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
         RawBash::Bool(enabled) => RawBash::Bool(enabled),
         RawBash::Features(mut features) => {
             features.linux_scope = None;
+            // A repository may tighten privacy, never restore inherited grants.
+            features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
             RawBash::Features(features)
         }
     })
@@ -1523,6 +1526,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                     .worker_wait_max_ms
                     .or(base.worker_wait_max_ms),
                 linux_scope: override_features.linux_scope.or(base.linux_scope),
+                disclaim_privacy: override_features.disclaim_privacy.or(base.disclaim_privacy),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
         }
@@ -1548,6 +1552,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             watch_sync_max_ms: None,
             worker_wait_max_ms: None,
             linux_scope: None,
+            disclaim_privacy: None,
             powershell_tool: None,
         },
         RawBash::Features(features) => features.clone(),
@@ -1647,6 +1652,15 @@ fn merge_inspect_duplicates(
 }
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
+    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.disclaim_privacy == Some(false))
+    {
+        push_drop(
+            dropped,
+            "bash.disclaim_privacy",
+            tier,
+            "projects may only enable privacy disclaiming",
+        );
+    }
     if raw.restrict_to_project_root.is_some() {
         push_drop(dropped, "restrict_to_project_root", tier, USER_ONLY_REASON);
     }
@@ -2311,6 +2325,7 @@ struct ResolvedBashConfig {
     watch_sync_max_ms: u64,
     worker_wait_max_ms: u64,
     linux_scope: bool,
+    disclaim_privacy: bool,
     powershell_tool: bool,
 }
 
@@ -2326,6 +2341,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.worker_wait_max_ms = bash.worker_wait_max_ms;
     config.bash.linux_scope = bash.linux_scope;
+    config.bash.disclaim_privacy = bash.disclaim_privacy;
     config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
@@ -2403,6 +2419,9 @@ fn resolve_bash_config(
         watch_sync_max_ms,
         worker_wait_max_ms,
         linux_scope: top_linux_scope,
+        disclaim_privacy: top_features
+            .and_then(|features| features.disclaim_privacy)
+            .unwrap_or(false),
         powershell_tool: false,
     };
 
@@ -3958,6 +3977,30 @@ mod tests {
         ]);
         assert!(result.config.bash.linux_scope);
         assert!(drop_keys(&result).contains(&"bash.linux_scope".to_string()));
+    }
+
+    #[test]
+    fn privacy_disclaim_project_only_tightens_and_reports_weakening() {
+        assert!(!resolve_config(&[]).config.bash.disclaim_privacy);
+        for user in [false, true] {
+            for project in [false, true] {
+                let result = resolve_config(&[
+                    tier(
+                        "user",
+                        &format!(r#"{{"bash":{{"disclaim_privacy":{user}}}}}"#),
+                    ),
+                    tier(
+                        "project",
+                        &format!(r#"{{"bash":{{"disclaim_privacy":{project}}}}}"#),
+                    ),
+                ]);
+                assert_eq!(result.config.bash.disclaim_privacy, user || project);
+                assert_eq!(
+                    drop_keys(&result).contains(&"bash.disclaim_privacy".to_string()),
+                    !project
+                );
+            }
+        }
     }
 
     #[test]

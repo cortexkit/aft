@@ -597,6 +597,9 @@ pub struct BashConfig {
     pub worker_wait_max_ms: u64,
     /// Put Linux tool shells in transient user scopes when systemd is available.
     pub linux_scope: bool,
+    /// On macOS, agent commands become responsible for their own privacy permissions.
+    /// Other platforms accept the setting but do not change process creation.
+    pub disclaim_privacy: bool,
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
@@ -612,6 +615,7 @@ impl Default for BashConfig {
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             worker_wait_max_ms: default_bash_worker_wait_max_ms(),
             linux_scope: false,
+            disclaim_privacy: false,
             powershell_tool: false,
         }
     }

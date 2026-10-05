@@ -627,6 +627,28 @@ fn project_edit_cannot_turn_off_a_sandbox_the_project_turned_on() {
 }
 
 #[test]
+fn privacy_disclaim_is_live_and_project_removal_cannot_loosen_it() {
+    let fixture = Fixture::new("{}", Some("{}"));
+    write(
+        &fixture.project_path,
+        r#"{"bash":{"disclaim_privacy":true}}"#,
+    );
+    assert_eq!(applied(&fixture.reload()), vec!["bash.disclaim_privacy"]);
+    assert!(fixture.ctx.config().bash.disclaim_privacy);
+    write(&fixture.project_path, "{}");
+    assert_eq!(held(&fixture.reload()), vec!["bash.disclaim_privacy"]);
+    assert!(fixture.ctx.config().bash.disclaim_privacy);
+}
+
+#[test]
+fn user_can_live_reload_privacy_disclaim_off() {
+    let fixture = Fixture::new(r#"{"bash":{"disclaim_privacy":true}}"#, Some("{}"));
+    write(&fixture.user_path, r#"{"bash":{"disclaim_privacy":false}}"#);
+    assert_eq!(applied(&fixture.reload()), vec!["bash.disclaim_privacy"]);
+    assert!(!fixture.ctx.config().bash.disclaim_privacy);
+}
+
+#[test]
 fn a_user_edit_can_still_loosen_what_the_user_set() {
     let fixture = Fixture::new(r#"{ "sandbox": { "enabled": true } }"#, Some("{}"));
     write(&fixture.user_path, r#"{ "sandbox": { "enabled": false } }"#);

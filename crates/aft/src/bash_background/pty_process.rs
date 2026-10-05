@@ -165,10 +165,22 @@ fn try_spawn_pty(
             pixel_height: 0,
         })
         .map_err(|error| format!("open PTY failed: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let child = if crate::privacy_spawn::requested(env) {
+        crate::privacy_spawn::spawn_pty(command, pair.master.as_ref())?
+    } else {
+        pair.slave
+            .spawn_command(command)
+            .map_err(|error| format!("spawn PTY command failed: {error}"))?
+    };
+    #[cfg(not(target_os = "macos"))]
     let child = pair
         .slave
         .spawn_command(command)
         .map_err(|error| format!("spawn PTY command failed: {error}"))?;
+    if crate::privacy_spawn::requested(env) {
+        crate::privacy_spawn::note_session(session_id);
+    }
     drop(profile_handle);
     let child_pid = child.process_id();
     let killer = child.clone_killer();

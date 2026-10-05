@@ -471,9 +471,13 @@ pub(crate) fn run_governed_gh(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::agent_child_env::apply_to_command(&mut command, &environment);
+    crate::privacy_spawn::install(&mut command, config.bash.disclaim_privacy, false)?;
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not start the governed gh shim: {error}"))?;
+    if config.bash.disclaim_privacy {
+        crate::privacy_spawn::note_session(req.session());
+    }
     child
         .stdin
         .take()

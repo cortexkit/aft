@@ -2603,6 +2603,9 @@ impl BgTaskRegistry {
         let child_pid = child.id();
         log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
         metadata.mark_running(child_pid, child_pid as i32);
+        if crate::privacy_spawn::requested(&env) {
+            crate::privacy_spawn::note_session(&session_id);
+        }
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
 
@@ -9052,6 +9055,7 @@ fn spawn_detached_child(
             .stderr(Stdio::from(stderr));
         crate::agent_child_env::apply_to_command(&mut child_command, env);
         crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
+        crate::sandbox_spawn::disclaim_command_for_plan(spawn_plan, &mut child_command, env)?;
         let child = child_command
             .spawn()
             .map_err(|e| format!("failed to spawn background bash command: {e}"));

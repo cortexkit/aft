@@ -169,6 +169,12 @@ function captureCase(caseDef: ParityCase, savedOpencodeConfigDir: string | undef
 }
 
 const CASES: ParityCase[] = [
+  { name: "privacy_user_on_project_off", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
+  { name: "privacy_project_on", user: { bash: { disclaim_privacy: false } }, project: { bash: { disclaim_privacy: true } } },
+  { name: "privacy_project_off_dropped", project: { bash: { disclaim_privacy: false } } },
+  { name: "privacy_user_on_project_bool", user: { bash: { disclaim_privacy: true } }, project: { bash: false } },
+  { name: "privacy_pi_project_on", harness: "pi", project: { bash: { disclaim_privacy: true } } },
+  { name: "privacy_pi_user_on_project_off", harness: "pi", user: { bash: { disclaim_privacy: true } }, project: { bash: { disclaim_privacy: false } } },
   { name: "empty" },
   {
     name: "user_only_basic",

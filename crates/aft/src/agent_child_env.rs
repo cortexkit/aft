@@ -458,6 +458,7 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
         command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
     }
     command.envs(environment);
+    command.env_remove(crate::privacy_spawn::CONTROL_ENV);
 
     let mut credential_keys = std::env::vars_os()
         .map(|(key, _)| key)
@@ -478,6 +479,7 @@ pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<Stri
 /// CommandBuilder materializes the process environment when it is constructed,
 /// so filtering the builder covers Unix exec and Windows CreateProcess alike.
 pub(crate) fn scrub_pty_command(command: &mut portable_pty::CommandBuilder) {
+    command.env_remove(crate::privacy_spawn::CONTROL_ENV);
     let mut credential_keys = std::env::vars_os()
         .map(|(key, _)| key)
         .filter(|key| key.to_str().is_some_and(is_subc_credential_env_key))
@@ -511,6 +513,11 @@ pub fn inject(
     // daemon connection. Remove them only from the child snapshot so the module
     // process retains the credentials it needs.
     environment.retain(|key, _| !is_subc_credential_env_key(key));
+    // This control belongs to the pinned config, never a caller or outer daemon.
+    environment.remove(crate::privacy_spawn::CONTROL_ENV);
+    if config.bash.disclaim_privacy {
+        environment.insert(crate::privacy_spawn::CONTROL_ENV.to_owned(), "1".to_owned());
+    }
 
     let gh_enabled = config.github.shim;
     environment.remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
@@ -1398,6 +1405,28 @@ mod tests {
     }
 
     #[test]
+    fn privacy_disclaim_control_comes_only_from_config_and_never_reaches_the_child() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        let mut environment =
+            HashMap::from([(crate::privacy_spawn::CONTROL_ENV.to_owned(), "1".to_owned())]);
+        inject(&config, root.path(), &mut environment, None).unwrap();
+        assert!(!environment.contains_key(crate::privacy_spawn::CONTROL_ENV));
+        config.bash.disclaim_privacy = true;
+        inject(&config, root.path(), &mut environment, None).unwrap();
+        assert!(crate::privacy_spawn::requested(&environment));
+        let mut command = Command::new("sh");
+        apply_to_command(&mut command, &environment);
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == crate::privacy_spawn::CONTROL_ENV && value.is_none()));
+        let mut pty = portable_pty::CommandBuilder::new("sh");
+        pty.env(crate::privacy_spawn::CONTROL_ENV, "1");
+        scrub_pty_command(&mut pty);
+        assert!(pty.get_env(crate::privacy_spawn::CONTROL_ENV).is_none());
+    }
+
+    #[test]
     fn gh_shim_ticket_is_set_only_from_the_argument_and_never_inherited() {
         let storage = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -1532,10 +1561,12 @@ mod tests {
         );
 
         let pty_spawns = pty.matches(".spawn_command(").count();
-        assert_eq!(pty_spawns, 1, "agent PTY spawn inventory drifted");
+        // The macOS opt-in branch uses posix_spawn; these two inherited
+        // alternatives are mutually exclusive cfg paths.
+        assert_eq!(pty_spawns, 2, "agent PTY spawn inventory drifted");
         assert_eq!(
             pty.matches("sandbox_spawn::pty_command_for_plan(").count(),
-            pty_spawns,
+            1,
             "every PTY spawn must use the scrubbed command factory"
         );
         assert!(

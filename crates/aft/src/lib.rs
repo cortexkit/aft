@@ -133,6 +133,7 @@ pub mod pattern_compile;
 pub mod persisted_format;
 pub mod pins;
 mod platform_tls;
+mod privacy_spawn;
 pub mod process_io;
 pub mod protocol;
 pub mod pty_render;

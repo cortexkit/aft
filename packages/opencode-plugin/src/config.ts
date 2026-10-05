@@ -345,6 +345,8 @@ const BashFeaturesSchema = z.object({
     .optional(),
   /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
   linux_scope: z.boolean().optional(),
+  /** macOS agent commands do not inherit the supervisor's privacy grants. Default false. */
+  disclaim_privacy: z.boolean().optional(),
   // Pi-only registration fallback. OpenCode accepts this shared config key but
   // never registers a PowerShell tool.
   powershell_tool: z.boolean().optional(),
@@ -903,9 +905,13 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       config.bash.db_schema_hints !== undefined ||
       config.bash.watch_sync_max_ms !== undefined ||
       config.bash.worker_wait_max_ms !== undefined ||
+      config.bash.disclaim_privacy !== undefined ||
       config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
+      ...(config.bash.disclaim_privacy !== undefined
+        ? { disclaim_privacy: config.bash.disclaim_privacy }
+        : {}),
       ...(config.bash.enabled !== undefined ? { enabled: config.bash.enabled } : {}),
       ...(config.bash.host_fallback !== undefined
         ? { host_fallback: config.bash.host_fallback }
@@ -1933,6 +1939,8 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   // enabled:true is an accepted project-tier hardening opt-in; only the
   // weakening direction (enabled:false) is stripped as user-only.
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
+  if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)
+    stripped.push("bash.disclaim_privacy");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
   if (override.opencode !== undefined) stripped.push("opencode");
@@ -1990,7 +1998,11 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const search = mergeProjectSearchConfig(base.search, override.search);
   const lsp = mergeLspConfig(base.lsp, override.lsp);
   const experimental = mergeExperimentalConfig(base.experimental, override.experimental);
-  const bash = mergeBashConfig(base.bash, override.bash);
+  const projectBash = typeof override.bash === "object" ? { ...override.bash } : override.bash;
+  if (typeof projectBash === "object" && projectBash.disclaim_privacy !== true)
+    delete projectBash.disclaim_privacy;
+  // Strip only the weakening direction before the usual field-wise merge.
+  const bash = mergeBashConfig(base.bash, projectBash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
