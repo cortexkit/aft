@@ -80,9 +80,11 @@ fn outline_files_mode_explicit_info_excluded_target_lists_its_files() {
     assert_eq!(response["success"], true, "{response}");
     assert_eq!(response["complete"], true, "{response}");
     assert_eq!(files(&response).len(), 20, "{response}");
+    let text = response["text"].as_str().unwrap();
+    assert_eq!(text.lines().count(), 20, "{text}");
     assert!(
-        response["text"].as_str().unwrap().contains("20 files"),
-        "{response}"
+        text.contains("evidence-00.json") && text.contains("evidence-19.json"),
+        "{text}"
     );
     assert!(!response_paths(&response)
         .iter()
