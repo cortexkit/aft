@@ -155,16 +155,34 @@ impl OutputSink for TaskSink {
         Ok(())
     }
     fn truncated(&mut self, before_seq: u64) -> io::Result<()> {
-        self.commit(|r| r.last_seq = before_seq.checked_sub(1))?;
         let mut db = DeferredDbWrites::new(&self.registry, &self.task);
         let mut state = self
             .task
             .state
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
-        state.metadata.execution_note=Some(format!("ran remotely on ck-motor; retained output starts at seq {before_seq} (earlier output expired)"));
-        self.registry
-            .persist_task_locked(&self.task, &state.metadata, &mut db)
+        let previous = state.metadata.clone();
+        let remote = state
+            .metadata
+            .remote
+            .as_mut()
+            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        let first = remote.last_seq.map_or(0, |seq| seq.saturating_add(1));
+        remote.last_seq = before_seq.checked_sub(1);
+        if first < before_seq {
+            state
+                .metadata
+                .incomplete_output
+                .push((first, before_seq - 1));
+        }
+        append_output_loss(&mut state.metadata);
+        let result = self
+            .registry
+            .persist_task_locked(&self.task, &state.metadata, &mut db);
+        if result.is_err() {
+            state.metadata = previous;
+        }
+        result
     }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
         let remote = self
@@ -658,6 +676,7 @@ impl BgTaskRegistry {
                     serde_json::to_string(changes).unwrap()
                 ));
         }
+        append_output_loss(&mut state.metadata);
         self.persist_task_locked(task, &state.metadata, &mut db)
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
@@ -844,6 +863,7 @@ impl BgTaskRegistry {
                 }
             }
             state.metadata.mark_terminal(status, code, reason.clone());
+            append_output_loss(&mut state.metadata);
             if let Some(reason) = reason {
                 let note = state
                     .metadata
@@ -910,6 +930,21 @@ fn repository_root(root: &Path) -> PathBuf {
         .and_then(|s| gitdir.join(s.trim()).canonicalize().ok())
         .and_then(|p| p.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| root.into())
+}
+
+#[cfg(unix)]
+fn append_output_loss(metadata: &mut PersistedTask) {
+    for (first, last) in &metadata.incomplete_output {
+        let warning = format!(
+            "output lost between seq {first} and {last}: the executor no longer retained it"
+        );
+        let note = metadata
+            .execution_note
+            .get_or_insert_with(|| "remote execution on ck-motor".into());
+        if !note.contains(&warning) {
+            note.push_str(&format!("\n{warning}"));
+        }
+    }
 }
 
 #[cfg(unix)]

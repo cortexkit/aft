@@ -24,6 +24,7 @@ pub(crate) enum Script {
     Utf8,
     Deadline,
     AttachRefused,
+    RetainedGap,
 }
 
 pub(crate) struct Daemon {
@@ -118,6 +119,10 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                                     for (seq,stream,bytes) in [(0,OutputStream::Stdout,vec![0xe2]),(1,OutputStream::Stderr,vec![0xf0,0x9f]),(2,OutputStream::Stdout,vec![0x82,0xac]),(3,OutputStream::Stderr,vec![0x98,0x80])] {
                                         replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(Output::new(seq,stream,BytePayload(bytes)))).unwrap()));
                                     }
+                                }
+                                if matches!(script,Script::RetainedGap) {
+                                    let output=Output::new(3,OutputStream::Stdout,BytePayload(b"D".to_vec())).with_truncated_before_seq(3);
+                                    replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(output)).unwrap()));
                                 }
                                 if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart | Script::AttachRefused) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);

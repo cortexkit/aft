@@ -343,6 +343,46 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     assert!(!log.iter().any(|(_, b)| b["method"] == "exec.run"));
 }
 
+#[tokio::test]
+async fn exec_remote_bash_retained_output_gap_survives_terminal_and_restart() {
+    let daemon = daemon(Script::RetainedGap, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task).unwrap();
+    sink.output(0, OutputStream::Stdout, b"A").unwrap();
+    drop(sink);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed);
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"AD");
+    let warning = "output lost between seq 1 and 2: the executor no longer retained it";
+    assert!(done.output_preview.contains(warning), "{done:?}");
+    assert_eq!(
+        crate::bash_background::persistence::read_task(&paths.json)
+            .unwrap()
+            .incomplete_output,
+        vec![(1, 2)]
+    );
+    let replay = registry();
+    replay.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&replay, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed);
+    assert!(done.output_preview.contains(warning), "{done:?}");
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, b)| b["method"] == "exec.run"));
+}
+
 fn persist_accepted_with_snapshot(
     dir: &Path,
     connection: PathBuf,
