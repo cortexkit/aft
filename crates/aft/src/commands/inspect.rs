@@ -1900,7 +1900,7 @@ fn partial_reason_from_parts(parts: &[(bool, String)]) -> Option<String> {
         return None;
     }
     let mut diagnostic_label_shown = false;
-    // Registered header-only presentation cap in list_surfaces::inspect.
+    // Headline cap, registered as an exclusion in list_surfaces.rs.
     let mut shown = parts
         .iter()
         .take(MAX_INSPECT_HEADER_PARTS)

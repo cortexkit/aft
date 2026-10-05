@@ -560,6 +560,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "commands::semantic_search::external_pattern::Corpus semantic enumeration",
         reason: "enumerates at most SEMANTIC_ENUMERATION_LIMIT prose candidates before ranking, like the external query-only route; more_available reports the remaining candidates and the engine envelopes the results page. Discovery currently attributes the restricted-visibility method to its preceding semantic_index helper",
     },
+    ExclusionEntry {
+        file: "commands/inspect.rs",
+        enclosing_item: "partial_reason_from_parts",
+        location_or_primitive: "commands::inspect::MAX_INSPECT_HEADER_PARTS",
+        reason: "the PARTIAL status line previews at most MAX_INSPECT_HEADER_PARTS incomplete parts and says `+N more`; every scanner reason stays in the body and the structured gaps, diagnostic overflow reasons are rendered in the body, and the cap never changes `complete`",
+    },
 ];
 
 /// Look up a surface by command, mode, and list id.
