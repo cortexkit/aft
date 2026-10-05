@@ -301,43 +301,49 @@ fn watcher_path_is_ignore_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn watcher_same_path(path: &Path, target: &Path) -> bool {
-    if path == target {
-        return true;
-    }
-
-    std::fs::canonicalize(target)
-        .map(|target| path == target)
-        .unwrap_or(false)
+struct WatcherBatchMetadata {
+    head_paths: BTreeSet<PathBuf>,
+    external_ignore_paths: BTreeSet<PathBuf>,
 }
 
-fn watcher_path_is_git_head_metadata(config: &WatcherFilterConfig, path: &Path) -> bool {
-    crate::alias::capture_git_head_metadata(&config.project_root, config.git_common_dir.as_deref())
-        .is_ok_and(|metadata| metadata.matches_path(path))
-}
-
-fn watcher_path_is_git_info_exclude(config: &WatcherFilterConfig, path: &Path) -> bool {
-    watcher_same_path(path, &config.git_info_exclude_path())
-}
-
-fn watcher_path_is_global_gitignore(path: &Path) -> bool {
-    ignore::gitignore::gitconfig_excludes_path()
-        .as_deref()
-        .is_some_and(|global_ignore| watcher_same_path(path, global_ignore))
-}
-
-fn watcher_path_can_change_corpus_ignore(config: &WatcherFilterConfig, path: &Path) -> bool {
-    if watcher_path_is_global_gitignore(path) {
-        return true;
+impl WatcherBatchMetadata {
+    fn resolve(config: &WatcherFilterConfig) -> Self {
+        fn add_spellings(paths: &mut BTreeSet<PathBuf>, path: &Path) {
+            paths.insert(path.to_path_buf());
+            if let Ok(canonical) = std::fs::canonicalize(path) {
+                paths.insert(canonical);
+            }
+        }
+        let mut external_ignore_paths = BTreeSet::new();
+        add_spellings(&mut external_ignore_paths, &config.git_info_exclude_path());
+        #[cfg(test)]
+        crate::search_index::audit_record(|work| work.watcher_global += 1);
+        if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+            add_spellings(&mut external_ignore_paths, &global);
+        }
+        let mut head_paths = BTreeSet::new();
+        #[cfg(test)]
+        crate::search_index::audit_record(|work| work.watcher_head += 1);
+        if let Ok(metadata) = crate::alias::capture_git_head_metadata(
+            &config.project_root,
+            config.git_common_dir.as_deref(),
+        ) {
+            for path in metadata.watch_paths() {
+                add_spellings(&mut head_paths, path);
+            }
+        }
+        Self {
+            head_paths,
+            external_ignore_paths,
+        }
     }
-    if watcher_path_is_git_info_exclude(config, path) {
-        return true;
-    }
-    if !path.starts_with(&config.project_root) {
-        return false;
-    }
 
-    watcher_path_is_ignore_file(path) && !watcher_path_is_infra_skip(path)
+    fn can_change_corpus_ignore(&self, config: &WatcherFilterConfig, path: &Path) -> bool {
+        self.external_ignore_paths.contains(path)
+            || (path.starts_with(&config.project_root)
+                && watcher_path_is_ignore_file(path)
+                && !watcher_path_is_infra_skip(path))
+    }
 }
 
 pub fn canonicalize_watcher_path(path: PathBuf) -> PathBuf {
@@ -1351,6 +1357,10 @@ fn filter_canonical_paths(
     matcher: &SharedGitignore,
     raw_paths: BTreeSet<PathBuf>,
 ) -> FilteredWatcherPaths {
+    // Resolve control paths once for this flush, not once for every source
+    // change. A fresh resolution on the next flush observes HEAD/ref and global
+    // ignore configuration changes without a process-lifetime cache.
+    let metadata = WatcherBatchMetadata::resolve(config);
     // A `.gitignore` written inside a directory the current rules already
     // ignore cannot change the corpus: git never descends into an ignored
     // directory to read one, and neither does the matcher. wrangler, for one,
@@ -1362,30 +1372,38 @@ fn filter_canonical_paths(
     let ignore_file_paths = raw_paths
         .iter()
         .filter(|path| {
-            watcher_path_can_change_corpus_ignore(config, path)
+            metadata.can_change_corpus_ignore(config, path)
                 && !ignore_file_is_ignored_by_matcher(matcher, path)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
     let ignore_file_changed = !ignore_file_paths.is_empty();
 
+    let matcher = matcher
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let changed = raw_paths
         .into_iter()
         .filter(|path| {
-            if watcher_path_is_git_head_metadata(config, path) {
+            if metadata.head_paths.contains(path) {
                 return true;
             }
             if watcher_path_is_infra_skip(path) {
                 return false;
             }
 
-            if watcher_path_is_global_gitignore(path)
-                || watcher_path_is_git_info_exclude(config, path)
-            {
+            if metadata.external_ignore_paths.contains(path) {
                 return false;
             }
 
-            if watcher_path_is_ignored_by_matcher(matcher, path) {
+            // raw_paths were canonicalized before the flush. Repeating that
+            // I/O here buys nothing and charges every checkout path twice.
+            if matcher.as_deref().is_some_and(|matcher| {
+                path.starts_with(matcher.path())
+                    && matcher
+                        .matched_path_or_any_parents(path, path.is_dir())
+                        .is_ignore()
+            }) {
                 return false;
             }
             true
@@ -1925,6 +1943,33 @@ mod tests {
             rewrite_nested_ignore_line(dir, "**/cache"),
             Some(r"foo\[1]/bar\*/**/cache".to_string())
         );
+    }
+
+    #[test]
+    fn perf_audit_watcher_resolves_once_per_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            root.join(".git/refs/heads/main"),
+            "0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+        let config = WatcherFilterConfig::new(root.clone(), Some(root.join(".git")));
+        let matcher = shared_matcher(&root);
+        let mut paths = (0..1000)
+            .map(|i| root.join(format!("src/file_{i:04}.rs")))
+            .collect::<BTreeSet<_>>();
+        paths.insert(root.join(".git/HEAD"));
+        paths.insert(root.join(".git/refs/heads/main"));
+        crate::search_index::audit_work_reset();
+        let filtered = filter_canonical_paths(&config, &matcher, paths);
+        assert_eq!(filtered.changed.len(), 1002);
+        assert!(!filtered.ignore_file_changed);
+        let work = crate::search_index::audit_work();
+        assert_eq!(work.watcher_global, 1, "{work:?}");
+        assert_eq!(work.watcher_head, 1, "{work:?}");
     }
 
     fn shared_matcher(root: &Path) -> SharedGitignore {
