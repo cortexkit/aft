@@ -6045,6 +6045,154 @@ fn reported_check_still_running(response: &Value) -> bool {
     still_checking
 }
 
+#[test]
+fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer() {
+    if !crate::helpers::real_rust_analyzer_available(
+        "rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer",
+    ) {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("checkout");
+    let storage = temp.path().join("storage");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"saved-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&root, "src/lib.rs", "pub fn answer() -> u8 { 42 }\n");
+    write_file(
+        &root,
+        "build.rs",
+        "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+    );
+    // Pre-create the lockfile: its creation during the first check changes an input.
+    write_file(
+        &root,
+        "Cargo.lock",
+        "version = 4\n[[package]]\nname = \"saved-check\"\nversion = \"0.1.0\"\n",
+    );
+    let new_context = || {
+        crate::helpers::disable_in_process_file_watcher();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let response = handle_configure(
+            &request(json!({
+                "id": "saved-configure", "command": "configure", "project_root": root, "storage_dir": storage,
+                "harness": "opencode", "config": crate::helpers::user_config(json!({
+                    "search_index": false, "semantic_search": false,
+                    "inspect": {"diagnostics_timeout_ms": 40_000}
+                }))
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        ctx.lsp()
+            .override_binary(ServerKind::Rust, fake_server_path());
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_PROXY", "rust-analyzer");
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS", "45000");
+        ctx
+    };
+    let ctx = new_context();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let warm = loop {
+        let warm = scoped_diagnostics_inspect(&ctx, "saved-warm", "src");
+        if warm["summary"]["diagnostics"]["errors"] == 0 {
+            break warm;
+        }
+        assert!(std::time::Instant::now() < deadline, "{warm:#}");
+    };
+    assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
+    assert!(
+        fs::read_dir(storage.join("rust-completed-checks"))
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "json")),
+        "no completed check was persisted: {warm:#}"
+    );
+    drop(ctx);
+    let ctx = new_context();
+    let started = std::time::Instant::now();
+    let cold = scoped_diagnostics_inspect(&ctx, "saved-cold", "src");
+    assert!(
+        cold["text"]
+            .as_str()
+            .unwrap()
+            .contains("last completed check"),
+        "{cold:#}"
+    );
+    assert_eq!(cold["summary"]["diagnostics"]["errors"], 0, "{cold:#}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // A cold request after an edit cannot reuse the previous clean check.
+    drop(ctx);
+    write_file(&root, "src/lib.rs", "pub fn answer() -> u8 { unknown }\n");
+    let ctx = new_context();
+    let config = ctx.config();
+    let file = root.join("src/lib.rs");
+    ctx.lsp().ensure_server_for_file(&file, &config);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        ctx.lsp().drain_events();
+        if ctx
+            .lsp()
+            .client_for_file(&file, &config)
+            .is_some_and(|client| !client.diagnostics_are_provisional())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "real analyzer did not finish indexing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let changed = scoped_diagnostics_inspect(&ctx, "saved-changed", "src");
+    assert!(
+        !changed["text"]
+            .as_str()
+            .unwrap()
+            .contains("no Rust inputs changed"),
+        "{changed:#}"
+    );
+    assert!(reported_check_still_running(&changed), "{changed:#}");
+    let errors = loop {
+        let response = scoped_diagnostics_inspect(&ctx, "saved-errors-warm", "src");
+        if response["summary"]["diagnostics"]["errors"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+        {
+            break response;
+        }
+        assert!(std::time::Instant::now() < deadline, "{response:#}");
+    };
+    drop(ctx);
+    let ctx = new_context();
+    let restored_errors = scoped_diagnostics_inspect(&ctx, "saved-errors-cold", "src");
+    assert!(
+        restored_errors["text"]
+            .as_str()
+            .unwrap()
+            .contains("last completed check"),
+        "{restored_errors:#}"
+    );
+    assert_eq!(
+        restored_errors["summary"]["diagnostics"]["errors"],
+        errors["summary"]["diagnostics"]["errors"],
+        "{restored_errors:#}"
+    );
+}
+
 /// rust-analyzer starts its first `cargo check` just after it reports
 /// quiescence, but a server short of CPU (several of them sharing a CI
 /// runner) can announce that check seconds later. A relay in front of the

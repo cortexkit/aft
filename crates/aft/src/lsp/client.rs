@@ -718,6 +718,8 @@ pub struct LspClient {
     /// this count, taken when the save is sent, with
     /// `rust_check_begins_drained` tells the two apart.
     rust_check_begins_read: Arc<AtomicU64>,
+    rust_check_begin_times: Arc<Mutex<HashMap<u64, SystemTime>>>,
+    pub(crate) completed_rust_check: Option<super::completed_rust_check::CompletedRustCheck>,
     /// How many check-run begin notifications have been drained (see
     /// [`LspClient::record_rust_progress`]).
     rust_check_begins_drained: u64,
@@ -930,6 +932,8 @@ impl LspClient {
         let reader_root = root.clone();
         let rust_check_begins_read = Arc::new(AtomicU64::new(0));
         let reader_check_begins = Arc::clone(&rust_check_begins_read);
+        let rust_check_begin_times = Arc::new(Mutex::new(HashMap::new()));
+        let reader_check_begin_times = Arc::clone(&rust_check_begin_times);
 
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -956,7 +960,10 @@ impl LspClient {
                     Ok(Some(ServerMessage::Notification { method, params })) => {
                         reader_writer.note_received();
                         if method == "$/progress" && is_rust_check_begin(params.as_ref()) {
-                            reader_check_begins.fetch_add(1, Ordering::SeqCst);
+                            let ordinal = reader_check_begins.fetch_add(1, Ordering::SeqCst) + 1;
+                            if let Ok(mut times) = reader_check_begin_times.lock() {
+                                times.insert(ordinal, SystemTime::now());
+                            }
                         }
                         let _ = event_tx.send(LspEvent::Notification {
                             server_kind: reader_kind.clone(),
@@ -1044,6 +1051,8 @@ impl LspClient {
             rust_flycheck_started_at: None,
             rust_save: None,
             rust_check_begins_read,
+            rust_check_begin_times,
+            completed_rust_check: None,
             rust_check_begins_drained: 0,
             save_notification: None,
             rust_checks_on_save: false,
@@ -1327,6 +1336,16 @@ impl LspClient {
                 if is_rust_check_progress(token, title) {
                     self.rust_check_begins_drained += 1;
                     let ordinal = self.rust_check_begins_drained;
+                    let began = self
+                        .rust_check_begin_times
+                        .lock()
+                        .ok()
+                        .and_then(|mut times| times.remove(&ordinal));
+                    if let Some(cache) = self.completed_rust_check.as_mut() {
+                        if let Some(began) = began {
+                            cache.begin(began);
+                        }
+                    }
                     self.rust_flycheck_running
                         .insert(token.to_string(), ordinal);
                     self.rust_flycheck_started_at = Some(Instant::now());
@@ -1357,6 +1376,9 @@ impl LspClient {
             }
             "end" => {
                 if let Some(begin) = self.rust_flycheck_running.remove(token) {
+                    if let Some(cache) = self.completed_rust_check.as_mut() {
+                        cache.finished = true;
+                    }
                     self.rust_flycheck_finished_at = Some(Instant::now());
                     self.rust_completed_check_begin = Some(
                         self.rust_completed_check_begin

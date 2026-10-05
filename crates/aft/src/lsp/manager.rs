@@ -2806,6 +2806,35 @@ impl LspManager {
         })
     }
 
+    pub(crate) fn saved_rust_checks(
+        &self,
+        deadline: Instant,
+    ) -> HashMap<ServerKey, super::completed_rust_check::SavedCheck> {
+        self.clients
+            .iter()
+            .filter_map(|(key, client)| {
+                if key.kind != ServerKind::Rust
+                    || self.producer_failure(key).is_some()
+                    || self.rust_check_completed_current(key)
+                {
+                    return None;
+                }
+                let saved = client.completed_rust_check.as_ref()?.validated(deadline)?;
+                Some((key.clone(), saved))
+            })
+            .collect()
+    }
+
+    pub(crate) fn rust_check_running_reason(&self, key: &ServerKey) -> String {
+        self.clients
+            .get(key)
+            .and_then(|c| c.completed_rust_check.as_ref())
+            .and_then(|cache| cache.running_reason())
+            .unwrap_or_else(|| {
+                crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON.to_string()
+            })
+    }
+
     /// Ask rust-analyzer again for a check that was expected and did not
     /// begin by its deadline (see
     /// [`LspClient::rearm_unreported_rust_check`]). Callers do this when they
@@ -2908,6 +2937,15 @@ impl LspManager {
         }
         let has_more = events.len() >= max_events && !self.event_rx.is_empty();
         self.send_due_rust_saves();
+        for client in self.clients.values_mut() {
+            if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
+                && !client.diagnostics_are_provisional()
+            {
+                if let Some(cache) = client.completed_rust_check.as_mut() {
+                    cache.complete();
+                }
+            }
+        }
         DrainedLspEvents {
             events,
             diagnostics_changed,
@@ -4653,6 +4691,15 @@ impl LspManager {
         );
         let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics, &server);
         let key = ServerKey { kind: server, root };
+        // Preserve the full compiler result independently of the working-set
+        // LRU and document-close exceptions, which must not turn errors clean.
+        if let Some(cache) = self
+            .clients
+            .get_mut(&key)
+            .and_then(|c| c.completed_rust_check.as_mut())
+        {
+            cache.reports.insert(file.clone(), stored.clone());
+        }
         let mut stored = stored;
         if key.kind == ServerKind::Rust && self.server_supports_pull(&key) {
             // Recorded before the close check below: rust-analyzer's reply to
@@ -4744,6 +4791,19 @@ impl LspManager {
                 );
             }
             client.record_rust_progress(&token, kind, title);
+            if kind == "end"
+                && value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| {
+                        message.to_lowercase().contains("cancel")
+                            || message.to_lowercase().contains("fail")
+                    })
+            {
+                if let Some(cache) = client.completed_rust_check.as_mut() {
+                    cache.abort();
+                }
+            }
         }
     }
 
@@ -5121,6 +5181,7 @@ impl LspManager {
             initialization_options,
             runtime_note,
             project_typescript,
+            storage_root: crate::bash_background::storage_dir(config.storage_dir.as_deref()),
         })
     }
 
@@ -5769,6 +5830,7 @@ struct PreparedSpawn {
     /// For the TypeScript server, the project's own TypeScript package, used
     /// to explain an initialize failure.
     project_typescript: Option<ProjectTypeScript>,
+    storage_root: PathBuf,
 }
 
 /// Why a prepared spawn produced no client. The manager records the details
@@ -5813,6 +5875,22 @@ impl PreparedSpawn {
     /// manager state, so it runs without the manager lock.
     fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
         let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
+        let completed_rust_check = (self.kind == ServerKind::Rust)
+            .then(|| {
+                super::completed_rust_check::CompletedRustCheck::new(
+                    &self.root,
+                    &self.reclaim_root,
+                    &self.storage_root,
+                    super::completed_rust_check::Runtime {
+                        binary: self.binary.clone(),
+                        args: self.args.clone(),
+                        env: self.env.clone(),
+                        options: self.initialization_options.clone(),
+                        launch_env: None,
+                    },
+                )
+            })
+            .flatten();
         let mut client = match LspClient::spawn_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),
@@ -5839,6 +5917,7 @@ impl PreparedSpawn {
             }
         };
         client.runtime_note = self.runtime_note;
+        client.completed_rust_check = completed_rust_check;
         let initialize = match initialize_timeout {
             Some(timeout) => {
                 client.initialize_with_timeout(&self.root, self.initialization_options, timeout)

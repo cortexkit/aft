@@ -114,6 +114,8 @@ struct DiagnosticsCollection {
     /// finished when the wait ran out. Their published reports lack the
     /// compiler's newest results, so totals cannot be certified.
     checking_producers: BTreeSet<(String, PathBuf)>,
+    saved_files: BTreeSet<PathBuf>,
+    checking_reasons: BTreeMap<(String, PathBuf), String>,
 }
 
 /// Collect diagnostics for the explicit inspect path.
@@ -167,14 +169,27 @@ pub(crate) fn run_diagnostics_category(
             .collect::<HashSet<_>>();
         (candidates, producer_keys)
     });
+    let saved = ctx.lsp().saved_rust_checks(
+        sweep_deadline
+            .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
+            .min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
+    );
     let mut sweep = match (&scoped, sweep_deadline) {
         (Some((candidates, _)), Some(deadline)) if !applicability_is_empty => {
             Some(sweep_scoped_files(
                 ctx,
                 &snapshot.config,
                 &snapshot.project_root,
-                candidates,
-                expected_producers,
+                &candidates
+                    .iter()
+                    .filter(|file| !saved.values().any(|check| check.covers(file)))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                &expected_producers
+                    .iter()
+                    .filter(|key| !saved.contains_key(*key))
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 deadline,
             ))
         }
@@ -203,9 +218,12 @@ pub(crate) fn run_diagnostics_category(
     // gap moves from `indexing_gaps` to `checking_producers`, so it is not
     // treated as a warming server, whose provisional rows would be shown.
     collection.indexing_gaps.retain(|producer, reason| {
-        let checking = reason == RUST_CHECK_RUNNING_REASON;
+        let checking = reason.starts_with("rust-analyzer: cargo check");
         if checking {
             collection.checking_producers.insert(producer.clone());
+            collection
+                .checking_reasons
+                .insert(producer.clone(), reason.clone());
         }
         !checking
     });
@@ -225,6 +243,64 @@ pub(crate) fn run_diagnostics_category(
         .iter()
         .map(|server| (server.server_id.clone(), server.reason()))
         .collect();
+    for (id, root) in &collection.checking_producers {
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: root.clone(),
+        };
+        collection.checking_reasons.insert(
+            (id.clone(), root.clone()),
+            ctx.lsp().rust_check_running_reason(&key),
+        );
+    }
+
+    // Revalidate after per-file work. A successful early validation only skips
+    // the cold wait; it cannot certify inputs which changed during that wait.
+    let saved = ctx
+        .lsp()
+        .saved_rust_checks(Instant::now() + crate::lsp::completed_rust_check::BUDGET);
+    for (key, check) in saved {
+        if scoped
+            .as_ref()
+            .is_some_and(|(_, producers)| !producers.contains(&key))
+        {
+            continue;
+        }
+        let producer = (server_id(&key), key.root.clone());
+        collection.servers_pending.remove(&producer);
+        collection.indexing_gaps.remove(&producer);
+        collection.checking_producers.remove(&producer);
+        collection
+            .authoritative_empty_producers
+            .insert(server_id(&key));
+        collection.producers_settled = collection.servers_pending.is_empty();
+        collection.server_ran = true;
+        collection.producer_notes.insert(check.note());
+        collection
+            .producer_reports
+            .retain(|(id, file, _)| !(id == "rust" && check.covers(file)));
+        collection
+            .diagnostics
+            .retain(|row| !check.covers(&row.diagnostic.file));
+        if let Some((candidates, _)) = &scoped {
+            collection
+                .saved_files
+                .extend(candidates.iter().filter(|file| check.covers(file)).cloned());
+        }
+        for (file, diagnostics) in check.diagnostics {
+            let rows = diagnostics
+                .into_iter()
+                .map(|diagnostic| CollectedDiagnostic {
+                    diagnostic,
+                    provisional: false,
+                })
+                .collect::<Vec<_>>();
+            collection.diagnostics.extend(rows.clone());
+            collection
+                .producer_reports
+                .push((server_id(&key), file, rows));
+        }
+    }
 
     if let Some((candidates, _)) = &scoped {
         collection.apply_scope(scope);
@@ -238,6 +314,8 @@ pub(crate) fn run_diagnostics_category(
             .iter()
             .map(|gap| gap.file.clone())
             .collect::<HashSet<_>>();
+        let saved_file_count = collection.saved_files.len();
+        let saved_files = collection.saved_files.clone();
         let mut payload = collection.into_payload(snapshot);
         // File inventory is independent of analysis: warm collection performs
         // no sweep, and another scanner may exhaust its budget before reporting
@@ -250,11 +328,12 @@ pub(crate) fn run_diagnostics_category(
             let authoritative = sweep
                 .eligible_files
                 .iter()
+                .chain(saved_files.iter())
                 .filter(|file| !uncovered.contains(*file))
                 .count();
             payload["coverage"] = serde_json::json!({
-                "files": sweep.eligible,
-                "examined": sweep.examined,
+                "files": sweep.eligible + saved_file_count,
+                "examined": sweep.examined + saved_file_count,
                 "authoritative": authoritative,
                 "not_examined": sweep.not_examined.len(),
                 "file_cap": SCOPED_SWEEP_FILE_CAP,
@@ -347,6 +426,9 @@ fn collect_warm_working_set(
                         || (!reported && !lsp.rust_check_completed_current(server))
                     {
                         collection.checking_producers.insert(key.clone());
+                        collection
+                            .checking_reasons
+                            .insert(key.clone(), lsp.rust_check_running_reason(server));
                     } else if !reported {
                         collection
                             .authoritative_empty_producers
@@ -604,6 +686,9 @@ impl DiagnosticsCollection {
         }
         let active: HashSet<ServerKey> = ctx.lsp().active_server_keys().into_iter().collect();
         for file in candidates {
+            if self.saved_files.contains(file) {
+                continue;
+            }
             let coverage = scoped_file_coverage(ctx, &snapshot.config, file);
             // A report published while `cargo check` was still running lacks
             // the compiler's errors, so it cannot certify the file.
@@ -619,7 +704,14 @@ impl DiagnosticsCollection {
                     cause: CoverageCause {
                         producer: Some(server_id(&key)),
                         root: Some(key.root.clone()),
-                        reason: STILL_CHECKING_REASON.to_string(),
+                        reason: {
+                            let reason = ctx.lsp().rust_check_running_reason(&key);
+                            if reason == RUST_CHECK_RUNNING_REASON {
+                                STILL_CHECKING_REASON.to_string()
+                            } else {
+                                reason
+                            }
+                        },
                     },
                 });
                 continue;
@@ -883,7 +975,7 @@ impl DiagnosticsCollection {
                 "kind": "checking_producer",
                 "producer": producer,
                 "root": display_root(snapshot, &root),
-                "reason": RUST_CHECK_RUNNING_REASON,
+                "reason": self.checking_reasons.get(&(producer.clone(), root.clone())).map(String::as_str).unwrap_or(RUST_CHECK_RUNNING_REASON),
             }));
         }
         if !gaps.is_empty() {

@@ -1,5 +1,6 @@
 pub mod child_registry;
 pub mod client;
+pub(crate) mod completed_rust_check;
 pub mod diagnostics;
 pub mod document;
 pub mod environmental;

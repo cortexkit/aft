@@ -6,7 +6,7 @@ use crate::lsp::registry::ServerKind;
 use crate::lsp::roots::ServerKey;
 
 /// A single diagnostic from an LSP server.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredDiagnostic {
     pub file: PathBuf,
     pub line: u32,
@@ -19,7 +19,7 @@ pub struct StoredDiagnostic {
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiagnosticSeverity {
     Error,
     Warning,

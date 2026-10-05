@@ -1438,6 +1438,15 @@ fn wait_for_root_quiescence(
 > {
     let started = Instant::now();
     let wait_until = deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP);
+    let saved = ctx.lsp().saved_rust_checks(
+        wait_until.min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
+    );
+    let expected = expected
+        .iter()
+        .filter(|key| !saved.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected = expected.as_slice();
     let mut accepted_snapshots = Vec::new();
     let mut blocked = false;
     let rust_check_state = |lsp: &crate::lsp::manager::LspManager, server: &ServerKey| {
@@ -1481,11 +1490,7 @@ fn wait_for_root_quiescence(
                 ),
                         ))
                     } else if rust_check_state(&lsp, server) != RustCheckState::Current {
-                        Some((
-                            server.clone(),
-                            crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON
-                                .to_string(),
-                        ))
+                        Some((server.clone(), lsp.rust_check_running_reason(server)))
                     } else {
                         None
                     }

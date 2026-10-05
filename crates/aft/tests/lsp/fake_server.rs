@@ -446,6 +446,13 @@ fn run_proxy(program: std::ffi::OsString) -> io::Result<()> {
 
 pub(crate) fn main() -> io::Result<()> {
     if let Some(program) = std::env::var_os("AFT_FAKE_LSP_PROXY") {
+        // Version probes are plain text, not JSON-RPC frames. Forward them
+        // directly so persistence tests fingerprint the real analyzer version.
+        if std::env::args_os().any(|arg| arg == "--version") {
+            let status = std::process::Command::new(program)
+                .args(std::env::args_os().skip(1)).status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
         return run_proxy(program);
     }
     // AFT_FAKE_LSP_IGNORE_SIGTERM=1: keep running through SIGTERM, like a
