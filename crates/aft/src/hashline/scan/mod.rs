@@ -510,9 +510,14 @@ impl ForwardScanner {
             return Err(ScanError::AlreadyFinished);
         }
 
-        for &byte in bytes {
-            self.raw_bytes.push(byte);
-            if byte == b'\n' {
+        let chunk_start = self.raw_bytes.len() as u64;
+        self.raw_bytes.extend_from_slice(bytes);
+        let mut consumed = 0u64;
+        for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+            consumed += segment.len() as u64;
+            if segment.ends_with(b"\n") {
+                self.current_line
+                    .extend_from_slice(&segment[..segment.len() - 1]);
                 let mut content = std::mem::take(&mut self.current_line);
                 let terminator = if content.last() == Some(&b'\r') {
                     content.pop();
@@ -523,7 +528,7 @@ impl ForwardScanner {
                 self.scanned_line_count += 1;
                 let line_number = self.next_line_number;
                 self.next_line_number += 1;
-                let byte_end = self.raw_bytes.len() as u64;
+                let byte_end = chunk_start + consumed;
                 self.retain_line_if_requested(
                     line_number,
                     RawLineRecord::new(content, terminator),
@@ -532,7 +537,7 @@ impl ForwardScanner {
                 );
                 self.current_line_start = byte_end;
             } else {
-                self.current_line.push(byte);
+                self.current_line.extend_from_slice(segment);
             }
         }
         Ok(())
@@ -594,10 +599,14 @@ impl ForwardScanner {
             .map(|(&line_number, retained)| (line_number, retained.record.clone()))
             .collect();
         let normalized_bytes = normalize_for_tag(&self.raw_bytes);
+        let tag = format!(
+            "{:04X}",
+            crate::hashline::oracle::xxhash32_seed_zero(&normalized_bytes) & 0xFFFF
+        );
         let mut capture_provenance = self.capture_provenance.clone();
         capture_provenance.byte_len = Some(self.raw_bytes.len() as u64);
         let snapshot = Snapshot {
-            tag: tag_for(&self.raw_bytes),
+            tag,
             normalized_bytes,
             records,
             retained_lines: self.retained_lines.clone(),
@@ -636,6 +645,11 @@ impl ForwardScanner {
             );
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCANNER_BYTE_PUSHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Scan a reader once, to EOF, while retaining only the requested coverage.
@@ -862,6 +876,77 @@ mod tests {
         assert_eq!(records[1].terminator, TerminatorKind::Lf);
         assert_eq!(records[2].content, b"last");
         assert_eq!(records[2].terminator, TerminatorKind::None);
+    }
+
+    #[test]
+    fn scanner_bulk_copies_chunks_and_normalizes_once() {
+        let input = b"\xef\xbb\xbfline with payload  \t\r\nnext\rrow\n".repeat(32_768);
+        SCANNER_BYTE_PUSHES.with(|count| count.set(0));
+        crate::hashline::oracle::xxhash32::NORMALIZATION_CALLS.with(|count| count.set(0));
+        let mut scanner = ForwardScanner::new(ScanRequest::whole_file());
+        for chunk in input.chunks(8_191) {
+            scanner.push(chunk).unwrap();
+        }
+        let result = scanner.finish().unwrap();
+        assert_eq!(
+            SCANNER_BYTE_PUSHES.with(|count| count.get()),
+            0,
+            "per-byte vector pushes"
+        );
+        assert_eq!(
+            crate::hashline::oracle::xxhash32::NORMALIZATION_CALLS.with(|count| count.get()),
+            1,
+            "snapshot normalization passes"
+        );
+        let snapshot = result.snapshot.unwrap();
+        assert_eq!(snapshot.tag, tag_for(&input));
+        let mut expected = ForwardScanner::new(ScanRequest::whole_file());
+        legacy_push(&mut expected, &input);
+        assert_eq!(snapshot, expected.finish().unwrap().snapshot.unwrap());
+    }
+
+    #[test]
+    fn scanner_normalization_uses_retained_normalized_bytes() {
+        let input = b"hello \t\r\nworld\t".repeat(32_768);
+        crate::hashline::oracle::xxhash32::NORMALIZATION_CALLS.with(|count| count.set(0));
+        let result = scan_bytes(&input);
+        assert_eq!(
+            crate::hashline::oracle::xxhash32::NORMALIZATION_CALLS.with(|count| count.get()),
+            1,
+            "snapshot normalization passes"
+        );
+        assert_eq!(result.tag, tag_for(&input));
+    }
+
+    // Frozen bytewise scanner for output parity at chunk boundaries.
+    pub(super) fn legacy_push(scanner: &mut ForwardScanner, bytes: &[u8]) {
+        for &byte in bytes {
+            SCANNER_BYTE_PUSHES.with(|count| count.set(count.get() + 1));
+            scanner.raw_bytes.push(byte);
+            if byte == b'\n' {
+                let mut content = std::mem::take(&mut scanner.current_line);
+                let terminator = if content.last() == Some(&b'\r') {
+                    content.pop();
+                    TerminatorKind::CrLf
+                } else {
+                    TerminatorKind::Lf
+                };
+                scanner.scanned_line_count += 1;
+                let line_number = scanner.next_line_number;
+                scanner.next_line_number += 1;
+                let byte_end = scanner.raw_bytes.len() as u64;
+                scanner.retain_line_if_requested(
+                    line_number,
+                    RawLineRecord::new(content, terminator),
+                    scanner.current_line_start,
+                    byte_end,
+                );
+                scanner.current_line_start = byte_end;
+            } else {
+                SCANNER_BYTE_PUSHES.with(|count| count.set(count.get() + 1));
+                scanner.current_line.push(byte);
+            }
+        }
     }
 
     #[test]

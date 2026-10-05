@@ -782,6 +782,8 @@ pub struct BackupStore {
     #[cfg(test)]
     history_content_reads: AtomicU64,
     #[cfg(test)]
+    history_metadata_reads: AtomicU64,
+    #[cfg(test)]
     fail_next_disk_write: bool,
 }
 
@@ -843,6 +845,8 @@ impl BackupStore {
             disk_io_count: AtomicU64::new(0),
             #[cfg(test)]
             history_content_reads: AtomicU64::new(0),
+            #[cfg(test)]
+            history_metadata_reads: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_disk_write: false,
         }
@@ -3040,6 +3044,10 @@ impl BackupStore {
                     e
                 );
             } else {
+                self.hydrated_entries
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|path, _| !path.starts_with(&session_dir));
                 crate::slog_warn!(
                     "removed stale backup session {} (last_accessed={})",
                     session_dir.display(),
@@ -3496,8 +3504,8 @@ impl BackupStore {
         session: &str,
         key: &Path,
     ) -> Result<bool, AftError> {
-        let entries = match self.read_stack_from_disk_unlocked(session, key) {
-            Ok(Some(entries)) => entries,
+        let (disk_meta, entries) = match self.read_stack_and_meta_from_disk_unlocked(session, key) {
+            Ok(Some(loaded)) => loaded,
             Ok(None) => {
                 if self.session_dir(session).is_some() {
                     self.restore_in_memory_stack(session, key, None);
@@ -3519,12 +3527,10 @@ impl BackupStore {
         };
 
         self.update_counter_from_entries(&entries);
-        if let Ok(Some((disk_meta, _))) = self.read_disk_meta_value(session, key) {
-            self.disk_index
-                .entry(session.to_string())
-                .or_default()
-                .insert(key.to_path_buf(), disk_meta);
-        }
+        self.disk_index
+            .entry(session.to_string())
+            .or_default()
+            .insert(key.to_path_buf(), disk_meta);
         self.entries
             .entry(session.to_string())
             .or_default()
@@ -3705,6 +3711,15 @@ impl BackupStore {
         session: &str,
         key: &Path,
     ) -> Result<Option<Vec<BackupEntry>>, String> {
+        self.read_stack_and_meta_from_disk_unlocked(session, key)
+            .map(|loaded| loaded.map(|(_, entries)| entries))
+    }
+
+    fn read_stack_and_meta_from_disk_unlocked(
+        &self,
+        session: &str,
+        key: &Path,
+    ) -> Result<Option<(DiskMeta, Vec<BackupEntry>)>, String> {
         let Some((disk_meta, meta)) = self.read_disk_meta_value(session, key)? else {
             return Ok(None);
         };
@@ -3730,7 +3745,7 @@ impl BackupStore {
             loaded
         };
 
-        Ok((!entries.is_empty()).then_some(entries))
+        Ok((!entries.is_empty()).then_some((disk_meta, entries)))
     }
 
     fn read_disk_meta_value(
@@ -3748,6 +3763,8 @@ impl BackupStore {
         }
         let content = std::fs::read_to_string(&meta_path)
             .map_err(|error| format!("failed to read {}: {}", meta_path.display(), error))?;
+        #[cfg(test)]
+        self.history_metadata_reads.fetch_add(1, Ordering::Relaxed);
         let mut meta = serde_json::from_str::<serde_json::Value>(&content)
             .map_err(|error| format!("failed to parse {}: {}", meta_path.display(), error))?;
         check_backup_meta_format(&meta_path, Some(&meta)).map_err(|refusal| refusal.to_string())?;
@@ -5852,6 +5869,75 @@ mod tests {
         std::fs::write(&path, b"edited").unwrap();
         store.restore_latest(session, &path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn snapshot_stack_hydration_reads_metadata_once() {
+        let (mut store, _storage, path) = durability_store();
+        for _ in 0..20 {
+            store
+                .snapshot("meta-work-count", &path, "baseline")
+                .unwrap();
+        }
+        let key = canonicalize_key(&path);
+        let _lock = store
+            .acquire_stack_disk_lock("meta-work-count", &key)
+            .unwrap();
+        store.history_metadata_reads.store(0, Ordering::Relaxed);
+        store
+            .ensure_stack_hydrated_locked("meta-work-count", &key)
+            .unwrap();
+        assert_eq!(
+            store.history_metadata_reads.load(Ordering::Relaxed),
+            1,
+            "hydration metadata reads"
+        );
+        assert_eq!(store.disk_history_count("meta-work-count", &path), 20);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operation_undo_content_read_counts_for_cold_and_warm_sessions() {
+        for warm in [false, true] {
+            let (mut store, storage, _) = durability_store();
+            let paths = (0..32)
+                .map(|i| storage.path().join(format!("file{i}.bin")))
+                .collect::<Vec<_>>();
+            let bytes = vec![0xff; 16 * 1024];
+            for path in &paths {
+                std::fs::write(path, &bytes).unwrap();
+                for i in 0..20 {
+                    store
+                        .snapshot_with_op(
+                            "undo-work-count",
+                            path,
+                            "baseline",
+                            Some(&format!("old-{i}")),
+                        )
+                        .unwrap();
+                }
+            }
+            store
+                .snapshot_with_op("undo-work-count", &paths[0], "latest", Some("latest"))
+                .unwrap();
+            if warm {
+                for path in &paths {
+                    assert_eq!(store.history("undo-work-count", path).len(), 20);
+                }
+            } else {
+                store = BackupStore::new();
+                store.set_storage_dir(storage.path().to_path_buf(), 72);
+            }
+            store.history_content_reads.store(0, Ordering::Relaxed);
+            let result = store.restore_last_operation("undo-work-count").unwrap();
+            assert_eq!(result.op_id, "latest");
+            assert_eq!(result.restored.len(), 1);
+            assert_eq!(
+                store.history_content_reads.load(Ordering::Relaxed),
+                if warm { 0 } else { 640 }
+            );
+            assert_eq!(std::fs::read(&paths[0]).unwrap(), bytes);
+        }
     }
 
     #[cfg(unix)]

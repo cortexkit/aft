@@ -94,6 +94,8 @@ pub fn xxhash32_seed_zero(input: &[u8]) -> u32 {
 /// Only spaces, tabs, and carriage returns immediately before LF or at EOF
 /// are removed.  Interior carriage returns and BOM bytes remain content.
 pub fn normalize_for_tag(input: &[u8]) -> Vec<u8> {
+    #[cfg(test)]
+    NORMALIZATION_CALLS.with(|count| count.set(count.get() + 1));
     let mut normalized = Vec::with_capacity(input.len());
     for &byte in input {
         if byte == b'\n' {
@@ -107,6 +109,11 @@ pub fn normalize_for_tag(input: &[u8]) -> Vec<u8> {
         normalized.pop();
     }
     normalized
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static NORMALIZATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Render the four-hex-digit, case-insensitive hashline tag.

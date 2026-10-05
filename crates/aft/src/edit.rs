@@ -635,6 +635,8 @@ pub fn write_format_validate(
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
     let pre_write_content = if path.exists() {
+        #[cfg(test)]
+        WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
         std::fs::read_to_string(path).ok()
     } else {
         None
@@ -642,14 +644,9 @@ pub fn write_format_validate(
     // Existing clean files are protected from invalid mutations. New files have
     // no safe prior content to restore, so their pre-write validity remains None
     // and invalid syntax is reported without rollback.
-    let was_syntax_valid = if pre_write_content.is_some() {
-        match validate_syntax(path) {
-            Ok(valid) => valid,
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    let was_syntax_valid = pre_write_content
+        .as_deref()
+        .and_then(|source| validate_captured_syntax(path, source));
 
     let _view_intent = crate::views::intent::record_paths([path]);
     // Step 1: Write
@@ -661,10 +658,12 @@ pub fn write_format_validate(
     let (formatted, format_skipped_reason) = format::auto_format(path, config);
 
     // Step 3: Validate syntax
-    let syntax_valid = match validate_syntax(path) {
-        Ok(sv) => sv,
-        Err(_) => None,
-    };
+    #[cfg(test)]
+    WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
+    let post_format_content = std::fs::read_to_string(path).ok();
+    let syntax_valid = post_format_content
+        .as_deref()
+        .and_then(|source| validate_captured_syntax(path, source));
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
             std::fs::write(path, original).map_err(|e| AftError::InvalidRequest {
@@ -693,10 +692,18 @@ pub fn write_format_validate(
 
     let reformatted_excerpt = if rolled_back {
         None
-    } else {
+    } else if validate_requested {
+        // A configured checker is an external program, not necessarily read
+        // only. Keep the final observation after it runs as before.
+        #[cfg(test)]
+        WRITE_PIPELINE_READS.with(|count| count.set(count.get() + 1));
         std::fs::read_to_string(path)
             .ok()
             .and_then(|final_on_disk| compute_reformatted_excerpt(content, &final_on_disk))
+    } else {
+        post_format_content
+            .as_deref()
+            .and_then(|final_on_disk| compute_reformatted_excerpt(content, final_on_disk))
     };
 
     Ok(WriteResult {
@@ -712,6 +719,18 @@ pub fn write_format_validate(
     })
 }
 
+fn validate_captured_syntax(path: &Path, source: &str) -> Option<bool> {
+    let lang = detect_language(path)?;
+    crate::parser::parse_source_with_cached_parser(path, source, lang)
+        .ok()
+        .map(|tree| !tree.root_node().has_error())
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_PIPELINE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -721,6 +740,36 @@ mod tests {
     #[test]
     fn line_col_to_byte_empty_string() {
         assert_eq!(line_col_to_byte("", 0, 0), 0);
+    }
+
+    #[test]
+    fn write_pipeline_reads_each_syntax_buffer_once() {
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("large.ts");
+        let original = "const value = 1;\n".repeat(20_000);
+        std::fs::write(&path, &original).unwrap();
+        let updated = "const value = 2;\n".repeat(20_000);
+        let config = Config {
+            format_on_edit: false,
+            ..Config::default()
+        };
+        WRITE_PIPELINE_READS.with(|count| count.set(0));
+        crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.set(0));
+        let result =
+            write_format_validate(&path, &updated, &config, &serde_json::json!({})).unwrap();
+        assert_eq!(result.syntax_valid, Some(true));
+        assert!(!result.rolled_back);
+        assert!(result.reformatted_excerpt.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+        let reads = WRITE_PIPELINE_READS.with(|count| count.get())
+            + crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.get());
+        assert_eq!(reads, 2, "shared write pipeline content reads");
+        let invalid =
+            write_format_validate(&path, "function {", &config, &serde_json::json!({})).unwrap();
+        assert_eq!(invalid.syntax_valid, Some(false));
+        assert!(invalid.rolled_back);
+        assert!(invalid.reformatted_excerpt.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
     }
 
     #[test]
