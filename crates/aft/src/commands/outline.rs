@@ -26,9 +26,6 @@ const MAX_OUTLINE_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const OUTLINE_FILE_WALK_CAP: usize = 200;
 const OUTLINE_FILE_COLLECTION_CAP: usize = 10_000;
-// A focused outline still lists all product members. Test bodies use the same
-// summary as broad outlines; read/zoom remain the way to inspect those bodies.
-const COLLAPSE_SINGLE_FILE_TESTS: bool = true;
 const TYPE_MEMBER_PREVIEW_CAP: usize = 3;
 
 /// A single entry in the outline tree.
@@ -215,10 +212,10 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
         &mut parser,
         ctx,
         &req.id,
-        COLLAPSE_SINGLE_FILE_TESTS,
+        false,
     ) {
         Ok(entries) => entries,
-        Err(response) => return response,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
     let filename = path
         .file_name()
@@ -407,6 +404,7 @@ struct TestSummary {
     name: String,
     range: Range,
     items: usize,
+    unknown_reason: Option<&'static str>,
 }
 
 struct TestRegion {
@@ -640,6 +638,7 @@ fn collect_test_regions(
                     } else {
                         0
                     },
+                    unknown_reason: None,
                 },
                 included_path,
                 implicit_include,
@@ -669,7 +668,7 @@ fn outline_structure_entries(
     ctx: &AppContext,
     req_id: &str,
     collapse_tests: bool,
-) -> Result<Vec<OutlineEntry>, Response> {
+) -> Result<Vec<OutlineEntry>, AftError> {
     let Some(lang) = detect_language(path).filter(|lang| {
         matches!(
             lang,
@@ -684,10 +683,15 @@ fn outline_structure_entries(
         return Ok(build_outline_tree(symbols));
     };
     let source = std::fs::read_to_string(path)
-        .map_err(|error| Response::error(req_id, "file_not_found", error.to_string()))?;
-    let (tree, _) = parser
-        .parse_cloned(path)
-        .map_err(|error| Response::error(req_id, error.code(), error.to_string()))?;
+        .map_err(|error| AftError::FileNotFound {
+            path: format!("{}: {error}", path.display()),
+        })?;
+    let (tree, _) = parser.parse_cloned(path)?;
+    if collapse_tests && tree.root_node().has_error() {
+        return Err(AftError::ParseError {
+            message: format!("syntax errors in {}", path.display()),
+        });
+    }
     let mut regions = Vec::new();
     if collapse_tests {
         collect_test_regions(tree.root_node(), &source, lang, &mut regions);
@@ -727,12 +731,25 @@ fn outline_structure_entries(
             }
             let included_label = relative_path_from_root(&included, parent)
                 .unwrap_or_else(|| path_to_slash(&included));
-            let included = ctx.validate_path(req_id, &included)?;
-            region.summary.items = parser
-                .extract_symbols(&included)
-                .map_err(|error| Response::error(req_id, error.code(), error.to_string()))?
-                .len();
-            parser.evict_parse_tree(&included);
+            // A test include is navigation metadata, not a requested file. A
+            // denied or unavailable include must not hide the declaring file's
+            // product API or bypass the project's path restrictions.
+            match ctx.validate_path(req_id, &included) {
+                Ok(included) => {
+                    let count = match outline_skip_reason(&included, Some(parser)) {
+                        Some(reason) => Err(reason),
+                        None => parser.extract_symbols(&included)
+                            .map(|symbols| symbols.len())
+                            .map_err(|error| outline_error_reason(&error)),
+                    };
+                    match count {
+                        Ok(items) => region.summary.items = items,
+                        Err(reason) => region.summary.unknown_reason = Some(reason),
+                    }
+                    parser.evict_parse_tree(&included);
+                }
+                Err(_) => region.summary.unknown_reason = Some("path_denied"),
+            }
             region
                 .summary
                 .name
@@ -758,14 +775,14 @@ fn outline_structure_entries(
         build_outline_tree(&product_symbols)
     };
     for summary in summaries {
+        let description = match summary.unknown_reason {
+            Some(reason) => format!("items unknown ({reason}) (lines {}-{})",
+                summary.range.start_line + 1, summary.range.end_line + 1),
+            None => format!("{} items (lines {}-{})", summary.items,
+                summary.range.start_line + 1, summary.range.end_line + 1),
+        };
         let entry = OutlineEntry {
-            signature: Some(format!(
-                "{}: {} items (lines {}-{})",
-                summary.name,
-                summary.items,
-                summary.range.start_line + 1,
-                summary.range.end_line + 1
-            )),
+            signature: Some(format!("{}: {}", summary.name, description)),
             name: summary.name,
             kind: "test_summary".into(),
             range: summary.range,
@@ -1994,27 +2011,32 @@ fn outline_many_files(
         };
         match symbols {
             Ok(symbols) => {
-                let mut entries = outline_structure_entries(
+                let structure = outline_structure_entries(
                     &path,
                     &symbols,
                     batch_parser.as_mut().unwrap_or(&mut fallback_parser),
                     ctx,
                     req_id,
                     true,
-                )?;
-                if detect_language(&path) == Some(LangId::Rust) {
-                    let parser = batch_parser.as_mut().unwrap_or(&mut fallback_parser);
-                    if let (Ok(source), Ok((tree, _))) =
-                        (std::fs::read_to_string(&path), parser.parse(&path))
-                    {
-                        add_trait_member_previews(tree.root_node(), &source, &mut entries);
+                );
+                match structure {
+                    Ok(mut entries) => {
+                        if detect_language(&path) == Some(LangId::Rust) {
+                            let parser = batch_parser.as_mut().unwrap_or(&mut fallback_parser);
+                            if let (Ok(source), Ok((tree, _))) =
+                                (std::fs::read_to_string(&path), parser.parse(&path))
+                            {
+                                add_trait_member_previews(tree.root_node(), &source, &mut entries);
+                            }
+                        }
+                        file_outlines.push(FileOutline {
+                            path: rel_path,
+                            entries,
+                            language: detect_language(&path),
+                        });
                     }
+                    Err(error) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error))),
                 }
-                file_outlines.push(FileOutline {
-                    path: rel_path,
-                    entries,
-                    language: detect_language(&path),
-                });
             }
             Err(e) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&e))),
         }
@@ -2941,13 +2963,13 @@ mod tests {
     }
 
     #[test]
-    fn outline_single_file_keeps_full_product_members_and_collapses_tests() {
+    fn outline_revision_regression_single_file_keeps_full_product_members_and_lists_tests() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("members.rs");
         std::fs::write(
             &path,
             format!(
-                "{}\n#[cfg(test)]\nmod checks {{ fn hidden() {{}} }}\n",
+                "{}\n#[cfg(test)]\nmod checks {{\n    #[test]\n    fn first_test() {{}}\n    #[test]\n    fn second_test() {{}}\n}}\n",
                 include_str!("../../tests/fixtures/outline_summaries/members.rs")
             ),
         )
@@ -2963,22 +2985,127 @@ mod tests {
         let response = serde_json::to_value(handle_outline(&req, &ctx)).unwrap();
         let text = response["text"].as_str().unwrap();
         assert_eq!(
-            text.lines()
+            text.split("  mod checks").next().unwrap().lines()
                 .filter(|line| line.trim_start().starts_with('.'))
                 .count(),
             7,
             "{text}"
         );
         assert!(
-            text.contains("checks: 1 items") && !text.contains("hidden") && !text.contains("more)"),
+            text.contains("first_test") && text.contains("second_test")
+                && !text.contains("items") && !text.contains("more)"),
             "{text}"
         );
-        let mut parser = FileParser::new();
-        let symbols = parser.extract_symbols(&path).unwrap();
-        let expanded =
-            outline_structure_entries(&path, &symbols, &mut parser, &ctx, "expanded", false)
-                .unwrap();
-        assert!(format_single_file_tree("members.rs", &expanded).contains("hidden"));
+        for params in [serde_json::json!({"files":[path]}), serde_json::json!({"directory":temp.path()})] {
+            let req = RawRequest { id: "broad".into(), command: "outline".into(), session_id: None, lsp_hints: None, params };
+            let response = handle_outline(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            let broad = response.data["text"].as_str().unwrap();
+            assert_eq!(broad.lines().filter(|line| line.trim_start().starts_with('.')).count(), 4, "{broad}");
+            assert!(broad.contains("(3 more)") && broad.contains("checks: 2 items"), "{broad}");
+            assert!(!broad.contains("first_test") && !broad.contains("second_test"), "{broad}");
+        }
+    }
+
+    fn restricted_outline_context(root: &Path) -> AppContext {
+        AppContext::new(Box::new(TreeSitterProvider::new()), crate::config::Config {
+            project_root: Some(root.to_path_buf()), restrict_to_project_root: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn outline_included_test_outside_root_has_unknown_items() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("lib.rs");
+        std::fs::write(&path, "pub fn product() {}\n#[cfg(test)]\n#[path = \"../outside.rs\"]\nmod checks;\n").unwrap();
+        std::fs::write(temp.path().join("outside.rs"), "fn outside_secret() {}\n").unwrap();
+        let ctx = restricted_outline_context(&root);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"outside-include", "command":"outline", "files":[path]})).unwrap();
+        let response = handle_outline(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        assert_eq!(response.data["skipped_files"], serde_json::json!([]));
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("checks (path ../outside.rs): items unknown (path_denied) (lines 2-4)"), "{text}");
+        assert!(text.contains("product") && !text.contains("outside_secret"), "{text}");
+    }
+
+    #[test]
+    fn outline_missing_and_unparseable_test_includes_have_unknown_items() {
+        for (source, reason) in [(None, "file_not_found"), (Some("fn (\n"), "parse_error")] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("lib.rs");
+            std::fs::write(&path, "pub fn product() {}\n#[cfg(test)]\n#[path = \"checks.rs\"]\nmod checks;\n").unwrap();
+            if let Some(source) = source { std::fs::write(temp.path().join("checks.rs"), source).unwrap(); }
+            let ctx = restricted_outline_context(temp.path());
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"unavailable-include", "command":"outline", "files":[path]})).unwrap();
+            let response = handle_outline(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], true, "{response:?}");
+            assert_eq!(response.data["skipped_files"], serde_json::json!([]));
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains(&format!("checks (path checks.rs): items unknown ({reason}) (lines 2-4)")), "{text}");
+            assert!(text.contains("product"), "{text}");
+        }
+    }
+
+    #[test]
+    fn outline_revision_regression_directory_bad_include_keeps_other_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("bad_include.rs"), "pub fn bad_include_product() {}\n#[cfg(test)]\n#[path = \"../outside.rs\"]\nmod checks;\n").unwrap();
+        std::fs::write(root.join("good.rs"), "pub fn good_product() {}\n").unwrap();
+        std::fs::write(temp.path().join("outside.rs"), "fn outside_secret() {}\n").unwrap();
+        let ctx = restricted_outline_context(&root);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"directory-bad-include", "command":"outline", "directory":root})).unwrap();
+        let response = handle_outline(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        assert_eq!(response.data["skipped_files"], serde_json::json!([]));
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("bad_include_product") && text.contains("good_product"), "{text}");
+        assert!(text.contains("checks (path ../outside.rs): items unknown (path_denied)"), "{text}");
+        assert!(!text.contains("outside_secret"), "{text}");
+    }
+
+    #[test]
+    fn outline_structure_read_and_parse_failures_skip_only_the_affected_file() {
+        // Change a file after syntax validation and symbol extraction, without
+        // relying on scheduling a concurrent writer at exactly the right time.
+        struct ChangingProvider { affected: PathBuf, break_syntax: bool }
+        impl crate::language::LanguageProvider for ChangingProvider {
+            fn as_any(&self) -> &dyn std::any::Any { self }
+            fn resolve_symbol(&self, file: &Path, name: &str) -> Result<Vec<crate::symbols::SymbolMatch>, AftError> {
+                crate::language::LanguageProvider::resolve_symbol(&TreeSitterProvider::new(), file, name)
+            }
+            fn list_symbols(&self, file: &Path) -> Result<Vec<Symbol>, AftError> {
+                let symbols = FileParser::new().extract_symbols(file)?;
+                if file == self.affected {
+                    if self.break_syntax { std::fs::write(file, "fn (\n").unwrap(); }
+                    else { std::fs::remove_file(file).unwrap(); }
+                }
+                Ok(symbols)
+            }
+        }
+        for (break_syntax, reason) in [(false, "file_not_found"), (true, "parse_error")] {
+            let temp = tempfile::tempdir().unwrap();
+            let affected = temp.path().join("affected.rs");
+            let good = temp.path().join("good.rs");
+            std::fs::write(&affected, "pub fn affected() {}\n").unwrap();
+            std::fs::write(&good, "pub fn good() {}\n").unwrap();
+            let ctx = AppContext::new(Box::new(ChangingProvider { affected: affected.clone(), break_syntax }), crate::config::Config::default());
+            let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"changed-file", "command":"outline", "files":[affected,good]})).unwrap();
+            let response = handle_outline(&req, &ctx);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["skipped_files"], serde_json::json!([{"file":"affected.rs", "reason":reason}]));
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains("good.rs") && !text.contains("affected.rs"), "{text}");
+        }
     }
 
     #[test]

@@ -57,6 +57,47 @@ fn outline_directory_and_array_match_real_structure_golden() {
 }
 
 #[test]
+fn outline_single_file_lists_test_names_and_every_product_member() {
+    let dir = TempDir::new().unwrap();
+    let product = write_file(dir.path(), "product.rs", include_str!("../fixtures/outline_summaries/product.rs"));
+    let members = write_file(dir.path(), "members.rs", include_str!("../fixtures/outline_summaries/members.rs"));
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    let focused = send(&mut aft, json!({"id":"focused-tests", "command":"outline", "file":product}));
+    assert_eq!(focused["success"], true, "{focused}");
+    let text = focused["text"].as_str().unwrap();
+    assert!(text.contains("fn first()") && text.contains("fn second()"), "{text}");
+    assert!(!text.contains("items"), "{text}");
+    let focused = send(&mut aft, json!({"id":"focused-members", "command":"outline", "file":members}));
+    let text = focused["text"].as_str().unwrap();
+    for name in ["private_first", "first", "second", "private_second", "third", "fourth", "only"] {
+        assert!(text.contains(name), "{text}");
+    }
+    assert!(!text.contains("more)"), "{text}");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn outline_directory_keeps_files_with_unavailable_test_includes() {
+    for (source, reason) in [(None, "file_not_found"), (Some("fn (\n"), "parse_error")] {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "lib.rs", "pub fn product() {}\n#[cfg(test)]\n#[path = \"__tests__/checks.rs\"]\nmod checks;\n");
+        write_file(dir.path(), "good.rs", "pub fn good_product() {}\n");
+        if let Some(source) = source { write_file(dir.path(), "__tests__/checks.rs", source); }
+        let mut aft = AftProcess::spawn();
+        assert_eq!(aft.configure(dir.path())["success"], true);
+        let response = send(&mut aft, json!({"id":"directory-unavailable-include", "command":"outline", "directory":dir.path()}));
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["complete"], true, "{response}");
+        assert_eq!(response["skipped_files"], json!([]));
+        let text = response["text"].as_str().unwrap();
+        assert!(text.contains("good_product") && text.contains("product"), "{text}");
+        assert!(text.contains(&format!("checks (path __tests__/checks.rs): items unknown ({reason}) (lines 2-4)")), "{text}");
+        assert!(aft.shutdown().success());
+    }
+}
+
+#[test]
 fn outline_go_test_file_filter_and_explicit_targets_keep_their_contract() {
     let dir = TempDir::new().unwrap();
     write_file(
