@@ -283,7 +283,9 @@ fn cortexkit_floor_shim_and_managed_hooks_execute_read_only() {
         .status()
         .unwrap()
         .success());
-    let response = foreground(&mut f.aft, "governed-child", "gh --status && git init -q --template= && printf tracked > tracked && git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm initial && git log -1 --format=%B");
+    // Executing a Mach-O image does not by itself prove file-read access on
+    // Seatbelt. Check the managed bytes too, before exercising both consumers.
+    let response = foreground(&mut f.aft, "governed-child", "cat \"$AFT_GH_SHIMS_DIR/gh\" > /dev/null && gh --status && cat \"$GIT_CONFIG_VALUE_0/prepare-commit-msg\" > /dev/null && git init -q --template= && printf tracked > tracked && git add tracked && git -c user.name='AFT Test' -c user.email=aft@example.invalid commit -qm initial && git log -1 --format=%B");
     assert_eq!(response["status"], "completed", "{response:?}");
     let output = response["output"].as_str().unwrap();
     assert!(output.contains("rung"), "shim status missing: {response:?}");
