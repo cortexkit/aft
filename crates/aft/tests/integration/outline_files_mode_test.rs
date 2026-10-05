@@ -54,13 +54,24 @@ fn response_paths(resp: &Value) -> Vec<String> {
 #[test]
 fn outline_files_mode_explicit_info_excluded_target_lists_its_files() {
     let dir = TempDir::new().unwrap();
-    let status = std::process::Command::new("git").args(["init", "--quiet"])
-        .current_dir(dir.path()).status().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
     assert!(status.success());
-    write_file(dir.path(), ".git/info/exclude", ".cortexkit/alfonso/\n.cortexkit/alfonso/evidence/nested/\n");
+    write_file(
+        dir.path(),
+        ".git/info/exclude",
+        ".cortexkit/alfonso/\n.cortexkit/alfonso/evidence/nested/\n",
+    );
     let target = dir.path().join(".cortexkit/alfonso/evidence");
     for index in 0..20 {
-        write_file(&target, &format!("evidence-{index:02}.json"), &format!("{{\"index\":{index}}}\n"));
+        write_file(
+            &target,
+            &format!("evidence-{index:02}.json"),
+            &format!("{{\"index\":{index}}}\n"),
+        );
     }
     write_file(&target, "nested/hidden.ts", "export function hidden() {}\n");
     let mut aft = AftProcess::spawn();
@@ -69,29 +80,47 @@ fn outline_files_mode_explicit_info_excluded_target_lists_its_files() {
     assert_eq!(response["success"], true, "{response}");
     assert_eq!(response["complete"], true, "{response}");
     assert_eq!(files(&response).len(), 20, "{response}");
-    assert!(response["text"].as_str().unwrap().contains("20 files"), "{response}");
-    assert!(!response_paths(&response).iter().any(|path| path.contains("nested")));
+    assert!(
+        response["text"].as_str().unwrap().contains("20 files"),
+        "{response}"
+    );
+    assert!(!response_paths(&response)
+        .iter()
+        .any(|path| path.contains("nested")));
     assert!(aft.shutdown().success());
 }
 
 #[test]
 fn outline_files_mode_empty_and_fully_ignored_subtrees_are_explained() {
     let dir = TempDir::new().unwrap();
-    let status = std::process::Command::new("git").args(["init", "--quiet"])
-        .current_dir(dir.path()).status().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
     assert!(status.success());
     write_file(dir.path(), ".git/info/exclude", "ignored/nested/\n");
     fs::create_dir(dir.path().join("empty")).unwrap();
-    write_file(dir.path(), "ignored/nested/hidden.ts", "export function hidden() {}\n");
+    write_file(
+        dir.path(),
+        "ignored/nested/hidden.ts",
+        "export function hidden() {}\n",
+    );
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
-    for (target, reason) in [("empty", "empty folder"), ("ignored", "all files ignored or excluded")] {
+    for (target, reason) in [
+        ("empty", "empty folder"),
+        ("ignored", "all files ignored or excluded"),
+    ] {
         let response = outline_files(&mut aft, &dir.path().join(target));
         assert_eq!(response["success"], true, "{response}");
         assert_eq!(response["complete"], true, "{response}");
         assert!(files(&response).is_empty());
         let text = response["text"].as_str().unwrap();
-        assert!(text.contains("0 files under") && text.contains(reason), "{text}");
+        assert!(
+            text.contains("0 files under") && text.contains(reason),
+            "{text}"
+        );
     }
     assert!(aft.shutdown().success());
 }

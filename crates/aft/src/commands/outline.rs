@@ -1040,7 +1040,10 @@ struct OutlineIgnoreStack {
 impl OutlineIgnoreStack {
     fn for_target_root(root: &Path) -> Self {
         let root = root.to_path_buf();
-        let mut stack = Self { target_root: root.clone(), ..Self::default() };
+        let mut stack = Self {
+            target_root: root.clone(),
+            ..Self::default()
+        };
 
         // Global excludes and .git/info/exclude are lower priority than every
         // .gitignore in the target's ancestor chain. Load them once per walk.
@@ -1090,7 +1093,9 @@ impl OutlineIgnoreStack {
                     ignored = false;
                     break;
                 }
-                let Some(parent) = current.parent() else { break; };
+                let Some(parent) = current.parent() else {
+                    break;
+                };
                 current = parent;
                 current_is_dir = true;
             }
@@ -1206,13 +1211,19 @@ fn handle_outline_files_mode(
         collection_truncated |= discovery.collection_truncated;
         skipped_foreign_mounts += discovery.skipped_foreign_mounts;
 
-        let empty_reason = if discovery.walk_truncated || discovery.collection_truncated
-            || discovery.skipped_foreign_mounts > 0 {
+        let empty_reason = if discovery.walk_truncated
+            || discovery.collection_truncated
+            || discovery.skipped_foreign_mounts > 0
+        {
             "directory walk incomplete"
         } else if discovery.files.is_empty() {
-            if discovery.ignored_entries > 0 { "all files ignored or excluded" }
-            else if discovery.entries_examined == 0 { "empty folder" }
-            else { "no regular files found" }
+            if discovery.ignored_entries > 0 {
+                "all files ignored or excluded"
+            } else if discovery.entries_examined == 0 {
+                "empty folder"
+            } else {
+                "no regular files found"
+            }
         } else {
             "test files excluded; set includeTests: true to include them"
         };
@@ -1228,8 +1239,10 @@ fn handle_outline_files_mode(
             &mut directory_nodes,
         );
         if file_entries.len() == files_before {
-            empty_targets.push(format!("0 files under {} ({empty_reason})\n",
-                display_path(&dir_path, &target, project_root.as_deref())));
+            empty_targets.push(format!(
+                "0 files under {} ({empty_reason})\n",
+                display_path(&dir_path, &target, project_root.as_deref())
+            ));
         }
         tree_roots.push(root);
     }
@@ -2296,10 +2309,16 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             entries.truncate(remaining);
             *collection_truncated = true;
         }
-        let mut entries = entries.into_iter().filter_map(|entry| match entry {
-            Ok(entry) => Some(entry),
-            Err(_) => { *collection_truncated = true; None }
-        }).collect::<Vec<_>>();
+        let mut entries = entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
+                Err(_) => {
+                    *collection_truncated = true;
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
@@ -3460,8 +3479,11 @@ mod tests {
     }
 
     fn files_mode_ignore_fixture(root: &Path, rules: &str) {
-        let status = std::process::Command::new("git").args(["init", "--quiet"])
-            .current_dir(root).status().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap();
         assert!(status.success());
         std::fs::write(root.join(".git/info/exclude"), rules).unwrap();
     }
@@ -3470,19 +3492,27 @@ mod tests {
         let ctx = restricted_outline_context(root);
         let req: RawRequest = serde_json::from_value(serde_json::json!({
             "id":"files-mode-fixture", "command":"outline", "directory":target, "files":true,
-        })).unwrap();
+        }))
+        .unwrap();
         handle_outline(&req, &ctx)
     }
 
     #[test]
     fn files_mode_revision_regression_explicit_ignored_target_lists_files() {
         let temp = tempfile::tempdir().unwrap();
-        files_mode_ignore_fixture(temp.path(), "ignored-parent/\nignored-parent/evidence/nested/\nignored-parent/evidence/drop.ts\n");
+        files_mode_ignore_fixture(
+            temp.path(),
+            "ignored-parent/\nignored-parent/evidence/nested/\nignored-parent/evidence/drop.ts\n",
+        );
         let target = temp.path().join("ignored-parent/evidence");
         std::fs::create_dir_all(target.join("nested")).unwrap();
         std::fs::write(target.join("keep.ts"), "export function keep() {}\n").unwrap();
         std::fs::write(target.join("drop.ts"), "export function drop() {}\n").unwrap();
-        std::fs::write(target.join("nested/private.ts"), "export function private() {}\n").unwrap();
+        std::fs::write(
+            target.join("nested/private.ts"),
+            "export function private() {}\n",
+        )
+        .unwrap();
         let response = files_mode_fixture_response(temp.path(), &target);
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["complete"], true, "{response:?}");
@@ -3490,7 +3520,10 @@ mod tests {
         assert_eq!(files.len(), 1, "{response:?}");
         assert_eq!(files[0]["path"], "keep.ts");
         let text = response.data["text"].as_str().unwrap();
-        assert!(text.contains("keep.ts") && !text.contains("private.ts") && !text.contains("drop.ts"), "{text}");
+        assert!(
+            text.contains("keep.ts") && !text.contains("private.ts") && !text.contains("drop.ts"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3499,7 +3532,11 @@ mod tests {
         files_mode_ignore_fixture(temp.path(), "nested/\n");
         std::fs::create_dir(temp.path().join("nested")).unwrap();
         std::fs::write(temp.path().join("keep.ts"), "export function keep() {}\n").unwrap();
-        std::fs::write(temp.path().join("nested/private.ts"), "export function private() {}\n").unwrap();
+        std::fs::write(
+            temp.path().join("nested/private.ts"),
+            "export function private() {}\n",
+        )
+        .unwrap();
         let response = files_mode_fixture_response(temp.path(), temp.path());
         assert!(response.success, "{response:?}");
         let files = response.data["files"].as_array().unwrap();
@@ -3510,7 +3547,11 @@ mod tests {
 
     #[test]
     fn files_mode_zero_results_explain_empty_ignored_and_test_only_targets() {
-        for (kind, reason) in [("empty", "empty folder"), ("ignored", "all files ignored or excluded"), ("tests", "test files excluded")] {
+        for (kind, reason) in [
+            ("empty", "empty folder"),
+            ("ignored", "all files ignored or excluded"),
+            ("tests", "test files excluded"),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let target = temp.path().join("target");
             std::fs::create_dir(&target).unwrap();
@@ -3518,9 +3559,16 @@ mod tests {
                 "ignored" => {
                     files_mode_ignore_fixture(temp.path(), "target/nested/\n");
                     std::fs::create_dir(target.join("nested")).unwrap();
-                    std::fs::write(target.join("nested/private.ts"), "export function private() {}\n").unwrap();
+                    std::fs::write(
+                        target.join("nested/private.ts"),
+                        "export function private() {}\n",
+                    )
+                    .unwrap();
                 }
-                "tests" => { std::fs::write(target.join("sample_test.rs"), "#[test]\nfn case() {}\n").unwrap(); }
+                "tests" => {
+                    std::fs::write(target.join("sample_test.rs"), "#[test]\nfn case() {}\n")
+                        .unwrap();
+                }
                 _ => {}
             }
             let response = files_mode_fixture_response(temp.path(), &target);
@@ -3528,7 +3576,10 @@ mod tests {
             assert_eq!(response.data["complete"], true, "{response:?}");
             assert_eq!(response.data["files"], serde_json::json!([]));
             let text = response.data["text"].as_str().unwrap();
-            assert!(text.contains("0 files under") && text.contains(reason), "{kind}: {text}");
+            assert!(
+                text.contains("0 files under") && text.contains(reason),
+                "{kind}: {text}"
+            );
         }
     }
 
