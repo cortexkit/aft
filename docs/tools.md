@@ -228,6 +228,23 @@ abort). A move hunk never deletes the source unless the destination write succee
 Context anchors (`@@`) use fuzzy matching to handle whitespace and Unicode differences.
 Diagnostics surface through the AFT status bar and `aft_inspect` (or inline on every edit with `lsp.diagnostics_on_edit: true`).
 
+With `validate_on_edit: "full"` (or a binary request's `validate: "full"` override),
+formatting and syntax validation still happen per write, but type checking waits until
+**all** hunks have succeeded. Each distinct checker runs once for the configured project
+root against the completed patch. File-scoped checkers receive all touched paths when
+their CLI supports it; Go named-file checks across directories fall back to one run per
+file. Deleted files are not checker inputs, and repeated writes to a path are checked once.
+
+Checker diagnostics appear on the existing `metadata.files` entries as `validation_errors`
+(including an empty array for a clean check) and, when necessary, `validate_skipped_reason`.
+Each diagnostic's `file` retains the checker-reported path, resolved against the checker
+root for attribution to the correct touched file.
+For a move hunk, diagnostics belong to the destination. The rendered `output` also includes
+a single summary, for example `type check: 2 errors in 1 of 3 files (cargo check, tsc)`;
+unchecked files are explicitly named by count and skip reason in that line. There is no
+top-level aggregate diagnostic list. Failed or partially applied patches do **not** run
+type checkers, even though their successful writes are kept.
+
 ---
 
 ### bash
@@ -1072,6 +1089,23 @@ to copy+delete for cross-filesystem moves. Backs up the original before moving.
 ```
 
 Returns `{ file, destination, moved, backup_id }` on success.
+
+### move_symbol (binary command)
+
+The symbol-relocation command moves a TypeScript/JavaScript symbol and rewrites its
+consumers. It is separate from `aft_move`, which moves a whole file. Source, destination
+and consumer writes are checkpointed; a write failure or syntax rollback restores the
+operation and does not run the type checker.
+
+With `validate: "full"` or `validate_on_edit: "full"`, type checking runs only after every
+file has been written and formatted, once per distinct checker and configured project
+root. File arguments are batched where supported (Go named-file checks across directories
+fall back to one run per file). Each existing per-file `results` entry carries its own
+`validation_errors` array and optional `validate_skipped_reason`. The rendered `output`
+contains one `type check: …` summary line, not a separate top-level diagnostic list.
+Type errors report the completed project's state; they do not roll back an otherwise
+successful move. Intermediate errors from a consumer's not-yet-rewritten import are not
+reported.
 
 ---
 

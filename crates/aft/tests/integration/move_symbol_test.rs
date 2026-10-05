@@ -68,85 +68,218 @@ fn configure_with_backup_disabled(aft: &mut AftProcess, root: &str) {
     );
 }
 
-/// This measurement intentionally pins the existing intermediate-project
-/// validation behavior. Batching checker runs needs a separate output-contract
-/// decision, so it is not part of the edit algorithm optimization.
+/// Use the installed compiler, not a diagnostic stub, so an incomplete project
+/// really produces TS2305 and a final type mismatch really produces TS2322.
 #[cfg(unix)]
-#[test]
-#[ignore = "requires the repository's installed TypeScript compiler"]
-fn multi_file_full_validation_counts_intermediate_project_checks() {
+fn full_validation_case(command: &str, broken: bool) -> (tempfile::TempDir, serde_json::Value) {
+    full_validation_case_with_failure(command, broken, false)
+}
+
+#[cfg(unix)]
+fn full_validation_case_with_failure(
+    command: &str,
+    broken: bool,
+    fail: bool,
+) -> (tempfile::TempDir, serde_json::Value) {
     use std::os::unix::fs::PermissionsExt;
     let tsc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../node_modules/typescript/bin/tsc")
         .canonicalize()
         .expect("bun install before the measurement");
-    for command in ["apply_patch", "move_symbol"] {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_file(
-            &root.join("tsconfig.json"),
-            r#"{"compilerOptions":{"strict":true,"noEmit":true,"target":"ES2020","module":"ESNext"},"include":["*.ts"]}"#,
-        );
-        let source =
-            "export function moved(n: number): number { return n + 1; }\nexport const kept = 1;\n";
-        let consumer = "import { moved } from './source';\nexport const result = moved(1);\n";
-        write_file(&root.join("source.ts"), source);
-        write_file(&root.join("consumer.ts"), consumer);
-        write_file(&root.join("dest.ts"), "export const existing = 1;\n");
-        let stub = root.join("node_modules/.bin/tsc");
-        write_file(&stub, &format!(
-            "#!/bin/sh\nprintf 'run\\n' >> '{0}/checker-count'\nout='{0}/checker-output-'$(wc -l < '{0}/checker-count' | tr -d ' ')\nnode '{1}' --pretty false > \"$out\" 2>&1\ncode=$?\ncat \"$out\"\nexit $code\n",
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(
+        &root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"strict":true,"noEmit":true,"target":"ES2020","module":"ESNext"},"include":["*.ts"]}"#,
+    );
+    let source =
+        "export function moved(n: number): number { return n + 1; }\nexport const kept = 1;\n";
+    let consumer = if broken {
+        "import { moved } from './source';\nexport const result: string = moved(1);\n"
+    } else {
+        "import { moved } from './source';\nexport const result = moved(1);\n"
+    };
+    write_file(&root.join("source.ts"), source);
+    write_file(&root.join("consumer.ts"), consumer);
+    write_file(&root.join("dest.ts"), "export const existing = 1;\n");
+    if fail {
+        write_file(&root.join("dest.js"), "export const existing = 1;\n");
+    }
+    let stub = root.join("node_modules/.bin/tsc");
+    write_file(&stub, &format!(
+            "#!/bin/sh\nprintf 'run\\n' >> '{0}/checker-count'\nout='{0}/checker-output-'$(wc -l < '{0}/checker-count' | tr -d ' ')\nnode '{1}' \"$@\" > \"$out\" 2>&1\ncode=$?\ncat \"$out\"\nexit $code\n",
             root.display(), tsc.display()));
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut aft = AftProcess::spawn();
-        let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut aft = AftProcess::spawn();
+    let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
             "config":user_config(json!({"format_on_edit":false, "validate_on_edit":"full", "checker":{"typescript":"tsc"}, "lsp":{"enabled":false}}))}).to_string());
-        assert_eq!(cfg["success"], true, "{cfg}");
-        let request = if command == "move_symbol" {
-            json!({"id":"count", "command":command, "file":root.join("source.ts"), "symbol":"moved", "destination":root.join("dest.ts")})
+    assert_eq!(cfg["success"], true, "{cfg}");
+    let request = if command == "move_symbol" {
+        json!({"id":"count", "command":command, "file":root.join("source.ts"), "symbol":"moved", "destination":root.join(if fail { "dest.js" } else { "dest.ts" })})
+    } else {
+        let annotation = if broken { ": string" } else { "" };
+        let failure_hunk = if fail {
+            "*** Update File: missing.ts\n@@\n-old\n+new\n"
         } else {
-            let patch = format!("*** Begin Patch\n*** Update File: {0}/source.ts\n@@\n-export function moved(n: number): number {{ return n + 1; }}\n+export function renamed(n: number): number {{ return n + 1; }}\n*** Update File: {0}/consumer.ts\n@@\n-import {{ moved }} from './source';\n-export const result = moved(1);\n+import {{ renamed }} from './source';\n+export const result = renamed(1);\n*** Update File: {0}/dest.ts\n@@\n-export const existing = 1;\n+export const existing = 2;\n*** End Patch", root.display());
-            json!({"id":"count", "command":command, "patch_text":patch})
+            ""
         };
-        let response = aft.send(&request.to_string());
+        let patch = format!("*** Begin Patch\n*** Update File: {0}/source.ts\n@@\n-export function moved(n: number): number {{ return n + 1; }}\n+export function renamed(n: number): number {{ return n + 1; }}\n*** Update File: {0}/consumer.ts\n@@\n-import {{ moved }} from './source';\n-export const result{annotation} = moved(1);\n+import {{ renamed }} from './source';\n+export const result{annotation} = renamed(1);\n*** Update File: {0}/dest.ts\n@@\n-export const existing = 1;\n+export const existing = 2;\n{failure_hunk}*** End Patch", root.display());
+        json!({"id":"count", "command":command, "patch_text":patch})
+    };
+    let response = aft.send(&request.to_string());
+    if fail {
+        if command == "apply_patch" {
+            assert_eq!(response["complete"], false, "{response}");
+            assert_eq!(response["partial"], true, "{response}");
+        } else {
+            assert_eq!(response["success"], false, "{response}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("source.ts")).unwrap(),
+                source
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("dest.js")).unwrap(),
+                "export const existing = 1;\n"
+            );
+        }
+    } else {
         assert_eq!(response["success"], true, "{command}: {response}");
+    }
+    assert!(aft.shutdown().success());
+    (dir, response)
+}
+
+#[cfg(unix)]
+fn validation_entries<'a>(
+    command: &str,
+    response: &'a serde_json::Value,
+) -> &'a [serde_json::Value] {
+    let entries = if command == "apply_patch" {
+        &response["metadata"]["files"]
+    } else {
+        &response["results"]
+    };
+    entries.as_array().expect("existing per-file entries")
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_runs_once_per_checker() {
+    for command in ["apply_patch", "move_symbol"] {
+        let (dir, _response) = full_validation_case(command, false);
         assert_eq!(
-            std::fs::read_to_string(root.join("checker-count"))
+            std::fs::read_to_string(dir.path().join("checker-count"))
                 .unwrap()
                 .lines()
                 .count(),
-            3,
+            1,
             "{command} checker runs"
         );
-        let first = std::fs::read_to_string(root.join("checker-output-1")).unwrap();
-        assert!(
-            first.contains("has no exported member 'moved'"),
-            "{command}: {first}"
-        );
-        assert!(std::fs::read_to_string(root.join("checker-output-3"))
-            .unwrap()
-            .is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_reports_real_error_in_touched_file() {
+    for command in ["apply_patch", "move_symbol"] {
+        let (_dir, response) = full_validation_case(command, true);
+        let entries = validation_entries(command, &response);
+        assert_eq!(entries.len(), 3, "{response}");
+        for entry in entries {
+            let path = entry[if command == "apply_patch" {
+                "filePath"
+            } else {
+                "file"
+            }]
+            .as_str()
+            .unwrap();
+            let errors = entry["validation_errors"]
+                .as_array()
+                .expect("per-file checker output");
+            if path.ends_with("consumer.ts") {
+                assert_eq!(errors.len(), 1, "{response}");
+                assert!(
+                    errors[0]["message"].as_str().unwrap().contains("TS2322"),
+                    "{response}"
+                );
+                assert_eq!(errors[0]["line"], 2);
+                assert_eq!(errors[0]["severity"], "error");
+                assert!(errors[0]["file"].as_str().unwrap().ends_with("consumer.ts"));
+            } else {
+                assert!(errors.is_empty(), "{response}");
+                assert!(entry.get("validate_skipped_reason").is_none(), "{response}");
+            }
+        }
         assert!(
             response.get("validation_errors").is_none(),
-            "{command} currently discards the checker diagnostics"
+            "no aggregate list: {response}"
         );
-        // Measure the proposed single final-state run without changing the
-        // command's production validation order or response contract.
-        let final_check = std::process::Command::new(&stub)
-            .current_dir(root)
-            .output()
-            .unwrap();
-        assert!(final_check.status.success());
-        assert!(final_check.stdout.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(root.join("checker-count"))
+        assert!(
+            response["output"]
+                .as_str()
                 .unwrap()
-                .lines()
-                .count(),
-            4
+                .contains("type check: 1 errors in 1 of 3 files (tsc)"),
+            "{response}"
         );
-        eprintln!("{command}: 3 current checker runs versus 1 clean final-state proposal run; first intermediate state reports TS2305; outer response discards validation_errors");
-        assert!(aft.shutdown().success());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_ignores_intermediate_only_errors() {
+    for command in ["apply_patch", "move_symbol"] {
+        let (dir, response) = full_validation_case(command, false);
+        // Inspect every invocation's real compiler output as well as the response:
+        // merely dropping intermediate diagnostics must not make this test pass.
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("checker-output-")
+            {
+                let output = std::fs::read_to_string(path).unwrap();
+                assert!(
+                    output.is_empty(),
+                    "{command} checked an incomplete project: {output}"
+                );
+            }
+        }
+        for entry in validation_entries(command, &response) {
+            assert_eq!(entry["validation_errors"], json!([]), "{response}");
+            assert!(entry.get("validate_skipped_reason").is_none(), "{response}");
+        }
+        assert!(
+            response["output"]
+                .as_str()
+                .unwrap()
+                .contains("type check: 0 errors in 0 of 3 files (tsc)"),
+            "{response}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_does_not_run_on_failure_or_rollback() {
+    for command in ["apply_patch", "move_symbol"] {
+        let (dir, response) = full_validation_case_with_failure(command, false, true);
+        assert!(
+            !dir.path().join("checker-count").exists(),
+            "{command} ran a checker: {response}"
+        );
+        assert!(
+            !response["output"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("type check:"),
+            "{response}"
+        );
     }
 }
 

@@ -616,6 +616,28 @@ fn notify_full_validation_start() {
     }
 }
 
+pub(crate) fn full_validation_requested(config: &Config, params: &serde_json::Value) -> bool {
+    params
+        .get("validate")
+        .and_then(|value| value.as_str())
+        .or(config.validate_on_edit.as_deref())
+        == Some("full")
+}
+
+/// Validate the completed multi-file operation, never its intermediate writes.
+/// Call only after all writes succeeded and rollback is no longer needed.
+pub(crate) fn validate_written_files(
+    paths: &[std::path::PathBuf],
+    config: &Config,
+    params: &serde_json::Value,
+) -> Option<format::BatchValidation> {
+    if paths.is_empty() || !full_validation_requested(config, params) {
+        return None;
+    }
+    notify_full_validation_start();
+    Some(format::validate_full_batch(paths, config))
+}
+
 /// Write content to disk, auto-format, then validate syntax.
 ///
 /// This is the shared tail for all mutation commands. The pipeline order is:
@@ -633,6 +655,27 @@ pub fn write_format_validate(
     content: &str,
     config: &Config,
     params: &serde_json::Value,
+) -> Result<WriteResult, AftError> {
+    write_format_validate_impl(path, content, config, params, false)
+}
+
+/// Write, format and syntax-check now; the caller checks the completed project
+/// with `validate_written_files` after every file has been written successfully.
+pub(crate) fn write_format_validate_deferred(
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+) -> Result<WriteResult, AftError> {
+    write_format_validate_impl(path, content, config, params, true)
+}
+
+fn write_format_validate_impl(
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+    defer_full_validation: bool,
 ) -> Result<WriteResult, AftError> {
     let pre_write_content = if path.exists() {
         #[cfg(test)]
@@ -678,11 +721,8 @@ pub fn write_format_validate(
     };
 
     // Step 4: Full validation (type checker) — only when requested
-    let param_validate = params.get("validate").and_then(|v| v.as_str());
-    let config_validate = config.validate_on_edit.as_deref();
     // Explicit param overrides config. Valid values: "syntax" | "full" | "off".
-    let validate_mode = param_validate.or(config_validate).unwrap_or("off");
-    let validate_requested = validate_mode == "full";
+    let validate_requested = full_validation_requested(config, params) && !defer_full_validation;
     let (validation_errors, validate_skipped_reason) = if validate_requested {
         notify_full_validation_start();
         format::validate_full(path, config)
