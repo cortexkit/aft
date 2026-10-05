@@ -2628,6 +2628,24 @@ mod tests {
             .set_observed_exclusion_prefixes(Vec::new());
     }
 
+    /// Paths reported by Windows can have both `\\?\` and backslash separators;
+    /// neither changes which flooding subtree the path belongs to.
+    fn is_flooding_ignored_path(path: &Path) -> bool {
+        let rendered = path.to_string_lossy().replace('\\', "/");
+        let normalized = rendered.strip_prefix("//?/").unwrap_or(&rendered);
+        for child in ["prompts", "athena"] {
+            let subtree = format!("/.cortexkit/alfonso/{child}");
+            if normalized.ends_with(&subtree) || normalized.contains(&format!("{subtree}/")) {
+                return true;
+            }
+        }
+        normalized.rsplit_once('/').is_some_and(|(parent, file)| {
+            parent.ends_with("/.cortexkit/alfonso")
+                && file.starts_with("ledger-")
+                && file.ends_with(".md")
+        })
+    }
+
     /// The shape of a repository that keeps one agent-tooling directory
     /// visible while ignoring what it holds: `.cortexkit/alfonso` itself is
     /// re-included, its children are ignored, and one child is re-included
@@ -2709,10 +2727,35 @@ mod tests {
                 notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
             ))
             .unwrap();
-        assert_eq!(
-            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
-        );
+        // The filter flushes a path batch when its window expires. Under load
+        // that batch can legitimately arrive before it consumes the overflow
+        // event, so wait for the rescan rather than assuming it is first.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for overflow rescan"
+            );
+            match dispatch_rx.recv_timeout(remaining) {
+                Ok(WatcherDispatchEvent::Paths(paths)) => {
+                    let ignored = paths
+                        .iter()
+                        .filter(|path| is_flooding_ignored_path(path))
+                        .collect::<Vec<_>>();
+                    assert!(
+                        ignored.is_empty(),
+                        "flooding ignored paths must not be dispatched before overflow rescan: {ignored:?}"
+                    );
+                }
+                Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    assert_eq!(reason, RescanReason::Unknown);
+                    break;
+                }
+                Ok(event) => panic!("unexpected dispatch before overflow rescan: {event:?}"),
+                Err(error) => panic!("timed out waiting for overflow rescan: {error}"),
+            }
+        }
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         handle.join().unwrap();
