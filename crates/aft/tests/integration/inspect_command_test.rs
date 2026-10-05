@@ -1823,8 +1823,10 @@ fn inspect_command_ignores_retired_tier2_deadline_overrides() {
     // This fixture disables the callgraph. Its unavailable dead-code analysis
     // makes an unscoped result PARTIAL, independently of the retired deadline.
     assert_eq!(response["complete"], false, "response: {response:#}");
-    assert_eq!(
-        response["inspect_terminal"], "partial",
+    assert!(
+        response["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("PARTIAL — dead code unavailable:")),
         "response: {response:#}"
     );
     assert_eq!(
