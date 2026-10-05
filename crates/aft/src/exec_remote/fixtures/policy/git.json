@@ -1,0 +1,18 @@
+{
+  "command": "git status && cargo test",
+  "matches": false,
+  "policy": {
+    "commands": [
+      "cd",
+      "cargo build",
+      "cargo check",
+      "cargo test",
+      "cargo nextest",
+      "cargo clippy",
+      "bun test"
+    ],
+    "enabled": true
+  },
+  "pty": false,
+  "stdin": false
+}

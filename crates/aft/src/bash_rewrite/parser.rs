@@ -219,12 +219,25 @@ fn read_next_redirect_target(
 }
 
 fn tokenize_word(input: &str) -> Option<(String, usize)> {
+    tokenize_literal_word(input, false)
+}
+
+fn tokenize_literal_word(input: &str, top_level: bool) -> Option<(String, usize)> {
     let mut token = String::new();
     let mut quote = Quote::None;
     let mut consumed = 0;
     let mut chars = input.char_indices().peekable();
 
     while let Some((idx, ch)) = chars.next() {
+        if top_level && quote == Quote::None {
+            if ch.is_whitespace() || matches!(ch, ';' | '&' | '|' | '>') {
+                consumed = idx;
+                break;
+            }
+            if matches!(ch, '(' | ')' | '<') {
+                return None;
+            }
+        }
         consumed = idx + ch.len_utf8();
         match quote {
             Quote::Single => {
@@ -274,6 +287,79 @@ fn tokenize_word(input: &str) -> Option<(String, usize)> {
     } else {
         None
     }
+}
+
+/// Literal top-level commands for whole-line execution policy. Uses the same
+/// quote removal and expansion rejection as bash rewriting. Unsupported syntax
+/// (including stdin and file writes) declines rather than guessing.
+pub fn parse_top_level(line: &str) -> Option<Vec<Vec<String>>> {
+    let mut rest = line;
+    let mut commands = Vec::new();
+    let mut command = Vec::new();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([' ', '\t', '\r']);
+        if rest.is_empty() {
+            break;
+        }
+        if rest.starts_with('#') {
+            rest = rest.find('\n').map_or("", |i| &rest[i..]);
+            continue;
+        }
+        if !rest.starts_with("&>") {
+            if let Some(separator) = ["&&", "||", ";", "\n", "|"]
+                .into_iter()
+                .find(|s| rest.starts_with(s))
+            {
+                if command.is_empty() {
+                    return None;
+                }
+                commands.push(std::mem::take(&mut command));
+                rest = &rest[separator.len()..];
+                continue;
+            }
+            if rest.starts_with('&') {
+                return None;
+            }
+        }
+        let descriptor_end = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let redirect = if rest[descriptor_end..].starts_with('>') {
+            Some(&rest[descriptor_end..])
+        } else {
+            rest.strip_prefix('&').filter(|r| r.starts_with('>'))
+        };
+        if let Some(mut tail) = redirect {
+            tail = &tail[1..];
+            if let Some(fd) = tail.strip_prefix('&') {
+                let n = fd.bytes().take_while(u8::is_ascii_digit).count();
+                let n = if n == 0 && fd.starts_with('-') { 1 } else { n };
+                if n == 0 {
+                    return None;
+                }
+                rest = &fd[n..];
+                continue;
+            }
+            if tail.starts_with(['>', '|']) {
+                tail = &tail[1..];
+            }
+            tail = tail.trim_start_matches([' ', '\t', '\r']);
+            let (target, consumed) = tokenize_literal_word(tail, true)?;
+            if target != "/dev/null" {
+                return None;
+            }
+            rest = &tail[consumed..];
+            continue;
+        }
+        let (word, consumed) = tokenize_literal_word(rest, true)?;
+        if consumed == 0 {
+            return None;
+        }
+        command.push(word);
+        rest = &rest[consumed..];
+    }
+    if !command.is_empty() {
+        commands.push(command);
+    }
+    Some(commands)
 }
 
 fn has_non_space_remainder(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> bool {
