@@ -1028,17 +1028,19 @@ struct OutlineFileDiscovery {
     walk_truncated: bool,
     collection_truncated: bool,
     skipped_foreign_mounts: usize,
+    ignored_entries: usize,
 }
 
 #[derive(Clone, Default)]
 struct OutlineIgnoreStack {
     matchers: Vec<Arc<ignore::gitignore::Gitignore>>,
+    target_root: PathBuf,
 }
 
 impl OutlineIgnoreStack {
     fn for_target_root(root: &Path) -> Self {
         let root = root.to_path_buf();
-        let mut stack = Self::default();
+        let mut stack = Self { target_root: root.clone(), ..Self::default() };
 
         // Global excludes and .git/info/exclude are lower priority than every
         // .gitignore in the target's ancestor chain. Load them once per walk.
@@ -1075,11 +1077,22 @@ impl OutlineIgnoreStack {
     fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         let mut ignored = false;
         for matcher in &self.matchers {
-            let matched = matcher.matched_path_or_any_parents(path, is_dir);
-            if matched.is_ignore() {
-                ignored = true;
-            } else if matched.is_whitelist() {
-                ignored = false;
+            let mut current = path;
+            let mut current_is_dir = is_dir;
+            // The caller explicitly selected the target. Ancestor exclusions
+            // must not hide its contents, but rules for descendants still apply.
+            while current != self.target_root && current.starts_with(&self.target_root) {
+                let matched = matcher.matched(current, current_is_dir);
+                if matched.is_ignore() {
+                    ignored = true;
+                    break;
+                } else if matched.is_whitelist() {
+                    ignored = false;
+                    break;
+                }
+                let Some(parent) = current.parent() else { break; };
+                current = parent;
+                current_is_dir = true;
             }
         }
         ignored
@@ -1159,6 +1172,7 @@ fn handle_outline_files_mode(
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
+    let mut empty_targets = Vec::new();
 
     for target in targets {
         let dir_path = match ctx.validate_path(&req.id, Path::new(&target)) {
@@ -1192,6 +1206,18 @@ fn handle_outline_files_mode(
         collection_truncated |= discovery.collection_truncated;
         skipped_foreign_mounts += discovery.skipped_foreign_mounts;
 
+        let empty_reason = if discovery.walk_truncated || discovery.collection_truncated
+            || discovery.skipped_foreign_mounts > 0 {
+            "directory walk incomplete"
+        } else if discovery.files.is_empty() {
+            if discovery.ignored_entries > 0 { "all files ignored or excluded" }
+            else if discovery.entries_examined == 0 { "empty folder" }
+            else { "no regular files found" }
+        } else {
+            "test files excluded; set includeTests: true to include them"
+        };
+        let files_before = file_entries.len();
+
         let root = append_outline_directory_tree(
             &dir_path,
             display_root,
@@ -1201,6 +1227,10 @@ fn handle_outline_files_mode(
             &mut file_entries,
             &mut directory_nodes,
         );
+        if file_entries.len() == files_before {
+            empty_targets.push(format!("0 files under {} ({empty_reason})\n",
+                display_path(&dir_path, &target, project_root.as_deref())));
+        }
         tree_roots.push(root);
     }
 
@@ -1211,11 +1241,14 @@ fn handle_outline_files_mode(
         &tree_roots,
         &directory_nodes,
         &file_entries,
-        max_output_bytes,
+        max_output_bytes.saturating_sub(empty_targets.iter().map(String::len).sum::<usize>()),
     );
     populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let table = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let mut text = table.into_string();
+    for explanation in empty_targets {
+        text.push_str(&explanation);
+    }
     let unknown_lines = file_entries
         .iter()
         .filter(|entry| entry.lines.is_none() && entry.language != "binary")
@@ -2084,6 +2117,7 @@ fn discover_outline_files_with_options(
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
+    let mut ignored_entries = 0usize;
     // Check mount boundaries before opening descendants. A disappearing mounted
     // child can otherwise make a directory iterator's destructor abort the daemon.
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(directory);
@@ -2099,6 +2133,7 @@ fn discover_outline_files_with_options(
                 &mut skipped_foreign_mounts,
                 &boundary,
                 &ignore_stack,
+                &mut ignored_entries,
             );
         } else {
             collect_outline_files_with_device_lookup(
@@ -2125,6 +2160,7 @@ fn discover_outline_files_with_options(
         walk_truncated,
         collection_truncated,
         skipped_foreign_mounts,
+        ignored_entries,
     }
 }
 
@@ -2236,6 +2272,7 @@ fn collect_outline_files_breadth_first_with_device_lookup(
     skipped_foreign_mounts: &mut usize,
     boundary: &crate::walk_boundary::DeviceBoundary,
     root_ignore_stack: &OutlineIgnoreStack,
+    ignored_entries: &mut usize,
 ) -> usize {
     let root_stack = root_ignore_stack.clone();
     let mut pending = VecDeque::from([(directory.to_path_buf(), root_stack)]);
@@ -2247,6 +2284,7 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             return entries_examined;
         }
         let Ok(entries) = std::fs::read_dir(&current) else {
+            *collection_truncated = true;
             continue;
         };
         let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
@@ -2258,12 +2296,16 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             entries.truncate(remaining);
             *collection_truncated = true;
         }
-        let mut entries = entries.into_iter().flatten().collect::<Vec<_>>();
+        let mut entries = entries.into_iter().filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(_) => { *collection_truncated = true; None }
+        }).collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.path());
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
         for entry in entries {
             let Ok(file_type) = entry.file_type() else {
+                *collection_truncated = true;
                 continue;
             };
             if file_type.is_symlink() {
@@ -2280,6 +2322,7 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         // its breadth-first coverage when the 10,000-file limit is reached.
         for path in child_directories {
             if should_skip_directory(&path) || ignore_stack.is_ignored(&path, true) {
+                *ignored_entries += 1;
                 continue;
             }
             match boundary.should_descend(&path) {
@@ -2302,6 +2345,8 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             }
             if !ignore_stack.is_ignored(&path, false) {
                 files.push(path.to_string_lossy().to_string());
+            } else {
+                *ignored_entries += 1;
             }
         }
         if *collection_truncated {
@@ -3412,6 +3457,79 @@ mod tests {
             "export function excludedByInfo() {}\n",
         )
         .expect("write info-excluded file");
+    }
+
+    fn files_mode_ignore_fixture(root: &Path, rules: &str) {
+        let status = std::process::Command::new("git").args(["init", "--quiet"])
+            .current_dir(root).status().unwrap();
+        assert!(status.success());
+        std::fs::write(root.join(".git/info/exclude"), rules).unwrap();
+    }
+
+    fn files_mode_fixture_response(root: &Path, target: &Path) -> Response {
+        let ctx = restricted_outline_context(root);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id":"files-mode-fixture", "command":"outline", "directory":target, "files":true,
+        })).unwrap();
+        handle_outline(&req, &ctx)
+    }
+
+    #[test]
+    fn files_mode_revision_regression_explicit_ignored_target_lists_files() {
+        let temp = tempfile::tempdir().unwrap();
+        files_mode_ignore_fixture(temp.path(), "ignored-parent/\nignored-parent/evidence/nested/\nignored-parent/evidence/drop.ts\n");
+        let target = temp.path().join("ignored-parent/evidence");
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        std::fs::write(target.join("keep.ts"), "export function keep() {}\n").unwrap();
+        std::fs::write(target.join("drop.ts"), "export function drop() {}\n").unwrap();
+        std::fs::write(target.join("nested/private.ts"), "export function private() {}\n").unwrap();
+        let response = files_mode_fixture_response(temp.path(), &target);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], true, "{response:?}");
+        let files = response.data["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{response:?}");
+        assert_eq!(files[0]["path"], "keep.ts");
+        let text = response.data["text"].as_str().unwrap();
+        assert!(text.contains("keep.ts") && !text.contains("private.ts") && !text.contains("drop.ts"), "{text}");
+    }
+
+    #[test]
+    fn files_mode_revision_regression_nested_ignored_folder_stays_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        files_mode_ignore_fixture(temp.path(), "nested/\n");
+        std::fs::create_dir(temp.path().join("nested")).unwrap();
+        std::fs::write(temp.path().join("keep.ts"), "export function keep() {}\n").unwrap();
+        std::fs::write(temp.path().join("nested/private.ts"), "export function private() {}\n").unwrap();
+        let response = files_mode_fixture_response(temp.path(), temp.path());
+        assert!(response.success, "{response:?}");
+        let files = response.data["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1, "{response:?}");
+        assert_eq!(files[0]["path"], "keep.ts");
+        assert_eq!(response.data["complete"], true);
+    }
+
+    #[test]
+    fn files_mode_zero_results_explain_empty_ignored_and_test_only_targets() {
+        for (kind, reason) in [("empty", "empty folder"), ("ignored", "all files ignored or excluded"), ("tests", "test files excluded")] {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            match kind {
+                "ignored" => {
+                    files_mode_ignore_fixture(temp.path(), "target/nested/\n");
+                    std::fs::create_dir(target.join("nested")).unwrap();
+                    std::fs::write(target.join("nested/private.ts"), "export function private() {}\n").unwrap();
+                }
+                "tests" => { std::fs::write(target.join("sample_test.rs"), "#[test]\nfn case() {}\n").unwrap(); }
+                _ => {}
+            }
+            let response = files_mode_fixture_response(temp.path(), &target);
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], true, "{response:?}");
+            assert_eq!(response.data["files"], serde_json::json!([]));
+            let text = response.data["text"].as_str().unwrap();
+            assert!(text.contains("0 files under") && text.contains(reason), "{kind}: {text}");
+        }
     }
 
     fn assert_outline_discovery_honors_target_ignore_rules(discovery: OutlineFileDiscovery) {
