@@ -4177,7 +4177,7 @@ where
         standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor));
     // Startup reconciliation is intentionally direct; subsequent passes use
     // this existing maintenance timer arm and never create a standing timer.
-    standing_actor.reconcile_at_startup();
+    standing_actor.reconcile_at_startup(storage_dir);
     let mut next_standing_pass_at = tokio::time::Instant::now();
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =

@@ -97,8 +97,11 @@ impl StandingActor {
 
     /// Startup reconciliation is intentionally direct and empty until subc has
     /// observed a user-tier configuration snapshot from a successful RouteBind.
-    pub(super) fn reconcile_at_startup(&self) {
-        let config = Config::default();
+    pub(super) fn reconcile_at_startup(&self, storage_dir: &std::path::Path) {
+        let config = Config {
+            storage_dir: Some(storage_dir.to_path_buf()),
+            ..Config::default()
+        };
         #[cfg(test)]
         let config = self.app.isolate_test_config(config);
         if let Err(error) = self.roots.reconcile(&config) {
@@ -379,6 +382,39 @@ impl StandingActor {
             .lock()
             .insert(entry.literal_path.clone(), (root_id.clone(), true));
         Some(root_id)
+    }
+}
+
+#[cfg(test)]
+mod startup_storage_tests {
+    use super::*;
+    #[test]
+    fn standing_startup_uses_explicit_storage_not_the_default_root() {
+        let _env = crate::test_env::process_env_lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(value) = &self.0 {
+                    std::env::set_var("AFT_STORAGE_DIR", value);
+                } else {
+                    std::env::remove_var("AFT_STORAGE_DIR");
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("AFT_STORAGE_DIR"));
+        std::env::remove_var("AFT_STORAGE_DIR");
+        let root = tempfile::tempdir().unwrap();
+        let ctx = super::super::test_support::test_ctx();
+        let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()));
+        let default =
+            crate::bash_background::storage_dir_without_overrides_for_test().join("aft.db");
+        assert!(
+            !default.exists(),
+            "the isolated test default must begin without a database"
+        );
+        actor.reconcile_at_startup(root.path());
+        assert!(root.path().join("aft.db").is_file());
+        assert!(!default.exists());
     }
 }
 
