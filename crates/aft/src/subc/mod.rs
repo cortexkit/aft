@@ -7564,7 +7564,7 @@ async fn handle_tool_call(
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
-            tool_provider::admission_trusted(&identity, &call.name),
+            tool_provider::admission_trusted(&identity, &call),
             &identity.project_root,
             frame.header.channel,
         ) {

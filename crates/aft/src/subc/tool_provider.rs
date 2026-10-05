@@ -620,9 +620,14 @@ fn log_scoped_preset_refusal_at(
 
 // A keyed shell may ask an untrusted consumer for permission, but the
 // consumer's elicitation capability does not authorize shell observation.
-pub(super) fn admission_trusted(identity: &super::RouteIdentity, name: &str) -> bool {
+pub(super) fn admission_trusted(
+    identity: &super::RouteIdentity,
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+) -> bool {
     !matches!(identity.trust, super::BindTrust::Untrusted)
-        || (identity.consumer_elicitation_capable && matches!(name, "bash" | "powershell"))
+        || (call.call_key.is_some()
+            && identity.consumer_elicitation_capable
+            && matches!(call.name.as_str(), "bash" | "powershell"))
 }
 
 pub(super) fn ledger_scope(
@@ -752,7 +757,7 @@ impl LedgerEdge {
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
-            admission_trusted(&identity, &call.name),
+            admission_trusted(&identity, &call),
         )
         .is_err()
         {

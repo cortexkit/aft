@@ -658,6 +658,27 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
 }
 
 #[tokio::test]
+async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let marker = root.join("project/keyless-marker");
+    let reply = route
+        .raw(
+            json!({"name":"bash","arguments":{"command":marker_command(&marker)}}),
+            true,
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert_eq!(response_json(&reply)["code"], "capability_not_admitted");
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
 async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");
