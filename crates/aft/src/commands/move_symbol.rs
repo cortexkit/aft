@@ -564,7 +564,12 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut results: Vec<serde_json::Value> = Vec::new();
 
     // 1. Write source file (symbol removed)
-    match edit::write_format_validate(&source_path, &new_source, &ctx.config(), &req.params) {
+    match edit::write_format_validate_deferred(
+        &source_path,
+        &new_source,
+        &ctx.config(),
+        &req.params,
+    ) {
         // A rolled-back write means the result was invalid syntax and the file
         // was reverted (symbol NOT removed). Continuing would add the symbol to
         // the destination too, leaving it defined in BOTH files. Treat it like a
@@ -612,7 +617,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     // 2. Write destination file (symbol added)
-    match edit::write_format_validate(&dest_path, &new_dest, &ctx.config(), &req.params) {
+    match edit::write_format_validate_deferred(&dest_path, &new_dest, &ctx.config(), &req.params) {
         // CRITICAL: the source already had the symbol removed. If the
         // destination write is rolled back (invalid syntax — e.g. moving
         // TS-only syntax into a .js file), the symbol would be defined NOWHERE —
@@ -679,7 +684,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     // 3. Write consumer files (imports rewritten)
     let mut consumers_updated = usize::from(source_rewritten_as_consumer);
     for (path, _original, new_content) in &consumer_rewrites {
-        match edit::write_format_validate(&path, new_content, &ctx.config(), &req.params) {
+        match edit::write_format_validate_deferred(&path, new_content, &ctx.config(), &req.params) {
             // A rolled-back consumer rewrite leaves the move half-applied (this
             // consumer still imports from the old location while others were
             // updated). Restore everything and fail, same as the Err branch.
@@ -731,6 +736,16 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
+    let paths: Vec<PathBuf> = std::iter::once(source_path.to_path_buf())
+        .chain(std::iter::once(dest_path.to_path_buf()))
+        .chain(consumer_rewrites.iter().map(|(path, _, _)| path.clone()))
+        .collect();
+    let validation = edit::validate_written_files(&paths, &ctx.config(), &req.params);
+    if let Some(validation) = &validation {
+        for (path, result) in paths.iter().zip(&mut results) {
+            validation.append_to(path, result);
+        }
+    }
     let files_modified = results.len();
 
     log::debug!(
@@ -741,17 +756,18 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         consumers_updated
     );
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "ok": true,
-            "files_modified": files_modified,
-            "consumers_updated": consumers_updated,
-            "checkpoint_name": checkpoint_name,
-            "backup_ids": backup_ids,
-            "results": results,
-        }),
-    )
+    let mut result = serde_json::json!({
+        "ok": true,
+        "files_modified": files_modified,
+        "consumers_updated": consumers_updated,
+        "checkpoint_name": checkpoint_name,
+        "backup_ids": backup_ids,
+        "results": results,
+    });
+    if let Some(validation) = validation {
+        result["output"] = serde_json::json!(validation.summary());
+    }
+    Response::success(&req.id, result)
 }
 
 // ---------------------------------------------------------------------------

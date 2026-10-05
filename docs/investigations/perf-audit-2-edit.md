@@ -39,37 +39,73 @@ pruned with durable artifacts and cleared on namespace changes. Platforms
 without the necessary change-time evidence use the original uncached path;
 Windows runtime performance is not claimed.
 
-## Deferred checker proposal
+## Completed-project checker validation
 
-The parent explicitly selected **defer checker coalescing; preserve the existing
-validation result contract**. A final-project check would often be more useful,
-but it is not interchangeable with a check against each intermediate project.
+The initial delivery deferred checker coalescing to preserve intermediate-state
+behavior. The operator subsequently approved a contract change for `apply_patch`
+and `move_symbol`: with full validation enabled, run the checker **after every
+write has completed**, not after each write. This section supersedes that deferral.
 
-`format.rs:2343` still runs the checker for each `write_format_validate` call.
-`commands/apply_patch.rs:366` and `commands/move_symbol.rs:567,615,682` call it
-once per written file. The opt-in integration measurement
-`multi_file_full_validation_counts_intermediate_project_checks` runs the actual
-installed TypeScript 5.9.3 compiler through a counting wrapper on a typed
-three-file fixture:
+The write pipeline still formats and syntax-checks every write, preserving backup,
+checkpoint, rollback and LSP notification ordering. Only the external type-checker
+step is deferred. If any hunk fails (including a partially applied patch), or a
+symbol move fails or rolls back, no checker runs. Single-file commands keep their
+existing validation pipeline. The full-validation request-loop hook fires at the
+final checker stage, after the complete operation's writes.
 
-| Command | Current real checker invocations | Proposed final-state check | Diagnostic difference |
+`format::validate_full_batch` deduplicates paths and groups by resolved checker,
+arguments and configured project root. `tsc`/`tsgo` and `cargo check` are project
+checks; Biome, Pyright and Ruff accept multiple file paths in one invocation.
+`go vet` and Staticcheck accept named files only within one directory: same-directory
+inputs are batched; cross-directory inputs **fall back to one invocation per file**
+to avoid forming an invalid package or broadening scope. Project selection remains
+the existing configured `project_root`; this change does not guess nested roots or
+add a root cache. Detection happens after writes, so edited checker configuration
+is visible. No subprocess result is reused between operations or project roots.
+
+Parsed diagnostics stay on `metadata.files` for `apply_patch` and on the existing
+per-file `results` for `move_symbol`. Clean files receive `validation_errors: []`;
+skips receive the existing `validate_skipped_reason`. A nonzero exit with an error
+in one touched file does not falsely mark the other touched files unchecked.
+Move-hunk diagnostics attach to the final destination. `ValidationError.file`
+retains the checker's reported path; the batch resolves it at the checker root
+before attribution, so `one.ts` does not also match `nested/one.ts`. There is no
+separate top-level list. Both commands emit one rendered `type check: …` summary; unchecked files are
+explicitly counted with reasons. Checker errors do not undo successful writes.
+
+The real TypeScript 5.9.3 integration fixture has three touched files and an export
+whose consumer temporarily imports the old name. The old counting measurement was
+replaced deliberately: its claim of three intermediate runs is now the opposite
+of the approved contract, not an optimization-compatible invariant.
+
+| Command / fixture | Before | After | Diagnostic evidence |
 | --- | --- | --- | --- |
-| Three-file `apply_patch`, rename an export and its consumer | 3 | 1 real invocation against the completed project | The first intermediate project produces TS2305, "has no exported member 'moved'"; the completed project is clean |
-| `move_symbol`, source + destination + consumer | 3 | 1 real invocation against the completed project | The old source import is temporarily invalid after removing the export; the completed destination import is clean |
+| Three-file `apply_patch`, rename an export and its consumer | 3 compiler runs | 1 compiler run | TS2305 exists only in the intermediate project; all final per-file arrays are empty |
+| `move_symbol`, source + destination + consumer | 3 compiler runs | 1 compiler run | Not-yet-rewritten source import is never checked; completed project is clean |
+| Either command, consumer assigns a returned number to `string` | Diagnostics discarded by handler | TS2322 on consumer entry only | Real compiler line 2 diagnostic plus `type check: 1 errors in 1 of 3 files (tsc)` |
+| Partial patch / syntax-rolled-back symbol move | Could run during earlier writes | 0 compiler runs | Counter file absent; symbol move restores original source/destination bytes |
 
-Both command handlers currently discard `WriteResult.validation_errors` and
-`validate_skipped_reason`; the measurement checks their outer responses do not
-contain `validation_errors`. For a per-file result filtered to source/destination,
-an error only in a consumer can instead become internal `validate_skipped_reason:
-"error"`. Single-file commands using this pipeline do expose these fields.
-Neither adding those diagnostics to multi-file responses nor substituting
-final-state results is included here. The proposed one final run is measured
-separately after the command, not installed as a production batching change.
+Three independent regression tests were observed red before implementation:
+`multi_file_full_validation_runs_once_per_checker` (3 versus 1),
+`multi_file_full_validation_reports_real_error_in_touched_file` (missing per-file
+output), and `multi_file_full_validation_ignores_intermediate_only_errors`
+(real TS2305). The latter inspects every captured compiler output, not merely the
+rendered response, so dropping diagnostics cannot masquerade as final-state checking.
+Separate mutation controls disable coalescing, discard parsed diagnostics, and
+re-enable per-write checking; each has its own named red test. Unit fixtures also
+exercise distinct tools, positional file batching, repeated paths, root isolation,
+Go's fallback, exact root-relative diagnostic attribution, and honest skip reporting.
+The exact-attribution guard was separately neutralized: only
+`batch_validation_attributes_root_relative_diagnostics_exactly` failed; the other
+63 format-library tests passed. All mutants were restored from the staged live
+implementation, with a non-empty mutation diff and empty post-restore diff.
 
-Run the measurement explicitly after `bun install`:
+Run the real-compiler tests explicitly after `bun install`, under a throwaway
+`HOME` and `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME`, with
+the real `CARGO_HOME` and `RUSTUP_HOME` retained and `AFT_STORAGE_DIR` unset:
 
 ```
-cargo test -p agent-file-tools --test integration -- multi_file_full_validation_counts_intermediate_project_checks --ignored --nocapture
+cargo test -p agent-file-tools --test integration -- multi_file_full_validation --ignored --nocapture
 ```
 
 ## Remaining claims checked in current source
@@ -109,16 +145,27 @@ still need their own fixtures and mutation-count fences.
 All filesystem write helpers and fsync calls are unchanged. Existing durability
 tests still check first-use parent publication order, steady sync counts, torn
 sidecar handling, read-only restoration, missing/corrupt/future metadata,
-checkpoint permissions, rollback, and retention. No old test was rewritten to
-accept opposite behavior. Binary, Unicode, BOM, CRLF, EOF and malformed-range
+checkpoint permissions, rollback, and retention. Compatibility tests for edit
+materialization and durable history were not rewritten to accept opposite behavior;
+the checker measurement's approved contract change is explained above.
+Binary, Unicode, BOM, CRLF, EOF and malformed-range
 compatibility controls accompany the counting tests.
 
-Local gates: Rust backup/checkpoint/edit/parser/hashline/move_symbol/rename lib
+Original delivery gates: Rust backup/checkpoint/edit/parser/hashline/move_symbol/rename lib
 suites, the `aft` binary suite, integration move_symbol/rename/format suites, the
 real-compiler measurement, and `cargo fmt --all -- --check`. The local Windows
 cross-check was intentionally skipped as requested. Rust-analyzer inspection
 was partial while its Cargo check was running; compiling lib, binary and
 integration targets provided the authoritative local compiler check.
+
+Checker follow-up gates: 64 format-library tests, 32 edit-library tests, four
+real-TypeScript full-validation tests, 36 ordinary move-symbol integration tests,
+15 patch integration tests, 35 format integration tests, 121 binary tests, and
+`cargo fmt --all -- --check`. Cargo tests used throwaway HOME/XDG directories
+without `AFT_STORAGE_DIR`, retaining the real Cargo/Rustup homes. Cargo was 1.99.0,
+rustfmt 1.10.0-stable, Node 24.16.0 and TypeScript 5.9.3. The Windows cross-check
+was skipped as requested. Scoped inspection was partial while rust-analyzer was
+indexing; the test-target compilations provided authoritative type checking.
 
 No ranking/routing fence files, configuration resolver, tool schemas, package
 manifests or lockfiles changed. The prepared Bun install/build were not repeated

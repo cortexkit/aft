@@ -1737,10 +1737,272 @@ pub fn run_external_tool_capture(
 /// A structured error from a type checker.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ValidationError {
+    pub file: String,
     pub line: u32,
     pub column: u32,
     pub message: String,
     pub severity: String,
+}
+
+/// Checker results remain attached to the existing per-file response entries.
+pub(crate) struct FileValidation {
+    path: PathBuf,
+    errors: Vec<ValidationError>,
+    skipped_reason: Option<String>,
+}
+
+pub(crate) struct BatchValidation {
+    files: Vec<FileValidation>,
+    checkers: Vec<String>,
+}
+
+impl BatchValidation {
+    pub(crate) fn append_to(&self, path: &Path, entry: &mut serde_json::Value) {
+        if let Some(file) = self.files.iter().find(|file| file.path == path) {
+            entry["validation_errors"] = serde_json::json!(file.errors);
+            if let Some(reason) = &file.skipped_reason {
+                entry["validate_skipped_reason"] = serde_json::json!(reason);
+            }
+        }
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        let error_count = |file: &FileValidation| {
+            file.errors
+                .iter()
+                .filter(|error| error.severity == "error")
+                .count()
+        };
+        let mut summary = format!(
+            "type check: {} errors in {} of {} files ({})",
+            self.files.iter().map(error_count).sum::<usize>(),
+            self.files
+                .iter()
+                .filter(|file| error_count(file) > 0)
+                .count(),
+            self.files.len(),
+            if self.checkers.is_empty() {
+                "none".to_string()
+            } else {
+                self.checkers.join(", ")
+            },
+        );
+        let skipped = self
+            .files
+            .iter()
+            .filter(|file| file.skipped_reason.is_some())
+            .count();
+        if skipped > 0 {
+            let mut reasons: Vec<&str> = self
+                .files
+                .iter()
+                .filter_map(|file| file.skipped_reason.as_deref())
+                .collect();
+            reasons.sort_unstable();
+            reasons.dedup();
+            summary.push_str(&format!(
+                "; {skipped} files unchecked ({})",
+                reasons.join(", ")
+            ));
+        }
+        summary
+    }
+}
+
+struct CheckerBatch {
+    command: String,
+    tool: String,
+    root: Option<PathBuf>,
+    args: Vec<String>,
+    file_args: bool,
+    files: Vec<usize>,
+}
+
+/// Run each resolved checker once against the final project state. The root is
+/// the configured project root, just as in single-file validation; detection is
+/// deliberately delayed so edits to checker configuration are also visible.
+pub(crate) fn validate_full_batch(paths: &[PathBuf], config: &Config) -> BatchValidation {
+    let mut validation = BatchValidation {
+        files: Vec::new(),
+        checkers: Vec::new(),
+    };
+    let mut batches: Vec<CheckerBatch> = Vec::new();
+    for path in paths {
+        if validation.files.iter().any(|file| file.path == *path) {
+            continue;
+        }
+        let index = validation.files.len();
+        validation.files.push(FileValidation {
+            path: path.clone(),
+            errors: Vec::new(),
+            skipped_reason: None,
+        });
+        let Some(lang) = detect_language(path).filter(|lang| has_checker_support(*lang)) else {
+            validation.files[index].skipped_reason = Some("unsupported_language".to_string());
+            continue;
+        };
+        let (command, tool, mut args) = match detect_checker_for_path(path, lang, config) {
+            ToolDetection::Found {
+                command,
+                tool,
+                args,
+            } => (command, tool, args),
+            ToolDetection::NotConfigured => {
+                validation.files[index].skipped_reason = Some("no_checker_configured".to_string());
+                continue;
+            }
+            ToolDetection::NotInstalled { .. } => {
+                validation.files[index].skipped_reason = Some("checker_not_installed".to_string());
+                continue;
+            }
+        };
+        // Strip only a known positional file argument, not arbitrary flags.
+        let file_args = matches!(
+            tool.as_str(),
+            "biome" | "pyright" | "ruff" | "go" | "staticcheck"
+        );
+        if file_args {
+            debug_assert_eq!(
+                args.last().map(String::as_str),
+                Some(path.to_string_lossy().as_ref())
+            );
+            args.pop();
+        }
+        let root = config.project_root.clone();
+        if let Some(batch) = batches.iter_mut().find(|batch| {
+            batch.command == command
+                && batch.root == root
+                && batch.args == args
+                && batch.file_args == file_args
+        }) {
+            batch.files.push(index);
+        } else {
+            batches.push(CheckerBatch {
+                command,
+                tool,
+                root,
+                args,
+                file_args,
+                files: vec![index],
+            });
+        }
+    }
+
+    // Go's named-file mode accepts several files only from the same directory.
+    // Across packages, retain one invocation per file instead of constructing
+    // an invalid package or broadening the check to every file in a directory.
+    let batches = batches
+        .into_iter()
+        .flat_map(|batch| {
+            let first_parent = validation.files[batch.files[0]].path.parent();
+            if matches!(batch.tool.as_str(), "go" | "staticcheck")
+                && batch
+                    .files
+                    .iter()
+                    .any(|index| validation.files[*index].path.parent() != first_parent)
+            {
+                batch
+                    .files
+                    .iter()
+                    .map(|index| CheckerBatch {
+                        command: batch.command.clone(),
+                        tool: batch.tool.clone(),
+                        root: batch.root.clone(),
+                        args: batch.args.clone(),
+                        file_args: batch.file_args,
+                        files: vec![*index],
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![batch]
+            }
+        })
+        .collect::<Vec<_>>();
+    for batch in batches {
+        let label = match batch.tool.as_str() {
+            "cargo" => "cargo check",
+            "go" => "go vet",
+            tool => tool,
+        }
+        .to_string();
+        if !validation.checkers.contains(&label) {
+            validation.checkers.push(label);
+        }
+        let mut args = batch.args;
+        if batch.file_args {
+            args.extend(
+                batch
+                    .files
+                    .iter()
+                    .map(|index| validation.files[*index].path.to_string_lossy().into_owned()),
+            );
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = run_external_tool_capture(
+            &batch.command,
+            &arg_refs,
+            batch.root.as_deref(),
+            config.type_checker_timeout_secs,
+        );
+        let skipped_reason = match result {
+            Ok(result) => {
+                let mut found_diagnostics = false;
+                for index in &batch.files {
+                    let file = &mut validation.files[*index];
+                    file.errors = parse_checker_output(
+                        &result.stdout,
+                        &result.stderr,
+                        &file.path,
+                        &batch.command,
+                    );
+                    // The single-file parsers allow suffix matches for relative
+                    // compiler paths. In a batch that could attribute a sibling
+                    // file's error twice, so resolve the reported path at the
+                    // actual checker root before attaching it to an entry.
+                    let expected_path = file
+                        .path
+                        .canonicalize()
+                        .unwrap_or_else(|_| file.path.clone());
+                    file.errors.retain(|error| {
+                        let normalized = normalize_path_for_compare(&error.file);
+                        let reported = Path::new(&normalized);
+                        let resolved = if reported.is_absolute() {
+                            reported.to_path_buf()
+                        } else if let Some(root) = &batch.root {
+                            root.join(reported)
+                        } else {
+                            reported.to_path_buf()
+                        };
+                        resolved.canonicalize().unwrap_or(resolved) == expected_path
+                    });
+                    found_diagnostics |= !file.errors.is_empty();
+                }
+                // A nonzero exit caused by another touched file does not make
+                // the clean members of the batch "unchecked".
+                if result.exit_code != 0 && !found_diagnostics {
+                    log::debug!(
+                        "validate: {} (skipped: error: {})",
+                        batch.command,
+                        output_tail_summary(&result.stdout, &result.stderr, result.truncated)
+                    );
+                    Some("error")
+                } else {
+                    None
+                }
+            }
+            Err(FormatError::Timeout { .. }) => Some("timeout"),
+            Err(FormatError::NotFound { .. }) => Some("checker_not_installed"),
+            Err(FormatError::Failed { .. }) => Some("error"),
+            Err(FormatError::UnsupportedLanguage) => Some("unsupported_language"),
+        };
+        if let Some(reason) = skipped_reason {
+            for index in batch.files {
+                validation.files[index].skipped_reason = Some(reason.to_string());
+            }
+        }
+    }
+    validation.checkers.sort();
+    validation
 }
 
 /// Detect the appropriate type checker command and arguments for a file.
@@ -1907,6 +2169,7 @@ fn parse_tsc_output(stdout: &str, stderr: &str, file: &Path) -> Vec<ValidationEr
             };
 
             errors.push(ValidationError {
+                file: file_part.to_string(),
                 line: line_num,
                 column: col_num,
                 message,
@@ -1957,6 +2220,9 @@ fn parse_biome_json_value(
 
         let (line, column) = biome_line_column(diag, source.as_deref());
         errors.push(ValidationError {
+            file: json_location_path(diag)
+                .map(str::to_string)
+                .unwrap_or_else(|| file.to_string_lossy().into_owned()),
             line,
             column,
             message: diagnostic_message(diag),
@@ -2036,6 +2302,11 @@ fn parse_ruff_json_value(json: &serde_json::Value, file: &Path, errors: &mut Vec
         };
 
         errors.push(ValidationError {
+            file: if diag_file.is_empty() {
+                file.to_string_lossy().into_owned()
+            } else {
+                diag_file.to_string()
+            },
             line: json_u32_at(diag, &["location", "row"])
                 .or_else(|| json_u32_at(diag, &["location", "line"]))
                 .unwrap_or(0),
@@ -2087,6 +2358,11 @@ fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
                     .to_lowercase();
 
                 errors.push(ValidationError {
+                    file: if diag_file.is_empty() {
+                        file.to_string_lossy().into_owned()
+                    } else {
+                        diag_file.to_string()
+                    },
                     line: line_num + 1,  // pyright uses 0-indexed lines
                     column: col_num + 1, // pyright uses 0-indexed columns
                     message,
@@ -2158,6 +2434,7 @@ fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<Validatio
                         .unwrap_or(0) as u32;
 
                     errors.push(ValidationError {
+                        file: span_file.to_string(),
                         line: line_num,
                         column: col_num,
                         message: text.clone(),
@@ -2192,6 +2469,7 @@ fn parse_go_vet_output(stderr: &str, file: &Path) -> Vec<ValidationError> {
         }
 
         errors.push(ValidationError {
+            file: err_file.to_string(),
             line: captures
                 .name("line")
                 .and_then(|m| m.as_str().parse().ok())
@@ -2281,6 +2559,11 @@ fn parse_staticcheck_diag(
     };
 
     errors.push(ValidationError {
+        file: if diag_file.is_empty() {
+            file.to_string_lossy().into_owned()
+        } else {
+            diag_file.to_string()
+        },
         line: json_u32_at(diag, &["location", "line"])
             .or_else(|| json_u32_at(diag, &["line"]))
             .unwrap_or(0),
@@ -2444,6 +2727,164 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    #[cfg(unix)]
+    fn counting_checker(root: &Path, tool: &str, output: &str, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = root.join("node_modules/.bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join(tool);
+        fs::write(&path, format!(
+            "#!/bin/sh\nprintf 'run\\n' >> '{0}/{tool}-count'\nprintf '%s\\n' \"$@\" >> '{0}/{tool}-args'\nprintf '%s\\n' '{output}'\nexit {code}\n", root.display()
+        )).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_validation_groups_distinct_checkers_and_file_arguments() {
+        for tool in [
+            "tsc",
+            "tsgo",
+            "cargo",
+            "biome",
+            "pyright",
+            "ruff",
+            "go",
+            "staticcheck",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            // Check the same resolved tool for two languages as well as repeated paths.
+            let config = Config {
+                project_root: Some(dir.path().to_path_buf()),
+                checker: [
+                    ("typescript".to_string(), tool.to_string()),
+                    ("python".to_string(), "pyright".to_string()),
+                ]
+                .into(),
+                ..Config::default()
+            };
+            counting_checker(dir.path(), tool, "", 0);
+            counting_checker(dir.path(), "pyright", "", 0);
+            let paths = ["one.ts", "two.ts", "one.ts", "one.py", "two.py"]
+                .map(|path| dir.path().join(path));
+            let validation = validate_full_batch(&paths, &config);
+            assert_eq!(validation.files.len(), 4);
+            assert!(validation
+                .files
+                .iter()
+                .all(|file| file.errors.is_empty() && file.skipped_reason.is_none()));
+            for checker in [tool, "pyright"] {
+                assert_eq!(
+                    fs::read_to_string(dir.path().join(format!("{checker}-count")))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1,
+                    "{tool}/{checker}"
+                );
+            }
+            if matches!(tool, "biome" | "pyright" | "ruff" | "go" | "staticcheck") {
+                let args = fs::read_to_string(dir.path().join(format!("{tool}-args"))).unwrap();
+                assert_eq!(
+                    args.lines().filter(|arg| arg.ends_with("one.ts")).count(),
+                    1,
+                    "{args}"
+                );
+                assert_eq!(
+                    args.lines().filter(|arg| arg.ends_with("two.ts")).count(),
+                    1,
+                    "{args}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_validation_preserves_project_roots_and_go_fallback() {
+        for tool in ["go", "staticcheck"] {
+            for _ in 0..2 {
+                let dir = tempfile::tempdir().unwrap();
+                counting_checker(dir.path(), tool, "", 0);
+                let config = Config {
+                    project_root: Some(dir.path().to_path_buf()),
+                    checker: [("go".to_string(), tool.to_string())].into(),
+                    ..Config::default()
+                };
+                let paths = ["one/main.go", "two/main.go"].map(|path| dir.path().join(path));
+                let validation = validate_full_batch(&paths, &config);
+                assert!(validation
+                    .files
+                    .iter()
+                    .all(|file| file.skipped_reason.is_none()));
+                assert_eq!(
+                    fs::read_to_string(dir.path().join(format!("{tool}-count")))
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    2
+                );
+                let args = fs::read_to_string(dir.path().join(format!("{tool}-args"))).unwrap();
+                assert!(args.contains(paths[0].to_str().unwrap()));
+                assert!(args.contains(paths[1].to_str().unwrap()));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_validation_reports_skips_without_claiming_clean_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        counting_checker(dir.path(), "tsc", "bad configuration", 1);
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            checker: [("typescript".to_string(), "tsc".to_string())].into(),
+            ..Config::default()
+        };
+        let paths = ["one.ts", "two.ts", "notes.txt", "one.py"].map(|path| dir.path().join(path));
+        let validation = validate_full_batch(&paths, &config);
+        for path in &paths[..2] {
+            let mut entry = serde_json::json!({});
+            validation.append_to(path, &mut entry);
+            assert_eq!(entry["validation_errors"], serde_json::json!([]));
+            assert_eq!(entry["validate_skipped_reason"], "error");
+        }
+        assert!(validation
+            .summary()
+            .contains("4 files unchecked (error, no_checker_configured, unsupported_language)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_validation_attributes_root_relative_diagnostics_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        counting_checker(
+            dir.path(),
+            "tsc",
+            "one.ts(1,7): error TS2322: number mismatch",
+            1,
+        );
+        let paths = ["one.ts", "nested/one.ts"].map(|path| dir.path().join(path));
+        fs::create_dir_all(paths[1].parent().unwrap()).unwrap();
+        for path in &paths {
+            fs::write(path, "export const n = 1;\n").unwrap();
+        }
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            checker: [("typescript".to_string(), "tsc".to_string())].into(),
+            ..Config::default()
+        };
+        let validation = validate_full_batch(&paths, &config);
+        assert_eq!(validation.files[0].errors.len(), 1);
+        assert_eq!(validation.files[0].errors[0].file, "one.ts");
+        assert!(validation.files[1].errors.is_empty());
+        assert!(validation.files[1].skipped_reason.is_none());
+        assert_eq!(
+            validation.summary(),
+            "type check: 1 errors in 1 of 2 files (tsc)"
+        );
+    }
 
     /// Serializes tests that mutate the global TOOL_RESOLUTION_CACHE /
     /// TOOL_AVAILABILITY_CACHE. Cargo runs tests in parallel by default, and

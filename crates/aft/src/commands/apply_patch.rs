@@ -363,17 +363,18 @@ fn write_patched_file(
     }
 
     let params = command_params(req);
-    let mut write_result = match edit::write_format_validate(path, content, &ctx.config(), params) {
-        Ok(result) => result,
-        Err(error) => {
-            restore_pre_write_state(path, existed, original.as_deref());
-            if snapshot_taken {
-                discard_latest_backup(ctx, req, op_id, path);
-                backed_paths.remove(path);
+    let mut write_result =
+        match edit::write_format_validate_deferred(path, content, &ctx.config(), params) {
+            Ok(result) => result,
+            Err(error) => {
+                restore_pre_write_state(path, existed, original.as_deref());
+                if snapshot_taken {
+                    discard_latest_backup(ctx, req, op_id, path);
+                    backed_paths.remove(path);
+                }
+                return Err(error.to_string());
             }
-            return Err(error.to_string());
-        }
-    };
+        };
 
     if write_result.rolled_back {
         if snapshot_taken {
@@ -992,7 +993,31 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     }
 
     let root = project_root_for_relative_paths(ctx);
-    let (diff, files) = metadata_files(&applied, root.as_deref());
+    let (diff, mut files) = metadata_files(&applied, root.as_deref());
+    // A partial patch keeps successful writes, but is not a completed project
+    // mutation. Do not run checkers when any hunk failed or rolled back.
+    if failures.is_empty() {
+        let paths: Vec<PathBuf> = applied
+            .iter()
+            .filter(|hunk| hunk.kind != "delete" && hunk.display_path.is_file())
+            .map(|hunk| hunk.display_path.clone())
+            .collect();
+        if let Some(validation) =
+            edit::validate_written_files(&paths, &ctx.config(), command_params(req))
+        {
+            for file in &mut files {
+                let path = file
+                    .get("movePath")
+                    .or_else(|| file.get("filePath"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                if let Some(path) = path {
+                    validation.append_to(&path, file);
+                }
+            }
+            output_lines.push(validation.summary());
+        }
+    }
     let output = output_lines.join("\n");
 
     if applied.is_empty() && !failures.is_empty() {
