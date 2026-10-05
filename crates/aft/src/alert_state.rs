@@ -7,10 +7,12 @@ use unicode_normalization::UnicodeNormalization;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::roots::ServerKey;
 
-/// Idle alert sessions are reaped by the embedding runtime. The duration is a
-/// product constant; callers inject `now` when they run a sweep so lifecycle
-/// behavior does not depend on wall-clock timing in tests.
+/// Idle alert sessions are reaped when the next accepted observation arrives;
+/// sessions with a live alert that has not been rendered remain protected. The
+/// duration is a product constant, and injected time keeps lifecycle tests
+/// deterministic.
 pub const ALERT_SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_CLOSED_EPISODES_PER_PARTITION: usize = 128;
 
 /// A stable identifier for the server partition that produced a diagnostic
 /// snapshot. The workspace root is included because a server kind can run for
@@ -328,11 +330,27 @@ impl std::error::Error for ObservationError {}
 /// Session-scoped alert delta state. The caller supplies the authoritative
 /// observation batch and an injected monotonic time; no passive diagnostic
 /// reads, timers, or heartbeats have a state-mutating API here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct AlertDeltaState {
     partitions: HashMap<AlertPartitionKey, AlertPartitionState>,
     session_last_touched: HashMap<String, Instant>,
     next_episode_id: u64,
+}
+
+#[cfg(test)]
+static ALERT_DELTA_STATE_CLONES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl Clone for AlertDeltaState {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        ALERT_DELTA_STATE_CLONES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            partitions: self.partitions.clone(),
+            session_last_touched: self.session_last_touched.clone(),
+            next_episode_id: self.next_episode_id,
+        }
+    }
 }
 
 impl AlertDeltaState {
@@ -343,25 +361,24 @@ impl AlertDeltaState {
         self.accept_batch_at(batch, Instant::now())
     }
 
-    /// Apply every accepted producer snapshot as one terminal transition. The
-    /// staging clone means a malformed batch cannot expose an intermediate
-    /// multi-producer state to a concurrent finalizer.
+    /// Apply every accepted producer snapshot as one terminal transition.
+    /// Validating the whole batch before mutation keeps duplicate producers from
+    /// exposing a partial transition; the caller serializes access to this state.
     pub fn accept_batch_at(
         &mut self,
         batch: &AcceptedObservationBatch,
         now: Instant,
     ) -> Result<Vec<AcceptedObservationResult>, ObservationError> {
-        // Batches built by `AcceptedObservationBatch::new` are already valid,
-        // but validate again so deserialization or future constructors cannot
-        // accidentally weaken the atomicity guarantee.
+        // Validate before pruning or mutating so malformed batches cannot
+        // expose partial multi-producer state. Applying a valid batch below is
+        // infallible, so a second deep copy of every live partition is not
+        // needed for atomicity.
         validate_batch(batch)?;
-
-        let mut staged = self.clone();
+        self.reap_idle_sessions_at(now, ALERT_SESSION_IDLE_TTL);
         let mut results = Vec::with_capacity(batch.observations.len());
         for observation in &batch.observations {
-            results.push(staged.accept_observation(observation, now));
+            results.push(self.accept_observation(observation, now));
         }
-        *self = staged;
         Ok(results)
     }
 
@@ -390,12 +407,24 @@ impl AlertDeltaState {
     /// `now` is injected by the runtime to make the lifecycle independently
     /// testable without pinning the product duration.
     pub fn reap_idle_sessions_at(&mut self, now: Instant, idle_for: Duration) -> Vec<String> {
+        let sessions_with_undelivered_alerts = self
+            .partitions
+            .iter()
+            .filter_map(|(key, partition)| {
+                partition
+                    .live
+                    .keys()
+                    .any(|identity| !partition.rendered.contains(identity))
+                    .then(|| key.session_id.clone())
+            })
+            .collect::<HashSet<_>>();
         let mut reaped = self
             .session_last_touched
             .iter()
             .filter_map(|(session_id, last_touched)| {
-                (now.saturating_duration_since(*last_touched) >= idle_for)
-                    .then(|| session_id.clone())
+                (now.saturating_duration_since(*last_touched) >= idle_for
+                    && !sessions_with_undelivered_alerts.contains(session_id))
+                .then(|| session_id.clone())
             })
             .collect::<Vec<_>>();
         reaped.sort();
@@ -481,6 +510,11 @@ impl AlertDeltaState {
                 partition.live.remove(&identity).map(|episode_id| {
                     partition.rendered.remove(&identity);
                     partition.closed_episodes.insert(episode_id);
+                    while partition.closed_episodes.len() > MAX_CLOSED_EPISODES_PER_PARTITION {
+                        if let Some(oldest) = partition.closed_episodes.iter().min().copied() {
+                            partition.closed_episodes.remove(&oldest);
+                        }
+                    }
                     ClosedIdentity {
                         identity,
                         episode_id,
@@ -521,6 +555,116 @@ fn validate_batch(batch: &AcceptedObservationBatch) -> Result<(), ObservationErr
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod growth_tests {
+    use super::*;
+    use crate::lsp::diagnostics::DiagnosticSeverity;
+
+    fn diagnostic() -> StoredDiagnostic {
+        StoredDiagnostic {
+            file: PathBuf::from("/alert-state-growth/file.rs"),
+            line: 1,
+            column: 1,
+            end_line: 1,
+            end_column: 2,
+            severity: DiagnosticSeverity::Error,
+            message: "still broken".to_owned(),
+            code: None,
+            source: Some("test".to_owned()),
+        }
+    }
+
+    fn batch(session: &str, diagnostics: Vec<StoredDiagnostic>) -> AcceptedObservationBatch {
+        AcceptedObservationBatch::new(vec![AcceptedObservation::new(
+            session,
+            "/alert-state-growth",
+            ProducerKey::new("test-producer"),
+            1,
+            diagnostics,
+        )])
+        .expect("one observation per partition")
+    }
+
+    #[test]
+    fn audit_growth_idle_session_requests_reap_old_state_but_keep_the_current_live_alert() {
+        let mut state = AlertDeltaState::default();
+        let start = Instant::now();
+        state
+            .accept_batch_at(&batch("alert-pending", Vec::new()), start)
+            .expect("silent baseline");
+        let pending = state
+            .accept_batch_at(&batch("alert-pending", vec![diagnostic()]), start)
+            .expect("new alert observation");
+        assert_eq!(pending[0].entered.len(), 1);
+        for index in 0..128 {
+            let session = format!("alert-growth-{index}");
+            let now = start + ALERT_SESSION_IDLE_TTL * index;
+            state
+                .accept_batch_at(&batch(&session, vec![diagnostic()]), now)
+                .expect("accepted observation");
+            assert!(state.partitions.len() <= 2);
+        }
+
+        let current_key = batch("alert-growth-127", Vec::new()).observations()[0].partition_key();
+        let current = state
+            .partition(&current_key)
+            .expect("current session remains");
+        assert_eq!(current.live.len(), 1, "current alert remains live");
+        assert_eq!(
+            current.rendered.len(),
+            1,
+            "undelivered alert state remains available"
+        );
+        assert_eq!(state.session_last_touched.len(), 2);
+        let pending_key = batch("alert-pending", Vec::new()).observations()[0].partition_key();
+        let pending_partition = state
+            .partition(&pending_key)
+            .expect("an undelivered alert must survive idle-session pruning");
+        assert_eq!(pending_partition.live.len(), 1);
+        assert!(pending_partition.rendered.is_empty());
+    }
+
+    #[test]
+    fn audit_growth_closed_episode_history_stays_bounded_while_transitions_are_returned() {
+        const MAX_RETAINED: usize = 128;
+        let mut state = AlertDeltaState::default();
+        let start = Instant::now();
+        let key = batch("alert-episode-growth", Vec::new()).observations()[0].partition_key();
+        let mut latest_closed = None;
+        for cycle in 0..256 {
+            let now = start + Duration::from_secs(cycle * 2);
+            state
+                .accept_batch_at(&batch("alert-episode-growth", vec![diagnostic()]), now)
+                .expect("diagnostic observation");
+            let closed = state
+                .accept_batch_at(&batch("alert-episode-growth", Vec::new()), now)
+                .expect("clean observation");
+            latest_closed = closed.into_iter().flat_map(|result| result.closed).last();
+        }
+        let partition = state.partition(&key).expect("partition remains active");
+        assert!(partition.closed_episodes.len() <= MAX_RETAINED);
+        assert_eq!(
+            latest_closed.map(|closed| closed.episode_id),
+            partition.closed_episodes.iter().max().copied(),
+            "the latest closure remains observable in state and in the batch result"
+        );
+    }
+
+    #[test]
+    fn audit_growth_batch_acceptance_does_not_clone_the_full_session_state() {
+        let mut state = AlertDeltaState::default();
+        let before = ALERT_DELTA_STATE_CLONES.load(std::sync::atomic::Ordering::Relaxed);
+        state
+            .accept_batch_at(&batch("alert-no-clone", vec![diagnostic()]), Instant::now())
+            .expect("accepted observation");
+        let clones = ALERT_DELTA_STATE_CLONES.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert_eq!(
+            clones, 0,
+            "batch acceptance must update validated state in place"
+        );
+    }
 }
 
 fn canonical_root_relative_file(canonical_root: &Path, file: &Path) -> PathBuf {
