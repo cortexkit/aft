@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "edit-perf-and-single-check"
+  ],
+  "note": "Edit, undo, checkpoint and hashline perf; multi-file edits type-check once per checker. No ranking change."
+}
