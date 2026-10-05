@@ -679,6 +679,105 @@ async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
 }
 
 #[tokio::test]
+async fn s1_cancelled_prepared_repeat_ends_without_settling_the_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let warm = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        false,
+    )
+    .await;
+    let marker = root.join("project/cancelled-repeat");
+    let mut body = json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"cancelled-repeat"});
+    route.adapt_preset(&mut body);
+    let mut wire = route.wire.lock().await;
+    let first = wire.next_corr;
+    let repeat = first + 1;
+    wire.next_corr += 2;
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Request,
+            flags(),
+            route.channel,
+            1,
+            first,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let ask = next_frame(&mut wire.stream).await.unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Request,
+            flags(),
+            route.channel,
+            1,
+            repeat,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(FrameType::Cancel, flags(), route.channel, 1, repeat, vec![]).unwrap(),
+    )
+    .await
+    .unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(5), next_frame(&mut wire.stream))
+        .await
+        .expect("a cancelled attachment must receive a terminal frame")
+        .unwrap();
+    assert_eq!(cancelled.header.corr, repeat);
+    assert_eq!(cancelled.header.ty, FrameType::Error);
+    assert_eq!(response_json(&cancelled)["code"], "cancelled");
+    assert!(!marker.exists());
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Response,
+            flags(),
+            route.channel,
+            1,
+            ask.header.corr,
+            serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let completed = next_frame(&mut wire.stream).await.unwrap();
+    assert_eq!(completed.header.corr, first);
+    assert_eq!(completed.header.ty, FrameType::Response);
+    assert_eq!(response_json(&completed)["isError"], false);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(400), next_frame(&mut wire.stream))
+            .await
+            .is_err(),
+        "the cancelled repeat must not also receive the result"
+    );
+    drop(wire);
+    let replay = route.raw(body, false).await;
+    assert_eq!(replay.body, completed.body);
+    assert_eq!(std::fs::read(marker).unwrap(), b"ran");
+}
+
+#[tokio::test]
 async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("module");

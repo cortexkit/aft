@@ -4839,6 +4839,14 @@ where
                         } else {decoded};
                         let frame = decoded.frame;
                         let phase_trace = decoded.phase_trace;
+                        if ledger_waited && ledger_edge.finish_waiting(&frame) {
+                            let cancelled = build_error_frame(frame.header.ver,
+                                route.channel, route.epoch, frame.header.corr,
+                                frame.header.flags, "cancelled", "request cancelled")?;
+                            send_reliable_writer_frame(&writer_tx, &dispatch_path_metrics,
+                                cancelled, "cancelled ledger admission").await?;
+                            continue;
+                        }
                         let result = if management_routes.contains(&route)
                             && gh_relay_operation(&frame).is_some()
                         {
@@ -4905,6 +4913,9 @@ where
                     FrameType::Cancel => {
                         let channel = route_key(frame.header.channel, frame.header.epoch);
                         let corr = frame.header.corr;
+                        if ledger_edge.cancel(channel, corr) {
+                            continue;
+                        }
                         // The daemon frees a request's credit only on the
                         // module's terminal frame, never on the client's Cancel.
                         // A call this Cancel stops tracking will never answer
@@ -5430,6 +5441,7 @@ where
     }
 
     connection_cancel.cancel();
+    ledger_edge.close();
     cancel_all_active_tool_calls(&active_tool_calls, executor.as_ref(), "connection teardown");
     let setup_drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while pending_deferred_setups.load(Ordering::SeqCst) != 0

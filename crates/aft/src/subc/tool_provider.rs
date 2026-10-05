@@ -670,6 +670,9 @@ pub(super) fn note_native_outcome(
 /// pass through the same edge and are committed before reaching the socket.
 pub(super) struct LedgerEdge {
     calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
+    waiting: std::sync::Mutex<
+        std::collections::HashMap<(super::RouteChannel, u64), super::PersistentCancelSignal>,
+    >,
     ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
 }
 struct LedgerCall {
@@ -687,6 +690,7 @@ impl LedgerEdge {
         (
             std::sync::Arc::new(Self {
                 calls: Default::default(),
+                waiting: Default::default(),
                 ready,
             }),
             receiver,
@@ -829,6 +833,11 @@ impl LedgerEdge {
         let root = identity.root.clone();
         let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
         let response_key = key.clone();
+        let cancel = PersistentCancelSignal::new();
+        self.waiting
+            .lock()
+            .unwrap()
+            .insert((route, decoded.frame.header.corr), cancel.clone());
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let rx = executor.submit_async(
             root.clone(),
@@ -903,6 +912,18 @@ impl LedgerEdge {
                     // Repeats observe the same durable execution, including a
                     // shell recovered after restart. They never dispatch again.
                     loop {
+                        if cancel.is_cancelled() {
+                            let frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                            edge.finish_waiting(&decoded.frame);
+                            let _ = send_reliable_writer_frame(
+                                &writer,
+                                &metrics,
+                                frame,
+                                "cancelled ledger attachment",
+                            )
+                            .await;
+                            break;
+                        }
                         let key = response_key.clone();
                         let (row_tx, row_rx) = oneshot::channel();
                         let rx = repeat_executor.submit_async(
@@ -919,11 +940,15 @@ impl LedgerEdge {
                                 Response::success("ledger-attach", json!({}))
                             }),
                         );
-                        let _ = await_executor_response(rx, "ledger-attach".into()).await;
+                        tokio::select! {
+                            _ = await_executor_response(rx, "ledger-attach".into()) => {},
+                            _ = cancel.cancelled() => continue,
+                        }
                         if let Ok(Some(row)) = row_rx.await {
                             if row.state == State::Settled {
                                 if let Some(recorded) = row.frame {
-                                    if let Ok(frame) = Self::replay(&decoded.frame, &recorded) {
+                                    if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded)
+                                    {
                                         let _ = send_reliable_writer_frame(
                                             &writer,
                                             &metrics,
@@ -936,14 +961,29 @@ impl LedgerEdge {
                                 break;
                             }
                         } else {
+                            edge.finish_waiting(&decoded.frame);
+                            let _ = send_provider_error(
+                                &writer,
+                                &metrics,
+                                &decoded.frame,
+                                ErrorBody::new(
+                                    "database_unavailable",
+                                    "call ledger attachment is unavailable",
+                                )
+                                .with_detail(json!({"retryable":false})),
+                            )
+                            .await;
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+                            _ = cancel.cancelled() => {},
+                        }
                     }
                 }
                 Ok(Admission::Repeat(row)) => {
                     if let Some(recorded) = row.frame {
-                        if let Ok(frame) = Self::replay(&decoded.frame, &recorded) {
+                        if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded) {
                             let _ = send_reliable_writer_frame(
                                 &writer,
                                 &metrics,
@@ -955,16 +995,19 @@ impl LedgerEdge {
                     }
                 }
                 Ok(Admission::Conflict) => {
-                    let _ = send_provider_error(
-                        &writer,
-                        &metrics,
-                        &decoded.frame,
-                        errors::invalid_request(
-                            "call_key",
-                            "key already names different content or scope",
-                        ),
-                    )
-                    .await;
+                    let error = errors::invalid_request(
+                        "call_key",
+                        "key already names different content or scope",
+                    );
+                    let recorded = ledger::RecordedFrame {
+                        ty: FrameType::Error,
+                        body: serde_json::to_vec(&error).unwrap(),
+                    };
+                    if let Ok(frame) = edge.finish_replay(&decoded.frame, &recorded) {
+                        let _ =
+                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger conflict")
+                                .await;
+                    }
                 }
                 Err(response) => {
                     let context = crate::subc_format::FormatContext::from_tool_call(
@@ -978,7 +1021,7 @@ impl LedgerEdge {
                         ),
                         response,
                     };
-                    if let Ok(frame) = build_tool_response_frame(
+                    if let Ok(mut frame) = build_tool_response_frame(
                         decoded.frame.header.ver,
                         route,
                         decoded.frame.header.corr,
@@ -986,6 +1029,9 @@ impl LedgerEdge {
                         &result,
                         identity.trust,
                     ) {
+                        if edge.finish_waiting(&decoded.frame) {
+                            frame = Self::cancelled_frame(&decoded.frame).unwrap();
+                        }
                         let _ =
                             send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
                                 .await;
@@ -1009,6 +1055,61 @@ impl LedgerEdge {
             request.header.corr,
             recorded.body.clone(),
         )
+    }
+
+    /// Pending admission and attached repeats do not belong to the tool's
+    /// executor job. Cancelling one attachment must not settle the shared row.
+    pub(super) fn cancel(&self, route: super::RouteChannel, corr: u64) -> bool {
+        let waiting = self.waiting.lock().unwrap();
+        if let Some(signal) = waiting.get(&(route, corr)) {
+            signal.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn close(&self) {
+        for signal in self.waiting.lock().unwrap().values() {
+            signal.cancel();
+        }
+    }
+
+    pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
+        self.waiting
+            .lock()
+            .unwrap()
+            .remove(&(
+                super::route_key(request.header.channel, request.header.epoch),
+                request.header.corr,
+            ))
+            .is_some_and(|signal| signal.is_cancelled())
+    }
+
+    fn cancelled_frame(
+        request: &subc_protocol::Frame,
+    ) -> Result<subc_protocol::Frame, super::SubcError> {
+        super::build_error_frame(
+            request.header.ver,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            request.header.flags,
+            "cancelled",
+            "request cancelled",
+        )
+    }
+
+    fn finish_replay(
+        &self,
+        request: &subc_protocol::Frame,
+        recorded: &crate::db::call_ledger::RecordedFrame,
+    ) -> Result<subc_protocol::Frame, super::SubcError> {
+        if self.finish_waiting(request) {
+            Self::cancelled_frame(request)
+        } else {
+            Self::replay(request, recorded).map_err(super::SubcError::FrameBuild)
+        }
     }
 
     pub(super) fn authorize(
