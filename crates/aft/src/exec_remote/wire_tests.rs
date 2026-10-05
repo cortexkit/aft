@@ -77,7 +77,7 @@ async fn daemon(script: Script, claim: &str) -> Daemon {
                     negotiated_ver: PROTOCOL_VERSION, subc_ops: vec!["catalog.list".into()], subc_capabilities: vec![], storage: None, machine_id: None,
                 }).unwrap())),
                 FrameType::Request if header.channel == 0 => match body["op"].as_str() {
-                    Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1,
+                    Some("catalog.list") => replies.push(reply(FrameType::Response, json!({"op":"catalog.list", "generation":1, "subc_ops":["catalog.list"],
                         "modules":[{"module_id":"executor-picked-by-capability", "roles":[], "control_ops":[], "capabilities":{"provides":[claim], "requires":[]}}]}))),
                     Some("route.open") => replies.push(reply(FrameType::Response, json!({"op":"route.open", "route_channel":40, "route_epoch":1}))),
                     _ => panic!("unexpected control request {body}"),
