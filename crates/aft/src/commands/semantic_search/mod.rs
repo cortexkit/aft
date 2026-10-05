@@ -8551,14 +8551,12 @@ mod tests {
             .as_str()
             .expect("busy fallback text")
             .contains("busy finishing an earlier inference"));
-        assert_eq!(
-            crate::search_b2::embed_counter::read(busy_request_id),
-            crate::search_b2::embed_counter::EmbedCounts {
-                requested: 1,
-                cache_hits: 0,
-                live_calls: 0,
-            }
-        );
+        // Counts are released when the request's attribution ends, so read the
+        // ones the response captured while the request was still running.
+        let busy_counts = &busy_response["structuredContent"]["search"];
+        assert_eq!(busy_counts["embedding_calls"], 1, "{busy_counts}");
+        assert_eq!(busy_counts["embedding_cache_hits"], 0, "{busy_counts}");
+        assert_eq!(busy_counts["live_embed_calls"], 0, "{busy_counts}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         let (released, wake) = &*gate;
