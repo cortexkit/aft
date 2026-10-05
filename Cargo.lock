@@ -30,6 +30,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "content_inspector",
+ "cortexkit-exec-remote-types",
  "cortexkit-paths",
  "cortexkit-role-harness",
  "cortexkit-role-tool-provider",
@@ -587,6 +588,17 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "cortexkit-exec-remote-types"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a68a70991b7beae16a98d0666fe502d96234237398d14d6fdeb0aa61e8b4c52a"
+dependencies = [
+ "base64 0.22.1",
+ "serde",
+ "uuid",
+]
 
 [[package]]
 name = "cortexkit-paths"
@@ -4630,6 +4642,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

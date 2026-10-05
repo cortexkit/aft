@@ -84,6 +84,7 @@ pub mod effective_path;
 #[doc(hidden)]
 pub mod environment;
 pub mod error;
+pub mod exec_remote;
 pub mod executor;
 pub mod extract;
 pub mod feature_config;
