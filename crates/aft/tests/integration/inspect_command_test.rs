@@ -6247,19 +6247,17 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
         );
         assert!(response.success, "{response:?}");
         configure_fake_rust_lsp(&ctx);
-        ctx.lsp()
-            .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "empty_then_quiescent");
-        // The fake's empty startup report becomes quiescent after 1.5 seconds;
-        // start the compiler run afterwards, as rust-analyzer does on load.
-        ctx.lsp()
-            .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
+        // Default fake startup is already quiescent; its check therefore begins
+        // after workspace load. The warming variant settles only on didOpen,
+        // which would leave a second compiler run owed after its first run.
+        ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "100");
         if let Some(message) = result {
             ctx.lsp()
                 .set_extra_env("AFT_FAKE_LSP_CHECK_END_MESSAGE", message);
         }
         let response = scoped_diagnostics_inspect(&ctx, "unsuccessful-check", "src");
         assert_eq!(
-            response["summary"]["diagnostics"]["errors"], 0,
+            response["summary"]["diagnostics"]["errors"], 1,
             "{response:#}"
         );
         assert_eq!(
