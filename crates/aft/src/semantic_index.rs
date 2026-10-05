@@ -12491,6 +12491,7 @@ Connection: close
             crate::test_allocations::count(|| borrowed.delta_for_paths(&requested));
         assert_eq!(delta.entries.len(), 40);
         let mut overlay = borrowed.clone();
+        overlay.hide_base_files(requested.iter());
         overlay.entries = delta.entries.clone();
         let (fork, fork_allocations) =
             crate::test_allocations::count(|| overlay.fork_for_refresh());

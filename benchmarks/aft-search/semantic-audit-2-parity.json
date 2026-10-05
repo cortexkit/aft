@@ -1,0 +1,44 @@
+{
+  "schema": "aft-semantic-audit-parity-v1",
+  "base_sha": "54a3d93e230e23e580c40a0164d5cfe2bdc9561d",
+  "evidence_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "manifest_sha256": "e7ca27111303540d2611175814a481e9c36128d5b9adab74b530f671eae811d8",
+  "before_binary_sha256": "37672c6a4ede11cb28731e0d5fd8f32322c14e8011c1470b8444f04f11bbd5f2",
+  "after_binary_sha256": "57f2d302688e24fcf5f786b7e7c08d82edf06a19605b37ab5dbbdbd27390fe21",
+  "before_score_sha256": "dd65c1cddd6f3f34c39650b3f755c73450523aaa9aa4c9fc3941201c8019d3ea",
+  "after_score_sha256": "9e0701bd67af60682da786e94f1788ff689ff2d980c705c934d857f4fdae154a",
+  "real_query_rows": 93,
+  "identical_complete_rows": 93,
+  "before_and_after_canonical_rows_sha256": "c7ae21d4e3a432e7e2f6a2f0a62548f6af6d1232a0470e01c29c9ff5f0899565",
+  "before_and_after_canonical_summary_sha256": "54bb9910143608f7389dc393b50f3a8178ad05926617ea13456d60651ecbd776",
+  "all_summary_metrics_equal": true,
+  "exact_and_concept_results_equal": true,
+  "final_gate_reference": ".bench/semantic-audit-2/control/score.json",
+  "final_gate_result": "real_query_behavior:equal",
+  "default_reference_gate": "pre-existing summary_text differences only; reproduced by old-code control",
+  "default_reference_changed_summary_rows": [
+    "followup-census:910001",
+    "followup-census:910003",
+    "followup-census:910004",
+    "followup-census:910005",
+    "followup-census:910006",
+    "followup-census:910007",
+    "followup-census:910008",
+    "followup-census:910009",
+    "followup-census:910011",
+    "followup-census:910012"
+  ],
+  "families_before_and_after": {
+    "real_query": {
+      "hit_at_1": 0.3010752688172043,
+      "hit_at_5": 0.5268817204301075,
+      "mrr_at_10": 0.3948924731182796
+    },
+    "concept_recall": {
+      "hit_at_1": 0.5384615384615384,
+      "hit_at_5": 0.7692307692307693,
+      "mrr_at_10": 0.6394230769230769
+    },
+    "exact_recall": { "hit_at_1": 1.0, "hit_at_5": 1.0, "mrr_at_10": 1.0 }
+  }
+}
