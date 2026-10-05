@@ -135,6 +135,18 @@ impl Drop for Guard {
         if remove_execution {
             active.remove(&self.execution);
         }
+        let still_attributed = active.values().any(|attributions| {
+            attributions
+                .iter()
+                .any(|attribution| attribution.request_id == self.request_id)
+        });
+        drop(active);
+        if !still_attributed {
+            observations()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.request_id);
+        }
     }
 }
 
@@ -197,5 +209,32 @@ mod tests {
             assert_eq!(counts.cache_hits, 1);
             assert_eq!(counts.live_calls, (index % 2) as u64);
         }
+    }
+
+    #[test]
+    fn audit_growth_completed_request_observations_are_released() {
+        let prefix = format!("counter-unit-growth-{}-", std::process::id());
+        for index in 0..128 {
+            let request_id = format!("{prefix}{index}");
+            {
+                let _guard = install(&request_id);
+                record(EmbedCounts {
+                    requested: 1,
+                    ..EmbedCounts::default()
+                });
+                assert_eq!(read(&request_id).requested, 1);
+            }
+            assert_eq!(read(&request_id), EmbedCounts::default());
+        }
+        let retained = observations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|request_id| request_id.starts_with(&prefix))
+            .count();
+        assert_eq!(
+            retained, 0,
+            "completed request observations must be released"
+        );
     }
 }
