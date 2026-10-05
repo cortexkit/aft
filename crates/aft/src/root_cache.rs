@@ -1115,10 +1115,7 @@ pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
     let after_comm = stat.rsplit_once(") ")?.1;
     let fields = after_comm.split_whitespace().collect::<Vec<_>>();
     let start_ticks = fields.get(19)?.parse::<u64>().ok()?;
-    let boot_time_secs = fs::read_to_string("/proc/stat")
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())?;
+    let boot_time_secs = boot_time_secs()?;
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if ticks_per_second <= 0 {
         return None;
@@ -1129,6 +1126,27 @@ pub(crate) fn process_start_time_ms(pid: u32) -> Option<u64> {
             .saturating_mul(1_000)
             .saturating_add(start_ticks.saturating_mul(1_000) / ticks_per_second),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_time_secs() -> Option<u64> {
+    fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time_secs() -> Option<u64> {
+    static BOOT_TIME_SECS: OnceLock<Option<u64>> = OnceLock::new();
+    cached_boot_time_secs(&BOOT_TIME_SECS, read_boot_time_secs)
+}
+
+fn cached_boot_time_secs(
+    cache: &OnceLock<Option<u64>>,
+    reader: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    *cache.get_or_init(reader)
 }
 
 #[cfg(target_os = "macos")]
@@ -1625,5 +1643,35 @@ mod tests {
         set_force_network_fs_for_test(true);
         assert!(!storage_allows_root_keyed(Path::new(".")).unwrap());
         set_force_network_fs_for_test(false);
+    }
+
+    #[test]
+    fn audit_growth_boot_time_cache_reads_its_source_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("proc-stat-fixture");
+        fs::write(&path, "btime 1234\n").unwrap();
+        let cache = OnceLock::new();
+        let reads = std::cell::Cell::new(0);
+        let first = cached_boot_time_secs(&cache, || {
+            reads.set(reads.get() + 1);
+            fs::read_to_string(&path)
+                .ok()?
+                .lines()
+                .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())
+        });
+        let second = cached_boot_time_secs(&cache, || {
+            reads.set(reads.get() + 1);
+            fs::read_to_string(&path)
+                .ok()?
+                .lines()
+                .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())
+        });
+        assert_eq!(first, Some(1234));
+        assert_eq!(second, first);
+        assert_eq!(
+            reads.get(),
+            1,
+            "/proc/stat's equivalent source is read once"
+        );
     }
 }
