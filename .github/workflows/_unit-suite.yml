@@ -965,6 +965,12 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
 
+      - name: Check feature-enabled provider conformance (deny warnings)
+        run: cargo check -p agent-file-tools --features test-timing-hooks --test rest
+        shell: pwsh
+        env:
+          RUSTFLAGS: "-D warnings"
+
   # ---------------------------------------------------------------------------
   # Bash permission flow on Windows
   # Scoped to bash.test.ts only: covers the runAsk + Effect runtime path on

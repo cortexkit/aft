@@ -9,6 +9,13 @@ use subc_protocol::FrameType;
 
 pub const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 pub const SWEEP_BATCH: usize = 64;
+
+/// One process-wide cursor identity, deliberately never persisted in aft.db.
+/// Reconnecting or binding another project must not look like a restart.
+pub fn provider_incarnation() -> &'static str {
+    static INCARNATION: std::sync::LazyLock<String> = std::sync::LazyLock::new(new_event_id);
+    INCARNATION.as_str()
+}
 pub(super) const MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS call_ledger (
     carrier TEXT NOT NULL,

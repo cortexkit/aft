@@ -686,6 +686,7 @@ impl LedgerEdge {
         std::sync::Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
     ) {
+        let _ = crate::db::call_ledger::provider_incarnation();
         let (ready, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
             std::sync::Arc::new(Self {
