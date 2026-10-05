@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/src/search_index.rs",
+    "crates/aft/src/commands/glob.rs",
+    "crates/aft/src/watcher_filter.rs",
+    "crates/aft/src/runtime_drain.rs",
+    "crates/aft/tests/integration/grep_glob_test.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Search-index work-count optimizations only: atomic cancellation with bounded liveness probes, indexed glob ordering, batch watcher metadata, prepared RAM updates, reusable delta slots, one-open trigram ingestion and unsorted build walks. No score, candidate membership, query routing or ranking formula changes are intended. search_index.rs is ranking-fenced; evaluation must reproduce byte-identical ranked rows."
+}
