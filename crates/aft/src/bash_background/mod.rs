@@ -629,8 +629,8 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     )
 }
 
-/// The environment-less default is forbidden to test-built contexts and DB
-/// writers even when an outer test runner also supplies a safe override.
+/// Resolve the current test environment's default, excluding AFT-specific
+/// overrides. HOME and XDG may deliberately name a fixture, not the live store.
 #[cfg(test)]
 pub(crate) fn storage_dir_without_overrides_for_test() -> PathBuf {
     let lookup = |name: &str| {
@@ -640,6 +640,15 @@ pub(crate) fn storage_dir_without_overrides_for_test() -> PathBuf {
             std::env::var_os(name)
         }
     };
+    storage_dir_from_test_environment(&lookup)
+}
+
+/// Let the persistence fence use the production ladder with account-owned homes
+/// instead of the temporary homes installed by a test or its runner.
+#[cfg(test)]
+pub(crate) fn storage_dir_from_test_environment(
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
     storage_dir_from(
         None,
         &lookup,

@@ -8931,7 +8931,17 @@ mod tests {
         );
         init_git_fixture(temp.path());
 
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        // Test contexts normally seed a private per-App store. This fixture
+        // deliberately exercises the shared default under its temporary XDG
+        // home, so seed that production-resolved default instead. The configure
+        // request still omits storage_dir, just like a plugin-less consumer.
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(crate::bash_background::storage_dir(None)),
+                ..Config::default()
+            },
+        );
         let req = configure_request_with_params(json!({
             "project_root": temp.path(),
             "harness": "opencode",
