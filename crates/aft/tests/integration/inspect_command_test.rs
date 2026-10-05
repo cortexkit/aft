@@ -6249,7 +6249,10 @@ fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
         configure_fake_rust_lsp(&ctx);
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "empty_then_quiescent");
-        ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "100");
+        // The fake's empty startup report becomes quiescent after 1.5 seconds;
+        // start the compiler run afterwards, as rust-analyzer does on load.
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "3000");
         if let Some(message) = result {
             ctx.lsp()
                 .set_extra_env("AFT_FAKE_LSP_CHECK_END_MESSAGE", message);
