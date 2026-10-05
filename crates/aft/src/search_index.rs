@@ -72,7 +72,6 @@ const FILE_TRIGRAM_COUNT_MAGIC: &[u8; 8] = b"AFTFTC01";
 const INDEX_VERSION: u32 = 4;
 /// Highest trigram cache format this build reads (and the one it writes).
 pub const INDEX_FORMAT_VERSION: u32 = INDEX_VERSION;
-const PREVIEW_BYTES: usize = 8 * 1024;
 const SPIMI_SOFT_LIMIT_BYTES: usize = 128 * 1024 * 1024;
 const SPIMI_HARD_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const SPILL_RECORD_ESTIMATED_BYTES: usize = 16;
@@ -3673,7 +3672,7 @@ fn search_candidate_file(
     };
     bytes_verified.fetch_add(content.len(), Ordering::Relaxed);
     // Defense in depth: even though indexing tries to filter binaries via
-    // `is_binary_path` + full-content `is_binary_bytes`, we double-check at
+    // The index classifies bytes at ingestion; we double-check at
     // query time. content_inspector is fast (~bytes-per-cycle on a small
     // preview) and this guarantees we never surface matches inside binary
     // files even if the indexer somehow let one through (e.g. file changed
@@ -3949,7 +3948,9 @@ fn metadata_for_indexed_content(path: &Path, size_hint: u64) -> SearchFileMetada
 }
 
 fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
-    match read_search_corpus_file(path, max_file_size) {
+    // The trigram index does not consume the generated flag. Other corpus
+    // readers still request it, preserving their eligibility policy.
+    match read_search_corpus_file_inner(path, max_file_size, false) {
         SearchCorpusEligibility::Eligible(file) => {
             PreparedSearchPath::Indexed(PreparedIndexedFile {
                 metadata: file.metadata,
@@ -3963,19 +3964,36 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
 }
 
 pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> SearchCorpusEligibility {
+    read_search_corpus_file_inner(path, max_file_size, true)
+}
+
+fn read_search_corpus_file_inner(
+    path: &Path,
+    max_file_size: u64,
+    classify_generated: bool,
+) -> SearchCorpusEligibility {
+    #[cfg(test)]
+    AUDIT_IO_PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow_mut().as_mut() {
+            probe();
+        }
+    });
     let metadata = match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
         _ => return SearchCorpusEligibility::Skipped,
     };
 
-    if is_binary_path(path, metadata.size) || metadata.size > max_file_size {
+    if metadata.size > max_file_size {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read();
     // Bound the read itself as well as admission: the file can grow after stat.
-    let mut bytes = Vec::new();
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
+    #[cfg(test)]
+    audit_record(|work| work.corpus_opens += 1);
     let read = File::open(path).and_then(|file| {
         file.take(max_file_size.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -3987,9 +4005,13 @@ pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> Search
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
+    #[cfg(test)]
+    if classify_generated {
+        audit_record(|work| work.corpus_opens += 1);
+    }
     SearchCorpusEligibility::Eligible(SearchCorpusFile {
         metadata,
-        generated: crate::inspect::is_generated_file(path, path),
+        generated: classify_generated && crate::inspect::is_generated_file(path, path),
         bytes,
     })
 }
@@ -7806,23 +7828,6 @@ fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: 
     }
 
     true
-}
-
-fn is_binary_path(path: &Path, size: u64) -> bool {
-    if size == 0 {
-        return false;
-    }
-
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return true,
-    };
-
-    let mut preview = vec![0u8; PREVIEW_BYTES.min(size as usize)];
-    match file.read(&mut preview) {
-        Ok(read) => is_binary_bytes(&preview[..read]),
-        Err(_) => true,
-    }
 }
 
 fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
