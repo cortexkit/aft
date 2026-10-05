@@ -321,6 +321,21 @@ pub fn clear(store: PersistedStore, scope: &Path) {
     });
 }
 
+/// Forget artifact refusals under a swept directory only when the refused
+/// path is confirmed absent. Permission errors and unreadable paths are not
+/// evidence of removal, and a reader floor is never lowered by housekeeping.
+pub fn clear_missing_artifacts(store: PersistedStore, root: &Path) {
+    with_registry(|entries| {
+        entries.retain(|entry| {
+            !(entry.refusal.store == store
+                && entry.refusal.source == RefusalSource::Artifact
+                && entry.scope.starts_with(root)
+                && std::fs::symlink_metadata(&entry.refusal.path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound))
+        })
+    });
+}
+
 /// The refusal, if any, that covers `path` for `store`: an artifact refusal
 /// recorded at or above `path`, or a floor refusal for the storage root that
 /// contains it.

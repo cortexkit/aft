@@ -179,6 +179,31 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             }
         }
         None => {
+            // Replay records a refusal before returning no snapshot. Consult
+            // both supported layouts so this task names the reader mismatch
+            // rather than pretending its record was lost.
+            let session_dir =
+                crate::bash_background::persistence::session_tasks_dir(&storage_dir, req.session());
+            if crate::bash_background::persistence::validate_task_id(&task_id).is_ok() {
+                for path in [
+                    session_dir
+                        .join(&task_id)
+                        .join("control")
+                        .join("metadata.json"),
+                    session_dir.join(format!("{task_id}.json")),
+                ] {
+                    if let Some(refusal) = crate::persisted_format::refusal_covering(
+                        crate::persisted_format::PersistedStore::BashTask,
+                        &path,
+                    ) {
+                        return Response::error(
+                            &req.id,
+                            crate::persisted_format::CODE,
+                            refusal.to_string(),
+                        );
+                    }
+                }
+            }
             let unadopted = ctx.config().project_root.as_deref().and_then(|root| {
                 ctx.bash_background()
                     .unadopted_task_message(&task_id, req.session(), root)
@@ -230,6 +255,311 @@ fn maybe_render_pty_screen(
 #[cfg(test)]
 mod tests {
     use super::{format_erased_task_message, format_unknown_task_message};
+    use crate::bash_background::persistence::{
+        create_task_layout, write_task_at, PersistedTask, TaskPaths,
+    };
+    use crate::bash_background::BgTaskStatus;
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::harness::Harness;
+    use crate::parser::TreeSitterProvider;
+    use crate::persisted_format::{PersistedStore, UnsupportedPersistedFormat};
+    use crate::protocol::{RawRequest, Response};
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    const FUTURE_TASK: &str = "bash-0000000000000001";
+    const RUNNING_TASK: &str = "bash-0000000000000002";
+    const COMPLETED_TASK: &str = "bash-0000000000000003";
+    const DELIVERED_TASK: &str = "bash-0000000000000004";
+    const SESSION: &str = "restore-session";
+
+    struct RestoreFixture {
+        root: tempfile::TempDir,
+        ctx: AppContext,
+        future: TaskPaths,
+        future_bytes: Vec<u8>,
+        running: TaskPaths,
+        delivered: TaskPaths,
+    }
+
+    impl RestoreFixture {
+        fn new(harness: Harness) -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let project = root.path().join("project");
+            fs::create_dir(&project).unwrap();
+            let storage = root.path().join("storage");
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    storage_dir: Some(storage.clone()),
+                    project_root: Some(project.clone()),
+                    harness: Some(harness.clone()),
+                    ..Config::default()
+                },
+            );
+            ctx.bash_background().set_harness(harness.clone());
+            let task_storage = storage.join(harness.storage_segment());
+            let future = create_task_layout(&task_storage, SESSION, FUTURE_TASK).unwrap();
+            // The version header must suffice: an older reader cannot assume
+            // the rest of a newer record still has its own payload shape.
+            let future_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 7,
+                "task_id": FUTURE_TASK,
+                "future_payload": { "do_not_touch": true },
+            }))
+            .unwrap();
+            fs::write(&future.paths.json, &future_bytes).unwrap();
+            let normal = |task_id: &str, terminal: bool, delivered: bool| {
+                let task = create_task_layout(&task_storage, SESSION, task_id).unwrap();
+                let mut metadata = PersistedTask::starting(
+                    task_id.into(),
+                    SESSION.into(),
+                    "printf output".into(),
+                    project.clone(),
+                    Some(project.clone()),
+                    None,
+                    true,
+                    false,
+                );
+                metadata.harness = Some(harness.storage_segment());
+                if terminal {
+                    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+                    metadata.completion_delivered = delivered;
+                } else {
+                    // Read-only restore probes; no timeout or process group can
+                    // signal the test process that stands in for a live child.
+                    metadata.status = BgTaskStatus::Running;
+                    metadata.child_pid = Some(std::process::id());
+                }
+                write_task_at(&task, &metadata).unwrap();
+                fs::write(&task.paths.stdout, "stdout before restart\n").unwrap();
+                fs::write(&task.paths.stderr, "stderr before restart\n").unwrap();
+                task.paths
+            };
+            let running = normal(RUNNING_TASK, false, false);
+            normal(COMPLETED_TASK, true, false);
+            let delivered = normal(DELIVERED_TASK, true, true);
+            // Bypass the GC grace period, using real artifacts rather than a
+            // mocked reader, so the future record is first in the task sweep.
+            let old = filetime::FileTime::from_system_time(
+                SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60),
+            );
+            for paths in [&future.paths, &running, &delivered] {
+                filetime::set_file_mtime(&paths.json, old).unwrap();
+            }
+            Self {
+                root,
+                ctx,
+                future: future.paths,
+                future_bytes,
+                running,
+                delivered,
+            }
+        }
+
+        fn task_storage(&self) -> std::path::PathBuf {
+            crate::bash_background::task_storage_dir(&self.ctx)
+        }
+
+        fn storage(&self) -> std::path::PathBuf {
+            self.root.path().join("storage")
+        }
+
+        fn status(&self, task_id: &str, session: &str) -> Response {
+            let request: RawRequest = serde_json::from_value(serde_json::json!({
+                "id": "restored-status", "command": "bash_status", "session_id": session,
+                "params": { "task_id": task_id },
+            }))
+            .unwrap();
+            super::handle(&request, &self.ctx)
+        }
+
+        fn assert_output(&self) {
+            for (task_id, status) in [(RUNNING_TASK, "running"), (COMPLETED_TASK, "completed")] {
+                let response = self.status(task_id, SESSION);
+                assert!(response.success, "{:?}", response.data);
+                assert_eq!(response.data["status"], status);
+                let output = response.data["output_preview"].as_str().unwrap();
+                assert!(output.contains("stdout before restart"), "{output:?}");
+                assert!(output.contains("stderr before restart"), "{output:?}");
+            }
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&self.running.stdout)
+                .unwrap()
+                .write_all(b"stdout after restart\n")
+                .unwrap();
+            let response = self.status(RUNNING_TASK, SESSION);
+            assert!(
+                response.data["output_preview"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stdout after restart"),
+                "{:?}",
+                response.data
+            );
+        }
+    }
+
+    impl Drop for RestoreFixture {
+        fn drop(&mut self) {
+            self.ctx.bash_background().detach();
+        }
+    }
+
+    #[test]
+    fn future_bash_task_does_not_abort_gc_or_restore() {
+        for harness in [Harness::Opencode, Harness::Pi, Harness::Runner] {
+            let fixture = RestoreFixture::new(harness);
+            assert_eq!(
+                fixture
+                    .ctx
+                    .bash_background()
+                    .maybe_gc_persisted(&fixture.task_storage())
+                    .unwrap(),
+                1
+            );
+            assert!(
+                !fixture.delivered.dir.exists(),
+                "GC never reached the task after the refusal"
+            );
+            fixture.assert_output();
+        }
+    }
+
+    #[test]
+    fn future_bash_task_restore_preserves_output_even_after_failed_gc() {
+        for harness in [Harness::Opencode, Harness::Pi, Harness::Runner] {
+            let fixture = RestoreFixture::new(harness);
+            // A GC error was detached from replay even before per-record skip
+            // handling. Exercise restore regardless of that sweep's result.
+            let _ = fixture
+                .ctx
+                .bash_background()
+                .maybe_gc_persisted(&fixture.task_storage());
+            fixture.assert_output();
+        }
+    }
+
+    #[test]
+    fn future_bash_task_is_skipped_byte_identical() {
+        let fixture = RestoreFixture::new(Harness::Opencode);
+        fixture
+            .ctx
+            .bash_background()
+            .replay_session(&fixture.task_storage(), SESSION)
+            .unwrap();
+        fixture
+            .ctx
+            .bash_background()
+            .maybe_gc_persisted(&fixture.task_storage())
+            .unwrap();
+        assert_eq!(
+            fs::read(&fixture.future.json).unwrap(),
+            fixture.future_bytes
+        );
+        assert!(!fixture
+            .task_storage()
+            .join("bash-tasks-quarantine")
+            .exists());
+        let refusal = crate::persisted_format::refusal_covering(
+            PersistedStore::BashTask,
+            &fixture.future.json,
+        )
+        .unwrap();
+        assert_eq!(refusal.found, 7);
+        assert!(refusal.to_string().contains(FUTURE_TASK));
+    }
+
+    #[test]
+    fn future_bash_task_refusal_is_task_scoped() {
+        let fixture = RestoreFixture::new(Harness::Opencode);
+        let response = fixture.status(FUTURE_TASK, SESSION);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], crate::persisted_format::CODE);
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.contains(FUTURE_TASK) && message.contains("format version 7"),
+            "{message}"
+        );
+        let health = fixture.ctx.build_status_snapshot();
+        assert!(!health["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(
+                "storage_requires_newer_reader:bash_task"
+            )));
+        assert!(
+            health["storage_refusals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|refusal| { refusal["path"] == fixture.future.json.display().to_string() }),
+            "{health}"
+        );
+        assert_eq!(
+            fixture
+                .status("bash-000000000000ffff", "other-session")
+                .data["code"],
+            "task_not_found"
+        );
+        fixture.assert_output();
+
+        let floor = UnsupportedPersistedFormat::floor(
+            PersistedStore::BashTask,
+            fixture.storage().join(crate::reader_floor::FLOOR_FILE),
+            7,
+        );
+        crate::persisted_format::record(&floor, &fixture.storage());
+        let health = fixture.ctx.build_status_snapshot();
+        assert!(health["degraded_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(
+                "storage_requires_newer_reader:bash_task"
+            )));
+    }
+
+    #[test]
+    fn future_bash_task_refusal_clears_after_removal() {
+        for remove in [false, true] {
+            let fixture = RestoreFixture::new(Harness::Runner);
+            fixture.status(FUTURE_TASK, SESSION);
+            assert!(crate::persisted_format::refusal_covering(
+                PersistedStore::BashTask,
+                &fixture.future.json
+            )
+            .is_some());
+            // Cover both a removed metadata file and a removed whole session;
+            // neither will be re-read by task discovery on the next sweep.
+            let path: &Path = if remove {
+                &fixture.future.session_dir
+            } else {
+                &fixture.future.json
+            };
+            if remove {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+            fixture
+                .ctx
+                .bash_background()
+                .maybe_gc_persisted(&fixture.task_storage())
+                .unwrap();
+            assert!(crate::persisted_format::refusal_covering(
+                PersistedStore::BashTask,
+                &fixture.future.json
+            )
+            .is_none());
+            assert!(crate::persisted_format::refusals_under(&fixture.storage()).is_empty());
+            let health = fixture.ctx.build_status_snapshot();
+            assert!(health["storage_refusals"].as_array().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn unknown_task_message_steers_agents_to_rerun() {

@@ -380,6 +380,14 @@ impl AppContext {
         let storage_root = crate::bash_background::storage_dir(config.storage_dir.as_deref());
         let storage_refusals = crate::persisted_format::refusals_under(&storage_root);
         for refusal in &storage_refusals {
+            // A single unreadable task does not disable bash for any other
+            // task or session. Health still lists it by path below; a floor
+            // refusal remains a storage-wide degraded-mode reason.
+            if refusal.store == crate::persisted_format::PersistedStore::BashTask
+                && refusal.source == crate::persisted_format::RefusalSource::Artifact
+            {
+                continue;
+            }
             let reason = refusal.reason();
             if !degraded_reasons.contains(&reason) {
                 degraded_reasons.push(reason);

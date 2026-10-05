@@ -2065,8 +2065,6 @@ mod route_tests {
         let (_dir, root) = test_support::test_root("tool-provider-admission");
         let ctx = test_support::test_ctx();
         ctx.mark_database_runtime_initializing_for_test();
-        let executor = Arc::new(Executor::new());
-        assert!(executor.register_actor(root.clone(), ctx));
         let identity = RouteIdentity(Arc::new(RouteIdentityData {
             root: root.clone(),
             project_root: root.as_path().into(),
@@ -2080,6 +2078,30 @@ mod route_tests {
             scope,
             made_tool_call: AtomicBool::new(false),
         }));
+        exchange_with_actor(body, identity, ctx, metrics, |request, _| {
+            ACTIONS.fetch_add(1, Ordering::SeqCst);
+            if request.worker_session() {
+                WORKER_ACTIONS.fetch_add(1, Ordering::SeqCst);
+            }
+            *LAST_DISPATCH.lock().unwrap() = Some(json!({
+                "command": request.command,
+                "session_id": request.session_id,
+                "params": request.params,
+            }));
+            Response::success(request.id, json!({}))
+        })
+        .await
+    }
+
+    async fn exchange_with_actor(
+        body: Value,
+        identity: RouteIdentity,
+        ctx: Arc<AppContext>,
+        metrics: &Arc<DispatchPathMetrics>,
+        dispatch: DispatchFn,
+    ) -> WriterFrame {
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(identity.root.clone(), ctx));
         let routes = HashMap::from([(route_key(41, 1), identity)]);
         let frame = Frame::build(
             FrameType::Request,
@@ -2121,18 +2143,7 @@ mod route_tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
-            |request, _| {
-                ACTIONS.fetch_add(1, Ordering::SeqCst);
-                if request.worker_session() {
-                    WORKER_ACTIONS.fetch_add(1, Ordering::SeqCst);
-                }
-                *LAST_DISPATCH.lock().unwrap() = Some(json!({
-                    "command": request.command,
-                    "session_id": request.session_id,
-                    "params": request.params,
-                }));
-                Response::success(request.id, json!({}))
-            },
+            dispatch,
             &deferred_tx,
             false,
             1024 * 1024,
@@ -2154,6 +2165,180 @@ mod route_tests {
                 .is_err()
         );
         reply
+    }
+
+    #[cfg(unix)]
+    fn runner_restore_context(root: &std::path::Path) -> Arc<AppContext> {
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.join("project")),
+                storage_dir: Some(root.join("storage")),
+                harness: Some(crate::harness::Harness::Runner),
+                experimental_bash_background: true,
+                ..crate::config::Config::default()
+            },
+        ));
+        ctx.update_config(|config| config.sandbox.enabled = false);
+        ctx.bash_background()
+            .set_harness(crate::harness::Harness::Runner);
+        ctx.bash_background()
+            .set_db_pool(Arc::new(std::sync::Mutex::new(
+                crate::db::open(&root.join("storage/aft.db")).unwrap(),
+            )));
+        ctx
+    }
+
+    #[cfg(unix)]
+    fn runner_restore_principal(project: &std::path::Path) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::FirstParty,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: project.into(),
+            harness: "runner".into(),
+            session_id: "runner-restore".into(),
+            principal_id: Some("reserved:broca".into()),
+        }
+    }
+
+    /// Invoked in a separate libtest process by the restore regression. A
+    /// normal test run does nothing; only the explicit fixture directory can
+    /// create storage or a child, never the operator's storage root.
+    #[cfg(unix)]
+    #[test]
+    fn runner_restore_process_fixture() {
+        let Some(root) = std::env::var_os("AFT_TEST_RUNNER_RESTORE_DIR") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let ctx = runner_restore_context(&root);
+        let request: crate::protocol::RawRequest = serde_json::from_value(json!({
+            "id": "runner-start", "command": "bash", "session_id": "runner-restore",
+            "params": { "command": "printf 'stdout before restart\\n'; printf 'stderr before restart\\n' >&2; while [ ! -f release ]; do sleep 0.05; done; printf 'stdout after restart\\n'; printf 'stderr after restart\\n' >&2; sleep 60",
+                "background": true, "compressed": true },
+        })).unwrap();
+        let response = crate::sandbox_spawn::with_authenticated_principal(
+            runner_restore_principal(&root.join("project")),
+            || crate::commands::bash::handle(&request, &ctx),
+        );
+        assert!(response.success, "{:?}", response.data);
+        let task_id = response.data["task_id"].as_str().unwrap();
+        std::fs::write(root.join("task-id"), task_id).unwrap();
+        ctx.bash_background().detach();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runner_tool_provider_restore_preserves_minted_task_output_across_processes() {
+        use crate::bash_background::persistence::{read_task, resolve_task, TaskArtifact};
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc::tool_provider::route_tests::runner_restore_process_fixture",
+                "--nocapture",
+            ])
+            .env("AFT_TEST_RUNNER_RESTORE_DIR", &root)
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let task_id = std::fs::read_to_string(root.join("task-id")).unwrap();
+        let task_storage = root.join("storage/runner");
+        let task = resolve_task(&task_storage, "runner-restore", &task_id).unwrap();
+        let metadata = read_task(&task.paths.json).unwrap();
+        let key = metadata.call_key.as_ref().unwrap();
+        assert_eq!(key.requester, "reserved:broca");
+        assert_eq!(key.key, task_id);
+        assert!(key.minted);
+        assert!(!metadata.sandbox_native);
+        assert!(task.paths.sandbox_unavailable.exists());
+
+        // Ensure cleanup even when an output assertion fails, and never leave
+        // a detached fixture command running past this test.
+        struct StopChild(i32);
+        impl Drop for StopChild {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::killpg(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _stop = StopChild(metadata.pgid.unwrap());
+        let ctx = runner_restore_context(&root);
+        let project_id = ProjectRootId::from_path(&project).unwrap();
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: project_id,
+            project_root: project.clone(),
+            harness: "runner".into(),
+            session: "runner-restore".into(),
+            role: RouteRole::ToolProviderV1,
+            trust: BindTrust::FirstParty,
+            spawn_principal: runner_restore_principal(&project),
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::default(),
+            scope: None,
+            made_tool_call: AtomicBool::new(false),
+        }));
+        // Wait on filesystem evidence, not on the command's completion. The
+        // old AFT process has exited while the detached shell keeps writing.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !std::fs::read_to_string(&task.paths.stderr)
+            .unwrap()
+            .contains("stderr before restart")
+        {
+            assert!(Instant::now() < deadline, "fixture produced no output");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for phase in ["before", "after"] {
+            if phase == "after" {
+                std::fs::write(project.join("release"), "go").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !std::fs::read_to_string(&task.paths.stderr)
+                    .unwrap()
+                    .contains("stderr after restart")
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture stopped writing after restart"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            let reply = exchange_with_actor(
+                json!({"name": "bash_status", "arguments": {"taskId": task_id}, "preset": "worker"}),
+                identity.clone(), ctx.clone(), &Arc::new(DispatchPathMetrics::new()),
+                |request, ctx| crate::commands::bash_status::handle(&request, ctx),
+            ).await;
+            let reply: Value = serde_json::from_slice(&reply.body).unwrap();
+            assert_eq!(reply["structuredContent"]["status"], "running", "{reply}");
+            let output = reply["structuredContent"]["output_preview"]
+                .as_str()
+                .unwrap();
+            for stream in ["stdout", "stderr"] {
+                let expected = format!("{stream} {phase} restart");
+                assert!(output.contains(&expected), "{reply}");
+                assert!(
+                    reply["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&expected),
+                    "{reply}"
+                );
+            }
+            assert!(ctx
+                .bash_background()
+                .read_artifact(&task_id, "runner-restore", TaskArtifact::Stdout)
+                .is_ok());
+        }
+        ctx.bash_background().detach();
     }
 
     #[test]

@@ -3671,6 +3671,9 @@ impl BgTaskRegistry {
             let resolved = match resolve_task_layout(&session_dir, &metadata.task_id) {
                 Ok(task) => task,
                 Err(error) => {
+                    if skip_refused_task(&metadata.task_id, "replay", &error) {
+                        continue;
+                    }
                     if error.kind() == std::io::ErrorKind::NotFound
                         && !task_artifacts_exist(&session_dir, &metadata.task_id)
                         && !Self::persisted_task_process_is_alive(&metadata)
@@ -3727,6 +3730,7 @@ impl BgTaskRegistry {
                         metadata = disk;
                     }
                 }
+                Err(error) if skip_refused_task(&metadata.task_id, "replay", &error) => continue,
                 Ok(_) | Err(_) => {
                     if Self::persisted_task_process_is_alive(&metadata) {
                         crate::slog_warn!(
@@ -3945,6 +3949,9 @@ impl BgTaskRegistry {
                     continue;
                 }
                 Err(error) => {
+                    if skip_refused_task(&task_id, "disk replay", &error) {
+                        continue;
+                    }
                     if self.db_has_live_process_for_task(&task_id) {
                         crate::slog_warn!(
                             "refusing to quarantine unresolved live background task {task_id} during replay: {error}"
@@ -3982,6 +3989,9 @@ impl BgTaskRegistry {
                     }
                 }
                 Err(error) => {
+                    if skip_refused_task(&task_id, "disk replay", &error) {
+                        continue;
+                    }
                     if self.db_has_live_process_for_task(&task_id) {
                         crate::slog_warn!(
                             "refusing to quarantine unreadable live background task {task_id} during replay: {error}"
@@ -4590,6 +4600,9 @@ impl BgTaskRegistry {
                 Ok(task) => task,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => {
+                    if skip_refused_task(task_id, "relaxed lookup", &error) {
+                        continue;
+                    }
                     if self.db_has_live_process_for_task(task_id) {
                         crate::slog_warn!(
                             "refusing to quarantine unresolved live background task {task_id} during relaxed lookup: {error}"
@@ -4606,6 +4619,9 @@ impl BgTaskRegistry {
             let metadata = match read_task_at(&resolved) {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    if skip_refused_task(task_id, "relaxed lookup", &error) {
+                        continue;
+                    }
                     if self.db_has_live_process_for_task(task_id) {
                         crate::slog_warn!(
                             "refusing to quarantine unreadable live background task {task_id} during relaxed lookup: {error}"
@@ -4755,6 +4771,13 @@ impl BgTaskRegistry {
         let mut deleted = 0usize;
 
         let root = storage_dir.join("bash-tasks");
+        // Discovery cannot re-read a record that was removed along with its
+        // task or session directory. Retire only confirmed missing artifacts;
+        // reader-floor refusals still apply to the entire storage root.
+        crate::persisted_format::clear_missing_artifacts(
+            crate::persisted_format::PersistedStore::BashTask,
+            &root,
+        );
         if root.exists() {
             let session_dirs = fs::read_dir(&root).map_err(|e| {
                 format!(
@@ -4835,6 +4858,9 @@ impl BgTaskRegistry {
                             continue;
                         }
                         Err(error) => {
+                            if skip_refused_task(task_id, "GC", &error) {
+                                continue;
+                            }
                             // A metadata file replaced under the open, eight times
                             // in a row, is a writer that never paused — proof the
                             // task is alive, not a layout to quarantine. Skip this
@@ -4854,8 +4880,14 @@ impl BgTaskRegistry {
                             crate::slog_warn!(
                                 "quarantining unresolved background task {task_id}: {error}"
                             );
-                            quarantine_task_layout(storage_dir, &session_dir, &task_id, "invalid")
-                                .map_err(|error| error.to_string())?;
+                            if let Err(error) = quarantine_task_layout(
+                                storage_dir,
+                                &session_dir,
+                                &task_id,
+                                "invalid",
+                            ) {
+                                crate::slog_warn!("failed to quarantine background task {task_id} during GC: {error}");
+                            }
                             continue;
                         }
                     };
@@ -4865,6 +4897,9 @@ impl BgTaskRegistry {
                     let metadata = match read_task_at(&resolved) {
                         Ok(metadata) => metadata,
                         Err(error) => {
+                            if skip_refused_task(task_id, "GC", &error) {
+                                continue;
+                            }
                             if concurrently_replaced(&error) {
                                 continue;
                             }
@@ -4880,8 +4915,14 @@ impl BgTaskRegistry {
                             crate::slog_warn!(
                                 "quarantining corrupt background task metadata {task_id}: {error}"
                             );
-                            quarantine_task_layout(storage_dir, &session_dir, &task_id, "corrupt")
-                                .map_err(|error| error.to_string())?;
+                            if let Err(error) = quarantine_task_layout(
+                                storage_dir,
+                                &session_dir,
+                                &task_id,
+                                "corrupt",
+                            ) {
+                                crate::slog_warn!("failed to quarantine background task {task_id} during GC: {error}");
+                            }
                             continue;
                         }
                     };
@@ -8416,6 +8457,18 @@ fn replay_record_reason(error: &std::io::Error) -> &'static str {
         std::io::ErrorKind::NotFound => "missing_record",
         std::io::ErrorKind::InvalidData => "corrupt_record",
         _ => "invalid_layout",
+    }
+}
+
+/// A newer record is neither abandoned nor corrupt. Name it without entering
+/// a destructive recovery path, then let the caller process its siblings.
+fn skip_refused_task(task_id: &str, operation: &str, error: &std::io::Error) -> bool {
+    if let Some(refusal) = crate::persisted_format::UnsupportedPersistedFormat::from_io_error(error)
+    {
+        crate::slog_warn!("skipping background task {task_id} during {operation}: {refusal}");
+        true
+    } else {
+        false
     }
 }
 

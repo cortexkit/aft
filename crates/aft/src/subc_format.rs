@@ -1090,7 +1090,10 @@ fn format_bash_status(
             .get("output_preview")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !preview.is_empty() && !running {
+        // Status is an explicit output read, including while the child is
+        // running. Suppressing its preview hid captured stdout/stderr from
+        // tool-provider callers even though the structured reply retained it.
+        if !preview.is_empty() {
             text.push('\n');
             text.push_str(preview);
         }
@@ -4453,7 +4456,7 @@ mod bash_companion_format_tests {
     }
 
     #[test]
-    fn bash_status_renders_piped_and_pty_text_like_the_opencode_tool() {
+    fn bash_status_renders_piped_output_and_pty_screen() {
         assert_eq!(
             status_text(
                 json!({
@@ -4473,7 +4476,7 @@ mod bash_companion_format_tests {
                 json!({ "task_id": "bash-1", "status": "running", "mode": "pipes", "output_preview": "partial" }),
                 None,
             ),
-            "Task bash-1: running\nA completion reminder will be delivered automatically; don't poll."
+            "Task bash-1: running\npartial\nA completion reminder will be delivered automatically; don't poll."
         );
         assert_eq!(
             status_text(

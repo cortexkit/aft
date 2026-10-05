@@ -1930,7 +1930,30 @@ fn build_health_diagnostic_rollup(
     let mut embedding_backend_available = true;
     let mut embedding_backend_last_error = None;
     let mut embedding_backend_since_ms = None;
+    let mut task_storage_roots = std::collections::HashSet::new();
+    let mut bash_task_refusals = Vec::new();
     for (root_id, ctx) in actor_entries {
+        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        if task_storage_roots.insert(storage.clone()) {
+            // Refused tasks are named health diagnostics, not a reason to
+            // disable shell execution for every route sharing this daemon.
+            bash_task_refusals.extend(
+                crate::persisted_format::refusals_under(&storage)
+                    .into_iter()
+                    .filter(|refusal| {
+                        refusal.store == crate::persisted_format::PersistedStore::BashTask
+                    })
+                    .map(|refusal| {
+                        json!({
+                            "code": crate::persisted_format::CODE,
+                            "path": refusal.path.display().to_string(),
+                            "found": refusal.found,
+                            "supported": refusal.supported,
+                            "message": refusal.to_string(),
+                        })
+                    }),
+            );
+        }
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -2202,6 +2225,7 @@ fn build_health_diagnostic_rollup(
         "memory": memory,
         "bash_task_retention": bash_task_retention_metrics(shared_app),
         "bash_db_schema_hints": bash_db_hint_metrics(),
+        "bash_task_refusals": bash_task_refusals,
         "mutating_lanes": mutating_lanes_metrics(executor),
         "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
         "roots": roots,
@@ -3111,6 +3135,65 @@ mod tests {
             "the background publication must reset snapshot age"
         );
         worker.shutdown();
+    }
+
+    #[test]
+    fn health_names_future_bash_tasks_without_global_shell_degradation() {
+        let (dir, root) = test_root("health-task-refusal");
+        let storage = dir.path().join("storage");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(storage.clone()),
+                project_root: Some(root.as_path().into()),
+                ..crate::config::Config::default()
+            },
+        ));
+        let harness_storage = storage.join("opencode");
+        let task = crate::bash_background::persistence::create_task_layout(
+            &harness_storage,
+            "session",
+            "bash-0000000000000001",
+        )
+        .unwrap();
+        std::fs::write(&task.paths.json, br#"{"schema_version":7}"#).unwrap();
+        ctx.bash_background()
+            .maybe_gc_persisted(&harness_storage)
+            .unwrap();
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, Arc::clone(&ctx)));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        cache.refresh(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let metrics = report.metrics.unwrap();
+        let refusals = metrics["bash_task_refusals"].as_array().unwrap();
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[0]["path"], task.paths.json.display().to_string());
+        assert_eq!(refusals[0]["code"], crate::persisted_format::CODE);
+        assert_eq!(report.status, HealthStatus::Ok);
+        std::fs::remove_dir_all(&task.paths.session_dir).unwrap();
+        ctx.bash_background()
+            .maybe_gc_persisted(&harness_storage)
+            .unwrap();
+        cache.refresh(&executor, &app);
+        let report = build_health_report(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        assert!(report.metrics.unwrap()["bash_task_refusals"]
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
