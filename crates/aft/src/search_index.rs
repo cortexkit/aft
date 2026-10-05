@@ -387,6 +387,10 @@ pub struct SearchIndex {
     // This reverse lookup is writer-only. Snapshots never read it, so exclusive
     // SearchIndex write access keeps it synchronized with the versioned postings.
     delta_file_trigrams: HashMap<u32, Vec<u32>>,
+    // Base IDs cannot be reused while immutable base postings still refer to
+    // them. Delta IDs can: removal first erases every posting for the ID, and
+    // snapshots retain the old tables through copy-on-write.
+    free_delta_file_ids: Vec<u32>,
     pub files: Arc<Vec<FileEntry>>,
     pub path_to_id: Arc<HashMap<PathBuf, u32>>,
     pub ready: bool,
@@ -1515,6 +1519,7 @@ impl SearchIndex {
             base: None,
             delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
+            free_delta_file_ids: Vec::new(),
             files: Arc::new(Vec::new()),
             path_to_id: Arc::new(HashMap::new()),
             ready: false,
@@ -1902,6 +1907,9 @@ impl SearchIndex {
             file.modified = UNIX_EPOCH;
             file.content_hash = cache_freshness::zero_hash();
         }
+        if file_id >= self.base_file_count {
+            self.free_delta_file_ids.push(file_id);
+        }
         if let Some(count) = Arc::make_mut(&mut self.file_trigram_count).get_mut(file_id as usize) {
             *count = 0;
         }
@@ -2016,6 +2024,7 @@ impl SearchIndex {
                 self.base = Some(Arc::new(base));
                 self.delta = Arc::new(DeltaState::default());
                 self.delta_file_trigrams.clear();
+                self.free_delta_file_ids.clear();
                 self.delta_packed_bytes = 0;
                 self.base_file_count = u32::try_from(plan.files.len()).unwrap_or(u32::MAX);
                 self.files = Arc::new(plan.files);
@@ -2429,6 +2438,7 @@ impl SearchIndex {
             base: Some(Arc::new(base)),
             delta: Arc::new(DeltaState::default()),
             delta_file_trigrams: HashMap::new(),
+            free_delta_file_ids: Vec::new(),
             files: Arc::new(files),
             path_to_id: Arc::new(path_to_id),
             ready: false,
@@ -2744,13 +2754,22 @@ impl SearchIndex {
         path: &Path,
         metadata: SearchFileMetadata,
     ) -> Option<u32> {
-        let file_id = u32::try_from(self.files.len()).ok()?;
-        Arc::make_mut(&mut self.files).push(FileEntry {
+        let file_id = match self.free_delta_file_ids.pop() {
+            Some(file_id) => file_id,
+            None => u32::try_from(self.files.len()).ok()?,
+        };
+        let file = FileEntry {
             path: path.to_path_buf(),
             size: metadata.size,
             modified: metadata.modified,
             content_hash: cache_freshness::zero_hash(),
-        });
+        };
+        let files = Arc::make_mut(&mut self.files);
+        if let Some(slot) = files.get_mut(file_id as usize) {
+            *slot = file;
+        } else {
+            files.push(file);
+        }
         Arc::make_mut(&mut self.path_to_id).insert(path.to_path_buf(), file_id);
         ensure_count_slot(Arc::make_mut(&mut self.file_trigram_count), file_id);
         Some(file_id)
@@ -4364,6 +4383,7 @@ fn build_streaming_index(
         base: Some(Arc::new(base)),
         delta: Arc::new(DeltaState::default()),
         delta_file_trigrams: HashMap::new(),
+        free_delta_file_ids: Vec::new(),
         files: Arc::new(files),
         path_to_id: Arc::new(path_to_id),
         ready: false,
