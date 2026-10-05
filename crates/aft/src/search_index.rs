@@ -5625,7 +5625,8 @@ pub(crate) fn build_path_filters(
 }
 
 pub(crate) fn walk_project_files(root: &Path, filters: &PathFilters) -> Vec<PathBuf> {
-    walk_project_files_from(root, root, filters)
+    walk_project_files_from_inner(root, root, filters, None, false)
+        .expect("unbounded project walk cannot exceed a file limit")
 }
 
 pub fn walk_project_files_bounded_default(
