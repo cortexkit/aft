@@ -206,14 +206,8 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let mut parser = FileParser::new();
-    let entries = match outline_structure_entries(
-        &path,
-        &symbols,
-        &mut parser,
-        ctx,
-        &req.id,
-        false,
-    ) {
+    let entries = match outline_structure_entries(&path, &symbols, &mut parser, ctx, &req.id, false)
+    {
         Ok(entries) => entries,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
@@ -682,10 +676,9 @@ fn outline_structure_entries(
     }) else {
         return Ok(build_outline_tree(symbols));
     };
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| AftError::FileNotFound {
-            path: format!("{}: {error}", path.display()),
-        })?;
+    let source = std::fs::read_to_string(path).map_err(|error| AftError::FileNotFound {
+        path: format!("{}: {error}", path.display()),
+    })?;
     let (tree, _) = parser.parse_cloned(path)?;
     if collapse_tests && tree.root_node().has_error() {
         return Err(AftError::ParseError {
@@ -738,7 +731,8 @@ fn outline_structure_entries(
                 Ok(included) => {
                     let count = match outline_skip_reason(&included, Some(&mut *parser)) {
                         Some(reason) => Err(reason),
-                        None => parser.extract_symbols(&included)
+                        None => parser
+                            .extract_symbols(&included)
                             .map(|symbols| symbols.len())
                             .map_err(|error| outline_error_reason(&error)),
                     };
@@ -776,10 +770,17 @@ fn outline_structure_entries(
     };
     for summary in summaries {
         let description = match summary.unknown_reason {
-            Some(reason) => format!("items unknown ({reason}) (lines {}-{})",
-                summary.range.start_line + 1, summary.range.end_line + 1),
-            None => format!("{} items (lines {}-{})", summary.items,
-                summary.range.start_line + 1, summary.range.end_line + 1),
+            Some(reason) => format!(
+                "items unknown ({reason}) (lines {}-{})",
+                summary.range.start_line + 1,
+                summary.range.end_line + 1
+            ),
+            None => format!(
+                "{} items (lines {}-{})",
+                summary.items,
+                summary.range.start_line + 1,
+                summary.range.end_line + 1
+            ),
         };
         let entry = OutlineEntry {
             signature: Some(format!("{}: {}", summary.name, description)),
@@ -2035,7 +2036,9 @@ fn outline_many_files(
                             language: detect_language(&path),
                         });
                     }
-                    Err(error) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error))),
+                    Err(error) => {
+                        skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&error)))
+                    }
                 }
             }
             Err(e) => skipped_files.push(SkippedFile::new(rel_path, outline_error_reason(&e))),
@@ -2985,33 +2988,64 @@ mod tests {
         let response = serde_json::to_value(handle_outline(&req, &ctx)).unwrap();
         let text = response["text"].as_str().unwrap();
         assert_eq!(
-            text.split("  mod checks").next().unwrap().lines()
+            text.split("  mod checks")
+                .next()
+                .unwrap()
+                .lines()
                 .filter(|line| line.trim_start().starts_with('.'))
                 .count(),
             7,
             "{text}"
         );
         assert!(
-            text.contains("first_test") && text.contains("second_test")
-                && !text.contains("items") && !text.contains("more)"),
+            text.contains("first_test")
+                && text.contains("second_test")
+                && !text.contains("items")
+                && !text.contains("more)"),
             "{text}"
         );
-        for params in [serde_json::json!({"files":[path]}), serde_json::json!({"directory":temp.path()})] {
-            let req = RawRequest { id: "broad".into(), command: "outline".into(), session_id: None, lsp_hints: None, params };
+        for params in [
+            serde_json::json!({"files":[path]}),
+            serde_json::json!({"directory":temp.path()}),
+        ] {
+            let req = RawRequest {
+                id: "broad".into(),
+                command: "outline".into(),
+                session_id: None,
+                lsp_hints: None,
+                params,
+            };
             let response = handle_outline(&req, &ctx);
             assert!(response.success, "{response:?}");
             let broad = response.data["text"].as_str().unwrap();
-            assert_eq!(broad.lines().filter(|line| line.trim_start().starts_with('.')).count(), 4, "{broad}");
-            assert!(broad.contains("(3 more)") && broad.contains("checks: 2 items"), "{broad}");
-            assert!(!broad.contains("first_test") && !broad.contains("second_test"), "{broad}");
+            assert_eq!(
+                broad
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with('.'))
+                    .count(),
+                4,
+                "{broad}"
+            );
+            assert!(
+                broad.contains("(3 more)") && broad.contains("checks: 2 items"),
+                "{broad}"
+            );
+            assert!(
+                !broad.contains("first_test") && !broad.contains("second_test"),
+                "{broad}"
+            );
         }
     }
 
     fn restricted_outline_context(root: &Path) -> AppContext {
-        AppContext::new(Box::new(TreeSitterProvider::new()), crate::config::Config {
-            project_root: Some(root.to_path_buf()), restrict_to_project_root: true,
-            ..Default::default()
-        })
+        AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                restrict_to_project_root: true,
+                ..Default::default()
+            },
+        )
     }
 
     #[test]
@@ -3020,17 +3054,30 @@ mod tests {
         let root = temp.path().join("project");
         std::fs::create_dir(&root).unwrap();
         let path = root.join("lib.rs");
-        std::fs::write(&path, "pub fn product() {}\n#[cfg(test)]\n#[path = \"../outside.rs\"]\nmod checks;\n").unwrap();
+        std::fs::write(
+            &path,
+            "pub fn product() {}\n#[cfg(test)]\n#[path = \"../outside.rs\"]\nmod checks;\n",
+        )
+        .unwrap();
         std::fs::write(temp.path().join("outside.rs"), "fn outside_secret() {}\n").unwrap();
         let ctx = restricted_outline_context(&root);
-        let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"outside-include", "command":"outline", "files":[path]})).unwrap();
+        let req: RawRequest = serde_json::from_value(
+            serde_json::json!({"id":"outside-include", "command":"outline", "files":[path]}),
+        )
+        .unwrap();
         let response = handle_outline(&req, &ctx);
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["complete"], true, "{response:?}");
         assert_eq!(response.data["skipped_files"], serde_json::json!([]));
         let text = response.data["text"].as_str().unwrap();
-        assert!(text.contains("checks (path ../outside.rs): items unknown (path_denied) (lines 2-4)"), "{text}");
-        assert!(text.contains("product") && !text.contains("outside_secret"), "{text}");
+        assert!(
+            text.contains("checks (path ../outside.rs): items unknown (path_denied) (lines 2-4)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("product") && !text.contains("outside_secret"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3038,8 +3085,14 @@ mod tests {
         for (source, reason) in [(None, "file_not_found"), (Some("fn (\n"), "parse_error")] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("lib.rs");
-            std::fs::write(&path, "pub fn product() {}\n#[cfg(test)]\n#[path = \"checks.rs\"]\nmod checks;\n").unwrap();
-            if let Some(source) = source { std::fs::write(temp.path().join("checks.rs"), source).unwrap(); }
+            std::fs::write(
+                &path,
+                "pub fn product() {}\n#[cfg(test)]\n#[path = \"checks.rs\"]\nmod checks;\n",
+            )
+            .unwrap();
+            if let Some(source) = source {
+                std::fs::write(temp.path().join("checks.rs"), source).unwrap();
+            }
             let ctx = restricted_outline_context(temp.path());
             let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"unavailable-include", "command":"outline", "files":[path]})).unwrap();
             let response = handle_outline(&req, &ctx);
@@ -3047,7 +3100,12 @@ mod tests {
             assert_eq!(response.data["complete"], true, "{response:?}");
             assert_eq!(response.data["skipped_files"], serde_json::json!([]));
             let text = response.data["text"].as_str().unwrap();
-            assert!(text.contains(&format!("checks (path checks.rs): items unknown ({reason}) (lines 2-4)")), "{text}");
+            assert!(
+                text.contains(&format!(
+                    "checks (path checks.rs): items unknown ({reason}) (lines 2-4)"
+                )),
+                "{text}"
+            );
             assert!(text.contains("product"), "{text}");
         }
     }
@@ -3067,8 +3125,14 @@ mod tests {
         assert_eq!(response.data["complete"], true, "{response:?}");
         assert_eq!(response.data["skipped_files"], serde_json::json!([]));
         let text = response.data["text"].as_str().unwrap();
-        assert!(text.contains("bad_include_product") && text.contains("good_product"), "{text}");
-        assert!(text.contains("checks (path ../outside.rs): items unknown (path_denied)"), "{text}");
+        assert!(
+            text.contains("bad_include_product") && text.contains("good_product"),
+            "{text}"
+        );
+        assert!(
+            text.contains("checks (path ../outside.rs): items unknown (path_denied)"),
+            "{text}"
+        );
         assert!(!text.contains("outside_secret"), "{text}");
     }
 
@@ -3076,17 +3140,33 @@ mod tests {
     fn outline_structure_read_and_parse_failures_skip_only_the_affected_file() {
         // Change a file after syntax validation and symbol extraction, without
         // relying on scheduling a concurrent writer at exactly the right time.
-        struct ChangingProvider { affected: PathBuf, break_syntax: bool }
+        struct ChangingProvider {
+            affected: PathBuf,
+            break_syntax: bool,
+        }
         impl crate::language::LanguageProvider for ChangingProvider {
-            fn as_any(&self) -> &dyn std::any::Any { self }
-            fn resolve_symbol(&self, file: &Path, name: &str) -> Result<Vec<crate::symbols::SymbolMatch>, AftError> {
-                crate::language::LanguageProvider::resolve_symbol(&TreeSitterProvider::new(), file, name)
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn resolve_symbol(
+                &self,
+                file: &Path,
+                name: &str,
+            ) -> Result<Vec<crate::symbols::SymbolMatch>, AftError> {
+                crate::language::LanguageProvider::resolve_symbol(
+                    &TreeSitterProvider::new(),
+                    file,
+                    name,
+                )
             }
             fn list_symbols(&self, file: &Path) -> Result<Vec<Symbol>, AftError> {
                 let symbols = FileParser::new().extract_symbols(file)?;
                 if file == self.affected {
-                    if self.break_syntax { std::fs::write(file, "fn (\n").unwrap(); }
-                    else { std::fs::remove_file(file).unwrap(); }
+                    if self.break_syntax {
+                        std::fs::write(file, "fn (\n").unwrap();
+                    } else {
+                        std::fs::remove_file(file).unwrap();
+                    }
                 }
                 Ok(symbols)
             }
@@ -3097,14 +3177,26 @@ mod tests {
             let good = temp.path().join("good.rs");
             std::fs::write(&affected, "pub fn affected() {}\n").unwrap();
             std::fs::write(&good, "pub fn good() {}\n").unwrap();
-            let ctx = AppContext::new(Box::new(ChangingProvider { affected: affected.clone(), break_syntax }), crate::config::Config::default());
+            let ctx = AppContext::new(
+                Box::new(ChangingProvider {
+                    affected: affected.clone(),
+                    break_syntax,
+                }),
+                crate::config::Config::default(),
+            );
             let req: RawRequest = serde_json::from_value(serde_json::json!({"id":"changed-file", "command":"outline", "files":[affected,good]})).unwrap();
             let response = handle_outline(&req, &ctx);
             assert!(response.success, "{response:?}");
             assert_eq!(response.data["complete"], false);
-            assert_eq!(response.data["skipped_files"], serde_json::json!([{"file":"affected.rs", "reason":reason}]));
+            assert_eq!(
+                response.data["skipped_files"],
+                serde_json::json!([{"file":"affected.rs", "reason":reason}])
+            );
             let text = response.data["text"].as_str().unwrap();
-            assert!(text.contains("good.rs") && !text.contains("affected.rs"), "{text}");
+            assert!(
+                text.contains("good.rs") && !text.contains("affected.rs"),
+                "{text}"
+            );
         }
     }
 
