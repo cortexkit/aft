@@ -8,6 +8,18 @@ pub(super) fn simulate_crash_before_local_pid(task: &str) -> bool {
     crash_tasks().lock().unwrap().remove(task)
 }
 
+fn post_spawn_failures() -> &'static Mutex<HashSet<String>> {
+    static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+pub(super) fn fail_running_metadata_after_spawn(task: &str) -> Result<(), String> {
+    if post_spawn_failures().lock().unwrap().remove(task) {
+        Err("injected running-metadata failure after spawn".into())
+    } else {
+        Ok(())
+    }
+}
+
 struct MarkerGate {
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
@@ -473,6 +485,91 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
         .unwrap()
         .iter()
         .any(|(_, b)| b["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn exec_remote_bash_post_spawn_persistence_failure_never_claims_no_run() {
+    for restarted in [true, false] {
+        let daemon = daemon(
+            if restarted {
+                Script::AttachRefused
+            } else {
+                Script::Refused
+            },
+            "exec-remote/v1",
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("started-count");
+        let command = format!("printf x >> '{}'", counter.display());
+        let (registry, task_id, paths) =
+            persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
+        let task = registry.task(&task_id).unwrap();
+        post_spawn_failures()
+            .lock()
+            .unwrap()
+            .insert(task_id.clone());
+        if restarted {
+            registry.resume_remote_task(&task_id).unwrap();
+        } else {
+            let layout = resolve_task_layout(&paths.session_dir, &task_id).unwrap();
+            let remote = task.state.lock().unwrap().metadata.remote.clone().unwrap();
+            let (plan, shell_path, env, linux_scope) = crate::sandbox_spawn::restore_local_launch(
+                &layout,
+                remote.fallback_digest.as_deref().unwrap(),
+            )
+            .unwrap();
+            let request = exec::build_request(
+                dir.path(),
+                dir.path(),
+                dir.path(),
+                &command,
+                BTreeMap::new(),
+                Some(30),
+                &exec::PresetParams::default(),
+            );
+            registry
+                .start_remote_worker(
+                    task,
+                    Some((
+                        request,
+                        LocalFallback {
+                            plan,
+                            shell_path,
+                            env,
+                            linux_scope,
+                            capture_pipeline: false,
+                        },
+                    )),
+                )
+                .unwrap();
+        }
+        let done = terminal(&registry, &task_id).await;
+        assert_eq!(
+            done.info.status,
+            BgTaskStatus::FateUnknown,
+            "restarted={restarted}: {done:?}"
+        );
+        assert!(
+            done.output_preview
+                .contains("the command started locally; AFT lost track of it"),
+            "{done:?}"
+        );
+        assert!(!done.output_preview.contains("did not run"), "{done:?}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !counter.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(fs::read(&counter).unwrap(), b"x");
+        let replay = super::tests::registry();
+        replay.replay_session(dir.path(), "session").unwrap();
+        let replayed = terminal(&replay, &task_id).await;
+        assert_eq!(replayed.info.status, BgTaskStatus::FateUnknown);
+        assert_eq!(fs::read(&counter).unwrap(), b"x");
+    }
 }
 
 #[tokio::test]

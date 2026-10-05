@@ -529,6 +529,8 @@ impl BgTaskRegistry {
                 Ok(StreamProgress::Record) => {}
                 Ok(StreamProgress::Complete(Verdict::RunLocally { reason })) => {
                     if let Some(fallback) = fallback.take() {
+                        // A live refusal uses the launch plan captured before
+                        // dispatch. The private disk snapshot is for restarts.
                         return self.remote_fallback(
                             &task,
                             fallback,
@@ -679,8 +681,26 @@ impl BgTaskRegistry {
         state.metadata.mark_running(child.id(), child.id() as i32);
         state.runtime = TaskRuntime::Piped(Some(child));
         state.detached = false;
-        self.persist_task_locked(task, &state.metadata, &mut db)
-            .map_err(|e| e.to_string())
+        let persisted = (|| {
+            #[cfg(test)]
+            tests::fail_running_metadata_after_spawn(&task.task_id)?;
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())
+        })();
+        drop(state);
+        drop(db);
+        if let Err(error) = persisted {
+            // Spawn succeeded. This is not a no-start refusal, even when the
+            // PID publication fails; both live and restarted callers end here.
+            self.remote_terminal(
+                task,
+                Verdict::OutcomeUnknown,
+                Some(format!(
+                    "the command started locally; AFT lost track of it: {error}; never rerun"
+                )),
+            );
+        }
+        Ok(())
     }
 
     fn restored_remote_fallback(
@@ -735,6 +755,8 @@ impl BgTaskRegistry {
     }
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
+        // Known terminals keep their real status. Only unknown outcomes lose
+        // their fate; no non-refusal terminal permits another execution.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let (status, code, reason) = match verdict {
             Verdict::Exited { code } => (
