@@ -6,6 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -550,6 +551,8 @@ pub(crate) struct Runtime {
     pub(crate) env: HashMap<String, String>,
     pub(crate) options: Option<serde_json::Value>,
     pub(crate) launch_env: Option<BTreeMap<String, String>>,
+    #[cfg(test)]
+    pub(crate) validation_delay: Duration,
 }
 
 fn relevant_environment_key(key: &str) -> bool {
@@ -879,7 +882,8 @@ pub(crate) struct CompletedRustCheck {
     checkout: PathBuf,
     path: PathBuf,
     runtime: Runtime,
-    saved: Option<SavedCheck>,
+    saved: Option<Arc<SavedCheck>>,
+    validation: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<Option<SavedCheck>>>>,
     pending: Option<Fingerprint>,
     pub(crate) reports: BTreeMap<PathBuf, Vec<StoredDiagnostic>>,
     started: Option<Instant>,
@@ -940,7 +944,7 @@ impl CompletedRustCheck {
                             blake3::hash(&bytes).to_hex().as_str() == envelope.checksum
                         })
             })
-            .map(|envelope| envelope.record);
+            .map(|envelope| Arc::new(envelope.record));
         #[cfg(not(unix))]
         let pre_spawn = {
             let deadline = Instant::now() + INITIAL_CAPTURE_BUDGET;
@@ -957,6 +961,7 @@ impl CompletedRustCheck {
             path,
             runtime,
             saved,
+            validation: parking_lot::Mutex::new(None),
             pending: None,
             reports: BTreeMap::new(),
             started: None,
@@ -1059,17 +1064,52 @@ impl CompletedRustCheck {
         };
         if let Ok(text) = serde_json::to_string(&envelope) {
             if crate::jsonc_edit::write_atomic(&self.path, &text).is_ok() {
-                self.saved = Some(record);
+                self.saved = Some(Arc::new(record));
             }
         }
     }
 
     pub(crate) fn validated(&self, deadline: Instant) -> Option<SavedCheck> {
-        let saved = self.saved.as_ref()?;
-        let current = self
-            .runtime
-            .capture(&self.root, Some(&saved.fingerprint), deadline, None)?;
-        self.accept_current(current)
+        expired(deadline)?;
+        let saved = self.saved.clone()?;
+        let mut active = self.validation.lock();
+        if let Some(receiver) = active.as_ref() {
+            if matches!(
+                receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ) {
+                // An earlier timed-out walk still owns this root's worker.
+                // Never accumulate blocked filesystem workers or reuse its old verdict.
+                return None;
+            }
+            *active = None;
+        }
+        let runtime = self.runtime.clone();
+        let root = self.root.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        *active = Some(rx);
+        if std::thread::Builder::new()
+            .name("aft-rust-fingerprint".into())
+            .spawn(move || {
+                #[cfg(test)]
+                std::thread::sleep(runtime.validation_delay);
+                let result = runtime
+                    .capture(&root, Some(&saved.fingerprint), deadline, None)
+                    .and_then(|current| accept_saved(&saved, current));
+                let _ = tx.send(result);
+            })
+            .is_err()
+        {
+            *active = None;
+            return None;
+        }
+        let result = active
+            .as_ref()?
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()?;
+        *active = None;
+        expired(deadline)?;
+        result
     }
 
     pub(crate) fn abort(&mut self) {
@@ -1090,14 +1130,15 @@ impl CompletedRustCheck {
         self.accept_current(current)
     }
 
+    #[cfg(test)]
     fn accept_current(&self, current: Fingerprint) -> Option<SavedCheck> {
         let saved = self.saved.as_ref()?;
-        if current.digest != saved.fingerprint.digest {
-            return None;
-        }
-        let mut saved = saved.clone();
-        saved.fingerprint = current;
-        Some(saved)
+        accept_saved(saved, current)
+    }
+
+    #[cfg(test)]
+    fn saved_mut(&mut self) -> &mut SavedCheck {
+        Arc::make_mut(self.saved.as_mut().unwrap())
     }
 
     pub(crate) fn running_reason(&self) -> Option<String> {
@@ -1105,6 +1146,15 @@ impl CompletedRustCheck {
         let last = self.saved.as_ref()?;
         Some(format!("rust-analyzer: cargo check running for {elapsed} s; the last full check here took {}; retry", duration(last.duration_seconds)))
     }
+}
+
+fn accept_saved(saved: &SavedCheck, current: Fingerprint) -> Option<SavedCheck> {
+    if current.digest != saved.fingerprint.digest {
+        return None;
+    }
+    let mut saved = saved.clone();
+    saved.fingerprint = current;
+    Some(saved)
 }
 
 fn duration(seconds: u64) -> String {
@@ -1147,6 +1197,7 @@ mod tests {
             env: HashMap::new(),
             options: None,
             launch_env: None,
+            validation_delay: Duration::ZERO,
         };
         let mut cache =
             CompletedRustCheck::new(&root, &root, &temp.path().join("storage"), runtime).unwrap();
@@ -1158,7 +1209,7 @@ mod tests {
             None,
         )
         .unwrap();
-        cache.saved = Some(SavedCheck {
+        cache.saved = Some(Arc::new(SavedCheck {
             schema: 1,
             root: cache.root.clone(),
             checkout: cache.checkout.clone(),
@@ -1166,7 +1217,7 @@ mod tests {
             diagnostics: BTreeMap::new(),
             completed_seconds: 77477,
             duration_seconds: 217,
-        });
+        }));
         (temp, cache)
     }
 
@@ -1238,6 +1289,10 @@ mod tests {
         fs::write(&binary, "#!/bin/sh\nprintf 'compiler 1\\n'\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
         cache.runtime.binary = binary.clone();
+        let analyzer = temp.path().join("analyzer");
+        fs::write(&analyzer, "#!/bin/sh\nprintf 'analyzer 1\\n'\n").unwrap();
+        fs::set_permissions(&analyzer, fs::Permissions::from_mode(0o755)).unwrap();
+        cache.runtime.binary = analyzer;
         cache
             .runtime
             .env
@@ -1247,7 +1302,7 @@ mod tests {
             .runtime
             .hash(&cache.root, Instant::now() + BUDGET)
             .unwrap();
-        cache.saved.as_mut().unwrap().fingerprint =
+        cache.saved_mut().fingerprint =
             fingerprint(&cache.root, runtime, None, Instant::now() + BUDGET, None).unwrap();
         assert!(cache.validated(Instant::now() + BUDGET).is_some());
         fs::write(binary, "#!/bin/sh\nprintf 'compiler 2\\n'\n").unwrap();
@@ -1271,7 +1326,7 @@ mod tests {
     fn saved_errors_are_served_as_errors() {
         let (_temp, mut cache) = fixture();
         let file = cache.root.join("member/src/lib.rs");
-        cache.saved.as_mut().unwrap().diagnostics.insert(
+        cache.saved_mut().diagnostics.insert(
             file.clone(),
             vec![StoredDiagnostic {
                 file: file.clone(),
@@ -1305,7 +1360,7 @@ mod tests {
             )
             .unwrap()
         };
-        let record = cache.saved.clone().unwrap();
+        let record = (**cache.saved.as_ref().unwrap()).clone();
         let envelope = Envelope {
             checksum: blake3::hash(&serde_json::to_vec(&record).unwrap())
                 .to_hex()
@@ -1360,7 +1415,7 @@ mod tests {
             "member/src/lib.rs",
             "pub const DATA: &str = include_str!(\"data.md\");\n",
         );
-        cache.saved.as_mut().unwrap().fingerprint = fingerprint(
+        cache.saved_mut().fingerprint = fingerprint(
             &cache.root,
             "v1".into(),
             None,
@@ -1379,7 +1434,7 @@ mod tests {
         write(&cache.root, "member/data/one.txt", "one");
         let mut seed = cache.saved.as_ref().unwrap().fingerprint.clone();
         seed.extra_inputs.push(cache.root.join("member/data"));
-        cache.saved.as_mut().unwrap().fingerprint = fingerprint(
+        cache.saved_mut().fingerprint = fingerprint(
             &cache.root,
             "v1".into(),
             Some(&seed),
@@ -1395,30 +1450,223 @@ mod tests {
     #[test]
     fn repository_fingerprint_completes_and_reuses_unchanged_hashes() {
         let root = canonical(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
-        let first = fingerprint(
-            &root,
-            "probe".into(),
-            None,
-            Instant::now() + Duration::from_secs(30),
-            None,
-        )
-        .expect("the repository's Rust inputs must fit the bounded initial capture");
-        let warm = fingerprint(
-            &root,
-            "probe".into(),
-            Some(&first),
-            Instant::now() + BUDGET,
-            None,
-        )
-        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Runtime {
+            binary: which::which("rust-analyzer").expect("rust-analyzer version probe is required"),
+            args: Vec::new(),
+            env: HashMap::new(),
+            options: Some(
+                serde_json::json!({"cargo":{"targetDir":true,"extraArgs":["--locked"],"metadataExtraArgs":["--locked"]}}),
+            ),
+            launch_env: None,
+            validation_delay: Duration::ZERO,
+        };
+        let cache =
+            CompletedRustCheck::new(&root, &root, &temp.path().join("storage"), runtime).unwrap();
+        let start = Instant::now();
+        let first = cache
+            .runtime
+            .capture(&root, None, Instant::now() + INITIAL_CAPTURE_BUDGET, None)
+            .expect("the repository's Rust inputs must fit the bounded initial capture");
+        let cold_ms = start.elapsed().as_millis();
+        let start = Instant::now();
+        let warm = cache
+            .runtime
+            .capture(&root, Some(&first), Instant::now() + BUDGET, None)
+            .unwrap();
+        let warm_ms = start.elapsed().as_millis();
         assert_eq!(first.digest, warm.digest);
         assert!(warm.hashed < first.hashed);
         println!(
-            "repository Rust fingerprint: examined {}, inputs {}, first hashed {}, warm hashed {}",
+            "repository Rust fingerprint: cold {} ms, warm {} ms; examined {}, inputs {}, first hashed {}, warm hashed {}",
+            cold_ms, warm_ms,
             warm.examined,
             warm.files.len(),
             first.hashed,
             warm.hashed
+        );
+        let record = SavedCheck {
+            schema: 1,
+            root: root.clone(),
+            checkout: root.clone(),
+            fingerprint: warm,
+            diagnostics: BTreeMap::new(),
+            completed_seconds: 1,
+            duration_seconds: 217,
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let envelope = Envelope {
+            record,
+            checksum: blake3::hash(&bytes).to_hex().to_string(),
+        };
+        crate::jsonc_edit::write_atomic(&cache.path, &serde_json::to_string(&envelope).unwrap())
+            .unwrap();
+        println!(
+            "repository completed-check record: {} bytes at {}",
+            fs::metadata(&cache.path).unwrap().len(),
+            cache.path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    fn live_fixture() -> (tempfile::TempDir, CompletedRustCheck) {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, mut cache) = fixture();
+        let compiler = temp.path().join("compiler");
+        fs::write(&compiler, "#!/bin/sh\nprintf 'compiler 1\\n'\n").unwrap();
+        fs::set_permissions(&compiler, fs::Permissions::from_mode(0o755)).unwrap();
+        cache.runtime.binary = compiler.clone();
+        cache
+            .runtime
+            .env
+            .insert("RUSTC".into(), compiler.to_string_lossy().into_owned());
+        cache.runtime.launch_env = Some(cache.runtime.effective_env().unwrap());
+        write(
+            &cache.root,
+            "target/debug/build/member-control/output",
+            "cargo:rerun-if-changed=build.rs\n",
+        );
+        cache.saved = None;
+        cache.begin(SystemTime::now());
+        assert!(
+            cache.pending.is_some(),
+            "control: the check has known inputs"
+        );
+        cache.finished = true;
+        cache.complete();
+        assert!(
+            cache.path.is_file(),
+            "control: a completed unchanged check is actually saved"
+        );
+        (temp, cache)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn analyzer_settings_change_invalidates_completed_check() {
+        let (_temp, mut cache) = live_fixture();
+        assert!(cache.validated(Instant::now() + BUDGET).is_some());
+        cache.runtime.options = Some(serde_json::json!({"check":{"features":["changed-feature"]}}));
+        assert!(cache.validated(Instant::now() + BUDGET).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn analyzer_version_change_invalidates_completed_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, mut cache) = live_fixture();
+        let analyzer = temp.path().join("analyzer");
+        fs::write(&analyzer, "#!/bin/sh\nprintf 'analyzer 1\\n'\n").unwrap();
+        fs::set_permissions(&analyzer, fs::Permissions::from_mode(0o755)).unwrap();
+        cache.runtime.binary = analyzer.clone();
+        cache.begin(SystemTime::now());
+        cache.finished = true;
+        cache.complete();
+        assert!(cache.validated(Instant::now() + BUDGET).is_some());
+        fs::write(analyzer, "#!/bin/sh\nprintf 'analyzer 2\\n'\n").unwrap();
+        assert!(cache.validated(Instant::now() + BUDGET).is_none());
+    }
+
+    #[test]
+    fn cargo_config_edit_invalidates_completed_check() {
+        let (_temp, mut cache) = fixture();
+        write(
+            &cache.root,
+            ".cargo/config.toml",
+            "[build]\nrustflags = [\"--cfg=before\"]\n",
+        );
+        cache.saved_mut().fingerprint = fingerprint(
+            &cache.root,
+            "v1".into(),
+            None,
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        assert!(valid(&cache).is_some());
+        write(
+            &cache.root,
+            ".cargo/config.toml",
+            "[build]\nrustflags = [\"--cfg=after\"]\n",
+        );
+        assert!(valid(&cache).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_beginning_before_last_edit_is_not_saved() {
+        let (_temp, mut cache) = live_fixture();
+        let before = fs::read(&cache.path).unwrap();
+        let began = SystemTime::now();
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            "pub fn after_begin() {}\n",
+        );
+        cache.begin(began);
+        cache.finished = true;
+        cache.complete();
+        assert_eq!(
+            fs::read(&cache.path).unwrap(),
+            before,
+            "a check which began before the edit replaced the authoritative record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn end_of_run_input_revalidation_refuses_changed_inputs() {
+        let (_temp, mut cache) = live_fixture();
+        let before = fs::read(&cache.path).unwrap();
+        cache.begin(SystemTime::now());
+        assert!(cache.pending.is_some());
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            "pub fn during_check() {}\n",
+        );
+        cache.reports.insert(
+            cache.root.join("member/src/lib.rs"),
+            vec![StoredDiagnostic {
+                file: cache.root.join("member/src/lib.rs"),
+                line: 1,
+                column: 1,
+                end_line: 1,
+                end_column: 2,
+                severity: DiagnosticSeverity::Error,
+                message: "report from the incomplete run".into(),
+                code: None,
+                source: Some("rustc".into()),
+            }],
+        );
+        cache.finished = true;
+        cache.complete();
+        assert_eq!(
+            fs::read(&cache.path).unwrap(),
+            before,
+            "an input changed during the check, but its result replaced the saved record"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validation_deadline_returns_unknown_without_waiting_for_slow_fingerprint() {
+        let (_temp, mut cache) = live_fixture();
+        assert!(
+            cache.validated(Instant::now() + BUDGET).is_some(),
+            "control: the saved result is valid"
+        );
+        cache.runtime.validation_delay = Duration::from_millis(250);
+        let started = Instant::now();
+        assert!(
+            cache
+                .validated(started + Duration::from_millis(20))
+                .is_none(),
+            "an incomplete validation served saved diagnostics"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "inspect waited past the validation budget"
         );
     }
 
@@ -1445,7 +1693,7 @@ mod tests {
             "member/src/lib.rs",
             &format!("pub const INPUT: &str = env!(\"{KEY}\");\n"),
         );
-        cache.saved.as_mut().unwrap().fingerprint = fingerprint(
+        cache.saved_mut().fingerprint = fingerprint(
             &cache.root,
             "v1".into(),
             None,

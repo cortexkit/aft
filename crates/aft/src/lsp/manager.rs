@@ -5887,6 +5887,8 @@ impl PreparedSpawn {
                         env: self.env.clone(),
                         options: self.initialization_options.clone(),
                         launch_env: None,
+                        #[cfg(test)]
+                        validation_delay: Duration::ZERO,
                     },
                 )
             })

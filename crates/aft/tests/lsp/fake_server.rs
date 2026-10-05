@@ -225,6 +225,8 @@ fn write_flycheck_progress(writer: &mut impl Write, kind: &str) -> io::Result<()
     let mut value = json!({ "kind": kind });
     if kind == "begin" {
         value["title"] = json!("cargo check");
+    } else if kind == "end" {
+        if let Ok(message) = std::env::var("AFT_FAKE_LSP_CHECK_END_MESSAGE") { value["message"] = json!(message); }
     }
     write_notification(
         writer,
@@ -454,6 +456,10 @@ pub(crate) fn main() -> io::Result<()> {
             std::process::exit(status.code().unwrap_or(1));
         }
         return run_proxy(program);
+    }
+    if std::env::args_os().any(|arg| arg == "--version") {
+        println!("aft fake rust-analyzer 1");
+        return Ok(());
     }
     // AFT_FAKE_LSP_IGNORE_SIGTERM=1: keep running through SIGTERM, like a
     // server with its own handler that is busy or wedged, so only a kill that

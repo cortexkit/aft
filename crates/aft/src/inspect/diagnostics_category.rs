@@ -256,9 +256,11 @@ pub(crate) fn run_diagnostics_category(
 
     // Revalidate after per-file work. A successful early validation only skips
     // the cold wait; it cannot certify inputs which changed during that wait.
-    let saved = ctx
-        .lsp()
-        .saved_rust_checks(Instant::now() + crate::lsp::completed_rust_check::BUDGET);
+    let saved = ctx.lsp().saved_rust_checks(
+        sweep_deadline
+            .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
+            .min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
+    );
     for (key, check) in saved {
         if scoped
             .as_ref()

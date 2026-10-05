@@ -6134,6 +6134,18 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     );
     assert_eq!(cold["summary"]["diagnostics"]["errors"], 0, "{cold:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let record = fs::read_dir(storage.join("rust-completed-checks"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    println!(
+        "real restart: cold inspect {} ms; record {} bytes at {}",
+        started.elapsed().as_millis(),
+        fs::metadata(&record).unwrap().len(),
+        record.display()
+    );
     // A cold request after an edit cannot reuse the previous clean check.
     drop(ctx);
     write_file(&root, "src/lib.rs", "pub fn answer() -> u8 { unknown }\n");
@@ -6191,6 +6203,78 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         errors["summary"]["diagnostics"]["errors"],
         "{restored_errors:#}"
     );
+}
+
+fn assert_unsuccessful_rust_check_is_not_persisted(message: &str) {
+    crate::helpers::disable_in_process_file_watcher();
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("storage");
+    let records = || {
+        fs::read_dir(storage.join("rust-completed-checks"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .count()
+    };
+    for (index, result) in [None, Some(message)].into_iter().enumerate() {
+        let root = temp.path().join(format!("checkout-{index}"));
+        write_file(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"saved-fake-check\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_file(&root, "src/lib.rs", "pub fn f() {}\n");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let response = handle_configure(
+            &request(
+                json!({"id":"unsuccessful-configure", "command":"configure", "harness":"opencode", "project_root":root,"storage_dir":storage,
+            "config":crate::helpers::user_config(json!({"search_index":false,"semantic_search":false,"inspect":{"diagnostics_timeout_ms":40_000}}))}),
+            ),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        configure_fake_rust_lsp(&ctx);
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_SERVER_STATUS", "empty_then_quiescent");
+        ctx.lsp().set_extra_env("AFT_FAKE_LSP_CHECK_ON_SAVE", "100");
+        if let Some(message) = result {
+            ctx.lsp()
+                .set_extra_env("AFT_FAKE_LSP_CHECK_END_MESSAGE", message);
+        }
+        let response = scoped_diagnostics_inspect(&ctx, "unsuccessful-check", "src");
+        assert_eq!(
+            response["summary"]["diagnostics"]["errors"], 0,
+            "{response:#}"
+        );
+        assert_eq!(
+            records(),
+            1,
+            "control writes one record, but the {result:?} run must not write another"
+        );
+    }
+}
+
+#[test]
+fn cancelled_rust_check_is_never_saved() {
+    assert_unsuccessful_rust_check_is_not_persisted("cancelled");
+}
+
+#[test]
+fn failed_rust_check_is_never_saved() {
+    assert_unsuccessful_rust_check_is_not_persisted("failed");
 }
 
 /// rust-analyzer starts its first `cargo check` just after it reports
