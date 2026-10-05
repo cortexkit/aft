@@ -3503,6 +3503,17 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
     let project_scope_key = crate::path_identity::project_scope_key(&canonical_cache_root);
+    if let Err(error) = crate::storage_retention::record_bind(
+        &storage_root,
+        &canonical_cache_root,
+        project_key.as_deref().unwrap_or_default(),
+    ) {
+        return Response::error(
+            &req.id,
+            "retention_binding_unavailable",
+            format!("cannot protect checkout cache binding: {error}"),
+        );
+    }
     if let Some(project_key) = project_key.as_ref() {
         // Read only the version headers of this project's shared artifacts
         // before any loader, builder or owner claim touches them, so a format
@@ -7052,6 +7063,12 @@ fn run_configure_maintenance_unit_inner(
             continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
         }
         ConfigureMaintenanceStage::StorageSweeps => {
+            crate::storage_retention::schedule(
+                job.storage_root.clone(),
+                ctx.subc_lifecycle_admission(),
+                ctx.configure_generation_flag(),
+                job.generation,
+            );
             if detach_storage_sweeps {
                 spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
             } else {
@@ -7458,13 +7475,9 @@ fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
         ),
         Err(err) => slog_warn!("filesystem lock reclaim-token cleanup failed: {}", err),
     }
-    crate::search_index::sweep_orphaned_index_dirs(storage_root);
     // Throttled per storage root inside; most configure tails return at once.
     let _ = crate::artifact_owner::sweep_orphaned_owner_manifests(storage_root);
     crate::search_index::sweep_transient_search_cache_dirs();
-    let inspect_root = storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
-    let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(storage_root);
-    crate::inspect::cache::sweep_inspect_scope_dirs(&inspect_root, &live_scope_keys);
     match crate::migrate_storage::cleanup_staging_dirs(storage_root, harness) {
         Ok(0) => {}
         Ok(n) => slog_info!(

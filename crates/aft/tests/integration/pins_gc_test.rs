@@ -113,7 +113,7 @@ fn gc_never_evicts_retained_or_query_pinned_generation_blobs() {
 }
 
 #[test]
-fn expired_live_looking_assembly_pin_is_reclaimed_by_ttl() {
+fn expired_live_assembly_pin_is_kept_until_its_owner_releases_it() {
     let storage = tempfile::tempdir().expect("create storage");
     let view = tempfile::tempdir().expect("create view");
     let key = semantic_key(b"expired");
@@ -141,10 +141,17 @@ fn expired_live_looking_assembly_pin_is_reclaimed_by_ttl() {
     .expect("expire pin metadata");
 
     let report = sweep(sweep_request(&storage, &view, SweepReferences::default())).expect("sweep");
-    assert_eq!(report.reclaimed_pins, 1);
-    assert!(!metadata_path.exists());
-    assert_eq!(store.get(&key).expect("read expired blob"), None);
+    assert_eq!(report.reclaimed_pins, 0);
+    assert!(metadata_path.exists());
+    assert_eq!(
+        store.get(&key).expect("read protected blob"),
+        Some(b"payload".to_vec())
+    );
     drop(pin);
+    let report = sweep(sweep_request(&storage, &view, SweepReferences::default()))
+        .expect("sweep after release");
+    assert_eq!(report.deleted_blobs, 1);
+    assert_eq!(store.get(&key).expect("read released blob"), None);
 }
 
 #[test]

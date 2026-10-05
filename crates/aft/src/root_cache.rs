@@ -30,7 +30,11 @@ use serde::{Deserialize, Serialize};
 use crate::fs_lock;
 
 static MARKER_SEQ: AtomicU64 = AtomicU64::new(0);
-static LIVE_SCOPE_KEYS: OnceLock<Mutex<HashMap<(PathBuf, String), usize>>> = OnceLock::new();
+struct LiveScope {
+    count: usize,
+    _marker: Option<ReadMarker>,
+}
+static LIVE_SCOPE_KEYS: OnceLock<Mutex<HashMap<(PathBuf, String), LiveScope>>> = OnceLock::new();
 
 /// Read-marker heartbeats refresh no more often than the filesystem lock
 /// heartbeat. Active readers piggyback this on normal read paths instead of
@@ -276,7 +280,7 @@ fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ArtifactAcces
 /// Track scope keys belonging to roots currently bound in this process. The
 /// inspect sweep snapshots this registry at publication time so a live actor's
 /// cache cannot be mistaken for a reclaimed worktree cache.
-fn live_scope_keys() -> &'static Mutex<HashMap<(PathBuf, String), usize>> {
+fn live_scope_keys() -> &'static Mutex<HashMap<(PathBuf, String), LiveScope>> {
     LIVE_SCOPE_KEYS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -287,7 +291,16 @@ pub(crate) fn register_live_scope(storage_root: &Path, project_root: &Path) {
         Ok(scopes) => scopes,
         Err(poisoned) => poisoned.into_inner(),
     };
-    *scopes.entry((storage_root, scope_key)).or_default() += 1;
+    let marker_root = storage_root.join("retention");
+    let entry = scopes
+        .entry((storage_root, scope_key.clone()))
+        .or_insert_with(|| LiveScope {
+            count: 0,
+            _marker: ReadMarker::create(&marker_root, &scope_key)
+                .map_err(|error| crate::slog_warn!("root residency marker unavailable: {error}"))
+                .ok(),
+        });
+    entry.count += 1;
 }
 
 pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
@@ -298,9 +311,9 @@ pub(crate) fn unregister_live_scope(storage_root: &Path, project_root: &Path) {
         Err(poisoned) => poisoned.into_inner(),
     };
     let key = (storage_root, scope_key);
-    if let Some(count) = scopes.get_mut(&key) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+    if let Some(scope) = scopes.get_mut(&key) {
+        scope.count = scope.count.saturating_sub(1);
+        if scope.count == 0 {
             scopes.remove(&key);
         }
     }
@@ -314,7 +327,7 @@ pub(crate) fn live_scope_keys_for_storage(storage_root: &Path) -> HashSet<String
     };
     scopes
         .iter()
-        .filter(|((root, _), count)| root == &storage_root && **count > 0)
+        .filter(|((root, _), scope)| root == &storage_root && scope.count > 0)
         .map(|((_, key), _)| key.clone())
         .collect()
 }
@@ -337,7 +350,7 @@ pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_o
     }
 }
 
-fn canonical_root(project_root: &Path) -> PathBuf {
+pub(crate) fn canonical_root(project_root: &Path) -> PathBuf {
     // Nearest-existing-ancestor canonicalization, not a raw-spelling fallback:
     // registration can precede the directory's creation (and lookups can follow
     // it), and on macOS the raw tempdir spelling (/var/...) differs from the
@@ -424,6 +437,15 @@ fn shared_process_lease(
         leases.remove(registry_key);
     }
     Ok(None)
+}
+
+pub(crate) fn local_callgraph_writer(cache_dir: &Path) -> Option<Arc<WriterLease>> {
+    shared_process_lease(&ProcessLeaseKey {
+        domain: RootCacheDomain::Callgraph,
+        cache_dir: canonical_process_lease_dir(cache_dir),
+    })
+    .ok()
+    .flatten()
 }
 
 fn process_lease_acquisition_lock(
@@ -805,7 +827,15 @@ fn read_marker_protection(
     let hostname = current_hostname();
     let now = now_ms();
     let mut sweep = ReadMarkerSweep::default();
-    for entry in entries.flatten() {
+    for (index, entry) in entries.take(4097).enumerate() {
+        if index == 4096 {
+            sweep.protected = true;
+            break;
+        }
+        let Ok(entry) = entry else {
+            sweep.protected = true;
+            continue;
+        };
         let path = entry.path();
         match marker_file_is_protected(&path, now, &hostname) {
             MarkerProtection::Protected => sweep.protected = true,

@@ -64,11 +64,6 @@ const MIGRATION_BACKUP_PAGES_PER_STEP: i32 = 128;
 const MIGRATION_BACKUP_RETRY_BUDGET: usize = 25;
 const MIGRATION_BACKUP_WALL_CLOCK_BUDGET: Duration = Duration::from_secs(10);
 const SQLITE_FILE_SET_SUFFIXES: &[&str] = &["", "-wal", "-shm", "-journal"];
-/// Marker-protected generations older than this absolute age are reclaimed even
-/// if a stale reader marker remains. Current and newest-previous generations are
-/// always retained, bounding the root-keyed callgraph store to roughly two or
-/// three large generations without adding user-visible configuration.
-const MARKED_GENERATION_RETENTION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const REFRESH_WORKER_WARN_AFTER: Duration = Duration::from_secs(5);
 const REFRESH_WORKER_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET: Duration = Duration::from_millis(100);
@@ -4646,6 +4641,10 @@ impl CallGraphStore {
         notify_cold_build_before_publish_observer();
         let publication = publish_if_current(|| {
             verify_writer_lease(&writer_lease)?;
+            let _publication_gc = crate::fs_lock::try_acquire(
+                &publication_gc_lock(callgraph_dir, project_key),
+                Duration::from_secs(5),
+            )?;
             let _files = crate::db::file_identity::filesystem_guard();
             ensure_sqlite_files_closed(&temp_path)?;
             ensure_sqlite_files_closed(&gen_path)?;
@@ -4676,19 +4675,14 @@ impl CallGraphStore {
             // Atomically publish the new generation, then best-effort GC old ones.
             verify_writer_lease(&writer_lease)?;
             publish_pointer(callgraph_dir, project_key, &generation)?;
-            gc_old_generations(callgraph_dir, project_key, &generation);
+            gc_old_generations_locked(callgraph_dir, project_key, &generation);
             // Store-wide orphan sweep on the same cadence: reclaims aged build
             // temps for roots that no longer build here, which the per-root GC
             // above never reaches.
             sweep_orphaned_build_temps_store_wide(callgraph_dir);
-            sweep_orphaned_callgraph_root_dirs(callgraph_dir);
+            // Storage-wide retention is scheduled independently of cold builds;
+            // payload age alone is not proof that a checkout has been abandoned.
             crate::search_index::sweep_transient_search_cache_dirs();
-            if let Some(storage_root) = root_storage_dir(callgraph_dir) {
-                let inspect_root =
-                    storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
-                let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(&storage_root);
-                crate::inspect::cache::sweep_inspect_scope_dirs(&inspect_root, &live_scope_keys);
-            }
             Ok(())
         });
         // A superseded generation remains a valid resumable staging artifact.
@@ -9101,6 +9095,10 @@ fn publish_migrated_generation(
     checkpoint_sqlite_before_publication(temp_path);
     let publication = publish_if_current(|| {
         verify_writer_lease(&writer_lease)?;
+        let _publication_gc = crate::fs_lock::try_acquire(
+            &publication_gc_lock(callgraph_dir, project_key),
+            Duration::from_secs(5),
+        )?;
         remove_sqlite_file_set(&gen_path);
         rename_sqlite_file_set(temp_path, &gen_path)?;
         // A backup copy is written in rollback mode; switch it while no
@@ -10617,15 +10615,25 @@ fn publish_pointer(callgraph_dir: &Path, project_key: &str, generation: &str) ->
 struct GenerationGcCandidate {
     name: String,
     path: PathBuf,
-    modified: SystemTime,
 }
 
-/// Best-effort GC of superseded generation files. The current pointer target and
-/// newest previous generation are always retained. Older generations are removed
-/// when they have no protected read marker, or after the absolute retention TTL
-/// even if an ultra-stale marker remains. Stale marker files are reclaimed during
-/// every sweep so dead-PID and expired cross-host readers do not pin disk forever.
-fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
+/// Superseded generations are rebuildable, not a rollback archive. Only the
+/// current pointer and live readers retain them; age never overrides a reader.
+fn publication_gc_lock(callgraph_dir: &Path, project_key: &str) -> PathBuf {
+    callgraph_dir.join(format!("{project_key}.publication.lock"))
+}
+
+pub(crate) fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) -> usize {
+    let Ok(_publication) = crate::fs_lock::try_acquire(
+        &publication_gc_lock(callgraph_dir, project_key),
+        Duration::ZERO,
+    ) else {
+        return 0;
+    };
+    gc_old_generations_locked(callgraph_dir, project_key, current)
+}
+
+fn gc_old_generations_locked(callgraph_dir: &Path, project_key: &str, current: &str) -> usize {
     let temp_grace = Duration::from_secs(60);
     let now = SystemTime::now();
     let pointer_current =
@@ -10637,10 +10645,10 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
         format!("{project_key}.sqlite.tmp."), // legacy-scheme build temps
     ];
     let Ok(entries) = std::fs::read_dir(callgraph_dir) else {
-        return;
+        return 0;
     };
     let mut gens: Vec<GenerationGcCandidate> = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries.take(4096).flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy().to_string();
         let mtime = entry.metadata().and_then(|m| m.modified()).unwrap_or(now);
@@ -10672,45 +10680,31 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
             gens.push(GenerationGcCandidate {
                 name,
                 path: entry.path(),
-                modified: mtime,
             });
         }
     }
 
-    let mut superseded = gens
-        .iter()
-        .filter(|generation| generation.name != pointer_current)
-        .collect::<Vec<_>>();
-    superseded.sort_by(|left, right| {
-        right
-            .modified
-            .cmp(&left.modified)
-            .then_with(|| right.name.cmp(&left.name))
-    });
-    let previous = superseded.first().map(|generation| generation.name.clone());
-
+    let mut removed = 0;
     for generation in gens {
         let sweep = crate::root_cache::sweep_read_markers(callgraph_dir, &generation.name);
-        if generation.name == pointer_current
-            || Some(generation.name.as_str()) == previous.as_deref()
-        {
+        if generation.name == pointer_current {
             continue;
         }
-
-        let age = now
-            .duration_since(generation.modified)
-            .unwrap_or(Duration::ZERO);
-        if sweep.protected && age < MARKED_GENERATION_RETENTION_TTL {
+        if sweep.protected {
             continue;
         }
-
         remove_sqlite_file_set(&generation.path);
+        if generation.path.exists() {
+            continue; // An in-process connection kept the file set open.
+        }
+        removed += 1;
         let _ = std::fs::remove_file(migration_manifest_path(callgraph_dir, &generation.name));
         let _ = std::fs::remove_dir_all(crate::root_cache::read_marker_dir(
             callgraph_dir,
             &generation.name,
         ));
     }
+    removed
 }
 
 fn ensure_sqlite_files_closed(path: &Path) -> Result<()> {
@@ -10794,6 +10788,9 @@ enum CallgraphRootCandidate {
 /// writer lease before mutating it. A current memo entry remains eligible only for
 /// superseded-generation GC; an absent entry is eligible for whole-directory
 /// deletion after the conservative age threshold.
+// Retained for the isolated age-policy fixtures. Production scheduling uses
+// storage_retention, which requires durable bind history and root absence.
+#[allow(dead_code)]
 fn sweep_orphaned_callgraph_root_dirs(callgraph_dir: &Path) {
     let Some(storage_root) = root_storage_dir(callgraph_dir) else {
         return;
@@ -21217,6 +21214,48 @@ mod cold_build_insert_tests {
     }
 
     #[test]
+    fn storage_retention_serializes_with_callgraph_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "project";
+        let current = write_generation_with_age(dir.path(), key, 2, Duration::ZERO);
+        let previous = write_generation_with_age(dir.path(), key, 1, Duration::from_secs(1));
+        let publication =
+            crate::fs_lock::try_acquire(&publication_gc_lock(dir.path(), key), Duration::ZERO)
+                .unwrap();
+        assert_eq!(gc_old_generations(dir.path(), key, &current), 0);
+        assert!(dir.path().join(&previous).exists());
+        drop(publication);
+        assert_eq!(gc_old_generations(dir.path(), key, &current), 1);
+        assert!(!dir.path().join(previous).exists());
+    }
+
+    #[test]
+    fn storage_retention_removes_unheld_previous_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "project";
+        let current = write_generation_with_age(dir.path(), key, 2, Duration::ZERO);
+        let previous = write_generation_with_age(dir.path(), key, 1, Duration::from_secs(1));
+        gc_old_generations(dir.path(), key, &current);
+        assert!(dir.path().join(current).exists());
+        assert!(!dir.path().join(previous).exists());
+    }
+
+    #[test]
+    fn storage_retention_live_reader_has_no_absolute_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "project";
+        let current = write_generation_with_age(dir.path(), key, 3, Duration::ZERO);
+        write_generation_with_age(dir.path(), key, 2, Duration::from_secs(1));
+        let old = write_generation_with_age(dir.path(), key, 1, Duration::from_secs(86400));
+        let marker = crate::root_cache::ReadMarker::create(dir.path(), &old).unwrap();
+        gc_old_generations(dir.path(), key, &current);
+        assert!(dir.path().join(&old).exists());
+        drop(marker);
+        gc_old_generations(dir.path(), key, &current);
+        assert!(!dir.path().join(old).exists());
+    }
+
+    #[test]
     fn gc_old_generations_preserves_live_reader_until_marker_drops() {
         let dir = tempfile::tempdir().unwrap();
         let project_key = "project";
@@ -21229,13 +21268,13 @@ mod cold_build_insert_tests {
 
         gc_old_generations(dir.path(), project_key, &current);
 
-        assert!(dir.path().join(&previous).is_file());
+        assert!(!dir.path().join(&previous).exists());
         assert!(dir.path().join(&pinned).is_file());
 
         drop(marker);
         gc_old_generations(dir.path(), project_key, &current);
 
-        assert!(dir.path().join(&previous).is_file());
+        assert!(!dir.path().join(&previous).exists());
         assert!(!dir.path().join(&pinned).exists());
     }
 
@@ -21257,10 +21296,10 @@ mod cold_build_insert_tests {
     }
 
     #[test]
-    fn gc_old_generations_applies_retention_ttl_to_marked_old_generations() {
+    fn gc_old_generations_retains_old_live_markers_without_an_age_override() {
         let dir = tempfile::tempdir().unwrap();
         let project_key = "project";
-        let expired = MARKED_GENERATION_RETENTION_TTL + Duration::from_secs(60);
+        let expired = Duration::from_secs(24 * 60 * 60);
         let current = write_generation_with_age(dir.path(), project_key, 400, Duration::ZERO);
         let previous = write_generation_with_age(dir.path(), project_key, 300, expired);
         let old = write_generation_with_age(
@@ -21274,8 +21313,8 @@ mod cold_build_insert_tests {
         gc_old_generations(dir.path(), project_key, &current);
 
         assert!(dir.path().join(&current).is_file());
-        assert!(dir.path().join(&previous).is_file());
-        assert!(!dir.path().join(&old).exists());
+        assert!(!dir.path().join(&previous).exists());
+        assert!(dir.path().join(&old).exists());
     }
 
     fn write_aged_callgraph_root(callgraph_root: &Path, key: &str) -> PathBuf {
@@ -21577,7 +21616,7 @@ mod cold_build_insert_tests {
 
         assert_eq!(summary.generation_gc, 1);
         assert!(cache_dir.join(&current).is_file());
-        assert!(cache_dir.join(&previous).is_file());
+        assert!(!cache_dir.join(&previous).exists());
         assert!(
             !cache_dir.join(&obsolete).exists(),
             "the store-wide sweep must collect an inactive live root's obsolete generation"

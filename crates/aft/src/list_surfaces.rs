@@ -347,6 +347,42 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "bounded filesystem fallback and empty-scope exclusion probe; ignored directories are pruned and counted once, and an exhausted probe reports unknown/incomplete rather than claiming an empty filesystem",
     },
     ExclusionEntry {
+        file: "storage_retention.rs",
+        enclosing_item: "bounded_dirs, next_batch, tree_files, run_pass, prune_bindings",
+        location_or_primitive: "PASS_ENTRIES, TREE_ENTRIES, HISTORY_ENTRIES, take",
+        reason: "internal disk-maintenance walks, not tool-result lists; bounds apply before filtering and incomplete protection snapshots refuse deletion; health reports examined, removed and stopped-early counts",
+    },
+    ExclusionEntry {
+        file: "views/registry.rs",
+        enclosing_item: "members_bounded, read_members_limited",
+        location_or_primitive: "SQL LIMIT",
+        reason: "internal family membership census, not an agent-visible list; an incomplete membership snapshot aborts background marking rather than deleting unmarked content",
+    },
+    ExclusionEntry {
+        file: "views/generation.rs",
+        enclosing_item: "blob_references_by_generation, sweep_generations_locked, remove_generation_files",
+        location_or_primitive: "take(4097), take(65537), take(65536)",
+        reason: "internal generation/protection enumeration; ownership or blob-mark overflow aborts before deletion, while an incomplete temporary-file deletion pass only leaves garbage for a later pass",
+    },
+    ExclusionEntry {
+        file: "gc/mod.rs",
+        enclosing_item: "sweep_bounded, mark_live_assembly_pins, sweep_plane",
+        location_or_primitive: "take(8193), take(4097), LIMIT 4096",
+        reason: "internal mark-and-sweep budgets; incomplete marks refuse deletion and a SQL keyset cursor resumes bounded deletion; row/deletion counts and compaction deferrals are reported",
+    },
+    ExclusionEntry {
+        file: "root_cache.rs",
+        enclosing_item: "read_marker_protection",
+        location_or_primitive: "take(4097)",
+        reason: "internal reader-protection census; an unread marker or iterator overflow is protected, never permission to unlink a generation",
+    },
+    ExclusionEntry {
+        file: "callgraph_store/mod.rs",
+        enclosing_item: "gc_old_generations",
+        location_or_primitive: "take(4096)",
+        reason: "internal generation deletion batch, not a query result list; the current pointer and protected readers are checked independently for every candidate",
+    },
+    ExclusionEntry {
         file: "logging.rs",
         enclosing_item: "write_str",
         location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",

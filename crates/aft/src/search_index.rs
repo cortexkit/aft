@@ -6642,6 +6642,9 @@ fn artifact_key_looks_valid(key: &str) -> bool {
 /// Reclaim old index directories that no configured or in-process root can use.
 /// Each candidate holds both search and root-keyed writer leases until deletion,
 /// so a concurrent publisher leaves the directory for a later maintenance pass.
+// Retained for isolated cache-lock fixtures; production eviction is scheduled
+// through storage_retention rather than inferring abandonment from payload age.
+#[allow(dead_code)]
 pub(crate) fn sweep_orphaned_index_dirs(storage_root: &Path) {
     let index_root = storage_root.join("index");
     let referenced_keys = match referenced_artifact_cache_keys(storage_root) {

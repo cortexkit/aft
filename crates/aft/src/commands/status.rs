@@ -514,6 +514,7 @@ impl AppContext {
             "degraded": degraded,
             "degraded_reasons": degraded_reasons,
             "storage_refusals": storage_refusals,
+            "storage_retention": crate::storage_retention::snapshot(&storage_root),
             "git": crate::developer_tools::git_status_json(),
             "features": {
                 "format_on_edit": config.format_on_edit,

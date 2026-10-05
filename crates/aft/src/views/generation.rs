@@ -65,7 +65,12 @@ impl ViewStore {
         &self,
     ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<[u8; 32]>>> {
         let mut result = std::collections::BTreeMap::new();
-        for entry in fs::read_dir(self.view_dir())? {
+        for (index, entry) in fs::read_dir(self.view_dir())?.take(4097).enumerate() {
+            if index == 4096 {
+                return Err(ViewError::InvalidManifest(
+                    "blob reference scan exceeded 4096 entries".into(),
+                ));
+            }
             let entry = entry?;
             let name = entry.file_name();
             let Some(generation) = name
@@ -97,16 +102,36 @@ impl ViewStore {
     /// Remove generation files only after checking both durable publication and
     /// liveness. A dead assembler can leave a derived file before any manifest.
     pub fn sweep_generations(&self) -> Result<usize> {
+        let _barrier = crate::storage_retention::pin_barrier(self.view_dir())?;
+        self.sweep_generations_locked()
+    }
+
+    pub(crate) fn sweep_generations_locked(&self) -> Result<usize> {
         // A publisher cannot add a reference after the ownership snapshot and
         // release its base pin before the sweep checks that pin.
         let mut pointer = self.open_pointer_connection()?;
-        let _ownership =
+        let ownership =
             pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current = self.current_generation()?;
+        let current: String = ownership.query_row(
+            "SELECT generation FROM pointer WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let current = (!current.is_empty()).then_some(current);
         let mut generations = std::collections::BTreeSet::new();
         let mut derived_owners = std::collections::BTreeSet::new();
-        for entry in fs::read_dir(self.view_dir())? {
-            let entry = entry?;
+        let mut temporaries: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        // A partial ownership snapshot could omit a reference to a shared
+        // derived file. Fail closed at the iterator bound, before any deletion.
+        let entries = fs::read_dir(self.view_dir())?
+            .take(65537)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        if entries.len() > 65536 {
+            return Err(ViewError::InvalidManifest(
+                "generation sweep exceeded 65536 entries".into(),
+            ));
+        }
+        for entry in entries {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if let Some(generation) = name
@@ -132,6 +157,12 @@ impl ViewStore {
                         .and_then(|s| s.split_once(".json.tmp.").map(|(generation, _)| generation))
                 });
             if let Some(generation) = generation {
+                if name.starts_with(".manifest-") {
+                    temporaries
+                        .entry(generation.to_owned())
+                        .or_default()
+                        .push(entry.path());
+                }
                 generations.insert(generation.to_owned());
             }
         }
@@ -139,7 +170,7 @@ impl ViewStore {
         for generation in generations {
             // Even an obsolete reference protects its owner until the next sweep.
             // This keeps shared files alive without depending on directory order.
-            if current.as_deref() == Some(&generation) || derived_owners.contains(&generation) {
+            if current.as_deref() == Some(&generation) {
                 continue;
             }
             let (metadata_path, keys_path) = crate::pins::pin_paths(self.view_dir(), &generation);
@@ -151,10 +182,7 @@ impl ViewStore {
                 else {
                     continue;
                 };
-                if crate::pins::owner_is_live(&metadata.owner)
-                    && crate::pins::now_ms().saturating_sub(metadata.renewed_at)
-                        <= crate::pins::PIN_TTL_MS
-                {
+                if crate::pins::owner_is_live(&metadata.owner) {
                     continue;
                 }
                 let _ = fs::remove_file(metadata_path);
@@ -163,24 +191,26 @@ impl ViewStore {
             if crate::root_cache::sweep_read_markers(self.view_dir(), &generation).protected {
                 continue;
             }
-            // Recheck after pin inspection: a publisher keeps its assembly pin
-            // until its committed pointer is visible.
-            if self.current_generation()?.as_deref() == Some(&generation) {
-                continue;
+            // The pointer write transaction still excludes publication here.
+            if let Some(paths) = temporaries.remove(&generation) {
+                for path in paths {
+                    let _ = fs::remove_file(path);
+                }
             }
-            self.remove_generation_files(&generation);
-            removed += 1;
+            if self.try_remove_generation_files_policy(
+                &generation,
+                derived_owners.contains(&generation),
+            ) {
+                removed += 1;
+            }
         }
         Ok(removed)
     }
 
     pub(super) fn remove_generation_files(&self, generation: &str) {
-        if super::validate_generation(generation).is_err() {
-            return;
-        }
         let temporary_prefix = format!(".manifest-{generation}.json.tmp.");
         if let Ok(entries) = fs::read_dir(self.view_dir()) {
-            for entry in entries.flatten() {
+            for entry in entries.take(65536).flatten() {
                 if entry
                     .file_name()
                     .to_str()
@@ -190,6 +220,28 @@ impl ViewStore {
                 }
             }
         }
+        self.try_remove_generation_files(generation);
+    }
+
+    fn try_remove_generation_files(&self, generation: &str) -> bool {
+        self.try_remove_generation_files_policy(generation, false)
+    }
+
+    fn try_remove_generation_files_policy(&self, generation: &str, keep_derived: bool) -> bool {
+        if super::validate_generation(generation).is_err() {
+            return false;
+        }
+        // The identity registry enforces (rather than merely logs) the same
+        // no-unlink-while-open boundary as callgraph generation deletion.
+        let _files = crate::db::file_identity::filesystem_guard();
+        if !keep_derived
+            && crate::db::file_identity::open_connections(
+                &self.view_dir().join(format!("derived-{generation}.sqlite")),
+            ) != 0
+        {
+            return false;
+        }
+        let mut removed = false;
         for path in [
             Ok(self.view_dir().join(format!("derived-{generation}.sqlite"))),
             Ok(self.view_dir().join(format!("derived-{generation}.ref"))),
@@ -199,13 +251,20 @@ impl ViewStore {
         .into_iter()
         .flatten()
         {
-            crate::db::file_identity::guard_replacement(&path, "view generation sweep");
+            if keep_derived
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "sqlite")
+            {
+                continue;
+            }
             for suffix in ["", "-wal", "-shm"] {
                 let mut name = path.as_os_str().to_owned();
                 name.push(suffix);
-                let _ = fs::remove_file(PathBuf::from(name));
+                removed |= fs::remove_file(PathBuf::from(name)).is_ok();
             }
         }
+        removed
     }
 }
 
@@ -769,5 +828,64 @@ mod ownership_tests {
             .unwrap()
             .unwrap();
         worker.join().unwrap();
+    }
+}
+#[cfg(test)]
+mod storage_retention_tests {
+    use super::*;
+    #[test]
+    fn storage_retention_shared_derived_owner_does_not_retain_obsolete_manifest_or_trigram() {
+        let temp = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
+        let database = view.derived_path("old").unwrap();
+        fs::write(&database, b"shared database").unwrap();
+        let manifest = view.manifest_path("old").unwrap();
+        let trigram = view.trigram_path("old").unwrap();
+        fs::write(&manifest, b"manifest").unwrap();
+        fs::write(&trigram, b"trigram").unwrap();
+        view.reuse_derived("current", "old").unwrap();
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'current'", [])
+            .unwrap();
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(database.exists());
+        assert!(!manifest.exists());
+        assert!(!trigram.exists());
+    }
+
+    #[test]
+    fn storage_retention_live_assembly_pin_has_no_absolute_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(directory.path(), "0123456789abcdef").unwrap();
+        let path = view.derived_path("old").unwrap();
+        fs::write(&path, b"generation").unwrap();
+        let pin = crate::pins::AssemblyPin::create(view.view_dir(), "family", "view", "old", &[])
+            .unwrap();
+        let mut metadata = pin.metadata().clone();
+        metadata.renewed_at = 0;
+        fs::write(
+            view.view_dir().join("pins/old.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(view.sweep_generations().unwrap(), 0);
+        assert!(path.exists());
+        drop(pin);
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!path.exists());
+    }
+    #[test]
+    fn storage_retention_keeps_open_derived_file_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(directory.path(), "0123456789abcdef").unwrap();
+        let path = view.derived_path("old").unwrap();
+        let connection =
+            crate::db::file_identity::IdentityConnection::open(&path, "retention test").unwrap();
+        assert_eq!(view.sweep_generations().unwrap(), 0);
+        assert!(path.exists());
+        drop(connection);
+        assert_eq!(view.sweep_generations().unwrap(), 1);
+        assert!(!path.exists());
     }
 }

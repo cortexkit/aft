@@ -366,6 +366,9 @@ impl FamilyRegistry {
     /// [`super::eviction::admit_new_view`]. Re-binding an existing member is
     /// never refused.
     pub fn register_view(&self, scope: &str, root: &Path) -> RegistryResult<ViewRegistration> {
+        if matches!(root.try_exists(), Ok(true)) {
+            crate::storage_retention::record_bind(&self.inner.storage, root, self.family())?;
+        }
         let view_dir = view_dir(&self.inner.storage, scope)?;
         if self.member(scope)?.is_none() {
             super::eviction::admit_new_view(self)?;
@@ -506,6 +509,17 @@ impl FamilyRegistry {
 
     pub fn members(&self) -> RegistryResult<Vec<MemberRecord>> {
         read_members(&self.connection())
+    }
+
+    pub(crate) fn members_bounded(&self, limit: usize) -> RegistryResult<Vec<MemberRecord>> {
+        let connection = self.connection();
+        let members = read_members_limited(&connection, limit.saturating_add(1))?;
+        if members.len() > limit {
+            return Err(RegistryError::Incompatible(format!(
+                "member walk exceeded {limit} rows"
+            )));
+        }
+        Ok(members)
     }
 
     pub fn member(&self, scope: &str) -> RegistryResult<Option<MemberRecord>> {
@@ -994,12 +1008,19 @@ pub(crate) fn current_owner() -> PinOwner {
 }
 
 pub(crate) fn read_members(connection: &rusqlite::Connection) -> RegistryResult<Vec<MemberRecord>> {
+    read_members_limited(connection, usize::MAX)
+}
+
+fn read_members_limited(
+    connection: &rusqlite::Connection,
+    limit: usize,
+) -> RegistryResult<Vec<MemberRecord>> {
     let mut statement = connection.prepare(
         "SELECT scope, root, view_dir, registered_at_ms, last_bind_ms, last_publish_ms,
                 missing_sweeps, state
-         FROM members ORDER BY scope",
+         FROM members ORDER BY scope LIMIT ?1",
     )?;
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
         Ok(MemberRecord {
             scope: row.get(0)?,
             root: row.get::<_, Option<Vec<u8>>>(1)?.and_then(decode_root),
@@ -1064,7 +1085,7 @@ pub(crate) fn has_live_session(
 
 /// Removes a view directory, treating one that is already gone as removed.
 pub(crate) fn remove_view_dir(view_dir: &Path) -> std::io::Result<()> {
-    match fs::remove_dir_all(view_dir) {
+    match crate::storage_retention::remove_directory_if_closed(view_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),

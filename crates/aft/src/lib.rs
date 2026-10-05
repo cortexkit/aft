@@ -158,6 +158,7 @@ pub mod setup_plan;
 pub mod standing_roots;
 #[cfg(all(test, unix))]
 mod storage_permissions_tests;
+pub(crate) mod storage_retention;
 pub mod subc;
 pub mod subc_config;
 pub mod subc_format;

@@ -1954,6 +1954,12 @@ fn build_health_diagnostic_rollup(
                     }),
             );
         }
+        crate::storage_retention::schedule(
+            ctx.storage_dir(),
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            ctx.configure_generation(),
+        );
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
             entry
@@ -2224,6 +2230,10 @@ fn build_health_diagnostic_rollup(
         },
         "memory": memory,
         "bash_task_retention": bash_task_retention_metrics(shared_app),
+        "storage_retention": lifecycle_contexts.iter().filter_map(|ctx| {
+            let storage = ctx.storage_dir();
+            crate::storage_retention::snapshot(&storage).map(|report| (storage.display().to_string(), report))
+        }).collect::<std::collections::BTreeMap<_, _>>(),
         "bash_db_schema_hints": bash_db_hint_metrics(),
         "bash_task_refusals": bash_task_refusals,
         "mutating_lanes": mutating_lanes_metrics(executor),

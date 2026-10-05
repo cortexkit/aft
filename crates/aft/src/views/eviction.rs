@@ -1866,6 +1866,23 @@ mod tests {
         let generation = publish(&view, &[("file.txt", text(5, 2_000))], 16);
         let view_dir = view.view_dir().to_path_buf();
         drop(view);
+        registry
+            .with_barrier(|tx| {
+                tx.execute(
+                    "UPDATE members SET last_bind_ms = 0 WHERE scope = 'removed'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let binding = storage.path().join(format!(
+            "retention/roots/{}.json",
+            crate::path_identity::project_scope_key(&root)
+        ));
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&binding).unwrap()).unwrap();
+        record["last_bound_ms"] = serde_json::json!(0);
+        fs::write(binding, serde_json::to_vec(&record).unwrap()).unwrap();
         fs::remove_dir_all(&root).unwrap();
         let reader = registry.register_reader("parent-folder").unwrap();
         let marker = reader.protect_current("removed").unwrap().unwrap();

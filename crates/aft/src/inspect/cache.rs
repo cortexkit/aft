@@ -1698,6 +1698,9 @@ enum InspectScopeCandidateResult {
 /// Process-wide inspect-scope GC. The caller supplies the scope keys currently
 /// bound in this process; the cursor lets the same publication cadence resume
 /// after a large or slow first-level directory exceeds its wall-clock budget.
+// The standalone age-policy fixtures still exercise this helper. Runtime
+// eviction uses storage_retention and its durable root/binding checks.
+#[allow(dead_code)]
 pub(crate) fn sweep_inspect_scope_dirs(
     inspect_root: &Path,
     live_scope_keys: &HashSet<String>,

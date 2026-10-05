@@ -81,6 +81,20 @@ def protections(directory):
     return held
 
 
+def old_binding(record, now):
+    if now - record["last_bound_ms"] < AGE_MS:
+        return False
+    volume = record.get("volume")
+    if volume:
+        try:
+            return os.stat(volume[0]).st_dev == volume[1]
+        except OSError:
+            return False
+    # Legacy paths lack a recorded device identity. Only disposable worktrees
+    # are known to be permanently removed, not temporarily unmounted projects.
+    return "/cortexkit/alfonso/worktrees/" in record["root"]
+
+
 def manifest_keys(value):
     if isinstance(value, dict):
         for key, child in value.items():
@@ -187,10 +201,11 @@ def census(root):
                 current.add("*")
             else:
                 current.update(held)
+            owners = set()
             for generation in list(current):
                 reference = base / f"derived-{generation}.ref"
                 if reference.is_file():
-                    current.add(reference.read_text().strip())
+                    owners.add(reference.read_text().strip())
             # Keys are content addressed globally. Mark every retained live manifest,
             # including pinned generations, not only this project's current one.
             for manifest in base.glob("manifest-*.json"):
@@ -201,11 +216,10 @@ def census(root):
                             referenced.update(manifest_keys(read_json(manifest)))
                         except (ValueError, OSError) as error:
                             gaps.append(f"{manifest}: {error}")
-            old = bool(records) and all(now - item["last_bound_ms"] >= AGE_MS and
-                not item["root"].startswith("/Volumes/") for item in records)
-            directories[identity] = (live, protected, current, old, records)
+            old = bool(records) and all(old_binding(item, now) for item in records)
+            directories[identity] = (live, protected, current, old, records, owners)
             directory_count[domain] += 1
-        live, protected, current, old, records = directories[identity]
+        live, protected, current, old, records, owners = directories[identity]
         generation = None
         match = re.match(r"(?:derived-|manifest-|trigram-)(.+)\.(?:sqlite|json|bin|ref)(?:-(?:wal|shm))?$", path.name)
         if match:
@@ -213,7 +227,8 @@ def census(root):
         elif re.match(re.escape(key) + r"\.g.*\.sqlite(?:-(?:wal|shm))?$", path.name):
             generation = re.sub(r"-(?:wal|shm)$", "", path.name)
         category = "live/current+coordination" if live else "dead/unknown root"
-        if live and generation and generation not in current and "*" not in current:
+        shared_derived = generation in owners and path.name.startswith("derived-") and ".sqlite" in path.name
+        if live and generation and generation not in current and "*" not in current and not shared_derived:
             category = "live/superseded"
             plans[(str(base), generation, "unheld superseded generation")] += stat.st_blocks * 512
         elif not live and old and not protected:
@@ -251,9 +266,57 @@ def census(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--storage-root", type=pathlib.Path, required=True)
+    parser.add_argument("--storage-root", type=pathlib.Path)
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if args.storage_root is None:
+        parser.error("--storage-root is required unless --self-test is used")
     print(json.dumps(census(args.storage_root.resolve()), indent=2, sort_keys=True))
+
+
+def self_test():
+    import tempfile
+    import unittest
+    from unittest import mock
+
+    class ReadOnlyReportTests(unittest.TestCase):
+        def test_sqlite_cli_is_always_readonly_and_never_ignores_a_wal(self):
+            with tempfile.TemporaryDirectory() as temp:
+                path = pathlib.Path(temp, "database.sqlite")
+                path.touch()
+                completed = subprocess.CompletedProcess([], 0, "[]", "")
+                with mock.patch.object(subprocess, "run", return_value=completed) as run:
+                    sqlite_ro(path, "SELECT 1")
+                    self.assertEqual(run.call_args.args[0][:3], ["sqlite3", "-readonly", "-json"])
+                    self.assertIn("immutable=1", run.call_args.args[0][3])
+                    pathlib.Path(str(path) + "-wal").write_bytes(b"fixture WAL")
+                    sqlite_ro(path, "SELECT 1")
+                    self.assertNotIn("immutable", run.call_args.args[0][3])
+
+        def test_real_readonly_cli_query_does_not_change_its_file_set(self):
+            with tempfile.TemporaryDirectory() as temp:
+                path = pathlib.Path(temp, "database.sqlite")
+                subprocess.run(["sqlite3", str(path), "CREATE TABLE state(value); INSERT INTO state VALUES(42);"], check=True)
+                before = [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in pathlib.Path(temp).iterdir()]
+                self.assertEqual(sqlite_ro(path, "SELECT value FROM state"), [{"value": 42}])
+                after = [(p.name, p.stat().st_size, p.stat().st_mtime_ns) for p in pathlib.Path(temp).iterdir()]
+                self.assertEqual(before, after)
+
+        def test_missing_mount_and_recent_binding_are_kept(self):
+            now = int(time.time() * 1000)
+            record = {"root": "/gone", "last_bound_ms": 0, "volume": ["/missing-volume-for-retention-test", 1]}
+            self.assertFalse(old_binding(record, now))
+            record = {"root": "/data/cortexkit/alfonso/worktrees/gone", "last_bound_ms": now}
+            self.assertFalse(old_binding(record, now))
+            record["last_bound_ms"] = 0
+            self.assertTrue(old_binding(record, now))
+
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(ReadOnlyReportTests))
+    if not result.wasSuccessful():
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

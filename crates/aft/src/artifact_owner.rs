@@ -589,6 +589,17 @@ fn manifest_owner_alive(manifest: &ArtifactOwnerManifest) -> bool {
     process_alive(manifest.pid)
 }
 
+pub(crate) fn protected_for_retention(manifest: &ArtifactOwnerManifest) -> bool {
+    if manifest.hostname != current_hostname() {
+        return true;
+    }
+    if !process_alive(manifest.pid) {
+        return false;
+    }
+    crate::root_cache::process_start_time_ms(manifest.pid)
+        .is_none_or(|start| start <= manifest.created_at_ms.saturating_add(1000))
+}
+
 fn reclaim_manifest_if_unchanged(path: &Path, judged: &ArtifactOwnerManifest) -> io::Result<bool> {
     match read_manifest(path) {
         Ok(current)
@@ -874,6 +885,7 @@ fn owner_manifest_is_orphaned(manifest: &ArtifactOwnerManifest, now: u64) -> boo
     !manifest.checkout_path.is_empty()
         && matches!(Path::new(&manifest.checkout_path).try_exists(), Ok(false))
         && now.saturating_sub(manifest.heartbeat_at_ms) > OWNER_REAP_MIN_HEARTBEAT_AGE_MS
+        && !protected_for_retention(manifest)
 }
 
 fn heartbeat_interval_ms() -> u64 {
@@ -1333,7 +1345,7 @@ mod tests {
             &path,
             checkout,
             key,
-            std::process::id(),
+            exited_owner_pid(),
             heartbeat_at_ms,
             None,
         );
@@ -1351,6 +1363,39 @@ mod tests {
                 summary
             })
             .collect()
+    }
+
+    #[test]
+    fn storage_retention_owner_reap_keeps_a_live_process_without_heartbeats() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("gone");
+        let path = owner_manifests_root(temp.path()).join("owner/owner.json");
+        write_synthetic_manifest_at_path_for_test(
+            &path,
+            &root,
+            "scope",
+            std::process::id(),
+            0,
+            None,
+        );
+        assert_eq!(
+            reap_owner_manifests_pass(temp.path(), 0, 512, now_ms()).removed,
+            0
+        );
+        assert!(path.exists());
+        write_synthetic_manifest_at_path_for_test(
+            &path,
+            &root,
+            "scope",
+            exited_owner_pid(),
+            0,
+            None,
+        );
+        assert_eq!(
+            reap_owner_manifests_pass(temp.path(), 0, 512, now_ms()).removed,
+            1
+        );
+        assert!(!path.exists());
     }
 
     #[test]

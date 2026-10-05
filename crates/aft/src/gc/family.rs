@@ -247,7 +247,7 @@ pub fn sweep_family_bounded(
     observe(observer, SweepStep::EpochRaised);
 
     report.reclaimed_readers = registry.reclaim_dead_readers()?;
-    let members = registry.members()?;
+    let members = registry.members_bounded(8192)?;
     let mut marked = BTreeSet::new();
     for member in &members {
         if bounds.past_deadline() {
@@ -288,6 +288,10 @@ pub fn sweep_family_bounded(
     observe(observer, SweepStep::Deleted);
 
     for member in &members {
+        if bounds.past_deadline() {
+            report.stopped_early = true;
+            break;
+        }
         deregister_if_missing(registry, member, observer, &mut report)?;
     }
     lease.release();
@@ -665,7 +669,14 @@ fn deregister_if_missing(
     observer: Option<&dyn SweepObserver>,
     report: &mut FamilySweepReport,
 ) -> Result<(), FamilySweepError> {
-    let missing = root_is_missing(member);
+    let missing = root_is_missing(member)
+        && member.root.as_ref().is_some_and(|root| {
+            crate::storage_retention::missing_root_due(
+                registry.storage(),
+                root,
+                member.last_bind_ms,
+            )
+        });
     let counted = registry.with_barrier(|tx| count_missing_sweep(tx, member, missing))?;
     let outcome = match counted {
         Deregistration::Due { recorded } => {
@@ -738,14 +749,25 @@ fn remove_if_still_due(
     if i64::from(current.missing_sweeps) != recorded {
         return Ok(Deregistration::Retained);
     }
-    if !root_is_missing(&current) {
+    let storage = current
+        .view_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent);
+    if !root_is_missing(&current)
+        || !storage
+            .zip(current.root.as_ref())
+            .is_some_and(|(storage, root)| {
+                crate::storage_retention::missing_root_due(storage, root, current.last_bind_ms)
+            })
+    {
         reset_missing_sweeps(tx, scope)?;
         return Ok(Deregistration::Present);
     }
     if let Some(kept) = protection_outcome(tx, scope, &current.view_dir)? {
         return Ok(kept);
     }
-    match fs::remove_dir_all(&current.view_dir) {
+    match crate::views::registry::remove_view_dir(&current.view_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Ok(Deregistration::Retained),

@@ -149,6 +149,7 @@ impl AssemblyPin {
         generation: String,
         keys: Vec<String>,
     ) -> Result<Self, PinError> {
+        let _barrier = crate::storage_retention::pin_barrier(view_dir)?;
         validate_generation(&generation)?;
         let pins_dir = view_dir.join("pins");
         crate::private_storage::create_dir_all(&pins_dir)?;
@@ -245,6 +246,7 @@ pub struct QueryPin {
 
 impl QueryPin {
     pub fn acquire(view_dir: &Path, generation: &str) -> Result<Self, PinError> {
+        let _barrier = crate::storage_retention::pin_barrier(view_dir)?;
         Ok(Self {
             marker: ReadMarker::create(view_dir, generation)?,
         })
