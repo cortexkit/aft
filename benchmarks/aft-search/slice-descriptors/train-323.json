@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "slices": [
+    "sandbox-private-floor"
+  ],
+  "note": "Sandbox floor denies the daemon connection file and CortexKit data; no ranking change."
+}
