@@ -9,6 +9,7 @@ const FIRE_COUNT: u64 = 3;
 const ESCALATE_COUNT: u64 = 6;
 const MIN_SPAN: Duration = Duration::from_secs(30);
 const KEY_IDLE_EXPIRY: Duration = Duration::from_secs(10 * 60);
+const SESSION_IDLE_EXPIRY: Duration = KEY_IDLE_EXPIRY;
 const MAX_RECENT_CALLS_PER_SESSION: usize = 256;
 const MAX_LIVE_KEYS_PER_SESSION: usize = 64;
 
@@ -117,6 +118,12 @@ impl RepeatBreaker {
             input_hash: hash_value(&semantic_key),
         };
         let mut sessions = self.sessions.lock();
+        sessions.retain(|existing_id, state| {
+            existing_id == session_id
+                || state.calls.back().is_some_and(|last_call| {
+                    now.saturating_duration_since(last_call.observed_at) <= SESSION_IDLE_EXPIRY
+                })
+        });
         let session = sessions.entry(session_id.to_string()).or_default();
         session.expire_idle_keys(now);
         session.make_room_for_key(&key);
@@ -241,4 +248,42 @@ fn canonicalize(value: Value) -> Value {
 
 pub fn escalation_starts_at(count: u64) -> bool {
     count >= ESCALATE_COUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_growth_idle_sessions_are_pruned_without_dropping_the_current_session() {
+        let breaker = RepeatBreaker::default();
+        let start = Instant::now();
+        let cadence_secs = KEY_IDLE_EXPIRY.as_secs() + 1;
+        for index in 0..128 {
+            let session_id = format!("repeat-growth-{index}");
+            breaker.observe_at(
+                &session_id,
+                "read",
+                format!("path-{index}"),
+                index,
+                start + Duration::from_secs(cadence_secs * index),
+            );
+        }
+
+        let current = format!("repeat-growth-{}", 127);
+        let mut sessions = breaker.sessions.lock();
+        assert_eq!(sessions.len(), 1, "expired sessions must not accumulate");
+        let state = sessions.get_mut(&current).expect("current session remains");
+        assert_eq!(state.calls.len(), 1, "current call remains available");
+        drop(sessions);
+
+        breaker.observe_at(
+            &current,
+            "read",
+            "path-127".to_owned(),
+            128,
+            start + Duration::from_secs(cadence_secs * 127),
+        );
+        assert_eq!(breaker.sessions.lock()[&current].calls.len(), 2);
+    }
 }

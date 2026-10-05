@@ -413,6 +413,22 @@ fn unmeasurable_entries_snapshot() -> Vec<Arc<UnmeasurableEntry>> {
         .collect()
 }
 
+/// Drop folded map entries only after no writer still holds a counter handle.
+/// The Arc check keeps retained hot-path counters registered while allowing
+/// operation-boundary counters for one-off roots to disappear after a fold.
+fn prune_folded_entries() {
+    registry()
+        .entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, entry| Arc::strong_count(entry) > 1 || entry.pending() != (0, 0));
+    registry()
+        .unmeasurable_entries
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, entry| Arc::strong_count(entry) > 1 || entry.pending() != (0, 0));
+}
+
 fn signed_difference(left: u64, right: u64) -> i64 {
     let difference = i128::from(left) - i128::from(right);
     difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
@@ -618,6 +634,9 @@ fn fold_minute_with_sample(
         sampled_at_ms,
     };
     refresh_recent_top(minute_ts, &folded);
+    drop(folded);
+    drop(folded_unmeasurable);
+    prune_folded_entries();
     conn.sample_write_pages();
     Ok(())
 }
@@ -1379,6 +1398,53 @@ mod tests {
         assert_eq!(
             row.seam_labels,
             vec!["fixture residual without a safe byte estimate".to_owned()]
+        );
+    }
+
+    #[test]
+    fn audit_growth_folded_inactive_roots_are_pruned_but_retained_counters_stay_registered() {
+        let _guard = test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let prefix = test_root("registry-growth");
+        let active_root = format!("{prefix}/active");
+        let active = register(Domain::SemanticDelta, active_root.clone());
+        for index in 0..128 {
+            let root = format!("{prefix}/inactive-{index}");
+            let counter = register(Domain::SemanticDelta, root);
+            counter.credit(1, 2);
+            counter.note_unmeasurable("growth", "fixture", Some(2), Some("fixture estimate"));
+        }
+
+        fold_minute_with_sample(&mut conn, now_ms(), None).unwrap();
+
+        let retained_roots = registry()
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|(_, root)| root.starts_with(&prefix))
+            .count();
+        let retained_unmeasurable = registry()
+            .unmeasurable_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|(root, _)| root.starts_with(&prefix))
+            .count();
+        assert_eq!(
+            retained_roots, 1,
+            "only the retained active counter remains"
+        );
+        assert_eq!(
+            retained_unmeasurable, 0,
+            "folded seam records are disposable"
+        );
+
+        active.credit(7, 11);
+        assert_eq!(
+            pending_for_test(Domain::SemanticDelta, &active_root),
+            (7, 11)
         );
     }
 }
