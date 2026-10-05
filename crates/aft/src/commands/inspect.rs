@@ -26,6 +26,9 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
+// The remaining reasons stay in the body and structured gaps. This is a
+// presentation limit, not a limit on analysis or completion accounting.
+const MAX_INSPECT_HEADER_PARTS: usize = 3;
 // Give each waiting phase at most half the remaining work time so a slow
 // producer leaves room for other categories and final freshness verification.
 // The cap avoids turning large configured budgets into equally long waits.
@@ -982,6 +985,11 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
             ),
         };
         crate::response_finalize::attach_checkout_query_gaps(&mut response, &ctx);
+        if response.success {
+            if let Some(payload) = response.data.as_object_mut() {
+                set_inspect_completion(payload);
+            }
+        }
         let _ = tx.send(response);
     });
     DispatchOutcome::Deferred(PendingResponse {
@@ -1051,18 +1059,14 @@ fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCatego
         InspectCategory::Duplicates,
     ]
     .iter()
-    .any(|category| {
-        matches!(
-            outcomes.get(category),
-            Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. })
-        )
+    .any(|category| match outcomes.get(category) {
+        Some(JobOutcome::Fresh { payload }) => category_is_incomplete(payload),
+        Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. } | JobOutcome::Failed { .. }) => {
+            true
+        }
+        None => false,
     });
-    let todos = outcomes
-        .get(&InspectCategory::Todos)
-        .and_then(JobOutcome::payload)
-        .and_then(|payload| payload.get("count"))
-        .and_then(Value::as_u64)
-        .map(|count| count as usize);
+    let todos = count_of(InspectCategory::Todos);
 
     ctx.update_status_bar_tier2(
         count_of(InspectCategory::DeadCode),
@@ -1361,11 +1365,6 @@ fn run_blocking_inspect_body(
                 response.data["gaps"] = serde_json::json!([]);
             }
             response.data["gaps"].as_array_mut().unwrap().push(gap);
-            if let Some(text) = response.data["text"].as_str() {
-                response.data["text"] = Value::String(format!(
-                    "{text}\ncomplete: false — file freshness unverified; retry aft_inspect"
-                ));
-            }
             return build_inspect_terminal(
                 &req.id,
                 &phase_log,
@@ -1689,14 +1688,238 @@ enum InspectTerminal {
     },
 }
 
-/// The same diagnostic uncertainty is described once, in the status header.
-/// Structured gaps retain the full reasons and individual affected paths.
+/// Completion is about every reported category, not just language servers.
+/// Sections and topK select detail rows; neither changes which results count.
 pub(crate) fn partial_terminal_reason(payload: &Map<String, Value>) -> Option<String> {
-    let diagnostics = payload.get("summary")?.get("diagnostics")?;
-    diagnostics_unknown_reason(diagnostics)
+    partial_reason_from_parts(&incomplete_result_parts(payload))
 }
 
-fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
+fn incomplete_result_parts(payload: &Map<String, Value>) -> Vec<(bool, String)> {
+    let mut parts = payload
+        .get("summary")
+        .and_then(Value::as_object)
+        .map(incomplete_summary_parts)
+        .unwrap_or_default();
+    for gap in payload
+        .get("gaps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        // Category gaps are already explained by their summary. Final checkout
+        // and stat-verification gaps have no category and must also count.
+        if gap.get("categories").is_some() {
+            continue;
+        }
+        let label = match gap["kind"].as_str() {
+            Some("view_pending") => "callgraph view pending",
+            Some("stat_verification_incomplete") => "file freshness unverified",
+            _ => "analysis incomplete",
+        };
+        let reason = gap["reason"].as_str().unwrap_or("analysis did not finish");
+        let reason = format!("{label}: {}", compact_inspect_reason(reason));
+        if !parts.iter().any(|(_, existing)| existing == &reason) {
+            parts.push((false, reason));
+        }
+    }
+    if parts.is_empty() && payload.get("complete").and_then(Value::as_bool) == Some(false) {
+        parts.push((false, "analysis incomplete: no complete report".to_string()));
+    }
+    parts.sort_by_key(|(diagnostic, reason)| {
+        (*diagnostic, if *diagnostic { 0 } else { reason.len() })
+    });
+    parts
+}
+
+/// Finalization can add freshness gaps after scanners have answered. Keep the
+/// structured state and the already rendered status line in sync at that point.
+fn set_inspect_completion(payload: &mut Map<String, Value>) {
+    let partial = partial_terminal_reason(payload);
+    payload.insert("complete".to_string(), Value::Bool(partial.is_none()));
+    payload.insert(
+        "inspect_terminal".to_string(),
+        serde_json::json!(if partial.is_some() {
+            "partial"
+        } else {
+            "fresh"
+        }),
+    );
+    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+        let body = if text.starts_with("PARTIAL — ") || text.starts_with("FRESH\n") {
+            text.split_once('\n').map_or("", |(_, body)| body)
+        } else {
+            text
+        };
+        let header = partial.as_ref().map_or_else(
+            || "FRESH".to_string(),
+            |reason| format!("PARTIAL — {reason}"),
+        );
+        let mut text = if body.is_empty() {
+            header
+        } else {
+            format!("{header}\n{body}")
+        };
+        let summary_parts = payload
+            .get("summary")
+            .and_then(Value::as_object)
+            .map(incomplete_summary_parts)
+            .unwrap_or_default();
+        for (diagnostic, reason) in incomplete_result_parts(payload)
+            .into_iter()
+            .skip(MAX_INSPECT_HEADER_PARTS)
+        {
+            if diagnostic && !text.contains(&reason) {
+                text.push_str(&format!("\nIncomplete diagnostics: {reason}"));
+            }
+        }
+        for (_, reason) in incomplete_result_parts(payload) {
+            if !summary_parts.iter().any(|(_, part)| part == &reason) && !text.contains(&reason) {
+                text.push_str(&format!("\nIncomplete analysis: {reason}"));
+            }
+        }
+        payload.insert("text".to_string(), Value::String(text));
+    }
+    match partial {
+        Some(reason) => {
+            payload.insert("partial_reason".to_string(), Value::String(reason));
+        }
+        None => {
+            payload.remove("partial_reason");
+        }
+    }
+}
+
+fn category_is_incomplete(value: &Value) -> bool {
+    value.get("complete").and_then(Value::as_bool) == Some(false)
+        || value.get("unavailable").and_then(Value::as_bool) == Some(true)
+        || value.get("callgraph_available").and_then(Value::as_bool) == Some(false)
+}
+
+fn compact_inspect_reason(reason: &str) -> String {
+    reason
+        .trim_end_matches("; retry aft_inspect.")
+        .trim_end_matches("; retry aft_inspect")
+        .trim_end_matches("; retry")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn incomplete_analysis_reason(value: &Value) -> String {
+    let mut reasons = Vec::new();
+    for (key, cause) in [
+        ("parse_errors", "could not be parsed"),
+        ("skipped_files", "could not be analyzed"),
+    ] {
+        if let Some(files) = value
+            .get(key)
+            .and_then(Value::as_array)
+            .filter(|files| !files.is_empty())
+        {
+            let label = if files.len() == 1 { "file" } else { "files" };
+            reasons.push(format!("{} {label} {cause}", files.len()));
+        }
+    }
+    if !reasons.is_empty() {
+        return reasons.join("; ");
+    }
+    compact_inspect_reason(
+        value
+            .get("reason")
+            .or_else(|| value.get("callgraph_unavailable_reason"))
+            .and_then(Value::as_str)
+            .unwrap_or("analysis did not finish"),
+    )
+}
+
+fn incomplete_category_gaps(category: InspectCategory, value: &Value) -> Vec<Value> {
+    if let Some(gaps) = value
+        .get("gaps")
+        .and_then(Value::as_array)
+        .filter(|gaps| !gaps.is_empty())
+    {
+        return gaps.clone();
+    }
+    let reason = if category == InspectCategory::Diagnostics {
+        "no authoritative report".to_string()
+    } else {
+        incomplete_analysis_reason(value)
+    };
+    vec![serde_json::json!({"kind": "analysis_incomplete", "reason": reason})]
+}
+
+/// Short scanner explanations precede verbose diagnostic producer explanations.
+/// Diagnostic causes retain first-seen order, including their scoped roots.
+fn incomplete_summary_parts(summary: &Map<String, Value>) -> Vec<(bool, String)> {
+    let mut parts = Vec::new();
+    for (category, value) in summary {
+        if category == "diagnostics" || !category_is_incomplete(value) {
+            continue;
+        }
+        let label = category.replace('_', " ");
+        let reason = match value.pointer("/building/state").and_then(Value::as_str) {
+            Some("building") => format!("{label} still building"),
+            Some("rebuilding") => format!("{label} still rebuilding"),
+            Some(state) => format!("{label} still building ({})", state.replace('_', " ")),
+            None => {
+                let reason = value
+                    .get("gaps")
+                    .and_then(Value::as_array)
+                    .and_then(|gaps| gaps.first())
+                    .and_then(|gap| gap["reason"].as_str())
+                    .map(compact_inspect_reason)
+                    .unwrap_or_else(|| incomplete_analysis_reason(value));
+                let status =
+                    if value["unavailable"] == true || value["callgraph_available"] == false {
+                        "unavailable"
+                    } else {
+                        "incomplete"
+                    };
+                format!("{label} {status}: {reason}")
+            }
+        };
+        parts.push((false, compact_inspect_reason(&reason)));
+    }
+    parts.sort_by_key(|(_, reason)| reason.len());
+    if let Some(causes) = summary
+        .get("diagnostics")
+        .and_then(diagnostics_unknown_causes)
+    {
+        parts.extend(causes.into_iter().map(|cause| (true, cause)));
+    }
+    parts
+}
+
+fn partial_summary_reason(summary: &Map<String, Value>) -> Option<String> {
+    let parts = incomplete_summary_parts(summary);
+    partial_reason_from_parts(&parts)
+}
+
+fn partial_reason_from_parts(parts: &[(bool, String)]) -> Option<String> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut diagnostic_label_shown = false;
+    // Registered header-only presentation cap in list_surfaces::inspect.
+    let mut shown = parts
+        .iter()
+        .take(MAX_INSPECT_HEADER_PARTS)
+        .map(|(diagnostic, reason)| {
+            if *diagnostic && !diagnostic_label_shown {
+                diagnostic_label_shown = true;
+                format!("diagnostics unknown: {reason}")
+            } else {
+                reason.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if parts.len() > shown.len() {
+        shown.push(format!("+{} more", parts.len() - shown.len()));
+    }
+    Some(format!("{}; retry aft_inspect.", shown.join("; ")))
+}
+
+fn diagnostics_unknown_causes(diagnostics: &Value) -> Option<Vec<String>> {
     if diagnostics.get("complete").and_then(Value::as_bool) != Some(false) {
         return None;
     }
@@ -1747,7 +1970,7 @@ fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
             }
         }
     }
-    let explanations = causes
+    let mut explanations = causes
         .into_iter()
         .map(|(producer, root, reason, files)| {
             let producer = if producer == "rust" {
@@ -1759,10 +1982,7 @@ fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
             let reason = reason
                 .strip_prefix(&format!("{producer}: "))
                 .unwrap_or(reason);
-            let reason = reason
-                .trim_end_matches("; retry aft_inspect")
-                .trim_end_matches("; retry");
-            let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+            let reason = compact_inspect_reason(reason);
             let root = if root.is_empty() {
                 String::new()
             } else {
@@ -1773,17 +1993,13 @@ fn diagnostics_unknown_reason(diagnostics: &Value) -> Option<String> {
                 1 => " (1 file)".to_string(),
                 n => format!(" ({n} files)"),
             };
-            format!("{producer}{root}: {reason}{count}")
+            compact_inspect_reason(&format!("{producer}{root}: {reason}{count}"))
         })
         .collect::<Vec<_>>();
-    Some(format!(
-        "diagnostics unknown: {}; retry aft_inspect.",
-        if explanations.is_empty() {
-            "no authoritative report".to_string()
-        } else {
-            explanations.join("; ")
-        }
-    ))
+    if explanations.is_empty() {
+        explanations.push("no authoritative report".to_string());
+    }
+    Some(explanations)
 }
 
 fn build_inspect_terminal(
@@ -1801,25 +2017,7 @@ fn build_inspect_terminal(
                     "inspect payload was not an object",
                 );
             };
-            // A completed request whose diagnostics are unknown for some
-            // producer is not fresh: it is partial, and its header says so
-            // and for which producers, so a reader never sees FRESH above
-            // "diagnostics: unknown".
-            let partial = partial_terminal_reason(payload);
-            payload.insert(
-                "inspect_terminal".to_string(),
-                Value::String(
-                    if partial.is_some() {
-                        "partial"
-                    } else {
-                        "fresh"
-                    }
-                    .to_string(),
-                ),
-            );
-            if let Some(reason) = partial {
-                payload.insert("partial_reason".to_string(), Value::String(reason));
-            }
+            set_inspect_completion(payload);
             payload.insert(
                 "wait_stamp".to_string(),
                 serde_json::json!({
@@ -2372,7 +2570,7 @@ fn build_inspect_payload(
             .get(category)
             .expect("all active categories have a fresh inspect payload");
         if payload.get("unavailable").and_then(Value::as_bool) == Some(true) {
-            let category_gaps = payload["gaps"].as_array().expect("unavailable gaps");
+            let category_gaps = incomplete_category_gaps(*category, payload);
             gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
                 gap["categories"] = serde_json::json!([category.as_str()]);
                 gap
@@ -2410,14 +2608,18 @@ fn build_inspect_payload(
             category_summary["total_analyzed_lines"] = serde_json::json!(0);
             category_summary["duplicated_percent"] = serde_json::json!(0.0);
         }
-        if payload.get("complete").and_then(Value::as_bool) == Some(false) {
+        if category_is_incomplete(payload) {
             category_summary["complete"] = Value::Bool(false);
-            if let Some(category_gaps) = payload.get("gaps").and_then(Value::as_array) {
-                category_summary["gaps"] = Value::Array(category_gaps.clone());
-                gaps.extend(category_gaps.iter().cloned().map(|mut gap| {
-                    gap["categories"] = serde_json::json!([category.as_str()]);
-                    gap
-                }));
+            let category_gaps = incomplete_category_gaps(*category, payload);
+            category_summary["gaps"] = Value::Array(category_gaps.clone());
+            gaps.extend(category_gaps.into_iter().map(|mut gap| {
+                gap["categories"] = serde_json::json!([category.as_str()]);
+                gap
+            }));
+            for key in ["parse_errors", "skipped_files", "building"] {
+                if let Some(value) = payload.get(key) {
+                    category_summary[key] = value.clone();
+                }
             }
         }
         if *category == InspectCategory::Diagnostics {
@@ -2514,6 +2716,7 @@ fn build_inspect_payload(
         }
     }
 
+    let complete = partial_summary_reason(&summary).is_none();
     let text = render_inspect_text(
         &summary,
         &details,
@@ -2522,6 +2725,7 @@ fn build_inspect_payload(
     let mut payload = serde_json::json!({
         "summary": Value::Object(summary),
         "text": text,
+        "complete": complete,
         "scanner_state": {
             "tier2_last_run": tier2_last_run(snapshot),
             "tier2_trigger_reason": ctx.tier2_trigger_reason(),
@@ -2547,7 +2751,6 @@ fn build_inspect_payload(
         payload["details"] = Value::Object(details);
     }
     if !gaps.is_empty() {
-        payload["complete"] = Value::Bool(false);
         payload["gaps"] = Value::Array(gaps);
     }
     payload
@@ -2561,10 +2764,7 @@ fn render_inspect_text(
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
 
-    if let Some(reason) = summary
-        .get("diagnostics")
-        .and_then(diagnostics_unknown_reason)
-    {
+    if let Some(reason) = partial_summary_reason(summary) {
         lines.push(format!("PARTIAL — {reason}"));
     }
 
@@ -2703,6 +2903,15 @@ fn render_incomplete_categories(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
 ) {
+    // Most diagnostic reasons live only in the header. Overflow must remain
+    // visible in the body, even for non-file producer failures.
+    for (_, reason) in incomplete_summary_parts(summary)
+        .into_iter()
+        .skip(MAX_INSPECT_HEADER_PARTS)
+        .filter(|(diagnostic, _)| *diagnostic)
+    {
+        lines.push(format!("Incomplete diagnostics: {reason}"));
+    }
     for (category, value) in summary {
         if value.get("complete").and_then(Value::as_bool) != Some(false) {
             continue;
@@ -3727,8 +3936,8 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
         InspectCategory::DeadCode
             if payload.get("callgraph_available").and_then(Value::as_bool) == Some(false) =>
         {
-            // This is a terminal capability result, not a partial scan: dead-code
-            // analysis cannot run without the callgraph, so it must not claim zero.
+            // No dead-code analysis ran without the graph. Report the capability
+            // failure without inventing a zero or claiming a complete result.
             serde_json::json!({
                 "callgraph_available": false,
                 "reason": payload.get("callgraph_unavailable_reason"),
@@ -4005,10 +4214,8 @@ fn generated_details_for(payload: &Value, top_k: usize) -> Value {
     }
 }
 
-fn available_count_from_payload(category: InspectCategory, payload: &Value) -> Option<usize> {
-    if category == InspectCategory::DeadCode
-        && payload.get("callgraph_available").and_then(Value::as_bool) == Some(false)
-    {
+fn available_count_from_payload(_category: InspectCategory, payload: &Value) -> Option<usize> {
+    if category_is_incomplete(payload) {
         return None;
     }
     payload
@@ -4238,6 +4445,46 @@ mod status_bar_refresh_tests {
             "one real category must not surface a bar with fabricated U0 C0"
         );
     }
+
+    #[test]
+    fn incomplete_fresh_payload_keeps_status_bar_counts_stale_not_current() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(7), Some(3), Some(1), None, false);
+        refresh_status_bar_counts(
+            &ctx,
+            &outcomes(vec![
+                (
+                    InspectCategory::DeadCode,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({
+                            "unavailable": true, "complete": false,
+                            "building": {"state": "building"},
+                            "gaps": [{"reason": "still building"}]
+                        }),
+                    },
+                ),
+                (
+                    InspectCategory::UnusedExports,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({
+                            "count": 0, "complete": false, "parse_errors": [{"file": "a.ts"}]
+                        }),
+                    },
+                ),
+                (
+                    InspectCategory::Duplicates,
+                    JobOutcome::Fresh {
+                        payload: serde_json::json!({"count": 1}),
+                    },
+                ),
+            ]),
+        );
+        let counts = ctx.status_bar_count_values();
+        assert!(counts.tier2_stale);
+        assert_eq!(counts.dead_code, Some(7));
+        assert_eq!(counts.unused_exports, Some(3));
+        assert_eq!(counts.duplicates, Some(1));
+    }
 }
 
 #[cfg(test)]
@@ -4278,7 +4525,7 @@ mod render_text_tests {
         let response = Response::success(
             "scoped-inspect",
             serde_json::json!({
-                "inspect_terminal": "partial", "partial_reason": diagnostics_unknown_reason(&summary["diagnostics"]),
+                "inspect_terminal": "partial", "partial_reason": partial_summary_reason(&summary),
                 "text": text, "summary": summary, "details": details,
                 "wait_stamp": {"text": "waited: yes; completed: lsp_start, lsp_quiescence",
                     "phases": [{"id": "lsp_start", "producer": "rust"}]}
@@ -4372,7 +4619,7 @@ mod render_text_tests {
             "dead_code": { "callgraph_available": false }
         }));
 
-        assert_eq!(text, "Dead code analysis unavailable (no callgraph)");
+        assert_eq!(text, "PARTIAL — dead code unavailable: analysis did not finish; retry aft_inspect.\nDead code analysis unavailable (no callgraph)");
         assert!(!text.contains("Dead code: 0"));
     }
 
@@ -4827,9 +5074,202 @@ mod fresh_payload_tests {
             .collect()
     }
 
+    fn header_response(
+        payloads: &BTreeMap<InspectCategory, Value>,
+        sections: &Sections,
+    ) -> Response {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let payload = build_inspect_payload(&snapshot(), payloads, sections, 1, &ctx, None);
+        build_inspect_terminal(
+            "inspect-category-header",
+            &InspectPhaseLog::for_request("inspect-category-header"),
+            InspectTerminal::Fresh(payload),
+        )
+    }
+
+    fn assert_header(response: &Response, expected: &str, complete: bool) {
+        assert_eq!(response.data["complete"], complete, "{}", response.data);
+        assert_eq!(
+            response.data["inspect_terminal"],
+            if complete { "fresh" } else { "partial" }
+        );
+        let text = crate::subc_format::format_inspect_for_test(response);
+        assert_eq!(text.lines().next(), Some(expected), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("PARTIAL — ") || *line == "FRESH")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn header_dead_code_pending_with_complete_diagnostics_is_partial() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::DeadCode, serde_json::json!({
+            "unavailable": true, "complete": false,
+            "building": {"state": "building", "progress": "projection"},
+            "gaps": [{"kind": "analysis_incomplete", "reason": "building projection; estimated remaining 10ms"}]
+        }));
+        for sections in [Sections::summary_only(), Sections::all()] {
+            let response = header_response(&payloads, &sections);
+            assert_header(
+                &response,
+                "PARTIAL — dead code still building; retry aft_inspect.",
+                false,
+            );
+            assert!(response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("building projection"));
+        }
+    }
+
+    #[test]
+    fn header_every_category_complete_is_fresh() {
+        assert_header(
+            &header_response(
+                &fresh_payloads_for_all_categories(),
+                &Sections::summary_only(),
+            ),
+            "FRESH",
+            true,
+        );
+    }
+
+    #[test]
+    fn header_complete_but_truncated_stays_fresh() {
+        let response = header_response(&fresh_payloads_for_all_categories(), &Sections::all());
+        assert!(response.data["details"]["diagnostics_list_envelope"].is_object());
+        assert_eq!(
+            response.data["details"]["diagnostics"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(response.data["summary"]["diagnostics"]["errors"], 2);
+        assert_header(&response, "FRESH", true);
+    }
+
+    #[test]
+    fn header_not_analyzed_languages_stay_fresh() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.get_mut(&InspectCategory::DeadCode).unwrap()["languages_skipped"] =
+            serde_json::json!(["bash", "toml"]);
+        let response = header_response(&payloads, &Sections::all());
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("bash, toml not analyzed"));
+        assert_header(&response, "FRESH", true);
+    }
+
+    #[test]
+    fn header_several_gaps_are_one_line_shortest_first_with_overflow_in_body() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(InspectCategory::DeadCode, serde_json::json!({
+            "unavailable": true, "complete": false, "building": {"state": "building"},
+            "gaps": [{"kind": "analysis_incomplete", "reason": "dead code projection still building"}]
+        }));
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["complete"] =
+            serde_json::json!(false);
+        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["gaps"] = serde_json::json!([
+            {"producer": "dockerfile", "root": ".", "reason": "docker-langserver\nis unavailable"},
+            {"producer": "rust", "root": ".", "reason": "cargo check still running"},
+            {"producer": "typescript", "root": ".", "reason": "initialize crashed"},
+            {"producer": "python", "root": ".", "reason": "pyright is unavailable"}
+        ]);
+        let response = header_response(&payloads, &Sections::all());
+        assert_header(&response, "PARTIAL — dead code still building; diagnostics unknown: dockerfile @ .: docker-langserver is unavailable; rust-analyzer @ .: cargo check still running; +2 more; retry aft_inspect.", false);
+        let text = response.data["text"].as_str().unwrap();
+        assert!(
+            text.contains("Incomplete diagnostics: typescript @ .: initialize crashed"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Incomplete diagnostics: python @ .: pyright is unavailable"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn header_each_incomplete_category_sets_complete_false_without_gaps() {
+        for category in InspectCategory::active() {
+            let mut payloads = fresh_payloads_for_all_categories();
+            payloads.get_mut(category).unwrap()["complete"] = serde_json::json!(false);
+            let response = header_response(&payloads, &Sections::summary_only());
+            let text = crate::subc_format::format_inspect_for_test(&response);
+            assert_eq!(response.data["complete"], false, "{category:?}: {text}");
+            assert_eq!(
+                response.data["inspect_terminal"], "partial",
+                "{category:?}: {text}"
+            );
+            assert!(text.starts_with("PARTIAL — "), "{category:?}: {text}");
+            assert!(
+                text.lines()
+                    .next()
+                    .unwrap()
+                    .contains(&category.as_str().replace('_', " ")),
+                "{category:?}: {text}"
+            );
+            assert!(!response.data["gaps"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn header_unavailable_callgraph_and_parse_failures_are_partial() {
+        let mut payloads = fresh_payloads_for_all_categories();
+        payloads.insert(
+            InspectCategory::DeadCode,
+            serde_json::json!({
+                "callgraph_available": false, "callgraph_unavailable_reason": "store not ready"
+            }),
+        );
+        let response = header_response(&payloads, &Sections::summary_only());
+        assert_header(
+            &response,
+            "PARTIAL — dead code unavailable: store not ready; retry aft_inspect.",
+            false,
+        );
+        payloads = fresh_payloads_for_all_categories();
+        payloads.get_mut(&InspectCategory::UnusedExports).unwrap()["complete"] =
+            serde_json::json!(false);
+        payloads.get_mut(&InspectCategory::UnusedExports).unwrap()["parse_errors"] =
+            serde_json::json!([{"file": "a.ts", "reason": "parse failed"}]);
+        let response = header_response(&payloads, &Sections::summary_only());
+        assert_header(
+            &response,
+            "PARTIAL — unused exports incomplete: 1 file could not be parsed; retry aft_inspect.",
+            false,
+        );
+        assert!(response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("1 file could not be parsed"));
+    }
+
+    #[test]
+    fn header_final_freshness_gap_is_partial_even_with_complete_categories() {
+        let response = header_response(&fresh_payloads_for_all_categories(), &Sections::all());
+        let mut payload = response.data;
+        payload["complete"] = serde_json::json!(false);
+        payload["gaps"] = serde_json::json!([{
+            "kind": "stat_verification_incomplete", "reason": "file freshness verification exceeded the request budget; retry aft_inspect"
+        }]);
+        let response = build_inspect_terminal(
+            "freshness-gap",
+            &InspectPhaseLog::for_request("freshness-gap"),
+            InspectTerminal::Fresh(payload),
+        );
+        assert_header(&response, "PARTIAL — file freshness unverified: file freshness verification exceeded the request budget; retry aft_inspect.", false);
+    }
+
     fn assert_no_banned_field(value: &Value) {
-        // `callgraph_available` is capability disclosure, not partiality, so fresh
-        // payloads may report terminal callgraph unavailability.
+        // These sentinels must never substitute for explicit completion and gaps.
         const BANNED_KEYS: &[&str] = &[
             "provisional",
             "provisional_counts",
@@ -4870,10 +5310,9 @@ mod fresh_payload_tests {
                         );
                     }
                     if key == "complete" {
-                        assert_eq!(
-                            value.as_bool(),
-                            Some(false),
-                            "inspect completion disclosure must name a real gap"
+                        assert!(
+                            value.is_boolean(),
+                            "completion must be an explicit boolean: {value}"
                         );
                     }
                     assert_no_banned_field(value);
@@ -4943,7 +5382,7 @@ mod fresh_payload_tests {
             "{payload:#}"
         );
         let text = payload["text"].as_str().unwrap();
-        assert!(text.starts_with("scope: 1 root, 606 files\n"), "{text}");
+        assert!(text.contains("\nscope: 1 root, 606 files\n"), "{text}");
         assert!(text.contains("606 of 606 scoped files"), "{text}");
     }
 
@@ -6262,6 +6701,9 @@ mod checkout_deferred_tests {
         let (response, calls) = run(true);
         assert_eq!(calls, 1, "one wait budget per worker request");
         assert_eq!(response.data["complete"], false);
+        assert_eq!(response.data["inspect_terminal"], "partial");
+        assert!(crate::subc_format::format_inspect_for_test(&response)
+            .starts_with("PARTIAL — callgraph view pending:"));
         let gaps = response.data["gaps"].as_array().unwrap();
         assert!(gaps.iter().any(|gap| gap["kind"] == "view_pending"
             && gap["path"]
@@ -6274,7 +6716,7 @@ mod checkout_deferred_tests {
         let (response, calls) = run(false);
         assert_eq!(calls, 0);
         assert_eq!(response.data["inspect_terminal"], "fresh");
-        assert!(response.data.get("complete").is_none());
+        assert_eq!(response.data["complete"], true);
         assert!(response.data.get("gaps").is_none());
     }
 }

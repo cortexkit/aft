@@ -2365,9 +2365,8 @@ pub(crate) fn format_inspect_for_test(response: &Response) -> String {
     format_inspect(response)
 }
 
-/// The one-line header of a partial inspect: it completed, but diagnostics
-/// are unknown for the named producers. Mirrors the OpenCode and Pi
-/// renderers.
+/// The server owns the one-line status: any unfinished category is partial.
+/// Plugins pass this rendered header through without adding another one.
 fn inspect_partial_header(data: &Value) -> Option<String> {
     if data.get("inspect_terminal").and_then(Value::as_str) != Some("partial") {
         return None;
@@ -2375,7 +2374,7 @@ fn inspect_partial_header(data: &Value) -> Option<String> {
     let reason = data
         .get("partial_reason")
         .and_then(Value::as_str)
-        .unwrap_or("diagnostics unknown");
+        .unwrap_or("analysis incomplete; retry aft_inspect.");
     Some(format!("PARTIAL — {reason}"))
 }
 
@@ -4435,5 +4434,40 @@ mod incomplete_diagnostics_tests {
         }});
         let text = format_diagnostics_summary(Some(&summary)).unwrap();
         assert_eq!(text, "diagnostics: unknown (typescript: initialize timed out); 0 errors, 1 warnings, 0 info, 0 hints from rust");
+    }
+}
+
+#[cfg(test)]
+mod inspect_header_tests {
+    use super::*;
+
+    #[test]
+    fn inspect_header_passes_through_non_diagnostic_partial_without_a_second_status() {
+        let text = "PARTIAL — dead code still building; retry aft_inspect.\ndiagnostics: 0 errors, 0 warnings, 0 info, 0 hints";
+        let response = Response::success(
+            "inspect-header",
+            serde_json::json!({
+                "complete": false, "inspect_terminal": "partial",
+                "partial_reason": "dead code still building; retry aft_inspect.",
+                "text": text,
+                "summary": {"diagnostics": {"errors": 0, "warnings": 0, "info": 0, "hints": 0}}
+            }),
+        );
+        assert_eq!(format_inspect(&response), text);
+    }
+
+    #[test]
+    fn inspect_header_renders_non_diagnostic_partial_for_unheaded_payload() {
+        let response = Response::success(
+            "inspect-header",
+            serde_json::json!({
+                "complete": false, "inspect_terminal": "partial",
+                "partial_reason": "dead code still building; retry aft_inspect.", "text": "body"
+            }),
+        );
+        assert_eq!(
+            format_inspect(&response),
+            "PARTIAL — dead code still building; retry aft_inspect.\nbody"
+        );
     }
 }
