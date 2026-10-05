@@ -1629,6 +1629,120 @@ mod tests {
             .covers(&cache.root.join("member/src/lib.rs")));
     }
 
+    fn legacy_record_text(record: &SavedCheck) -> (String, usize) {
+        let legacy_files: BTreeMap<_, _> = record
+            .fingerprint
+            .files
+            .iter()
+            .map(|(path, stamp)| {
+                (
+                    path,
+                    serde_json::json!({
+                        "size": stamp.size, "modified": stamp.modified, "changed": stamp.changed,
+                        "hash": stamp.hash, "included": stamp.included, "env_keys": stamp.env_keys,
+                    }),
+                )
+            })
+            .collect();
+        let ledger_bytes = serde_json::to_vec(&legacy_files).unwrap().len();
+        let mut legacy = serde_json::to_value(record).unwrap();
+        legacy["schema"] = 1.into();
+        legacy["fingerprint"]["files"] = serde_json::to_value(&legacy_files).unwrap();
+        legacy["fingerprint"]["extra_inputs"] =
+            serde_json::to_value(&record.fingerprint.extra_inputs).unwrap();
+        let checksum = blake3::hash(&serde_json::to_vec(&legacy).unwrap())
+            .to_hex()
+            .to_string();
+        let text =
+            serde_json::to_string(&serde_json::json!({"record": legacy, "checksum": checksum}))
+                .unwrap();
+        (text, ledger_bytes)
+    }
+
+    #[test]
+    fn fixed_fixture_compact_record_has_exact_encoding_savings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("size-workspace");
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"size-fixture\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "Cargo.lock", "version = 4\n");
+        write(&root, "src/lib.rs", "pub fn value() -> u32 { 1 }\n");
+        let mut inputs = vec![
+            PathBuf::from("Cargo.toml"),
+            PathBuf::from("Cargo.lock"),
+            PathBuf::from("src/lib.rs"),
+        ];
+        for index in 0..8 {
+            let path = format!("src/module_{index}.rs");
+            write(&root, &path, "pub fn value() -> u32 { 1 }\n");
+            inputs.push(PathBuf::from(path));
+        }
+        inputs.sort();
+        let root = canonical(&root).unwrap();
+        let mut fingerprint = fingerprint(
+            &root,
+            "size-fixture".into(),
+            None,
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        // Only the fixed workspace inputs belong to this encoding fixture;
+        // ancestor and user-home Cargo configuration must not change its size.
+        fingerprint.files.retain(|path, _| path.starts_with(&root));
+        assert_eq!(
+            fingerprint
+                .files
+                .keys()
+                .map(|path| path.strip_prefix(&root).unwrap().to_path_buf())
+                .collect::<Vec<_>>(),
+            inputs
+        );
+        assert!(fingerprint
+            .files
+            .values()
+            .all(|stamp| stamp.included.is_empty() && stamp.env_keys.is_empty()));
+        let record = SavedCheck {
+            schema: RECORD_SCHEMA,
+            root: root.clone(),
+            checkout: root.clone(),
+            fingerprint,
+            diagnostics: BTreeMap::new(),
+            completed_seconds: 1,
+            duration_seconds: 1,
+        };
+        let path = temp
+            .path()
+            .join("storage/rust-completed-checks")
+            .join(format!("{}.json", blake3::hash(b"size-fixture")));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (legacy_text, _) = legacy_record_text(&record);
+        crate::jsonc_edit::write_atomic(&path, &legacy_text).unwrap();
+        let before_bytes = fs::metadata(&path).unwrap().len();
+        write_record(&path, &record).unwrap();
+        let after_bytes = fs::metadata(&path).unwrap().len();
+        // Six JSON property names and their colons cost exactly 57 bytes per
+        // stamp. Known fixture paths independently pin the prefix savings;
+        // variable mtimes, temp-directory names and platform escaping cancel.
+        let expected_savings = 57 * inputs.len() as u64
+            + inputs
+                .iter()
+                .map(|input| {
+                    (serde_json::to_vec(&root.join(input)).unwrap().len()
+                        - serde_json::to_vec(input).unwrap().len()) as u64
+                })
+                .sum::<u64>();
+        assert_eq!(
+            after_bytes + expected_savings,
+            before_bytes,
+            "compact encoding must remove every repeated field name and workspace prefix"
+        );
+        println!("fixed-fixture completed-check record: before {before_bytes} bytes, after {after_bytes} bytes; expected savings {expected_savings} bytes for {} inputs", inputs.len());
+    }
+
     #[test]
     fn compact_record_preserves_includes_build_inputs_and_external_config() {
         let (temp, mut cache) = fixture();
@@ -1968,38 +2082,12 @@ mod tests {
             completed_seconds: 1,
             duration_seconds: 217,
         };
-        // Measure both formats using the same real repository fingerprint, not
-        // a synthetic ledger. Reconstruct the old named-field, absolute-path wire
-        // format so this comparison remains useful after the schema bump.
-        let legacy_files: BTreeMap<_, _> = record
-            .fingerprint
-            .files
-            .iter()
-            .map(|(path, stamp)| {
-                (
-                    path,
-                    serde_json::json!({
-                        "size": stamp.size, "modified": stamp.modified, "changed": stamp.changed,
-                        "hash": stamp.hash, "included": stamp.included, "env_keys": stamp.env_keys,
-                    }),
-                )
-            })
-            .collect();
-        let mut legacy = serde_json::to_value(&record).unwrap();
-        legacy["schema"] = 1.into();
-        legacy["fingerprint"]["files"] = serde_json::to_value(&legacy_files).unwrap();
-        legacy["fingerprint"]["extra_inputs"] =
-            serde_json::to_value(&record.fingerprint.extra_inputs).unwrap();
-        let legacy_checksum = blake3::hash(&serde_json::to_vec(&legacy).unwrap())
-            .to_hex()
-            .to_string();
-        let legacy_text = serde_json::to_string(
-            &serde_json::json!({"record": legacy, "checksum": legacy_checksum}),
-        )
-        .unwrap();
+        // The live checkout provides measurement and validation coverage, not a
+        // compression ratio contract: its input paths and contents change over
+        // time. A fixed fixture separately pins the encoding's exact savings.
+        let (legacy_text, ledger_bytes) = legacy_record_text(&record);
         crate::jsonc_edit::write_atomic(&cache.path, &legacy_text).unwrap();
         let before_bytes = fs::metadata(&cache.path).unwrap().len();
-        let ledger_bytes = serde_json::to_vec(&legacy_files).unwrap().len();
         assert!(
             reload(&cache).saved.is_none(),
             "old schemas require a new certified check"
@@ -2011,10 +2099,6 @@ mod tests {
         assert_eq!(record.fingerprint.files, saved.fingerprint.files);
         assert_eq!(record.fingerprint.digest, saved.fingerprint.digest);
         assert!(restored.validated(Instant::now() + BUDGET).is_some());
-        assert!(
-            after_bytes < before_bytes / 2,
-            "compact records must halve the real ledger's disk cost"
-        );
         println!(
             "repository completed-check record: before {} bytes (ledger {}), after {} bytes; {} inputs at {}",
             before_bytes, ledger_bytes, after_bytes, record.fingerprint.files.len(),
