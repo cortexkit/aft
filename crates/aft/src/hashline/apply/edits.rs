@@ -214,8 +214,96 @@ fn coalesce_one_op(edits: Vec<LineEdit>) -> Vec<LineEdit> {
     coalesced
 }
 
-/// Splice edits into content lines. Coordinates are pre-request (baseline).
+/// Materialize edits in baseline order without shifting the retained suffix
+/// once for every deleted or replaced line.
 pub fn materialize_edits(original_lines: &[String], edits: &[LineEdit]) -> Vec<String> {
+    let mut by_line: std::collections::BTreeMap<usize, Vec<&LineEdit>> =
+        std::collections::BTreeMap::new();
+    let mut bof = Vec::new();
+    let mut eof = Vec::new();
+    for edit in edits {
+        match edit {
+            LineEdit::Insert {
+                place: InsertPlace::Bof,
+                text,
+                ..
+            } => bof.push(text.clone()),
+            LineEdit::Insert {
+                place: InsertPlace::Eof,
+                text,
+                ..
+            } => eof.push(text.clone()),
+            LineEdit::Insert { anchor, .. } => by_line.entry(*anchor).or_default().push(edit),
+            LineEdit::Delete { line, .. } => by_line.entry(*line).or_default().push(edit),
+        }
+    }
+    let mut out = Vec::with_capacity(original_lines.len());
+    for (index, current) in original_lines.iter().enumerate() {
+        if let Some(bucket) = by_line.get(&(index + 1)) {
+            append_line_bucket(&mut out, Some(current), bucket);
+        } else {
+            out.push(current.clone());
+        }
+    }
+    // The old splice implementation also accepted an anchor just past EOF,
+    // while ignoring anchors beyond it.
+    if let Some(bucket) = by_line.get(&(original_lines.len() + 1)) {
+        append_line_bucket(&mut out, None, bucket);
+    }
+    // Zero saturates to index zero and was applied after line one. Preserve
+    // that edge case against the already transformed first row, not baseline.
+    if let Some(bucket) = by_line.get(&0) {
+        let mut rows = std::mem::take(&mut out).into_iter();
+        let first = rows.next();
+        append_line_bucket(&mut out, first.as_ref(), bucket);
+        out.extend(rows);
+    }
+    bof.extend(out);
+    bof.extend(eof);
+    bof
+}
+
+fn append_line_bucket(out: &mut Vec<String>, current: Option<&String>, bucket: &[&LineEdit]) {
+    let deleted = bucket
+        .iter()
+        .any(|edit| matches!(edit, LineEdit::Delete { .. }));
+    // Plain-before rows precede replacement rows regardless of their order in
+    // the lowered operation list; after rows follow the retained baseline row.
+    for replacement in [false, true] {
+        for edit in bucket {
+            if let LineEdit::Insert {
+                place: InsertPlace::Before,
+                text,
+                mode,
+                ..
+            } = edit
+            {
+                if (*mode == InsertMode::Replacement) == replacement {
+                    out.push(text.clone());
+                }
+            }
+        }
+    }
+    if !deleted {
+        if let Some(current) = current {
+            out.push(current.clone());
+        }
+    }
+    for edit in bucket {
+        if let LineEdit::Insert {
+            place: InsertPlace::After,
+            text,
+            ..
+        } = edit
+        {
+            out.push(text.clone());
+        }
+    }
+}
+
+/// Frozen splice oracle, including permissive zero/out-of-range anchors.
+#[cfg(test)]
+fn materialize_edits_legacy(original_lines: &[String], edits: &[LineEdit]) -> Vec<String> {
     let mut file_lines = original_lines.to_vec();
     let mut bof: Vec<String> = Vec::new();
     let mut eof: Vec<String> = Vec::new();
@@ -302,6 +390,9 @@ pub fn materialize_edits(original_lines: &[String], edits: &[LineEdit]) -> Vec<S
             rows
         };
         if idx < file_lines.len() {
+            #[cfg(test)]
+            MATERIALIZE_SHIFTED_ROWS
+                .with(|count| count.set(count.get() + file_lines.len() - idx - 1));
             file_lines.splice(idx..=idx, spliced);
         } else {
             file_lines.extend(spliced);
@@ -315,6 +406,11 @@ pub fn materialize_edits(original_lines: &[String], edits: &[LineEdit]) -> Vec<S
     }
     file_lines.extend(eof);
     file_lines
+}
+
+#[cfg(test)]
+thread_local! {
+    static MATERIALIZE_SHIFTED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Rebuild file bytes from logical lines using the baseline terminator policy.
@@ -377,6 +473,76 @@ pub fn terminator_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialize_large_cut_does_not_shift_retained_rows() {
+        let original = (0..20_000)
+            .map(|i| format!("line {i} — payload"))
+            .collect::<Vec<_>>();
+        let edits = (5_001..=15_000)
+            .map(|line| LineEdit::Delete { line, op_index: 0 })
+            .collect::<Vec<_>>();
+        MATERIALIZE_SHIFTED_ROWS.with(|count| count.set(0));
+        let actual = materialize_edits(&original, &edits);
+        let expected = original[..5_000]
+            .iter()
+            .chain(&original[15_000..])
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            join_lines(&actual, TerminatorKind::CrLf, true),
+            join_lines(&expected, TerminatorKind::CrLf, true)
+        );
+        assert_eq!(
+            MATERIALIZE_SHIFTED_ROWS.with(|count| count.get()),
+            0,
+            "rows shifted by per-line splice"
+        );
+    }
+
+    #[test]
+    fn materialize_matches_splice_oracle_for_mixed_and_boundary_edits() {
+        let mut seed = 41u64;
+        for n in 0..=4 {
+            let original = (0..n).map(|i| format!("row {i} — 🌍")).collect::<Vec<_>>();
+            for _ in 0..512 {
+                let mut edits = Vec::new();
+                for op_index in 0..8 {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let anchor = ((seed >> 32) % 8) as usize;
+                    let place = match (seed >> 16) % 4 {
+                        0 => InsertPlace::Bof,
+                        1 => InsertPlace::Eof,
+                        2 => InsertPlace::Before,
+                        _ => InsertPlace::After,
+                    };
+                    if seed % 3 == 0 {
+                        edits.push(LineEdit::Delete {
+                            line: anchor,
+                            op_index,
+                        });
+                    } else {
+                        edits.push(LineEdit::Insert {
+                            anchor,
+                            place,
+                            text: format!("new {op_index}"),
+                            mode: if seed % 2 == 0 {
+                                InsertMode::Plain
+                            } else {
+                                InsertMode::Replacement
+                            },
+                            op_index,
+                        });
+                    }
+                }
+                assert_eq!(
+                    materialize_edits(&original, &edits),
+                    materialize_edits_legacy(&original, &edits),
+                    "baseline={original:?}, edits={edits:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn materialize_replaces_a_span() {

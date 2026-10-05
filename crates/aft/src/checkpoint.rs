@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
@@ -1043,6 +1044,10 @@ impl CheckpointStore {
                 self.blob_counter.fetch_add(1, Ordering::Relaxed)
             );
             let bytes = checkpoint_file_bytes(file);
+            #[cfg(test)]
+            if let Cow::Owned(bytes) = &bytes {
+                CHECKPOINT_COPIED_BYTES.with(|count| count.set(count.get() + bytes.len()));
+            }
             write_temp_fsync_rename(&checkpoint_dir, &blob, &bytes).map_err(|error| {
                 AftError::IoError {
                     path: checkpoint_dir.join(&blob).display().to_string(),
@@ -1517,13 +1522,18 @@ fn read_checkpoint_from_disk(
     Ok(checkpoint)
 }
 
-fn checkpoint_file_bytes(file: &CheckpointFile) -> Vec<u8> {
+fn checkpoint_file_bytes(file: &CheckpointFile) -> Cow<'_, [u8]> {
     match &file.kind {
-        CheckpointFileKind::Regular { bytes } => bytes.to_vec(),
+        CheckpointFileKind::Regular { bytes } => Cow::Borrowed(bytes),
         CheckpointFileKind::Symlink { target, .. } => {
-            target.as_os_str().to_string_lossy().as_bytes().to_vec()
+            Cow::Owned(target.as_os_str().to_string_lossy().as_bytes().to_vec())
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_COPIED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -2223,6 +2233,27 @@ mod tests {
         for path in paths {
             assert_eq!(fs::read(path).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn checkpoint_persistence_borrows_regular_file_bytes() {
+        let (mut store, _storage) = checkpoint_store();
+        let files = tempfile::tempdir().unwrap();
+        let path = files.path().join("large.bin");
+        let bytes = vec![0xff; 2 * 1024 * 1024];
+        fs::write(&path, &bytes).unwrap();
+        CHECKPOINT_COPIED_BYTES.with(|count| count.set(0));
+        store
+            .create_for_files("copy-work-count", "cp", vec![path.clone()])
+            .unwrap();
+        assert_eq!(
+            CHECKPOINT_COPIED_BYTES.with(|count| count.get()),
+            0,
+            "regular blob serialization copied bytes"
+        );
+        fs::write(&path, b"edited").unwrap();
+        store.restore("copy-work-count", "cp").unwrap();
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[cfg(unix)]

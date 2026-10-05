@@ -13,7 +13,7 @@ use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::edit;
 use crate::imports;
 use crate::lsp_hints;
-use crate::parser::{detect_language, grammar_for, LangId};
+use crate::parser::{detect_language, grammar_for, parse_source_with_cached_parser, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::symbols::SymbolKind;
 
@@ -1130,6 +1130,17 @@ fn rewrite_consumer_imports(
         return Ok(None);
     }
 
+    // Import and re-export syntax requires these literal keywords. A script
+    // with neither cannot consume another file's export. The source itself is
+    // exempt: its remaining local references can require a new import even
+    // when it had no module declarations before the move.
+    if !consumer_content.contains("import")
+        && !consumer_content.contains("export")
+        && !paths_equivalent(consumer_file, source_file)
+    {
+        return Ok(None);
+    }
+
     // Parse imports from the content passed in. For the source file this is
     // the post-removal text, not the original on-disk content.
     let Some((tree, block)) = parse_imports_from_content(consumer_content, lang) else {
@@ -1778,12 +1789,16 @@ fn parse_imports_from_content(
     content: &str,
     lang: LangId,
 ) -> Option<(tree_sitter::Tree, imports::ImportBlock)> {
-    let grammar = grammar_for(lang);
-    let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&grammar).ok()?;
-    let tree = parser.parse(content.as_bytes(), None)?;
+    #[cfg(test)]
+    MOVE_CONSUMER_PARSES.with(|count| count.set(count.get() + 1));
+    let tree = parse_source_with_cached_parser(Path::new("consumer"), content, lang).ok()?;
     let block = imports::parse_imports(content, &tree, lang);
     Some((tree, block))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MOVE_CONSUMER_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn build_add_moved_import_edit(
@@ -2596,6 +2611,52 @@ mod tests {
         let from = Path::new("src/components/Button.ts");
         let to = Path::new("src/components/utils.ts");
         assert_eq!(compute_relative_import_path(from, to), "./utils");
+    }
+
+    #[test]
+    fn move_consumer_prefilter_skips_scripts_without_module_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.ts");
+        let dest = root.path().join("dest.ts");
+        std::fs::write(&source, "export function moved() {}\n").unwrap();
+        std::fs::write(&dest, "").unwrap();
+        let consumer = root.path().join("consumer.ts");
+        MOVE_CONSUMER_PARSES.with(|count| count.set(0));
+        for i in 0..512 {
+            let script = format!("const script{i} = {}\n", "[0, 1, 2];\n".repeat(256));
+            assert_eq!(
+                rewrite_consumer_imports(
+                    &script,
+                    &consumer,
+                    &source,
+                    &dest,
+                    "moved",
+                    Some(LangId::TypeScript),
+                    false,
+                    root.path()
+                ),
+                Ok(None)
+            );
+        }
+        let input = "import { moved } from './source';\nmoved();\n";
+        let actual = rewrite_consumer_imports(
+            input,
+            &consumer,
+            &source,
+            &dest,
+            "moved",
+            Some(LangId::TypeScript),
+            false,
+            root.path(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual, "import { moved } from './dest';\nmoved();\n");
+        assert_eq!(
+            MOVE_CONSUMER_PARSES.with(|count| count.get()),
+            1,
+            "consumer parses"
+        );
     }
 
     #[test]

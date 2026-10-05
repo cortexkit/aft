@@ -999,6 +999,8 @@ pub(crate) mod work_counters {
         pub(crate) static GRAMMAR_LOADS: Cell<usize> = const { Cell::new(0) };
         /// Source reads the language provider does to inspect a file's tree.
         pub(crate) static PARSED_FILE_READS: Cell<usize> = const { Cell::new(0) };
+        /// Reads performed by FileParser to construct a tree, not by a provider.
+        pub(crate) static TREE_SOURCE_READS: Cell<usize> = const { Cell::new(0) };
         /// Copies of a cached symbol list handed out by `FileParser`.
         pub(crate) static CACHED_SYMBOL_COPIES: Cell<usize> = const { Cell::new(0) };
         pub(crate) static FILE_PARSE_READS: Cell<usize> = const { Cell::new(0) };
@@ -1659,6 +1661,8 @@ impl FileParser {
         if needs_reparse {
             #[cfg(test)]
             work_counters::FILE_PARSE_READS.with(|count| count.set(count.get() + 1));
+            #[cfg(test)]
+            work_counters::TREE_SOURCE_READS.with(|count| count.set(count.get() + 1));
             let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
             })?;

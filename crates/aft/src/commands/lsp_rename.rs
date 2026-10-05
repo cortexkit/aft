@@ -435,6 +435,104 @@ fn apply_collected_changes(
 }
 
 fn apply_text_edits(source: &str, edits: &[PendingTextEdit]) -> Result<String, LspError> {
+    if edits.is_empty() {
+        return Ok(source.to_owned());
+    }
+    let mut requested: BTreeMap<u32, std::collections::BTreeSet<u32>> = BTreeMap::new();
+    for edit in edits {
+        for position in [edit.range.start, edit.range.end] {
+            requested
+                .entry(position.line)
+                .or_default()
+                .insert(position.character);
+        }
+    }
+    let positions = resolve_workspace_positions(source, &requested);
+    let mut resolved = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let Some(&start) = positions.get(&(edit.range.start.line, edit.range.start.character))
+        else {
+            return apply_text_edits_legacy(source, edits);
+        };
+        let Some(&end) = positions.get(&(edit.range.end.line, edit.range.end.character)) else {
+            return apply_text_edits_legacy(source, edits);
+        };
+        if start > end {
+            return apply_text_edits_legacy(source, edits);
+        }
+        resolved.push((start, end, edit));
+    }
+    resolved.sort_by(|left, right| compare_ranges_desc(&left.2.range, &right.2.range));
+    let mut cursor = 0;
+    let mut content = String::with_capacity(source.len());
+    for (start, end, edit) in resolved.into_iter().rev() {
+        // LSP normally supplies non-overlapping baseline ranges. Preserve the
+        // previous sequential semantics for malformed overlapping edits rather
+        // than changing their result or introducing a new rejection.
+        if start < cursor {
+            return apply_text_edits_legacy(source, edits);
+        }
+        content.push_str(&source[cursor..start]);
+        content.push_str(&edit.new_text);
+        cursor = end;
+    }
+    content.push_str(&source[cursor..]);
+    Ok(content)
+}
+
+/// Resolve requested UTF-16 columns in one pass per requested line. Splitting
+/// inclusively retains CRLF bytes, and columns inside a surrogate pair still
+/// clamp to the beginning of that code point as in the sequential path.
+fn resolve_workspace_positions(
+    source: &str,
+    requested: &BTreeMap<u32, std::collections::BTreeSet<u32>>,
+) -> HashMap<(u32, u32), usize> {
+    let mut positions = HashMap::new();
+    let mut start = 0;
+    let mut line_count = 0;
+    for (line, segment) in source.split_inclusive('\n').enumerate() {
+        #[cfg(test)]
+        RENAME_SCAN_BYTES.with(|count| count.set(count.get() + segment.len()));
+        line_count = line + 1;
+        if let Some(columns) = requested.get(&(line as u32)) {
+            let text = segment.strip_suffix('\n').unwrap_or(segment);
+            let mut columns = columns.iter().copied().peekable();
+            let mut utf16 = 0;
+            for (byte, ch) in text.char_indices() {
+                #[cfg(test)]
+                RENAME_SCAN_BYTES.with(|count| count.set(count.get() + ch.len_utf8()));
+                let next = utf16 + ch.len_utf16() as u32;
+                while columns.peek().is_some_and(|column| *column < next) {
+                    positions.insert((line as u32, columns.next().unwrap()), start + byte);
+                }
+                utf16 = next;
+                if columns.peek().is_none() {
+                    break;
+                }
+            }
+            // Oversized columns clamp against the *mutated* line in the old
+            // path, so they cannot safely use baseline offsets.
+            for column in columns {
+                if column == utf16 {
+                    positions.insert((line as u32, column), start + text.len());
+                }
+            }
+        }
+        start += segment.len();
+    }
+    if source.is_empty() {
+        if let Some(columns) = requested.get(&0) {
+            if columns.contains(&0) {
+                positions.insert((0, 0), 0);
+            }
+        }
+    } else if source.ends_with('\n') {
+        positions.insert((line_count as u32, 0), source.len());
+    }
+    positions
+}
+
+fn apply_text_edits_legacy(source: &str, edits: &[PendingTextEdit]) -> Result<String, LspError> {
     let mut sorted = edits.to_vec();
     sorted.sort_by(|left, right| compare_ranges_desc(&left.range, &right.range));
 
@@ -487,6 +585,8 @@ fn line_col_to_byte_lsp(source: &str, line: u32, character: u32) -> Result<usize
     // Keep the UTF-16 conversion local, but preserve raw newline bytes by iterating
     // split_inclusive('\n') segments instead of source.lines(); that keeps CRLF offsets accurate.
     for (index, segment) in source.split_inclusive('\n').enumerate() {
+        #[cfg(test)]
+        RENAME_SCAN_BYTES.with(|count| count.set(count.get() + segment.len()));
         let line_text = segment.strip_suffix('\n').unwrap_or(segment);
         if index == target_line {
             return Ok(line_start + utf16_column_to_byte(line_text, character));
@@ -506,6 +606,72 @@ fn line_col_to_byte_lsp(source: &str, line: u32, character: u32) -> Result<usize
         "line {} is out of bounds for workspace edit",
         line + 1
     )))
+}
+
+#[cfg(test)]
+thread_local! {
+    static RENAME_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_types::Position;
+
+    #[test]
+    fn rename_large_workspace_edits_scan_source_once() {
+        let row = "let café = \"🌍\";\r\n";
+        let source = row.repeat(20_000);
+        let edits = (19_000..20_000)
+            .map(|line| PendingTextEdit {
+                range: Range::new(Position::new(line, 4), Position::new(line, 8)),
+                new_text: "renamed".into(),
+            })
+            .collect::<Vec<_>>();
+        RENAME_SCAN_BYTES.with(|count| count.set(0));
+        let actual = apply_text_edits(&source, &edits).unwrap();
+        let expected = format!(
+            "{}{}",
+            row.repeat(19_000),
+            "let renamed = \"🌍\";\r\n".repeat(1_000)
+        );
+        assert_eq!(actual, expected);
+        let scanned = RENAME_SCAN_BYTES.with(|count| count.get());
+        assert_eq!(scanned, 430_000, "indexed workspace edit scan bytes");
+        eprintln!(
+            "indexed workspace edit: {scanned} scan bytes for {} source bytes",
+            source.len()
+        );
+        assert!(
+            scanned <= source.len() * 2,
+            "workspace edit scanned {scanned} bytes for {} source bytes",
+            source.len()
+        );
+    }
+
+    #[test]
+    fn rename_matches_sequential_utf16_boundary_and_overlap_semantics() {
+        for source in ["", "a", "a\r\n🌍 café\r\n", "a\n\n", "🌍 café"] {
+            let mut seed = 19u64;
+            for _ in 0..512 {
+                let mut edits = Vec::new();
+                for _ in 0..4 {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let line = ((seed >> 32) % 4) as u32;
+                    let start = ((seed >> 16) % 10) as u32;
+                    let end = ((seed >> 8) % 10) as u32;
+                    edits.push(PendingTextEdit {
+                        range: Range::new(Position::new(line, start), Position::new(line, end)),
+                        new_text: if seed % 2 == 0 { "new\n" } else { "" }.into(),
+                    });
+                }
+                let actual = apply_text_edits(source, &edits).map_err(|error| error.to_string());
+                let expected =
+                    apply_text_edits_legacy(source, &edits).map_err(|error| error.to_string());
+                assert_eq!(actual, expected, "source={source:?}, edits={edits:?}");
+            }
+        }
+    }
 }
 
 fn utf16_column_to_byte(line: &str, character: u32) -> usize {

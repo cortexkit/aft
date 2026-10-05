@@ -68,6 +68,88 @@ fn configure_with_backup_disabled(aft: &mut AftProcess, root: &str) {
     );
 }
 
+/// This measurement intentionally pins the existing intermediate-project
+/// validation behavior. Batching checker runs needs a separate output-contract
+/// decision, so it is not part of the edit algorithm optimization.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the repository's installed TypeScript compiler"]
+fn multi_file_full_validation_counts_intermediate_project_checks() {
+    use std::os::unix::fs::PermissionsExt;
+    let tsc = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../node_modules/typescript/bin/tsc")
+        .canonicalize()
+        .expect("bun install before the measurement");
+    for command in ["apply_patch", "move_symbol"] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_file(
+            &root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"strict":true,"noEmit":true,"target":"ES2020","module":"ESNext"},"include":["*.ts"]}"#,
+        );
+        let source =
+            "export function moved(n: number): number { return n + 1; }\nexport const kept = 1;\n";
+        let consumer = "import { moved } from './source';\nexport const result = moved(1);\n";
+        write_file(&root.join("source.ts"), source);
+        write_file(&root.join("consumer.ts"), consumer);
+        write_file(&root.join("dest.ts"), "export const existing = 1;\n");
+        let stub = root.join("node_modules/.bin/tsc");
+        write_file(&stub, &format!(
+            "#!/bin/sh\nprintf 'run\\n' >> '{0}/checker-count'\nout='{0}/checker-output-'$(wc -l < '{0}/checker-count' | tr -d ' ')\nnode '{1}' --pretty false > \"$out\" 2>&1\ncode=$?\ncat \"$out\"\nexit $code\n",
+            root.display(), tsc.display()));
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut aft = AftProcess::spawn();
+        let cfg = aft.send(&json!({"id":"cfg-count", "command":"configure", "harness":"opencode", "project_root":root,
+            "config":user_config(json!({"format_on_edit":false, "validate_on_edit":"full", "checker":{"typescript":"tsc"}, "lsp":{"enabled":false}}))}).to_string());
+        assert_eq!(cfg["success"], true, "{cfg}");
+        let request = if command == "move_symbol" {
+            json!({"id":"count", "command":command, "file":root.join("source.ts"), "symbol":"moved", "destination":root.join("dest.ts")})
+        } else {
+            let patch = format!("*** Begin Patch\n*** Update File: {0}/source.ts\n@@\n-export function moved(n: number): number {{ return n + 1; }}\n+export function renamed(n: number): number {{ return n + 1; }}\n*** Update File: {0}/consumer.ts\n@@\n-import {{ moved }} from './source';\n-export const result = moved(1);\n+import {{ renamed }} from './source';\n+export const result = renamed(1);\n*** Update File: {0}/dest.ts\n@@\n-export const existing = 1;\n+export const existing = 2;\n*** End Patch", root.display());
+            json!({"id":"count", "command":command, "patch_text":patch})
+        };
+        let response = aft.send(&request.to_string());
+        assert_eq!(response["success"], true, "{command}: {response}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("checker-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            3,
+            "{command} checker runs"
+        );
+        let first = std::fs::read_to_string(root.join("checker-output-1")).unwrap();
+        assert!(
+            first.contains("has no exported member 'moved'"),
+            "{command}: {first}"
+        );
+        assert!(std::fs::read_to_string(root.join("checker-output-3"))
+            .unwrap()
+            .is_empty());
+        assert!(
+            response.get("validation_errors").is_none(),
+            "{command} currently discards the checker diagnostics"
+        );
+        // Measure the proposed single final-state run without changing the
+        // command's production validation order or response contract.
+        let final_check = std::process::Command::new(&stub)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(final_check.status.success());
+        assert!(final_check.stdout.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("checker-count"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        eprintln!("{command}: 3 current checker runs versus 1 clean final-state proposal run; first intermediate state reports TS2305; outer response discards validation_errors");
+        assert!(aft.shutdown().success());
+    }
+}
+
 fn write_file(path: &std::path::Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).expect("create parent");
     std::fs::write(path, content).expect("write file");
