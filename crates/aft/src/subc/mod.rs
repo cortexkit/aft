@@ -199,6 +199,8 @@ type PushEnvelope = (ProjectRootId, PushFrame);
 type LossyPushEnvelope = (u64, ProjectRootId, PushFrame);
 type RetryBuffer = HashMap<RouteChannel, VecDeque<(push::ReplayKey, PushFrame)>>;
 mod bash;
+#[cfg(test)]
+mod bash_selector_tests;
 mod drain;
 mod health;
 mod manifest;
@@ -7324,14 +7326,7 @@ async fn handle_tool_call(
                 .expect("admission validated arguments");
             args.insert("foreground_orchestrate".into(), json!(true));
             args.insert("block_to_completion".into(), json!(true));
-            args.insert(
-                "shell".into(),
-                json!(if call.name == "powershell" {
-                    "powershell"
-                } else {
-                    "bash"
-                }),
-            );
+            provider_shell_selector(&call.name, args);
         }
         RouteRequest::ToolCall(ToolCallRequest {
             name: call.name,
@@ -8562,6 +8557,16 @@ struct BgEventsRequest {
 #[serde(rename_all = "snake_case")]
 enum BgEventsOp {
     BgEvents,
+}
+
+fn provider_shell_selector(name: &str, args: &mut serde_json::Map<String, Value>) {
+    // The public selector distinguishes PowerShell from the default bash;
+    // `shell: "bash"` is not part of the bash tool's argument grammar.
+    if name == "powershell" {
+        args.insert("shell".into(), json!("powershell"));
+    } else {
+        args.remove("shell");
+    }
 }
 
 /// A tool call as AFT decodes it from a route `REQUEST` body.
