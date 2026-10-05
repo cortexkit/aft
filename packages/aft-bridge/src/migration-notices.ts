@@ -11,11 +11,12 @@
  * persisted. A crash between delivery and persistence can repeat a notice.
  */
 
-import { mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { MIGRATION_POLICY_ID } from "./feature-config.js";
+import { openPrivateStorageDir, PRIVATE_FILE_MODE, privateMkdirSync } from "./private-storage.js";
 
 type NoticeRecords = Record<string, { delivered_at: string }>;
 
@@ -47,11 +48,11 @@ const LOCK_STALE_MS = 10_000;
 
 function withStoreLock<T>(storePath: string, action: () => T): T {
   const lockPath = `${storePath}.lock`;
-  mkdirSync(dirname(storePath), { recursive: true });
+  openPrivateStorageDir(dirname(storePath));
   const deadline = Date.now() + 2_000;
   for (;;) {
     try {
-      mkdirSync(lockPath);
+      privateMkdirSync(lockPath, false);
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -99,7 +100,10 @@ export function deliverMigrationNoticeOnce(options: MigrationNoticeOptions): boo
       delivered = true;
       records[key] = { delivered_at: new Date().toISOString() };
       const tmpPath = `${storePath}.tmp.${process.pid}`;
-      writeFileSync(tmpPath, `${JSON.stringify(records, null, 2)}\n`, "utf8");
+      writeFileSync(tmpPath, `${JSON.stringify(records, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: PRIVATE_FILE_MODE,
+      });
       renameSync(tmpPath, storePath);
       return true;
     });
@@ -118,6 +122,9 @@ export function clearMigrationNotices(configPath: string, storePath = migrationN
   withStoreLock(storePath, () => {
     const records = readRecords(storePath);
     for (const key of Object.keys(records)) if (key.startsWith(prefix)) delete records[key];
-    writeFileSync(storePath, `${JSON.stringify(records, null, 2)}\n`, "utf8");
+    writeFileSync(storePath, `${JSON.stringify(records, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: PRIVATE_FILE_MODE,
+    });
   });
 }

@@ -663,7 +663,8 @@ pub fn prepare_checkout(
     }
     prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
-    fs::write(&trigram, []).map_err(|error| ViewError::io_at("writing", &trigram, error))?;
+    crate::private_storage::write(&trigram, [])
+        .map_err(|error| ViewError::io_at("writing", &trigram, error))?;
     let artifacts = PublicationArtifacts {
         blob_databases: if reused_derived {
             vec![semantic.path().to_path_buf()]

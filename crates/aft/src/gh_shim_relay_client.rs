@@ -410,9 +410,9 @@ fn load_check(paths: &StatePaths) -> Option<BindingsCheck> {
 }
 
 fn store_check(paths: &StatePaths, check: &BindingsCheck) {
-    let _ = std::fs::create_dir_all(&paths.root);
+    let _ = crate::private_storage::open_root(&paths.root);
     if let Ok(bytes) = serde_json::to_vec(check) {
-        let _ = std::fs::write(paths.root.join(BINDINGS_CHECK_FILE), bytes);
+        let _ = crate::private_storage::write(paths.root.join(BINDINGS_CHECK_FILE), bytes);
     }
 }
 

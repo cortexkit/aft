@@ -778,6 +778,7 @@ fn ensure_managed_git_hooks(hooks_dir: &Path) -> Result<(), String> {
     if fs::symlink_metadata(hooks_dir).is_err() {
         install_managed_git_hook_set(hooks_dir, expected)?;
     }
+    crate::private_storage::tighten_open_dir(hooks_dir.parent().unwrap_or(hooks_dir), hooks_dir);
     // The directory is shared by every storage root, so verify it before each
     // child launch: tampering in one place would otherwise reach every agent.
     // An intact set costs only reads here; nothing is rewritten or re-chmodded.
@@ -898,6 +899,12 @@ fn replace_legacy_hook(
     permissions: fs::Permissions,
 ) -> Result<(), String> {
     use std::io::Write;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = permissions;
+        fs::Permissions::from_mode(crate::private_storage::DIR_MODE)
+    };
 
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = path.with_file_name(format!(
@@ -907,7 +914,7 @@ fn replace_legacy_hook(
         SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let replaced = (|| {
-        let mut file = fs::OpenOptions::new()
+        let mut file = crate::private_storage::executable_options()
             .write(true)
             .create_new(true)
             .open(&temporary)?;
@@ -915,7 +922,7 @@ fn replace_legacy_hook(
         file.set_permissions(permissions)?;
         drop(file);
         // rename replaces an existing regular file atomically, including on
-        // Windows. Preserve the old mode before publishing the new inode.
+        // Windows. Publish owner-only executables on Unix; retain Windows ACLs.
         fs::rename(&temporary, path)
     })();
     if let Err(error) = replaced {
@@ -942,7 +949,7 @@ fn install_managed_git_hook_set(
             hooks_dir.display()
         )
     })?;
-    fs::create_dir_all(parent).map_err(|error| {
+    crate::private_storage::open_root(parent).map_err(|error| {
         format!(
             "failed to create child Git hooks directory {}: {error}",
             parent.display()
@@ -962,7 +969,7 @@ fn install_managed_git_hook_set(
         STAGING_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let populated = (|| {
-        fs::create_dir(&staging).map_err(|error| {
+        crate::private_storage::create_dir(&staging).map_err(|error| {
             format!(
                 "failed to create Git hooks staging directory {}: {error}",
                 staging.display()
@@ -970,12 +977,14 @@ fn install_managed_git_hook_set(
         })?;
         for (name, contents) in expected {
             let hook = staging.join(name);
-            fs::write(&hook, contents.as_bytes()).map_err(|error| {
-                format!(
-                    "failed to write staged Git hook {}: {error}",
-                    hook.display()
-                )
-            })?;
+            crate::private_storage::write_executable(&hook, contents.as_bytes()).map_err(
+                |error| {
+                    format!(
+                        "failed to write staged Git hook {}: {error}",
+                        hook.display()
+                    )
+                },
+            )?;
             #[cfg(unix)]
             set_executable(&hook)?;
         }
@@ -1061,7 +1070,7 @@ fn quarantine_foreign_hook_entries(
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        fs::create_dir(&staging).map_err(|error| {
+        crate::private_storage::create_dir(&staging).map_err(|error| {
             format!(
                 "failed to stage the Git hook quarantine directory {}: {error}",
                 staging.display()
@@ -1083,7 +1092,7 @@ fn quarantine_foreign_hook_entries(
         moved.push(quarantine.join(destination_name));
         foreign.retain(|path| path != &quarantine);
     } else {
-        fs::create_dir_all(&quarantine).map_err(|error| {
+        crate::private_storage::create_dir_all(&quarantine).map_err(|error| {
             format!(
                 "failed to create Git hook quarantine directory {}: {error}",
                 quarantine.display()
@@ -1182,12 +1191,14 @@ fn quarantine_test_logs() -> &'static Mutex<Vec<String>> {
 fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
     use std::os::unix::fs::symlink;
 
-    fs::create_dir_all(shims_dir).map_err(|error| {
-        format!(
-            "failed to create gh shim directory {}: {error}",
-            shims_dir.display()
-        )
-    })?;
+    crate::private_storage::open_dir(shims_dir.parent().unwrap_or(shims_dir), shims_dir).map_err(
+        |error| {
+            format!(
+                "failed to create gh shim directory {}: {error}",
+                shims_dir.display()
+            )
+        },
+    )?;
     let entry = shims_dir.join("gh");
     if fs::read_link(&entry).ok().as_deref() == Some(binary) {
         return Ok(());
@@ -1218,7 +1229,7 @@ fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn ensure_gh_entry(shims_dir: &Path, binary: &Path) -> Result<(), String> {
-    fs::create_dir_all(shims_dir).map_err(|error| {
+    crate::private_storage::create_dir_all(shims_dir).map_err(|error| {
         format!(
             "failed to create gh shim directory {}: {error}",
             shims_dir.display()
@@ -1273,7 +1284,7 @@ fn write_hook_if_changed(path: &Path, bytes: &[u8]) -> Result<(), String> {
         {
             use std::os::unix::fs::PermissionsExt;
             let executable = fs::metadata(path)
-                .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o755);
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o700);
             if !executable {
                 set_executable(path)?;
             }
@@ -1305,7 +1316,7 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
     let parent = path
         .parent()
         .ok_or_else(|| format!("managed child file has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|error| {
+    crate::private_storage::create_dir_all(parent).map_err(|error| {
         format!(
             "failed to create managed child directory {}: {error}",
             parent.display()
@@ -1321,7 +1332,12 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
         std::process::id(),
         TEMPORARY_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    fs::write(&temporary, bytes).map_err(|error| {
+    let write = if executable {
+        crate::private_storage::write_executable(&temporary, bytes)
+    } else {
+        crate::private_storage::write(&temporary, bytes)
+    };
+    write.map_err(|error| {
         format!(
             "failed to write managed child file {}: {error}",
             temporary.display()
@@ -1357,18 +1373,18 @@ fn install_managed_file(path: &Path, bytes: &[u8], executable: bool) -> Result<(
 
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = fs::metadata(path)
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
         .map_err(|error| {
             format!(
-                "failed to read hook permissions {}: {error}",
+                "failed to open hook permissions {}: {error}",
                 path.display()
             )
-        })?
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions)
+        })?;
+    file.set_permissions(fs::Permissions::from_mode(crate::private_storage::DIR_MODE))
         .map_err(|error| format!("failed to make hook executable {}: {error}", path.display()))
 }
 
@@ -1380,6 +1396,14 @@ pub fn windows_gh_cmd(binary: &Path) -> Vec<u8> {
     debug_assert!(!rendered.contains('"'));
     let rendered = rendered.replace('%', "%%");
     format!("@echo off\r\n\"{rendered}\" gh-shim %*\r\n").into_bytes()
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn write_storage_permission_fixture(root: &Path) {
+    let hooks = root
+        .join(GIT_HOOKS_DIR_NAME)
+        .join(&managed_git_hook_set().key);
+    ensure_managed_git_hooks(&hooks).unwrap();
 }
 
 #[cfg(test)]
@@ -2177,7 +2201,7 @@ mod tests {
                     .unwrap()
                     .permissions()
                     .mode();
-                assert_eq!(mode & 0o777, 0o755, "{name} is not executable");
+                assert_eq!(mode & 0o777, 0o700, "{name} is not owner-only executable");
             }
         }
         assert_eq!(
@@ -2524,7 +2548,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn legacy_refresh_preserves_modes_and_never_rewrites_foreign_files() {
+    fn legacy_refresh_tightens_owned_modes_and_never_rewrites_foreign_files() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let temp = tempfile::tempdir().unwrap();
@@ -2558,7 +2582,7 @@ mod tests {
             after.ino(),
             "refresh must publish a new inode atomically"
         );
-        assert_eq!(after.permissions().mode() & 0o777, 0o750);
+        assert_eq!(after.permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::read(&foreign).unwrap(), foreign_bytes);
         assert_eq!(fs::metadata(&foreign).unwrap().ino(), foreign_inode);
         assert_eq!(fs::read(&copied_header).unwrap(), unkeyed_bytes);

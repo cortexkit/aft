@@ -12,7 +12,7 @@
 //! already deregistered the view and the creation fails.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,7 +65,7 @@ impl LivePin {
             LIVE_SEQ.fetch_add(1, Ordering::Relaxed)
         );
         validate_generation(&label)?;
-        fs::create_dir_all(view_dir.join("pins"))?;
+        crate::private_storage::create_dir_all(view_dir.join("pins"))?;
         let (metadata_path, keys_path) = pin_paths(view_dir, &label);
         let metadata = PinMetadata {
             family,
@@ -144,7 +144,7 @@ impl LivePin {
             LIVE_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> Result<(), PinError> {
-            let file = OpenOptions::new()
+            let file = crate::private_storage::options()
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;

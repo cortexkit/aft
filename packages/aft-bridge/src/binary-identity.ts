@@ -155,7 +155,7 @@ function writeSidecarAtomically(binaryPath: string, identity: BinaryIdentity): v
   const sidecar = identitySidecarPath(binaryPath);
   const tmp = `${sidecar}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
   try {
-    writeFileSync(tmp, `${JSON.stringify(identity)}\n`, "utf8");
+    writeFileSync(tmp, `${JSON.stringify(identity)}\n`, { encoding: "utf8", mode: 0o600 });
     if (process.platform === "win32") {
       // renameSync cannot replace an existing file on Windows.
       try {
@@ -370,6 +370,7 @@ export function writeStampedFileDigest(path: string, sha256: string, verifiedSta
     writeFileSync(
       tmp,
       JSON.stringify({ schema: 1, stamp: verifiedStamp ?? digestStamp(path), sha256 }),
+      { mode: 0o600 },
     );
     renameSync(tmp, sidecar);
   } catch {

@@ -967,7 +967,7 @@ fn preserve_raw_sample(pid: u32, raw: &str) -> Result<PathBuf, ProfileError> {
         .ok()
         .map(|duration| duration.as_secs());
     let path = raw_sample_path(&std::env::temp_dir(), pid, stamp)?;
-    fs::write(&path, raw).map_err(|error| {
+    aft::private_storage::write(&path, raw).map_err(|error| {
         ProfileError::runtime(format!("could not write {}: {error}", path.display()))
     })?;
     Ok(path)
@@ -1009,6 +1009,8 @@ fn capture_sample(pid: u32, seconds: u64) -> Result<CapturedSample, ProfileError
     {
         let path =
             std::env::temp_dir().join(format!("aft-profile-{pid}-{}.txt", std::process::id()));
+        aft::private_storage::create(&path)
+            .map_err(|error| ProfileError::runtime(error.to_string()))?;
         let status = Command::new("sample")
             .args([
                 pid.to_string(),
@@ -1056,12 +1058,14 @@ fn capture_linux_sample(pid: u32, seconds: u64) -> Result<CapturedSample, Profil
     if which::which("perf").is_ok() {
         let directory =
             std::env::temp_dir().join(format!("aft-profile-{pid}-{}", std::process::id()));
-        fs::create_dir_all(&directory).map_err(|error| {
+        aft::private_storage::create_dir_all(&directory).map_err(|error| {
             ProfileError::runtime(format!(
                 "could not create perf temporary directory: {error}"
             ))
         })?;
         let perf_data = directory.join("perf.data");
+        aft::private_storage::create(&perf_data)
+            .map_err(|error| ProfileError::runtime(error.to_string()))?;
         let pid_text = pid.to_string();
         let seconds_text = seconds.to_string();
         let perf_data_text = perf_data.display().to_string();
@@ -1601,7 +1605,7 @@ fn download_release_debug(
     let cache_parent = cache.parent().ok_or_else(|| {
         ProfileError::runtime(format!("dSYM cache has no parent: {}", cache.display()))
     })?;
-    fs::create_dir_all(cache_parent).map_err(|error| {
+    aft::private_storage::create_dir_all(cache_parent).map_err(|error| {
         ProfileError::runtime(format!(
             "could not create dSYM cache root {}: {error}",
             cache_parent.display()
@@ -1613,31 +1617,38 @@ fn download_release_debug(
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&download_dir);
-    fs::create_dir_all(&download_dir).map_err(|error| {
+    aft::private_storage::create_dir_all(&download_dir).map_err(|error| {
         ProfileError::runtime(format!(
             "could not create temporary dSYM directory {}: {error}",
             download_dir.display()
         ))
     })?;
     let archive = download_dir.join(&asset_name);
-    fs::write(&archive, bytes)
+    aft::private_storage::write(&archive, bytes)
         .map_err(|error| ProfileError::runtime(format!("could not cache {asset_name}: {error}")))?;
-    let archive_path = archive.display().to_string();
-    let cache_path = download_dir.display().to_string();
-    let mut extract = if cfg!(target_os = "macos") {
-        let mut command = Command::new("ditto");
-        command.args(["-x", "-k", &archive_path, &cache_path]);
-        command
-    } else {
-        let mut command = Command::new("unzip");
-        command.args(["-q", &archive_path, "-d", &cache_path]);
-        command
-    };
-    command_text(&mut extract).map_err(|error| {
-        ProfileError::runtime(format!(
-            "could not extract {asset_name} for UUID/build-id {expected_id}: {error}"
-        ))
+    #[cfg(unix)]
+    aft::private_storage::extract_zip(&archive, &download_dir).map_err(|error| {
+        ProfileError::runtime(format!("could not extract {asset_name}: {error}"))
     })?;
+    #[cfg(not(unix))]
+    {
+        let archive_path = archive.display().to_string();
+        let cache_path = download_dir.display().to_string();
+        let mut extract = if cfg!(target_os = "macos") {
+            let mut command = Command::new("ditto");
+            command.args(["-x", "-k", &archive_path, &cache_path]);
+            command
+        } else {
+            let mut command = Command::new("unzip");
+            command.args(["-q", &archive_path, "-d", &cache_path]);
+            command
+        };
+        command_text(&mut extract).map_err(|error| {
+            ProfileError::runtime(format!(
+                "could not extract {asset_name} for UUID/build-id {expected_id}: {error}"
+            ))
+        })?;
+    }
     let _ = fs::remove_file(archive);
     match inspect_debug_candidate(&download_dir, image, expected_id, true) {
         Ok(Some(_)) => {}

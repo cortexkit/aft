@@ -319,7 +319,7 @@ impl AliasStore {
             .join(artifact_key)
             .join("oid-alias.sqlite");
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::open_dir(storage, parent)?;
         }
 
         let connection =
@@ -637,7 +637,7 @@ pub struct ManifestSqliteStore {
 impl ManifestSqliteStore {
     pub fn open(path: &Path) -> Result<Self, AliasError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::create_dir_all(parent)?;
         }
         let connection = crate::db::file_identity::IdentityConnection::open(
             path,

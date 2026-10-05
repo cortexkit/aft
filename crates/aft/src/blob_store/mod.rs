@@ -451,7 +451,7 @@ impl BlobStore {
             .join(&artifact_key)
             .join(format!("{}.sqlite", plane.as_str()));
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::open_dir(storage, parent)?;
         }
 
         match Self::open_at(&artifact_key, plane, path.clone()) {

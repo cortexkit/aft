@@ -61,6 +61,8 @@ disable requires editing the base list):
 
 ## Storage Root Environment Override
 
+On Unix, AFT storage is owner-only (0700 directories and executables, 0600 files), and existing loose storage directories are tightened when opened without walking their contents.
+
 Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and indexes on a local disk when `$HOME` is NFS-mounted (for example on corporate or HPC systems). The variable is process state, not a JSONC configuration key, and an empty value is treated as unset. Relative values are resolved to an absolute path at first read; `~` and `~/...` are expanded using the current user's home directory.
 
 Storage resolution is identical for plugins, standalone binaries, and warmup:

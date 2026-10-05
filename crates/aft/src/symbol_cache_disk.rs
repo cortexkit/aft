@@ -47,7 +47,7 @@ impl SymbolCacheLock {
         if !access.allows_write(project_key, &path) {
             return Ok(Self { _guard: None });
         }
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::open_dir(storage_dir, &dir)?;
         let _acquire_guard = SYMBOL_LOCK_ACQUIRE_MUTEX
             .lock()
             .map_err(|_| std::io::Error::other("symbol cache lock acquisition mutex poisoned"))?;
@@ -127,6 +127,10 @@ fn note_cache_write(path: &Path) {
 }
 
 pub fn read_from_disk(storage_dir: &Path, project_key: &str) -> Option<DiskSymbolCache> {
+    crate::private_storage::tighten_open_dir(
+        storage_dir,
+        &storage_dir.join("symbols").join(project_key),
+    );
     let data_path = cache_path(storage_dir, project_key);
     if !data_path.exists() {
         return None;
@@ -172,7 +176,7 @@ pub fn write_to_disk(
     // Checked again under the lock: another process running a newer build may
     // have written its cache since the check above.
     check_disk_format(storage_dir, project_key).map_err(|refusal| refusal.into_io_error())?;
-    fs::create_dir_all(&dir)?;
+    crate::private_storage::open_dir(storage_dir, &dir)?;
     let tmp_path = dir.join(format!(
         "symbols.bin.tmp.{}.{}.{}",
         std::process::id(),
@@ -343,7 +347,7 @@ fn write_cache_file(
     project_root: &Path,
     tmp_path: &Path,
 ) -> std::io::Result<()> {
-    let mut writer = BufWriter::new(File::create(tmp_path)?);
+    let mut writer = BufWriter::new(crate::private_storage::create(tmp_path)?);
     let entries = cache
         .disk_entries()
         .into_iter()

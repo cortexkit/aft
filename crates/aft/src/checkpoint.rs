@@ -878,36 +878,15 @@ impl CheckpointStore {
         Ok(())
     }
 
-    /// Durable checkpoints written before they were owner-only may hold 0644
-    /// copies of secret files; tighten them in bounded, resumable passes.
+    /// Protect the namespace boundary without visiting historical blobs.
     fn tighten_permissions_locked(&self) {
         let Some(checkpoints_dir) = self.durable_checkpoints_dir() else {
             return;
         };
-        #[cfg(unix)]
-        let started = std::time::Instant::now();
-        #[cfg(unix)]
-        match crate::backup::tighten_store_permissions(
-            &checkpoints_dir,
-            crate::backup::PERMISSION_TIGHTEN_BUDGET,
-        ) {
-            Ok(Some(report)) => crate::slog_info!(
-                "tightened durable checkpoint permissions under {}: examined={} tightened={} complete={} elapsed_ms={}",
-                checkpoints_dir.display(),
-                report.examined,
-                report.tightened,
-                report.complete,
-                started.elapsed().as_millis()
-            ),
-            Ok(None) => {}
-            Err(error) => crate::slog_warn!(
-                "failed to tighten durable checkpoint permissions under {}: {}",
-                checkpoints_dir.display(),
-                error
-            ),
+        if let Some(root) = self.storage_dir.as_deref() {
+            crate::private_storage::tighten_root(root);
+            crate::private_storage::tighten_open_dir(root, &checkpoints_dir);
         }
-        #[cfg(not(unix))]
-        let _ = checkpoints_dir;
     }
 
     fn cleanup_locked(&mut self) -> Result<(), AftError> {
@@ -1016,6 +995,9 @@ impl CheckpointStore {
                 message: format!("failed to create durable checkpoint directory: {error}"),
             }
         })?;
+        if let Some(root) = self.storage_dir.as_deref() {
+            crate::private_storage::tighten_open_dir(root, &checkpoint_dir);
+        }
 
         let mut files = Vec::with_capacity(checkpoint.file_contents.len());
         let mut ledger_bytes = 0_u64;
@@ -1472,7 +1454,7 @@ fn write_temp_fsync_rename(dir: &Path, final_name: &str, bytes: &[u8]) -> io::Re
     let tmp_path = dir.join(tmp_name);
     let final_path = dir.join(final_name);
     {
-        let mut options = fs::OpenOptions::new();
+        let mut options = crate::private_storage::options();
         options.write(true).create_new(true);
         // Checkpoint blobs are copies of user files (possibly secrets), so
         // they are owner-only from creation, like undo backups.
@@ -3221,7 +3203,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn durable_checkpoints_are_owner_only_and_old_loose_ones_are_tightened() {
+    fn durable_checkpoints_are_owner_only_and_old_history_is_shielded_without_a_walk() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -3283,9 +3265,9 @@ mod tests {
             0o700
         );
 
-        // Process maintenance tightened the pre-existing loose checkpoint.
-        assert_eq!(mode_of(&old_blob), 0o600);
-        assert_eq!(mode_of(&old_dir), 0o700);
+        // The boundary shields old history without visiting every blob.
+        assert_eq!(mode_of(&old_blob), 0o644);
+        assert_eq!(mode_of(&old_dir), 0o755);
         assert_eq!(mode_of(&checkpoints_dir), 0o700);
 
         // Restore still gives the source its own recorded mode back.

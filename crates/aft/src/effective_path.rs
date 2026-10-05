@@ -579,7 +579,7 @@ fn read_effective_path_cache(path: &Path) -> Option<EffectivePathCache> {
 #[cfg(unix)]
 fn write_effective_path_cache(path: &Path, cache: &EffectivePathCache) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
     let content = serde_json::to_vec(cache).map_err(std::io::Error::other)?;
     let temporary = path.with_file_name(format!(
@@ -590,7 +590,7 @@ fn write_effective_path_cache(path: &Path, cache: &EffectivePathCache) -> std::i
         std::process::id()
     ));
     let result = (|| {
-        std::fs::write(&temporary, content)?;
+        crate::private_storage::write(&temporary, content)?;
         std::fs::rename(&temporary, path)?;
         Ok(())
     })();

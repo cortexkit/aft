@@ -2075,6 +2075,7 @@ impl SearchIndex {
     }
 
     pub fn read_from_disk(cache_dir: &Path, current_canonical_root: &Path) -> Option<Self> {
+        crate::private_storage::tighten_keyed_dir(cache_dir, "index");
         Self::read_from_disk_with_options(cache_dir, current_canonical_root, true)
     }
 

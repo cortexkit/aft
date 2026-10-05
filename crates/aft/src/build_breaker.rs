@@ -166,7 +166,7 @@ impl BuildDeathBreaker {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.set(calls.get() + 1));
         let path = path.into();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
+            crate::private_storage::create_dir_all(parent).map_err(|error| {
                 BuildBreakerError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
             })?;
         }

@@ -540,7 +540,7 @@ impl InspectCache {
                 "inspect writer lease epoch changed before opening cache",
             )));
         }
-        std::fs::create_dir_all(&inspect_dir)?;
+        crate::private_storage::open_keyed_dir(&inspect_dir, "inspect")?;
         let (sqlite_path, generation, needs_publish) =
             resolve_or_create_inspect_target(&inspect_dir, &project_key);
         let conn = TrackedConnection::open_attributed(
@@ -586,6 +586,7 @@ impl InspectCache {
     ) -> Result<Option<ReadonlyInspectCache>, InspectCacheError> {
         let project_key = crate::path_identity::project_scope_key(&project_root);
         let inspect_dir = project_inspect_dir(inspect_dir, &project_key);
+        crate::private_storage::tighten_keyed_dir(&inspect_dir, "inspect");
         let Some((sqlite_path, generation)) = resolve_inspect_target(&inspect_dir, &project_key)
         else {
             return Ok(None);
@@ -1625,7 +1626,7 @@ fn publish_inspect_pointer(
     ));
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         file.write_all(generation.as_bytes())?;
         file.write_all(b"\n")?;
         // The pointer names rebuildable analysis. Keep the atomic rename for
@@ -1925,6 +1926,7 @@ fn acquire_writer_lease(
 }
 
 fn open_readonly_connection(path: &Path) -> Result<TrackedConnection, InspectCacheError> {
+    crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let uri = sqlite_readonly_uri(path);
     let conn = TrackedConnection::open_with_flags(
         &uri,

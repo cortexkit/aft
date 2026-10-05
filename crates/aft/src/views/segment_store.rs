@@ -31,7 +31,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -406,7 +406,7 @@ pub fn write_segment(
             TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> SegmentResult<()> {
-            let mut file = OpenOptions::new()
+            let mut file = crate::private_storage::options()
                 .create_new(true)
                 .write(true)
                 .open(&temporary)?;

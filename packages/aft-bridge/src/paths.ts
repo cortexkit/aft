@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { MigrationHarness } from "./migration.js";
+import { openPrivateStorageDir, PRIVATE_FILE_MODE } from "./private-storage.js";
 
 export interface ResolvedAftConfigPaths {
   userConfigPath: string;
@@ -104,7 +105,7 @@ export function repairRootScopedStorageFile(
   if (existsSync(harnessPath) || !existsSync(rootPath)) return harnessPath;
 
   try {
-    mkdirSync(dirname(harnessPath), { recursive: true });
+    openPrivateStorageDir(storageRoot, dirname(harnessPath));
     renameSync(rootPath, harnessPath);
   } catch {
     // Best-effort compatibility repair. Callers still use the harness path so
@@ -172,8 +173,8 @@ export function shouldShowAnnouncement(
     // older version still hit the `lastVersion !== currentVersion` path
     // above and surface the dialog.
     try {
-      mkdirSync(dirname(versionFile), { recursive: true });
-      writeFileSync(versionFile, currentVersion);
+      openPrivateStorageDir(storageRoot, dirname(versionFile));
+      writeFileSync(versionFile, currentVersion, { mode: PRIVATE_FILE_MODE });
     } catch {
       // Best-effort. If we couldn't seed the file we still skip this turn so
       // the user isn't pestered; we'll just try to seed again next launch.
@@ -199,8 +200,8 @@ export function markAnnouncementSeen(
   const versionFile = repairRootScopedStorageFile(storageRoot, harness, "last_announced_version");
 
   try {
-    mkdirSync(dirname(versionFile), { recursive: true });
-    writeFileSync(versionFile, currentVersion);
+    openPrivateStorageDir(storageRoot, dirname(versionFile));
+    writeFileSync(versionFile, currentVersion, { mode: PRIVATE_FILE_MODE });
   } catch {
     // Best-effort.
   }

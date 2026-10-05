@@ -1537,40 +1537,20 @@ fn rotated_path(base: &Path, generation: usize) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Log lines can quote paths, commands and server output, so on Unix the log
-/// directory is owner-only. Windows keeps its inherited ACLs; AFT has no ACL
-/// helper to tighten them with.
-#[cfg(unix)]
-const LOG_DIR_MODE: u32 = 0o700;
 /// Owner read/write only for every log file AFT creates.
 #[cfg(unix)]
-const LOG_FILE_MODE: u32 = 0o600;
+const LOG_FILE_MODE: u32 = crate::private_storage::FILE_MODE;
 
 /// Create the log directory owner-only, and tighten one left over from before
-/// logs were private. Parent directories keep their default mode.
+/// logs were private. Only the storage root and its log directory are tightened.
 fn create_private_log_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        crate::private_storage::create_dir_all(dir)?;
-        match fs::DirBuilder::new().mode(LOG_DIR_MODE).create(dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
-            Err(error) => return Err(error),
-        }
-        tighten_if_owned(dir, LOG_DIR_MODE);
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(dir)
-    }
+    crate::private_storage::open_dir(dir.parent().unwrap_or(dir), dir)
 }
 
 /// Open a log file for appending (or truncate it, for a fresh generation after
 /// rotation). A newly created file is owner read/write only on Unix.
 fn open_private_log_file(path: &Path, truncate: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
+    let mut options = crate::private_storage::options();
     options.create(true);
     if truncate {
         options.write(true).truncate(true);
@@ -1599,8 +1579,23 @@ pub(crate) fn write_storage_permission_fixture(dir: &Path) {
 /// that cannot be changed is left as it is rather than failing log setup.
 #[cfg(unix)]
 fn tighten_if_owned(path: &Path, mode: u32) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(metadata) = fs::metadata(path) else {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    if path
+        .parent()
+        .into_iter()
+        .chain(path.parent().and_then(Path::parent))
+        .any(|dir| fs::symlink_metadata(dir).is_ok_and(|metadata| metadata.is_symlink()))
+    {
+        return;
+    }
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
         return;
     };
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -1608,7 +1603,7 @@ fn tighten_if_owned(path: &Path, mode: u32) {
     if metadata.uid() != euid || metadata.mode() & 0o777 & !mode == 0 {
         return;
     }
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    let _ = file.set_permissions(fs::Permissions::from_mode(mode));
 }
 
 fn remove_file_if_present(path: &Path) -> io::Result<()> {

@@ -112,7 +112,7 @@ pub fn fetch_url_to_cache(
     validate_public_url(&fetch_url, &options)?;
 
     let dir = cache_dir(storage_dir);
-    fs::create_dir_all(&dir).map_err(|error| {
+    crate::private_storage::open_dir(storage_dir, &dir).map_err(|error| {
         UrlFetchError::new(format!(
             "Failed to create URL cache directory {}: {error}",
             dir.display()
@@ -1184,7 +1184,7 @@ fn atomic_write(
     options: &UrlFetchOptions,
 ) -> Result<(), UrlFetchError> {
     let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| {
+    crate::private_storage::create_dir_all(parent).map_err(|error| {
         UrlFetchError::new(format!(
             "Failed to create URL cache parent {}: {error}",
             parent.display()
@@ -1204,7 +1204,7 @@ fn atomic_write(
     ));
 
     let write_result = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&tmp_path)?;
+        let mut file = crate::private_storage::create(&tmp_path)?;
         file.write_all(bytes)?;
         file.flush()?;
         Ok(())

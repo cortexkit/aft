@@ -97,7 +97,7 @@ fn with_trust_lock<T>(
     storage_dir: &Path,
     action: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    fs::create_dir_all(storage_dir)
+    crate::private_storage::open_root(storage_dir)
         .map_err(|e| format!("create_dir_all {}: {e}", storage_dir.display()))?;
     let lock_path = trust_lock_path(storage_dir);
     let _guard = fs_lock::acquire(&lock_path)
@@ -118,13 +118,14 @@ fn load(storage_dir: &Path) -> Result<TrustState, String> {
 }
 
 fn save(storage_dir: &Path, state: &TrustState) -> Result<(), String> {
-    fs::create_dir_all(storage_dir)
+    crate::private_storage::open_root(storage_dir)
         .map_err(|e| format!("create_dir_all {}: {e}", storage_dir.display()))?;
     let path = trust_path(storage_dir);
     let tmp_path = save_temp_path(&path);
     let bytes =
         serde_json::to_vec_pretty(state).map_err(|e| format!("serialize trust state: {e}"))?;
-    fs::write(&tmp_path, &bytes).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
+    crate::private_storage::write(&tmp_path, &bytes)
+        .map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
     if let Err(e) = fs::rename(&tmp_path, &path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(format!(

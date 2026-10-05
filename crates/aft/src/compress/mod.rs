@@ -1499,7 +1499,7 @@ pub(crate) fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness
     }
 
     let harness_dir = user_filter_dir(storage_dir, harness);
-    if fs::create_dir_all(&harness_dir).is_err() {
+    if crate::private_storage::create_dir_all(&harness_dir).is_err() {
         return;
     }
 

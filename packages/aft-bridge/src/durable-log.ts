@@ -1,5 +1,11 @@
-import { appendFile, chmod, mkdir, rename, rm, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { appendFile, lstat, mkdir, open, rename, rm, stat } from "node:fs/promises";
 import { dirname } from "node:path";
+import {
+  openPrivateStorageDir,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+} from "./private-storage.js";
 
 /** Maximum size of the active plugin log before its single backup rotates in. */
 export const DEFAULT_LOG_BYTES = 32 * 1024 * 1024;
@@ -10,8 +16,8 @@ export const DEFAULT_LOG_GENERATIONS = 1;
  * is owner-only and log files are owner read/write, matching the Rust daemon's
  * logs in the same directory. POSIX only: Windows ignores these modes.
  */
-export const LOG_DIR_MODE = 0o700;
-export const LOG_FILE_MODE = 0o600;
+export const LOG_DIR_MODE = PRIVATE_DIRECTORY_MODE;
+export const LOG_FILE_MODE = PRIVATE_FILE_MODE;
 
 import { resolveAftLogPath, resolveAftStorageRoot } from "./storage-paths.js";
 
@@ -114,12 +120,13 @@ export class RotatingLogSink {
   private async ensureDirectory(): Promise<string> {
     const dir = dirname(this.path);
     this.mkdirCalls += 2;
-    await mkdir(dirname(dir), { recursive: true });
+    await mkdir(dirname(dir), { recursive: true, mode: LOG_DIR_MODE });
     try {
       await mkdir(dir, { mode: LOG_DIR_MODE });
     } catch (error: unknown) {
       if (!hasCode(error, "EEXIST")) throw error;
     }
+    openPrivateStorageDir(dirname(dir), dir);
     this.directoryReady = true;
     return dir;
   }
@@ -191,12 +198,19 @@ function hasCode(error: unknown, code: string): boolean {
  */
 async function tightenIfOwned(path: string, mode: number): Promise<void> {
   if (process.platform === "win32" || typeof process.getuid !== "function") return;
+  let file: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const info = await stat(path);
+    for (const dir of [dirname(path), dirname(dirname(path))]) {
+      if ((await lstat(dir)).isSymbolicLink()) return;
+    }
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await file.stat();
     if (info.uid !== process.getuid() || (info.mode & 0o777 & ~mode) === 0) return;
-    await chmod(path, mode);
+    await file.chmod(mode);
   } catch {
     // Best effort; see above.
+  } finally {
+    await file?.close();
   }
 }
 

@@ -314,7 +314,7 @@ fn repair_root_scoped_harness_file(
     }
 
     if let Some(parent) = harness_path.parent() {
-        if fs::create_dir_all(parent).is_err() {
+        if crate::private_storage::create_dir_all(parent).is_err() {
             return harness_path;
         }
     }
@@ -332,7 +332,7 @@ fn legacy_host_path(ctx: &AppContext, key: &str) -> Option<PathBuf> {
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::private_storage::open_dir(parent, parent)?;
     }
     let tmp_path = path.with_file_name(format!(
         "{}.tmp.{}.{}",
@@ -343,7 +343,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         unix_millis()
     ));
 
-    let mut file = File::create(&tmp_path)?;
+    let mut file = crate::private_storage::create(&tmp_path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);

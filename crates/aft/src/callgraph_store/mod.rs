@@ -4141,6 +4141,7 @@ impl CallGraphStore {
         callgraph_dir: PathBuf,
         project_root: PathBuf,
     ) -> Result<Option<ReadonlyCallGraphStore>> {
+        crate::private_storage::tighten_keyed_dir(&callgraph_dir, "callgraph");
         let project_key = crate::search_index::artifact_cache_key(&project_root);
         // A generation written by a newer build is refused by name rather than
         // reported as not built (which would send callers to a cold build) or
@@ -9387,6 +9388,7 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
 }
 
 fn open_readonly_connection_before(path: &Path, deadline: Instant) -> Result<TrackedConnection> {
+    crate::private_storage::prepare_sqlite(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let uri = sqlite_readonly_uri(path);
     let conn = TrackedConnection::open_with_flags(
         &uri,

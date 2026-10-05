@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
@@ -261,7 +261,13 @@ impl PinnedDir {
     #[cfg(unix)]
     fn create_dir_at(&self, name: &OsStr) -> io::Result<Self> {
         let name = os_cstring(name)?;
-        let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
+        let result = unsafe {
+            libc::mkdirat(
+                self.file.as_raw_fd(),
+                name.as_ptr(),
+                crate::private_storage::DIR_MODE as libc::mode_t,
+            )
+        };
         if result != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -283,7 +289,7 @@ impl PinnedDir {
             self.file.as_raw_fd(),
             name,
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
+            crate::private_storage::FILE_MODE as libc::mode_t,
         )?;
         #[cfg(windows)]
         self.ensure_current_identity()?;
@@ -1191,7 +1197,7 @@ fn quarantine_names(
         io::Error::new(io::ErrorKind::InvalidInput, "session dir has no identity")
     })?;
     let quarantine_path = storage_dir.join("bash-tasks-quarantine").join(session_hash);
-    fs::create_dir_all(&quarantine_path)?;
+    crate::private_storage::create_dir_all(&quarantine_path)?;
     let quarantine = PinnedDir::open(&quarantine_path)?;
     for name in names {
         let mut random = [0_u8; 8];
@@ -1327,7 +1333,7 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
 pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
     validate_task_id(&task.task_id)?;
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let dir = PinnedDir::open(parent)?;

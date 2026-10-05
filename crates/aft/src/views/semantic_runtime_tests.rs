@@ -1570,14 +1570,15 @@ fn store_errors_name_the_gap_without_a_retry_loop() {
     write_tree(root.path(), FILES);
     let (slot, epoch, wake, runtime) = served_lane(storage.path(), root.path());
     // An edit makes the next refresh reload, which publishes into the view
-    // directory; a read-only directory refuses that publication.
+    // directory; an owner-only read-only directory refuses that publication.
+    // Public read/execute bits would be repaired when the store is reopened.
     std::fs::write(root.path().join("src/gamma.rs"), "pub fn gamma_edit() {}\n").unwrap();
     runtime
         .driver()
         .record_absolute_change(&root.path().join("src/gamma.rs"));
     let view_dir = crate::views::registry::view_dir(storage.path(), "scope").unwrap();
     let original = std::fs::metadata(&view_dir).unwrap().permissions();
-    std::fs::set_permissions(&view_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::fs::set_permissions(&view_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
     let worker = {
         let weak = Arc::downgrade(&slot);
         let root = root.path().to_path_buf();

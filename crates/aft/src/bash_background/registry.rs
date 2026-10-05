@@ -8990,7 +8990,7 @@ fn detached_shell_command_for(
             .unwrap_or("wrapper"),
         wrapper_ext
     ));
-    fs::write(&wrapper_path, wrapper_body)
+    crate::private_storage::write(&wrapper_path, wrapper_body)
         .map_err(|e| format!("failed to write background bash wrapper script: {e}"))?;
 
     let mut cmd = Command::new(shell.binary().as_ref());

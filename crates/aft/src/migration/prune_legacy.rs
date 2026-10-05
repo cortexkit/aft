@@ -711,7 +711,7 @@ fn move_set(set: &LegacySet, area: &Path) -> io::Result<Moved> {
             }
         }
         let target = area.join(&set.key);
-        fs::create_dir(&target)?;
+        crate::private_storage::create_dir(&target)?;
         let mut moved: Vec<(&Path, PathBuf)> = Vec::new();
         for dir in &set.dirs {
             let destination = target.join(dir.kind.dir_name());
@@ -803,7 +803,7 @@ pub fn prune_legacy(
     if !eligible.is_empty() {
         let millis = now_ms(SystemTime::now());
         let path = storage.join(format!("{PRUNE_DIR_PREFIX}{millis}-{}", std::process::id()));
-        fs::create_dir(&path)?;
+        crate::private_storage::create_dir(&path)?;
         for set in &eligible {
             match move_set(set, &path)? {
                 Moved::All => {

@@ -43,7 +43,7 @@ impl ViewStore {
             pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let owner = self.derived_owner(base)?;
         let path = self.view_dir().join(format!("derived-{generation}.ref"));
-        let mut file = fs::OpenOptions::new()
+        let mut file = crate::private_storage::options()
             .write(true)
             .create_new(true)
             .open(&path)

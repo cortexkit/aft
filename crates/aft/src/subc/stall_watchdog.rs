@@ -95,6 +95,7 @@ pub(super) struct PlatformCapture;
 impl StallCapture for PlatformCapture {
     #[cfg(target_os = "macos")]
     fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+        crate::private_storage::create(path)?;
         // `-mayDie` keeps `sample` from failing if the daemon exits mid-sample.
         std::process::Command::new("/usr/bin/sample")
             .arg(pid.to_string())
@@ -111,7 +112,7 @@ impl StallCapture for PlatformCapture {
 
     #[cfg(target_os = "linux")]
     fn capture(&self, _pid: u32, path: &Path) -> io::Result<CaptureStarted> {
-        std::fs::write(path, linux_thread_states()?)?;
+        crate::private_storage::write(path, linux_thread_states()?)?;
         Ok(CaptureStarted::Written)
     }
 
@@ -374,7 +375,7 @@ fn start_capture(config: &StallWatchdogConfig, children: &mut Vec<Child>) -> Str
     let path = config
         .diagnostics_dir
         .join(capture_file_name(SystemTime::now(), config.pid));
-    if let Err(error) = std::fs::create_dir_all(&config.diagnostics_dir) {
+    if let Err(error) = crate::private_storage::create_dir_all(&config.diagnostics_dir) {
         return format!("failed ({}: {error})", config.diagnostics_dir.display());
     }
     // Make room first so the new file is one of the newest `keep_captures`.

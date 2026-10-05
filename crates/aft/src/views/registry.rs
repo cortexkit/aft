@@ -262,7 +262,7 @@ impl FamilyRegistry {
     /// Opens the registry, creating it when absent.
     pub fn open(storage: &Path, family: &str) -> RegistryResult<Self> {
         let dir = family_dir(storage, family)?;
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::open_dir(storage, &dir)?;
         Self::open_path(storage, family, dir.join(REGISTRY_FILE), true)
     }
 
@@ -423,7 +423,7 @@ impl FamilyRegistry {
         )?;
         tx.commit()?;
         drop(connection);
-        fs::create_dir_all(&view_dir)?;
+        crate::private_storage::open_dir(&self.inner.storage, &view_dir)?;
         Ok(ViewRegistration {
             registry: self.clone(),
             scope: scope.to_owned(),

@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ impl JsonLogger {
     pub(super) fn open(path: &Path, harness: Harness) -> Self {
         let mut warned = false;
         if let Some(parent) = path.parent() {
-            if fs::create_dir_all(parent).is_err() {
+            if crate::private_storage::create_dir_all(parent).is_err() {
                 eprintln!("log write failed; continuing migration");
                 warned = true;
             }
@@ -23,7 +23,11 @@ impl JsonLogger {
         let file = if warned {
             None
         } else {
-            match OpenOptions::new().create(true).append(true).open(path) {
+            match crate::private_storage::options()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
                 Ok(file) => Some(file),
                 Err(_) => {
                     if !warned {

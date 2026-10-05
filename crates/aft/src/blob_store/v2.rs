@@ -428,7 +428,7 @@ impl FamilyStore {
     pub fn open(access: &StoreWriteAccess, plane: FamilyPlane) -> StoreResult<Self> {
         let path = plane_path(&access.storage, &access.family, plane)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::open_dir(&access.storage, parent)?;
         }
         let inner = shared_inner(&access.family, plane, &path, true)?;
         ensure_schema(&inner)?;

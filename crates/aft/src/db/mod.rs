@@ -9,7 +9,6 @@ pub use lifecycle::{
     connection_snapshot, SqliteConnectionSnapshot, SqliteStore, SqliteStoreCount, TrackedConnection,
 };
 use std::fmt;
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 

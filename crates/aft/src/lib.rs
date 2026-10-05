@@ -134,7 +134,8 @@ pub mod persisted_format;
 pub mod pins;
 mod platform_tls;
 mod privacy_spawn;
-pub(crate) mod private_storage;
+#[doc(hidden)]
+pub mod private_storage;
 pub mod process_io;
 pub mod protocol;
 pub mod pty_render;

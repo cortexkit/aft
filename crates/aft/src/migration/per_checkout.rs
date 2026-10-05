@@ -46,7 +46,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -434,7 +434,7 @@ impl ImportLedger {
     pub fn open(storage: &Path, legacy_key: &str) -> ImportResult<Self> {
         validate_legacy_key(legacy_key)?;
         let dir = ledger_dir(storage, legacy_key);
-        fs::create_dir_all(&dir)?;
+        crate::private_storage::create_dir_all(&dir)?;
         Self::open_path(dir, true).map(|ledger| ledger.expect("created ledger"))
     }
 
@@ -521,11 +521,14 @@ impl ImportLedger {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let result = (|| {
-            fs::create_dir_all(&copy_dir)?;
+            crate::private_storage::create_dir_all(&copy_dir)?;
             let copy = copy_dir.join(LEDGER_FILE);
-            fs::copy(&path, &copy)?;
+            crate::private_storage::copy(&path, &copy)?;
             let journal = path.with_file_name(format!("{LEDGER_FILE}-wal"));
-            match fs::copy(&journal, copy.with_file_name(format!("{LEDGER_FILE}-wal"))) {
+            match crate::private_storage::copy(
+                &journal,
+                copy.with_file_name(format!("{LEDGER_FILE}-wal")),
+            ) {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -867,10 +870,10 @@ fn staged_path(ledger: &ImportLedger, artifact: Artifact, staged_hash: &[u8; 32]
 /// directory, so `staged` is only recorded for bytes that reached the disk.
 fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    crate::private_storage::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp.{}.{}", std::process::id(), now_ms()));
     let result = (|| {
-        let mut file = OpenOptions::new()
+        let mut file = crate::private_storage::options()
             .create_new(true)
             .write(true)
             .open(&temporary)?;

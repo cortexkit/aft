@@ -111,7 +111,10 @@ pub fn claim_or_open_read_only(
     }
 
     let manifest_dir = resolve_manifest_dir(storage_dir, project_root, project_key);
-    fs::create_dir_all(&manifest_dir)?;
+    crate::private_storage::open_dir(
+        &crate::bash_background::storage_dir(storage_dir),
+        &manifest_dir,
+    )?;
     let path = manifest_dir.join("owner.json");
     let checkout_path = project_root.display().to_string();
     let git_common_dir = git_common_dir.map(|path| path.display().to_string());
@@ -138,7 +141,10 @@ pub fn claim_or_open_read_only(
                         // The orphaned-manifest sweep removed the key
                         // directory; recreate it and claim again.
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                            fs::create_dir_all(&manifest_dir)?;
+                            crate::private_storage::open_dir(
+                                &crate::bash_background::storage_dir(storage_dir),
+                                &manifest_dir,
+                            )?;
                             continue;
                         }
                         result => return result,
@@ -179,7 +185,10 @@ pub fn claim_or_open_read_only(
                     // The orphaned-manifest sweep removes empty key
                     // directories; recreate it and try again.
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        fs::create_dir_all(&manifest_dir)?;
+                        crate::private_storage::open_dir(
+                            &crate::bash_background::storage_dir(storage_dir),
+                            &manifest_dir,
+                        )?;
                         continue;
                     }
                     Err(error) => return Err(error),
@@ -483,7 +492,7 @@ fn heartbeat_manifest(
 fn replace_manifest_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = temp_path(path);
     let write_result = (|| -> io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
         write_manifest_bytes(&mut file, bytes)?;
         drop(file);
@@ -509,7 +518,10 @@ fn create_owner_manifest(
     git_common_dir: Option<&str>,
 ) -> io::Result<ArtifactOwnerClaim> {
     let manifest = new_manifest(project_scope_key, checkout_path, git_common_dir);
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut file = crate::private_storage::options()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
     write_manifest_to_file(&mut file, &manifest)?;
     Ok(owner_claim(path, project_key, manifest))
@@ -659,7 +671,7 @@ pub(crate) fn check_manifest_format(
 fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::Result<()> {
     let tmp = temp_path(path);
     let write_result = (|| -> io::Result<()> {
-        let mut file = File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         fs_lock::io_ledger::record(|ledger| ledger.new_files += 1);
         write_manifest_to_file(&mut file, manifest)?;
         fs::rename(&tmp, path)?;

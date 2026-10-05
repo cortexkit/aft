@@ -94,7 +94,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
         log: log_path,
     };
 
-    let target_root_error = fs::create_dir_all(&args.to).err();
+    let target_root_error = crate::private_storage::open_root(&args.to).err();
     let log_harness = args.harness.clone();
     let mut log = JsonLogger::open(&args.log, log_harness);
     let started = SystemTime::now();
@@ -118,7 +118,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     }
 
     let lock_dir = args.to.join(".aft");
-    if let Err(error) = fs::create_dir_all(&lock_dir) {
+    if let Err(error) = crate::private_storage::open_dir(&args.to, &lock_dir) {
         log.write(serde_json::json!({
             "level": "error",
             "step": "create_lock_dir",
@@ -222,7 +222,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
     }
 
     if !args.from.exists() {
-        if let Err(error) = fs::create_dir_all(&target_harness) {
+        if let Err(error) = crate::private_storage::create_dir_all(&target_harness) {
             log.write(serde_json::json!({
                 "level": "error",
                 "step": "create_harness_dir",
@@ -246,7 +246,7 @@ pub fn run_with_options(args: Args, options: Options) -> ExitStatus {
         return ExitStatus::Success;
     }
 
-    if let Err(error) = fs::create_dir_all(&target_harness) {
+    if let Err(error) = crate::private_storage::create_dir_all(&target_harness) {
         log.write(serde_json::json!({
             "level": "error",
             "step": "create_harness_dir",
@@ -573,7 +573,7 @@ fn migrate_whole(
 
     let staging = staging_path(&final_path, item.name);
     if let Some(parent) = staging.parent() {
-        fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
 
     let copy_result = match item.entry {
@@ -603,7 +603,7 @@ fn migrate_child_union(
     log: &mut JsonLogger,
 ) -> io::Result<()> {
     let final_dir = target_path(args, item);
-    fs::create_dir_all(&final_dir)?;
+    crate::private_storage::create_dir_all(&final_dir)?;
     let mut copied_bytes = 0_u64;
     let mut failed = false;
 
@@ -718,7 +718,7 @@ fn staging_path(final_path: &Path, subtree: &str) -> PathBuf {
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
-    fs::create_dir_all(target)?;
+    crate::private_storage::create_dir_all(target)?;
     for entry in sorted_read_dir(source)? {
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
@@ -734,9 +734,9 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
 
 fn copy_file(source: &Path, target: &Path) -> io::Result<u64> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
-    let bytes = fs::copy(source, target)?;
+    let bytes = crate::private_storage::copy(source, target)?;
     sync_path(target);
     Ok(bytes)
 }
@@ -824,7 +824,7 @@ fn write_source_marker(args: &MigrationArgs) -> io::Result<()> {
 }
 
 fn write_target_marker(args: &MigrationArgs) -> io::Result<()> {
-    fs::create_dir_all(args.to.join(args.harness.storage_segment()))?;
+    crate::private_storage::create_dir_all(args.to.join(args.harness.storage_segment()))?;
     atomic_write_json(&target_marker_path(args), &marker(args))
 }
 
@@ -844,7 +844,7 @@ fn target_marker_path_from(target_root: &Path, harness: &Harness) -> PathBuf {
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::private_storage::create_dir_all(parent)?;
     }
     let tmp = path.with_file_name(format!(
         ".{}.tmp.{}.{}",
@@ -855,7 +855,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         now_millis()
     ));
     let result = (|| {
-        let mut file = File::create(&tmp)?;
+        let mut file = crate::private_storage::create(&tmp)?;
         serde_json::to_writer(&mut file, value).map_err(io::Error::other)?;
         file.write_all(b"\n")?;
         file.sync_all()?;

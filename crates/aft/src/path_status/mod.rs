@@ -6,7 +6,6 @@
 
 use std::error::Error;
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
@@ -139,7 +138,7 @@ impl PathStatusStore {
     /// assembler to share its already-created derived database with this table.
     pub fn open_at(path: &Path) -> Result<Self, PathStatusError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::private_storage::open_dir(parent, parent)?;
         }
         let connection = crate::db::file_identity::IdentityConnection::open(
             path,

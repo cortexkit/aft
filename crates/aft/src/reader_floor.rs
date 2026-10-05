@@ -200,7 +200,7 @@ pub fn raise(
     requirements: &[(PersistedStore, u32)],
 ) -> Result<ReaderFloor, FloorError> {
     let path = floor_path(storage_root);
-    fs::create_dir_all(storage_root).map_err(|error| FloorError::Io {
+    crate::private_storage::open_root(storage_root).map_err(|error| FloorError::Io {
         path: storage_root.to_path_buf(),
         error,
     })?;
@@ -250,7 +250,7 @@ fn write_atomic(path: &Path, floor: &ReaderFloor) -> Result<(), FloorError> {
         .unwrap_or_default();
     let tmp = dir.join(format!(".{FLOOR_FILE}.tmp.{}.{nanos}", std::process::id()));
     let result = (|| -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
+        let mut file = crate::private_storage::options()
             .write(true)
             .create_new(true)
             .open(&tmp)?;

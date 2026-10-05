@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -4172,11 +4172,6 @@ fn retain_manifest(paths: &StatePaths, envelope: &SignedManifest, filing_version
         eprintln!("gh-shim: refusing to retain manifest: could not write temporary file");
         return;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600));
-    }
     if fs::rename(&temporary, &destination).is_err() {
         eprintln!("gh-shim: refusing to retain manifest: could not move into place");
         let _ = fs::remove_file(&temporary);
@@ -6394,7 +6389,7 @@ fn write_seam_state(paths: &StatePaths, state: SeamState) -> io::Result<()> {
     crate::private_storage::open_root(&paths.root)?;
     let bytes = serde_json::to_vec(&state).map_err(io::Error::other)?;
     let temporary = paths.seam_state.with_extension("tmp");
-    let mut file = OpenOptions::new()
+    let mut file = crate::private_storage::options()
         .create(true)
         .truncate(true)
         .write(true)
@@ -6730,7 +6725,7 @@ fn append_bypass_audit_record(paths: &StatePaths, record: &Value) -> io::Result<
     crate::private_storage::open_root(&paths.root)?;
     let mut record = serde_json::to_vec(record).map_err(io::Error::other)?;
     record.push(b'\n');
-    let mut file = OpenOptions::new()
+    let mut file = crate::private_storage::options()
         .create(true)
         .append(true)
         .open(&paths.bypass_audit)?;

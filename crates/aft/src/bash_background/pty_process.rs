@@ -73,7 +73,7 @@ pub(crate) fn spawn_pty_for_command(
         for shell in candidates {
             let wrapper_body = shell.wrapper_script_bytes(user_command, &paths.exit);
             let wrapper_path = windows_wrapper_path(paths, &shell);
-            if let Err(error) = fs::write(&wrapper_path, wrapper_body) {
+            if let Err(error) = crate::private_storage::write(&wrapper_path, wrapper_body) {
                 last_err = format!("write wrapper {wrapper_path:?}: {error}");
                 continue;
             }

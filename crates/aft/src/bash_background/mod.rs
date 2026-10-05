@@ -918,7 +918,7 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
         return;
     }
     if let Some(parent) = harness_tasks.parent() {
-        if let Err(error) = std::fs::create_dir_all(parent) {
+        if let Err(error) = crate::private_storage::create_dir_all(parent) {
             crate::slog_warn!(
                 "failed to create harness bash task dir {}: {}",
                 parent.display(),
@@ -942,7 +942,7 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
                 harness_tasks.display(),
                 error
             );
-            if std::fs::create_dir_all(&harness_tasks).is_err() {
+            if crate::private_storage::create_dir_all(&harness_tasks).is_err() {
                 return;
             }
             if let Ok(entries) = std::fs::read_dir(&root_tasks) {

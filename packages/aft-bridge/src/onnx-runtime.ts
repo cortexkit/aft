@@ -38,7 +38,6 @@ import {
   createWriteStream,
   existsSync,
   lstatSync,
-  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -61,6 +60,13 @@ import { probeOnnxRuntimeLoadable } from "./onnx-probe.js";
 import { relativePathEscapesRoot } from "./path-display.js";
 import { withPathPrepended } from "./path-env.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
+import {
+  openPrivateStorageDir,
+  PRIVATE_DIRECTORY_MODE,
+  PRIVATE_FILE_MODE,
+  privateCopyFileSync,
+  privateMkdirSync,
+} from "./private-storage.js";
 import { execTarExtractionSync } from "./tar-executable.js";
 
 const ORT_VERSION = "1.24.4";
@@ -342,7 +348,7 @@ async function resolveOnnxRuntimeUncoalesced(
   // reuse withInstallLock from lsp-cache because that helper is keyed on
   // lspPackageDir, while ONNX lives in storageDir.)
   const onnxBaseDir = join(storageDir, "onnxruntime");
-  mkdirSync(onnxBaseDir, { recursive: true });
+  openPrivateStorageDir(storageDir, onnxBaseDir);
   const lockPath = join(onnxBaseDir, ONNX_LOCK_FILE);
 
   const pollMs = seams.lockPollMs ?? LOCK_POLL_MS;
@@ -809,7 +815,7 @@ async function downloadFileWithCap(url: string, destPath: string): Promise<void>
       throw new Error(`Content-Length ${advertised} exceeds max ${MAX_DOWNLOAD_BYTES}`);
     }
 
-    mkdirSync(dirname(destPath), { recursive: true });
+    privateMkdirSync(dirname(destPath));
 
     let bytesWritten = 0;
     const guard = new TransformStream<Uint8Array, Uint8Array>({
@@ -830,7 +836,9 @@ async function downloadFileWithCap(url: string, destPath: string): Promise<void>
     const guarded = res.body.pipeThrough(guard);
     // biome-ignore lint/suspicious/noExplicitAny: ReadableStream→Node stream conversion
     const nodeStream = Readable.fromWeb(guarded as any);
-    await pipeline(nodeStream, createWriteStream(destPath), { signal: controller.signal });
+    await pipeline(nodeStream, createWriteStream(destPath, { mode: PRIVATE_FILE_MODE }), {
+      signal: controller.signal,
+    });
   } catch (err) {
     try {
       unlinkSync(destPath);
@@ -890,11 +898,13 @@ function validateExtractedTree(stagingRoot: string): void {
       }
 
       if (lst.isDirectory()) {
+        if (process.platform !== "win32") chmodSync(fullPath, PRIVATE_DIRECTORY_MODE);
         walk(fullPath);
         continue;
       }
 
       if (lst.isFile()) {
+        if (process.platform !== "win32") chmodSync(fullPath, PRIVATE_FILE_MODE);
         totalBytes += lst.size;
         if (totalBytes > MAX_EXTRACT_BYTES) {
           throw new Error(
@@ -929,7 +939,7 @@ async function downloadOnnxRuntime(
   const stagedInstallDir = join(tmpDir, "install");
 
   try {
-    mkdirSync(extractionRoot, { recursive: true });
+    privateMkdirSync(extractionRoot);
     const archivePath = join(tmpDir, `onnxruntime.${info.archiveType}`);
 
     // Download with a streaming size cap.
@@ -940,7 +950,7 @@ async function downloadOnnxRuntime(
     log(`ONNX Runtime archive sha256=${archiveSha256}`);
 
     if (info.archiveType === "tgz") {
-      execTarExtractionSync(["xzf", archivePath, "-C", extractionRoot], 120_000);
+      execTarExtractionSync(["xzf", archivePath, "-C", extractionRoot], 120_000, true);
     } else {
       await extractZipArchive(archivePath, extractionRoot);
     }
@@ -1069,7 +1079,7 @@ function copyOnnxLibraries(
   // The installer passes a fresh staging directory that does not exist yet.
   // Without this, every copy fails with ENOENT on the destination path and
   // no managed install can ever succeed.
-  mkdirSync(targetDir, { recursive: true });
+  privateMkdirSync(targetDir);
 
   // Copy real files first. Required library failures are fatal; optional extra
   // libraries stay best-effort so one unusual sidecar does not block install.
@@ -1077,9 +1087,10 @@ function copyOnnxLibraries(
     const src = join(extractedDir, libFile);
     const dst = join(targetDir, libFile);
     try {
-      copyFile(src, dst);
+      if (copyFile === copyFileSync) privateCopyFileSync(src, dst);
+      else copyFile(src, dst);
       if (process.platform !== "win32") {
-        chmodSync(dst, 0o755);
+        chmodSync(dst, PRIVATE_FILE_MODE);
       }
     } catch (copyErr) {
       if (requiredLibs.has(libFile)) {
@@ -1169,7 +1180,10 @@ function writeOnnxInstalledMeta(
       ...(sha256 ? { sha256 } : {}),
       archiveSha256,
     };
-    writeFileSync(join(installDir, ONNX_INSTALLED_META_FILE), JSON.stringify(meta), "utf8");
+    writeFileSync(join(installDir, ONNX_INSTALLED_META_FILE), JSON.stringify(meta), {
+      encoding: "utf8",
+      mode: PRIVATE_FILE_MODE,
+    });
   } catch (err) {
     log(`[onnx] failed to write installed-meta in ${installDir}: ${err}`);
   }
@@ -1208,7 +1222,7 @@ function readOnnxInstalledMeta(installDir: string): OnnxInstalledMeta | null {
 function acquireLock(lockPath: string): boolean {
   const tryClaim = (): boolean => {
     try {
-      const fd = openSync(lockPath, "wx");
+      const fd = openSync(lockPath, "wx", PRIVATE_FILE_MODE);
       try {
         writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`);
       } finally {

@@ -151,7 +151,7 @@ impl AssemblyPin {
     ) -> Result<Self, PinError> {
         validate_generation(&generation)?;
         let pins_dir = view_dir.join("pins");
-        fs::create_dir_all(&pins_dir)?;
+        crate::private_storage::create_dir_all(&pins_dir)?;
 
         let keys_path = pins_dir.join(format!("{generation}.keys"));
         write_keys(&keys_path, keys)?;

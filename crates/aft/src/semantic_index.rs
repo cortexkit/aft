@@ -7631,6 +7631,10 @@ impl SemanticIndex {
         expected_fingerprint: Option<&str>,
     ) -> Option<Self> {
         debug_assert!(current_canonical_root.is_absolute());
+        crate::private_storage::tighten_open_dir(
+            storage_dir,
+            &storage_dir.join("semantic").join(project_key),
+        );
         let data_path = storage_dir
             .join("semantic")
             .join(project_key)
@@ -7777,6 +7781,10 @@ impl SemanticIndex {
         project_key: &str,
         current_canonical_root: &Path,
     ) -> Option<Self> {
+        crate::private_storage::tighten_open_dir(
+            storage_dir,
+            &storage_dir.join("semantic").join(project_key),
+        );
         let load_started = Instant::now();
         let loaded = Self::read_from_disk_borrow_tolerant_inner(
             storage_dir,

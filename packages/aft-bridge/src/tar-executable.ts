@@ -22,10 +22,31 @@ export function windowsTarExecutable(options: TarResolverOptions = {}): string {
 }
 
 /** Run an extraction command and preserve the resolved executable in failures. */
-export function execTarExtractionSync(args: string[], timeout: number): void {
+export function execTarExtractionSync(
+  args: string[],
+  timeout: number,
+  privateStorage = false,
+): void {
   const executable = windowsTarExecutable();
   try {
-    execFileSync(executable, args, { stdio: "pipe", timeout });
+    if (privateStorage && process.platform !== "win32") {
+      // The child-only umask protects each member as it appears, without
+      // changing permissions of unrelated host/plugin writes in this process.
+      execFileSync(
+        "/bin/sh",
+        [
+          "-c",
+          'umask 077; exec "$@"',
+          "aft-extract",
+          executable,
+          "--no-same-permissions",
+          ...args.map((arg, index) => (index === 0 && !arg.startsWith("-") ? `-${arg}` : arg)),
+        ],
+        { stdio: "pipe", timeout },
+      );
+    } else {
+      execFileSync(executable, args, { stdio: "pipe", timeout });
+    }
   } catch (cause) {
     const detail = cause instanceof Error ? cause.message : String(cause);
     throw new Error(`tar extraction failed using ${executable}: ${detail}`, { cause });
