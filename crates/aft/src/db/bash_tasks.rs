@@ -88,6 +88,8 @@ pub struct BashTaskRow {
     pub timeout_ms: Option<i64>,
     pub completion_delivered: bool,
     pub output_bytes: Option<i64>,
+    /// Includes the remote job ID, contiguous delivered seq and committed
+    /// output lengths. Replay prefers the atomic task file if this mirror lags.
     pub metadata: String,
 }
 

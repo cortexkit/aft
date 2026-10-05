@@ -53,6 +53,26 @@ thread_local! {
     /// only sees the tool's own arguments, which the agent controls.
     static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteLaunch {
+    pub params: crate::exec_remote::FrozenParams,
+    pub connection_file: Option<PathBuf>,
+    pub harness: String,
+    pub session: String,
+}
+
+pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RemoteLaunch>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_REMOTE.with(|s| *s.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CURRENT_REMOTE.with(|s| s.replace(policy)));
+    run()
 }
 
 /// Run `run` with `call_key` as the current call's key, restoring the
@@ -429,7 +449,40 @@ pub fn spawn(
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
-    let spawn_result = if pty {
+    let remote = CURRENT_REMOTE
+        .with(|s| s.borrow().clone())
+        .filter(|launch| {
+            !shell.is_powershell()
+                && launch.params.remote_exec.as_ref().is_some_and(|policy| {
+                    crate::exec_remote::policy::matches(policy, command, pty, false)
+                })
+        });
+    #[cfg(unix)]
+    let remote_result = remote.map(|launch| {
+        ctx.bash_background().spawn_remote(
+            launch,
+            spawn_plan.clone(),
+            command,
+            shell_path.clone(),
+            session_id.to_string(),
+            workdir.clone(),
+            env.clone(),
+            hard_kill,
+            storage_dir.clone(),
+            max_running,
+            notify_on_completion,
+            compressed,
+            project_root.clone(),
+        )
+    });
+    #[cfg(not(unix))]
+    let remote_result: Option<Result<String, String>> = {
+        let _ = remote;
+        None
+    };
+    let spawn_result = if let Some(result) = remote_result {
+        result
+    } else if pty {
         ctx.bash_background().spawn_pty_with_shell(
             spawn_plan,
             command,

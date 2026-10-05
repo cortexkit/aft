@@ -7,22 +7,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subc_protocol::{BindIdentity, Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
 
-fn id() -> Uuid {
+pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
 #[derive(Clone, Copy)]
-enum Script {
+pub(crate) enum Script {
     Lost,
     Refused,
     Restart,
     Cancel,
     MissingTerminal,
+    KnownRefused,
+    FutureOutcome,
+    Expired,
+    Utf8,
+    Deadline,
 }
 
-struct Daemon {
-    connection: std::path::PathBuf,
-    log: Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>>,
+pub(crate) struct Daemon {
+    pub(crate) connection: std::path::PathBuf,
+    pub(crate) log: Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -33,7 +38,7 @@ impl Drop for Daemon {
     }
 }
 
-async fn daemon(script: Script, claim: &str) -> Daemon {
+pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -86,13 +91,16 @@ async fn daemon(script: Script, claim: &str) -> Daemon {
                     match body["method"].as_str().unwrap() {
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
-                            if !attaching && !matches!(script, Script::Refused) {
+                            if !attaching && !matches!(script, Script::Refused | Script::KnownRefused) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                             }
                             let outcome = if attaching && cancelled { Outcome::Signal { signal: 15 } }
                                 else { match script {
                                     Script::Lost => Outcome::OutcomeUnknown,
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
+                                    Script::KnownRefused => Outcome::RefusedBeforeStart { reason: serde_json::from_value(json!("server_unreachable")).unwrap() },
+                                    Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
+                                    Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
                             if matches!(script, Script::Cancel) && !attaching { /* accepted, still running */ }
@@ -104,9 +112,19 @@ async fn daemon(script: Script, claim: &str) -> Daemon {
                                         replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(vec![b'A' + seq as u8])))).unwrap()));
                                     }
                                 }
+                                if matches!(script, Script::Utf8) {
+                                    for (seq,stream,bytes) in [(0,OutputStream::Stdout,vec![0xe2]),(1,OutputStream::Stderr,vec![0xf0,0x9f]),(2,OutputStream::Stdout,vec![0x82,0xac]),(3,OutputStream::Stderr,vec![0x98,0x80])] {
+                                        replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(Output::new(seq,stream,BytePayload(bytes)))).unwrap()));
+                                    }
+                                }
                                 if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
                                     if cancelled { terminal = terminal.with_killed(Killed::Cancel); }
+                                    if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
+                                    if matches!(script, Script::Utf8) {
+                                        terminal.pipestatus=Some(vec![3,0]);
+                                        terminal.workspace_changes=Some(vec!["generated.txt".into()]);
+                                    }
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Terminal(terminal)).unwrap()));
                                 }
                                 replies.push(Frame::build_with_version(header.ver, FrameType::StreamEnd, header.flags, header.channel, header.epoch, header.corr, vec![]).unwrap());

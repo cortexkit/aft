@@ -207,6 +207,7 @@ mod manifest;
 mod persistence;
 mod push;
 mod readiness;
+mod remote_policy;
 mod stall_watchdog;
 mod standing;
 mod tool_provider;
@@ -2036,6 +2037,10 @@ fn reap_idle_roots_with_presence(
         if deleted {
             match executor.try_retire_idle_actor_in_background(&root_id) {
                 Some(true) => {
+                    crate::db::remote_exec::forget_root_in_background(
+                        ctx.db(),
+                        root_id.as_path().display().to_string(),
+                    );
                     live_roots.remove(&root_id);
                     forgotten_deleted_roots.push(root_id.clone());
                 }
@@ -2828,6 +2833,7 @@ async fn handle_bash_elicitation_reply(
                 pending.repeat,
                 pending.worker_session,
                 false,
+                None,
             );
             return Ok(());
         }
@@ -5092,6 +5098,7 @@ where
                 // only spawn their work, and only when it is due.
                 if let Some(db) = shared_app.try_db() {
                     crate::db::write_ledger::maybe_spawn_fold(db.clone());
+                    crate::db::remote_exec::maybe_spawn_sweep(db.clone());
                     crate::db::compression_events::maybe_spawn_retention(
                         db,
                         retention_registries,
@@ -7098,27 +7105,41 @@ async fn submit_provider_read(
     let job_operation = operation.clone();
     let request_id = format!("subc-{}-{}", route.channel, corr);
     let job_id = request_id.clone();
-    // No database, index, build, or configuration lookup occurs on this lane.
+    // Parameterless catalogs stay on the read lane. Scoped worker routing
+    // params are committed durably before the catalog reply is published.
+    let freeze_policy = remote_policy::key(&identity, body.get("preset").and_then(Value::as_str))
+        .is_some()
+        && body
+            .get("params")
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key("remote_exec") || p.contains_key("siblings"));
     let rx = submit_active_tool_call(
         executor,
         active,
         route,
         corr,
         identity.root.clone(),
-        Lane::PureRead,
+        if freeze_policy {
+            Lane::Mutating
+        } else {
+            Lane::PureRead
+        },
         request_id.clone(),
         RouteDetachPolicy::CancelOnDetach,
         &operation,
         RequestFrameMeta { ver, flags },
-        Box::new(move |_| {
+        Box::new(move |ctx| {
             let result = if job_operation == "role.describe" {
                 Ok(tool_provider::describe())
             } else {
-                tool_provider::catalog(
-                    body,
-                    &identity.disabled_tools,
-                    crate::bash_background::powershell_available(),
-                )
+                if freeze_policy {
+                    crate::database_open::run_staged_open(
+                        ctx,
+                        crate::database_open::DatabaseOpenRunner::ConfigureTail,
+                        true,
+                    );
+                }
+                remote_policy::catalog(body, &identity, ctx)
             };
             Response::success(
                 job_id,
@@ -7789,6 +7810,7 @@ async fn handle_tool_call(
             repeat,
             role.is_worker(),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
+            remote_policy::key(&identity, call.preset.as_deref()),
         );
         return Ok(());
     }

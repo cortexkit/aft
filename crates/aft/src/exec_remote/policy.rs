@@ -35,7 +35,7 @@ pub fn matches(policy: &RemoteExecPolicy, line: &str, pty: bool, stdin: bool) ->
         })
 }
 
-fn valid_prefix(prefix: &str) -> bool {
+pub(super) fn valid_prefix(prefix: &str) -> bool {
     !prefix.is_empty()
         && prefix.split(' ').all(|word| {
             !word.is_empty()

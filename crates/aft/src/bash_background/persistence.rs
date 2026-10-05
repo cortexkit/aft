@@ -26,7 +26,7 @@ use crate::db::bash_tasks::BashTaskRow;
 use super::process::LiveDescendant;
 use super::BgTaskStatus;
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 const CONTROL_DIR: &str = "control";
 const IO_DIR: &str = "io";
 const METADATA_FILE: &str = "metadata.json";
@@ -548,6 +548,10 @@ pub struct PersistedTask {
     /// written before AFT recorded it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_key: Option<super::TaskCallKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote: Option<super::registry::remote::RemoteTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_note: Option<String>,
 }
 
 fn default_notify_on_completion() -> bool {
@@ -617,6 +621,8 @@ impl PersistedTask {
             sandbox_temp_dir: None,
             status_reason: None,
             call_key,
+            remote: None,
+            execution_note: None,
         }
     }
 
@@ -738,6 +744,8 @@ impl From<BashTaskRow> for PersistedTask {
             sandbox_temp_dir: None,
             status_reason: None,
             call_key: None,
+            remote: None,
+            execution_note: None,
         }
     }
 }
@@ -1282,11 +1290,11 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
     work_counts::record_parse();
     let task: PersistedTask = serde_json::from_str(&content)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    if !matches!(task.schema_version, 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
+    if !matches!(task.schema_version, 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "unsupported background task schema_version {} (expected 2, 3, 4, 5, or {SCHEMA_VERSION})",
+                "unsupported background task schema_version {} (expected 2, 3, 4, 5, 6, or {SCHEMA_VERSION})",
                 task.schema_version
             ),
         ));
@@ -1333,7 +1341,7 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
     let mut upgraded = task.clone();
     upgraded.schema_version = SCHEMA_VERSION;
     let content = serde_json::to_vec_pretty(&upgraded).map_err(io::Error::other)?;
-    randomized_atomic_replace(dir, name, &content)
+    atomic_replace(dir, name, &content, task.remote.is_some())
 }
 
 pub fn update_task_at<F>(task: &ResolvedTask, update: F) -> io::Result<PersistedTask>
@@ -1578,6 +1586,10 @@ pub fn read_exit_marker(paths: &TaskPaths) -> io::Result<Option<ExitMarker>> {
 }
 
 pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) -> io::Result<()> {
+    atomic_replace(dir, name, content, false)
+}
+
+fn atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8], durable: bool) -> io::Result<()> {
     for _ in 0..32 {
         let temporary = random_temp_name()?;
         let mut file = match dir.open_new_file(&temporary) {
@@ -1587,10 +1599,17 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
         };
         let result = (|| {
             file.write_all(content)?;
+            if durable {
+                file.sync_all()?;
+            }
             // Atomic replacement protects readers after a daemon kill. Task
             // history is mirrored in a weaker database and is not a durable log.
             validate_regular_handle(&file)?;
-            dir.rename(&temporary, name)
+            dir.rename(&temporary, name)?;
+            if durable {
+                dir.file.sync_all()?;
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = dir.remove_file(&temporary);

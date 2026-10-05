@@ -1,0 +1,78 @@
+{
+  "tool_items": [
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {
+        "behavior": "autonomous",
+        "scope": "readwrite",
+        "tool_descs": "concise",
+        "host": "broca",
+        "remote_exec": {
+          "enabled": false,
+          "commands": [
+            "cd",
+            "cargo build",
+            "cargo check",
+            "cargo test",
+            "cargo nextest",
+            "cargo clippy",
+            "bun test"
+          ]
+        },
+        "siblings": [
+          "/Users/worker/projects/commons",
+          "/Users/worker/projects/claustrum"
+        ]
+      }
+    }
+  ],
+  "system_text_items": [
+    {
+      "provider": "prefrontal-core",
+      "preset": "worker",
+      "params": {
+        "role": "mason"
+      }
+    },
+    {
+      "provider": "aft",
+      "preset": "worker",
+      "params": {}
+    }
+  ],
+  "step_transform_items": [],
+  "composition": {
+    "providers": [
+      {
+        "provider": "aft",
+        "tools": [
+          {
+            "name": "bash",
+            "capabilities": [
+              "shell.exec/v1"
+            ]
+          },
+          {
+            "name": "edit",
+            "capabilities": [
+              "code.edit/v1"
+            ]
+          },
+          {
+            "name": "read",
+            "capabilities": [
+              "code.read/v1"
+            ]
+          }
+        ]
+      },
+      {
+        "provider": "prefrontal-core",
+        "tools": []
+      }
+    ],
+    "step_transform_items": []
+  },
+  "composition_digest": "804d43d4845feac793b051772414475648cf3abc413294b5b9b7d89fe4020b82"
+}

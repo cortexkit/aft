@@ -464,6 +464,7 @@ pub(super) fn submit_deferred_bash(
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
     server_completion: bool,
+    remote_key: Option<crate::db::remote_exec::PolicyKey>,
 ) {
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
@@ -573,7 +574,10 @@ pub(super) fn submit_deferred_bash(
                     crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                         crate::bash_background::with_call_key(call_key, || {
                             (
-                                dispatch(raw_req, ctx),
+                                crate::bash_background::with_remote_policy(
+                                    super::remote_policy::lookup(ctx, remote_key.as_ref()),
+                                    || dispatch(raw_req, ctx),
+                                ),
                                 crate::bash_background::task_storage_dir(ctx),
                             )
                         })
@@ -1581,6 +1585,7 @@ mod grant_path_tests {
                 None,
                 false,
                 true,
+                None,
             );
             let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
                 .await
@@ -1691,6 +1696,7 @@ mod grant_path_tests {
                 None,
                 false,
                 false,
+                None,
             );
         }
 
@@ -1839,6 +1845,7 @@ mod grant_path_tests {
             None,
             false,
             false,
+            None,
         );
 
         let started_by = Instant::now() + Duration::from_secs(3);

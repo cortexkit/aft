@@ -11,7 +11,7 @@ mod request;
 mod stream;
 pub use client::{ExecRemoteClient, RemoteStream, StreamProgress};
 pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
-pub use request::{build_request, PresetParams};
+pub use request::{build_request, FrozenParams, PresetParams};
 pub use stream::{OutputSink, ResumePoint, StreamConsumer};
 
 #[derive(Debug)]
@@ -110,4 +110,4 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod wire_tests;
+pub(crate) mod wire_tests;

@@ -3,3 +3,8 @@ Policy fixtures copied byte-for-byte from prefrontal commit `519c93ee4a5e`,
 the reference generator. Tests verify canonical bytes, SHA-256 digests and
 every independent expected routing decision. Do not regenerate these from
 AFT's matcher.
+
+`plans/broca-worker*` comes from the same commit's
+`test-vectors/fetch-plan-v1/plans/`. These are the actual frozen core plans;
+catalog tests use their AFT tool item's params verbatim and verify the JCS
+bytes against the published SHA-256, not against an AFT-generated expectation.

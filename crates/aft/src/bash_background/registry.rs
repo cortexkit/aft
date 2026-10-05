@@ -75,6 +75,8 @@ const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
+#[path = "remote.rs"]
+pub(crate) mod remote;
 #[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
@@ -1358,6 +1360,11 @@ impl BgTaskRegistry {
     ) -> BgTaskSnapshot {
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(task, &mut snapshot);
+        if let Ok(state) = task.state.lock() {
+            if let Some(note) = &state.metadata.execution_note {
+                snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
+            }
+        }
         snapshot
     }
 
@@ -1638,6 +1645,9 @@ impl BgTaskRegistry {
     }
 
     fn persisted_task_process_is_alive(metadata: &PersistedTask) -> bool {
+        if metadata.remote.is_some() && !metadata.is_terminal() {
+            return true;
+        }
         let child_pid = metadata.child_pid;
         let group_leader = metadata.pgid.and_then(|pid| u32::try_from(pid).ok());
         child_pid
@@ -3555,7 +3565,14 @@ impl BgTaskRegistry {
             match read_task_at(&resolved) {
                 Ok(disk)
                     if disk.task_id == metadata.task_id
-                        && disk.session_id == metadata.session_id => {}
+                        && disk.session_id == metadata.session_id =>
+                {
+                    // Output and cursor commit to the task file together;
+                    // the database mirror may lag after a process crash.
+                    if disk.remote.is_some() {
+                        metadata = disk;
+                    }
+                }
                 Ok(_) | Err(_) => {
                     if Self::persisted_task_process_is_alive(&metadata) {
                         crate::slog_warn!(
@@ -3579,6 +3596,13 @@ impl BgTaskRegistry {
                 }
             }
             let paths = resolved.paths;
+            if metadata.remote.is_some() && !metadata.is_terminal() {
+                let task_id = metadata.task_id.clone();
+                self.insert_rehydrated_task(metadata, paths, true)?;
+                #[cfg(unix)]
+                self.resume_remote_task(&task_id)?;
+                continue;
+            }
             match metadata.status {
                 BgTaskStatus::Starting => {
                     let completion_was_delivered = metadata.completion_delivered;
@@ -5466,6 +5490,9 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn poll_task(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+            return Ok(());
+        }
         if let Ok(state) = task.state.lock() {
             if let TaskRuntime::Pty(Some(pty)) = &state.runtime {
                 // On Windows ConPTY, the reader may not observe EOF while the
@@ -5489,6 +5516,9 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn reap_child(&self, task: &Arc<BgTask>) {
+        if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+            return;
+        }
         let mut needs_completion = false;
         {
             let mut db = DeferredDbWrites::new(self, task);
@@ -5994,6 +6024,10 @@ impl BgTaskRegistry {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
+        #[cfg(unix)]
+        if task.state.lock().is_ok_and(|s| s.metadata.remote.is_some()) {
+            return self.kill_remote_task(&task);
+        }
         let mut terminalized = false;
         let mut kill_signaled = false;
         let mut kill_reached = 0;

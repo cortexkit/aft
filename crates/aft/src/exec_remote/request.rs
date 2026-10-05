@@ -3,11 +3,57 @@ use std::{collections::BTreeMap, path::Path};
 
 /// Scheduling and sibling data supplied by the frozen worker preset, not read
 /// from config files. The caller does not build snapshots or transfer bundles.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PresetParams {
     pub siblings: Vec<String>,
     pub weight_hint: Option<u32>,
     pub queue_wait_limit_s: Option<u64>,
+}
+
+/// Only the routing fields of a frozen catalog plan; never tool arguments.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct FrozenParams {
+    pub remote_exec: Option<super::policy::RemoteExecPolicy>,
+    pub siblings: Vec<String>,
+    /// Reserved for host-specific serving; AFT does not act on it today.
+    pub host: Option<String>,
+}
+
+impl FrozenParams {
+    pub fn decode(params: &serde_json::Map<String, serde_json::Value>) -> Result<Self, String> {
+        let remote_exec = params
+            .get("remote_exec")
+            .map(|v| {
+                serde_json::from_value::<super::policy::RemoteExecPolicy>(v.clone())
+                    .map_err(|e| format!("remote_exec: {e}"))
+            })
+            .transpose()?;
+        if let Some(policy) = &remote_exec {
+            if policy
+                .commands
+                .iter()
+                .any(|p| !super::policy::valid_prefix(p))
+            {
+                return Err("remote_exec.commands: malformed prefix".into());
+            }
+        }
+        let siblings: Vec<String> = params
+            .get("siblings")
+            .map(|v| serde_json::from_value(v.clone()).map_err(|e| format!("siblings: {e}")))
+            .transpose()?
+            .unwrap_or_default();
+        if siblings.iter().any(|s| !Path::new(s).is_absolute()) {
+            return Err("siblings: paths must be absolute".into());
+        }
+        Ok(Self {
+            remote_exec,
+            siblings,
+            host: params
+                .get("host")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+        })
+    }
 }
 
 /// Build the caller request from bash's launch inputs. The entire shell env is
