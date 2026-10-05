@@ -11,6 +11,7 @@ mod request;
 mod stream;
 pub use client::{ExecRemoteClient, RemoteStream, StreamProgress};
 pub use reply::{decode_reply, grade_reply, Reply, ReplyVerdict};
+pub(crate) use request::denied_environment_name;
 pub use request::{build_request, FrozenParams, PresetParams};
 pub use stream::{OutputSink, ResumePoint, StreamConsumer};
 

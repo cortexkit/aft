@@ -56,8 +56,37 @@ impl FrozenParams {
     }
 }
 
-/// Build the caller request from bash's launch inputs. The entire shell env is
-/// copied verbatim; secret filtering belongs to ck-motor before any SSH traffic.
+/// Caller-side defense in depth, independent of ck-motor's authoritative
+/// allowlist. Only names are inspected; no allowlist is mirrored here.
+pub(crate) fn denied_environment_name(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|part| name.contains(part))
+        || [
+            "AWS_",
+            "GH_",
+            "AFT_",
+            "CORTEXKIT_",
+            "CORTEX_",
+            "CK_",
+            "SUBC_",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || name == "SSH_AUTH_SOCK"
+}
+
+/// Build the caller request from bash's launch inputs. Secret-shaped and
+/// AFT/CortexKit control variables are removed before any off-host request.
 /// Timeout is run time in seconds, independently of the queue wait limit.
 pub fn build_request(
     worktree_root: &Path,
@@ -97,7 +126,11 @@ pub fn build_request(
         absolute(Path::new(sibling))?;
     }
     let mut request = RunRequest::new(key, repository, cwd_string, command)
-        .with_env(env)
+        .with_env(
+            env.into_iter()
+                .filter(|(name, _)| !denied_environment_name(name))
+                .collect(),
+        )
         .with_siblings(preset.siblings.clone());
     if let Some(weight) = preset.weight_hint {
         request = request.with_weight_hint(weight);

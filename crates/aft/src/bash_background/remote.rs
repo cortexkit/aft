@@ -337,47 +337,49 @@ impl BgTaskRegistry {
         let linux_scope = env
             .remove("AFT_INTERNAL_LINUX_SCOPE")
             .is_some_and(|v| v == "1");
-        let environment = if !plan.is_native_launcher() && plan.host_shell_path().is_none() {
-            std::env::vars_os()
-                .chain(env.clone().into_iter().map(|(k, v)| (k.into(), v.into())))
-                .filter(|(k, _)| {
-                    !k.to_str()
-                        .is_some_and(crate::agent_child_env::is_subc_credential_env_key)
-                })
-                .map(|(k, v)| {
-                    Ok((
-                        k.into_string().map_err(|_| {
-                            exec::Error::Protocol(
-                                "shell environment contains a non-Unicode key".into(),
-                            )
-                        })?,
-                        v.into_string().map_err(|_| {
-                            exec::Error::Protocol(
-                                "shell environment contains a non-Unicode value".into(),
-                            )
-                        })?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, exec::Error>>()
-        } else {
-            crate::sandbox_spawn::approved_environment_for_plan(&plan, &env)
-                .into_iter()
-                .map(|(k, v)| {
-                    Ok((
-                        k.into_string().map_err(|_| {
-                            exec::Error::Protocol(
-                                "shell environment contains a non-Unicode key".into(),
-                            )
-                        })?,
-                        v.into_string().map_err(|_| {
-                            exec::Error::Protocol(
-                                "shell environment contains a non-Unicode value".into(),
-                            )
-                        })?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, exec::Error>>()
-        };
+        let shell_environment: crate::sandbox_spawn::ChildEnvironment =
+            if !plan.is_native_launcher() && plan.host_shell_path().is_none() {
+                std::env::vars_os()
+                    .chain(env.clone().into_iter().map(|(k, v)| (k.into(), v.into())))
+                    .collect()
+            } else {
+                crate::sandbox_spawn::approved_environment_for_plan(&plan, &env)
+            };
+        let mut stripped = Vec::new();
+        let environment = shell_environment
+            .into_iter()
+            .filter(|(key, _)| {
+                if let Some(key) = key
+                    .to_str()
+                    .filter(|name| exec::denied_environment_name(name))
+                {
+                    stripped.push(key.to_owned());
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string().map_err(|_| {
+                        exec::Error::Protocol("shell environment contains a non-Unicode key".into())
+                    })?,
+                    value.into_string().map_err(|_| {
+                        exec::Error::Protocol(
+                            "shell environment contains a non-Unicode value".into(),
+                        )
+                    })?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, exec::Error>>();
+        {
+            let mut db = DeferredDbWrites::new(self, &task);
+            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            state.metadata.stripped_env_names = stripped;
+            append_environment_disclosure(&mut state.metadata);
+            self.persist_task_locked(&task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
         let request = environment.and_then(|environment| {
             exec::build_request(
                 request_root,
@@ -945,6 +947,7 @@ fn repository_root(root: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn append_output_loss(metadata: &mut PersistedTask) {
+    append_environment_disclosure(metadata);
     for (first, last) in &metadata.incomplete_output {
         let warning = format!(
             "output lost between seq {first} and {last}: the executor no longer retained it"
@@ -955,6 +958,23 @@ fn append_output_loss(metadata: &mut PersistedTask) {
         if !note.contains(&warning) {
             note.push_str(&format!("\n{warning}"));
         }
+    }
+}
+
+#[cfg(unix)]
+fn append_environment_disclosure(metadata: &mut PersistedTask) {
+    if metadata.stripped_env_names.is_empty() {
+        return;
+    }
+    let disclosure = format!(
+        "AFT stripped env names: {}",
+        serde_json::to_string(&metadata.stripped_env_names).unwrap()
+    );
+    let note = metadata
+        .execution_note
+        .get_or_insert_with(|| "remote execution on ck-motor".into());
+    if !note.contains(&disclosure) {
+        note.push_str(&format!("; {disclosure}"));
     }
 }
 

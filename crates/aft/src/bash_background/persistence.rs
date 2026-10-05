@@ -555,6 +555,9 @@ pub struct PersistedTask {
     /// Missing job-wide output ranges, independent of execution outcome.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub incomplete_output: Vec<(u64, u64)>,
+    /// Caller-side removals, names only; never environment values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stripped_env_names: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub local_fallback_started: bool,
 }
@@ -629,6 +632,7 @@ impl PersistedTask {
             remote: None,
             execution_note: None,
             incomplete_output: Vec::new(),
+            stripped_env_names: Vec::new(),
             local_fallback_started: false,
         }
     }
@@ -754,6 +758,7 @@ impl From<BashTaskRow> for PersistedTask {
             remote: None,
             execution_note: None,
             incomplete_output: Vec::new(),
+            stripped_env_names: Vec::new(),
             local_fallback_started: false,
         }
     }

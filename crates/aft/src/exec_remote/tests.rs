@@ -408,7 +408,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
     std::fs::create_dir(&cwd).unwrap();
     let env = std::collections::BTreeMap::from([
         ("RUSTFLAGS".into(), "-Dwarnings".into()),
-        ("SHELL_SECRET".into(), "executor filters this".into()),
+        ("SHELL_SECRET".into(), "must stay on caller".into()),
     ]);
     let preset = PresetParams {
         siblings: vec![worktree.to_str().unwrap().into()],
@@ -425,7 +425,10 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         &preset,
     )
     .unwrap();
-    assert_eq!(request.env, env);
+    assert_eq!(
+        request.env,
+        std::collections::BTreeMap::from([("RUSTFLAGS".into(), "-Dwarnings".into())])
+    );
     assert_eq!(request.workspace_key, worktree.to_str().unwrap());
     assert_eq!(request.cwd, cwd.to_str().unwrap());
     assert_eq!(request.timeout, Some(23));
@@ -463,6 +466,62 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         &preset
     )
     .is_err());
+}
+
+#[test]
+fn request_strips_secret_shaped_and_control_environment_names() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let denied = [
+        "MY_TOKEN",
+        "SHELL_SECRET",
+        "PASSWORD",
+        "DB_PASSWD",
+        "PRIVATE_KEY_FILE",
+        "SERVICE_API_KEY",
+        "USER_CREDENTIAL",
+        "AWS_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "GH_REPO",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "SSH_AUTH_SOCK",
+        "AFT_STORAGE_DIR",
+        "AFT_TEST_CONTROL",
+        "CORTEXKIT_CONTROL_SOCKET",
+        "CK_CONTROL_PATH",
+        "SUBC_MODULE_ID",
+        "SUBC_LAUNCH_NONCE",
+    ];
+    for name in denied {
+        for spelling in [name.to_owned(), name.to_ascii_lowercase()] {
+            let env = std::collections::BTreeMap::from([
+                (spelling.clone(), "sensitive-fixture-value".into()),
+                ("FOO".into(), "ordinary".into()),
+                ("RUSTFLAGS".into(), "-Dwarnings".into()),
+            ]);
+            let request = build_request(
+                &root,
+                &root,
+                &root,
+                "cargo test",
+                env,
+                None,
+                &PresetParams::default(),
+            )
+            .unwrap();
+            assert!(
+                !request.env.contains_key(&spelling),
+                "{spelling} left the caller"
+            );
+            assert_eq!(request.env["FOO"], "ordinary");
+            assert_eq!(request.env["RUSTFLAGS"], "-Dwarnings");
+            assert!(!serde_json::to_string(&request)
+                .unwrap()
+                .contains("sensitive-fixture-value"));
+        }
+    }
 }
 
 #[cfg(unix)]

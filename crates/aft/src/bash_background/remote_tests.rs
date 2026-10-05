@@ -64,7 +64,7 @@ fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
             resolve_posix_shell(),
             "session".into(),
             dir.into(),
-            HashMap::from([("AFT_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
+            HashMap::from([("BUILD_REMOTE_ENV_TEST".into(), "environment-proof".into())]),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.into(),
             10,
@@ -115,7 +115,7 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
         let log = daemon.log.lock().unwrap();
         let request = log.iter().find(|(_, b)| b["method"] == "exec.run").unwrap();
         assert_eq!(
-            request.1["params"]["env"]["AFT_REMOTE_ENV_TEST"],
+            request.1["params"]["env"]["BUILD_REMOTE_ENV_TEST"],
             "environment-proof"
         );
         assert_eq!(request.1["params"]["cwd"], dir.path().display().to_string());
@@ -195,6 +195,65 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
         .output_preview
         .contains("workspace_changes (not copied back): generated.txt"));
     assert!(!dir.path().join("generated.txt").exists());
+}
+
+#[tokio::test]
+async fn exec_remote_bash_discloses_only_names_aft_stripped() {
+    let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let env = HashMap::from([
+        ("BUILD_LABEL".into(), "ordinary-build".into()),
+        ("SHELL_SECRET".into(), "secret-fixture-value".into()),
+        ("AWS_REGION".into(), "not-off-host".into()),
+        ("AFT_CONTROL_PATH".into(), "private-control-value".into()),
+    ]);
+    let task_id = registry
+        .spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            "printf unused",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            env,
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            10,
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let done = terminal(&registry, &task_id).await;
+    let log = daemon.log.lock().unwrap();
+    let request = &log
+        .iter()
+        .find(|(_, body)| body["method"] == "exec.run")
+        .unwrap()
+        .1;
+    assert!(request["params"]["env"].get("SHELL_SECRET").is_none());
+    assert!(request["params"]["env"].get("AWS_REGION").is_none());
+    assert!(request["params"]["env"].get("AFT_CONTROL_PATH").is_none());
+    assert_eq!(request["params"]["env"]["BUILD_LABEL"], "ordinary-build");
+    assert!(
+        done.output_preview.contains("AFT stripped env names:"),
+        "{done:?}"
+    );
+    for name in ["SHELL_SECRET", "AWS_REGION", "AFT_CONTROL_PATH"] {
+        assert!(done.output_preview.contains(name), "{done:?}");
+    }
+    for value in [
+        "secret-fixture-value",
+        "not-off-host",
+        "private-control-value",
+    ] {
+        assert!(!done.output_preview.contains(value));
+        assert!(!request.to_string().contains(value));
+    }
+    assert!(!done
+        .output_preview
+        .contains("the remote job does not receive"));
 }
 
 #[tokio::test]
