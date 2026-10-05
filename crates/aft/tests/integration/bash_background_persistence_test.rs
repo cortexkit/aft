@@ -2028,9 +2028,14 @@ fn erased_watch_is_process_local_and_never_replays_to_a_foreign_session() {
         ORIGINATING_SESSION,
         HARNESS,
     );
+    // The task can outlive the AFT process this test kills, and then nothing
+    // kills it at its timeout. Bound the loop itself: it also ends when the
+    // test's temp directory disappears or after two minutes, so a test that
+    // fails before writing the release file cannot leave it polling forever.
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done",
-        shell_quote_path(&release)
+        "end=$((SECONDS + 120)); while [ ! -e {} ] && [ -d {} ] && [ $SECONDS -lt $end ]; do sleep 0.05; done",
+        shell_quote_path(&release),
+        shell_quote_path(release.parent().expect("release file has a parent"))
     );
     let task_id = spawn_bg(&mut session_a, ORIGINATING_SESSION, &command, Some(30_000));
     let registered = notify(
@@ -2138,9 +2143,14 @@ fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() 
         ORIGINATING_SESSION,
         HARNESS,
     );
+    // The task can outlive the AFT process this test kills, and then nothing
+    // kills it at its timeout. Bound the loop itself: it also ends when the
+    // test's temp directory disappears or after two minutes, so a test that
+    // fails before writing the release file cannot leave it polling forever.
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done",
-        shell_quote_path(&release)
+        "end=$((SECONDS + 120)); while [ ! -e {} ] && [ -d {} ] && [ $SECONDS -lt $end ]; do sleep 0.05; done",
+        shell_quote_path(&release),
+        shell_quote_path(release.parent().expect("release file has a parent"))
     );
     let task_id = spawn_bg(&mut session_a, ORIGINATING_SESSION, &command, Some(30_000));
     let registered = notify(
@@ -2223,9 +2233,14 @@ fn assert_pi_erased_watch_is_process_local(task_row_survives_restart: bool) {
 
     let mut aft = AftProcess::spawn();
     configure_background_for_harness(&mut aft, project.path(), storage.path(), SESSION, HARNESS);
+    // The task can outlive the AFT process this test kills, and then nothing
+    // kills it at its timeout. Bound the loop itself: it also ends when the
+    // test's temp directory disappears or after two minutes, so a test that
+    // fails before writing the release file cannot leave it polling forever.
     let command = format!(
-        "while [ ! -e {} ]; do sleep 0.05; done",
-        shell_quote_path(&release)
+        "end=$((SECONDS + 120)); while [ ! -e {} ] && [ -d {} ] && [ $SECONDS -lt $end ]; do sleep 0.05; done",
+        shell_quote_path(&release),
+        shell_quote_path(release.parent().expect("release file has a parent"))
     );
     let task_id = spawn_bg(&mut aft, SESSION, &command, Some(30_000));
     let registered = notify(&mut aft, SESSION, &task_id, "never-matches", false);

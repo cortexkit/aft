@@ -408,13 +408,22 @@ mod startup_storage_tests {
         let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()));
         let default =
             crate::bash_background::storage_dir_without_overrides_for_test().join("aft.db");
-        assert!(
-            !default.exists(),
-            "the isolated test default must begin without a database"
-        );
+        // Other tests in the same process may already have created a database
+        // at the default root (CI shares one hermetic home), so compare its
+        // state before and after instead of requiring it to be absent.
+        let snapshot = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.len(), meta.modified().ok()))
+        };
+        let before = snapshot(&default);
         actor.reconcile_at_startup(root.path());
         assert!(root.path().join("aft.db").is_file());
-        assert!(!default.exists());
+        assert_eq!(
+            snapshot(&default),
+            before,
+            "standing startup with an explicit storage dir must not touch the default root"
+        );
     }
 }
 
