@@ -7,6 +7,55 @@ fn parse(source: &str, language: &str) -> ParseBlob {
         _ => unreachable!(),
     }
 }
+
+#[test]
+fn perf_audit2_dispatch_repeated_sites_do_not_rescan_the_project() {
+    let parses = (0..128)
+        .map(|index| {
+            parse(
+                &format!("export class C{index} {{ run() {{}} }}"),
+                "typescript",
+            )
+        })
+        .collect::<Vec<_>>();
+    let resolver = Resolver::new(
+        parses
+            .iter()
+            .enumerate()
+            .map(|(index, parse)| (format!("p{index:03}.ts"), parse))
+            .collect(),
+    );
+    let memo = MemoizedResolver::new(&resolver);
+    let mut site = SiteHint {
+        ordinal: 0,
+        caller: Some("caller".into()),
+        line: 1,
+        member: Some("run".into()),
+        receiver: None,
+        dynamic: false,
+    };
+    let unknown = resolver.resolve("p000.ts", &site);
+    assert_eq!(unknown.protected.len(), 128);
+    site.receiver = Some("C0".into());
+    let typed = resolver.resolve("p000.ts", &site);
+    assert!(!typed.targets.is_empty());
+    resolver.file_visits.set(0);
+    for index in 0..96 {
+        site.ordinal = index;
+        site.line = index + 1;
+        site.caller = Some(format!("caller{index}"));
+        site.receiver = None;
+        assert_eq!(*memo.resolve("p000.ts", &site), unknown);
+        site.receiver = Some("C0".into());
+        assert_eq!(*memo.resolve("p000.ts", &site), typed);
+    }
+    let visits = resolver.file_visits.get();
+    eprintln!("dispatch file scans: {visits} for 192 sites in 128 files");
+    assert!(
+        visits <= 384,
+        "repeated receiver/member queries must be resolved once: {visits}"
+    );
+}
 fn resolutions(parse: &ParseBlob) -> Vec<Resolution> {
     let resolver = Resolver::new(BTreeMap::from([("fixture".into(), parse)]));
     parse

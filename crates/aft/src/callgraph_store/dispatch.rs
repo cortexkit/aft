@@ -1133,6 +1133,8 @@ pub struct Resolver<'a> {
     pub files: BTreeMap<String, &'a ParseBlob>,
     pub import_targets: BTreeMap<(String, String), String>,
     pub type_targets: BTreeMap<(String, String), (String, String)>,
+    #[cfg(test)]
+    file_visits: std::cell::Cell<usize>,
 }
 impl<'a> Resolver<'a> {
     pub fn new(files: BTreeMap<String, &'a ParseBlob>) -> Self {
@@ -1140,10 +1142,16 @@ impl<'a> Resolver<'a> {
             files,
             import_targets: BTreeMap::new(),
             type_targets: BTreeMap::new(),
+            #[cfg(test)]
+            file_visits: std::cell::Cell::new(0),
         }
     }
     fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
         self.project_type_at_depth(file, name, 0)
+    }
+    fn note_file_visit(&self) {
+        #[cfg(test)]
+        self.file_visits.set(self.file_visits.get() + 1);
     }
     fn project_type_at_depth(
         &self,
@@ -1199,6 +1207,7 @@ impl<'a> Resolver<'a> {
                 .files
                 .iter()
                 .filter(|(f, p)| {
+                    self.note_file_visit();
                     p.language == parse.language && std::path::Path::new(f).parent() == directory
                 })
                 .flat_map(|(f, p)| {
@@ -1266,6 +1275,7 @@ impl<'a> Resolver<'a> {
             }
             let base = parts.join("/");
             for (path, candidate) in &self.files {
+                self.note_file_visit();
                 if candidate.language != parse.language {
                     continue;
                 }
@@ -1292,6 +1302,7 @@ impl<'a> Resolver<'a> {
         self.files
             .iter()
             .filter(|(_, p)| p.language == self.files[file].language)
+            .inspect(|_| self.note_file_visit())
             .flat_map(|(method_file, p)| {
                 p.dispatch
                     .methods
@@ -1373,6 +1384,7 @@ impl<'a> Resolver<'a> {
             .files
             .iter()
             .filter(|(_, p)| p.language == language)
+            .inspect(|_| self.note_file_visit())
             .flat_map(|(file, p)| {
                 p.dispatch
                     .methods
@@ -1478,6 +1490,7 @@ impl<'a> Resolver<'a> {
         let mut targets = exact.into_iter().collect::<BTreeSet<_>>();
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
             for (candidate_file, candidate) in &self.files {
+                self.note_file_visit();
                 if candidate.language != parse.language {
                     continue;
                 }
@@ -1535,6 +1548,56 @@ impl<'a> Resolver<'a> {
             external,
             ..Resolution::default()
         }
+    }
+}
+
+/// Resolution inputs are borrowed immutably for one emission pass. Locations
+/// and caller identities are emitted by the caller, not used to choose targets.
+pub struct MemoizedResolver<'r, 'a> {
+    resolver: &'r Resolver<'a>,
+    resolved: std::cell::RefCell<BTreeMap<ResolutionKey, std::rc::Rc<Resolution>>>,
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+struct ResolutionKey {
+    scope: String,
+    receiver: Option<String>,
+    member: Option<String>,
+    dynamic: bool,
+}
+
+impl<'r, 'a> MemoizedResolver<'r, 'a> {
+    pub fn new(resolver: &'r Resolver<'a>) -> Self {
+        Self {
+            resolver,
+            resolved: Default::default(),
+        }
+    }
+
+    pub fn resolve(&self, file: &str, site: &SiteHint) -> std::rc::Rc<Resolution> {
+        let key = ResolutionKey {
+            // An unknown receiver consults only language membership, so callers
+            // in different files can reuse the same conservative answer. Typed
+            // receiver lookup also depends on the caller's imports and directory.
+            scope: if site.receiver.is_none() {
+                self.resolver.files[file].language.clone()
+            } else {
+                file.to_string()
+            },
+            receiver: site.receiver.clone(),
+            member: site.member.clone(),
+            dynamic: site.dynamic,
+        };
+        if let Some(resolved) = self.resolved.borrow().get(&key) {
+            return resolved.clone();
+        }
+        let resolved = std::rc::Rc::new(self.resolver.resolve(file, site));
+        // Large projects can have almost one distinct receiver expression per
+        // site. Retain the hot set, not every answer for the whole manifest.
+        if self.resolved.borrow().len() < 4096 {
+            self.resolved.borrow_mut().insert(key, resolved.clone());
+        }
+        resolved
     }
 }
 

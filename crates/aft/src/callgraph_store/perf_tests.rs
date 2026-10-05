@@ -8,6 +8,7 @@
 //! the store can be compared for identical results.
 
 use super::*;
+use crate::inspect::CallgraphSnapshot;
 use rusqlite::ffi;
 use std::fs;
 use std::os::raw::{c_char, c_int, c_void};
@@ -62,6 +63,7 @@ pub(super) struct WorkCounts {
     pub cargo_toml_reads: usize,
     pub config_reads: usize,
     pub statements_compiled: usize,
+    pub staging_reads: usize,
     pub wall: Duration,
 }
 
@@ -83,6 +85,7 @@ pub(super) fn measure<T>(
         cargo_toml_reads: work_counts::config_reads_under(root, Some("Cargo.toml")),
         config_reads: work_counts::config_reads_under(root, None),
         statements_compiled: compiles.load(AtomicOrdering::Relaxed) - compiled_before,
+        staging_reads: work_counts::staging_reads_under(root),
         wall,
     };
     (value, counts)
@@ -208,7 +211,7 @@ fn copy_tracked_sources(source: &Path, destination: &Path) {
 
 fn report(label: &str, counts: &WorkCounts) {
     eprintln!(
-        "{label}: parses={} max_parses_of_one_file={} package_json_reads={} tsconfig_reads={} cargo_toml_reads={} config_reads={} statements_compiled={} wall_ms={}",
+        "{label}: parses={} max_parses_of_one_file={} package_json_reads={} tsconfig_reads={} cargo_toml_reads={} config_reads={} statements_compiled={} staging_reads={} wall_ms={}",
         counts.parses,
         counts.max_parses_of_one_file,
         counts.package_json_reads,
@@ -216,8 +219,179 @@ fn report(label: &str, counts: &WorkCounts) {
         counts.cargo_toml_reads,
         counts.config_reads,
         counts.statements_compiled,
+        counts.staging_reads,
         counts.wall.as_millis()
     );
+}
+
+/// Frozen tracked inputs and sorted logical rows follow the extraction-work
+/// census, but include both storage paths and the dead-code consumer this time.
+#[test]
+#[ignore = "measurement: needs AFT_CALLGRAPH_MEASURE_ROOT and AFT_CALLGRAPH_MEASURE_DUMP"]
+fn perf_audit2_real_repo_output_equivalence() {
+    use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
+    let source = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_ROOT").expect("root"));
+    let dump = PathBuf::from(std::env::var("AFT_CALLGRAPH_MEASURE_DUMP").expect("dump"));
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture_root(&dir, "project");
+    copy_tracked_sources(&source, &root);
+    let files = callgraph::walk_project_files(&root).collect::<Vec<_>>();
+    fs::create_dir_all(&dump).unwrap();
+    let (store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    report("real_repo_cold", &counts);
+    fs::write(dump.join("legacy_rows.txt"), dump_graph_rows(&store)).unwrap();
+    let snapshot = project_dead_code_snapshot(store.sqlite_path()).unwrap();
+    fs::write(
+        dump.join("legacy_dead_code.txt"),
+        dump_dead_code(&root, &files, snapshot),
+    )
+    .unwrap();
+
+    let blobs_path = dir.path().join("blobs.sqlite");
+    let blobs = Connection::open(&blobs_path).unwrap();
+    blobs
+        .execute_batch(
+            "CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL)",
+        )
+        .unwrap();
+    let mut entries = Vec::new();
+    let inputs = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&source)
+        .args(["ls-files", "-z"])
+        .output()
+        .unwrap();
+    assert!(inputs.status.success());
+    for rel in inputs
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|rel| !rel.is_empty())
+    {
+        let path = root.join(std::str::from_utf8(rel).unwrap());
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = fs::read(&path).unwrap();
+        let config = resolution_config::resolution_config_kind(&path).is_some()
+            || path
+                .file_name()
+                .is_some_and(|name| name == ".gitignore" || name == ".aftignore");
+        let blob = if config {
+            join::CallgraphBlob::config(bytes, "ruled-callgraph-v2")
+        } else if let Some(lang) = crate::parser::detect_language(&path) {
+            join::CallgraphBlob::extract(
+                std::str::from_utf8(&bytes).unwrap(),
+                lang_label(lang),
+                "ruled-callgraph-v2",
+            )
+            .unwrap()
+        } else {
+            continue;
+        };
+        let payload = blob.to_bytes().unwrap();
+        let key = blake3::hash(&payload);
+        blobs
+            .execute(
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2)",
+                params![key.as_bytes().as_slice(), payload],
+            )
+            .unwrap();
+        entries.push((
+            RelPath::new(rel).unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: RegularPlanes {
+                    semantic: None,
+                    callgraph: Some(key.to_hex().to_string()),
+                },
+                resolution_input: config,
+            },
+        ));
+    }
+    let manifest = Manifest::new(entries).unwrap();
+    let views = dir.path().join("views");
+    fs::create_dir_all(&views).unwrap();
+    let generation = "audit2";
+    let database = manifest_view_database_path(&views, generation).unwrap();
+    crate::views::materialization::materialize_manifest_view_database(
+        &database,
+        &blobs_path,
+        &manifest,
+    )
+    .unwrap();
+    let mut rows = crate::views::materialization::parity::logical_snapshot(&database);
+    // Operational metadata contains build timestamps, not graph evidence.
+    rows.remove("meta");
+    fs::write(
+        dump.join("view_rows.json"),
+        serde_json::to_vec(&rows).unwrap(),
+    )
+    .unwrap();
+    let view = ReadonlyCallGraphStore::open_manifest_view(
+        root.clone(),
+        "audit2".into(),
+        views,
+        generation,
+        None,
+    )
+    .unwrap();
+    let (_, snapshot, _, _) = project_dead_code_snapshot_from_view(&view).unwrap();
+    fs::write(
+        dump.join("view_dead_code.txt"),
+        dump_dead_code(&root, &files, snapshot),
+    )
+    .unwrap();
+    eprintln!(
+        "equivalence corpus: files={} legacy_edges={} view_edges={} dispatch_sites={} artifacts={}",
+        files.len(),
+        store.edge_snapshot().unwrap().len(),
+        rows["edges"].len(),
+        rows["view_dispatch_sites"].len(),
+        dump.display()
+    );
+}
+
+fn dump_dead_code(root: &Path, files: &[PathBuf], mut snapshot: CallgraphSnapshot) -> String {
+    use crate::inspect::{InspectCategory, InspectJob, JobKey};
+    snapshot.generated_at = None;
+    let projection = format!("{snapshot:?}");
+    let job = InspectJob {
+        job_id: 1,
+        key: JobKey::for_project_category(InspectCategory::DeadCode),
+        category: InspectCategory::DeadCode,
+        scope_files: files.to_vec(),
+        project_root: root.to_path_buf(),
+        inspect_dir: root.join(".inspect"),
+        config: Arc::new(crate::config::Config {
+            project_root: Some(root.to_path_buf()),
+            ..Default::default()
+        }),
+        symbol_cache: Arc::new(std::sync::RwLock::new(crate::parser::SymbolCache::new())),
+        inspect_writer: true,
+        callgraph_writer: true,
+        callgraph_snapshot: Some(Arc::new(snapshot)),
+    };
+    let result = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+        .outcome
+        .unwrap();
+    let mut contributions = result
+        .contributions
+        .iter()
+        .map(|contribution| {
+            format!(
+                "{} {:?}",
+                contribution.file_path.display(),
+                contribution.contribution
+            )
+        })
+        .collect::<Vec<_>>();
+    contributions.sort();
+    format!(
+        "{projection}\n{}\n{}",
+        result.aggregate,
+        contributions.join("\n")
+    )
+    .replace(&root.display().to_string(), "<root>")
 }
 
 /// Cold build and one incremental refresh of a copy of a real repository.
@@ -263,6 +437,7 @@ fn measure_cold_build_and_refresh_on_real_repo() {
     }
 
     let edit_path = root.join(&edit);
+    assert!(store.checkpoint_wal_truncate());
     let addition = match edit_path.extension().and_then(|ext| ext.to_str()) {
         Some("rs") => "\npub fn aft_measure_added_function() {}\n",
         Some("py") => "\n\ndef aft_measure_added_function():\n    pass\n",
@@ -277,6 +452,20 @@ fn measure_cold_build_and_refresh_on_real_repo() {
     });
     let refresh_stats = refresh_stats.expect("refresh");
     report("refresh", &refresh);
+    let conn = store.conn.lock().unwrap();
+    let page_size: u64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .unwrap();
+    let wal_bytes = fs::metadata(sqlite_file_set_path(store.sqlite_path(), "-wal"))
+        .unwrap()
+        .len();
+    let checkpoint: (u64, u64, u64) = conn
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    eprintln!("refresh bytes: database_bytes={} wal_bytes={wal_bytes} dirty_frames={} checkpoint_bytes={}", fs::metadata(store.sqlite_path()).unwrap().len(), checkpoint.1, checkpoint.2 * page_size);
+    drop(conn);
     eprintln!(
         "refresh stats: dependency_selected_refs={} refreshed_own_files={} surface_changed={:?}",
         refresh_stats.dependency_selected_refs,
@@ -423,6 +612,102 @@ fn cold_build_parses_each_file_once_and_matches_a_reparsing_build() {
         dump_graph_rows(&retaining),
         dump_graph_rows(&reparsing),
         "retained resolver inputs must resolve exactly like a fresh parse"
+    );
+}
+
+#[test]
+fn perf_audit2_fresh_staging_does_not_read_sources_before_extraction() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = fixture_root(&dir, "project");
+    let (files, _) = ts_workspace_fixture(&root, 96);
+    let (store, counts) = cold_build_counts(&root, &dir.path().join("store"), &files);
+    assert_eq!(counts.parses, files.len());
+    assert!(store.edge_snapshot().unwrap().len() >= 192);
+    eprintln!(
+        "fresh staging: {} files, {} source re-reads",
+        files.len(),
+        counts.staging_reads
+    );
+    assert_eq!(
+        counts.staging_reads, 0,
+        "an absent staged row cannot match content"
+    );
+}
+
+#[test]
+fn perf_audit2_one_function_refresh_writes_a_delta_not_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut volumes = Vec::new();
+    for file_count in [32, 256] {
+        let root = fixture_root(&dir, &format!("project-{file_count}"));
+        let mut files = Vec::new();
+        for file in 0..file_count {
+            let mut source = String::new();
+            for function in 0..64 {
+                source.push_str(&format!(
+                    "export function f{function}() {{ console.log('value'); return f{}(); }}\n",
+                    (function + 1) % 64
+                ));
+            }
+            files.push(write(&root, &format!("src/f{file:03}.ts"), &source));
+        }
+        let (store, _) = cold_build_counts(
+            &root,
+            &dir.path().join(format!("store-{file_count}")),
+            &files,
+        );
+        assert!(store.checkpoint_wal_truncate());
+        let database_bytes = fs::metadata(store.sqlite_path()).unwrap().len();
+        let path = &files[0];
+        let source = fs::read_to_string(path).unwrap();
+        // One function body changes at the end, leaving every other symbol and
+        // reference location unchanged. A call edge is added, not just a comment.
+        let position = source.rfind("return f0();").unwrap();
+        let edited = format!("{}f1(); {}", &source[..position], &source[position..]);
+        fs::write(path, edited).unwrap();
+        let before = store.conn.lock().unwrap().total_changes();
+        let stats = store.refresh_files(std::slice::from_ref(path)).unwrap();
+        assert_eq!(stats.refreshed_own_files, 1);
+        let conn = store.conn.lock().unwrap();
+        let changed_rows = conn.total_changes() - before;
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let wal_bytes = fs::metadata(sqlite_file_set_path(store.sqlite_path(), "-wal"))
+            .unwrap()
+            .len();
+        let (busy, frames, checkpointed): (u64, u64, u64) = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(frames, checkpointed);
+        let checkpoint_bytes = checkpointed * page_size;
+        drop(conn);
+        let rebuilt = CallGraphStore::open(
+            dir.path().join(format!("rebuilt-{file_count}")),
+            root.clone(),
+        )
+        .unwrap();
+        rebuilt.cold_build(&files).unwrap();
+        assert_eq!(
+            dump_graph_rows(&store),
+            dump_graph_rows(&rebuilt),
+            "one-function refresh must match a cold build"
+        );
+        eprintln!("one-function refresh: files={file_count} database_bytes={database_bytes} changed_rows={changed_rows} wal_bytes={wal_bytes} dirty_frames={frames} checkpoint_bytes={checkpoint_bytes}");
+        volumes.push((frames, changed_rows));
+    }
+    assert!(
+        volumes
+            .iter()
+            .all(|(frames, rows)| *frames <= 128 && *rows <= 32),
+        "one-function edit must not rewrite unchanged rows or full tables: {volumes:?}"
+    );
+    assert!(
+        volumes[1].0 <= volumes[0].0 + 32,
+        "8x membership must not cause store-sized WAL/checkpoints: {volumes:?}"
     );
 }
 

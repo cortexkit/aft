@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use rusqlite::{params, OptionalExtension, Transaction};
 
-use crate::callgraph_store::join::{dispatch::Resolver, CallgraphBlob, ManifestBlobReader};
+use crate::callgraph_store::join::{
+    dispatch::{MemoizedResolver, Resolver},
+    CallgraphBlob, ManifestBlobReader,
+};
 use crate::callgraph_store::{CallGraphStoreError, Result};
 use crate::views::{Manifest, ManifestEntry};
 
@@ -95,6 +98,7 @@ pub(super) fn emit(
             DELETE FROM edges WHERE provenance IN ('exact', 'dispatch', 'name_match');",
         )?;
     }
+    let memoized = MemoizedResolver::new(&resolver);
     for (file, parse) in &resolver.files {
         for site in &parse.dispatch.sites {
             let ref_id = format!("view:{file}:{}", site.ordinal);
@@ -102,7 +106,7 @@ pub(super) fn emit(
                 "DELETE FROM edges WHERE ref_id=?1 AND provenance NOT IN ('exact', 'dispatch', 'name_match')",
                 [&ref_id],
             )?;
-            let resolution = resolver.resolve(file, site);
+            let resolution = memoized.resolve(file, site);
             transaction.execute("UPDATE refs SET status=?2, target_node=NULL, target_file=NULL, target_symbol=NULL WHERE ref_id=?1", params![ref_id, if resolution.targets.is_empty() { "unresolved" } else { "resolved" }])?;
             if changed {
                 transaction.execute(
@@ -132,7 +136,7 @@ pub(super) fn emit(
             let Some(caller) = caller else {
                 continue;
             };
-            for target in resolution.targets {
+            for target in &resolution.targets {
                 let target_node = node(transaction, &target.file, &target.symbol)?;
                 transaction.execute("INSERT OR REPLACE INTO edges (edge_id, ref_id, source_node, target_node, target_file, target_symbol, kind, line, provenance)
                     VALUES (?1,?2,?3,?4,?5,?6,'call',?7,?8)", params![format!("dispatch:{file}:{}:{}:{}", site.ordinal, target.file, target.symbol), ref_id, caller, target_node, target.file, target.symbol, site.line, target.provenance])?;

@@ -159,6 +159,7 @@ pub(crate) mod work_counts {
 
     static PARSES: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
     static CONFIG_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static STAGING_READS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
     fn note(map: &OnceLock<Mutex<HashMap<PathBuf, usize>>>, path: &Path) {
         *map.get_or_init(Default::default)
@@ -193,6 +194,14 @@ pub(crate) mod work_counts {
         note(&CONFIG_READS, path);
     }
 
+    pub(crate) fn note_staging_read(path: &Path) {
+        note(&STAGING_READS, path);
+    }
+
+    pub(crate) fn staging_reads_under(root: &Path) -> usize {
+        under(&STAGING_READS, root, None)
+    }
+
     pub(crate) fn parses_under(root: &Path) -> usize {
         under(&PARSES, root, None)
     }
@@ -215,7 +224,7 @@ pub(crate) mod work_counts {
     }
 
     pub(crate) fn reset_under(root: &Path) {
-        for map in [&PARSES, &CONFIG_READS] {
+        for map in [&PARSES, &CONFIG_READS, &STAGING_READS] {
             map.get_or_init(Default::default)
                 .lock()
                 .expect("work counter mutex poisoned")
@@ -9988,18 +9997,25 @@ fn increment_staged_extracted_bytes(tx: &Transaction<'_>, bytes: u64) -> Result<
 }
 
 fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -> Result<bool> {
+    let rel_path = relative_path(project_root, path);
+    let staged_hash = conn
+        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
+        .query_row(params![rel_path], |row| row.get::<_, String>(0))
+        .optional()?;
+    // Fresh staging has no row to match. Reading and hashing those sources here
+    // duplicates the extraction pass's I/O; only adopted committed rows need it.
+    let Some(staged_hash) = staged_hash else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    work_counts::note_staging_read(path);
     let Ok(source) = std::fs::read_to_string(path) else {
         return Ok(false);
     };
     let Ok(freshness) = collect_source_freshness(path, &source) else {
         return Ok(false);
     };
-    let rel_path = relative_path(project_root, path);
-    let staged_hash = conn
-        .prepare_cached("SELECT content_hash FROM files WHERE path = ?1")?
-        .query_row(params![rel_path], |row| row.get::<_, String>(0))
-        .optional()?;
-    Ok(staged_hash.as_deref() == Some(hash_to_hex(freshness.content_hash).as_str()))
+    Ok(staged_hash == hash_to_hex(freshness.content_hash))
 }
 
 fn delete_staged_file_rows(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {

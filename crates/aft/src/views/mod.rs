@@ -477,6 +477,16 @@ impl Manifest {
         self.entries.iter()
     }
 
+    /// Start at a bytewise lower bound without requiring it to be a valid member
+    /// path. Directory prefixes end in `/`, and the root prefix is empty.
+    pub(crate) fn entries_from(
+        &self,
+        lower: &[u8],
+    ) -> impl Iterator<Item = (&RelPath, &ManifestEntry)> {
+        self.entries
+            .range(RelPath(ByteString::new(lower.to_vec()))..)
+    }
+
     pub fn get(&self, rel_path: &RelPath) -> Option<&ManifestEntry> {
         self.entries.get(rel_path)
     }

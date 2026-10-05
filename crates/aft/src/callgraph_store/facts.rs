@@ -7,6 +7,16 @@ use std::sync::Arc;
 use super::join::CallgraphBlob;
 use crate::views::{Manifest, ManifestEntry, RelPath};
 
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_directory_visit() {
+    #[cfg(test)]
+    DIRECTORY_VISITS.with(|visits| visits.set(visits.get() + 1));
+}
+
 /// Manifest planes currently store their full blob keys as strings.
 pub(crate) type BlobKey = String;
 
@@ -75,9 +85,13 @@ impl ProjectFacts for ManifestFacts<'_> {
         if !prefix.is_empty() {
             prefix.push(b'/');
         }
-        self.manifest.entries().any(|(path, _)| {
-            path.as_bytes().starts_with(&prefix) && path.as_bytes().len() > prefix.len()
-        })
+        self.manifest
+            .entries_from(&prefix)
+            .next()
+            .is_some_and(|(path, _)| {
+                note_directory_visit();
+                path.as_bytes().starts_with(&prefix) && path.as_bytes().len() > prefix.len()
+            })
     }
 
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
@@ -149,9 +163,11 @@ impl ProjectFacts for ManifestFacts<'_> {
             prefix.push(b'/');
         }
         let mut entries = BTreeMap::new();
-        for (path, entry) in self.manifest.entries() {
+        for (path, entry) in self.manifest.entries_from(&prefix) {
+            note_directory_visit();
             let Some(tail) = path.as_bytes().strip_prefix(prefix.as_slice()) else {
-                continue;
+                // Bytewise ordering puts all members of the prefix together.
+                break;
             };
             if tail.is_empty() {
                 continue;
@@ -174,6 +190,56 @@ impl ProjectFacts for ManifestFacts<'_> {
             .into_iter()
             .map(|(name, kind)| DirEntry { name, kind })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::RegularPlanes;
+
+    fn regular() -> ManifestEntry {
+        ManifestEntry::Regular {
+            mode: 0o100644,
+            planes: RegularPlanes {
+                semantic: None,
+                callgraph: None,
+            },
+            resolution_input: false,
+        }
+    }
+
+    #[test]
+    fn perf_audit2_manifest_directory_work_is_local_to_the_prefix() {
+        let mut entries = Vec::new();
+        for package in 0..256 {
+            for file in 0..16 {
+                entries.push((
+                    RelPath::new(format!("packages/p{package:03}/src/f{file:02}.ts").into_bytes())
+                        .unwrap(),
+                    regular(),
+                ));
+            }
+        }
+        let manifest = Manifest::new(entries).unwrap();
+        let facts = ManifestFacts {
+            manifest: &manifest,
+            blobs: &|_| None,
+        };
+        DIRECTORY_VISITS.with(|visits| visits.set(0));
+        assert!(facts.is_dir(b"packages/p255/src"));
+        assert!(!facts.is_dir(b"packages/p255/src-missing"));
+        assert_eq!(
+            facts.canonical(b"packages/p255/src/f15.ts"),
+            Some(b"packages/p255/src/f15.ts".to_vec())
+        );
+        assert_eq!(facts.list_dir(b"packages/p255/src").len(), 16);
+        let visits = DIRECTORY_VISITS.with(|visits| visits.get());
+        eprintln!("manifest directory candidates: {visits} for 4096 members");
+        assert!(
+            visits <= 24,
+            "directory probes must not scan unrelated members: {visits}"
+        );
     }
 }
 
