@@ -344,7 +344,10 @@ pub fn recover(conn: &Connection) -> rusqlite::Result<()> {
                 now_ms(),
             )?;
         } else {
-            let task: Option<String> = conn.query_row("SELECT task_id FROM bash_tasks WHERE json_extract(metadata,'$.call_key.requester')=?1 AND json_extract(metadata,'$.call_key.key')=?2 ORDER BY started_at DESC LIMIT 1", params![key.carrier,key.call_key], |r| r.get(0)).optional()?;
+            // Keys become reusable after their ledger row is deleted. Only
+            // the task linked to this admission is evidence of its execution;
+            // a previous task carrying the same consumer key is not.
+            let task: Option<String> = conn.query_row("SELECT task_id FROM bash_tasks WHERE task_id=?1 AND json_extract(metadata,'$.call_key.requester')=?2 AND json_extract(metadata,'$.call_key.key')=?3 LIMIT 1", params![row.task_id,key.carrier,key.call_key], |r| r.get(0)).optional()?;
             if let Some(task) = task {
                 conn.execute("UPDATE call_ledger SET task_id=?3,recovered=1 WHERE carrier=?1 AND call_key=?2", params![key.carrier,key.call_key,task])?;
             } else {
@@ -388,7 +391,14 @@ pub fn recover_pool_once(
     Ok(())
 }
 
-/// Task writes link the spawn and settle only restart-recovered executions;
+/// Link the task born during this admitted v1 dispatch, never a legacy task
+/// or a later snapshot of an older task sharing a reusable consumer key.
+pub fn link_task(conn: &Connection, key: &Key, task_id: &str) -> rusqlite::Result<()> {
+    conn.execute("UPDATE call_ledger SET task_id=?3 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted' AND task_id IS NULL", params![key.carrier,key.call_key,task_id])?;
+    Ok(())
+}
+
+/// Task observations settle only the exact restart-recovered execution;
 /// live executions record their actual bounded terminal frame at the edge.
 pub fn observe_task(
     conn: &Connection,
@@ -402,11 +412,10 @@ pub fn observe_task(
         carrier: carrier.into(),
         call_key: call_key.into(),
     };
-    conn.execute("UPDATE call_ledger SET task_id=?3 WHERE carrier=?1 AND call_key=?2 AND state='DispatchStarted'",params![carrier,call_key,task_id])?;
     let recovered: bool = conn
         .query_row(
-            "SELECT recovered=1 AND state='DispatchStarted' FROM call_ledger WHERE carrier=?1 AND call_key=?2",
-            params![carrier, call_key],
+            "SELECT recovered=1 AND state='DispatchStarted' AND task_id=?3 FROM call_ledger WHERE carrier=?1 AND call_key=?2",
+            params![carrier, call_key, task_id],
             |r| r.get(0),
         )
         .optional()?
@@ -586,12 +595,33 @@ mod tests {
     }
 
     #[test]
+    fn call_ledger_restart_does_not_attach_a_reused_key_to_an_old_task() {
+        let conn = database();
+        let key = key("reserved:carrier");
+        conn.execute("INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,metadata) VALUES('h','s','old-task','p','command','cwd','completed',1,?1)", [json!({"call_key":{"requester":key.carrier,"key":key.call_key}}).to_string()]).unwrap();
+        admit(
+            &conn,
+            &key,
+            "new-read",
+            Some(&scope("owner")),
+            State::DispatchStarted,
+        )
+        .unwrap();
+        recover(&conn).unwrap();
+        let row = get(&conn, &key).unwrap().unwrap();
+        assert_eq!(row.state, State::Settled);
+        assert!(row.task_id.is_none());
+        assert_eq!(row.outcome.as_deref(), Some("unknown"));
+    }
+
+    #[test]
     fn call_ledger_recovered_shell_settles_one_result_and_never_restarts() {
         let conn = database();
         let key = key("reserved:carrier");
         let scope = scope("owner");
         admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
         conn.execute("INSERT INTO bash_tasks(harness,session_id,task_id,project_key,command,cwd,status,started_at,metadata) VALUES('h','s','task','p','command','cwd','running',1,?1)",[json!({"call_key":{"requester":key.carrier,"key":key.call_key}}).to_string()]).unwrap();
+        link_task(&conn, &key, "task").unwrap();
         recover(&conn).unwrap();
         assert_eq!(
             get(&conn, &key).unwrap().unwrap().state,

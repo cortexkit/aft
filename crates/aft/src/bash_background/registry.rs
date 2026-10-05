@@ -66,6 +66,26 @@ use crate::db::bash_watches::BashPatternWatchRow;
 /// Agents can override per-call via the `timeout` parameter (in ms); see
 /// [`super::HardKill`].
 pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+thread_local! {
+    static LEDGER_SPAWN: std::cell::RefCell<Option<crate::db::call_ledger::Key>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The registry's first task write runs synchronously during dispatch. Carry
+/// its durable admission identity without putting host data in tool arguments.
+pub(crate) fn with_ledger_spawn<T>(
+    key: Option<crate::db::call_ledger::Key>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<crate::db::call_ledger::Key>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LEDGER_SPAWN.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(LEDGER_SPAWN.with(|slot| slot.replace(key)));
+    run()
+}
 /// How far past the last written hard-kill limit a renewal must reach before
 /// it is written to the task's record (see `BgTaskRegistry::renew_hard_kill`).
 pub(crate) const RENEWAL_PERSIST_STEP_MS: u64 = 60_000;
@@ -1692,25 +1712,28 @@ impl BgTaskRegistry {
                 return;
             }
         };
-        if let Err(error) = crate::db::bash_tasks::upsert_bash_task(&conn, &row) {
+        // The first durable task write and its ledger link must commit
+        // together. Recovery must never infer a task from a reusable call key.
+        let persisted = (|| -> rusqlite::Result<()> {
+            let tx = conn.unchecked_transaction()?;
+            crate::db::bash_tasks::upsert_bash_task(&tx, &row)?;
+            if let Some(key) = LEDGER_SPAWN.with(|slot| slot.borrow().clone()) {
+                if metadata.call_key.as_ref().is_some_and(|task_key| {
+                    !task_key.minted
+                        && task_key.requester == key.carrier
+                        && task_key.key == key.call_key
+                }) {
+                    crate::db::call_ledger::link_task(&tx, &key, &metadata.task_id)?;
+                }
+            }
+            tx.commit()
+        })();
+        if let Err(error) = persisted {
             crate::slog_warn!(
                 "dual-write bash_task to DB failed for {}: {}",
                 metadata.task_id,
                 error
             );
-        } else if let Some(key) = &metadata.call_key {
-            if !key.minted {
-                if let Err(error) = crate::db::call_ledger::observe_task(
-                    &conn,
-                    &key.requester,
-                    &key.key,
-                    &metadata.task_id,
-                    None,
-                    "unknown",
-                ) {
-                    crate::slog_warn!("call ledger task observation failed: {error}");
-                }
-            }
         }
         drop(conn);
         self.settle_recovered_call(metadata, paths, row);

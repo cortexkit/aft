@@ -685,6 +685,7 @@ pub(super) fn submit_deferred_bash(
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             crate::bash_background::with_call_key(call_key, || {
+                                crate::bash_background::registry::with_ledger_spawn(ledger_key.clone(), || {
                                 (
                                     crate::bash_background::with_spawn_receipt(
                                         Arc::clone(&receipt_for_spawn),
@@ -695,6 +696,7 @@ pub(super) fn submit_deferred_bash(
                                     ),
                                     crate::bash_background::task_storage_dir(ctx),
                                 )
+                                })
                             })
                         });
                     if let (Some(key), Some(db)) = (&ledger_key, ctx.db()) {
