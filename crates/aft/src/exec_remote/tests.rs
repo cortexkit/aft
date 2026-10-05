@@ -30,7 +30,7 @@ fn vectors() -> &'static std::path::Path {
             .filter(|p| p["name"] == "cortexkit-exec-remote-types")
             .collect();
         assert_eq!(packages.len(), 1, "exactly one caller contract version");
-        assert_eq!(packages[0]["version"], "0.1.0");
+        assert_eq!(packages[0]["version"], "0.2.0");
         PathBuf::from(packages[0]["manifest_path"].as_str().unwrap())
             .parent()
             .unwrap()
@@ -65,7 +65,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
 #[test]
 fn published_outcomes_have_explicit_grades() {
     let cases = vector_cases("outcomes");
-    assert_eq!(cases.len(), 22);
+    assert_eq!(cases.len(), 26);
     for (name, value) in cases {
         let _: RunRequest = serde_json::from_value(value["request"].clone()).unwrap();
         let records: Vec<StreamRecord> = serde_json::from_value(value["stream"].clone()).unwrap();
@@ -82,6 +82,10 @@ fn published_outcomes_have_explicit_grades() {
             "killed-cancel" => Verdict::CancelKilled,
             "outcome_unknown" | "outcome_unknown-queued" | "crate-local-unknown-outcome" => {
                 Verdict::OutcomeUnknown
+            }
+            "crate-local-unknown-ran" | "crate-local-unknown-killed" => Verdict::OutcomeUnknown,
+            "crate-local-unknown-stream-record" | "crate-local-unknown-output-stream" => {
+                Verdict::Exited { code: 0 }
             }
             "history_expired" => Verdict::HistoryExpired,
             "bundle_rejected" => Verdict::RunLocally {
@@ -120,13 +124,49 @@ fn published_outcomes_have_explicit_grades() {
             _ => panic!("ungraded published case: {name}"),
         };
         assert_eq!(grade(terminal), expected, "{name}");
-        let mut consumer = StreamConsumer::new();
+        // The two output/record future-tag goldens are attach excerpts: seq 7
+        // without an accepted record. Resume from the prior retained cursor.
+        let mut consumer = if matches!(
+            name.as_str(),
+            "crate-local-unknown-stream-record" | "crate-local-unknown-output-stream"
+        ) {
+            StreamConsumer::resume(ResumePoint {
+                job_id: terminal.job_id,
+                last_seq: Some(6),
+            })
+        } else {
+            StreamConsumer::new()
+        };
         let mut sink = MemorySink::default();
         for record in records {
             consumer.consume(record, &mut sink).unwrap();
         }
         assert_eq!(consumer.finish().unwrap(), expected, "stream grade: {name}");
         assert_eq!(sink.terminals, [expected]);
+        if name == "crate-local-unknown-stream-record" {
+            assert_eq!(
+                consumer
+                    .resume_point()
+                    .unwrap()
+                    .attach_request()
+                    .unwrap()
+                    .from_seq,
+                8
+            );
+            assert_eq!(sink.unknown, [(7, vec![])]);
+        }
+        if name == "crate-local-unknown-output-stream" {
+            assert_eq!(
+                consumer
+                    .resume_point()
+                    .unwrap()
+                    .attach_request()
+                    .unwrap()
+                    .from_seq,
+                8
+            );
+            assert_eq!(sink.unknown, [(7, vec![0xe2])]);
+        }
     }
 }
 
@@ -279,13 +319,24 @@ fn restart_attach_after_n_chunks_has_no_duplicate_or_gap() {
 #[test]
 fn published_unary_replies_have_explicit_grades() {
     let cases = vector_cases("replies");
-    assert_eq!(cases.len(), 14);
+    assert_eq!(cases.len(), 16);
     for (name, value) in cases {
         let (operation, expected) = match name.as_str() {
             "cancel" => ("exec.cancel", ReplyVerdict::CancelAcknowledged),
             "drop-existing" => ("workspace.drop", ReplyVerdict::Dropped { existed: true }),
             "drop-missing" => ("workspace.drop", ReplyVerdict::Dropped { existed: false }),
             "prepare-prepared" => ("workspace.prepare", ReplyVerdict::Prepared),
+            "crate-local-unknown-prepare-outcome" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared { reason: None },
+            ),
+            "crate-local-unknown-rebuild-result" => (
+                "exec.status",
+                ReplyVerdict::Status {
+                    reachable: true,
+                    has_unknown_rebuild: true,
+                },
+            ),
             "prepare-bundle_rejected" => (
                 "workspace.prepare",
                 ReplyVerdict::WorkspaceUnprepared {

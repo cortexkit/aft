@@ -146,6 +146,7 @@ impl StreamConsumer {
                 self.terminal = Some(verdict);
                 Ok(())
             }
+            StreamRecord::Unknown { seq, .. } => self.consume_unknown(seq, sink),
             _ => Err(Error::Protocol(
                 "unknown typed record requires consume_bytes for its sequence".into(),
             )),
