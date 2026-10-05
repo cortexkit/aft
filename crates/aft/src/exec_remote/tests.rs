@@ -1,7 +1,7 @@
 use super::*;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use types::*;
+use cortexkit_exec_remote_types::*;
 
 fn job_id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
