@@ -21,6 +21,7 @@ const INITIAL_CAPTURE_BUDGET: Duration = Duration::from_secs(15);
 // Worktree churn must not turn completed compiler checks into an unbounded disk cache.
 const MAX_RECORDS: usize = 64;
 const RECORD_SCAN_LIMIT: usize = 1024;
+const RECORD_SCHEMA: u32 = 2;
 
 fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path)
@@ -58,6 +59,7 @@ impl Drop for WalkReport<'_> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "CompactStamp", into = "CompactStamp")]
 struct Stamp {
     size: u64,
     modified: u128,
@@ -67,6 +69,43 @@ struct Stamp {
     hash: String,
     included: Vec<PathBuf>,
     env_keys: Vec<String>,
+}
+
+// Positional fields avoid repeating six property names for every input. The
+// digest remains a single 64-character hex string, not a JSON array of bytes.
+type CompactStamp = (
+    u64,
+    u128,
+    Option<(i64, i64)>,
+    String,
+    Vec<PathBuf>,
+    Vec<String>,
+);
+
+impl From<Stamp> for CompactStamp {
+    fn from(stamp: Stamp) -> Self {
+        (
+            stamp.size,
+            stamp.modified,
+            stamp.changed,
+            stamp.hash,
+            stamp.included,
+            stamp.env_keys,
+        )
+    }
+}
+
+impl From<CompactStamp> for Stamp {
+    fn from((size, modified, changed, hash, included, env_keys): CompactStamp) -> Self {
+        Self {
+            size,
+            modified,
+            changed,
+            hash,
+            included,
+            env_keys,
+        }
+    }
 }
 
 fn stamp(meta: &fs::Metadata) -> Option<Stamp> {
@@ -851,6 +890,7 @@ impl Runtime {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(try_from = "DiskCheck", into = "DiskCheck")]
 pub(crate) struct SavedCheck {
     schema: u32,
     root: PathBuf,
@@ -859,6 +899,101 @@ pub(crate) struct SavedCheck {
     pub(crate) diagnostics: BTreeMap<PathBuf, Vec<StoredDiagnostic>>,
     completed_seconds: u64,
     duration_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DiskCheck {
+    schema: u32,
+    root: PathBuf,
+    checkout: PathBuf,
+    fingerprint: Fingerprint,
+    diagnostics: BTreeMap<PathBuf, Vec<StoredDiagnostic>>,
+    completed_seconds: u64,
+    duration_seconds: u64,
+}
+
+fn relative_input(root: &Path, path: PathBuf) -> PathBuf {
+    // Cargo also reads ancestor and user-home configuration. Keep those few
+    // external inputs absolute rather than silently dropping their hashes.
+    path.strip_prefix(root)
+        .map(Path::to_path_buf)
+        .unwrap_or(path)
+}
+
+fn map_fingerprint_paths(
+    mut fingerprint: Fingerprint,
+    mut map: impl FnMut(PathBuf) -> Result<PathBuf, &'static str>,
+) -> Result<Fingerprint, &'static str> {
+    let mut files = BTreeMap::new();
+    for (path, mut stamp) in fingerprint.files {
+        stamp.included = stamp
+            .included
+            .into_iter()
+            .map(&mut map)
+            .collect::<Result<_, _>>()?;
+        if files.insert(map(path)?, stamp).is_some() {
+            return Err("duplicate input path");
+        }
+    }
+    fingerprint.files = files;
+    fingerprint.extra_inputs = fingerprint
+        .extra_inputs
+        .into_iter()
+        .map(map)
+        .collect::<Result<_, _>>()?;
+    Ok(fingerprint)
+}
+
+impl From<SavedCheck> for DiskCheck {
+    fn from(saved: SavedCheck) -> Self {
+        let fingerprint = map_fingerprint_paths(saved.fingerprint, |path| {
+            Ok(relative_input(&saved.root, path))
+        })
+        .expect("canonical fingerprint paths remain distinct when made relative");
+        Self {
+            schema: saved.schema,
+            root: saved.root,
+            checkout: saved.checkout,
+            fingerprint,
+            diagnostics: saved.diagnostics,
+            completed_seconds: saved.completed_seconds,
+            duration_seconds: saved.duration_seconds,
+        }
+    }
+}
+
+impl TryFrom<DiskCheck> for SavedCheck {
+    type Error = &'static str;
+
+    fn try_from(disk: DiskCheck) -> Result<Self, Self::Error> {
+        if disk.schema != RECORD_SCHEMA || !disk.root.is_absolute() || !disk.checkout.is_absolute()
+        {
+            return Err("unsupported completed-check identity");
+        }
+        for stamp in disk.fingerprint.files.values() {
+            blake3::Hash::from_hex(&stamp.hash).map_err(|_| "invalid input hash")?;
+        }
+        let fingerprint = map_fingerprint_paths(disk.fingerprint, |path| {
+            if path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            }) {
+                return Err("non-canonical input path");
+            }
+            Ok(disk.root.join(path))
+        })?;
+        Ok(Self {
+            schema: disk.schema,
+            root: disk.root,
+            checkout: disk.checkout,
+            fingerprint,
+            diagnostics: disk.diagnostics,
+            completed_seconds: disk.completed_seconds,
+            duration_seconds: disk.duration_seconds,
+        })
+    }
 }
 
 impl SavedCheck {
@@ -1057,7 +1192,7 @@ impl CompletedRustCheck {
         let saved = read_bounded(&path, Instant::now() + BUDGET)
             .and_then(|bytes| serde_json::from_slice::<Envelope>(&bytes).ok())
             .filter(|envelope| {
-                envelope.record.schema == 1
+                envelope.record.schema == RECORD_SCHEMA
                     && envelope.record.root == root
                     && envelope.record.checkout == checkout
                     && serde_json::to_vec(&envelope.record)
@@ -1167,7 +1302,7 @@ impl CompletedRustCheck {
             return;
         }
         let record = SavedCheck {
-            schema: 1,
+            schema: RECORD_SCHEMA,
             root: self.root.clone(),
             checkout: self.checkout.clone(),
             fingerprint: current,
@@ -1347,7 +1482,7 @@ mod tests {
         )
         .unwrap();
         cache.saved = Some(Arc::new(SavedCheck {
-            schema: 1,
+            schema: RECORD_SCHEMA,
             root: cache.root.clone(),
             checkout: cache.checkout.clone(),
             fingerprint,
@@ -1355,7 +1490,23 @@ mod tests {
             completed_seconds: 77477,
             duration_seconds: 217,
         }));
-        (temp, cache)
+        write_record(&cache.path, cache.saved.as_ref().unwrap()).unwrap();
+        let reloaded = reload(&cache);
+        assert!(
+            reloaded.saved.is_some(),
+            "control: fixture survives disk round trip"
+        );
+        (temp, reloaded)
+    }
+
+    fn reload(cache: &CompletedRustCheck) -> CompletedRustCheck {
+        CompletedRustCheck::new(
+            &cache.root,
+            &cache.checkout,
+            cache.path.parent().unwrap().parent().unwrap(),
+            cache.runtime.clone(),
+        )
+        .unwrap()
     }
 
     fn valid(cache: &CompletedRustCheck) -> Option<SavedCheck> {
@@ -1385,6 +1536,7 @@ mod tests {
     #[test]
     fn record_cap_evicts_least_recently_validated() {
         let (_temp, cache) = fixture();
+        fs::remove_file(&cache.path).unwrap();
         let record = cache.saved.as_ref().unwrap();
         let mut paths = Vec::new();
         for index in 0..64 {
@@ -1393,7 +1545,9 @@ mod tests {
                 blake3::hash(index.to_string().as_bytes())
             ));
             write_record(&path, record).unwrap();
-            fs::File::open(&path)
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
                 .unwrap()
                 .set_times(
                     fs::FileTimes::new()
@@ -1404,7 +1558,9 @@ mod tests {
         }
         // Completion order is not validation recency: the oldest completion was
         // just validated again, so the next-oldest validation must be evicted.
-        fs::File::open(&paths[0])
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&paths[0])
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1000)))
             .unwrap();
@@ -1439,13 +1595,94 @@ mod tests {
         assert_eq!(sweep.removed, 0);
     }
 
+    #[test]
+    fn record_ledger_uses_relative_paths_and_compact_stamps() {
+        let (_temp, cache) = fixture();
+        write_record(&cache.path, cache.saved.as_ref().unwrap()).unwrap();
+        let disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cache.path).unwrap()).unwrap();
+        let ledger = disk["record"]["fingerprint"]["files"].as_object().unwrap();
+        assert!(
+            ledger.contains_key("member/src/lib.rs"),
+            "workspace input paths must be relative"
+        );
+        let entry = ledger["member/src/lib.rs"]
+            .as_array()
+            .expect("stamps must not repeat field names for every input");
+        assert_eq!(
+            entry[3].as_str().unwrap().len(),
+            64,
+            "one fixed-size hex digest per input"
+        );
+        let reloaded = CompletedRustCheck::new(
+            &cache.root,
+            &cache.checkout,
+            cache.path.parent().unwrap().parent().unwrap(),
+            cache.runtime.clone(),
+        )
+        .unwrap();
+        assert!(valid(&reloaded).is_some());
+        assert!(reloaded
+            .saved
+            .as_ref()
+            .unwrap()
+            .covers(&cache.root.join("member/src/lib.rs")));
+    }
+
+    #[test]
+    fn compact_record_preserves_includes_build_inputs_and_external_config() {
+        let (temp, mut cache) = fixture();
+        write(&cache.root, "member/src/data.md", "before");
+        write(
+            &cache.root,
+            "member/src/lib.rs",
+            "pub const DATA: &str = include_str!(\"data.md\");\n",
+        );
+        write(&cache.root, "member/data/one.txt", "one");
+        let external = temp.path().join("external-config");
+        fs::write(&external, "external cargo configuration").unwrap();
+        let mut seed = cache.saved.as_ref().unwrap().fingerprint.clone();
+        seed.extra_inputs
+            .extend([cache.root.join("member/data"), external.clone()]);
+        seed.extra_env_keys
+            .push("AFT_COMPLETED_CHECK_ROUND_TRIP_TEST".into());
+        cache.saved_mut().fingerprint = fingerprint(
+            &cache.root,
+            "v1".into(),
+            Some(&seed),
+            Instant::now() + BUDGET,
+            None,
+        )
+        .unwrap();
+        write_record(&cache.path, cache.saved.as_ref().unwrap()).unwrap();
+        let reloaded = reload(&cache);
+        let original = &cache.saved.as_ref().unwrap().fingerprint;
+        let restored = &reloaded.saved.as_ref().unwrap().fingerprint;
+        assert_eq!(original.files, restored.files);
+        assert_eq!(original.extra_inputs, restored.extra_inputs);
+        assert_eq!(original.extra_env_keys, restored.extra_env_keys);
+        assert!(valid(&reloaded).is_some());
+        fs::write(&external, "changed configuration").unwrap();
+        assert!(valid(&reloaded).is_none());
+        fs::write(&external, "external cargo configuration").unwrap();
+        assert!(valid(&reloaded).is_some());
+        write(&cache.root, "member/src/data.md", "after!");
+        assert!(valid(&reloaded).is_none());
+        write(&cache.root, "member/src/data.md", "before");
+        assert!(valid(&reloaded).is_some());
+        write(&cache.root, "member/data/two.txt", "two");
+        assert!(valid(&reloaded).is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn successful_validation_refreshes_record_recency_but_invalid_validation_does_not() {
         let (_temp, cache) = live_fixture();
         let before = UNIX_EPOCH + Duration::from_secs(100);
         let reset = || {
-            fs::File::open(&cache.path)
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&cache.path)
                 .unwrap()
                 .set_times(fs::FileTimes::new().set_modified(before))
                 .unwrap()
@@ -1723,7 +1960,7 @@ mod tests {
             warm.hashed
         );
         let record = SavedCheck {
-            schema: 1,
+            schema: RECORD_SCHEMA,
             root: root.clone(),
             checkout: root.clone(),
             fingerprint: warm,
@@ -1731,16 +1968,56 @@ mod tests {
             completed_seconds: 1,
             duration_seconds: 217,
         };
-        let bytes = serde_json::to_vec(&record).unwrap();
-        let envelope = Envelope {
-            record,
-            checksum: blake3::hash(&bytes).to_hex().to_string(),
-        };
-        crate::jsonc_edit::write_atomic(&cache.path, &serde_json::to_string(&envelope).unwrap())
-            .unwrap();
+        // Measure both formats using the same real repository fingerprint, not
+        // a synthetic ledger. Reconstruct the old named-field, absolute-path wire
+        // format so this comparison remains useful after the schema bump.
+        let legacy_files: BTreeMap<_, _> = record
+            .fingerprint
+            .files
+            .iter()
+            .map(|(path, stamp)| {
+                (
+                    path,
+                    serde_json::json!({
+                        "size": stamp.size, "modified": stamp.modified, "changed": stamp.changed,
+                        "hash": stamp.hash, "included": stamp.included, "env_keys": stamp.env_keys,
+                    }),
+                )
+            })
+            .collect();
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy["schema"] = 1.into();
+        legacy["fingerprint"]["files"] = serde_json::to_value(&legacy_files).unwrap();
+        legacy["fingerprint"]["extra_inputs"] =
+            serde_json::to_value(&record.fingerprint.extra_inputs).unwrap();
+        let legacy_checksum = blake3::hash(&serde_json::to_vec(&legacy).unwrap())
+            .to_hex()
+            .to_string();
+        let legacy_text = serde_json::to_string(
+            &serde_json::json!({"record": legacy, "checksum": legacy_checksum}),
+        )
+        .unwrap();
+        crate::jsonc_edit::write_atomic(&cache.path, &legacy_text).unwrap();
+        let before_bytes = fs::metadata(&cache.path).unwrap().len();
+        let ledger_bytes = serde_json::to_vec(&legacy_files).unwrap().len();
+        assert!(
+            reload(&cache).saved.is_none(),
+            "old schemas require a new certified check"
+        );
+        write_record(&cache.path, &record).unwrap();
+        let after_bytes = fs::metadata(&cache.path).unwrap().len();
+        let restored = reload(&cache);
+        let saved = restored.saved.as_ref().unwrap();
+        assert_eq!(record.fingerprint.files, saved.fingerprint.files);
+        assert_eq!(record.fingerprint.digest, saved.fingerprint.digest);
+        assert!(restored.validated(Instant::now() + BUDGET).is_some());
+        assert!(
+            after_bytes < before_bytes / 2,
+            "compact records must halve the real ledger's disk cost"
+        );
         println!(
-            "repository completed-check record: {} bytes at {}",
-            fs::metadata(&cache.path).unwrap().len(),
+            "repository completed-check record: before {} bytes (ledger {}), after {} bytes; {} inputs at {}",
+            before_bytes, ledger_bytes, after_bytes, record.fingerprint.files.len(),
             cache.path.display()
         );
     }
@@ -1764,6 +2041,7 @@ mod tests {
             "cargo:rerun-if-changed=build.rs\n",
         );
         cache.saved = None;
+        fs::remove_file(&cache.path).unwrap();
         cache.begin(SystemTime::now());
         assert!(
             cache.pending.is_some(),
