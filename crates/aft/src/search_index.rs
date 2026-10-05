@@ -7309,6 +7309,11 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
 
 impl PathFilters {
     pub(crate) fn matches(&self, root: &Path, path: &Path) -> bool {
+        if self.includes.is_none() && self.excludes.is_none() {
+            return true;
+        }
+        #[cfg(test)]
+        audit_record(|work| work.filter_keys += 1);
         // Compare normalized copies: the search root arrives non-verbatim while
         // indexed entries may carry the Windows `\\?\` form, and a raw
         // strip_prefix between the two forms fails, which read as "no match".
