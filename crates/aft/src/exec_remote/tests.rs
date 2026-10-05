@@ -1,7 +1,7 @@
 use super::*;
+use cortexkit_exec_remote_types::*;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use cortexkit_exec_remote_types::*;
 
 fn job_id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
@@ -74,7 +74,7 @@ fn published_outcomes_have_explicit_grades() {
         };
         let expected = match name.as_str() {
             "exit" | "pipestatus" => Verdict::Exited { code: 0 },
-            "exit-nonzero" => Verdict::Exited { code: 101 },
+            "exit-nonzero" => Verdict::Exited { code: 100 },
             "signal" => Verdict::Signalled { signal: 15 },
             "cancelled" => Verdict::Cancelled,
             "killed-deadline" => Verdict::DeadlineKilled,
@@ -148,4 +148,116 @@ fn control_history_expired_never_reruns() {
         )),
         Verdict::HistoryExpired
     );
+}
+
+#[derive(Default)]
+struct MemorySink {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    seqs: Vec<u64>,
+    terminals: Vec<Verdict>,
+    truncations: Vec<u64>,
+}
+
+impl OutputSink for MemorySink {
+    fn accepted(&mut self, _accepted: &Accepted) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> std::io::Result<()> {
+        self.seqs.push(seq);
+        match stream {
+            OutputStream::Stdout => self.stdout.extend_from_slice(bytes),
+            OutputStream::Stderr => self.stderr.extend_from_slice(bytes),
+            _ => panic!("unexpected stream in known-output test"),
+        }
+        Ok(())
+    }
+    fn truncated(&mut self, seq: u64) -> std::io::Result<()> {
+        self.truncations.push(seq);
+        Ok(())
+    }
+    fn terminal(&mut self, _record: &TerminalRecord, verdict: &Verdict) -> std::io::Result<()> {
+        self.terminals.push(verdict.clone());
+        Ok(())
+    }
+}
+
+fn accepted() -> StreamRecord {
+    StreamRecord::Accepted(Accepted::new(job_id(), 1))
+}
+fn output(seq: u64, stream: OutputStream, bytes: &[u8]) -> StreamRecord {
+    StreamRecord::Output(Output::new(seq, stream, BytePayload(bytes.to_vec())))
+}
+fn terminal(outcome: Outcome) -> StreamRecord {
+    StreamRecord::Terminal(TerminalRecord::new(job_id(), outcome, 1, 0, 0))
+}
+
+#[test]
+fn control_split_utf8_is_reassembled_as_exact_bytes() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    // Three-byte Euro symbol split across non-adjacent stdout/stderr chunks.
+    for record in [
+        output(0, OutputStream::Stdout, b"A\xe2"),
+        output(1, OutputStream::Stderr, b"\xfferr"),
+        output(2, OutputStream::Stdout, b"\x82"),
+        output(3, OutputStream::Stdout, b"\xacZ"),
+    ] {
+        consumer.consume(record, &mut sink).unwrap();
+    }
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(sink.stdout, "A€Z".as_bytes());
+    assert_eq!(sink.stderr, b"\xfferr");
+}
+
+#[test]
+fn control_seq_dedupe_keeps_first_record_in_sorted_order() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    for record in [
+        output(1, OutputStream::Stdout, b"B"),
+        output(1, OutputStream::Stderr, b"wrong pending duplicate"),
+        output(0, OutputStream::Stdout, b"A"),
+        output(0, OutputStream::Stdout, b"wrong delivered duplicate"),
+        output(2, OutputStream::Stderr, b"C"),
+    ] {
+        consumer.consume(record, &mut sink).unwrap();
+    }
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(sink.stdout, b"AB");
+    assert_eq!(sink.stderr, b"C");
+    assert_eq!(sink.seqs, [0, 1, 2]);
+}
+
+#[test]
+fn restart_attach_after_n_chunks_has_no_duplicate_or_gap() {
+    for n in 0..=6 {
+        let mut consumer = StreamConsumer::new();
+        let mut sink = MemorySink::default();
+        consumer.consume(accepted(), &mut sink).unwrap();
+        for seq in 0..n {
+            consumer
+                .consume(output(seq, OutputStream::Stdout, &[seq as u8]), &mut sink)
+                .unwrap();
+        }
+        let resume = consumer.resume_point().unwrap();
+        assert_eq!(resume.attach_request().unwrap().from_seq, n);
+        let mut restored = StreamConsumer::resume(resume);
+        // Replay an old chunk too, exercising dedupe across the durable cursor.
+        for seq in n.saturating_sub(1)..6 {
+            restored
+                .consume(output(seq, OutputStream::Stdout, &[seq as u8]), &mut sink)
+                .unwrap();
+        }
+        restored
+            .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+            .unwrap();
+        assert_eq!(sink.stdout, [0, 1, 2, 3, 4, 5], "after {n} chunks");
+    }
 }

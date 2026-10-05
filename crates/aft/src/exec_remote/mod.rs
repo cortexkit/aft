@@ -4,6 +4,15 @@
 pub use cortexkit_exec_remote_types as types;
 use types::{Outcome, TerminalRecord};
 
+mod stream;
+pub use stream::{OutputSink, ResumePoint, StreamConsumer};
+
+#[derive(Debug)]
+pub enum Error {
+    Protocol(String),
+    Sink(std::io::Error),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     RunLocally { reason: types::RefusalReason },
