@@ -383,6 +383,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "internal generation deletion batch, not a query result list; the current pointer and protected readers are checked independently for every candidate",
     },
     ExclusionEntry {
+        file: "lsp/completed_rust_check.rs",
+        enclosing_item: "sweep_records",
+        location_or_primitive: "RECORD_SCAN_LIMIT, MAX_RECORDS",
+        reason: "background disk-cache maintenance, not an agent-visible list; the scan counts directory entries inside the iterator loop and logs examined, removed and completion counts; a bounded scan refuses a new record until it can certify the 64-record cap",
+    },
+    ExclusionEntry {
         file: "logging.rs",
         enclosing_item: "write_str",
         location_or_primitive: "PANIC_MESSAGE_BYTES, PANIC_BACKTRACE_BYTES",

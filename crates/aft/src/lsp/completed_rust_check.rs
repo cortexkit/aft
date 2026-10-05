@@ -18,6 +18,9 @@ pub(crate) const BUDGET: Duration = Duration::from_secs(2);
 // include dependencies is a one-time cost; later requests reuse the ledger and
 // retain the much smaller serving budget.
 const INITIAL_CAPTURE_BUDGET: Duration = Duration::from_secs(15);
+// Worktree churn must not turn completed compiler checks into an unbounded disk cache.
+const MAX_RECORDS: usize = 64;
+const RECORD_SCAN_LIMIT: usize = 1024;
 
 fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path)
@@ -877,6 +880,125 @@ struct Envelope {
     checksum: String,
 }
 
+fn write_record(path: &Path, record: &SavedCheck) -> Option<()> {
+    let bytes = serde_json::to_vec(record).ok()?;
+    let envelope = Envelope {
+        record: record.clone(),
+        checksum: blake3::hash(&bytes).to_hex().to_string(),
+    };
+    let text = serde_json::to_string(&envelope).ok()?;
+    let directory = path.parent()?;
+    // Serialize writers across daemon processes, including eviction, so parallel
+    // worktree checks cannot each claim the last free cache slot.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".write-lock"))
+        .ok()?;
+    lock.lock().ok()?;
+    if !sweep_records(directory, path, RECORD_SCAN_LIMIT).complete {
+        // A saturated legacy store is reduced on each write attempt. Do not add
+        // another record until a bounded scan can certify the total record cap.
+        return None;
+    }
+    crate::jsonc_edit::write_atomic(path, &text).ok()
+}
+
+#[derive(Deserialize)]
+struct RecordHeader {
+    checkout: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct EnvelopeHeader {
+    record: RecordHeader,
+}
+
+#[derive(Default)]
+struct RecordSweep {
+    examined: usize,
+    removed: usize,
+    complete: bool,
+}
+
+fn sweep_records(directory: &Path, writing: &Path, scan_limit: usize) -> RecordSweep {
+    let mut sweep = RecordSweep::default();
+    let Ok(mut entries) = fs::read_dir(directory) else {
+        return sweep;
+    };
+    let deadline = Instant::now() + BUDGET;
+    let mut retained = Vec::new();
+    loop {
+        // Count every entry, including non-records, before advancing the iterator.
+        if sweep.examined >= scan_limit || expired(deadline).is_none() {
+            break;
+        }
+        let Some(entry) = entries.next() else {
+            sweep.complete = true;
+            break;
+        };
+        sweep.examined += 1;
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path == writing
+            || !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || path.extension().is_none_or(|ext| ext != "json")
+            || !path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| {
+                    stem.len() == 64 && stem.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            continue;
+        }
+        let dead = read_bounded(&path, deadline)
+            .and_then(|bytes| serde_json::from_slice::<EnvelopeHeader>(&bytes).ok())
+            .is_some_and(|header| {
+                header.record.checkout.is_absolute()
+                    && matches!(fs::metadata(&header.record.checkout), Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound)
+            });
+        if dead && fs::remove_file(&path).is_ok() {
+            sweep.removed += 1;
+            continue;
+        }
+        // Record mtime is validation recency, not access recency. Successful
+        // validation refreshes it; merely reading an invalid cache never does.
+        let validated = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        retained.push((validated, path));
+    }
+    retained.sort_unstable_by(|a, b| b.cmp(a));
+    // Reserve one slot for the record about to be atomically written.
+    for (_, path) in retained.into_iter().skip(MAX_RECORDS - 1) {
+        if fs::remove_file(path).is_ok() {
+            sweep.removed += 1;
+        } else {
+            sweep.complete = false;
+        }
+    }
+    crate::slog_info!(
+        "rust completed-check sweep examined={} removed={} complete={}",
+        sweep.examined,
+        sweep.removed,
+        sweep.complete
+    );
+    sweep
+}
+
+fn mark_validated(path: &Path) {
+    // Opening without create cannot resurrect an evicted record. Using the open
+    // file also avoids touching an atomic replacement that raced validation.
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+    }
+}
+
 pub(crate) struct CompletedRustCheck {
     root: PathBuf,
     checkout: PathBuf,
@@ -1056,17 +1178,26 @@ impl CompletedRustCheck {
                 .as_secs(),
             duration_seconds: started.map_or(0, |start| start.elapsed().as_secs()),
         };
-        let Ok(bytes) = serde_json::to_vec(&record) else {
-            return;
-        };
-        let envelope = Envelope {
-            record: record.clone(),
-            checksum: blake3::hash(&bytes).to_hex().to_string(),
-        };
-        if let Ok(text) = serde_json::to_string(&envelope) {
-            if crate::jsonc_edit::write_atomic(&self.path, &text).is_ok() {
-                self.saved = Some(Arc::new(record));
-            }
+        let path = self.path.clone();
+        let persisted = record.clone();
+        if let Ok(worker) = std::thread::Builder::new()
+            .name("aft-rust-check-save".into())
+            .spawn(move || {
+                if write_record(&path, &persisted).is_none() {
+                    crate::slog_info!(
+                        "rust completed-check persistence refused path={}",
+                        path.display()
+                    );
+                }
+            })
+        {
+            // The compiler check is already certified; a disk-cache failure does
+            // not prevent using its authoritative in-memory snapshot.
+            self.saved = Some(Arc::new(record));
+            #[cfg(test)]
+            worker.join().unwrap();
+            #[cfg(not(test))]
+            drop(worker);
         }
     }
 
@@ -1087,6 +1218,7 @@ impl CompletedRustCheck {
         }
         let runtime = self.runtime.clone();
         let root = self.root.clone();
+        let path = self.path.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         *active = Some(rx);
         if std::thread::Builder::new()
@@ -1097,6 +1229,9 @@ impl CompletedRustCheck {
                 let result = runtime
                     .capture(&root, Some(&saved.fingerprint), deadline, None)
                     .and_then(|current| accept_saved(&saved, current));
+                if result.is_some() && expired(deadline).is_some() {
+                    mark_validated(&path);
+                }
                 let _ = tx.send(result);
             })
             .is_err()
@@ -1225,6 +1360,106 @@ mod tests {
 
     fn valid(cache: &CompletedRustCheck) -> Option<SavedCheck> {
         cache.validated_with_runtime("v1".into(), Instant::now() + BUDGET)
+    }
+
+    #[test]
+    fn next_write_removes_record_for_deleted_checkout() {
+        let (temp, cache) = fixture();
+        let mut dead = (**cache.saved.as_ref().unwrap()).clone();
+        dead.checkout = temp.path().join("deleted-checkout");
+        fs::create_dir(&dead.checkout).unwrap();
+        let dead_path = cache
+            .path
+            .with_file_name(format!("{}.json", blake3::hash(b"dead")));
+        write_record(&dead_path, &dead).unwrap();
+        assert!(
+            dead_path.is_file(),
+            "control: the live checkout is retained"
+        );
+        fs::remove_dir(&dead.checkout).unwrap();
+        write_record(&cache.path, cache.saved.as_ref().unwrap()).unwrap();
+        assert!(!dead_path.exists(), "a write must sweep deleted checkouts");
+        assert!(cache.path.is_file());
+    }
+
+    #[test]
+    fn record_cap_evicts_least_recently_validated() {
+        let (_temp, cache) = fixture();
+        let record = cache.saved.as_ref().unwrap();
+        let mut paths = Vec::new();
+        for index in 0..64 {
+            let path = cache.path.with_file_name(format!(
+                "{}.json",
+                blake3::hash(index.to_string().as_bytes())
+            ));
+            write_record(&path, record).unwrap();
+            fs::File::open(&path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(UNIX_EPOCH + Duration::from_secs(100 + index)),
+                )
+                .unwrap();
+            paths.push(path);
+        }
+        // Completion order is not validation recency: the oldest completion was
+        // just validated again, so the next-oldest validation must be evicted.
+        fs::File::open(&paths[0])
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1000)))
+            .unwrap();
+        write_record(&cache.path, record).unwrap();
+        assert!(paths[0].is_file());
+        assert!(
+            !paths[1].exists(),
+            "least recently validated record must be evicted"
+        );
+        assert!(paths[2..].iter().all(|path| path.is_file()));
+        assert!(cache.path.is_file());
+        assert_eq!(
+            fs::read_dir(cache.path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count(),
+            64
+        );
+    }
+
+    #[test]
+    fn record_sweep_counts_non_records_inside_scan_limit() {
+        let (_temp, cache) = fixture();
+        let directory = cache.path.parent().unwrap();
+        for index in 0..10 {
+            fs::write(directory.join(format!("not-a-record-{index}")), "").unwrap();
+        }
+        let sweep = sweep_records(directory, &cache.path, 3);
+        assert_eq!(sweep.examined, 3);
+        assert!(!sweep.complete);
+        assert_eq!(sweep.removed, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_validation_refreshes_record_recency_but_invalid_validation_does_not() {
+        let (_temp, cache) = live_fixture();
+        let before = UNIX_EPOCH + Duration::from_secs(100);
+        let reset = || {
+            fs::File::open(&cache.path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(before))
+                .unwrap()
+        };
+        reset();
+        assert!(cache.validated(Instant::now() + BUDGET).is_some());
+        assert!(fs::metadata(&cache.path).unwrap().modified().unwrap() > before);
+        reset();
+        write(&cache.root, "member/src/lib.rs", "pub fn changed() {}\n");
+        assert!(cache.validated(Instant::now() + BUDGET).is_none());
+        assert_eq!(
+            fs::metadata(&cache.path).unwrap().modified().unwrap(),
+            before
+        );
     }
 
     #[test]
