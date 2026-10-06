@@ -1653,6 +1653,28 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/integration/per_checkout_9.rs",
+      "line": 1401,
+      "column": 85,
+      "token": "filePath",
+      "text": "json!({\"id\": \"read\", \"command\": \"tool_call\", \"name\": \"read\", \"arguments\": {\"filePath\": root.join(\"src/file0.rs\")}}),",
+      "location": "line 1401, column 85",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/per_checkout_9.rs",
+      "line": 1493,
+      "column": 89,
+      "token": "filePath",
+      "text": "json!({\"id\": \"read\", \"command\": \"tool_call\", \"name\": \"read\", \"arguments\": {\"filePath\": root.join(\"src/file0.rs\")}}),",
+      "location": "line 1493, column 89",
+      "ordinal": 2,
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "crates/aft/tests/integration/per_checkout_callgraph.rs",
       "line": 137,
       "column": 14,
