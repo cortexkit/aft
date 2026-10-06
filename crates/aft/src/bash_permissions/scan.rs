@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use tree_sitter::{Node, Parser};
+use tree_sitter::{Node, Parser, Tree};
 
 use crate::context::AppContext;
 
@@ -101,28 +101,12 @@ fn scan_with_read_exemption(
     let project_root = resolve_existing(&project_root);
     let cwd = resolve_existing(cwd);
 
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .is_err()
-    {
-        // Fail closed: if we can't even load the bash grammar we cannot
-        // verify the command is safe, so require explicit permission via
-        // a wildcard ask rather than silently letting the command run.
-        // This was previously `return Vec::new()` which created a hard
-        // bypass of the user's bash permission rules whenever grammar
-        // loading failed.
-        return vec![parse_failed_ask()];
-    }
-
-    let Some(tree) = parser.parse(command, None) else {
+    let Some(tree) = parse_tree(command) else {
+        // Permission scanning fails closed when syntax cannot be understood.
         return vec![parse_failed_ask()];
     };
 
     let root = tree.root_node();
-    if root.has_error() {
-        return vec![parse_failed_ask()];
-    }
     let mut command_nodes = Vec::new();
     collect_commands(root, &mut command_nodes);
 
@@ -237,7 +221,18 @@ fn parse_failed_ask() -> PermissionAsk {
     }
 }
 
-fn collect_commands<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
+/// The permission scanner and worker load guard share the same bash grammar
+/// and definition of a successful parse, but choose their own failure policy.
+pub(super) fn parse_tree(command: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(command, None)?;
+    (!tree.root_node().has_error()).then_some(tree)
+}
+
+pub(super) fn collect_commands<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
     if node.kind() == "command" {
         out.push(node);
     }

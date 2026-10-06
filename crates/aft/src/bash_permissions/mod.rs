@@ -6,6 +6,7 @@
 
 pub mod arity;
 pub mod scan;
+pub(crate) mod synthetic_load;
 
 use crate::context::AppContext;
 use serde::{Deserialize, Serialize};

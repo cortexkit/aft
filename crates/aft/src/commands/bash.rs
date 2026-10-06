@@ -104,6 +104,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         params.shell = crate::bash_background::BashShell::Powershell;
     }
 
+    // Reject before permissions, rewrites, or process creation. The worker
+    // flag is resolved by the caller's session context, not command text.
+    if req.worker_session()
+        && !params.shell.is_powershell()
+        && crate::bash_permissions::synthetic_load::is_synthetic_load(&params.command)
+    {
+        return Response::error(
+            &req.id,
+            "synthetic_load_refused",
+            "synthetic CPU load is not allowed on the shared machine; reproduce on the remote runner or prove the mechanism deterministically",
+        );
+    }
+
     if let Some(description) = params.description.as_deref() {
         log::debug!("bash description: {description}");
     }
@@ -812,6 +825,57 @@ mod tests {
             },
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn synthetic_load_role_gate_refuses_worker_not_head() {
+        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(project.path(), storage.path());
+        // A refusing spawn seam keeps this test safe even when the load guard is
+        // removed: no real load generator is ever launched by either role.
+        for background in [false, true] {
+            let mut request = spawn_test_request("synthetic-load", "yes > /dev/null &", background);
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+            let worker =
+                with_spawn_plan_for_test(SpawnPlan::refused_for_test("test_no_execution"), || {
+                    handle(&request, &ctx)
+                });
+            assert!(!worker.success);
+            assert_eq!(worker.data["code"], "synthetic_load_refused");
+            assert_eq!(
+                worker.data["message"].as_str(),
+                Some("synthetic CPU load is not allowed on the shared machine; reproduce on the remote runner or prove the mechanism deterministically")
+            );
+
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(false);
+            let head =
+                with_spawn_plan_for_test(SpawnPlan::refused_for_test("test_no_execution"), || {
+                    handle(&request, &ctx)
+                });
+            assert_eq!(head.data["code"], "test_no_execution");
+
+            // Both PowerShell selectors bypass the POSIX-only guard, whether
+            // PowerShell is installed locally or not. The spawn seam still
+            // prevents execution if it is installed and permission is granted.
+            request.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+            for dedicated_route in [false, true] {
+                request.command = if dedicated_route {
+                    "powershell"
+                } else {
+                    "bash"
+                }
+                .to_string();
+                request.params["params"]["shell"] = json!("powershell");
+                let powershell = with_spawn_plan_for_test(
+                    SpawnPlan::refused_for_test("test_no_execution"),
+                    || handle(&request, &ctx),
+                );
+                assert_ne!(powershell.data["code"], "synthetic_load_refused");
+            }
+        }
     }
 
     fn stop_spawned_test_task(ctx: &AppContext, response: &Response) {
