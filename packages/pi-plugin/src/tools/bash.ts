@@ -711,7 +711,7 @@ export function registerBashTool(
     label: registeredName,
     description: isPowerShell
       ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
-      : `Execute shell commands.${compressionSentence}${tasksSentence}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
+      : `Execute shell commands.${compressionSentence}${tasksSentence} \`timeout\` starts after process spawn, not setup. Expiry sends SIGTERM to the Unix process group, then SIGKILL after up to 2 seconds (Windows uses taskkill /T /F) and reports exit 124; group-escaping processes survive, and macOS has no tree kill.${bashCfg.background ? " Output files are deleted once the task has finished for 24 hours and its completion has been delivered; copy needed evidence into your report or a shared file. With project-root restrictions, only the starting session gets an ownership exception for output outside the project; other sessions may be refused while files exist." : ""}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
     promptSnippet: isPowerShell
       ? `Run PowerShell commands (timeout in milliseconds; supports ${supported})`
       : `Run shell commands (timeout in milliseconds; supports ${supported})`,
@@ -1011,7 +1011,7 @@ export function createBashStatusTool(ctx: PluginContext) {
     name: "bash_status",
     label: "bash_status",
     // Point at bash_watch for waiting only when the model can call it.
-    description: `Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${bashCompanionRegistered(ctx.config, "bash_watch") ? " To wait, use bash_watch." : ""}`,
+    description: `Read-only snapshot of a background bash task. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. Output files are deleted once the task has finished for 24 hours and its completion has been delivered; copy needed evidence into your report or a shared file. With project-root restrictions, only the starting session gets an ownership exception for output outside the project; other sessions may be refused while files exist.${bashCompanionRegistered(ctx.config, "bash_watch") ? " To wait, use bash_watch." : ""}`,
     promptSnippet: "Inspect a background bash task by task_id",
     parameters: BashStatusParams,
     async execute(

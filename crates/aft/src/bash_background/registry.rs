@@ -4993,7 +4993,11 @@ impl BgTaskRegistry {
     }
 
     pub fn cleanup_finished(&self, older_than: Duration) {
-        let cutoff = Instant::now().checked_sub(older_than);
+        self.cleanup_finished_at(older_than, Instant::now());
+    }
+
+    fn cleanup_finished_at(&self, older_than: Duration, now: Instant) {
+        let cutoff = now.checked_sub(older_than);
         let removable_paths: Vec<(String, TaskPaths)> =
             if let Ok(mut tasks) = self.inner.tasks.lock() {
                 let removable = tasks
@@ -10539,6 +10543,77 @@ mod tests {
     }
 
     #[test]
+    fn finished_retention_keeps_two_hour_task_and_removes_task_past_24_hours() {
+        use crate::bash_background::watchdog::FINISHED_RETENTION;
+
+        assert_eq!(FINISHED_RETENTION, Duration::from_secs(24 * 60 * 60));
+
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut task_ids = Vec::new();
+        for _ in 0..2 {
+            let task_id = registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    QUICK_SUCCESS_COMMAND,
+                    "session-retention".to_string(),
+                    dir.path().to_path_buf(),
+                    HashMap::new(),
+                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                    dir.path().to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(dir.path().to_path_buf()),
+                )
+                .unwrap();
+            registry
+                .kill_with_status(&task_id, "session-retention", BgTaskStatus::Killed)
+                .unwrap();
+            task_ids.push(task_id);
+        }
+        let completions = registry.drain_completions_for_session(Some("session-retention"));
+        assert_eq!(completions.len(), 2);
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session-retention"), &task_ids,),
+            task_ids
+        );
+
+        let clock_origin = Instant::now();
+        let two_hours_ago = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
+        let past_retention = clock_origin;
+        let cleanup_now = clock_origin + Duration::from_secs(26 * 60 * 60 + 2);
+        let mut task_dirs = Vec::new();
+        for (task_id, terminal_at) in task_ids.iter().zip([two_hours_ago, past_retention]) {
+            let task = registry
+                .task_for_session(task_id, "session-retention")
+                .unwrap();
+            task_dirs.push(task.paths.dir.clone());
+            *task.terminal_at.lock().unwrap() = Some(terminal_at);
+        }
+
+        assert_eq!(registry.estimated_memory().counts["tasks"], 2);
+        registry.cleanup_finished_at(FINISHED_RETENTION, cleanup_now);
+
+        let tasks = registry.inner.tasks.lock().unwrap();
+        assert!(
+            tasks.contains_key(&task_ids[0]),
+            "2-hour task must remain available"
+        );
+        assert!(
+            !tasks.contains_key(&task_ids[1]),
+            "task past 24 hours must be removed"
+        );
+        assert!(
+            task_dirs[0].exists(),
+            "2-hour task files must remain available"
+        );
+        assert!(!task_dirs[1].exists(), "expired task files must be deleted");
+        drop(tasks);
+        assert_eq!(registry.estimated_memory().counts["tasks"], 1);
+    }
+
+    #[test]
     fn cleanup_finished_retains_undelivered_terminals() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
@@ -10617,7 +10692,7 @@ mod tests {
             task_ids.push(task_id);
         }
 
-        registry.cleanup_finished(Duration::from_secs(3600));
+        registry.cleanup_finished(crate::bash_background::watchdog::FINISHED_RETENTION);
         assert_eq!(registry.inner.tasks.lock().unwrap().len(), 3);
         registry.cleanup_finished(Duration::ZERO);
         let tasks = registry.inner.tasks.lock().unwrap();

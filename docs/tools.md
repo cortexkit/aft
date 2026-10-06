@@ -248,7 +248,11 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `pty` | boolean | Run in a real PTY for interactive programs. Implies `background: true`. |
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
 
-**Timeout model:** `timeout` is a hard-kill cap, never a polling parameter. A bare foreground
+**Timeout model:** `timeout` is a hard-kill cap, never a polling parameter, and starts after
+process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
+SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
+that leave the group (`setsid`, `setpgid`, Python `start_new_session=True`) survive; macOS has no
+tree kill. A bare foreground
 `bash({ command })` is polled for a short internal wait window (~5s); if the command hasn't
 finished it auto-promotes to a background task and returns a `taskId` while the command keeps
 running under the 30-minute (or explicit `timeout`) kill cap. `bash({ timeout: 2000 })` polls
@@ -346,6 +350,10 @@ the next foreground tool call, and a completion reminder is delivered automatica
 needed). Output is buffered in memory up to 1MB and spills beyond that to AFT's bash-output cache
 (default `~/.cache/aft/bash-output/<taskId>.log`, or the harness storage directory when configured).
 Background tasks and undelivered completions are persisted to disk and survive AFT restarts.
+Once a task has finished for 24 hours and its completion has been delivered, its output files are
+deleted; copy evidence you need into your report or a shared file. With project-root restrictions,
+only the starting session gets an ownership exception for output outside the project; another
+session (such as a reviewer reading a worker's path) may be refused even while the files exist.
 
 Foreground bash also starts through the same task flow. Short commands are polled and return inline
 output; commands that exceed the foreground wait window are automatically promoted to background
