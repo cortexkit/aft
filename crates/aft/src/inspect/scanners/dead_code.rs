@@ -2472,11 +2472,26 @@ fn dispatch_live_source_names_by_file<'a>(
     for contribution in contributions {
         let language = language_for_file(&contribution.file);
         if language == "go" {
-            let methods = contribution
+            let mut methods = contribution
                 .go_dispatch
                 .as_ref()
                 .map(|facts| facts.live_methods.clone())
                 .unwrap_or_default();
+            // An explicit receiver call is independent evidence of method
+            // use. Interface satisfaction adds implicit uses; it must not
+            // remove the existing callgraph's name-based dispatch evidence.
+            if let Some(names) = dispatched_method_names.get(language) {
+                methods.extend(
+                    contribution
+                        .exports
+                        .iter()
+                        .filter(|export| {
+                            export_is_method(export)
+                                && names.contains(symbol_liveness_name(&export.symbol))
+                        })
+                        .map(|export| symbol_liveness_name(&export.symbol).to_string()),
+                );
+            }
             by_file.insert(
                 contribution.file.as_str(),
                 DispatchNamesForFile::GoMethods(methods),
@@ -2502,11 +2517,14 @@ fn dispatch_liveness_keeps_export_live(
     let language = language_for_file(&contribution.file);
     if language == "go" {
         return export_is_method(export)
-            && contribution.go_dispatch.as_ref().is_some_and(|facts| {
-                facts
-                    .live_methods
-                    .contains(symbol_liveness_name(&export.symbol))
-            });
+            && (dispatched_method_names
+                .get(language)
+                .is_some_and(|names| names.contains(symbol_liveness_name(&export.symbol)))
+                || contribution.go_dispatch.as_ref().is_some_and(|facts| {
+                    facts
+                        .live_methods
+                        .contains(symbol_liveness_name(&export.symbol))
+                }));
     }
     let Some(method_names) = dispatched_method_names.get(language) else {
         return false;
@@ -5494,9 +5512,10 @@ fn dispatched_method_names_from_call(
     let mut names = BTreeSet::new();
     let is_go = language_for_file(caller_file) == "go";
     if is_go {
-        if let Some(interface_methods) = go_well_known_interface_methods_from_call(call) {
-            names.extend(interface_methods.iter().map(|name| (*name).to_string()));
-            return names.into_iter().collect();
+        if go_well_known_interface_methods_from_call(call).is_some() {
+            // These are implicit interface uses, not explicit receiver calls.
+            // The interface predicate checks the receiver and full method set.
+            return Vec::new();
         }
     }
 
@@ -5531,9 +5550,8 @@ fn go_well_known_interface_methods_from_call(
 ) -> Option<&'static [&'static str]> {
     let (target, full_callee) = split_call_target_metadata(&call.target);
     let callee = full_callee.unwrap_or(target).trim();
-    // Go interface methods are invoked by library code outside the project
-    // graph. These entry calls add method names only; the final liveness check
-    // is still gated to Go method exports, not functions.
+    // These library entry calls dispatch implicitly. Keep them out of the
+    // explicit-name rescue; receiver-aware interface satisfaction handles them.
     match callee {
         "sort.Sort" | "sort.Stable" | "sort.IsSorted" => Some(&["Len", "Less", "Swap"]),
         "list.New" => Some(&["FilterValue"]),
@@ -6055,8 +6073,7 @@ mod tests {
             ("src/service.ts", "handle"),
             ("src/service.ts", "missing"),
             ("src/worker.py", "process"),
-            // Go: a bare dispatched name without a used receiver and a known
-            // interface contract is insufficient to make an implicit root.
+            // Go: explicit dispatched names apply only to method exports.
             ("src/server.go", "Serve"),
             ("src/server.go", "Handle"),
             ("src/server.go", "helper"),
@@ -6078,6 +6095,7 @@ mod tests {
                 ("src/service.ts".to_string(), "render".to_string()),
                 ("src/service.ts".to_string(), "handle".to_string()),
                 ("src/worker.py".to_string(), "process".to_string()),
+                ("src/server.go".to_string(), "Serve".to_string()),
             ])
         );
     }
