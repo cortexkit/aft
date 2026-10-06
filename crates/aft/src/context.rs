@@ -289,6 +289,51 @@ fn pending_path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
 /// and stop loading the embedding backend.
 pub(crate) const UNBOUND_BUILD_ABANDON_GRACE: Duration = Duration::from_secs(120);
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static HELD_LIFECYCLE_LOCKS: std::cell::RefCell<Vec<usize>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Detect recursive admission before parking on a non-reentrant mutex. Track
+/// the mutex identity, not the context, because cloned admissions share it.
+struct LifecycleLockMarker {
+    #[cfg(debug_assertions)]
+    identity: usize,
+}
+
+impl LifecycleLockMarker {
+    fn enter(_mutex: &Arc<parking_lot::Mutex<bool>>) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            let identity = Arc::as_ptr(_mutex) as usize;
+            HELD_LIFECYCLE_LOCKS.with(|held| {
+                let mut held = held.borrow_mut();
+                assert!(
+                    !held.contains(&identity),
+                    "recursive root lifecycle lock acquisition"
+                );
+                held.push(identity);
+            });
+            Self { identity }
+        }
+        #[cfg(not(debug_assertions))]
+        Self {}
+    }
+}
+
+impl Drop for LifecycleLockMarker {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        HELD_LIFECYCLE_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            let position = held.iter().rposition(|id| *id == self.identity).unwrap();
+            held.remove(position);
+        });
+    }
+}
+
 /// Serializes the daemon's bound/unbound transition with admission of deferred
 /// root work. The lock covers only the bounded decision and worker-start commit;
 /// call sites must not wait for worker completion or run a scan while holding it.
@@ -317,12 +362,14 @@ impl Default for SubcLifecycleAdmission {
 
 impl SubcLifecycleAdmission {
     fn mark_bound(&self) {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let mut unbound = self.unbound.lock();
         *unbound = false;
         *self.unbound_since.lock() = None;
     }
 
     fn mark_unbound(&self, configure_generation: &AtomicU64) {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let mut unbound = self.unbound.lock();
         if !*unbound {
             *unbound = true;
@@ -336,6 +383,7 @@ impl SubcLifecycleAdmission {
     /// unbind (rebind within the window) never trips it, so those builds keep
     /// running exactly as they do while bound.
     pub(crate) fn unbound_past_grace(&self) -> bool {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if !*unbound {
             return false;
@@ -355,6 +403,7 @@ impl SubcLifecycleAdmission {
         let Some(unbound) = self.unbound.try_lock() else {
             return;
         };
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let grace = Duration::from_millis(self.abandon_grace_ms.load(Ordering::SeqCst));
         if *unbound
             && self
@@ -373,11 +422,13 @@ impl SubcLifecycleAdmission {
     }
 
     pub(crate) fn is_current(&self, generation: &AtomicU64, expected: u64) -> bool {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         !*unbound && generation.load(Ordering::SeqCst) == expected
     }
 
     fn advance_generation(&self, generation: &AtomicU64) -> u64 {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let _unbound = self.unbound.lock();
         generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
     }
@@ -388,6 +439,7 @@ impl SubcLifecycleAdmission {
         expected: u64,
         action: impl FnOnce() -> R,
     ) -> Option<R> {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if *unbound || generation.load(Ordering::SeqCst) != expected {
             return None;
@@ -396,6 +448,7 @@ impl SubcLifecycleAdmission {
     }
 
     pub(crate) fn is_bound(&self) -> bool {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         !*self.unbound.lock()
     }
 
@@ -408,6 +461,7 @@ impl SubcLifecycleAdmission {
     }
 
     fn run_if_unbound<R>(&self, action: impl FnOnce() -> R) -> Option<R> {
+        let _held = LifecycleLockMarker::enter(&self.unbound);
         let unbound = self.unbound.lock();
         if !*unbound {
             return None;
@@ -4606,6 +4660,10 @@ impl AppContext {
     #[doc(hidden)]
     pub fn subc_unbound_quiesced(&self) -> bool {
         self.subc_lifecycle.is_unbound()
+    }
+
+    pub(crate) fn try_subc_unbound_quiesced(&self) -> Option<bool> {
+        self.subc_lifecycle.try_is_bound().map(|bound| !bound)
     }
 
     #[cfg(test)]
@@ -11375,6 +11433,49 @@ mod subc_lifecycle_admission_tests {
                 .is_none(),
             "worker starts after unbind must be denied"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn lifecycle_gate_recursive_acquisition_panics_instead_of_parking() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let admission = SubcLifecycleAdmission::default();
+            let generation = AtomicU64::new(11);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                admission.run_if_current(&generation, 11, || {
+                    // A clone must not bypass the same-thread ownership marker.
+                    admission.clone().is_bound();
+                });
+            }));
+            tx.send(result).unwrap();
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recursive acquisition must panic before parking on the lifecycle mutex");
+        worker.join().unwrap();
+        let panic = result.expect_err("recursive acquisition was accepted");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied());
+        assert_eq!(message, Some("recursive root lifecycle lock acquisition"));
+    }
+
+    #[test]
+    fn lifecycle_gate_marker_allows_other_roots_and_cleans_up_after_unwind() {
+        let admission = SubcLifecycleAdmission::default();
+        let other = SubcLifecycleAdmission::default();
+        let generation = AtomicU64::new(11);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            admission.run_if_current(&generation, 11, || {
+                assert!(other.is_bound());
+                assert_eq!(admission.try_is_bound(), None);
+                panic!("unwind admission");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(admission.is_bound());
     }
 
     #[test]

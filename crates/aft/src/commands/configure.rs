@@ -4218,6 +4218,23 @@ fn schedule_missing_artifact_loads(
     request_search: bool,
     request_semantic: bool,
 ) -> ArtifactLoadStarts {
+    let semantic_view_work_allowed =
+        request_semantic && ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+    schedule_missing_artifact_loads_admitted(
+        ctx,
+        request_search,
+        request_semantic,
+        semantic_view_work_allowed,
+    )
+}
+
+/// The caller has already read lifecycle state, before entering admission.
+fn schedule_missing_artifact_loads_admitted(
+    ctx: &AppContext,
+    request_search: bool,
+    request_semantic: bool,
+    semantic_view_work_allowed: bool,
+) -> ArtifactLoadStarts {
     let _reload_guard = ctx.artifact_reload_guard();
     let missing = missing_artifact_loads(ctx);
     let load_search = request_search && missing.search;
@@ -4225,7 +4242,7 @@ fn schedule_missing_artifact_loads(
     if !load_search && !load_semantic {
         return (None, None);
     }
-    schedule_artifact_loads(ctx, load_search, load_semantic)
+    schedule_artifact_loads_admitted(ctx, load_search, load_semantic, semantic_view_work_allowed)
 }
 
 fn start_artifact_loads(starts: ArtifactLoadStarts) -> bool {
@@ -4254,7 +4271,9 @@ pub(crate) fn trigger_search_index_reload_if_evicted(ctx: &AppContext) -> bool {
     }
     let generation = ctx.configure_generation();
     ctx.run_if_subc_bound_generation(generation, || {
-        start_artifact_loads(schedule_missing_artifact_loads(ctx, true, false))
+        start_artifact_loads(schedule_missing_artifact_loads_admitted(
+            ctx, true, false, false,
+        ))
     })
     .unwrap_or(false)
 }
@@ -4288,7 +4307,7 @@ pub(crate) fn restart_search_index_after_load_disconnect(ctx: &AppContext) -> bo
             );
             return false;
         }
-        let started = start_artifact_loads(schedule_artifact_loads(ctx, true, false));
+        let started = start_artifact_loads(schedule_artifact_loads_admitted(ctx, true, false, false));
         if started {
             crate::slog_info!(
                 "search index load disconnected without an index; scheduled one automatic replacement load"
@@ -4389,7 +4408,12 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
-        let started = start_artifact_loads(schedule_artifact_loads(ctx, false, true));
+        let started = start_artifact_loads(schedule_artifact_loads_admitted(
+            ctx,
+            false,
+            true,
+            heavy_root_work_allowed,
+        ));
         if !started {
             *ctx.semantic_index_status()
                 .write()
@@ -4422,8 +4446,16 @@ pub(crate) fn trigger_semantic_index_reload_if_evicted(ctx: &AppContext) -> bool
         return false;
     }
     let generation = ctx.configure_generation();
+    // Admission holds the root lifecycle mutex through worker-start commit.
+    // Its nested scheduler must consume this snapshot, not lock it recursively.
+    let semantic_view_work_allowed = ctx.config().views.enabled && ctx.heavy_root_work_allowed();
     ctx.run_if_subc_bound_generation(generation, || {
-        start_artifact_loads(schedule_missing_artifact_loads(ctx, false, true))
+        start_artifact_loads(schedule_missing_artifact_loads_admitted(
+            ctx,
+            false,
+            true,
+            semantic_view_work_allowed,
+        ))
     })
     .unwrap_or(false)
 }
@@ -4466,14 +4498,26 @@ fn warm_search_reload_limiter() -> Arc<crate::cold_build_limiter::ColdBuildLimit
     Arc::clone(&WARM_SEARCH_RELOAD_LIMITER)
 }
 
+#[cfg(test)]
 fn schedule_artifact_loads(
     ctx: &AppContext,
     load_search: bool,
     load_semantic: bool,
-) -> (
-    Option<crossbeam_channel::Sender<()>>,
-    Option<crossbeam_channel::Sender<()>>,
-) {
+) -> ArtifactLoadStarts {
+    let semantic_view_work_allowed =
+        load_semantic && ctx.config().views.enabled && ctx.heavy_root_work_allowed();
+    schedule_artifact_loads_admitted(ctx, load_search, load_semantic, semantic_view_work_allowed)
+}
+
+/// Schedule using the pre-admission lifecycle decision. Generation admission
+/// still serializes worker installation with unbind; no nested lifecycle read
+/// is needed to choose the semantic view lane.
+fn schedule_artifact_loads_admitted(
+    ctx: &AppContext,
+    load_search: bool,
+    load_semantic: bool,
+    semantic_view_work_allowed: bool,
+) -> ArtifactLoadStarts {
     let canonical_cache_root = ctx.canonical_cache_root();
     let project_key = ctx.memoized_artifact_cache_key(&canonical_cache_root);
     let config = ctx.config();
@@ -4841,7 +4885,7 @@ fn schedule_artifact_loads(
     // With views enabled, this checkout's own view serves semantic search
     // (see `views::semantic_runtime`); the legacy index is not built, so
     // identical content in sibling worktrees is embedded once per family.
-    let load_semantic = if load_semantic && views_enabled && ctx.heavy_root_work_allowed() {
+    let load_semantic = if load_semantic && views_enabled && semantic_view_work_allowed {
         semantic_artifact_load_start = Some(start_checkout_semantic_lane(
             ctx,
             &canonical_cache_root,
@@ -11965,6 +12009,56 @@ mod tests {
         crate::runtime_drain::drain_build_completions(ctx);
         assert!(ctx.semantic_index_rx().lock().is_none());
         assert!(ctx.semantic_index().read().unwrap().is_some());
+    }
+
+    #[test]
+    fn evicted_semantic_view_reload_completes_under_bound_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            project_root: Some(root.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        config.indexes.semantic = true;
+        config.views.enabled = true;
+        config.semantic.backend = SemanticBackend::OpenAiCompatible;
+        config.semantic.base_url = Some("http://127.0.0.1:1/v1".into());
+        let ctx = std::sync::Arc::new(AppContext::from_app(App::default_shared(), config));
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        ctx.set_heavy_root_work_allowed(true);
+        *ctx.semantic_index().write().unwrap() =
+            Some(SemanticIndex::new(root.path().to_path_buf(), 3));
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::ready();
+        // Idle eviction leaves a ready status but no resident index or receiver.
+        *ctx.semantic_index().write().unwrap() = None;
+        let generation = ctx.configure_generation();
+        let worker_ctx = std::sync::Arc::clone(&ctx);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::trigger_semantic_index_reload_if_evicted(&worker_ctx)
+            }));
+            let _ = tx.send(outcome);
+        });
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Only join a finished call: the deadline must also fail safely if the
+        // debug lock guard is disabled and the reload really parks forever.
+        assert!(
+            outcome.is_ok(),
+            "semantic view reload exceeded its two-second deadline"
+        );
+        worker.join().unwrap();
+        assert!(outcome
+            .unwrap()
+            .expect("reload recursively acquired lifecycle admission"));
+        assert!(
+            ctx.checkout_semantic().active(),
+            "views-enabled reload must enter the checkout semantic lane"
+        );
+        ctx.checkout_semantic().clear();
+        assert_eq!(ctx.configure_generation(), generation);
     }
 
     #[test]
