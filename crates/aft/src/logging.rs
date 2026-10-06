@@ -272,6 +272,46 @@ fn capture_log_line(level: log::Level, line: &str) {
     });
 }
 
+/// Whether this thread is collecting slog records for a unit test.
+#[doc(hidden)]
+#[cfg(test)]
+#[inline]
+pub fn capture_active() -> bool {
+    LOG_LINE_CAPTURE.with(|slot| slot.borrow().is_some())
+}
+
+/// Production builds never capture log lines in memory.
+#[doc(hidden)]
+#[cfg(not(test))]
+#[inline]
+pub fn capture_active() -> bool {
+    false
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_info_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Info) || capture_active()
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_warn_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Warn) || capture_active()
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_error_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Error) || capture_active()
+}
+
+#[doc(hidden)]
+#[inline]
+pub fn slog_debug_enabled(target: &'static str) -> bool {
+    log::log_enabled!(target: target, log::Level::Debug) || capture_active()
+}
+
 // Exported slog macros expand outside this module, so their entry points must
 // be public even though callers should use the macros instead.
 #[doc(hidden)]
