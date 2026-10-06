@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -1275,7 +1275,6 @@ fn zoom_one_symbol_inner(
         let resolved_source = &enrichment.source;
         let line_starts = &enrichment.line_starts;
         let all_file_calls = &enrichment.calls;
-        let known_names: HashSet<&str> = all_symbols.iter().map(|s| s.name.as_str()).collect();
         let signature_byte_start = zoom_line_col_to_byte(
             resolved_source,
             line_starts,
@@ -1300,9 +1299,9 @@ fn zoom_one_symbol_inner(
         });
         let calls_out = dedupe_call_refs_by_name(
             raw_calls
-                .filter(|call| {
-                    known_names.contains(&call.name.as_str()) && call.name != target.name
-                })
+                // A call is local to this body even when its callee is imported,
+                // unresolved, or recursive. Nested bodies remain included, as
+                // they are in the per-file call graph's range-based attribution.
                 .map(|call| CallRef {
                     name: call.name.clone(),
                     line: call.line,
@@ -2420,12 +2419,16 @@ fn symbol_body_byte_range(
     let node = smallest_node_covering_range(root, byte_start, byte_end)?;
     let mut current = Some(node);
     while let Some(node) = current {
-        if is_symbol_body_node(node.kind()) {
+        // A leading doc comment can make the smallest covering node the whole
+        // file or an enclosing function. Neither is the selected declaration.
+        // Only expand a signature to a body that starts inside the supplied
+        // range; never widen it to an enclosing symbol or the entire file.
+        if is_symbol_body_node(node.kind()) && node.start_byte() >= byte_start {
             return Some((node.start_byte(), node.end_byte()));
         }
         current = node.parent();
     }
-    Some((node.start_byte(), node.end_byte()))
+    Some((byte_start, byte_end))
 }
 
 fn smallest_node_covering_range<'tree>(
@@ -3010,6 +3013,181 @@ function helper(value: number): number {
                 .contains("more lines — zoom"),
             "explicit zoom must not budget-cap leaf bodies"
         );
+    }
+
+    #[test]
+    fn zoom_callgraph_nested_doc_commented_function_keeps_own_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.ts");
+        std::fs::write(
+            &path,
+            r#"function outer() {
+  before();
+  /** Acquire the background lease. */
+  function A() {
+    acquireRefreshFileLock();
+  }
+  after();
+  A();
+}
+"#,
+        )
+        .unwrap();
+        let ctx = make_ctx();
+        for (name, expected) in [
+            (
+                "A",
+                serde_json::json!([{ "name": "acquireRefreshFileLock", "line": 5 }]),
+            ),
+            (
+                "outer",
+                serde_json::json!([
+                    { "name": "before", "line": 2 },
+                    { "name": "acquireRefreshFileLock", "line": 5 },
+                    { "name": "after", "line": 7 },
+                    { "name": "A", "line": 8 },
+                ]),
+            ),
+        ] {
+            let req = make_zoom_request_cg(name, path.to_str().unwrap(), name);
+            let json = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+            assert_eq!(json["success"], true, "{json}");
+            assert_eq!(json["annotations"]["calls_out"], expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn zoom_callgraph_doc_commented_exports_keep_own_calls() {
+        assert_adjacent_zoom_calls(
+            "ts",
+            r#"import { acquireRefreshFileLock } from './lock';
+
+/**
+ * Acquire the background lease.
+ */
+export function A() {
+  return acquireRefreshFileLock();
+}
+
+export function B() {
+  A();
+  claimBackgroundRefresh();
+  runUnderBackgroundLease();
+  runUnderBackgroundLease();
+}
+
+function claimBackgroundRefresh() {}
+function runUnderBackgroundLease() {}
+"#,
+            serde_json::json!([{ "name": "acquireRefreshFileLock", "line": 7 }]),
+            serde_json::json!([
+                { "name": "A", "line": 11 },
+                { "name": "claimBackgroundRefresh", "line": 12 },
+                { "name": "runUnderBackgroundLease", "line": 13, "extra_count": 1 },
+            ]),
+            11,
+        );
+    }
+
+    #[test]
+    fn zoom_callgraph_rust_doc_commented_functions_keep_own_calls() {
+        assert_adjacent_zoom_calls(
+            "rs",
+            r#"use crate::lock::acquire_refresh_file_lock;
+
+/// Acquire the background lease.
+#[inline]
+pub fn A() {
+    acquire_refresh_file_lock();
+}
+
+pub fn B() {
+    A();
+    claim_background_refresh();
+    run_under_background_lease();
+    run_under_background_lease();
+}
+
+fn claim_background_refresh() {}
+fn run_under_background_lease() {}
+"#,
+            serde_json::json!([{ "name": "acquire_refresh_file_lock", "line": 6 }]),
+            serde_json::json!([
+                { "name": "A", "line": 10 },
+                { "name": "claim_background_refresh", "line": 11 },
+                { "name": "run_under_background_lease", "line": 12, "extra_count": 1 },
+            ]),
+            10,
+        );
+    }
+
+    #[test]
+    fn zoom_callgraph_python_decorated_functions_keep_own_calls() {
+        assert_adjacent_zoom_calls(
+            "py",
+            r#"from lock import acquire_refresh_file_lock
+
+@lease
+def A():
+    "Acquire the background lease."
+    return acquire_refresh_file_lock()
+
+def B():
+    A()
+    claim_background_refresh()
+    run_under_background_lease()
+    run_under_background_lease()
+
+def claim_background_refresh():
+    pass
+
+def run_under_background_lease():
+    pass
+"#,
+            serde_json::json!([{ "name": "acquire_refresh_file_lock", "line": 6 }]),
+            serde_json::json!([
+                { "name": "A", "line": 9 },
+                { "name": "claim_background_refresh", "line": 10 },
+                { "name": "run_under_background_lease", "line": 11, "extra_count": 1 },
+            ]),
+            9,
+        );
+    }
+
+    fn assert_adjacent_zoom_calls(
+        extension: &str,
+        source: &str,
+        a_calls: serde_json::Value,
+        b_calls: serde_json::Value,
+        a_call_line: u32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("adjacent.{extension}"));
+        std::fs::write(&path, source).unwrap();
+        let ctx = make_ctx();
+        for (name, expected) in [("A", a_calls), ("B", b_calls)] {
+            let req = make_zoom_request_cg(name, path.to_str().unwrap(), name);
+            let json = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+            assert_eq!(json["success"], true, "{json}");
+            assert_eq!(
+                json["annotations"]["calls_out"], expected,
+                "{extension}:{name}"
+            );
+            for call in json["annotations"]["calls_out"].as_array().unwrap() {
+                let line = call["line"].as_u64().unwrap();
+                assert!(line > json["range"]["start_line"].as_u64().unwrap());
+                assert!(line <= json["range"]["end_line"].as_u64().unwrap() + 1);
+            }
+            if name == "A" {
+                assert_eq!(
+                    json["annotations"]["called_by"],
+                    serde_json::json!([{ "name": "B", "line": a_call_line }]),
+                );
+                assert!(!json["content"].as_str().unwrap().contains("function B"));
+                assert!(!json["content"].as_str().unwrap().contains("fn B"));
+                assert!(!json["content"].as_str().unwrap().contains("def B"));
+            }
+        }
     }
 
     #[test]

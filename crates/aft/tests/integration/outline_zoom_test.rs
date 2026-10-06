@@ -783,6 +783,125 @@ function unused(): void {
 }
 
 #[test]
+fn zoom_doc_commented_export_calls_match_call_tree_and_callers() {
+    let dir = TempDir::new().unwrap();
+    let lock = write_file(
+        dir.path(),
+        "lock.ts",
+        "export function acquireRefreshFileLock() {}\n",
+    );
+    let file = write_file(
+        dir.path(),
+        "background.ts",
+        r#"import { acquireRefreshFileLock } from './lock';
+
+/**
+ * Acquire the background lease.
+ */
+export function A() {
+  return acquireRefreshFileLock();
+}
+
+export function B() {
+  A();
+  claimBackgroundRefresh();
+  runUnderBackgroundLease();
+  runUnderBackgroundLease();
+}
+
+function claimBackgroundRefresh() {}
+function runUnderBackgroundLease() {}
+"#,
+    );
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    for (name, expected) in [
+        (
+            "A",
+            json!([{ "name": "acquireRefreshFileLock", "line": 7 }]),
+        ),
+        (
+            "B",
+            json!([
+                { "name": "A", "line": 11 },
+                { "name": "claimBackgroundRefresh", "line": 12 },
+                { "name": "runUnderBackgroundLease", "line": 13, "extra_count": 1 },
+            ]),
+        ),
+    ] {
+        let resp = send(
+            &mut aft,
+            json!({"id": name, "command": "zoom", "file": file, "symbol": name, "callgraph": true}),
+        );
+        assert_eq!(resp["success"], true, "{resp}");
+        assert_eq!(resp["annotations"]["calls_out"], expected, "{name}");
+        if name == "A" {
+            assert_eq!(
+                resp["range"]["start_line"], 3,
+                "range includes the doc comment"
+            );
+            assert_eq!(resp["range"]["end_line"], 8);
+            assert_eq!(
+                resp["annotations"]["called_by"],
+                json!([{ "name": "B", "line": 11 }])
+            );
+        }
+    }
+
+    // The index-backed operations use per-symbol call sites rather than zoom's
+    // AST body expansion. Check both sides of the same imported edge to ensure
+    // a neighbouring declaration never inherits it there either.
+    for (name, expected_names) in [
+        ("A", vec!["acquireRefreshFileLock"]),
+        (
+            "B",
+            vec![
+                "A",
+                "claimBackgroundRefresh",
+                "runUnderBackgroundLease",
+                "runUnderBackgroundLease",
+            ],
+        ),
+    ] {
+        let resp = send(
+            &mut aft,
+            json!({"id": name, "command": "call_tree", "file": file, "symbol": name, "depth": 1}),
+        );
+        assert_eq!(resp["success"], true, "{resp}");
+        let children = resp["children"].as_array().unwrap();
+        let mut names = children
+            .iter()
+            .map(|child| child["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, expected_names, "{name}: {resp}");
+        assert!(
+            children.iter().all(|child| child["resolved"] == true),
+            "{resp}"
+        );
+    }
+    for (target_file, symbol, expected_caller, line) in [
+        (&file, "A", "B", 11),
+        (&lock, "acquireRefreshFileLock", "A", 7),
+    ] {
+        let resp = send(
+            &mut aft,
+            json!({"id": symbol, "command": "callers", "file": target_file, "symbol": symbol, "depth": 1}),
+        );
+        assert_eq!(resp["success"], true, "{resp}");
+        assert_eq!(resp["total_callers"], 1, "{resp}");
+        let groups = resp["callers"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{resp}");
+        let callers = groups[0]["callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 1, "{resp}");
+        assert_eq!(callers[0]["symbol"], expected_caller, "{resp}");
+        assert_eq!(callers[0]["line"], line, "{resp}");
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn zoom_large_container_returns_member_signature_menu() {
     let dir = TempDir::new().unwrap();
     let file = write_file(dir.path(), "large.ts", &large_ts_class_source());
