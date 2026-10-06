@@ -497,7 +497,58 @@ pub(super) fn submit_deferred_bash(
     worker_session: bool,
     server_completion: bool,
     remote_key: Option<crate::db::remote_exec::PolicyKey>,
+    received_at: Instant,
 ) {
+    // Leave room for writer queueing and the daemon relay under the shortest
+    // supported client transport deadline (25 s). Explicit waits only extend
+    // execution, never startup admission or control-file creation.
+    let spawn_ctx = match executor.try_actor_context(&root) {
+        Some(Some(ctx)) => ctx,
+        state => {
+            let code = if state.is_none() {
+                "executor_busy"
+            } else {
+                "actor_not_registered"
+            };
+            let response = Response::error(
+                &request_id,
+                code,
+                "bash refused before startup: executor admission state is unavailable",
+            );
+            let result = bash_result_from_response(response, &format_context);
+            let completion_tx = completion_tx.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                send_bash_deferred_completion(
+                    &completion_tx,
+                    &metrics,
+                    route,
+                    corr,
+                    flags,
+                    ver,
+                    root,
+                    request_id,
+                    Some(result),
+                    false,
+                )
+                .await;
+            });
+            return;
+        }
+    };
+    let startup_window = if server_completion {
+        20_000
+    } else {
+        crate::commands::bash_orchestrate::resolve_foreground_wait_window_ms(
+            spawn_ctx.config().foreground_wait_window_ms,
+        )
+    }
+    .min(20_000);
+    let startup_deadline = received_at + Duration::from_millis(startup_window);
+    let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(startup_deadline));
+    let receipt_for_spawn = Arc::clone(&receipt);
+    let admitted = Arc::new(AtomicBool::new(false));
+    let admitted_for_spawn = Arc::clone(&admitted);
     let claim = metrics.held_bash_calls.insert(route, corr);
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
@@ -514,52 +565,189 @@ pub(super) fn submit_deferred_bash(
     // call the module loop answers instead (drain or cancel) carries no result
     // and is not observed.
     let mut repeat_for_spawn = repeat.clone();
-    let spawn_rx = executor.submit_async(
-        root_for_spawn,
-        Lane::Mutating,
-        request_id.clone(),
-        Box::new(move |ctx| {
-            log_ctx::with_session(Some(session_for_spawn.clone()), || {
-                let mut spawn_text_tx = Some(spawn_text_tx);
-                let mut spawn_control_tx = Some(spawn_control_tx);
+    let submit_executor = executor.clone();
+    let spawn_cancel = JobCancellation::new();
+    let submit_cancel = spawn_cancel.clone();
+    let submit_request_id = request_id.clone();
+    // Even submission can wait for a scheduler lock. The reply timer below
+    // lives on the frame runtime; submission and every spawn syscall do not.
+    let spawn_submission = tokio::task::spawn_blocking(move || {
+        submit_executor.submit_tool_call_with_cancellation_async(
+            root_for_spawn,
+            Lane::Mutating,
+            submit_request_id,
+            "bash",
+            Box::new(move |ctx| {
+                log_ctx::with_session(Some(session_for_spawn.clone()), || {
+                    admitted_for_spawn.store(true, Ordering::Relaxed);
+                    if receipt_for_spawn.refused() {
+                        return Response::error(
+                            &request_id_for_spawn,
+                            "bash_start_deadline",
+                            "bash startup deadline expired while queued for executor admission",
+                        );
+                    }
+                    let mut spawn_text_tx = Some(spawn_text_tx);
+                    let mut spawn_control_tx = Some(spawn_control_tx);
 
-                if matches!(bind_trust, BindTrust::Untrusted) && permissions_granted.is_none() {
-                    let response = bash_denied_untrusted_response(request_id_for_spawn.clone());
-                    return finish_bash_spawn_immediate(
-                        response,
-                        ctx,
-                        &session_for_spawn,
-                        &format_context_for_spawn,
-                        &mut spawn_text_tx,
-                        &mut spawn_control_tx,
-                        false,
-                        &mut repeat_for_spawn,
-                    );
-                }
+                    if matches!(bind_trust, BindTrust::Untrusted) && permissions_granted.is_none() {
+                        let response = bash_denied_untrusted_response(request_id_for_spawn.clone());
+                        return finish_bash_spawn_immediate(
+                            response,
+                            ctx,
+                            &session_for_spawn,
+                            &format_context_for_spawn,
+                            &mut spawn_text_tx,
+                            &mut spawn_control_tx,
+                            false,
+                            &mut repeat_for_spawn,
+                        );
+                    }
 
-                // Native bash skips the normal tool-call registration flow, so update the
-                // registration before rewriting. Rewritten reads then match ordinary reads.
-                if edit_slot_survives.is_some() {
-                    crate::run_tool_call::ensure_hashline_registration(
-                        ctx,
+                    // Native bash skips the normal tool-call registration flow, so update the
+                    // registration before rewriting. Rewritten reads then match ordinary reads.
+                    if edit_slot_survives.is_some() {
+                        crate::run_tool_call::ensure_hashline_registration(
+                            ctx,
+                            &project_root_for_spawn,
+                            &session_for_spawn,
+                            edit_slot_survives,
+                            false,
+                        );
+                    }
+
+                    let mut translated = match crate::subc_translate::subc_translate_owned(
+                        "bash",
+                        arguments,
                         &project_root_for_spawn,
-                        &session_for_spawn,
-                        edit_slot_survives,
-                        false,
-                    );
-                }
+                    ) {
+                        Ok(translated) => translated,
+                        Err(error) => {
+                            let response = Response::error(
+                                request_id_for_spawn.clone(),
+                                error.code,
+                                error.message,
+                            );
+                            return finish_bash_spawn_immediate(
+                                response,
+                                ctx,
+                                &session_for_spawn,
+                                &format_context_for_spawn,
+                                &mut spawn_text_tx,
+                                &mut spawn_control_tx,
+                                true,
+                                &mut repeat_for_spawn,
+                            );
+                        }
+                    };
+                    if let Some(grants) = permissions_granted {
+                        translated
+                            .args
+                            .insert("permissions_requested".to_string(), Value::Bool(true));
+                        translated.args.insert(
+                            "permissions_granted".to_string(),
+                            Value::Array(grants.into_iter().map(Value::String).collect()),
+                        );
+                    }
+                    // `worker_session` comes from the plugin-set field of the subc
+                    // call body, never from the agent's arguments: an agent must not be able to claim it is a
+                    // worker to lift the default hard kill on its command.
+                    translated
+                        .args
+                        .remove(crate::protocol::WORKER_SESSION_FIELD);
+                    if worker_session {
+                        translated.args.insert(
+                            crate::protocol::WORKER_SESSION_FIELD.to_string(),
+                            Value::Bool(true),
+                        );
+                    }
+                    let settings = bash_settings_from_translated(&translated.args);
+                    let raw_req = RawRequest {
+                        id: request_id_for_spawn.clone(),
+                        command: "bash".to_string(),
+                        lsp_hints: None,
+                        session_id: Some(session_for_spawn.clone()),
+                        params: Value::Object(translated.args),
+                    };
+                    let (response, storage_dir) =
+                        crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
+                            crate::bash_background::with_call_key(call_key, || {
+                                (
+                                    crate::bash_background::with_spawn_receipt(
+                                        Arc::clone(&receipt_for_spawn),
+                                        || crate::bash_background::with_remote_policy(
+                                            super::remote_policy::lookup(ctx, remote_key.as_ref()),
+                                            || dispatch(raw_req, ctx),
+                                        ),
+                                    ),
+                                    crate::bash_background::task_storage_dir(ctx),
+                                )
+                            })
+                        });
+                    if !response.success {
+                        return finish_bash_spawn_immediate(
+                            response,
+                            ctx,
+                            &session_for_spawn,
+                            &format_context_for_spawn,
+                            &mut spawn_text_tx,
+                            &mut spawn_control_tx,
+                            true,
+                            &mut repeat_for_spawn,
+                        );
+                    }
 
-                let mut translated = match crate::subc_translate::subc_translate_owned(
-                    "bash",
-                    arguments,
-                    &project_root_for_spawn,
-                ) {
-                    Ok(translated) => translated,
-                    Err(error) => {
-                        let response = Response::error(
-                            request_id_for_spawn.clone(),
-                            error.code,
-                            error.message,
+                    let Some(task_id) = response
+                        .data
+                        .get("task_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                    else {
+                        return finish_bash_spawn_immediate(
+                            response,
+                            ctx,
+                            &session_for_spawn,
+                            &format_context_for_spawn,
+                            &mut spawn_text_tx,
+                            &mut spawn_control_tx,
+                            true,
+                            &mut repeat_for_spawn,
+                        );
+                    };
+                    if response.data.get("status").and_then(Value::as_str) != Some("running") {
+                        return finish_bash_spawn_immediate(
+                            response,
+                            ctx,
+                            &session_for_spawn,
+                            &format_context_for_spawn,
+                            &mut spawn_text_tx,
+                            &mut spawn_control_tx,
+                            true,
+                            &mut repeat_for_spawn,
+                        );
+                    }
+
+                    let mode = response
+                        .data
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("pipes");
+                    let is_pty = mode == "pty" || settings.pty;
+                    if !server_completion && (is_pty || settings.background) {
+                        let response = bash_background_launch_response(
+                            &request_id_for_spawn,
+                            &task_id,
+                            is_pty,
+                            worker_session,
+                            format_context_for_spawn
+                                .bash_watch_available
+                                .unwrap_or(worker_session),
+                            &crate::commands::bash_orchestrate::kill_deadline_note(
+                                ctx.bash_background(),
+                                &task_id,
+                                &session_for_spawn,
+                                worker_session,
+                            ),
                         );
                         return finish_bash_spawn_immediate(
                             response,
@@ -572,173 +760,63 @@ pub(super) fn submit_deferred_bash(
                             &mut repeat_for_spawn,
                         );
                     }
-                };
-                if let Some(grants) = permissions_granted {
-                    translated
-                        .args
-                        .insert("permissions_requested".to_string(), Value::Bool(true));
-                    translated.args.insert(
-                        "permissions_granted".to_string(),
-                        Value::Array(grants.into_iter().map(Value::String).collect()),
+
+                    // A server-owned call is killed rather than detached when it
+                    // ends, so the worker wait limit (which detaches) leaves it be.
+                    let worker_cap_ms = crate::commands::bash_orchestrate::worker_wait_cap_ms(
+                        worker_session && !server_completion,
+                        settings.block_to_completion || settings.wait,
+                        crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
                     );
-                }
-                // `worker_session` comes from the plugin-set field of the subc
-                // call body, never from the agent's arguments: an agent must not be able to claim it is a
-                // worker to lift the default hard kill on its command.
-                translated
-                    .args
-                    .remove(crate::protocol::WORKER_SESSION_FIELD);
-                if worker_session {
-                    translated.args.insert(
-                        crate::protocol::WORKER_SESSION_FIELD.to_string(),
-                        Value::Bool(true),
-                    );
-                }
-                let settings = bash_settings_from_translated(&translated.args);
-                let raw_req = RawRequest {
-                    id: request_id_for_spawn.clone(),
-                    command: "bash".to_string(),
-                    lsp_hints: None,
-                    session_id: Some(session_for_spawn.clone()),
-                    params: Value::Object(translated.args),
-                };
-                let (response, storage_dir) =
-                    crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
-                        crate::bash_background::with_call_key(call_key, || {
-                            (
-                                crate::bash_background::with_remote_policy(
-                                    super::remote_policy::lookup(ctx, remote_key.as_ref()),
-                                    || dispatch(raw_req, ctx),
-                                ),
-                                crate::bash_background::task_storage_dir(ctx),
-                            )
-                        })
+                    let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
+                        crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
+                            ctx.config().foreground_wait_window_ms,
+                            settings.timeout,
+                            settings.wait,
+                        )
                     });
-                if !response.success {
-                    return finish_bash_spawn_immediate(
-                        response,
-                        ctx,
-                        &session_for_spawn,
-                        &format_context_for_spawn,
-                        &mut spawn_text_tx,
-                        &mut spawn_control_tx,
-                        true,
-                        &mut repeat_for_spawn,
-                    );
-                }
-
-                let Some(task_id) = response
-                    .data
-                    .get("task_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                else {
-                    return finish_bash_spawn_immediate(
-                        response,
-                        ctx,
-                        &session_for_spawn,
-                        &format_context_for_spawn,
-                        &mut spawn_text_tx,
-                        &mut spawn_control_tx,
-                        true,
-                        &mut repeat_for_spawn,
-                    );
-                };
-                if response.data.get("status").and_then(Value::as_str) != Some("running") {
-                    return finish_bash_spawn_immediate(
-                        response,
-                        ctx,
-                        &session_for_spawn,
-                        &format_context_for_spawn,
-                        &mut spawn_text_tx,
-                        &mut spawn_control_tx,
-                        true,
-                        &mut repeat_for_spawn,
-                    );
-                }
-
-                let mode = response
-                    .data
-                    .get("mode")
-                    .and_then(Value::as_str)
-                    .unwrap_or("pipes");
-                let is_pty = mode == "pty" || settings.pty;
-                if !server_completion && (is_pty || settings.background) {
-                    let response = bash_background_launch_response(
-                        &request_id_for_spawn,
-                        &task_id,
-                        is_pty,
-                        worker_session,
-                        format_context_for_spawn
-                            .bash_watch_available
-                            .unwrap_or(worker_session),
-                        &crate::commands::bash_orchestrate::kill_deadline_note(
-                            ctx.bash_background(),
-                            &task_id,
-                            &session_for_spawn,
-                            worker_session,
-                        ),
-                    );
-                    return finish_bash_spawn_immediate(
-                        response,
-                        ctx,
-                        &session_for_spawn,
-                        &format_context_for_spawn,
-                        &mut spawn_text_tx,
-                        &mut spawn_control_tx,
-                        true,
-                        &mut repeat_for_spawn,
-                    );
-                }
-
-                // A server-owned call is killed rather than detached when it
-                // ends, so the worker wait limit (which detaches) leaves it be.
-                let worker_cap_ms = crate::commands::bash_orchestrate::worker_wait_cap_ms(
-                    worker_session && !server_completion,
-                    settings.block_to_completion || settings.wait,
-                    crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
-                );
-                let wait_window_ms = worker_cap_ms.unwrap_or_else(|| {
-                    crate::commands::bash_orchestrate::select_foreground_wait_window_ms(
-                        ctx.config().foreground_wait_window_ms,
-                        settings.timeout,
-                        settings.wait,
-                    )
-                });
-                let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
-                let project_root = ctx.config().project_root.clone();
-                // Register the session as detachable exactly like the
-                // standalone path (bash_orchestrate) does: without this, a
-                // bash_wait_detach signal finds no active wait and wait:true
-                // blocks through user messages.
-                let detach_on_user_message = settings.wait && !server_completion;
-                ctx.bash_background()
-                    .register_foreground_task(&session_for_spawn, &task_id);
-                if detach_on_user_message {
+                    let wait_window_ms =
+                        if settings.wait || settings.block_to_completion || server_completion {
+                            wait_window_ms
+                        } else {
+                            wait_window_ms.min(20_000)
+                        };
+                    let deadline = received_at + Duration::from_millis(wait_window_ms);
+                    let project_root = ctx.config().project_root.clone();
+                    // Register the session as detachable exactly like the
+                    // standalone path (bash_orchestrate) does: without this, a
+                    // bash_wait_detach signal finds no active wait and wait:true
+                    // blocks through user messages.
+                    let detach_on_user_message = settings.wait && !server_completion;
                     ctx.bash_background()
-                        .begin_wait_mode_session(&session_for_spawn, &task_id);
-                }
-                if let Some(tx) = spawn_control_tx.take() {
-                    let _ = tx.send(BashSpawnControl::Foreground {
-                        task_id,
-                        session_id: session_for_spawn.clone(),
-                        project_root,
-                        storage_dir,
-                        deadline,
-                        // A capped worker wait detaches at its deadline.
-                        block_to_completion: (settings.block_to_completion || settings.wait)
-                            && worker_cap_ms.is_none(),
-                        timeout: settings.timeout,
-                        wait_window_ms,
-                        detach_on_user_message,
-                        worker_session,
-                        worker_cap_ms,
-                    });
-                }
-                response
-            })
-        }),
-    );
+                        .register_foreground_task(&session_for_spawn, &task_id);
+                    if detach_on_user_message {
+                        ctx.bash_background()
+                            .begin_wait_mode_session(&session_for_spawn, &task_id);
+                    }
+                    if let Some(tx) = spawn_control_tx.take() {
+                        let _ = tx.send(BashSpawnControl::Foreground {
+                            task_id,
+                            session_id: session_for_spawn.clone(),
+                            project_root,
+                            storage_dir,
+                            deadline,
+                            // A capped worker wait detaches at its deadline.
+                            block_to_completion: (settings.block_to_completion || settings.wait)
+                                && worker_cap_ms.is_none(),
+                            timeout: settings.timeout,
+                            wait_window_ms,
+                            detach_on_user_message,
+                            worker_session,
+                            worker_cap_ms,
+                        });
+                    }
+                    response
+                })
+            }),
+            submit_cancel,
+        )
+    });
 
     let executor = Arc::clone(executor);
     let completion_tx = completion_tx.clone();
@@ -747,8 +825,61 @@ pub(super) fn submit_deferred_bash(
     let root_for_task = root.clone();
     tokio::spawn(async move {
         let _response_task = ResponseTaskGuard::new(&task_metrics);
-        let spawn_response = await_executor_response(spawn_rx, request_id.clone()).await;
+        let spawn_request_id = request_id.clone();
+        let spawn_future = async move {
+            match spawn_submission.await {
+                Ok(rx) => await_executor_response(rx, spawn_request_id.clone()).await,
+                Err(error) => Response::error(
+                    &spawn_request_id,
+                    "execution_failed",
+                    format!("bash submission worker failed: {error}"),
+                ),
+            }
+        };
+        tokio::pin!(spawn_future);
+        let mut answered_startup = false;
+        let spawn_response = tokio::select! {
+            biased;
+            response = &mut spawn_future => response,
+            _ = tokio::time::sleep_until(startup_deadline.into()) => {
+                let task_id = receipt.expire();
+                if task_id.is_none() { spawn_cancel.request_cancel(); }
+                let response = match task_id {
+                    Some(task_id) if !server_completion => deadline_handoff_response(&request_id, &task_id, startup_window, worker_session),
+                    _ => Response::error(&request_id, "bash_start_deadline", startup_refusal_reason(&executor, &root_for_task, admitted.load(Ordering::Relaxed))),
+                };
+                log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
+                send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task.clone(), request_id.clone(), Some(bash_result_from_response(response, &format_context)), false).await;
+                answered_startup = true;
+                (&mut spawn_future).await
+            }
+        };
         let spawn_control = spawn_control_rx.await;
+        if answered_startup {
+            // A slow startup may settle after its caller has already received
+            // the task id. Promotion/persistence must not hold that reply open.
+            if let Ok(BashSpawnControl::Foreground {
+                task_id,
+                session_id,
+                detach_on_user_message,
+                ..
+            }) = spawn_control
+            {
+                detach_held_bash_in_background(drain::BashDetachTarget {
+                    task_id,
+                    session_id,
+                    wait_mode: detach_on_user_message,
+                    worker_session,
+                    server_completion,
+                    registry: spawn_ctx.bash_background().clone(),
+                    request_id,
+                    ver,
+                    flags,
+                    format_context,
+                });
+            }
+            return;
+        }
         match spawn_control {
             Ok(BashSpawnControl::Immediate) => {
                 let text = spawn_text_rx.await.unwrap_or_else(|_| {
@@ -799,17 +930,29 @@ pub(super) fn submit_deferred_bash(
                 };
                 task_metrics.held_bash_calls.set_phase(route, corr, phase);
                 let _deferred_wait = DeferredBashWaitGuard::new(&task_metrics);
-                run_deferred_bash_wait(
+                let deadline_target = drain::BashDetachTarget {
+                    task_id: task_id.clone(),
+                    session_id: session_id.clone(),
+                    wait_mode: detach_on_user_message,
+                    worker_session,
+                    server_completion,
+                    registry: spawn_ctx.bash_background().clone(),
+                    request_id: request_id.clone(),
+                    ver,
+                    flags,
+                    format_context: format_context.clone(),
+                };
+                let wait_future = run_deferred_bash_wait(
                     executor,
-                    completion_tx,
+                    completion_tx.clone(),
                     poll_touch_tx,
-                    task_metrics,
+                    task_metrics.clone(),
                     route,
                     corr,
                     flags,
                     ver,
-                    root_for_task,
-                    request_id,
+                    root_for_task.clone(),
+                    request_id.clone(),
                     task_id,
                     session_id,
                     project_root,
@@ -823,11 +966,28 @@ pub(super) fn submit_deferred_bash(
                     worker_cap_ms,
                     format_context,
                     cancel,
-                    claim,
+                    claim.clone(),
                     repeat,
                     server_completion,
-                )
-                .await;
+                );
+                // A healthy executor normally finishes the deadline poll and
+                // promotion, including repeat steering and the hard-kill note,
+                // within one poll turn. Only bypass it when it fails to answer;
+                // the bounded grace still leaves nearly five seconds under the
+                // 25 s transport class, even at the largest plain wait window.
+                let reply_deadline = deadline + PENDING_POLL_INTERVAL * 2;
+                tokio::select! {
+                    biased;
+                    _ = wait_future => {}
+                    _ = tokio::time::sleep_until(reply_deadline.into()), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
+                        if claim.claim_for_wait_task() {
+                            let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session);
+                            let result = bash_result_from_response(response, &deadline_target.format_context);
+                            detach_held_bash_in_background(deadline_target);
+                            send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;
+                        }
+                    }
+                }
             }
             Err(_) => {
                 let result = bash_result_from_response(spawn_response, &format_context);
@@ -848,6 +1008,42 @@ pub(super) fn submit_deferred_bash(
             }
         }
     });
+}
+
+fn deadline_handoff_response(
+    request_id: &str,
+    task_id: &str,
+    wait_window_ms: u64,
+    worker_session: bool,
+) -> Response {
+    Response::success(
+        request_id,
+        json!({
+            "output": crate::commands::bash_orchestrate::format_promotion_message(task_id, None, wait_window_ms, worker_session),
+            "task_id": task_id, "status": "running",
+        }),
+    )
+}
+
+fn startup_refusal_reason(executor: &Executor, root: &ProjectRootId, admitted: bool) -> String {
+    if admitted {
+        return "bash startup exceeded its reply budget during control-file creation or process startup; process creation is refused if it has not committed".into();
+    }
+    if let Some(writer) = executor
+        .try_mutating_lane_snapshots()
+        .and_then(|writers| writers.into_iter().find(|writer| &writer.root_id == root))
+    {
+        return format!("bash startup deadline: queued behind root Mutating job {} ({}); command was not started", writer.request_id, writer.command);
+    }
+    if executor
+        .try_dispatch_liveness_snapshot()
+        .is_some_and(|snapshot| {
+            snapshot.running.interactive + snapshot.running.maintenance >= executor.pool_size()
+        })
+    {
+        return "bash startup deadline: executor workers saturated; command was not started".into();
+    }
+    "bash startup deadline: queued for executor admission or scheduler lock; command was not started".into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1638,6 +1834,7 @@ mod grant_path_tests {
                 false,
                 true,
                 None,
+                Instant::now(),
             );
             let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
                 .await
@@ -1661,6 +1858,373 @@ mod grant_path_tests {
     }
 
     struct DeferredWaitReleaseGuard(Vec<std::path::PathBuf>);
+
+    fn deadline_test_call(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        dispatch: DispatchFn,
+        arguments: Value,
+    ) -> mpsc::Receiver<BashDeferredCompletion> {
+        deadline_test_call_received(executor, root, dispatch, arguments, Instant::now())
+    }
+
+    fn deadline_test_call_received(
+        executor: &Arc<Executor>,
+        root: &ProjectRootId,
+        dispatch: DispatchFn,
+        arguments: Value,
+        received_at: Instant,
+    ) -> mpsc::Receiver<BashDeferredCompletion> {
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (tx, rx) = mpsc::channel(8);
+        let (touch_tx, _) = mpsc::channel(8);
+        submit_deferred_bash(
+            executor,
+            &tx,
+            &touch_tx,
+            &metrics,
+            dispatch,
+            root.clone(),
+            root.as_path().into(),
+            "deadline-session".into(),
+            "deadline-call".into(),
+            RouteChannel {
+                channel: 1,
+                epoch: 1,
+            },
+            1,
+            Flags::new(false, Priority::Interactive, false),
+            PROTOCOL_VERSION,
+            arguments,
+            crate::subc_format::FormatContext::default(),
+            BashWaitCancel {
+                connection: PersistentCancelSignal::new(),
+                route: PersistentCancelSignal::new(),
+                drain: drain::ModuleDrainWindow::default(),
+            },
+            BindTrust::FirstParty,
+            crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            received_at,
+        );
+        rx
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_counts_reader_queue_time_from_receipt() {
+        let (_dir, root) = super::super::test_support::test_root("bash-receipt-clock");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| config.foreground_wait_window_ms = 2000);
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx);
+        let mut rx = deadline_test_call_received(
+            &executor,
+            &root,
+            slow_start_stub,
+            json!({"command":"sleep 3", "timeout":60000}),
+            Instant::now() - Duration::from_secs(3),
+        );
+        let done = tokio::time::timeout(Duration::from_millis(150), rx.recv())
+            .await
+            .expect("time spent in the reader queue is part of startup's reply budget")
+            .unwrap();
+        assert_eq!(done.response_for_test().data["code"], "bash_start_deadline");
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_refuses_contended_admission_lock() {
+        let (_dir, root) = super::super::test_support::test_root("bash-admission-lock");
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+        let holder_executor = executor.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            holder_executor.hold_state_lock_for_test(|| {
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(350));
+            })
+        });
+        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let started = Instant::now();
+        let mut rx = deadline_test_call(
+            &executor,
+            &root,
+            running_bash_stub,
+            json!({"command":"sleep 3"}),
+        );
+        let done = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+        let elapsed = started.elapsed();
+        holder.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "admission must never park the frame runtime: {elapsed:?}"
+        );
+        assert_eq!(
+            done.unwrap().unwrap().response_for_test().data["code"],
+            "executor_busy"
+        );
+    }
+
+    async fn deadline_queue_case(saturation: bool) {
+        let (_dir, root) = super::super::test_support::test_root("bash-deadline");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 80;
+            config.project_root = Some(root.as_path().into());
+        });
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        }));
+        executor.register_actor(root.clone(), ctx);
+        let mut holders = Vec::new();
+        // Use the effective pool size: the executor clamps a requested one-
+        // worker pool to two. Bind-only reserve workers cannot run bash jobs.
+        for index in 0..if saturation { executor.pool_size() } else { 1 } {
+            let holder_root = if saturation {
+                let path = root.as_path().join(format!("other-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                let other = ProjectRootId::from_path(path).unwrap();
+                executor.register_actor(other.clone(), super::super::test_support::test_ctx());
+                other
+            } else {
+                root.clone()
+            };
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = executor.submit_async(
+                holder_root,
+                Lane::Mutating,
+                "long-writer".into(),
+                Box::new(move |_| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                    Response::success("long-writer", json!({}))
+                }),
+            );
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            holders.push((release_tx, holder));
+        }
+        let mut rx = deadline_test_call(
+            &executor,
+            &root,
+            running_bash_stub,
+            json!({"command":"printf ran > late-command", "timeout":60000}),
+        );
+        let done = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        for (release_tx, holder) in holders {
+            release_tx.send(()).unwrap();
+            holder.await.unwrap();
+        }
+        let response = done
+            .expect("bash must refuse before the transport deadline")
+            .unwrap();
+        assert_eq!(
+            response.response_for_test().data["code"],
+            "bash_start_deadline"
+        );
+        let message = response.response_for_test().data["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            message.contains(if saturation {
+                "workers saturated"
+            } else {
+                "root Mutating job long-writer"
+            }),
+            "{message}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !root.as_path().join("late-command").exists(),
+            "a refused bash must never start later"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_refuses_behind_long_root_writer() {
+        deadline_queue_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_refuses_executor_saturation() {
+        deadline_queue_case(true).await;
+    }
+
+    fn slow_start_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        std::thread::sleep(Duration::from_millis(300));
+        running_bash_stub(req, ctx)
+    }
+
+    fn disk_full_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        with_task_io_fault(TaskIoFault::LayoutEnospc, || running_bash_stub(req, ctx))
+    }
+
+    fn running_disk_full_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        with_task_io_fault(TaskIoFault::RunningEnospc, || running_bash_stub(req, ctx))
+    }
+
+    fn slow_running_write_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        with_task_io_fault(
+            TaskIoFault::RunningDelay(Duration::from_millis(2500)),
+            || running_bash_stub(req, ctx),
+        )
+    }
+
+    async fn startup_case(
+        dispatch: DispatchFn,
+        window: u64,
+    ) -> (tempfile::TempDir, Arc<AppContext>, BashDeferredCompletion) {
+        let (dir, root) = super::super::test_support::test_root("bash-startup");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = window;
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut rx = deadline_test_call(
+            &executor,
+            &root,
+            dispatch,
+            json!({"command":"printf ran > started-command; sleep 3", "timeout":60000}),
+        );
+        let done = tokio::time::timeout(Duration::from_millis(window + 400), rx.recv())
+            .await
+            .expect("bash must answer within the receipt-based reply budget")
+            .unwrap();
+        (dir, ctx, done)
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_fences_slow_startup_before_process_creation() {
+        let (dir, _ctx, done) = startup_case(slow_start_stub, 80).await;
+        assert_eq!(done.response_for_test().data["code"], "bash_start_deadline");
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert!(
+            !dir.path().join("started-command").exists(),
+            "a startup refusal must fence late process creation"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_names_enospc_during_task_directory_creation() {
+        let (dir, _ctx, done) = startup_case(disk_full_stub, 1500).await;
+        let response = done.response_for_test();
+        assert!(!response.success);
+        assert!(
+            response.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("No space left on device"),
+            "{response:?}"
+        );
+        assert!(!dir.path().join("started-command").exists());
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_retains_task_when_running_metadata_hits_enospc() {
+        let (_dir, ctx, done) = startup_case(running_disk_full_stub, 1000).await;
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().expect("live task id");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            ctx.bash_background().task_for_test(task_id).is_some(),
+            "running process must be registered despite ENOSPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_hands_off_before_running_metadata_write_settles() {
+        let (_dir, ctx, done) = startup_case(slow_running_write_stub, 1000).await;
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"]
+            .as_str()
+            .expect("committed task id");
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert!(
+            ctx.bash_background().task_for_test(task_id).is_some(),
+            "receipt must name the actual late-registered task"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_promotion_bypasses_root_writer_and_task_lock() {
+        let (dir, root) = super::super::test_support::test_root("bash-poll-deadline");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 2000;
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut rx = deadline_test_call(
+            &executor,
+            &root,
+            running_bash_stub,
+            json!({"command":"sleep 4", "timeout":60000}),
+        );
+        let started_by = Instant::now() + Duration::from_millis(1500);
+        let task = loop {
+            if let Some(snapshot) = ctx.bash_background().list(0).first() {
+                break ctx
+                    .bash_background()
+                    .task_for_test(&snapshot.info.task_id)
+                    .unwrap();
+            }
+            assert!(
+                Instant::now() < started_by,
+                "task startup must fit the test budget"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "writer-after-spawn".into(),
+            Box::new(move |_| {
+                let _state = task.state.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                Response::success("writer-after-spawn", json!({}))
+            }),
+        );
+        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let done = tokio::time::timeout(Duration::from_millis(2300), rx.recv()).await;
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        let done = done
+            .expect("promotion must bypass both executor and registry locks")
+            .unwrap();
+        assert!(done.response_for_test().success);
+        assert!(done.response_for_test().data["task_id"].as_str().is_some());
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "only one terminal reply"
+        );
+    }
 
     impl Drop for DeferredWaitReleaseGuard {
         fn drop(&mut self) {
@@ -1749,6 +2313,7 @@ mod grant_path_tests {
                 false,
                 false,
                 None,
+                Instant::now(),
             );
         }
 
@@ -1898,6 +2463,7 @@ mod grant_path_tests {
             false,
             false,
             None,
+            Instant::now(),
         );
 
         let started_by = Instant::now() + Duration::from_secs(3);

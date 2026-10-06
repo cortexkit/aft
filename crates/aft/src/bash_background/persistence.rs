@@ -881,6 +881,8 @@ pub fn create_task_layout(
 }
 
 fn create_private_task_store(session_dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    task_io_fault_for_test(false)?;
     fs::create_dir_all(session_dir)?;
     #[cfg(unix)]
     {
@@ -1356,6 +1358,10 @@ pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Resul
 }
 
 fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io::Result<()> {
+    #[cfg(test)]
+    if task.status == BgTaskStatus::Running {
+        task_io_fault_for_test(true)?;
+    }
     // Every terminal transition is persisted through here, so this is the one
     // place that retires the task's gh shim ticket on completion, kill,
     // timeout and unknown fate alike. It runs before the write so a failed
@@ -1372,6 +1378,45 @@ fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io:
         &content,
         task.remote.is_some() || task.local_fallback_started,
     )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(crate) enum TaskIoFault {
+    LayoutEnospc,
+    RunningEnospc,
+    RunningDelay(std::time::Duration),
+}
+
+#[cfg(test)]
+thread_local! {
+    static TASK_IO_FAULT: std::cell::Cell<Option<TaskIoFault>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_task_io_fault<T>(fault: TaskIoFault, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<TaskIoFault>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TASK_IO_FAULT.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = TASK_IO_FAULT.with(|slot| slot.replace(Some(fault)));
+    let _restore = Restore(previous);
+    run()
+}
+
+#[cfg(test)]
+fn task_io_fault_for_test(running: bool) -> io::Result<()> {
+    TASK_IO_FAULT.with(|slot| match slot.get() {
+        Some(TaskIoFault::LayoutEnospc) if !running => Err(io::Error::from_raw_os_error(28)),
+        Some(TaskIoFault::RunningEnospc) if running => Err(io::Error::from_raw_os_error(28)),
+        Some(TaskIoFault::RunningDelay(delay)) if running => {
+            std::thread::sleep(delay);
+            Ok(())
+        }
+        _ => Ok(()),
+    })
 }
 
 pub fn update_task_at<F>(task: &ResolvedTask, update: F) -> io::Result<PersistedTask>

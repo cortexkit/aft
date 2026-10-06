@@ -1478,6 +1478,28 @@ impl Executor {
         job: ExecutorJob,
     ) -> (oneshot::Receiver<Response>, JobCancellation) {
         let cancellation = JobCancellation::new();
+        let completion_rx = self.submit_tool_call_with_cancellation_async(
+            root_id,
+            lane,
+            request_id,
+            tool,
+            job,
+            cancellation.clone(),
+        );
+        (completion_rx, cancellation)
+    }
+
+    /// Allows a receipt deadline to cancel admission even while submission is
+    /// waiting for the scheduler state lock on a blocking worker.
+    pub(crate) fn submit_tool_call_with_cancellation_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        tool: &str,
+        job: ExecutorJob,
+        cancellation: JobCancellation,
+    ) -> oneshot::Receiver<Response> {
         let (completion_tx, completion_rx) = oneshot::channel();
         self.submit_labeled(
             root_id,
@@ -1491,7 +1513,7 @@ impl Executor {
             None,
             None,
         );
-        (completion_rx, cancellation)
+        completion_rx
     }
 
     /// Submit a route-bind configure (a request id starting `subc-bind-`)

@@ -504,6 +504,7 @@ impl BindAckLatencies {
 }
 
 pub(super) struct DispatchPathMetrics {
+    unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
     pub(super) frame_loop_last_tick_ms: AtomicU64,
     /// When the frame loop next promised to wake (its drain-tick timer), as
@@ -552,6 +553,7 @@ pub(super) struct DispatchPathMetrics {
 impl DispatchPathMetrics {
     pub(super) fn new() -> Self {
         Self {
+            unanswered_tools: StdMutex::new(HashMap::new()),
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
             frame_loop_wake_deadline_ms_plus_one: AtomicU64::new(0),
@@ -583,6 +585,78 @@ impl DispatchPathMetrics {
             bind_acks: StdMutex::new(BindAckLatencies::default()),
             presetless_tool_calls: StdMutex::new(BTreeMap::new()),
             scoped_routes_with_tool_calls: AtomicU64::new(0),
+        }
+    }
+
+    pub(super) fn tool_received(&self, frame: &super::Frame, received_at: Instant) {
+        let name = serde_json::from_slice::<Value>(&frame.body)
+            .ok()
+            .and_then(|body| {
+                body.get("name")
+                    .or_else(|| body.get("op"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "undecoded".into());
+        if let Ok(mut tools) = self.unanswered_tools.lock() {
+            tools.insert(
+                (
+                    super::route_key(frame.header.channel, frame.header.epoch),
+                    frame.header.corr,
+                ),
+                UnansweredTool {
+                    received_at,
+                    name,
+                    warned: false,
+                },
+            );
+        }
+    }
+
+    /// Called by the independent watchdog thread, not by an executor job or
+    /// the frame runtime. A call that never finishes must still leave evidence.
+    pub(super) fn warn_unanswered_tools(&self) {
+        self.warn_unanswered_tools_with(Instant::now(), &|line| log::warn!("{line}"));
+    }
+
+    fn warn_unanswered_tools_with(&self, now: Instant, log: &dyn Fn(&str)) {
+        let Ok(mut tools) = self.unanswered_tools.try_lock() else {
+            return;
+        };
+        for (&(route, corr), tool) in tools.iter_mut() {
+            if !tool.warned
+                && now.saturating_duration_since(tool.received_at) >= Duration::from_secs(25)
+            {
+                tool.warned = true;
+                log(&format!("tool_call unanswered past client deadline class name={} channel={} epoch={} corr={} elapsed_ms={} deadline_class_ms=25000", tool.name, route.channel, route.epoch, corr, now.saturating_duration_since(tool.received_at).as_millis()));
+            }
+        }
+    }
+
+    pub(super) fn tool_replied(&self, frame: &super::Frame) {
+        self.tool_replied_with(frame, Instant::now(), &|line| log::info!("{line}"));
+    }
+
+    fn tool_replied_with(&self, frame: &super::Frame, now: Instant, log: &dyn Fn(&str)) {
+        if matches!(
+            frame.header.ty,
+            super::FrameType::Response | super::FrameType::Error
+        ) {
+            if let Ok(mut tools) = self.unanswered_tools.lock() {
+                let key = (
+                    super::route_key(frame.header.channel, frame.header.epoch),
+                    frame.header.corr,
+                );
+                if let Some(tool) = tools.remove(&key) {
+                    // Bash does not travel through the ordinary phase tracer.
+                    // Record the actual socket handoff, not merely queueing a
+                    // completion, so a later client timeout can be localized to
+                    // AFT or to the daemon/consumer leg of the connection.
+                    if tool.name == "bash" || tool.name == "powershell" {
+                        log(&format!("tool_call reply written name={} channel={} epoch={} corr={} total_ms={} destination=subc_daemon", tool.name, key.0.channel, key.0.epoch, key.1, now.saturating_duration_since(tool.received_at).as_millis()));
+                    }
+                }
+            }
         }
     }
 
@@ -1009,6 +1083,12 @@ impl DispatchPathMetrics {
             },
         })
     }
+}
+
+struct UnansweredTool {
+    received_at: Instant,
+    name: String,
+    warned: bool,
 }
 
 pub(super) struct DeferredBashWaitGuard {
@@ -2357,6 +2437,76 @@ fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bash_deadline_reply_log_proves_actual_daemon_handoff() {
+        use std::cell::RefCell;
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let mut frame = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            1280,
+            1,
+            1335,
+            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&frame, now);
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.tool_replied_with(&frame, now, &sink);
+        assert!(
+            lines.borrow().is_empty(),
+            "ingress cannot stand in for actual egress"
+        );
+        frame.header.ty = crate::subc::FrameType::Response;
+        metrics.tool_replied_with(&frame, now + super::Duration::from_millis(12), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0]
+            .contains("channel=1280 epoch=1 corr=1335 total_ms=12 destination=subc_daemon"));
+        assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
+        metrics.tool_replied_with(&frame, now, &sink);
+        assert_eq!(
+            lines.borrow().len(),
+            1,
+            "an untracked response is not a second handoff"
+        );
+    }
+    #[test]
+    fn bash_deadline_watchdog_logs_unanswered_calls_until_actual_write() {
+        use std::cell::RefCell;
+        let metrics = super::DispatchPathMetrics::new();
+        let now = super::Instant::now();
+        let request = crate::subc::Frame::build_with_version(
+            crate::subc::PROTOCOL_VERSION,
+            crate::subc::FrameType::Request,
+            crate::subc::control_flags(),
+            24,
+            1,
+            1188,
+            serde_json::to_vec(&serde_json::json!({"name":"bash"})).unwrap(),
+        )
+        .unwrap();
+        metrics.tool_received(&request, now);
+        let lines = RefCell::new(Vec::new());
+        let sink = |line: &str| lines.borrow_mut().push(line.to_string());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(24), &sink);
+        assert!(lines.borrow().is_empty());
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(25), &sink);
+        assert_eq!(lines.borrow().len(), 1);
+        assert!(lines.borrow()[0].contains("name=bash channel=24 epoch=1 corr=1188"));
+        metrics.warn_unanswered_tools_with(now + super::Duration::from_secs(30), &sink);
+        assert_eq!(
+            lines.borrow().len(),
+            1,
+            "warn only once per unanswered call"
+        );
+        let mut reply = request;
+        reply.header.ty = crate::subc::FrameType::Response;
+        metrics.tool_replied(&reply);
+        assert!(metrics.unanswered_tools.lock().unwrap().is_empty());
+    }
     use super::super::test_support::{test_ctx, test_root};
     use super::super::{Lane, Response};
     use super::*;

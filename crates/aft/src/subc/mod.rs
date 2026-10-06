@@ -2896,6 +2896,7 @@ async fn handle_bash_elicitation_reply(
                 pending.worker_session,
                 false,
                 None,
+                Instant::now(),
             );
             return Ok(());
         }
@@ -4239,7 +4240,7 @@ where
     // dedicated reader task owns the socket, reads whole frames sequentially, and
     // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
     let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
-    let reader_task = spawn_reader_task(read, reader_tx);
+    let reader_task = spawn_reader_task(read, reader_tx, Arc::clone(&dispatch_path_metrics));
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
     // loop turn rather than as an Interval select arm: the select below is
@@ -5504,6 +5505,7 @@ where
             .await;
             metrics.writer_active.store(false, Ordering::Relaxed);
             let write_timing = write_timing?;
+            metrics.tool_replied(queued.frame());
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
                 (queued.tool_response_trace.take(), dequeued, write_timing)
@@ -5577,6 +5579,7 @@ where
 fn spawn_reader_task<R>(
     mut read: R,
     tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
+    metrics: Arc<DispatchPathMetrics>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -5585,12 +5588,16 @@ where
         loop {
             match read_frame(&mut read).await {
                 Ok(Some(frame)) => {
+                    let received_at = Instant::now();
+                    if frame.header.ty == FrameType::Request && frame.header.channel != 0 {
+                        metrics.tool_received(&frame, received_at);
+                    }
                     #[cfg(any(test, feature = "test-timing-hooks"))]
                     let delay_after_ping =
                         frame.header.ty == FrameType::Ping && frame.header.corr == 124;
                     let decoded = DecodedFrame {
                         frame,
-                        phase_trace: PhaseTrace::new(Instant::now()),
+                        phase_trace: PhaseTrace::new(received_at),
                     };
                     if tx.send(Ok(decoded)).await.is_err() {
                         return;
@@ -7946,6 +7953,7 @@ async fn handle_tool_call(
             role.is_worker(),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
             remote_policy::key(&identity, call.preset.as_deref()),
+            phase_trace.received_at(),
         );
         return Ok(());
     }

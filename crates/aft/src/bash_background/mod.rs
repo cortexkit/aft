@@ -30,6 +30,112 @@ use std::time::Duration;
 
 pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
+/// A shell startup has a reply budget even before it has an executor worker.
+/// The short state lock fences process creation against a deadline refusal;
+/// no filesystem operation, process creation, or registry lock runs under it.
+pub(crate) struct SpawnReceipt {
+    state: std::sync::Mutex<SpawnReceiptState>,
+    deadline: std::time::Instant,
+}
+
+#[derive(Default)]
+enum SpawnReceiptState {
+    #[default]
+    Pending,
+    Refused,
+    Committed(String),
+}
+
+impl SpawnReceipt {
+    pub(crate) fn new(deadline: std::time::Instant) -> Self {
+        Self {
+            state: std::sync::Mutex::new(SpawnReceiptState::Pending),
+            deadline,
+        }
+    }
+    pub(crate) fn expire(&self) -> Option<String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*state {
+            SpawnReceiptState::Committed(id) => Some(id.clone()),
+            _ => {
+                *state = SpawnReceiptState::Refused;
+                None
+            }
+        }
+    }
+
+    fn commit(&self, task_id: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, SpawnReceiptState::Refused)
+            || std::time::Instant::now() >= self.deadline
+        {
+            *state = SpawnReceiptState::Refused;
+            return Err("bash startup deadline expired before process creation".into());
+        }
+        *state = SpawnReceiptState::Committed(task_id.into());
+        Ok(())
+    }
+
+    pub(crate) fn refused(&self) -> bool {
+        matches!(
+            *self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SpawnReceiptState::Refused
+        )
+    }
+}
+
+fn spawn_receipt_committed() -> bool {
+    CURRENT_SPAWN_RECEIPT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|receipt| {
+            matches!(
+                *receipt
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                SpawnReceiptState::Committed(_)
+            )
+        })
+    })
+}
+
+thread_local! {
+    static CURRENT_SPAWN_RECEIPT: std::cell::RefCell<Option<std::sync::Arc<SpawnReceipt>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_spawn_receipt<T>(
+    receipt: std::sync::Arc<SpawnReceipt>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::sync::Arc<SpawnReceipt>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_SPAWN_RECEIPT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = CURRENT_SPAWN_RECEIPT.with(|slot| slot.replace(Some(receipt)));
+    let _restore = Restore(previous);
+    run()
+}
+
+/// Called only after the starting record and every control/output file exist,
+/// immediately before process creation. Once committed, the caller can always
+/// get the task id, including while running-record persistence is blocked.
+pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
+    CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
+        Some(receipt) => receipt.commit(task_id),
+        None => Ok(()),
+    })
+}
+
 /// Who started a background task and the key they gave the call, recorded on
 /// the task so a consumer can find the task its own call started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -555,12 +661,21 @@ pub fn spawn(
             Response::error(request_id, "background_task_limit_exceeded", message)
         }
         Err(message) => {
-            cleanup_plan.cleanup_unspawned();
+            // A deadline may already have handed the starting task id to its
+            // caller. Keep its terminal failure record available to status.
+            if !spawn_receipt_committed() {
+                cleanup_plan.cleanup_unspawned();
+            }
             #[cfg(unix)]
-            if let Some(task) = unregistered_task.as_ref() {
+            if let Some(task) = unregistered_task
+                .as_ref()
+                .filter(|_| !spawn_receipt_committed())
+            {
                 let _ = persistence::delete_resolved_task(task);
             }
-            if cleanup_plan.is_native_launcher() {
+            if message.contains("startup deadline expired") {
+                Response::error(request_id, "bash_start_deadline", message)
+            } else if cleanup_plan.is_native_launcher() {
                 Response::error(
                     request_id,
                     "sandbox_unavailable",

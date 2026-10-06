@@ -2580,6 +2580,10 @@ impl BgTaskRegistry {
         let mut io_handles =
             TaskIoHandles::create(&task_layout, BgMode::Pipes, capture_pipeline_status)
                 .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
+        if let Err(error) = super::commit_spawn_receipt(&task_id) {
+            let _ = delete_resolved_task(&task_layout);
+            return Err(error);
+        }
         let child = match spawn_detached_child(
             &spawn_plan,
             command,
@@ -2594,8 +2598,14 @@ impl BgTaskRegistry {
         ) {
             Ok(child) => child,
             Err(error) => {
-                crate::slog_warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
-                let _ = delete_task_bundle(&paths);
+                crate::slog_warn!("failed to spawn background bash task {task_id}: {error}");
+                if super::spawn_receipt_committed() {
+                    metadata.notify_on_completion = true;
+                    metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
+                    let _ = self.persist_task(&paths, &metadata);
+                } else {
+                    let _ = delete_task_bundle(&paths);
+                }
                 return Err(error);
             }
         };
@@ -2606,8 +2616,13 @@ impl BgTaskRegistry {
         if crate::privacy_spawn::requested(&env) {
             crate::privacy_spawn::note_session(&session_id);
         }
-        self.persist_task(&paths, &metadata)
-            .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
+        // The process exists now. A full disk must not orphan it by returning
+        // before registration; its starting record already exists on disk.
+        if let Err(error) = self.persist_task(&paths, &metadata) {
+            crate::slog_warn!(
+                "running bash task {task_id} persistence failed; retaining live task: {error}"
+            );
+        }
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
@@ -2796,6 +2811,11 @@ impl BgTaskRegistry {
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pty, false)
             .map_err(|error| format!("failed to pre-open PTY output handles: {error}"))?;
 
+        if let Err(error) = super::commit_spawn_receipt(&task_id) {
+            let _ = delete_resolved_task(&task_layout);
+            return Err(error);
+        }
+
         let runtime = match spawn_pty_for_command(
             &spawn_plan,
             &task_id,
@@ -2813,10 +2833,14 @@ impl BgTaskRegistry {
         ) {
             Ok(runtime) => runtime,
             Err(error) => {
-                crate::slog_warn!(
-                    "failed to spawn PTY background bash task {task_id}; deleting partial bundle: {error}"
-                );
-                let _ = delete_task_bundle(&paths);
+                crate::slog_warn!("failed to spawn PTY background bash task {task_id}: {error}");
+                if super::spawn_receipt_committed() {
+                    metadata.notify_on_completion = true;
+                    metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
+                    let _ = self.persist_task(&paths, &metadata);
+                } else {
+                    let _ = delete_task_bundle(&paths);
+                }
                 return Err(error);
             }
         };
@@ -2828,8 +2852,11 @@ impl BgTaskRegistry {
             metadata.status = BgTaskStatus::Running;
             metadata.pgid = None;
         }
-        self.persist_task(&paths, &metadata)
-            .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
+        if let Err(error) = self.persist_task(&paths, &metadata) {
+            crate::slog_warn!(
+                "running PTY task {task_id} persistence failed; retaining live task: {error}"
+            );
+        }
 
         let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
@@ -2984,6 +3011,11 @@ impl BgTaskRegistry {
         let mut io_handles = TaskIoHandles::create(&task_layout, BgMode::Pipes, false)
             .map_err(|error| format!("failed to pre-open task output handles: {error}"))?;
 
+        if let Err(error) = super::commit_spawn_receipt(&task_id) {
+            let _ = delete_resolved_task(&task_layout);
+            return Err(error);
+        }
+
         let child = match spawn_detached_child(
             &spawn_plan,
             command,
@@ -2998,8 +3030,14 @@ impl BgTaskRegistry {
         ) {
             Ok(child) => child,
             Err(error) => {
-                crate::slog_warn!("failed to spawn background bash task {task_id}; deleting partial bundle: {error}");
-                let _ = delete_task_bundle(&paths);
+                crate::slog_warn!("failed to spawn background bash task {task_id}: {error}");
+                if super::spawn_receipt_committed() {
+                    metadata.notify_on_completion = true;
+                    metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
+                    let _ = self.persist_task(&paths, &metadata);
+                } else {
+                    let _ = delete_task_bundle(&paths);
+                }
                 return Err(error);
             }
         };
@@ -3009,8 +3047,11 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.child_pid = Some(child_pid);
         metadata.pgid = None;
-        self.persist_task(&paths, &metadata)
-            .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
+        if let Err(error) = self.persist_task(&paths, &metadata) {
+            crate::slog_warn!(
+                "running bash task {task_id} persistence failed; retaining live task: {error}"
+            );
+        }
 
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),

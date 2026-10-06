@@ -462,6 +462,7 @@ impl LivenessMarker for FrameLoopMarker {
     }
 
     fn progress_age(&self) -> Duration {
+        self.0.warn_unanswered_tools();
         self.0.frame_loop_progress_age()
     }
 
