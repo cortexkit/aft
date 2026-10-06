@@ -8284,8 +8284,8 @@ async fn handle_tool_call(
                     }
                 }
             };
-            // Undo history belongs to the route that made the edit, not to
-            // whichever harness configured this shared root last.
+            // Undo history and named checkpoints belong to the issuing route,
+            // not to whichever harness configured this shared root last.
             let harness = identity_for_run.harness.clone();
             crate::backup::with_request_harness(&harness, || {
                 if matches!(bind_trust, BindTrust::Untrusted) {

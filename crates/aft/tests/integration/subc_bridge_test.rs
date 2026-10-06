@@ -1195,6 +1195,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "undo" => aft::commands::undo::handle_undo(&req, ctx),
         "edit_history" => aft::commands::edit_history::handle_edit_history(&req, ctx),
         "checkpoint" => aft::commands::checkpoint::handle_checkpoint(&req, ctx),
+        "checkpoint_paths" => aft::commands::checkpoint::handle_checkpoint_paths(&req, ctx),
         "restore_checkpoint" => {
             aft::commands::restore_checkpoint::handle_restore_checkpoint(&req, ctx)
         }
@@ -2220,6 +2221,17 @@ fn subc_bridge_tool_calls_carry_route_bind_session() {
         Duration::from_secs(30),
         drive_route_bind_session_daemon,
         |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_checkpoint_paths_survives_sibling_harness_bind_and_root_rebind() {
+    run_subc_bridge_production_test_with_dispatch(
+        "subc_bridge_checkpoint_paths_survives_sibling_harness_bind_and_root_rebind",
+        Duration::from_secs(30),
+        drive_checkpoint_rebind_daemon,
+        |_, _, _| {},
+        real_configure_bridge_dispatch,
     );
 }
 
@@ -5814,6 +5826,140 @@ async fn drive_route_bind_session_daemon(input: FakeDaemonInput) {
         Some("session-4"),
     );
 
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_checkpoint_rebind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    let nested = root1.join(".cortexkit/alfonso/implementation-worktrees/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let file = nested.join("pool-authority.test.ts");
+    std::fs::write(&file, "checkpoint contents").unwrap();
+    let session = "019de471-4fdc-762d-9286-624dfad0b5fe";
+    let doc = json!({ "callgraph_store": false, "search_index": false, "semantic_search": false });
+    send_route_bind_with_harness_session_principal_and_doc(
+        &mut stream,
+        1,
+        101,
+        &root1,
+        "pi",
+        session,
+        Some(Principal::Direct),
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 101).await;
+    let created = call_tool_response(
+        &mut stream,
+        1,
+        102,
+        "safety",
+        json!({ "op": "checkpoint", "name": "proof", "files": [&file] }),
+        "create durable checkpoint",
+    )
+    .await;
+    assert_tool_success(&created, "create durable checkpoint");
+    let storage_path = std::path::PathBuf::from(created["storage_path"].as_str().unwrap());
+    assert!(storage_path.join("meta.json").is_file());
+    assert!(storage_path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .ends_with("pi"));
+    let meta: Value =
+        serde_json::from_slice(&std::fs::read(storage_path.join("meta.json")).unwrap()).unwrap();
+    assert_eq!(
+        meta["session_id"], session,
+        "log prefix must not alter storage identity"
+    );
+    std::fs::write(&file, "modified contents").unwrap();
+
+    // Root actors are shared across harnesses. This bind changes the actor's
+    // configured harness without invalidating the first route.
+    send_route_bind_with_harness_session_principal_and_doc(
+        &mut stream,
+        2,
+        103,
+        &root1,
+        "opencode",
+        session,
+        Some(Principal::Direct),
+        doc.clone(),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 103).await;
+    let preview = call_tool_response(
+        &mut stream,
+        1,
+        104,
+        "checkpoint_paths",
+        json!({ "name": "proof", "session_id": "spoofed-body-session" }),
+        "owner preview after sibling bind",
+    )
+    .await;
+    assert_tool_success(&preview, "owner preview after sibling bind");
+    assert_eq!(preview["paths"], json!([&file]));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "modified contents");
+    let sibling = call_tool_response(
+        &mut stream,
+        2,
+        105,
+        "checkpoint_paths",
+        json!({ "name": "proof" }),
+        "sibling namespace isolation",
+    )
+    .await;
+    assert_tool_error_code(
+        &sibling,
+        "checkpoint_not_found",
+        "sibling namespace isolation",
+    );
+
+    // Moving the owner's route to the nested workspace uses a different actor
+    // with an empty cache. It must hydrate the same harness/session disk tree.
+    send_route_bind_with_harness_session_principal_and_doc(
+        &mut stream,
+        3,
+        106,
+        &nested,
+        "pi",
+        session,
+        Some(Principal::Direct),
+        doc,
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 106).await;
+    let preview = call_tool_response(
+        &mut stream,
+        3,
+        107,
+        "checkpoint_paths",
+        json!({ "name": "proof" }),
+        "preview on rebound root",
+    )
+    .await;
+    assert_tool_success(&preview, "preview on rebound root");
+    assert_eq!(preview["paths"], json!([&file]));
+    let restored = call_tool_response(
+        &mut stream,
+        3,
+        108,
+        "safety",
+        json!({ "op": "restore", "name": "proof", "files": [&file] }),
+        "restore on rebound root",
+    )
+    .await;
+    assert_tool_success(&restored, "restore on rebound root");
+    assert_eq!(restored["storage_path"], created["storage_path"]);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "checkpoint contents"
+    );
     send_connection_goodbye(&mut stream).await;
 }
 

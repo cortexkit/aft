@@ -87,7 +87,7 @@ impl Drop for RequestHarnessScope {
     }
 }
 
-/// Run `run` with backups keyed under the storage namespace of `harness`, the
+/// Run `run` with backups and checkpoints keyed under the storage namespace of `harness`, the
 /// harness of the route that issued the request. An unparseable harness leaves
 /// the store's configured namespace in effect.
 pub(crate) fn with_request_harness<R>(harness: &str, run: impl FnOnce() -> R) -> R {
@@ -100,7 +100,7 @@ pub(crate) fn with_request_harness<R>(harness: &str, run: impl FnOnce() -> R) ->
     run()
 }
 
-fn request_harness_segment() -> Option<String> {
+pub(crate) fn request_harness_segment() -> Option<String> {
     REQUEST_HARNESS_SEGMENT.with(|slot| slot.borrow().clone())
 }
 

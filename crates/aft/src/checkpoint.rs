@@ -417,6 +417,16 @@ impl CheckpointStore {
         if let Some((dir, harness)) = self.namespace_request.take() {
             self.select_namespace(dir, harness);
         }
+        // A root actor serves routes from several harnesses. Configure records
+        // whichever one bound last, not necessarily the route issuing this
+        // checkpoint operation. Use that route's namespace for both durable
+        // lookup and creation, clearing the derived cache when it changes.
+        if let (Some(dir), Some(harness)) = (
+            self.storage_dir.clone(),
+            crate::backup::request_harness_segment(),
+        ) {
+            self.select_namespace(dir, harness);
+        }
     }
 
     /// Caller holds the checkpoint mutation lock.
@@ -1905,6 +1915,79 @@ mod tests {
     fn checkpoint_store() -> (CheckpointStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         (fresh_checkpoint_store(dir.path()), dir)
+    }
+
+    #[test]
+    fn checkpoint_paths_follows_issuing_route_harness_after_rebind_and_restart() {
+        use crate::backup::with_request_harness;
+        use crate::harness::Harness;
+
+        for (owner, sibling) in [
+            (Harness::Pi, Harness::Opencode),
+            (Harness::Opencode, Harness::Pi),
+        ] {
+            let storage = tempfile::tempdir().unwrap();
+            let (file, _files) = temp_file("target.txt", "original");
+            let session = "019de471-4fdc-762d-9286-624dfad0b5fe";
+            let mut store = fresh_checkpoint_store(storage.path());
+            store.set_storage_dir_for_harness(storage.path().to_path_buf(), owner.clone());
+            let created = with_request_harness(&owner.wire_label(), || {
+                store.create_for_files(session, "proof", vec![file.clone()])
+            })
+            .unwrap();
+            assert!(created.storage_path.unwrap().join("meta.json").is_file());
+
+            // Another harness binds the same root after creation. Configure
+            // selects its namespace, but the existing owner's route is still live.
+            store
+                .namespace_request()
+                .request(storage.path().to_path_buf(), sibling.clone());
+            fs::write(&file, "modified").unwrap();
+            let paths = with_request_harness(&owner.wire_label(), || {
+                store.absolute_file_paths(session, "proof")
+            })
+            .expect("owner checkpoint_paths after sibling bind");
+            assert_eq!(paths, vec![file.clone()]);
+            assert_eq!(
+                fs::read_to_string(&file).unwrap(),
+                "modified",
+                "preview must not restore"
+            );
+            with_request_harness(&owner.wire_label(), || store.restore(session, "proof")).unwrap();
+            assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+
+            assert!(
+                with_request_harness(&sibling.wire_label(), || {
+                    store.absolute_file_paths(session, "proof")
+                })
+                .is_err(),
+                "same session must not cross harness namespaces"
+            );
+            drop(store);
+
+            // A fresh actor after restart has no in-memory checkpoints, and
+            // may have been configured by the sibling harness first.
+            let mut restarted = fresh_checkpoint_store(storage.path());
+            restarted.set_storage_dir_for_harness(storage.path().to_path_buf(), sibling);
+            fs::write(&file, "after restart").unwrap();
+            let paths = with_request_harness(&owner.wire_label(), || {
+                restarted.absolute_file_paths(session, "proof")
+            })
+            .expect("owner checkpoint_paths in fresh actor");
+            assert_eq!(paths, vec![file.clone()]);
+            with_request_harness(&owner.wire_label(), || {
+                restarted.restore_validated(session, "proof", &paths)
+            })
+            .unwrap();
+            assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+            assert!(
+                with_request_harness(&owner.wire_label(), || {
+                    restarted.absolute_file_paths("other-session", "proof")
+                })
+                .is_err(),
+                "different sessions must remain isolated"
+            );
+        }
     }
 
     #[test]
