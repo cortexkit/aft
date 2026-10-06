@@ -113,7 +113,10 @@ pub fn session_prefix() -> String {
 #[macro_export]
 macro_rules! slog_info {
     ($($arg:tt)*) => {
-        log::info!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        $crate::logging::emit_slog_info(
+            module_path!(),
+            format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+        )
     };
 }
 
@@ -123,7 +126,10 @@ macro_rules! slog_info {
 #[macro_export]
 macro_rules! slog_warn {
     ($($arg:tt)*) => {
-        log::warn!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        $crate::logging::emit_slog_warn(
+            module_path!(),
+            format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+        )
     };
 }
 
@@ -133,7 +139,10 @@ macro_rules! slog_warn {
 #[macro_export]
 macro_rules! slog_error {
     ($($arg:tt)*) => {
-        log::error!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        $crate::logging::emit_slog_error(
+            module_path!(),
+            format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+        )
     };
 }
 
@@ -146,7 +155,10 @@ macro_rules! slog_error {
 #[macro_export]
 macro_rules! slog_debug {
     ($($arg:tt)*) => {
-        log::debug!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*))
+        $crate::logging::emit_slog_debug(
+            module_path!(),
+            format!("{}{}", $crate::log_ctx::session_prefix(), format!($($arg)*)),
+        )
     };
 }
 

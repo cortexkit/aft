@@ -486,6 +486,7 @@ pub(super) fn admit(
 }
 
 const SCOPED_PRESET_REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+const SCOPED_PRESET_REFUSAL_STATE_LIMIT: usize = 256;
 
 #[derive(Default)]
 struct RefusalLogState {
@@ -495,6 +496,9 @@ struct RefusalLogState {
 
 static SCOPED_PRESET_REFUSALS: LazyLock<Mutex<HashMap<(String, String), RefusalLogState>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+static SCOPED_PRESET_REFUSAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Admit a provider call with the route identity available for refusal diagnostics.
 pub(super) fn admit_on_route(
@@ -569,6 +573,24 @@ fn log_scoped_preset_refusal_at(
         let Ok(mut refusals) = SCOPED_PRESET_REFUSALS.lock() else {
             return;
         };
+        if !refusals.contains_key(&key) && refusals.len() >= SCOPED_PRESET_REFUSAL_STATE_LIMIT {
+            refusals.retain(|_, state| {
+                state.last_logged_at.is_some_and(|last| {
+                    now.checked_duration_since(last)
+                        .is_some_and(|elapsed| elapsed < SCOPED_PRESET_REFUSAL_WINDOW)
+                })
+            });
+            while refusals.len() >= SCOPED_PRESET_REFUSAL_STATE_LIMIT {
+                let oldest = refusals
+                    .iter()
+                    .min_by_key(|(_, state)| state.last_logged_at)
+                    .map(|(key, _)| key.clone());
+                let Some(oldest) = oldest else {
+                    break;
+                };
+                refusals.remove(&oldest);
+            }
+        }
         let state = refusals.entry(key).or_default();
         let elapsed = state
             .last_logged_at
@@ -1560,7 +1582,8 @@ mod tests {
     }
 
     #[test]
-    fn scoped_presetless_call_logs_once_and_reports_suppressed_refusals() {
+    fn log_capture_scoped_presetless_call_and_suppression() {
+        let _serial = SCOPED_PRESET_REFUSAL_TEST_LOCK.lock().unwrap();
         let call = call("status", json!({}));
         let session = format!("preset-refusal-test-{}", std::process::id());
         let root = std::env::temp_dir().join(format!("preset-refusal-test-{}", std::process::id()));
@@ -1611,6 +1634,31 @@ mod tests {
             lines[1]
         );
         assert!(lines[2].ends_with(&refusal), "{}", lines[2]);
+    }
+
+    #[test]
+    fn scoped_preset_refusal_state_stays_bounded_for_distinct_sessions() {
+        let _serial = SCOPED_PRESET_REFUSAL_TEST_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("preset-refusal-cap-{}", std::process::id()));
+        let now = Instant::now();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for index in 0..(SCOPED_PRESET_REFUSAL_STATE_LIMIT + 100) {
+                log_scoped_preset_refusal_at(
+                    &format!("preset-refusal-cap-{index}"),
+                    &root,
+                    42,
+                    "status",
+                    now,
+                );
+            }
+        });
+        assert_eq!(lines.len(), SCOPED_PRESET_REFUSAL_STATE_LIMIT + 100);
+        let refusals = SCOPED_PRESET_REFUSALS.lock().unwrap();
+        assert!(
+            refusals.len() <= SCOPED_PRESET_REFUSAL_STATE_LIMIT,
+            "refusal log state grew to {} entries",
+            refusals.len()
+        );
     }
 
     #[test]

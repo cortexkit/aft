@@ -12803,7 +12803,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn spawned_bash_task_logs_child_pid_and_truncated_command() {
+    fn log_capture_spawned_bash_pid_and_truncated_command() {
         let storage = tempfile::tempdir().expect("storage dir");
         let root = storage.path().join("project");
         fs::create_dir_all(&root).unwrap();
