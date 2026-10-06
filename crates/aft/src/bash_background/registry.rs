@@ -5151,8 +5151,17 @@ impl BgTaskRegistry {
     }
 
     fn cleanup_finished_at(&self, older_than: Duration, now: Instant) {
+        self.cleanup_finished_at_with(older_than, now, delete_task_bundle);
+    }
+
+    fn cleanup_finished_at_with(
+        &self,
+        older_than: Duration,
+        now: Instant,
+        delete_bundle: impl Fn(&TaskPaths) -> std::io::Result<()>,
+    ) {
         let cutoff = now.checked_sub(older_than);
-        let removable_paths: Vec<(String, TaskPaths)> =
+        let removable_tasks: Vec<(String, Arc<BgTask>)> =
             if let Ok(mut tasks) = self.inner.tasks.lock() {
                 let removable = tasks
                     .iter()
@@ -5181,25 +5190,28 @@ impl BgTaskRegistry {
 
                 removable
                     .into_iter()
-                    .filter_map(|task_id| {
-                        tasks
-                            .remove(&task_id)
-                            .map(|task| (task_id, task.paths.clone()))
-                    })
+                    .filter_map(|task_id| tasks.remove(&task_id).map(|task| (task_id, task)))
                     .collect()
             } else {
                 Vec::new()
             };
-        self.prune_session_harnesses();
-
-        for (task_id, paths) in removable_paths {
-            match delete_task_bundle(&paths) {
+        for (task_id, task) in removable_tasks {
+            match delete_bundle(&task.paths) {
                 Ok(()) => log::debug!("deleted persisted background task bundle {task_id}"),
-                Err(error) => crate::slog_warn!(
-                    "failed to delete persisted background task bundle {task_id}: {error}"
-                ),
+                Err(error) => match self.inner.tasks.lock() {
+                    Ok(mut tasks) => {
+                        tasks.entry(task_id.clone()).or_insert(task);
+                        crate::slog_warn!(
+                            "failed to delete persisted background task bundle {task_id}; retained for a later cleanup retry: {error}"
+                        );
+                    }
+                    Err(lock_error) => crate::slog_warn!(
+                        "failed to delete persisted background task bundle {task_id}: {error}; registry lock also failed, so it could not be retained for retry: {lock_error}"
+                    ),
+                },
             }
         }
+        self.prune_session_harnesses();
     }
 
     pub fn drain_completions(&self) -> Vec<BgCompletion> {
@@ -11008,44 +11020,29 @@ mod tests {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let mut task_ids = Vec::new();
+        let mut task_jsons = Vec::new();
         for _ in 0..2 {
-            let task_id = registry
-                .spawn(
-                    SpawnPlan::Unsandboxed,
-                    QUICK_SUCCESS_COMMAND,
-                    "session-retention".to_string(),
-                    dir.path().to_path_buf(),
-                    HashMap::new(),
-                    crate::bash_background::HardKill::After(Duration::from_secs(30)),
-                    dir.path().to_path_buf(),
-                    10,
-                    true,
-                    false,
-                    Some(dir.path().to_path_buf()),
-                )
-                .unwrap();
-            registry
-                .kill_with_status(&task_id, "session-retention", BgTaskStatus::Killed)
-                .unwrap();
+            let (task_id, task) = insert_terminal_piped_task(
+                &registry,
+                &dir,
+                QUICK_SUCCESS_COMMAND,
+                "finished output\n",
+                "",
+                false,
+            );
+            let mut state = task.state.lock().unwrap();
+            state.metadata.completion_delivered = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+            task_jsons.push(task.paths.json.clone());
             task_ids.push(task_id);
         }
-        let completions = registry.drain_completions_for_session(Some("session-retention"));
-        assert_eq!(completions.len(), 2);
-        assert_eq!(
-            registry.ack_completions_for_session(Some("session-retention"), &task_ids,),
-            task_ids
-        );
 
         let clock_origin = Instant::now();
         let two_hours_ago = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
         let past_retention = clock_origin;
         let cleanup_now = clock_origin + Duration::from_secs(26 * 60 * 60 + 2);
-        let mut task_dirs = Vec::new();
         for (task_id, terminal_at) in task_ids.iter().zip([two_hours_ago, past_retention]) {
-            let task = registry
-                .task_for_session(task_id, "session-retention")
-                .unwrap();
-            task_dirs.push(task.paths.dir.clone());
+            let task = registry.task_for_session(task_id, "session").unwrap();
             *task.terminal_at.lock().unwrap() = Some(terminal_at);
         }
 
@@ -11062,12 +11059,81 @@ mod tests {
             "task past 24 hours must be removed"
         );
         assert!(
-            task_dirs[0].exists(),
+            task_jsons[0].exists(),
             "2-hour task files must remain available"
         );
-        assert!(!task_dirs[1].exists(), "expired task files must be deleted");
+        assert!(
+            !task_jsons[1].exists(),
+            "expired task files must be deleted"
+        );
         drop(tasks);
         assert_eq!(registry.estimated_memory().counts["tasks"], 1);
+    }
+
+    #[test]
+    fn cleanup_finished_retries_a_transient_bundle_delete_failure() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let (task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &storage,
+            "true",
+            "completed output\n",
+            "",
+            false,
+        );
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.completion_delivered = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        let task_json = task.paths.json.clone();
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+        let cleanup_now = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
+        let delete_attempts = AtomicUsize::new(0);
+        let delete_with_one_transient_failure = |paths: &TaskPaths| {
+            if delete_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                fs::remove_file(&paths.stdout).unwrap();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected transient bundle deletion failure",
+                ))
+            } else {
+                delete_task_bundle(paths)
+            }
+        };
+
+        registry.cleanup_finished_at_with(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            cleanup_now,
+            delete_with_one_transient_failure,
+        );
+
+        assert!(
+            registry.task_for_session(&task_id, "session").is_some(),
+            "failed deletion must retain the task for a later retry"
+        );
+        assert!(
+            task_json.exists(),
+            "a failed deletion must leave the bundle in place"
+        );
+
+        registry.cleanup_finished_at_with(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            cleanup_now,
+            delete_with_one_transient_failure,
+        );
+
+        assert_eq!(delete_attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(
+            registry.task_for_session(&task_id, "session").is_none(),
+            "successful retry must release the in-memory task"
+        );
+        assert!(
+            !task_json.exists(),
+            "successful retry must delete the bundle"
+        );
     }
 
     #[test]

@@ -1421,6 +1421,13 @@ pub fn delete_resolved_task(task: &ResolvedTask) -> io::Result<()> {
 }
 
 fn remove_directory_task(task: &ResolvedTask) -> io::Result<()> {
+    remove_directory_task_with_io_cleanup(task, remove_tree_contents)
+}
+
+fn remove_directory_task_with_io_cleanup(
+    task: &ResolvedTask,
+    remove_io_contents: impl FnOnce(&PinnedDir) -> io::Result<()>,
+) -> io::Result<()> {
     let current = task
         .dirs
         .session
@@ -1433,10 +1440,16 @@ fn remove_directory_task(task: &ResolvedTask) -> io::Result<()> {
     }
     #[cfg(unix)]
     let tombstone = rename_task_to_tombstone(task)?;
-    for name in task.dirs.control.list_names()? {
+    // Windows may refuse to delete an output file while the killed process
+    // still has it open. Remove the child-writable IO tree before control
+    // metadata so a partial failure leaves the task resolvable for the next
+    // cleanup pass. Keep metadata until every other control file is gone too.
+    remove_io_contents(&task.dirs.io)?;
+    let mut control_names = task.dirs.control.list_names()?;
+    control_names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));
+    for name in control_names {
         task.dirs.control.remove_file(&name)?;
     }
-    remove_tree_contents(&task.dirs.io)?;
     #[cfg(unix)]
     {
         remove_dir_entry(&task.dirs.task, IO_DIR)?;
@@ -2562,6 +2575,35 @@ mod tests {
 
         // The victim's control content is untouched because the swap never happened.
         assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
+    }
+
+    #[test]
+    fn directory_cleanup_preserves_metadata_when_io_removal_fails() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, metadata) = counted_task(storage.path());
+        write_task_at(&task, &metadata).unwrap();
+        fs::write(&task.paths.stdout, b"output held by a child").unwrap();
+
+        let error = remove_directory_task_with_io_cleanup(&task, |io_dir| {
+            io_dir.remove_file(OsStr::new(TaskArtifact::Stdout.file_name()))?;
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected failure after partial IO cleanup",
+            ))
+        })
+        .expect_err("an injected IO cleanup failure must abort bundle deletion");
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            task.dirs
+                .control
+                .list_names()
+                .unwrap()
+                .iter()
+                .any(|name| name == OsStr::new(METADATA_FILE)),
+            "task metadata must remain available so a later sweep can resolve and retry deletion"
+        );
+        assert_eq!(read_task_at(&task).unwrap().task_id, task.paths.task_id);
     }
 
     #[test]
