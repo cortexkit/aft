@@ -280,12 +280,12 @@ export function bashToolDescription(
   const tasks = backgroundOn
     ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
-  const timeoutRules =
-    " `timeout` starts after process spawn, not setup. Expiry sends SIGTERM to the Unix process group, then SIGKILL after up to 2 seconds (Windows uses taskkill /T /F) and reports exit 124; group-escaping processes survive, and macOS has no tree kill.";
   const outputRules = backgroundOn
-    ? " Output files are deleted once the task has finished for 24 hours and its completion has been delivered; copy needed evidence into your report or a shared file. With project-root restrictions, only the starting session gets an ownership exception for output outside the project; other sessions may be refused while files exist."
+    ? " Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report."
     : "";
-  return `Execute shell commands.${compression}${tasks}${timeoutRules}${outputRules}
+  const timeoutRules =
+    " `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.";
+  return `Execute shell commands.${compression}${tasks}${outputRules}${timeoutRules}
 
 DO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
 }
@@ -763,7 +763,7 @@ export function createBashStatusTool(ctx: PluginContext): ToolDefinition {
     ? " To wait, use bash_watch."
     : "";
   return {
-    description: `Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. Output files are deleted once the task has finished for 24 hours and its completion has been delivered; copy needed evidence into your report or a shared file. With project-root restrictions, only the starting session gets an ownership exception for output outside the project; other sessions may be refused while files exist.${waitSteer}`,
+    description: `Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion.${waitSteer}`,
     args: {
       taskId: z
         .string()
