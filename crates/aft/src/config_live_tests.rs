@@ -865,6 +865,48 @@ fn a_forced_reattach_watches_the_same_directory_again() {
     assert_eq!(unwatched, vec![dir]);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn watcher_config_user_dropped_rescans_without_creating_streams() {
+    use notify::{event::Flag, Event, EventKind, RecursiveMode};
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    // Fresh worktrees have no .cortexkit directory. The config fallback watches
+    // the root until that directory appears, without recursive exclusions.
+    let dir = root.join(".cortexkit");
+    let counters = crate::context::watcher_counters_for_root(&root);
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut watcher = crate::watcher_backend::DirectoryWatcher::new(tx, Arc::clone(&counters));
+    let mut attachment = DirAttachment::new(dir.clone());
+    let mut attach = |attachment: &mut DirAttachment| {
+        attachment.attach(&mut |op| match op {
+            WatchOp::Watch(path) => watcher
+                .watch(path, RecursiveMode::NonRecursive)
+                .map_err(|e| e.to_string()),
+            WatchOp::Unwatch(path) => watcher.unwatch(path).map_err(|e| e.to_string()),
+        })
+    };
+    assert!(!attach(&mut attachment)); // attached to root, not yet to config dir
+    let initial = counters.snapshot().fsevents_stream_creations_total;
+    assert_eq!(initial, 1, "the counter must reach FSEventStreamCreate");
+    let rescans = std::cell::Cell::new(0);
+    let rescan = || rescans.set(rescans.get() + 1);
+    for _ in 0..8 {
+        let event = Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .set_info("rescan: user dropped")
+            .add_path(root.clone());
+        handle_config_watch_event(&dir, &event, &mut attachment, &rescan);
+        attach(&mut attachment);
+    }
+    assert_eq!(
+        counters.snapshot().fsevents_stream_creations_total - initial,
+        0,
+        "user_dropped must not reattach the config fallback stream"
+    );
+    assert_eq!(rescans.get(), 8, "every drop must request a content rescan");
+}
+
 #[test]
 fn publishing_inside_update_config_panics_instead_of_deadlocking() {
     let ctx = Arc::new(AppContext::new(

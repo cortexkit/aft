@@ -12,6 +12,8 @@ mod inotify;
 mod windows;
 
 #[cfg(target_os = "macos")]
+pub(crate) use fsevents::DirectoryWatcher;
+#[cfg(target_os = "macos")]
 pub(crate) use fsevents::ProjectWatcher;
 #[cfg(target_os = "linux")]
 pub(crate) use inotify::ProjectWatcher;

@@ -316,13 +316,16 @@ pub fn sync_config_watches(ctx: &AppContext) {
         .then_some(sources.user.path.clone())
         .flatten();
     if watches.user.as_ref().map(ConfigFileWatch::file) != wanted_user.as_deref() {
-        watches.user = wanted_user.map(|path| ConfigFileWatch::start(path, state.signal()));
+        watches.user = wanted_user.map(|path| {
+            ConfigFileWatch::start_for_root(path, state.signal(), ctx.watcher_counters())
+        });
     }
 
     let wanted_project = (!covered).then_some(sources.project.path.clone()).flatten();
     if watches.project_fallback.as_ref().map(ConfigFileWatch::file) != wanted_project.as_deref() {
-        watches.project_fallback =
-            wanted_project.map(|path| ConfigFileWatch::start(path, state.signal()));
+        watches.project_fallback = wanted_project.map(|path| {
+            ConfigFileWatch::start_for_root(path, state.signal(), ctx.watcher_counters())
+        });
     }
 }
 
@@ -985,12 +988,31 @@ impl ConfigFileWatch {
 
     /// Watch `file` and call `on_change` for each relevant event.
     pub fn start_with(file: PathBuf, on_change: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let counters = crate::context::watcher_counters_for_root(file.parent().unwrap_or(&file));
+        Self::start_with_counters(file, on_change, counters)
+    }
+
+    fn start_for_root(
+        file: PathBuf,
+        signal: Arc<ConfigReloadSignal>,
+        counters: Arc<crate::context::WatcherCounters>,
+    ) -> Self {
+        Self::start_with_counters(file, Arc::new(move || signal.request()), counters)
+    }
+
+    fn start_with_counters(
+        file: PathBuf,
+        on_change: Arc<dyn Fn() + Send + Sync>,
+        counters: Arc<crate::context::WatcherCounters>,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_file = file.clone();
         let spawned = thread::Builder::new()
             .name("aft-config-watch".to_string())
-            .spawn(move || run_config_file_watch(thread_file, on_change, thread_shutdown));
+            .spawn(move || {
+                run_config_file_watch(thread_file, on_change, thread_shutdown, counters)
+            });
         if let Err(error) = spawned {
             crate::slog_warn!(
                 "config watch for {} could not start: {}",
@@ -1018,13 +1040,24 @@ fn run_config_file_watch(
     file: PathBuf,
     on_change: Arc<dyn Fn() + Send + Sync>,
     shutdown: Arc<AtomicBool>,
+    counters: Arc<crate::context::WatcherCounters>,
 ) {
-    use notify::{RecursiveMode, Watcher};
+    use notify::RecursiveMode;
+    #[cfg(not(target_os = "macos"))]
+    use notify::Watcher;
+
+    #[cfg(target_os = "macos")]
+    type ConfigDirectoryWatcher = crate::watcher_backend::DirectoryWatcher;
+    #[cfg(not(target_os = "macos"))]
+    type ConfigDirectoryWatcher = notify::RecommendedWatcher;
 
     let Some(dir) = file.parent().map(Path::to_path_buf) else {
         return;
     };
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    #[cfg(target_os = "macos")]
+    let mut watcher = ConfigDirectoryWatcher::new(tx, counters);
+    #[cfg(not(target_os = "macos"))]
     let mut watcher = match notify::recommended_watcher(tx) {
         Ok(watcher) => watcher,
         Err(error) => {
@@ -1032,8 +1065,10 @@ fn run_config_file_watch(
             return;
         }
     };
+    #[cfg(not(target_os = "macos"))]
+    let _ = counters;
     let mut attachment = DirAttachment::new(dir.clone());
-    let attach = |watcher: &mut notify::RecommendedWatcher, attachment: &mut DirAttachment| {
+    let attach = |watcher: &mut ConfigDirectoryWatcher, attachment: &mut DirAttachment| {
         attachment.attach(&mut |op| match op {
             WatchOp::Watch(path) => watcher
                 .watch(path, RecursiveMode::NonRecursive)
@@ -1049,31 +1084,7 @@ fn run_config_file_watch(
     while !shutdown.load(Ordering::Acquire) {
         match rx.recv_timeout(CONFIG_WATCH_POLL) {
             Ok(Ok(event)) => {
-                // Backends may report the resolved spelling of the directory
-                // (macOS `/private/var` for `/var`), so compare both.
-                let resolved_dir = std::fs::canonicalize(&dir).ok();
-                let is_dir = |candidate: &Path| {
-                    candidate == dir.as_path() || resolved_dir.as_deref() == Some(candidate)
-                };
-                let relevant = event.paths.is_empty()
-                    || event.paths.iter().any(|path| {
-                        (path.parent().is_some_and(is_dir) && is_config_file_name(path))
-                            || is_dir(path)
-                    });
-                // An event about the watched directory itself (removed,
-                // renamed, recreated) re-attaches the watch.
-                let watched = attachment.watched().map(Path::to_path_buf);
-                if let Some(watched) = watched {
-                    let resolved_watched = std::fs::canonicalize(&watched).ok();
-                    if event.paths.iter().any(|path| {
-                        *path == watched || resolved_watched.as_deref() == Some(path.as_path())
-                    }) {
-                        attachment.force_reattach();
-                    }
-                }
-                if relevant {
-                    on_change();
-                }
+                handle_config_watch_event(&dir, &event, &mut attachment, on_change.as_ref());
             }
             Ok(Err(_)) => {
                 attachment.force_reattach();
@@ -1088,6 +1099,47 @@ fn run_config_file_watch(
         if attach(&mut watcher, &mut attachment) {
             on_change();
         }
+    }
+}
+
+fn handle_config_watch_event(
+    dir: &Path,
+    event: &notify::Event,
+    attachment: &mut DirAttachment,
+    on_change: &dyn Fn(),
+) {
+    // Backends may report the resolved spelling of the directory (macOS
+    // `/private/var` for `/var`), so compare both.
+    let resolved_dir = std::fs::canonicalize(dir).ok();
+    let is_dir = |candidate: &Path| candidate == dir || resolved_dir.as_deref() == Some(candidate);
+    let relevant = event.need_rescan()
+        || event.paths.is_empty()
+        || event.paths.iter().any(|path| {
+            (path.parent().is_some_and(is_dir) && is_config_file_name(path)) || is_dir(path)
+        });
+    // FSEvents drop sentinels name the watched root even when it has not
+    // changed. Re-reading our state is required; restarting the stream is not.
+    // Only directory lifetime events need the inode-reuse safeguard. Identity
+    // checks on every tick still catch replacements after lost events.
+    let directory_lifetime_changed = !event.need_rescan()
+        && matches!(
+            event.kind,
+            notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+        );
+    if let Some(watched) = attachment.watched().filter(|_| directory_lifetime_changed) {
+        let resolved_watched = std::fs::canonicalize(watched).ok();
+        if event
+            .paths
+            .iter()
+            .any(|path| path == watched || resolved_watched.as_deref() == Some(path.as_path()))
+        {
+            attachment.force_reattach();
+        }
+    }
+    if relevant {
+        on_change();
     }
 }
 
@@ -1124,7 +1176,7 @@ impl DirAttachment {
     }
 
     /// Make the next [`Self::attach`] watch again even if the directory's
-    /// identity looks unchanged. Used when an event names the watched
+    /// identity looks unchanged. Used when a lifetime event names the watched
     /// directory itself or the backend reports an error: a directory deleted
     /// and recreated can get the same inode back (ext4 reuses them), which
     /// the identity check alone would miss.

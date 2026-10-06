@@ -12,7 +12,7 @@ use fsevent_sys::core_foundation as cf;
 use notify::event::{
     CreateKind, DataChange, Flag, MetadataKind, ModifyKind, RemoveKind, RenameMode,
 };
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode};
 
 use crate::watcher_filter::{
     derive_watcher_exclusion_plan, watcher_exclusion_paths, SharedGitignore,
@@ -62,6 +62,8 @@ fn write_during_stream_handoff_for_test(root: &Path) {
 pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    #[cfg(test)]
+    raw_sender: mpsc::Sender<notify::Result<Event>>,
 }
 
 impl ProjectWatcher {
@@ -83,6 +85,8 @@ impl ProjectWatcher {
         super::log_exclusions(&root, &exclusions, observed_generation);
 
         let (backend_tx, backend_rx) = mpsc::channel();
+        #[cfg(test)]
+        let stream_sender_for_test = backend_tx.clone();
         // Capture the journal cursor before starting the first stream. If no
         // callback has run by the time exclusions change, this still precedes
         // every event that might be waiting in the old stream's latency window.
@@ -101,12 +105,15 @@ impl ProjectWatcher {
             exclusion_paths,
             watcher_exclusion_paths(&plan.dropped),
         );
-        let mut external_watcher = notify::recommended_watcher(backend_tx)?;
-        for path in extra_watch_paths {
-            if path.exists() {
-                external_watcher.watch(&path, RecursiveMode::NonRecursive)?;
-            }
-        }
+        // Auxiliary watches use the same stream owner as the recursive watch:
+        // notify restarts its entire stream on each watch() and purges the
+        // device journal when stopping it. Neither is needed for these paths.
+        let extra_watch_paths = extra_watch_paths
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        let mut external_watcher = DirectoryWatcher::new(backend_tx, Arc::clone(&counters));
+        external_watcher.watch_paths(&extra_watch_paths)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
@@ -200,6 +207,8 @@ impl ProjectWatcher {
         Ok(Self {
             shutdown,
             join: Some(join),
+            #[cfg(test)]
+            raw_sender: stream_sender_for_test,
         })
     }
 }
@@ -210,6 +219,58 @@ impl Drop for ProjectWatcher {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
+    }
+}
+
+/// Non-recursive path watches share one native stream. FSEvents itself is
+/// recursive; the callback admits only the path and its immediate children.
+pub(crate) struct DirectoryWatcher {
+    stream: Option<FsEventsStream>,
+    sender: mpsc::Sender<notify::Result<Event>>,
+    counters: Arc<crate::context::WatcherCounters>,
+}
+
+impl DirectoryWatcher {
+    pub(crate) fn new(
+        sender: mpsc::Sender<notify::Result<Event>>,
+        counters: Arc<crate::context::WatcherCounters>,
+    ) -> Self {
+        Self {
+            stream: None,
+            sender,
+            counters,
+        }
+    }
+
+    fn watch_paths(&mut self, paths: &[PathBuf]) -> notify::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let paths = paths
+            .iter()
+            .map(std::fs::canonicalize)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(notify::Error::io)?;
+        self.stream = Some(FsEventsStream::start_paths(
+            &paths,
+            &[],
+            self.sender.clone(),
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
+            Some(paths.clone()),
+            Arc::clone(&self.counters),
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        debug_assert_eq!(mode, RecursiveMode::NonRecursive);
+        self.watch_paths(&[path.to_path_buf()])
+    }
+
+    pub(crate) fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+        self.stream.take();
+        Ok(())
     }
 }
 
@@ -227,10 +288,31 @@ impl FsEventsStream {
         since_when: fs::FSEventStreamEventId,
         last_delivered_id: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
-        let watched_paths = create_cf_path_array(std::slice::from_ref(&root.to_path_buf()))?;
+        Self::start_paths(
+            &[root.to_path_buf()],
+            exclusions,
+            sender,
+            since_when,
+            last_delivered_id,
+            None,
+            crate::context::watcher_counters_for_root(root),
+        )
+    }
+
+    fn start_paths(
+        paths: &[PathBuf],
+        exclusions: &[PathBuf],
+        sender: mpsc::Sender<notify::Result<Event>>,
+        since_when: fs::FSEventStreamEventId,
+        last_delivered_id: Arc<AtomicU64>,
+        nonrecursive_paths: Option<Vec<PathBuf>>,
+        counters: Arc<crate::context::WatcherCounters>,
+    ) -> notify::Result<Self> {
+        let watched_paths = create_cf_path_array(paths)?;
         let context_info = Box::into_raw(Box::new(CallbackContext {
             sender: sender.clone(),
             last_delivered_id,
+            nonrecursive_paths,
             #[cfg(test)]
             replay_stream: since_when != fs::kFSEventStreamEventIdSinceNow,
         }));
@@ -261,6 +343,9 @@ impl FsEventsStream {
             }
             return Err(notify::Error::generic("FSEventStreamCreate returned null"));
         }
+        // Count successful native allocations, not matcher publications or
+        // rescans. Auxiliary and config streams are attributed to their root too.
+        counters.note_fsevents_stream_creation();
 
         let exclusions_set = if exclusions.is_empty() {
             true
@@ -362,6 +447,7 @@ impl Drop for FsEventsStream {
 struct CallbackContext {
     sender: mpsc::Sender<notify::Result<Event>>,
     last_delivered_id: Arc<AtomicU64>,
+    nonrecursive_paths: Option<Vec<PathBuf>>,
     #[cfg(test)]
     replay_stream: bool,
 }
@@ -401,6 +487,17 @@ extern "C" fn callback(
             }
             let flags = *event_flags.add(index);
             for event in translate_event(flags, &path) {
+                // A drop can hide a config edit even when its sentinel path is
+                // outside the non-recursive scope. Never filter rescan controls.
+                if !event.need_rescan()
+                    && context.nonrecursive_paths.as_ref().is_some_and(|roots| {
+                        !roots
+                            .iter()
+                            .any(|root| &path == root || path.parent() == Some(root.as_path()))
+                    })
+                {
+                    continue;
+                }
                 if context.sender.send(Ok(event)).is_err() {
                     return;
                 }
@@ -735,6 +832,205 @@ mod tests {
         let wrapped = translate_event(fs::kFSEventStreamEventFlagEventIdsWrapped, path);
         assert!(wrapped[0].need_rescan());
         assert!(translate_event(fs::kFSEventStreamEventFlagHistoryDone, path).is_empty());
+    }
+
+    #[test]
+    fn watcher_user_dropped_rescans_keep_recursive_stream_with_unchanged_exclusions() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        let generation = Arc::new(AtomicU64::new(1));
+        let counters = crate::context::watcher_counters_for_root(&root);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let backend_matcher = Arc::clone(&matcher);
+        let backend_generation = Arc::clone(&generation);
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        let filter_generation = Arc::clone(&generation);
+        let join = thread::spawn(move || {
+            run_watcher_thread(
+                config,
+                Vec::new(),
+                matcher,
+                filter_generation,
+                dispatch_tx,
+                thread_shutdown,
+                move |root, extra, tx| {
+                    let watcher = ProjectWatcher::create(
+                        root,
+                        extra,
+                        tx,
+                        backend_matcher,
+                        backend_generation,
+                    )?;
+                    raw_tx.send(watcher.raw_sender.clone()).unwrap();
+                    Ok::<_, notify::Error>(watcher)
+                },
+            );
+        });
+        let sender = raw_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let initial = counters.snapshot().fsevents_stream_creations_total;
+        assert_eq!(initial, 1);
+        // Inject native callback flags into the live backend/filter pipeline.
+        // Each acknowledged rescan republishes an unchanged matcher, as a real
+        // overflow drain does, exercising the replacement-stream decision too.
+        let mut context = CallbackContext {
+            sender,
+            last_delivered_id: Arc::new(AtomicU64::new(0)),
+            nonrecursive_paths: None,
+            replay_stream: false,
+        };
+        let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes()).unwrap();
+        let paths = [path.as_ptr()];
+        for index in 0..8 {
+            let flags =
+                fs::kFSEventStreamEventFlagUserDropped | fs::kFSEventStreamEventFlagMustScanSubDirs;
+            callback(
+                ptr::null_mut(),
+                (&mut context as *mut CallbackContext).cast(),
+                1,
+                paths.as_ptr().cast_mut().cast(),
+                &flags,
+                &index,
+            );
+            assert_eq!(
+                dispatch_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                WatcherDispatchEvent::RescanRequired(
+                    crate::watcher_filter::RescanReason::UserDropped
+                )
+            );
+            counters.begin_rescan(crate::watcher_filter::RescanReason::UserDropped);
+            counters.finish_rescan(0, None);
+            let published = generation.fetch_add(1, Ordering::AcqRel) + 1;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while counters.backend_exclusions().matcher_generation != published {
+                assert!(
+                    Instant::now() < deadline,
+                    "backend did not observe rescan matcher"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(counters.snapshot().overflows_total, 8);
+        assert_eq!(counters.snapshot().rescans_user_dropped_total, 8);
+        assert_eq!(
+            counters.snapshot().fsevents_stream_creations_total - initial,
+            0
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_auxiliary_stream_filters_children_but_preserves_drop_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (sender, rx) = mpsc::channel();
+        let mut context = CallbackContext {
+            sender,
+            last_delivered_id: Arc::new(AtomicU64::new(0)),
+            nonrecursive_paths: Some(vec![root.clone()]),
+            replay_stream: false,
+        };
+        let paths = [
+            root.join("aft.jsonc"),
+            root.join("build/nested.js"),
+            root.join("build/deep"),
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            let paths = [path.as_ptr()];
+            let flags = if index == 2 {
+                fs::kFSEventStreamEventFlagUserDropped
+            } else {
+                fs::kFSEventStreamEventFlagItemModified
+            };
+            callback(
+                ptr::null_mut(),
+                (&mut context as *mut CallbackContext).cast(),
+                1,
+                paths.as_ptr().cast_mut().cast(),
+                &flags,
+                &(index as u64),
+            );
+        }
+        let events = rx.try_iter().map(Result::unwrap).collect::<Vec<_>>();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].paths, vec![root.join("aft.jsonc")]);
+        assert!(events[1].need_rescan());
+    }
+
+    #[test]
+    #[ignore = "measures live FSEvents exclusion coverage"]
+    fn watcher_unexcluded_auxiliary_stream_receives_excluded_build_burst() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir_all(target.join("debug")).unwrap();
+        let (excluded_tx, excluded_rx) = mpsc::channel();
+        let (unexcluded_tx, unexcluded_rx) = mpsc::channel();
+        let cursor = Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() }));
+        let excluded = FsEventsStream::start(
+            &root,
+            &[target.clone()],
+            excluded_tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            Arc::clone(&cursor),
+        )
+        .unwrap();
+        let unexcluded = FsEventsStream::start(
+            &root,
+            &[],
+            unexcluded_tx,
+            fs::kFSEventStreamEventIdSinceNow,
+            cursor,
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        for index in 0..200 {
+            std::fs::write(target.join(format!("debug/artifact-{index}.o")), b"object").unwrap();
+        }
+        std::fs::write(root.join("kept.rs"), b"fn kept() {}\n").unwrap();
+        thread::sleep(Duration::from_secs(1));
+        let excluded_events = excluded_rx
+            .try_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let unexcluded_events = unexcluded_rx
+            .try_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let build_count = |events: &[Event]| {
+            events
+                .iter()
+                .flat_map(|event| &event.paths)
+                .filter(|path| path.starts_with(&target))
+                .count()
+        };
+        let kept_count = |events: &[Event]| {
+            events
+                .iter()
+                .filter(|event| event.paths.contains(&root.join("kept.rs")))
+                .count()
+        };
+        eprintln!(
+            "target/debug burst: excluded={} unexcluded={} excluded_kept={} unexcluded_kept={}",
+            build_count(&excluded_events),
+            build_count(&unexcluded_events),
+            kept_count(&excluded_events),
+            kept_count(&unexcluded_events)
+        );
+        assert_eq!(build_count(&excluded_events), 0);
+        assert!(build_count(&unexcluded_events) >= 200);
+        assert!(excluded_events
+            .iter()
+            .any(|event| event.paths.contains(&root.join("kept.rs"))));
+        assert!(unexcluded_events
+            .iter()
+            .any(|event| event.paths.contains(&root.join("kept.rs"))));
+        drop((excluded, unexcluded));
     }
 
     /// The backend half of a matcher loaded after the watcher started: the

@@ -3810,6 +3810,7 @@ mod tests {
         let (_dir, root) = test_root("health-snapshot-age-coverage");
         let ctx = test_ctx();
         let watcher = ctx.watcher_counters();
+        watcher.note_fsevents_stream_creation();
         watcher.note_raw_event();
         watcher.note_raw_event();
         watcher.note_invalidating_event();
@@ -3849,6 +3850,7 @@ mod tests {
         assert_eq!(watcher["invalidating_events_total"].as_u64(), Some(1));
         assert_eq!(watcher["paths_after_gitignore_total"].as_u64(), Some(7));
         assert_eq!(watcher["paths_dispatched_total"].as_u64(), Some(6));
+        assert_eq!(watcher["fsevents_stream_creations_total"].as_u64(), Some(1));
         assert_eq!(watcher["overflows_total"].as_u64(), Some(1));
         assert_eq!(watcher["overflows_during_rescan"].as_u64(), Some(0));
         assert_eq!(

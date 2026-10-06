@@ -908,6 +908,9 @@ impl Default for WatcherBackendExclusions {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WatcherCountersSnapshot {
+    /// Successful native stream allocations over this root's process lifetime,
+    /// including its auxiliary paths and config-file fallback watch.
+    pub(crate) fsevents_stream_creations_total: u64,
     pub(crate) raw_events_total: u64,
     pub(crate) raw_events_since_last_rescan: u64,
     pub(crate) invalidating_events_total: u64,
@@ -938,6 +941,7 @@ const WATCHER_RESCAN_RERUN: u8 = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
+    fsevents_stream_creations_total: AtomicU64,
     raw_events_total: AtomicU64,
     raw_events_since_last_rescan: AtomicU64,
     invalidating_events_total: AtomicU64,
@@ -970,6 +974,12 @@ pub(crate) struct WatcherRescanInterval {
 }
 
 impl WatcherCounters {
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn note_fsevents_stream_creation(&self) {
+        self.fsevents_stream_creations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_raw_event(&self) {
         self.raw_events_total.fetch_add(1, Ordering::Relaxed);
         self.raw_events_since_last_rescan
@@ -1187,6 +1197,9 @@ impl WatcherCounters {
     pub(crate) fn snapshot(&self) -> WatcherCountersSnapshot {
         let last_rescan_at_ms = self.last_rescan_at_ms.load(Ordering::Acquire);
         WatcherCountersSnapshot {
+            fsevents_stream_creations_total: self
+                .fsevents_stream_creations_total
+                .load(Ordering::Relaxed),
             raw_events_total: self.raw_events_total.load(Ordering::Relaxed),
             raw_events_since_last_rescan: self.raw_events_since_last_rescan.load(Ordering::Relaxed),
             invalidating_events_total: self.invalidating_events_total.load(Ordering::Relaxed),
