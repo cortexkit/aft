@@ -466,11 +466,23 @@ mod tests {
     #[test]
     fn unknown_total_and_unmeasured_rate_are_null() {
         let registry = Arc::new(Registry::default());
-        let _job = registry.register("/repo", "walk", false, false);
+        let job = registry.register("/repo", "walk", false, false);
         let value = serde_json::to_value(registry.snapshot(0, Instant::now())).unwrap();
         assert!(value["running"][0]["total"].is_null());
         assert!(value["running"][0]["rate_per_minute"].is_null());
         assert!(value["running"][0]["eta_seconds"].is_null());
+        let now = lock(&job.entry).started;
+        lock(&job.entry).advance(20, now + Duration::from_secs(60));
+        let row = registry
+            .snapshot(0, now + Duration::from_secs(60))
+            .running
+            .remove(0);
+        assert_eq!(row.rate_per_minute, Some(20.0));
+        assert_eq!(row.total, None);
+        assert_eq!(
+            row.eta_seconds, None,
+            "a rate alone does not determine an ETA"
+        );
     }
 
     #[test]
@@ -479,6 +491,26 @@ mod tests {
         let job = registry.register("/repo", "build", false, false);
         assert_eq!(registry.snapshot(0, Instant::now()).running.len(), 1);
         drop(job);
+        assert!(registry.snapshot(0, Instant::now()).running.is_empty());
+        let permit = registry.register("unknown", "unclassified", false, true);
+        let detail = registry.register("/repo", "build", false, false);
+        let snapshot = registry.snapshot(0, Instant::now());
+        assert_eq!(
+            snapshot.running.len(),
+            1,
+            "admission must not duplicate detailed work"
+        );
+        assert_eq!(snapshot.running[0].root, "/repo");
+        drop(detail);
+        let snapshot = registry.snapshot(0, Instant::now());
+        assert_eq!(
+            snapshot.running.len(),
+            1,
+            "post-build persistence still holds the permit"
+        );
+        assert_eq!(snapshot.running[0].phase, "finishing");
+        assert_eq!(snapshot.running[0].total, None);
+        drop(permit);
         assert!(registry.snapshot(0, Instant::now()).running.is_empty());
     }
 

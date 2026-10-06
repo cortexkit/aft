@@ -360,11 +360,19 @@ pub(crate) fn schedule(
                         }
                         token.wait_for_cancellation(std::time::Duration::from_millis(25));
                     };
+                    let _progress = crate::cold_build_limiter::progress::start(
+                        &target.ctx.canonical_cache_root(),
+                        "view publication",
+                        if paths.is_empty() { None } else { Some(paths.len()) },
+                    );
+                    crate::cold_build_limiter::progress::phase("preparing", if paths.is_empty() { None } else { Some(paths.len()) });
                     let mut prepared = target.ctx.prepare_view_paths(
                         paths.clone(),
                         allow_blob_put,
                         &mut |phase| lifecycle.phase(phase),
                     )?;
+                    crate::cold_build_limiter::progress::advance(paths.len());
+                    crate::cold_build_limiter::progress::phase("publishing", None);
                     // Equivalent unbind/rebind retains this root actor and its epoch.
                     // Content-changing configure is rejected by commit_view_update.
                     let report = {

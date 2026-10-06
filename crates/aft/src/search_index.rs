@@ -1687,6 +1687,8 @@ impl SearchIndex {
     }
 
     fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
+        let _progress = crate::cold_build_limiter::progress::start(root, "trigram build", None);
+        crate::cold_build_limiter::progress::phase("enumerating", None);
         let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut index = SearchIndex {
             project_root: project_root.clone(),
@@ -1696,6 +1698,7 @@ impl SearchIndex {
         };
         let filters = PathFilters::default();
         let paths: Vec<PathBuf> = walk_project_files(&index.project_root, &filters);
+        crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
         let indexed = index.ingest_paths_parallel(&paths);
         index.git_head = current_git_head(&index.project_root);
         index.ready = true;
@@ -1772,6 +1775,7 @@ impl SearchIndex {
                     indexed += 1;
                 }
             }
+            crate::cold_build_limiter::progress::advance(chunk.len());
         }
 
         indexed
@@ -4268,12 +4272,15 @@ fn build_streaming_index(
     max_file_size: u64,
     cache_dir: &Path,
 ) -> std::io::Result<(SearchIndex, usize)> {
+    let _progress = crate::cold_build_limiter::progress::start(root, "trigram build", None);
+    crate::cold_build_limiter::progress::phase("enumerating", None);
     fs::create_dir_all(cache_dir)?;
     sweep_stale_search_build_dirs(cache_dir);
     let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let ignore_fingerprint = ignore_rules_fingerprint(&project_root);
     let filters = PathFilters::default();
     let paths: Vec<PathBuf> = walk_project_files(&project_root, &filters);
+    crate::cold_build_limiter::progress::phase("indexing", Some(paths.len()));
     let pool_size = search_index_build_pool_size();
     let chunk_size = pool_size.saturating_mul(4).clamp(1, 32);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -4358,8 +4365,10 @@ fn build_streaming_index(
                     spill_seq += 1;
                 }
             }
+            crate::cold_build_limiter::progress::advance(chunk.len());
         }
 
+        crate::cold_build_limiter::progress::phase("publishing", None);
         block.sort_unstable_by_key(|record| (record.trigram, record.file_id));
         let mut sources: Vec<Box<dyn PostingRecordSource>> = Vec::new();
         for path in &spill_paths {

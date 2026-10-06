@@ -2371,6 +2371,7 @@ impl SemanticEmbeddingModel {
         match self.embed_texts(texts.clone(), EmbeddingRequestPolicy::Build(budget)) {
             Ok(vectors) => {
                 validate_embedding_batch(&vectors, texts.len(), "embedding backend")?;
+                crate::cold_build_limiter::progress::embedded(texts.len());
                 Ok(texts
                     .into_iter()
                     .zip(vectors)
@@ -2416,6 +2417,7 @@ impl SemanticEmbeddingModel {
                     ) {
                         Ok(mut vectors) => {
                             validate_embedding_batch(&vectors, 1, "embedding backend")?;
+                            crate::cold_build_limiter::progress::embedded(1);
                             return Ok(vec![AdaptiveBuildRow {
                                 metadata: BuildEmbeddingRowMetadata {
                                     embedded_text,
@@ -3685,6 +3687,9 @@ where
     let requested_texts = texts.clone();
     let vectors = embed_fn(texts)?;
     let metadata = take_http_build_metadata();
+    // Adaptive HTTP requests report their successful sub-batches immediately,
+    // including when later requests fail. Generic/local providers report here.
+    let reported_by_http = metadata.is_some();
 
     // Skipped rows carry an empty vector on purpose; the count check still
     // applies because every requested row must have exactly one slot.
@@ -3737,6 +3742,13 @@ where
         });
     }
 
+    if !reported_by_http {
+        crate::cold_build_limiter::progress::embedded(
+            rows.iter()
+                .filter(|row| matches!(row, BuildEmbeddingRow::Embedded { .. }))
+                .count(),
+        );
+    }
     Ok(rows)
 }
 
@@ -4927,12 +4939,16 @@ impl SemanticIndex {
         embed_text_caps: EmbedTextCaps,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
         let collect_started = Instant::now();
+        let progress = crate::cold_build_limiter::progress::counter();
         let collect_one = |file: &Path, sched: Duration| {
             let mut phases = SemanticCollectPhaseTimings {
                 sched,
                 ..SemanticCollectPhaseTimings::default()
             };
             let result = collect_semantic_file(project_root, file, embed_text_caps, &mut phases);
+            if let Some(progress) = &progress {
+                progress.advance(1);
+            }
             (file.to_path_buf(), result, phases)
         };
         let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 {
@@ -5251,6 +5267,18 @@ impl SemanticIndex {
     {
         debug_assert!(project_root.is_absolute());
         let total_chunks = chunks.len();
+        crate::cold_build_limiter::progress::phase("embedding", Some(file_metadata.len()));
+        // A file is complete only after its last chunk's batch has returned.
+        // Chunkless files need no model work; skipped rows still finish a file.
+        let mut last_chunk = HashMap::new();
+        for (index, chunk) in chunks.iter().enumerate() {
+            last_chunk.insert(&chunk.file, index);
+        }
+        crate::cold_build_limiter::progress::advance(
+            file_metadata.len().saturating_sub(last_chunk.len()),
+        );
+        let mut file_ends: Vec<usize> = last_chunk.into_values().collect();
+        file_ends.sort_unstable();
 
         if chunks.is_empty() {
             return Ok(Self {
@@ -5339,6 +5367,9 @@ impl SemanticIndex {
             }
 
             completed_rows += batch_end - batch_start;
+            let finished_files = file_ends.partition_point(|end| *end < batch_end)
+                - file_ends.partition_point(|end| *end < batch_start);
+            crate::cold_build_limiter::progress::advance(finished_files);
             if let Some(callback) = progress.as_mut() {
                 callback(completed_rows, total_chunks);
             }
@@ -5450,6 +5481,12 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "semantic build",
+            Some(files.len()),
+        );
+        crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let mut should_continue = || true;
         let result = Self::build_from_chunks(
@@ -5478,6 +5515,12 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "semantic build",
+            Some(files.len()),
+        );
+        crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) =
             Self::collect_chunks(project_root, files, EmbedTextCaps::default());
         let total_chunks = chunks.len();
@@ -5538,6 +5581,12 @@ impl SemanticIndex {
         C: FnMut() -> bool,
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "semantic build",
+            Some(files.len()),
+        );
+        crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
@@ -10837,6 +10886,47 @@ Connection: close
     }
 
     #[test]
+    fn live_semantic_build_reports_completed_files_and_chunks_inside_embed_loop() {
+        let root = tempfile::tempdir().unwrap();
+        let files = [root.path().join("one.rs"), root.path().join("two.rs")];
+        write_rust_file(&files[0], "one");
+        write_rust_file(&files[1], "two");
+        let mut observed_completed_file = false;
+        let mut calls = 0;
+        SemanticIndex::build(
+            root.path(),
+            &files,
+            &mut |texts| {
+                calls += 1;
+                let snapshot = crate::cold_build_limiter::progress::snapshot(0);
+                let job = snapshot
+                    .running
+                    .iter()
+                    .find(|job| job.root == root.path().to_string_lossy())
+                    .unwrap();
+                assert_eq!(job.kind, "semantic build");
+                assert_eq!(job.phase, "embedding");
+                assert_eq!(job.total, Some(2));
+                if calls > 1 {
+                    assert_eq!(job.chunks_embedded, Some((calls - 1) as u64));
+                }
+                observed_completed_file |= job.done == 1;
+                test_vector_for_texts(texts)
+            },
+            1,
+        )
+        .unwrap();
+        assert!(
+            observed_completed_file,
+            "one file must finish before the next file embeds"
+        );
+        assert!(!crate::cold_build_limiter::progress::snapshot(0)
+            .running
+            .iter()
+            .any(|job| job.root == root.path().to_string_lossy()));
+    }
+
+    #[test]
     #[ignore = "large-base serving-lock benchmark"]
     fn revision_new_file_batch_has_bounded_serving_lock_time() {
         let root = test_project_root();
@@ -14139,6 +14229,39 @@ public class Greeter {
 
     fn embedding_inputs(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("chunk {index}")).collect()
+    }
+
+    #[test]
+    fn live_http_progress_counts_adaptive_requests_without_double_counting() {
+        let root = tempfile::tempdir().unwrap();
+        let server = ProgrammableEmbeddingServer::start(Duration::ZERO);
+        let mut config = programmable_http_config(&server);
+        config.max_batch_size = 4;
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        model.adaptive_build_batch_size = 1;
+        let _progress =
+            crate::cold_build_limiter::progress::start(root.path(), "semantic build", Some(2));
+        model.embed(embedding_inputs(4)).unwrap();
+        let chunks = || {
+            crate::cold_build_limiter::progress::snapshot(0)
+                .running
+                .into_iter()
+                .find(|job| job.root == root.path().to_string_lossy())
+                .unwrap()
+                .chunks_embedded
+        };
+        assert_eq!(
+            chunks(),
+            Some(4),
+            "HTTP requests must report before the outer embedding batch returns"
+        );
+        execute_build_embedding_batch(embedding_inputs(4), &mut |texts| model.embed(texts))
+            .unwrap();
+        assert_eq!(
+            chunks(),
+            Some(8),
+            "adaptive requests must not be counted twice"
+        );
     }
 
     fn overflow_http_config(server: &OverflowEmbeddingServer) -> SemanticBackendConfig {

@@ -1371,6 +1371,51 @@ fn permanent_fill_failure_preserves_reason_without_retry() {
     );
 }
 
+#[test]
+fn live_view_fill_progress_is_visible_before_each_model_call() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let mut calls = 0;
+    let mut saw_finished_file = false;
+    let outcome = catch_up(
+        &Arc::downgrade(&slot),
+        epoch,
+        &runtime,
+        &schedule,
+        FillBudget {
+            max_files: 1,
+            max_batch: 1,
+            ..FillBudget::default()
+        },
+        &mut |texts| {
+            calls += 1;
+            let snapshot = crate::cold_build_limiter::progress::snapshot(0);
+            let job = snapshot
+                .running
+                .iter()
+                .find(|job| job.root == root.path().to_string_lossy())
+                .unwrap();
+            assert_eq!(job.kind, "semantic view fill");
+            assert_eq!(job.phase, "embedding");
+            assert_eq!(job.total, Some(3));
+            if calls > 1 {
+                assert_eq!(job.chunks_embedded, Some((calls - 1) as u64));
+            }
+            saw_finished_file |= job.done > 0;
+            Ok(texts.iter().map(|text| vector(text)).collect())
+        },
+    );
+    assert!(matches!(outcome, FillOutcome::Settled));
+    assert!(saw_finished_file);
+    assert!(!crate::cold_build_limiter::progress::snapshot(0)
+        .running
+        .iter()
+        .any(|job| job.root == root.path().to_string_lossy()));
+}
+
 /// A lane whose checkout is loaded and served, as the worker leaves it.
 fn served_lane(
     storage: &Path,

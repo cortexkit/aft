@@ -4542,6 +4542,23 @@ impl CallGraphStore {
             remove_sqlite_file_set(&temp_path);
         }
 
+        let _progress = crate::cold_build_limiter::progress::start(
+            project_root,
+            "callgraph build",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+        );
+        crate::cold_build_limiter::progress::phase(
+            "enumerating",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+        );
         let scope = crate::logging::IndexBuildScope::new(
             crate::logging::IndexPlane::Callgraph,
             project_root,
@@ -5027,6 +5044,23 @@ impl CallGraphStore {
         files: &[PathBuf],
         chunk_size: usize,
     ) -> Result<ColdBuildStats> {
+        let _progress = crate::cold_build_limiter::progress::start(
+            &self.project_root,
+            "callgraph build",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+        );
+        crate::cold_build_limiter::progress::phase(
+            "enumerating",
+            if files.is_empty() {
+                None
+            } else {
+                Some(files.len())
+            },
+        );
         let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
         self.cold_build_chunked_from_staged_inventory(chunk_size, &corpus_fingerprint)
     }
@@ -5064,11 +5098,13 @@ impl CallGraphStore {
             batch.push((rel_path, size));
             if batch.len() == COLD_BUILD_EXTRACT_BATCH_FILES {
                 self.insert_staged_file_inventory_batch(&mut conn, &batch)?;
+                crate::cold_build_limiter::progress::advance(batch.len());
                 batch.clear();
             }
         }
         if !batch.is_empty() {
             self.insert_staged_file_inventory_batch(&mut conn, &batch)?;
+            crate::cold_build_limiter::progress::advance(batch.len());
         }
 
         staged_corpus_fingerprint(&conn, &self.project_root)
@@ -5213,6 +5249,7 @@ impl CallGraphStore {
 
             let total_files =
                 query_count(&conn, "SELECT COUNT(*) FROM staging_file_inventory")? as usize;
+            crate::cold_build_limiter::progress::phase("extracting", Some(total_files));
             let mut completed_files = 0usize;
             ensure_cold_build_current("extraction", completed_files, total_files)?;
             let mut after_path = String::new();
@@ -5238,6 +5275,7 @@ impl CallGraphStore {
                 }
                 if needs_extract.is_empty() {
                     completed_files = completed_files.saturating_add(batch_files);
+                    crate::cold_build_limiter::progress::completed(completed_files);
                     ensure_cold_build_current("extraction", completed_files, total_files)?;
                     continue;
                 }
@@ -5303,6 +5341,7 @@ impl CallGraphStore {
                 // no second fd is ever opened on the live staging file set.
                 conn.sample_write_pages();
                 completed_files = completed_files.saturating_add(batch_files);
+                crate::cold_build_limiter::progress::completed(completed_files);
                 ensure_cold_build_current("extraction", completed_files, total_files)?;
             }
 
@@ -5320,6 +5359,7 @@ impl CallGraphStore {
         // durable, so pass 1 remains bulk-load shaped and pass 2 sees a complete
         // corpus-wide symbol/export table.
         note_cold_build_phase("symbol_export_index");
+        crate::cold_build_limiter::progress::phase("symbol export index", None);
         if phase.as_deref() == Some("indexing") {
             ensure_cold_build_current("symbol-export-index", 0, 1)?;
             self.verify_writer_lease()?;
@@ -5333,6 +5373,9 @@ impl CallGraphStore {
         }
 
         note_cold_build_phase("resolution");
+        // Resolution is paged by references, not files. Do not label those
+        // counts as files or extrapolate its duration from extraction's rate.
+        crate::cold_build_limiter::progress::phase("resolving", None);
         let workspace_crate_prefixes = WorkspaceCratePrefixCache::default();
         // Resolver lookups are shared by every caller and window: their inputs
         // are final once extraction ends (see `DiskProjectIndex`).
@@ -5414,6 +5457,7 @@ impl CallGraphStore {
 
         ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
         note_cold_build_phase("publication");
+        crate::cold_build_limiter::progress::phase("publishing", None);
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
@@ -5469,6 +5513,12 @@ impl CallGraphStore {
         changed_files: &[PathBuf],
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
     ) -> Result<(IncrementalStats, RefreshFilesProfile)> {
+        let _progress = crate::cold_build_limiter::progress::start(
+            &self.project_root,
+            "callgraph refresh",
+            Some(changed_files.len()),
+        );
+        crate::cold_build_limiter::progress::phase("checking", Some(changed_files.len()));
         let _io = crate::views::io::Window::event("legacy_callgraph_refresh", &self.project_root);
         let total_started = Instant::now();
         let mut profile = RefreshFilesProfile::default();
@@ -5555,6 +5605,7 @@ impl CallGraphStore {
         // Inputs whose content changed, in input order, for the parallel parse.
         let mut to_parse: Vec<(PathBuf, String, Option<FileRow>)> = Vec::new();
         for input in changed_files {
+            crate::cold_build_limiter::progress::advance(1);
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
                 Ok(path) => path,
@@ -5646,6 +5697,7 @@ impl CallGraphStore {
         }
 
         // Parse the changed inputs with the connection released.
+        crate::cold_build_limiter::progress::phase("extracting", Some(to_parse.len()));
         drop(conn);
         let started = Instant::now();
         let parse_paths = to_parse
@@ -5658,6 +5710,7 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
         for ((abs_path, rel_path, old_row), extract) in to_parse.into_iter().zip(parsed) {
+            crate::cold_build_limiter::progress::advance(1);
             let extract = match extract {
                 Ok(extract) => extract,
                 // One file that is not UTF-8 must not fail the whole batch.
@@ -5825,6 +5878,7 @@ impl CallGraphStore {
 
         // Dependents are parsed in parallel with the connection released, then
         // taken in caller order so the first failure is the one reported.
+        crate::cold_build_limiter::progress::phase("dependency selection", None);
         let mut dependents = Vec::new();
         for rel_path in &touched_callers {
             if deleted.contains(rel_path) || changed_extracts.contains_key(rel_path) {
@@ -5842,6 +5896,10 @@ impl CallGraphStore {
             .map(|(_, abs_path)| abs_path.clone())
             .collect::<Vec<_>>();
         let parsed_dependents = pool.parse_files(&self.project_root, &dependent_paths, &memo);
+        crate::cold_build_limiter::progress::phase(
+            "resolving dependents",
+            Some(dependent_paths.len()),
+        );
         profile.dependent_parse += started.elapsed();
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
 
@@ -5854,6 +5912,7 @@ impl CallGraphStore {
             }
         }
         for ((rel_path, _), extract) in dependents.into_iter().zip(parsed_dependents) {
+            crate::cold_build_limiter::progress::advance(1);
             match extract {
                 Ok(extract) => {
                     caller_extracts.insert(rel_path, extract);
@@ -5895,6 +5954,7 @@ impl CallGraphStore {
             );
         }
 
+        crate::cold_build_limiter::progress::phase("publishing", None);
         let tx = conn.transaction()?;
         for update in &resolution_updates {
             store_resolution_config_fields(&tx, &update.rel_path, update.fields.as_deref())?;

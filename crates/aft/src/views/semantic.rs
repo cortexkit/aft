@@ -556,6 +556,7 @@ impl SemanticPlane {
             self.work_items(&state, &resident, snapshot)
         };
         report.queued = items.len();
+        crate::cold_build_limiter::progress::remaining(items.len());
         report.deferred = items.len().saturating_sub(budget.max_files);
         items.truncate(budget.max_files);
 
@@ -851,6 +852,7 @@ fn admit_ready(
         }
     }
     if report.installed != installed_before {
+        crate::cold_build_limiter::progress::advance(report.installed - installed_before);
         state.fill_version += 1;
     }
     Ok(())
