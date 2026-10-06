@@ -73,7 +73,7 @@ For the fully timed subset, summed elapsed milliseconds per observed hour rank: 
 | standing actor tick | standing-root reconciliation and coalesced per-root passes | 250 ms scheduling opportunity; N/L |
 | `subc/health.rs` rollup | two sets of root memory estimates, process observations, root health, breaker state, lifecycle inventory | worker timeout/wakes plus pre-fix RouteBind; see rows 2–3 |
 | health stuck-watch / occupancy diagnostics | subscriptions, tasks, running jobs | watch scan 60 s; stuck age/log interval 10 min; occupancy threshold 60 s; N/L |
-| `bash_background/watchdog.rs` | task polling, output/watch scanning, child reaping, reminders | 500 ms running-task poll; cleanup 60 s, finished retention 1 h; N/L |
+| `bash_background/watchdog.rs` | task polling, output/watch scanning, child reaping, reminders | 500 ms running-task poll; cleanup 60 s, finished retention 24 h; N/L |
 | `response_finalize.rs` | per-session completions, fleet status, alert finalization, status-bar counts | each agent-visible response; N/L |
 | `alert_render.rs::finalize` | partition candidates, sorting, rendering, dispatch-root canonicalization | each alert-bearing finalization; N/L |
 | `commands/status.rs` | root memory census, checkpoint list, backup state, recursive cache size walks, compression query | explicit status requests and internal status signals; N/L |
