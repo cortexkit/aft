@@ -4133,6 +4133,8 @@ struct RustApiModule {
     name: String,
     public: bool,
     file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4177,6 +4179,7 @@ fn rust_collect_api_facts(
                     continue;
                 };
                 let body = node.child_by_field_name("body");
+                let path_override = rust_path_attribute_value(source, node);
                 let mut nested = scope.to_vec();
                 nested.push(name.clone());
                 let module_file = if body.is_none() {
@@ -4188,22 +4191,20 @@ fn rust_collect_api_facts(
                     } else {
                         dir.join(stem)
                     };
-                    Some(
-                        if let Some(path) = rust_path_attribute_value(source, node) {
-                            normalize_relative_segments(
-                                &base
-                                    .parent()
-                                    .unwrap_or(Path::new(""))
-                                    .join(path)
-                                    .to_string_lossy(),
-                            )
-                        } else {
-                            dir.join(nested.join("/"))
-                                .with_extension("rs")
-                                .to_string_lossy()
-                                .replace('\\', "/")
-                        },
-                    )
+                    Some(if let Some(path) = &path_override {
+                        normalize_relative_segments(
+                            &base
+                                .parent()
+                                .unwrap_or(Path::new(""))
+                                .join(path)
+                                .to_string_lossy(),
+                        )
+                    } else {
+                        dir.join(nested.join("/"))
+                            .with_extension("rs")
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
                 } else {
                     None
                 };
@@ -4212,6 +4213,7 @@ fn rust_collect_api_facts(
                     name,
                     public,
                     file: module_file,
+                    path_override,
                 });
                 if let Some(body) = body {
                     rust_collect_api_facts(source, body, file, &nested, facts);
@@ -4475,8 +4477,24 @@ fn rust_public_api_items(
         for module in &facts.modules {
             let parent = (file.clone(), module.scope.clone());
             let child = if let Some(path) = &module.file {
+                // Manifest-named crate roots have children beside the root,
+                // not under a directory named after its arbitrary file stem.
+                // Library root identity comes from the entry-point resolver.
+                let path = if library_roots.contains(file) && module.path_override.is_none() {
+                    let mut scope = module.scope.clone();
+                    scope.push(module.name.clone());
+                    Path::new(file)
+                        .parent()
+                        .unwrap_or(Path::new(""))
+                        .join(scope.join("/"))
+                        .with_extension("rs")
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                } else {
+                    path.clone()
+                };
                 let nested = format!("{}/mod.rs", path.trim_end_matches(".rs"));
-                if files.contains(path) {
+                if files.contains(&path) {
                     (path.clone(), vec![])
                 } else {
                     (nested, vec![])
@@ -6662,6 +6680,39 @@ mod tests {
         assert!(
             aggregate_has_item(&private, "src/hidden.rs", "exposed"),
             "{private:#}"
+        );
+    }
+
+    #[test]
+    fn rust_public_api_manifest_named_lib_root_has_root_relative_modules() {
+        let (_temp, root, paths) = canonical_fixture(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = 'demo'\nversion = '0.1.0'\n[lib]\npath = 'custom/entry.rs'\n",
+            ),
+            (
+                "custom/entry.rs",
+                "pub mod hidden;\n#[path = \"redirected.rs\"]\npub mod renamed;\n",
+            ),
+            ("custom/hidden.rs", "pub fn exposed() {}\n"),
+            ("custom/redirected.rs", "pub fn via_attribute() {}\n"),
+        ]);
+        let graph = snapshot(
+            paths.clone(),
+            vec![
+                export(&root, "custom/hidden.rs", "exposed", "function"),
+                export(&root, "custom/redirected.rs", "via_attribute", "function"),
+            ],
+            vec![],
+        );
+        let aggregate = scan(job(&root, paths, graph));
+        assert!(
+            !aggregate_has_item(&aggregate, "custom/hidden.rs", "exposed"),
+            "{aggregate:#}"
+        );
+        assert!(
+            !aggregate_has_item(&aggregate, "custom/redirected.rs", "via_attribute"),
+            "{aggregate:#}"
         );
     }
 
