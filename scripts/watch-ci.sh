@@ -166,15 +166,13 @@ fi
 while true; do
   write_heartbeat
   STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
-  # Advisory (continue-on-error) jobs read 'failure' at the job level but do
-  # not gate the run: 'Bash permission e2e (Windows)' in PR mode
-  # (_unit-suite.yml strict=false). 'OpenCode 2 (Linux Docker)' is NOT
-  # advisory: it has been a required check on main since 2026-09-22, so a
-  # red there must fail the train here rather than surface as a refused
-  # landing. Fail-fast must not fire on advisory jobs; the run-level
-  # conclusion check below remains authoritative.
+  # Every failing job fails the train, including 'Bash permission e2e
+  # (Windows)'. That job is continue-on-error in PR mode (_unit-suite.yml
+  # strict=false), but it is a required check on main, so a red there makes
+  # the landing refuse; treating it as advisory only hid the failure until
+  # the end of the run.
   FAILED_JOB=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-    --jq '[.jobs[] | select(.conclusion=="failure") | select(.name | test("Bash permission") | not)][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
+    --jq '[.jobs[] | select(.conclusion=="failure")][0] | if . == null then "" else .name + "|" + (.databaseId|tostring) end' 2>/dev/null || echo "")
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
@@ -197,15 +195,12 @@ while true; do
       echo "CI_DONE run=$RID conclusion=$CONC"
       exit 0
     fi
-    # An advisory job cancelled at its own time cap makes the RUN read
-    # 'cancelled' while every gating job passed. The sha is landable then, so
-    # the verdict is the set of non-advisory jobs, not the run's summary
-    # conclusion. (Train 114 round 2 hit this with 'OpenCode 2 (Linux
-    # Docker)', which was advisory then and is required now.)
+    # The run's summary conclusion can read non-success while every job
+    # passed or was skipped; judge the jobs, which are what main requires.
     GATING_BAD=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
-      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission") | not) | .name] | join("; ")')
+      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | .name] | join("; ")')
     if [ -z "$GATING_BAD" ]; then
-      echo "CI_DONE run=$RID conclusion=$CONC advisory_only=1"
+      echo "CI_DONE run=$RID conclusion=$CONC jobs_all_passed=1"
       exit 0
     fi
     echo "CI_DONE run=$RID conclusion=$CONC gating_failed='$GATING_BAD'"
