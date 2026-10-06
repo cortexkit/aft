@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "fsevents-overflow-churn",
+    "bash-output-retention-24h"
+  ],
+  "note": "FSEvents config watcher no longer re-registers on dropped-event overflows; finished bash output kept 24 hours with tool-help wording. No search ranking change."
+}
