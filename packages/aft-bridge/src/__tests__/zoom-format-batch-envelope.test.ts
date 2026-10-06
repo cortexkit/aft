@@ -37,6 +37,21 @@ describe("Rust zoom batch envelope", () => {
 });
 
 describe("formatZoomText call annotations", () => {
+  test("renders other calls once with or without followable calls", () => {
+    for (const calls of [[], [{ name: "lock", line: 2 }]]) {
+      const text = formatZoomText("fixture.ts", {
+        name: "A",
+        kind: "function",
+        content: "body",
+        annotations: { calls_out: calls, other_calls: 3 },
+      });
+      const expectedCalls = calls.length ? "  lock (line 2)\n" : "";
+      expect(text).toBe(
+        `fixture.ts:1-1 [function A]\n\n1: body\n\n──── calls_out\n${expectedCalls}  +3 other calls`,
+      );
+    }
+  });
+
   test("renders folded call-site counts compactly", () => {
     const text = formatZoomText("src/calls.ts", {
       name: "caller",

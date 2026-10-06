@@ -2346,11 +2346,18 @@ fn format_zoom_text(target_label: &str, response: &Value) -> String {
     let calls_out = annotations
         .and_then(|annotations| annotations.get("calls_out"))
         .and_then(Value::as_array);
-    if let Some(calls_out) = calls_out.filter(|calls| !calls.is_empty()) {
+    let other_calls = annotations
+        .and_then(|annotations| annotations.get("other_calls"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if calls_out.is_some_and(|calls| !calls.is_empty()) || other_calls > 0 {
         out.push(String::new());
         out.push("──── calls_out".to_string());
-        for call in calls_out {
+        for call in calls_out.into_iter().flatten() {
             out.push(format_zoom_call_ref(call));
+        }
+        if other_calls > 0 {
+            out.push(format!("  +{other_calls} other calls"));
         }
     }
 
@@ -2382,6 +2389,31 @@ fn format_zoom_call_ref(call: &Value) -> String {
         .map(|count| format!(" +{count}"))
         .unwrap_or_default();
     format!("  {name} (line {line}){extra}")
+}
+
+#[cfg(test)]
+mod zoom_other_calls_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_formats_other_calls_once_with_or_without_followable_calls() {
+        for calls in [
+            serde_json::json!([]),
+            serde_json::json!([{ "name": "lock", "line": 2 }]),
+        ] {
+            let response = serde_json::json!({
+                "name": "A", "kind": "function", "content": "body",
+                "annotations": { "calls_out": calls, "other_calls": 3 }
+            });
+            let text = format_zoom_text("fixture.ts", &response);
+            let expected_calls = if calls.as_array().unwrap().is_empty() {
+                ""
+            } else {
+                "  lock (line 2)\n"
+            };
+            assert_eq!(text, format!("fixture.ts:1-1 [function A]\n\n1: body\n\n──── calls_out\n{expected_calls}  +3 other calls"));
+        }
+    }
 }
 
 // Mirrors packages/opencode-plugin/src/tools/inspect.ts inspectTools.

@@ -49,6 +49,7 @@ interface CallRefShape {
 interface AnnotationsShape {
   calls_out?: CallRefShape[];
   called_by?: CallRefShape[];
+  other_calls?: number;
 }
 
 /**
@@ -127,10 +128,14 @@ export function formatZoomText(targetLabel: string, response: ZoomResponseLike):
   // Annotations (only when non-empty)
   const callsOut = response.annotations?.calls_out ?? [];
   const calledBy = response.annotations?.called_by ?? [];
-  if (callsOut.length > 0) {
+  const otherCalls = response.annotations?.other_calls ?? 0;
+  if (callsOut.length > 0 || otherCalls > 0) {
     out.push("", "──── calls_out");
     for (const ref of callsOut) {
       out.push(`  ${ref.name} (line ${ref.line})${formatExtraCallSites(ref)}`);
+    }
+    if (otherCalls > 0) {
+      out.push(`  +${otherCalls} other calls`);
     }
   }
   if (calledBy.length > 0) {

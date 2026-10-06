@@ -2139,6 +2139,15 @@ fn rust_use_entries(imp: &imports::ImportStatement) -> Vec<RustUseEntry> {
     entries
 }
 
+/// Reuse the resolver's use-tree expansion when a caller only needs the names
+/// introduced into scope, without resolving or reading imported modules.
+pub(crate) fn rust_import_local_names(imp: &imports::ImportStatement) -> Vec<String> {
+    rust_use_entries(imp)
+        .into_iter()
+        .map(|entry| entry.local_name)
+        .collect()
+}
+
 fn rust_use_body(raw: &str) -> Option<&str> {
     let use_pos = raw.find("use ")?;
     let body = raw[use_pos + 4..].trim();

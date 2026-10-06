@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -57,6 +57,9 @@ fn dedupe_call_refs_by_name(calls: Vec<CallRef>) -> Vec<CallRef> {
 pub struct Annotations {
     pub calls_out: Vec<CallRef>,
     pub called_by: Vec<CallRef>,
+    /// Call sites in the body without a locally declared or imported callee.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub other_calls: u32,
 }
 
 /// Response payload for the zoom command.
@@ -125,6 +128,8 @@ struct ZoomTargetMemo {
 
 struct ZoomEnrichment {
     symbols: std::sync::Arc<Vec<Symbol>>,
+    local_names: HashSet<String>,
+    imported_bindings: HashSet<String>,
     source: String,
     tree: tree_sitter::Tree,
     calls: Vec<RawCall>,
@@ -133,6 +138,7 @@ struct ZoomEnrichment {
 
 struct RawCall {
     name: String,
+    full_callee: String,
     line: u32,
     start_byte: usize,
     end_byte: usize,
@@ -152,6 +158,85 @@ fn zoom_parse_source(
     // Zoom already read these bytes. Parse the displayed source, not a second
     // disk snapshot that can differ if an editor saves during the request.
     Ok((FileParser::parse_source(path, source, lang)?, lang))
+}
+
+/// Collect explicit bindings using the existing import parsers. No module
+/// resolution is needed to recognize an imported callee or namespace receiver.
+fn imported_call_bindings(source: &str, tree: &tree_sitter::Tree, lang: LangId) -> HashSet<String> {
+    use crate::imports::{specifier_local_name, ImportForm, ImportKind};
+
+    let mut bindings = HashSet::new();
+    for import in crate::imports::parse_imports(source, tree, lang).imports {
+        match &import.form {
+            ImportForm::Es {
+                default_import,
+                namespace_import,
+                named,
+                type_only,
+                ..
+            } if !type_only => {
+                bindings.extend(default_import.iter().cloned());
+                bindings.extend(namespace_import.iter().cloned());
+                bindings.extend(
+                    named
+                        .iter()
+                        .filter(|name| !name.trim_start().starts_with("type "))
+                        .map(|name| specifier_local_name(name).to_string()),
+                );
+            }
+            ImportForm::Python { from_import, named } => {
+                for name in named {
+                    let local = specifier_local_name(name);
+                    // `import os.path` binds `os`; an alias or `from` import
+                    // binds the local specifier itself instead.
+                    let local = if !from_import && !name.contains(" as ") {
+                        local.split('.').next().unwrap_or(local)
+                    } else {
+                        local
+                    };
+                    if local != "*" {
+                        bindings.insert(local.to_string());
+                    }
+                }
+            }
+            ImportForm::RustUse { .. } => {
+                bindings.extend(crate::callgraph::rust_import_local_names(&import));
+            }
+            ImportForm::Es { .. } => {}
+            _ if import.kind != ImportKind::Type => {
+                bindings.extend(import.default_import.iter().cloned());
+                bindings.extend(import.namespace_import.iter().cloned());
+                bindings.extend(
+                    import
+                        .names
+                        .iter()
+                        .map(|name| specifier_local_name(name).to_string()),
+                );
+            }
+            _ => {}
+        }
+    }
+    bindings.remove("_");
+    bindings
+}
+
+fn is_followable_call(call: &RawCall, enrichment: &ZoomEnrichment) -> bool {
+    if enrichment.local_names.contains(&call.name) {
+        return true;
+    }
+    // Match the binding at the start of a callee, not its method's short name:
+    // `fs.readFile` is imported through `fs`, but `ordinary.readFile` is not.
+    let binding_end = call
+        .full_callee
+        .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '$'))
+        .unwrap_or(call.full_callee.len());
+    // A method on an imported function's return value is not a member of the
+    // import itself: keep `fs.readFile`, but summarize `fs.readFile().trim`.
+    // The inner imported call is extracted separately and remains followable.
+    !call.full_callee.contains('(')
+        && enrichment
+            .imported_bindings
+            .contains(&call.full_callee[..binding_end])
 }
 
 fn resolve_file_or_url(
@@ -1183,6 +1268,7 @@ fn zoom_one_symbol_inner(
             annotations: Annotations {
                 calls_out: Vec::new(),
                 called_by: Vec::new(),
+                other_calls: 0,
             },
         };
         return match serde_json::to_value(&resp) {
@@ -1243,7 +1329,7 @@ fn zoom_one_symbol_inner(
     } else {
         None
     };
-    let (calls_out, called_by) = if include_callgraph {
+    let (calls_out, called_by, other_calls) = if include_callgraph {
         if !enrichments.contains_key(resolved_file_path) {
             #[cfg(test)]
             ZOOM_ENRICHMENT_BUILDS.with(|count| count.set(count.get() + 1));
@@ -1259,10 +1345,14 @@ fn zoom_one_symbol_inner(
             };
             let calls = extract_calls_with_ranges(&resolved_source, tree.root_node(), lang);
             let line_starts = zoom_line_starts(&resolved_source);
+            let local_names = symbols.iter().map(|symbol| symbol.name.clone()).collect();
+            let imported_bindings = imported_call_bindings(&resolved_source, &tree, lang);
             enrichments.insert(
                 resolved_file_path.to_path_buf(),
                 ZoomEnrichment {
                     symbols,
+                    local_names,
+                    imported_bindings,
                     source: resolved_source,
                     tree,
                     calls,
@@ -1297,18 +1387,23 @@ fn zoom_one_symbol_inner(
         let raw_calls = all_file_calls.iter().filter(|call| {
             call.start_byte >= target_byte_start && call.end_byte <= target_byte_end
         });
-        let calls_out = dedupe_call_refs_by_name(
-            raw_calls
-                // A call is local to this body even when its callee is imported,
-                // unresolved, or recursive. Nested bodies remain included, as
-                // they are in the per-file call graph's range-based attribution.
-                .map(|call| CallRef {
+        let mut calls_out = Vec::new();
+        let mut other_calls = 0u32;
+        for call in raw_calls {
+            // Preserve local declarations (including recursion) and imported
+            // bindings. Summarize unbound calls instead of listing builtins and
+            // ordinary receiver methods that cannot be followed to a symbol.
+            if is_followable_call(call, enrichment) {
+                calls_out.push(CallRef {
                     name: call.name.clone(),
                     line: call.line,
                     extra_count: 0,
-                })
-                .collect(),
-        );
+                });
+            } else {
+                other_calls = other_calls.saturating_add(1);
+            }
+        }
+        let calls_out = dedupe_call_refs_by_name(calls_out);
 
         // Preserve file-call order for each name when attributing nested symbols.
         let matching_calls: Vec<&RawCall> = all_file_calls
@@ -1351,9 +1446,9 @@ fn zoom_one_symbol_inner(
 
         let called_by = dedupe_call_refs_by_name(called_by);
 
-        (calls_out, called_by)
+        (calls_out, called_by, other_calls)
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), 0)
     };
 
     let kind_str = symbol_kind_string(&target.kind);
@@ -1368,6 +1463,7 @@ fn zoom_one_symbol_inner(
         annotations: Annotations {
             calls_out,
             called_by,
+            other_calls,
         },
     };
 
@@ -1989,6 +2085,7 @@ fn render_json_zoom(
         annotations: Annotations {
             calls_out,
             called_by,
+            other_calls: 0,
         },
     };
 
@@ -2494,6 +2591,8 @@ fn collect_calls_with_ranges(
     if call_kinds.contains(&node.kind()) {
         if let Some(name) = crate::calls::extract_callee_name(&node, source) {
             results.push(RawCall {
+                full_callee: crate::calls::extract_full_callee(&node, source)
+                    .unwrap_or_else(|| name.clone()),
                 name,
                 line: node.start_position().row as u32 + 1,
                 start_byte: node.start_byte(),
@@ -3030,6 +3129,7 @@ function helper(value: number): number {
   after();
   A();
 }
+import { before, acquireRefreshFileLock, after } from './ops';
 "#,
         )
         .unwrap();
@@ -3066,6 +3166,8 @@ function helper(value: number): number {
  * Acquire the background lease.
  */
 export function A() {
+  items.map(String);
+  JSON.stringify(items);
   return acquireRefreshFileLock();
 }
 
@@ -3079,13 +3181,13 @@ export function B() {
 function claimBackgroundRefresh() {}
 function runUnderBackgroundLease() {}
 "#,
-            serde_json::json!([{ "name": "acquireRefreshFileLock", "line": 7 }]),
+            serde_json::json!([{ "name": "acquireRefreshFileLock", "line": 9 }]),
             serde_json::json!([
-                { "name": "A", "line": 11 },
-                { "name": "claimBackgroundRefresh", "line": 12 },
-                { "name": "runUnderBackgroundLease", "line": 13, "extra_count": 1 },
+                { "name": "A", "line": 13 },
+                { "name": "claimBackgroundRefresh", "line": 14 },
+                { "name": "runUnderBackgroundLease", "line": 15, "extra_count": 1 },
             ]),
-            11,
+            13,
         );
     }
 
@@ -3098,6 +3200,8 @@ function runUnderBackgroundLease() {}
 /// Acquire the background lease.
 #[inline]
 pub fn A() {
+    vec.push(1);
+    text.trim();
     acquire_refresh_file_lock();
 }
 
@@ -3111,13 +3215,13 @@ pub fn B() {
 fn claim_background_refresh() {}
 fn run_under_background_lease() {}
 "#,
-            serde_json::json!([{ "name": "acquire_refresh_file_lock", "line": 6 }]),
+            serde_json::json!([{ "name": "acquire_refresh_file_lock", "line": 8 }]),
             serde_json::json!([
-                { "name": "A", "line": 10 },
-                { "name": "claim_background_refresh", "line": 11 },
-                { "name": "run_under_background_lease", "line": 12, "extra_count": 1 },
+                { "name": "A", "line": 12 },
+                { "name": "claim_background_refresh", "line": 13 },
+                { "name": "run_under_background_lease", "line": 14, "extra_count": 1 },
             ]),
-            10,
+            12,
         );
     }
 
@@ -3130,6 +3234,8 @@ fn run_under_background_lease() {}
 @lease
 def A():
     "Acquire the background lease."
+    len(items)
+    print(items)
     return acquire_refresh_file_lock()
 
 def B():
@@ -3144,13 +3250,13 @@ def claim_background_refresh():
 def run_under_background_lease():
     pass
 "#,
-            serde_json::json!([{ "name": "acquire_refresh_file_lock", "line": 6 }]),
+            serde_json::json!([{ "name": "acquire_refresh_file_lock", "line": 8 }]),
             serde_json::json!([
-                { "name": "A", "line": 9 },
-                { "name": "claim_background_refresh", "line": 10 },
-                { "name": "run_under_background_lease", "line": 11, "extra_count": 1 },
+                { "name": "A", "line": 11 },
+                { "name": "claim_background_refresh", "line": 12 },
+                { "name": "run_under_background_lease", "line": 13, "extra_count": 1 },
             ]),
-            9,
+            11,
         );
     }
 
@@ -3179,6 +3285,7 @@ def run_under_background_lease():
                 assert!(line <= json["range"]["end_line"].as_u64().unwrap() + 1);
             }
             if name == "A" {
+                assert_eq!(json["annotations"]["other_calls"], 2);
                 assert_eq!(
                     json["annotations"]["called_by"],
                     serde_json::json!([{ "name": "B", "line": a_call_line }]),
@@ -3186,8 +3293,123 @@ def run_under_background_lease():
                 assert!(!json["content"].as_str().unwrap().contains("function B"));
                 assert!(!json["content"].as_str().unwrap().contains("fn B"));
                 assert!(!json["content"].as_str().unwrap().contains("def B"));
+            } else {
+                assert!(json["annotations"].get("other_calls").is_none());
             }
         }
+    }
+
+    #[test]
+    fn zoom_callgraph_import_bindings_filter_noise_typescript() {
+        assert_filtered_zoom_calls(
+            "ts",
+            r#"import { acquire as lock } from './lock';
+import reader from './reader';
+import * as fs from 'node:fs';
+import type { TypeOnly } from './types';
+function A() {
+  lock();
+  reader();
+  fs.readFile();
+  fs?.stat?.();
+  reader().trim();
+  ordinary.readFile();
+  Math.random();
+  items.map(String);
+  TypeOnly();
+  A();
+  local();
+}
+function local() {}
+"#,
+            serde_json::json!([
+                { "name": "lock", "line": 6 },
+                { "name": "reader", "line": 7, "extra_count": 1 },
+                { "name": "readFile", "line": 8 },
+                { "name": "stat", "line": 9 },
+                { "name": "A", "line": 15 },
+                { "name": "local", "line": 16 },
+            ]),
+            5,
+        );
+    }
+
+    #[test]
+    fn zoom_callgraph_import_bindings_filter_noise_rust() {
+        assert_filtered_zoom_calls(
+            "rs",
+            r#"use crate::lock::{acquire as lock, nested::{self as locks, renew as again}};
+pub fn A() {
+    lock();
+    locks::acquire();
+    again();
+    locks::acquire().trim();
+    vec.push(1);
+    text.trim();
+    A();
+    local();
+}
+fn local() {}
+"#,
+            serde_json::json!([
+                { "name": "lock", "line": 3 },
+                { "name": "locks::acquire", "line": 4, "extra_count": 1 },
+                { "name": "again", "line": 5 },
+                { "name": "A", "line": 9 },
+                { "name": "local", "line": 10 },
+            ]),
+            3,
+        );
+    }
+
+    #[test]
+    fn zoom_callgraph_import_bindings_filter_noise_python() {
+        assert_filtered_zoom_calls(
+            "py",
+            r#"from locks import acquire as lock
+import os.path, json as codec
+def A():
+    lock()
+    os.path.exists('x')
+    codec.dumps([])
+    codec.dumps([]).strip()
+    ordinary.dumps([])
+    len([])
+    print('x')
+    A()
+    local()
+def local():
+    pass
+"#,
+            serde_json::json!([
+                { "name": "lock", "line": 4 },
+                { "name": "exists", "line": 5 },
+                { "name": "dumps", "line": 6, "extra_count": 1 },
+                { "name": "A", "line": 11 },
+                { "name": "local", "line": 12 },
+            ]),
+            4,
+        );
+    }
+
+    fn assert_filtered_zoom_calls(
+        extension: &str,
+        source: &str,
+        expected: serde_json::Value,
+        other_calls: u32,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!("bindings.{extension}"));
+        std::fs::write(&path, source).unwrap();
+        let ctx = make_ctx();
+        let req = make_zoom_request_cg("bindings", path.to_str().unwrap(), "A");
+        let json = serde_json::to_value(handle_zoom(&req, &ctx)).unwrap();
+        assert_eq!(json["success"], true, "{json}");
+        assert_eq!(json["annotations"]["calls_out"], expected, "{extension}");
+        assert_eq!(
+            json["annotations"]["other_calls"], other_calls,
+            "{extension}"
+        );
     }
 
     #[test]
