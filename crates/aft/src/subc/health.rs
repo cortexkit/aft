@@ -2147,6 +2147,24 @@ pub(super) fn build_health_report(
     dispatch_path_metrics: &DispatchPathMetrics,
     shared_app: &App,
 ) -> HealthReport {
+    build_health_report_with_indexing(
+        cache,
+        executor,
+        pending_binds,
+        dispatch_path_metrics,
+        shared_app,
+        crate::cold_build_limiter::progress::snapshot,
+    )
+}
+
+fn build_health_report_with_indexing(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    dispatch_path_metrics: &DispatchPathMetrics,
+    shared_app: &App,
+    indexing_snapshot: impl FnOnce(u64) -> crate::cold_build_limiter::progress::Snapshot,
+) -> HealthReport {
     // The diagnostic payload is fixed-size and cached. Only probe-purpose
     // liveness signals are read fresh, using atomics or non-blocking snapshots.
     let (rollup, snapshot_age_ms) = cache.snapshot();
@@ -2200,7 +2218,7 @@ pub(super) fn build_health_report(
         "cold_build_limiter".to_string(),
         render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),
     );
-    let indexing = crate::cold_build_limiter::progress::snapshot(
+    let indexing = indexing_snapshot(
         metrics
             .get("warming_roots")
             .and_then(Value::as_u64)
@@ -2338,7 +2356,24 @@ mod tests {
         } else {
             refresh_until_root_count(&cache, executor, app, root_count);
         }
-        build_health_report(&cache, executor, pending_binds, metrics, app)
+        // These tests own an executor, not the process-wide indexing work of
+        // other tests. Live indexing has its own root-scoped fixture below.
+        build_health_report_with_indexing(
+            &cache,
+            executor,
+            pending_binds,
+            metrics,
+            app,
+            |warming_roots| crate::cold_build_limiter::progress::Snapshot {
+                running: Vec::new(),
+                queued: Vec::new(),
+                warming_roots,
+                omitted: crate::cold_build_limiter::progress::Omitted {
+                    running: 0,
+                    queued: 0,
+                },
+            },
+        )
     }
 
     #[test]
@@ -2346,34 +2381,49 @@ mod tests {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
         let app = crate::context::App::default_shared();
-        let root = Path::new("/fake/openclaw");
-        let _fill =
-            crate::cold_build_limiter::progress::start(root, "semantic view fill", Some(31_705));
+        let foreign_root = tempfile::tempdir().unwrap();
+        let _foreign = crate::cold_build_limiter::progress::start(
+            foreign_root.path(),
+            "unrelated work",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Quiet,
+        );
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("openclaw");
+        let _fill = crate::cold_build_limiter::progress::start(
+            &root,
+            "semantic view fill",
+            Some(31_705),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
         crate::cold_build_limiter::progress::phase("embedding", Some(31_705));
         crate::cold_build_limiter::progress::advance(1_280);
         crate::cold_build_limiter::progress::embedded(9_000);
         let _queued =
-            crate::cold_build_limiter::progress::queued("/fake/hermes-agent", "semantic build");
-        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+            crate::cold_build_limiter::progress::queued(&root.to_string_lossy(), "semantic build");
+        let cache = HealthRollupCache::new();
+        cache.refresh(&executor, &app);
+        let report = build_health_report_with_indexing(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &metrics,
+            &app,
+            |warming_roots| {
+                crate::cold_build_limiter::progress::snapshot_for_root(&root, warming_roots)
+            },
+        );
         let value = report.metrics.as_ref().unwrap();
         let indexing = &value["indexing"];
         let running = indexing["running"].as_array().expect("live indexing block");
         let fill = running
             .iter()
-            .find(|row| row["root"] == "/fake/openclaw")
+            .find(|row| row["root"].as_str() == Some(root.to_string_lossy().as_ref()))
             .unwrap();
         assert_eq!(fill["done"], 1_280);
         assert_eq!(fill["total"], 31_705);
         assert_eq!(fill["chunks_embedded"], 9_000);
         assert_eq!(fill["phase"], "embedding");
-        assert!(fill["eta_seconds"].is_null());
-        assert_eq!(indexing["warming_roots"], 0);
-        assert!(report
-            .detail
-            .as_ref()
-            .unwrap()
-            .contains("semantic view fill openclaw 1,280/31,705 files"));
-        assert!(!report.detail.as_ref().unwrap().contains('\n'));
         let headline = value["headline"]
             .as_array()
             .expect("CLI headline selection");
@@ -2396,6 +2446,42 @@ mod tests {
         }
         eprintln!("SAMPLE detail: {}", report.detail.unwrap());
         eprintln!("SAMPLE indexing: {}", indexing);
+    }
+
+    #[test]
+    fn indexing_detail_renders_owned_snapshot_with_known_and_unknown_eta() {
+        use crate::cold_build_limiter::progress::{Omitted, Queued, Running, Snapshot};
+        let mut snapshot = Snapshot {
+            running: vec![Running {
+                root: "/fake/openclaw".to_owned(),
+                root_label: "openclaw".to_owned(),
+                kind: "semantic view fill".to_owned(),
+                phase: "embedding",
+                started_at_ms: 1,
+                done: 1_280,
+                total: Some(31_705),
+                chunks_embedded: Some(9_000),
+                rate_per_minute: Some(28.17),
+                eta_seconds: Some(64_800.0),
+                age_seconds: 60.0,
+            }],
+            queued: vec![Queued {
+                root: "/fake/hermes-agent".to_owned(),
+                kind: "semantic build".to_owned(),
+                waited_seconds: 5.0,
+            }],
+            warming_roots: 49,
+            omitted: Omitted {
+                running: 0,
+                queued: 2,
+            },
+        };
+        assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
+            "indexing: semantic view fill openclaw 1,280/31,705 files (~18 h) [embedding], 3 queued; 49 roots warming"));
+        snapshot.running[0].total = None;
+        snapshot.running[0].eta_seconds = None;
+        assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
+            "indexing: semantic view fill openclaw 1,280/? files [embedding], 3 queued; 49 roots warming"));
     }
 
     #[test]

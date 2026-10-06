@@ -364,6 +364,7 @@ pub(crate) fn schedule(
                         &target.ctx.canonical_cache_root(),
                         "view publication",
                         if paths.is_empty() { None } else { Some(paths.len()) },
+                        crate::cold_build_limiter::progress::StartLog::Quiet,
                     );
                     crate::cold_build_limiter::progress::phase("preparing", if paths.is_empty() { None } else { Some(paths.len()) });
                     let mut prepared = target.ctx.prepare_view_paths(

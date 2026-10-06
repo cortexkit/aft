@@ -320,7 +320,6 @@ pub(crate) fn admitted(root: &str, kind: &str) -> Option<Job> {
     if CURRENT.with(|current| current.borrow().is_some()) {
         return None;
     }
-    crate::slog_info!("indexing start root={} kind={} total=unknown", root, kind);
     Some(REGISTRY.register(root, kind, false, true))
 }
 
@@ -336,15 +335,32 @@ pub(crate) struct Scope {
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-pub(crate) fn start(root: &Path, kind: &str, total: Option<usize>) -> Scope {
-    let job = REGISTRY.register(&root.to_string_lossy(), kind, false, false);
-    lock(&job.entry).total = total.map(|n| n as u64);
-    crate::slog_info!(
+/// Cold builds and full fills announce their start. Incremental maintenance
+/// selects Quiet explicitly because it can run every second on a busy root.
+#[derive(Clone, Copy)]
+pub(crate) enum StartLog {
+    Info,
+    Quiet,
+}
+
+fn start_message(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Option<String> {
+    if matches!(log, StartLog::Quiet) {
+        return None;
+    }
+    Some(format!(
         "indexing start root={} kind={} total={:?}",
         root.display(),
         kind,
         total
-    );
+    ))
+}
+
+pub(crate) fn start(root: &Path, kind: &str, total: Option<usize>, log: StartLog) -> Scope {
+    let job = REGISTRY.register(&root.to_string_lossy(), kind, false, false);
+    lock(&job.entry).total = total.map(|n| n as u64);
+    if let Some(message) = start_message(root, kind, total, log) {
+        crate::slog_info!("{}", message);
+    }
     let previous = CURRENT.with(|current| current.replace(Some(Arc::clone(&job.entry))));
     Scope {
         _job: job,
@@ -438,9 +454,70 @@ pub(crate) fn snapshot(warming_roots: u64) -> Snapshot {
     REGISTRY.snapshot(warming_roots, Instant::now())
 }
 
+/// Test fixtures observe only their unique root. The production census keeps
+/// its cap, so a parallel test with many older jobs cannot hide a fixture's row.
+#[cfg(test)]
+pub(crate) fn snapshot_for_root(root: &Path, warming_roots: u64) -> Snapshot {
+    let root = root.to_string_lossy();
+    let now = Instant::now();
+    let state = lock(&REGISTRY.0);
+    Snapshot {
+        running: state
+            .running
+            .values()
+            .find_map(|entry| {
+                let entry = lock(entry);
+                (entry.root == root && !entry.shadowed).then(|| entry.render(now))
+            })
+            .into_iter()
+            .collect(),
+        queued: state
+            .queued
+            .values()
+            .find_map(|entry| {
+                let entry = lock(entry);
+                (entry.root == root).then(|| Queued {
+                    root: entry.root.clone(),
+                    kind: entry.kind.clone(),
+                    waited_seconds: now.saturating_duration_since(entry.started).as_secs_f64(),
+                })
+            })
+            .into_iter()
+            .collect(),
+        warming_roots,
+        omitted: Omitted {
+            running: 0,
+            queued: 0,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_refreshes_do_not_emit_info_start_messages() {
+        assert!(start_message(
+            Path::new("/repo"),
+            "callgraph refresh",
+            Some(1),
+            StartLog::Quiet
+        )
+        .is_none());
+        assert!(start_message(
+            Path::new("/repo"),
+            "view publication",
+            None,
+            StartLog::Quiet
+        )
+        .is_none());
+        assert!(
+            start_message(Path::new("/repo"), "callgraph build", None, StartLog::Info)
+                .unwrap()
+                .contains("indexing start root=/repo kind=callgraph build total=None")
+        );
+    }
 
     #[test]
     fn progress_and_recent_rate_are_measured() {
@@ -548,20 +625,21 @@ mod tests {
     fn token_cancellation_removes_scoped_work_immediately() {
         let token = crate::executor::JobCancellation::new();
         let _token = crate::executor::install_job_cancellation(token.clone());
-        let root = Path::new("/fake/token-progress");
-        let _job = start(root, "fill", Some(10));
-        let _queued = queued("/fake/token-progress", "other");
-        assert!(snapshot(0)
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let _job = start(root, "fill", Some(10), StartLog::Quiet);
+        let _queued = queued(&root.to_string_lossy(), "other");
+        assert!(snapshot_for_root(root, 0)
             .running
             .iter()
             .any(|job| job.root == root.to_string_lossy()));
         token.request_cancel();
         advance(1);
-        assert!(!snapshot(0)
+        assert!(!snapshot_for_root(root, 0)
             .running
             .iter()
             .any(|job| job.root == root.to_string_lossy()));
-        assert!(!snapshot(0)
+        assert!(!snapshot_for_root(root, 0)
             .queued
             .iter()
             .any(|job| job.root == root.to_string_lossy()));

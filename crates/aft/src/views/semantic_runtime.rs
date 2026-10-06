@@ -1205,6 +1205,7 @@ where
                 &schedule.root,
                 LIMITER_KIND,
                 None,
+                crate::cold_build_limiter::progress::StartLog::Info,
             ));
             crate::cold_build_limiter::progress::phase("embedding", None);
         }

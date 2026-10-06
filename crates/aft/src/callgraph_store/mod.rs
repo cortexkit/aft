@@ -4550,6 +4550,7 @@ impl CallGraphStore {
             } else {
                 Some(files.len())
             },
+            crate::cold_build_limiter::progress::StartLog::Info,
         );
         crate::cold_build_limiter::progress::phase(
             "enumerating",
@@ -5052,6 +5053,7 @@ impl CallGraphStore {
             } else {
                 Some(files.len())
             },
+            crate::cold_build_limiter::progress::StartLog::Info,
         );
         crate::cold_build_limiter::progress::phase(
             "enumerating",
@@ -5517,6 +5519,7 @@ impl CallGraphStore {
             &self.project_root,
             "callgraph refresh",
             Some(changed_files.len()),
+            crate::cold_build_limiter::progress::StartLog::Quiet,
         );
         crate::cold_build_limiter::progress::phase("checking", Some(changed_files.len()));
         let _io = crate::views::io::Window::event("legacy_callgraph_refresh", &self.project_root);

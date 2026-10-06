@@ -5485,6 +5485,7 @@ impl SemanticIndex {
             project_root,
             "semantic build",
             Some(files.len()),
+            crate::cold_build_limiter::progress::StartLog::Info,
         );
         crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
@@ -5519,6 +5520,7 @@ impl SemanticIndex {
             project_root,
             "semantic build",
             Some(files.len()),
+            crate::cold_build_limiter::progress::StartLog::Info,
         );
         crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) =
@@ -5585,6 +5587,7 @@ impl SemanticIndex {
             project_root,
             "semantic build",
             Some(files.len()),
+            crate::cold_build_limiter::progress::StartLog::Info,
         );
         crate::cold_build_limiter::progress::phase("collecting", Some(files.len()));
         let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
@@ -10898,7 +10901,8 @@ Connection: close
             &files,
             &mut |texts| {
                 calls += 1;
-                let snapshot = crate::cold_build_limiter::progress::snapshot(0);
+                let snapshot =
+                    crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0);
                 let job = snapshot
                     .running
                     .iter()
@@ -10920,10 +10924,12 @@ Connection: close
             observed_completed_file,
             "one file must finish before the next file embeds"
         );
-        assert!(!crate::cold_build_limiter::progress::snapshot(0)
-            .running
-            .iter()
-            .any(|job| job.root == root.path().to_string_lossy()));
+        assert!(
+            !crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0)
+                .running
+                .iter()
+                .any(|job| job.root == root.path().to_string_lossy())
+        );
     }
 
     #[test]
@@ -14239,11 +14245,15 @@ public class Greeter {
         config.max_batch_size = 4;
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
         model.adaptive_build_batch_size = 1;
-        let _progress =
-            crate::cold_build_limiter::progress::start(root.path(), "semantic build", Some(2));
+        let _progress = crate::cold_build_limiter::progress::start(
+            root.path(),
+            "semantic build",
+            Some(2),
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
         model.embed(embedding_inputs(4)).unwrap();
         let chunks = || {
-            crate::cold_build_limiter::progress::snapshot(0)
+            crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0)
                 .running
                 .into_iter()
                 .find(|job| job.root == root.path().to_string_lossy())

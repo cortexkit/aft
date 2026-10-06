@@ -1687,7 +1687,12 @@ impl SearchIndex {
     }
 
     fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
-        let _progress = crate::cold_build_limiter::progress::start(root, "trigram build", None);
+        let _progress = crate::cold_build_limiter::progress::start(
+            root,
+            "trigram build",
+            None,
+            crate::cold_build_limiter::progress::StartLog::Info,
+        );
         crate::cold_build_limiter::progress::phase("enumerating", None);
         let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         let mut index = SearchIndex {
@@ -4272,7 +4277,12 @@ fn build_streaming_index(
     max_file_size: u64,
     cache_dir: &Path,
 ) -> std::io::Result<(SearchIndex, usize)> {
-    let _progress = crate::cold_build_limiter::progress::start(root, "trigram build", None);
+    let _progress = crate::cold_build_limiter::progress::start(
+        root,
+        "trigram build",
+        None,
+        crate::cold_build_limiter::progress::StartLog::Info,
+    );
     crate::cold_build_limiter::progress::phase("enumerating", None);
     fs::create_dir_all(cache_dir)?;
     sweep_stale_search_build_dirs(cache_dir);

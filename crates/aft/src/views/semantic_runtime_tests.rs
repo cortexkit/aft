@@ -1392,7 +1392,7 @@ fn live_view_fill_progress_is_visible_before_each_model_call() {
         },
         &mut |texts| {
             calls += 1;
-            let snapshot = crate::cold_build_limiter::progress::snapshot(0);
+            let snapshot = crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0);
             let job = snapshot
                 .running
                 .iter()
@@ -1410,10 +1410,12 @@ fn live_view_fill_progress_is_visible_before_each_model_call() {
     );
     assert!(matches!(outcome, FillOutcome::Settled));
     assert!(saw_finished_file);
-    assert!(!crate::cold_build_limiter::progress::snapshot(0)
-        .running
-        .iter()
-        .any(|job| job.root == root.path().to_string_lossy()));
+    assert!(
+        !crate::cold_build_limiter::progress::snapshot_for_root(root.path(), 0)
+            .running
+            .iter()
+            .any(|job| job.root == root.path().to_string_lossy())
+    );
 }
 
 /// A lane whose checkout is loaded and served, as the worker leaves it.
