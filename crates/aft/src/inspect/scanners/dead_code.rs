@@ -1,6 +1,4 @@
-use std::collections::{
-    btree_map::Entry as BTreeMapEntry, hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque,
-};
+use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -32,8 +30,9 @@ use crate::parser::{detect_language, grammar_for, LangId};
 
 use super::DEFAULT_EXPORT_MARKER_KIND;
 
+pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 6;
+#[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
-pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 5;
 const MACRO_TOKEN_LIVENESS_PROVENANCE: &str = "macro_token_liveness";
 const RUST_PATH_LIVENESS_PROVENANCE: &str = "rust_path_liveness";
 const RUST_MACRO_REF_SHAPE_CALL: &str = "call";
@@ -115,6 +114,8 @@ struct ImportedExportLiveness {
 
 #[derive(Debug, Default)]
 struct FileAnalysis {
+    rust_api: Option<RustApiFacts>,
+    go_dispatch: Option<GoDispatchFacts>,
     raw_imports: Vec<RawImportContribution>,
     rust_imports: Vec<RawImportContribution>,
     raw_reexports: Vec<RawReexportContribution>,
@@ -298,6 +299,33 @@ impl DeadCodeFileAnalyzer {
         };
 
         FileAnalysis {
+            rust_api: (lang == LangId::Rust).then(|| {
+                tree.as_ref()
+                    .map(|tree| rust_api_facts(&source, tree.root_node(), relative_file))
+                    .unwrap_or_default()
+            }),
+            go_dispatch: (lang == LangId::Go).then(|| {
+                let mut facts = tree
+                    .as_ref()
+                    .map(|tree| go_dispatch_facts(&source, tree.root_node()))
+                    .unwrap_or_default();
+                let mut relative = Path::new(relative_file).parent().unwrap_or(Path::new(""));
+                let mut absolute = file.parent().unwrap_or(Path::new(""));
+                loop {
+                    if absolute.join("go.mod").is_file() {
+                        facts.module = relative.to_string_lossy().replace('\\', "/");
+                        break;
+                    }
+                    let (Some(next_relative), Some(next_absolute)) =
+                        (relative.parent(), absolute.parent())
+                    else {
+                        break;
+                    };
+                    relative = next_relative;
+                    absolute = next_absolute;
+                }
+                facts
+            }),
             raw_imports,
             rust_imports,
             raw_reexports,
@@ -420,7 +448,7 @@ fn run_dead_code_scan_with_oxc_started(
         &contributions,
         &public_api_files,
         &roles,
-        Some(MAX_DRILL_DOWN_ITEMS),
+        None,
     );
     let success = InspectScanSuccess {
         scanned_files: job.scope_files.clone(),
@@ -444,6 +472,7 @@ fn fallback_export_contributions_by_file(
             .entry(relative_path(&job.project_root, &export.file))
             .or_default()
             .push(ExportContribution {
+                public_api: false,
                 symbol: export.symbol.clone(),
                 kind: export.kind.clone(),
                 line: export.line,
@@ -510,6 +539,8 @@ fn gather_file_contribution(
                 .unwrap_or_default()
         });
     let FileAnalysis {
+        rust_api,
+        go_dispatch,
         raw_imports,
         rust_imports,
         raw_reexports,
@@ -541,6 +572,13 @@ fn gather_file_contribution(
             })
             .collect::<Vec<_>>(),
     });
+
+    if let Some(facts) = rust_api {
+        payload["rust_api"] = json!(facts);
+    }
+    if let Some(facts) = go_dispatch {
+        payload["go_dispatch"] = json!(facts);
+    }
 
     if !raw_imports.is_empty() {
         payload["raw_imports"] = json!(raw_imports);
@@ -612,6 +650,7 @@ fn oxc_fact_export_contributions(facts: &FileFacts) -> Vec<ExportContribution> {
         .exports
         .iter()
         .map(|export| ExportContribution {
+            public_api: false,
             symbol: export.name.as_symbol(),
             kind: export.kind.clone(),
             line: export.line,
@@ -631,6 +670,7 @@ fn oxc_export_contributions(file: &OxcFileVerdicts) -> Vec<ExportContribution> {
     file.exports
         .iter()
         .map(|export| ExportContribution {
+            public_api: false,
             symbol: export.symbol.clone(),
             kind: export.kind.clone(),
             line: export.line,
@@ -839,7 +879,10 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
             .any(|file| rollup_semantics_file(file))
         || changed_export_surface(previous, &parsed, &affected_files)
         || parsed.iter().any(|contribution| {
-            affected_files.contains(&contribution.file) && contribution.oxc_facts.is_some()
+            affected_files.contains(&contribution.file)
+                && (contribution.oxc_facts.is_some()
+                    || contribution.rust_api.is_some()
+                    || contribution.go_dispatch.is_some())
         })
     {
         affected_files = parsed
@@ -962,6 +1005,7 @@ fn rollup_semantics_file(file: &str) -> bool {
         .unwrap_or(file);
     name == "package.json"
         || name == "Cargo.toml"
+        || name == "go.mod"
         || (name.starts_with("tsconfig") && name.ends_with(".json"))
         || (name.starts_with("jsconfig") && name.ends_with(".json"))
         || name.ends_with(".config.js")
@@ -1186,11 +1230,31 @@ fn fragments_from_aggregate(
         .collect()
 }
 
+// Aggregates retain all findings; presentation applies its page limit after
+// offset. Ties must not depend on contribution or callgraph iteration order.
+fn rank_dead_code_items(
+    mut items: Vec<Value>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
+) -> Vec<Value> {
+    items.sort_by(|a, b| {
+        let key = |item: &Value| {
+            (
+                roles.role_for(item["file"].as_str().unwrap_or("")),
+                item["file"].as_str().unwrap_or("").to_string(),
+                item["line"].as_u64().unwrap_or(0),
+                item["symbol"].as_str().unwrap_or("").to_string(),
+            )
+        };
+        key(a).cmp(&key(b))
+    });
+    items
+}
+
 fn fold_dead_code_fragments(
     fragments: &BTreeMap<String, DeadCodeFileFragment>,
     materialized: &[DeadCodeContribution],
     roles: &crate::inspect::entry_points::ProjectRoles,
-    drill_down_limit: Option<usize>,
+    _drill_down_limit: Option<usize>,
     scanned_files: usize,
 ) -> Value {
     let count = fragments
@@ -1215,43 +1279,37 @@ fn fold_dead_code_fragments(
             *by_language.entry(language.clone()).or_default() += value;
         }
     }
-    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
+    let headline_items = rank_dead_code_items(
         fragments
             .values()
             .flat_map(|fragment| fragment.headline_items.iter().cloned())
             .collect(),
         roles,
-        drill_down_limit,
     );
-    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
+    let generated_items = rank_dead_code_items(
         fragments
             .values()
             .flat_map(|fragment| fragment.generated_items.iter().cloned())
             .collect(),
         roles,
-        drill_down_limit,
     );
-    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
+    let test_only_items = rank_dead_code_items(
         fragments
             .values()
             .flat_map(|fragment| fragment.test_only_items.iter().cloned())
             .collect(),
         roles,
-        drill_down_limit,
     );
-    let mut uncertain_items = fragments
-        .values()
-        .flat_map(|fragment| fragment.uncertain_items.iter().cloned())
-        .collect::<Vec<_>>();
-    if let Some(limit) = drill_down_limit {
-        uncertain_items.truncate(limit);
-    }
+    let uncertain_items = rank_dead_code_items(
+        fragments
+            .values()
+            .flat_map(|fragment| fragment.uncertain_items.iter().cloned())
+            .collect::<Vec<_>>(),
+        roles,
+    );
     let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
     let mut dead_items = headline_items;
     dead_items.extend(generated_items.iter().cloned());
-    if let Some(limit) = drill_down_limit {
-        dead_items.truncate(limit);
-    }
     let generated_top = generated_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
@@ -1275,9 +1333,9 @@ fn fold_dead_code_fragments(
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
         "by_language": by_language,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
-        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
-        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
+        "drill_down_capped": false,
+        "generated_drill_down_capped": false,
+        "test_only_drill_down_capped": false,
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
         "languages_skipped": languages_skipped,
@@ -1348,6 +1406,8 @@ fn materialize_dead_code_contributions(
         .map(|contribution| (contribution.file.as_str(), contribution))
         .collect::<BTreeMap<_, _>>();
     let test_module_files = cfg_test_module_files(&parsed);
+    let rust_public_items = rust_public_api_items(&parsed, public_api_files);
+    let go_live_methods = go_interface_live_methods(&parsed);
     let rust_imports_by_file = parsed
         .iter()
         .filter(|contribution| !contribution.rust_imports.is_empty())
@@ -1363,6 +1423,12 @@ fn materialize_dead_code_contributions(
                 }
             }
             let _facts_format_version = contribution.facts_format_version;
+            if let Some(facts) = &mut contribution.go_dispatch {
+                facts.live_methods = go_live_methods
+                    .get(&contribution.file)
+                    .cloned()
+                    .unwrap_or_default();
+            }
             let absolute_file = project_root.join(&contribution.file);
             let normalized_file = normalize_absolute(project_root, &absolute_file);
             let outbound_calls_for_file = outbound_calls_by_caller_file
@@ -1456,7 +1522,44 @@ fn materialize_dead_code_contributions(
             if let Some(snapshot_roots) = attribute_roots_from_snapshot.get(&contribution.file) {
                 attribute_entry_points.extend(snapshot_roots.iter().cloned());
             }
-            attribute_entry_points.extend(contribution.trait_impl_methods.iter().cloned());
+            // Trait methods in a library need an exported type and trait path;
+            // a private impl is not a blanket public-API root.
+            if !rust_file_in_library(&contribution.file, &rust_public_items) {
+                attribute_entry_points.extend(contribution.trait_impl_methods.iter().cloned());
+            }
+            for export in &mut exports {
+                export.public_api =
+                    rust_item_is_public_api(&contribution, export, &rust_public_items);
+            }
+            if let Some(facts) = &contribution.rust_api {
+                for item in &facts.items {
+                    if rust_public_items
+                        .get(&contribution.file)
+                        .is_some_and(|items| items.contains(&(item.name.clone(), item.line)))
+                    {
+                        if facts
+                            .items
+                            .iter()
+                            .filter(|candidate| candidate.name == item.name)
+                            .count()
+                            == 1
+                        {
+                            attribute_entry_points.insert(item.name.clone());
+                        }
+                        if item.owner.is_none() {
+                            attribute_entry_points
+                                .insert(macro_scoped_symbol(&item.scope, &item.name));
+                        }
+                        if let Some(owner) = &item.owner {
+                            attribute_entry_points.insert(format!("{owner}::{}", item.name));
+                            if let Some(trait_name) = &item.trait_name {
+                                attribute_entry_points
+                                    .insert(format!("{trait_name} for {owner}::{}", item.name));
+                            }
+                        }
+                    }
+                }
+            }
             let liveness_roots = liveness_roots_for_file(
                 &contribution.file,
                 &exports,
@@ -1464,7 +1567,8 @@ fn materialize_dead_code_contributions(
                 &attribute_entry_points,
                 executable_root_exports_by_file.get(&contribution.file),
                 liveness_root_files.contains(&contribution.file),
-                public_api_files.contains(&contribution.file),
+                language_for_file(&contribution.file) != "rust"
+                    && public_api_files.contains(&contribution.file),
             );
             for export in &mut exports {
                 export.is_entry_point = liveness_roots.contains(&export.symbol);
@@ -1607,15 +1711,13 @@ fn aggregate_materialized_dead_code_contributions(
     parsed: &[DeadCodeContribution],
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
-    drill_down_limit: Option<usize>,
+    _drill_down_limit: Option<usize>,
     scanned_files: usize,
     reachable: &BTreeSet<ExportNode>,
     production_reachable: &BTreeSet<ExportNode>,
     dispatched_method_names: &MethodNamesByLanguage,
 ) -> serde_json::Value {
     let test_only_callers = test_only_callers_by_target(facts);
-    let test_reachable = test_reachable_nodes(facts);
-    let caller_files = std::cell::OnceCell::new();
     let referenced_type_names = collect_referenced_type_names(facts);
     let test_module_files = cfg_test_module_files(facts);
 
@@ -1640,8 +1742,15 @@ fn aggregate_materialized_dead_code_contributions(
         // test-only usage, but its own dead symbols are not product findings:
         // they are tallied as excluded instead of counted.
         let test_code = is_test_code_file(&contribution.file, &test_module_files);
-        let is_public_api_file = public_api_files.contains(&contribution.file);
-        for (export, other_lines) in exports_deduplicated_by_node(&contribution.exports) {
+        let is_public_api_file = language_for_file(&contribution.file) != "rust"
+            && public_api_files.contains(&contribution.file);
+        let candidates = contribution
+            .exports
+            .iter()
+            .filter(|export| !export.public_api)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (export, other_lines) in exports_deduplicated_by_node(&candidates) {
             if export_uses_oxc(export) {
                 match export.verdict.unwrap_or(LivenessVerdict::Unused) {
                     LivenessVerdict::Used => {
@@ -1669,7 +1778,7 @@ fn aggregate_materialized_dead_code_contributions(
                     LivenessVerdict::Uncertain if test_code => continue,
                     LivenessVerdict::Uncertain => {
                         uncertain_count += 1;
-                        if drill_down_limit.is_none_or(|limit| uncertain_items.len() < limit) {
+                        {
                             let mut item = json!({
                                 "file": contribution.file,
                                 "symbol": export.symbol,
@@ -1713,20 +1822,14 @@ fn aggregate_materialized_dead_code_contributions(
                 let node = (contribution.file.clone(), export.symbol.clone());
                 if !test_code
                     && !is_public_api_file
+                    && !export.public_api
                     && !export.is_entry_point
                     && !production_reachable.contains(&node)
-                    && (test_only_callers.contains_key(&node) || test_reachable.contains(&node))
+                    && test_only_callers.contains_key(&node)
                 {
-                    // A symbol reached only through other test-only code (a
-                    // production-file helper that only tests call) is test
-                    // usage too; name its direct callers' files.
-                    let used_by = test_only_callers.get(&node).cloned().unwrap_or_else(|| {
-                        caller_files
-                            .get_or_init(|| caller_files_by_target(facts))
-                            .get(&node)
-                            .map(|files| files.iter().cloned().collect())
-                            .unwrap_or_default()
-                    });
+                    // Transitive test usage names the original tests, not the
+                    // production helper in the middle of the chain.
+                    let used_by = &test_only_callers[&node];
                     let mut item = json!({
                         "file": contribution.file,
                         "symbol": export.symbol,
@@ -1748,6 +1851,7 @@ fn aggregate_materialized_dead_code_contributions(
                 }
                 if reachable.contains(&node)
                     || is_public_api_file
+                    || export.public_api
                     || dispatch_liveness_keeps_export_live(
                         contribution,
                         export,
@@ -1795,32 +1899,18 @@ fn aggregate_materialized_dead_code_contributions(
         }
     }
 
-    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
-        headline_items,
-        roles,
-        drill_down_limit,
-    );
-    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
-        generated_items,
-        roles,
-        drill_down_limit,
-    );
+    let headline_items = rank_dead_code_items(headline_items, roles);
+    let generated_items = rank_dead_code_items(generated_items, roles);
+    let uncertain_items = rank_dead_code_items(uncertain_items, roles);
     let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
     let mut dead_items = headline_items;
     dead_items.extend(generated_items.iter().cloned());
-    if let Some(limit) = drill_down_limit {
-        dead_items.truncate(limit);
-    }
     let generated_top = generated_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
         .cloned()
         .collect::<Vec<_>>();
-    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
-        test_only_items,
-        roles,
-        drill_down_limit,
-    );
+    let test_only_items = rank_dead_code_items(test_only_items, roles);
     let test_only_top = test_only_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
@@ -1840,9 +1930,9 @@ fn aggregate_materialized_dead_code_contributions(
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
         "by_language": by_language,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
-        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
-        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
+        "drill_down_capped": false,
+        "generated_drill_down_capped": false,
+        "test_only_drill_down_capped": false,
         "uncertain_count": uncertain_count,
         "uncertain_items": uncertain_items,
         "languages_skipped": languages_skipped,
@@ -1973,71 +2063,69 @@ fn edges_by_source(
     edges
 }
 
-/// Nodes reachable from test code: the targets of test-origin calls and every
-/// node they reach in turn. A node in this set that production code never
-/// reaches is used only by tests, even when its direct caller lives in a
-/// production file (a helper that only tests call).
-fn test_reachable_nodes(contributions: &[DeadCodeContribution]) -> BTreeSet<ExportNode> {
-    let edges = edges_by_source(contributions, false);
-    let mut frontier = contributions
-        .iter()
-        .flat_map(|contribution| contribution.internal_calls.iter())
-        .filter(|call| call.test_origin == Some(true))
-        .map(|call| (call.file.clone(), call.symbol.clone()))
-        .collect::<Vec<_>>();
-    let mut reached = BTreeSet::new();
-    while let Some(node) = frontier.pop() {
-        if let Some(targets) = edges.get(&node) {
-            if !reached.contains(&node) {
-                frontier.extend(targets.iter().cloned());
-            }
-        }
-        reached.insert(node);
-    }
-    reached
-}
-
-/// For every call target, the files whose code calls it directly.
-fn caller_files_by_target(
-    contributions: &[DeadCodeContribution],
-) -> BTreeMap<ExportNode, BTreeSet<String>> {
-    let mut callers: BTreeMap<ExportNode, BTreeSet<String>> = BTreeMap::new();
-    for contribution in contributions {
-        for call in &contribution.internal_calls {
-            callers
-                .entry((call.file.clone(), call.symbol.clone()))
-                .or_default()
-                .insert(contribution.file.clone());
-        }
-    }
-    callers
-}
-
 fn test_only_callers_by_target(
     contributions: &[DeadCodeContribution],
 ) -> BTreeMap<ExportNode, Vec<String>> {
-    let mut callers: BTreeMap<ExportNode, (bool, BTreeSet<String>)> = BTreeMap::new();
+    let test_files = cfg_test_module_files(contributions);
+    let edges = edges_by_source(contributions, false);
+    let mut origins = BTreeMap::<ExportNode, BTreeSet<String>>::new();
+    let mut frontier = VecDeque::new();
     for contribution in contributions {
         for call in &contribution.internal_calls {
-            let Some(test_origin) = call.test_origin else {
-                continue;
-            };
-            let target = (call.file.clone(), call.symbol.clone());
-            let summary = callers
-                .entry(target)
-                .or_insert_with(|| (true, BTreeSet::new()));
-            if test_origin {
-                summary.1.insert(contribution.file.clone());
-            } else {
-                summary.0 = false;
+            if call.test_origin == Some(true) {
+                let origin = if is_test_code_file(&contribution.file, &test_files) {
+                    contribution.file.clone()
+                } else if contribution
+                    .cfg_test_ranges
+                    .iter()
+                    .any(|range| range.contains(call.line))
+                {
+                    format!("{}:{}", contribution.file, call.line)
+                } else {
+                    continue;
+                };
+                let target = (call.file.clone(), call.symbol.clone());
+                if origins.entry(target.clone()).or_default().insert(origin) {
+                    frontier.push_back(target);
+                }
             }
         }
     }
-    callers
+    while let Some(node) = frontier.pop_front() {
+        let labels = origins[&node].clone();
+        for target in edges.get(&node).into_iter().flatten() {
+            let entry = origins.entry(target.clone()).or_default();
+            let before = entry.len();
+            entry.extend(labels.iter().cloned());
+            if entry.len() != before {
+                frontier.push_back(target.clone());
+            }
+        }
+    }
+    let mut production = BTreeSet::new();
+    for contribution in contributions {
+        for call in &contribution.internal_calls {
+            if call.test_origin == Some(false)
+                && !origins.contains_key(&(contribution.file.clone(), call.caller_symbol.clone()))
+            {
+                production.insert((call.file.clone(), call.symbol.clone()));
+            }
+        }
+    }
+    // A production caller disqualifies the entire downstream chain, even if
+    // that caller is not reachable from the executable entry point.
+    let mut frontier = production.iter().cloned().collect::<Vec<_>>();
+    while let Some(node) = frontier.pop() {
+        for target in edges.get(&node).into_iter().flatten() {
+            if production.insert(target.clone()) {
+                frontier.push(target.clone());
+            }
+        }
+    }
+    origins
         .into_iter()
-        .filter_map(|(target, (all_test, files))| {
-            (all_test && !files.is_empty()).then(|| (target, files.into_iter().collect()))
-        })
+        .filter(|(node, _)| !production.contains(node))
+        .map(|(node, files)| (node, files.into_iter().collect()))
         .collect()
 }
 
@@ -2383,35 +2471,25 @@ fn dispatch_live_source_names_by_file<'a>(
     let mut by_file: BTreeMap<&'a str, DispatchNamesForFile<'a>> = BTreeMap::new();
     for contribution in contributions {
         let language = language_for_file(&contribution.file);
-        let Some(language_method_names) = dispatched_method_names.get(language) else {
-            continue;
-        };
-        if language != "go" {
+        if language == "go" {
+            let methods = contribution
+                .go_dispatch
+                .as_ref()
+                .map(|facts| facts.live_methods.clone())
+                .unwrap_or_default();
             by_file.insert(
                 contribution.file.as_str(),
-                DispatchNamesForFile::Language(language_method_names),
+                DispatchNamesForFile::GoMethods(methods),
             );
             continue;
         }
-
-        let entry = match by_file.entry(contribution.file.as_str()) {
-            BTreeMapEntry::Occupied(entry) => entry.into_mut(),
-            BTreeMapEntry::Vacant(entry) => {
-                entry.insert(DispatchNamesForFile::GoMethods(BTreeSet::new()))
-            }
-        };
-        let DispatchNamesForFile::GoMethods(methods) = entry else {
-            // A file's language is a function of its path, so a Go file cannot
-            // already be indexed as a non-Go one.
+        let Some(language_method_names) = dispatched_method_names.get(language) else {
             continue;
         };
-        for export in &contribution.exports {
-            if export_is_method(export)
-                && language_method_names.contains(symbol_liveness_name(&export.symbol))
-            {
-                methods.insert(symbol_liveness_name(&export.symbol).to_string());
-            }
-        }
+        by_file.insert(
+            contribution.file.as_str(),
+            DispatchNamesForFile::Language(language_method_names),
+        );
     }
     by_file
 }
@@ -2422,15 +2500,18 @@ fn dispatch_liveness_keeps_export_live(
     dispatched_method_names: &MethodNamesByLanguage,
 ) -> bool {
     let language = language_for_file(&contribution.file);
+    if language == "go" {
+        return export_is_method(export)
+            && contribution.go_dispatch.as_ref().is_some_and(|facts| {
+                facts
+                    .live_methods
+                    .contains(symbol_liveness_name(&export.symbol))
+            });
+    }
     let Some(method_names) = dispatched_method_names.get(language) else {
         return false;
     };
-    let name_is_dispatched = method_names.contains(symbol_liveness_name(&export.symbol));
-    if language == "go" {
-        export_is_method(export) && name_is_dispatched
-    } else {
-        name_is_dispatched
-    }
+    method_names.contains(symbol_liveness_name(&export.symbol))
 }
 
 fn export_is_method(export: &ExportContribution) -> bool {
@@ -3349,7 +3430,7 @@ fn cfg_test_module_files(contributions: &[DeadCodeContribution]) -> BTreeSet<Str
 
 /// Whether `file` is test code: a test-tree path (tests, fixtures, mocks) or
 /// a module file that is only compiled under `#[cfg(test)]`.
-fn is_test_code_file(file: &str, cfg_test_module_files: &BTreeSet<String>) -> bool {
+pub(crate) fn is_test_code_file(file: &str, cfg_test_module_files: &BTreeSet<String>) -> bool {
     is_test_tree_file(file) || cfg_test_module_files.contains(file)
 }
 
@@ -4009,6 +4090,858 @@ fn rust_module_entry_from_file(
     let file = project_root.join(file_name);
     let base_dir = file.parent().unwrap_or_else(|| Path::new("."));
     resolve_rust_module_file(base_dir, first)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RustApiFacts {
+    items: Vec<RustApiItem>,
+    modules: Vec<RustApiModule>,
+    uses: Vec<RustApiUse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RustApiItem {
+    name: String,
+    scope: Vec<String>,
+    public: bool,
+    line: u32,
+    owner: Option<String>,
+    trait_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RustApiModule {
+    scope: Vec<String>,
+    name: String,
+    public: bool,
+    file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RustApiUse {
+    scope: Vec<String>,
+    path: Vec<String>,
+    alias: String,
+    public: bool,
+    line: u32,
+}
+
+fn rust_unrestricted_pub(source: &str, node: tree_sitter::Node) -> bool {
+    find_child_by_kind(node, "visibility_modifier")
+        .is_some_and(|visibility| node_text(source, visibility).trim() == "pub")
+}
+
+fn rust_api_facts(source: &str, root: tree_sitter::Node, file: &str) -> RustApiFacts {
+    let mut facts = RustApiFacts::default();
+    rust_collect_api_facts(source, root, file, &[], &mut facts);
+    facts
+}
+
+fn rust_collect_api_facts(
+    source: &str,
+    root: tree_sitter::Node,
+    file: &str,
+    scope: &[String],
+    facts: &mut RustApiFacts,
+) {
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if rust_node_has_cfg_test_attribute(source, node) {
+            continue;
+        }
+        let name = node
+            .child_by_field_name("name")
+            .map(|name| node_text(source, name).to_string());
+        let public = rust_unrestricted_pub(source, node);
+        match node.kind() {
+            "mod_item" => {
+                let Some(name) = name else {
+                    continue;
+                };
+                let body = node.child_by_field_name("body");
+                let mut nested = scope.to_vec();
+                nested.push(name.clone());
+                let module_file = if body.is_none() {
+                    let base = Path::new(file);
+                    let dir = base.parent().unwrap_or(Path::new(""));
+                    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let dir = if matches!(stem, "lib" | "main" | "mod") {
+                        dir.to_path_buf()
+                    } else {
+                        dir.join(stem)
+                    };
+                    Some(
+                        if let Some(path) = rust_path_attribute_value(source, node) {
+                            normalize_relative_segments(
+                                &base
+                                    .parent()
+                                    .unwrap_or(Path::new(""))
+                                    .join(path)
+                                    .to_string_lossy(),
+                            )
+                        } else {
+                            dir.join(nested.join("/"))
+                                .with_extension("rs")
+                                .to_string_lossy()
+                                .replace('\\', "/")
+                        },
+                    )
+                } else {
+                    None
+                };
+                facts.modules.push(RustApiModule {
+                    scope: scope.to_vec(),
+                    name,
+                    public,
+                    file: module_file,
+                });
+                if let Some(body) = body {
+                    rust_collect_api_facts(source, body, file, &nested, facts);
+                }
+            }
+            "use_declaration" => {
+                let text = node_text(source, node);
+                let Some((_, path)) = text.split_once("use ") else {
+                    continue;
+                };
+                rust_api_use_paths(
+                    path.trim().trim_end_matches(';'),
+                    &[],
+                    &mut |path, alias| {
+                        facts.uses.push(RustApiUse {
+                            scope: scope.to_vec(),
+                            path,
+                            alias,
+                            public,
+                            line: node.start_position().row as u32 + 1,
+                        });
+                    },
+                );
+            }
+            "impl_item" => {
+                let owner = node
+                    .child_by_field_name("type")
+                    .map(|ty| rust_api_type_path(node_text(source, ty)));
+                let trait_name = node
+                    .child_by_field_name("trait")
+                    .map(|ty| rust_api_type_path(node_text(source, ty)));
+                if let Some(body) = node.child_by_field_name("body") {
+                    let mut cursor = body.walk();
+                    for method in body
+                        .named_children(&mut cursor)
+                        .filter(|item| item.kind() == "function_item")
+                    {
+                        if rust_node_has_cfg_test_attribute(source, method) {
+                            continue;
+                        }
+                        if let Some(name) = method.child_by_field_name("name") {
+                            facts.items.push(RustApiItem {
+                                name: node_text(source, name).to_string(),
+                                scope: scope.to_vec(),
+                                public: rust_unrestricted_pub(source, method)
+                                    || trait_name.is_some(),
+                                line: method.start_position().row as u32 + 1,
+                                owner: owner.clone(),
+                                trait_name: trait_name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
+            | "const_item" | "static_item" => {
+                if let Some(name) = name {
+                    facts.items.push(RustApiItem {
+                        name,
+                        scope: scope.to_vec(),
+                        public,
+                        line: node.start_position().row as u32 + 1,
+                        owner: None,
+                        trait_name: None,
+                    });
+                }
+            }
+            "macro_invocation" => {
+                // Declarative item macros often pass Rust items as their input.
+                // Parse those items rather than making the whole module public.
+                if let Some(tokens) = find_child_by_kind(node, "token_tree") {
+                    rust_collect_api_macro_items(source, tokens, file, scope, facts);
+                }
+                if let Some(name) = node.child_by_field_name("macro") {
+                    let mut cursor = root.walk();
+                    for definition in root
+                        .named_children(&mut cursor)
+                        .filter(|n| n.kind() == "macro_definition")
+                    {
+                        if definition
+                            .child_by_field_name("name")
+                            .is_some_and(|n| node_text(source, n) == node_text(source, name))
+                        {
+                            let mut cursor = definition.walk();
+                            for rule in definition
+                                .named_children(&mut cursor)
+                                .filter(|n| n.kind() == "macro_rule")
+                            {
+                                if let (Some(left), Some(right), Some(input)) = (
+                                    rule.child_by_field_name("left"),
+                                    rule.child_by_field_name("right"),
+                                    find_child_by_kind(node, "token_tree"),
+                                ) {
+                                    if let Some(expanded) = rust_api_macro_expansion(
+                                        node_text(source, left),
+                                        node_text(source, right),
+                                        node_text(source, input),
+                                    ) {
+                                        rust_collect_api_macro_text(
+                                            &expanded,
+                                            right.start_position().row,
+                                            file,
+                                            scope,
+                                            facts,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn rust_collect_api_macro_items(
+    source: &str,
+    tokens: tree_sitter::Node,
+    file: &str,
+    scope: &[String],
+    facts: &mut RustApiFacts,
+) {
+    let text = node_text(source, tokens);
+    if text.len() < 2 {
+        return;
+    }
+    rust_collect_api_macro_text(
+        &text[1..text.len() - 1],
+        tokens.start_position().row,
+        file,
+        scope,
+        facts,
+    );
+}
+
+// Expand simple ident/path captures used by re-export macros. Repetition and
+// procedural macros require compiler expansion; unresolved templates are not
+// evidence that every item in their module is public.
+fn rust_api_macro_expansion(pattern: &str, template: &str, input: &str) -> Option<String> {
+    let interior = |text: &str| {
+        text.get(1..text.len().checked_sub(1)?)
+            .map(str::trim)
+            .map(str::to_string)
+    };
+    let pattern = interior(pattern)?;
+    let input = interior(input)?;
+    let mut template = interior(template)?;
+    if !pattern.contains('$') {
+        return (pattern == input).then_some(template);
+    }
+    let patterns = split_cfg_predicates(&pattern);
+    let inputs = split_cfg_predicates(&input);
+    if patterns.len() != inputs.len() {
+        return None;
+    }
+    for (pattern, input) in patterns.into_iter().zip(inputs) {
+        let (name, kind) = pattern.trim().strip_prefix('$')?.split_once(':')?;
+        if !matches!(kind.trim(), "ident" | "path")
+            || !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+        {
+            return None;
+        }
+        if !input
+            .trim()
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == ':')
+        {
+            return None;
+        }
+        template = template.replace(&format!("${}", name.trim()), input.trim());
+    }
+    (!template.contains('$')).then_some(template)
+}
+
+fn rust_collect_api_macro_text(
+    interior: &str,
+    row: usize,
+    file: &str,
+    scope: &[String],
+    facts: &mut RustApiFacts,
+) {
+    if interior.contains('$') {
+        return;
+    }
+    let padded = format!("{}{}", "\n".repeat(row), interior);
+    let mut analyzer = DeadCodeFileAnalyzer::default();
+    if let Some(tree) = analyzer.parse_source(LangId::Rust, &padded) {
+        if !tree.root_node().has_error() {
+            rust_collect_api_facts(&padded, tree.root_node(), file, scope, facts);
+        }
+    }
+}
+
+fn rust_api_type_path(text: &str) -> String {
+    text.split('<').next().unwrap_or(text).trim().to_string()
+}
+
+fn rust_api_use_paths(text: &str, prefix: &[String], emit: &mut impl FnMut(Vec<String>, String)) {
+    let text = text.trim();
+    if let Some(open) = text.find('{') {
+        let mut prefix = prefix.to_vec();
+        prefix.extend(rust_path_segments(text[..open].trim_end_matches(':')));
+        let inner = text[open + 1..].trim_end_matches('}');
+        let mut depth = 0;
+        let mut start = 0;
+        for (index, ch) in inner.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    rust_api_use_paths(&inner[start..index], &prefix, emit);
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        rust_api_use_paths(&inner[start..], &prefix, emit);
+    } else if !text.is_empty() {
+        let (path, alias) = text
+            .split_once(" as ")
+            .map(|(path, alias)| (path.trim(), Some(alias.trim())))
+            .unwrap_or((text, None));
+        let mut segments = prefix.to_vec();
+        segments.extend(rust_path_segments(path));
+        if segments.last().is_some_and(|s| s == "self") {
+            segments.pop();
+        }
+        if let Some(name) = alias.or_else(|| segments.last().map(String::as_str)) {
+            emit(segments.clone(), name.to_string());
+        }
+    }
+}
+
+// A module's private name table is used to resolve a path, but only its public
+// table can escape through a public module or a glob. Items, not files, become
+// liveness roots, so re-exporting one function never rescues its siblings.
+type RustApiModuleId = (String, Vec<String>);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum RustApiTarget {
+    Module(RustApiModuleId),
+    Item(String, usize),
+}
+type RustApiTable = BTreeMap<RustApiModuleId, BTreeMap<String, BTreeSet<RustApiTarget>>>;
+
+fn rust_public_api_items(
+    contributions: &[DeadCodeContribution],
+    library_roots: &BTreeSet<String>,
+) -> BTreeMap<String, BTreeSet<(String, u32)>> {
+    let facts = contributions
+        .iter()
+        .filter_map(|c| c.rust_api.as_ref().map(|facts| (c.file.clone(), facts)))
+        .collect::<BTreeMap<_, _>>();
+    let files = facts.keys().cloned().collect::<BTreeSet<_>>();
+    let mut names = RustApiTable::new();
+    let mut public = RustApiTable::new();
+    let mut parents = BTreeMap::<RustApiModuleId, RustApiModuleId>::new();
+    for (file, facts) in &facts {
+        names.entry((file.clone(), vec![])).or_default();
+        for module in &facts.modules {
+            let parent = (file.clone(), module.scope.clone());
+            let child = if let Some(path) = &module.file {
+                let nested = format!("{}/mod.rs", path.trim_end_matches(".rs"));
+                if files.contains(path) {
+                    (path.clone(), vec![])
+                } else {
+                    (nested, vec![])
+                }
+            } else {
+                let mut scope = module.scope.clone();
+                scope.push(module.name.clone());
+                (file.clone(), scope)
+            };
+            parents.insert(child.clone(), parent.clone());
+            names.entry(child.clone()).or_default();
+            let target = RustApiTarget::Module(child);
+            names
+                .entry(parent.clone())
+                .or_default()
+                .entry(module.name.clone())
+                .or_default()
+                .insert(target.clone());
+            if module.public {
+                public
+                    .entry(parent)
+                    .or_default()
+                    .entry(module.name.clone())
+                    .or_default()
+                    .insert(target);
+            }
+        }
+        for (index, item) in facts
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.owner.is_none())
+        {
+            let module = (file.clone(), item.scope.clone());
+            let target = RustApiTarget::Item(file.clone(), index);
+            names
+                .entry(module.clone())
+                .or_default()
+                .entry(item.name.clone())
+                .or_default()
+                .insert(target.clone());
+            if item.public {
+                public
+                    .entry(module)
+                    .or_default()
+                    .entry(item.name.clone())
+                    .or_default()
+                    .insert(target);
+            }
+        }
+    }
+    loop {
+        let mut additions = Vec::new();
+        for (file, facts) in &facts {
+            for use_item in &facts.uses {
+                let module = (file.clone(), use_item.scope.clone());
+                if use_item.alias == "*" {
+                    let path = &use_item.path[..use_item.path.len().saturating_sub(1)];
+                    for target in rust_api_resolve(&module, path, &names, &parents) {
+                        if let RustApiTarget::Module(target) = target {
+                            for (name, targets) in public.get(&target).into_iter().flatten() {
+                                additions.push((
+                                    module.clone(),
+                                    name.clone(),
+                                    targets.clone(),
+                                    use_item.public,
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    let targets = rust_api_resolve(&module, &use_item.path, &names, &parents);
+                    additions.push((module, use_item.alias.clone(), targets, use_item.public));
+                }
+            }
+        }
+        let mut changed = false;
+        for (module, name, targets, is_public) in additions {
+            for target in targets {
+                changed |= names
+                    .entry(module.clone())
+                    .or_default()
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(target.clone());
+                if is_public {
+                    changed |= public
+                        .entry(module.clone())
+                        .or_default()
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(target);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut frontier = library_roots
+        .iter()
+        .filter(|file| facts.contains_key(*file))
+        .map(|file| RustApiTarget::Module((file.clone(), vec![])))
+        .collect::<Vec<_>>();
+    let mut live = BTreeSet::new();
+    while let Some(target) = frontier.pop() {
+        if !live.insert(target.clone()) {
+            continue;
+        }
+        if let RustApiTarget::Module(module) = target {
+            frontier.extend(
+                public
+                    .get(&module)
+                    .into_iter()
+                    .flat_map(|names| names.values())
+                    .flatten()
+                    .cloned(),
+            );
+        }
+    }
+    let mut result = BTreeMap::<String, BTreeSet<(String, u32)>>::new();
+    // Include even private modules belonging to a library, so their trait
+    // impls do not fall back to the executable's conservative dispatch roots.
+    let mut modules = library_roots
+        .iter()
+        .filter(|file| facts.contains_key(*file))
+        .map(|file| (file.clone(), vec![]))
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(module) = modules.pop() {
+        if !visited.insert(module.clone()) {
+            continue;
+        }
+        result.entry(module.0.clone()).or_default();
+        for target in names
+            .get(&module)
+            .into_iter()
+            .flat_map(|names| names.values())
+            .flatten()
+        {
+            if let RustApiTarget::Module(target) = target {
+                modules.push(target.clone());
+            }
+        }
+    }
+    // Some projections carry a synthetic export for the `pub use` binding
+    // itself. Its visibility belongs to the re-exporting module, even though
+    // the definition (and its executable body) lives in the source module.
+    for (file, facts) in &facts {
+        for use_item in &facts.uses {
+            let module = (file.clone(), use_item.scope.clone());
+            if use_item.public
+                && use_item.alias != "*"
+                && live.contains(&RustApiTarget::Module(module.clone()))
+                && rust_api_resolve(&module, &use_item.path, &names, &parents)
+                    .iter()
+                    .any(|target| live.contains(target))
+            {
+                result
+                    .entry(file.clone())
+                    .or_default()
+                    .insert((use_item.alias.clone(), use_item.line));
+            }
+        }
+    }
+    for (file, facts) in &facts {
+        for (index, item) in facts.items.iter().enumerate() {
+            let module = (file.clone(), item.scope.clone());
+            let reachable = if let Some(owner) = &item.owner {
+                item.public
+                    && rust_api_resolve(&module, &rust_path_segments(owner), &names, &parents)
+                        .iter()
+                        .any(|target| live.contains(target))
+                    && item.trait_name.as_ref().is_none_or(|trait_name| {
+                        rust_api_resolve(&module, &rust_path_segments(trait_name), &names, &parents)
+                            .iter()
+                            .any(|target| live.contains(target))
+                    })
+            } else {
+                item.public && live.contains(&RustApiTarget::Item(file.clone(), index))
+            };
+            if reachable {
+                result
+                    .entry(file.clone())
+                    .or_default()
+                    .insert((item.name.clone(), item.line));
+            }
+        }
+    }
+    result
+}
+
+fn rust_file_in_library(file: &str, public: &BTreeMap<String, BTreeSet<(String, u32)>>) -> bool {
+    public.contains_key(file)
+}
+
+fn rust_item_is_public_api(
+    contribution: &DeadCodeContribution,
+    export: &ExportContribution,
+    public: &BTreeMap<String, BTreeSet<(String, u32)>>,
+) -> bool {
+    let Some(facts) = &contribution.rust_api else {
+        return false;
+    };
+    let name = symbol_liveness_name(&export.symbol);
+    // Parser ranges can start at doc comments or attributes before the item.
+    let item = facts
+        .items
+        .iter()
+        .filter(|item| item.name == name && item.line >= export.line)
+        .min_by_key(|item| item.line)
+        .or_else(|| facts.items.iter().find(|item| item.name == name));
+    if item.is_none() {
+        return public.get(&contribution.file).is_some_and(|items| {
+            items
+                .iter()
+                .any(|(name, line)| name == &export.symbol && *line >= export.line)
+        });
+    }
+    item.is_some_and(|item| {
+        public
+            .get(&contribution.file)
+            .is_some_and(|items| items.contains(&(item.name.clone(), item.line)))
+    })
+}
+
+fn rust_api_resolve(
+    module: &RustApiModuleId,
+    path: &[String],
+    names: &RustApiTable,
+    parents: &BTreeMap<RustApiModuleId, RustApiModuleId>,
+) -> BTreeSet<RustApiTarget> {
+    let mut module = module.clone();
+    let mut path = path;
+    if path.first().is_some_and(|s| s == "crate") {
+        let mut visited = BTreeSet::new();
+        while let Some(parent) = parents.get(&module) {
+            if !visited.insert(module.clone()) {
+                return BTreeSet::new();
+            }
+            module = parent.clone();
+        }
+        path = &path[1..];
+    } else {
+        while path.first().is_some_and(|s| s == "super" || s == "self") {
+            if path[0] == "super" {
+                if let Some(parent) = parents.get(&module) {
+                    module = parent.clone();
+                }
+            }
+            path = &path[1..];
+        }
+    }
+    let mut targets = BTreeSet::from([RustApiTarget::Module(module)]);
+    for name in path {
+        targets = targets
+            .into_iter()
+            .filter_map(|target| match target {
+                RustApiTarget::Module(module) => Some(module),
+                _ => None,
+            })
+            .flat_map(|module| {
+                names
+                    .get(&module)
+                    .and_then(|names| names.get(name))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+    }
+    targets
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct GoDispatchFacts {
+    #[serde(default)]
+    module: String,
+    methods: Vec<GoMethodFact>,
+    interfaces: Vec<Vec<String>>,
+    used_types: BTreeSet<String>,
+    #[serde(default)]
+    live_methods: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoMethodFact {
+    receiver: String,
+    name: String,
+    signature: String,
+}
+
+fn go_dispatch_facts(source: &str, root: tree_sitter::Node) -> GoDispatchFacts {
+    let mut facts = GoDispatchFacts::default();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "method_declaration" {
+            if let (Some(receiver), Some(name)) = (
+                node.child_by_field_name("receiver"),
+                node.child_by_field_name("name"),
+            ) {
+                let mut cursor = receiver.walk();
+                if let Some(parameter) = receiver.named_children(&mut cursor).next() {
+                    if let Some(ty) = parameter.child_by_field_name("type") {
+                        facts.methods.push(GoMethodFact {
+                            receiver: node_text(source, ty).trim_start_matches('*').to_string(),
+                            name: node_text(source, name).to_string(),
+                            signature: go_method_signature(source, node),
+                        });
+                    }
+                }
+                let mut cursor = node.walk();
+                stack.extend(
+                    node.named_children(&mut cursor)
+                        .filter(|child| child.id() != receiver.id()),
+                );
+                continue;
+            }
+        }
+        if node.kind() == "interface_type" {
+            let mut cursor = node.walk();
+            let methods = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "method_elem")
+                .map(|method| go_method_signature(source, method))
+                .collect::<Vec<_>>();
+            // Empty interfaces impose no method contract. Embedded/constraint
+            // interfaces need their complete method set; never accept a partial
+            // set as if it were the whole interface.
+            let mut cursor = node.walk();
+            if !methods.is_empty()
+                && !node
+                    .named_children(&mut cursor)
+                    .any(|child| child.kind() == "type_elem")
+            {
+                facts.interfaces.push(methods);
+            }
+            continue;
+        }
+        if node.kind() == "type_identifier"
+            && !node.parent().is_some_and(|parent| {
+                parent.kind() == "type_spec"
+                    && parent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| name.id() == node.id())
+            })
+        {
+            facts.used_types.insert(node_text(source, node).to_string());
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    facts
+}
+
+fn go_method_signature(source: &str, method: tree_sitter::Node) -> String {
+    let name = method
+        .child_by_field_name("name")
+        .map(|name| node_text(source, name))
+        .unwrap_or("");
+    let parameters = method
+        .child_by_field_name("parameters")
+        .map(|node| go_signature_types(source, node))
+        .unwrap_or_default();
+    let result = method
+        .child_by_field_name("result")
+        .map(|node| go_signature_types(source, node))
+        .unwrap_or_default();
+    format!("{name}({parameters})({result})")
+}
+
+fn go_signature_types(source: &str, node: tree_sitter::Node) -> String {
+    if node.kind() != "parameter_list" {
+        return node_text(source, node)
+            .split_whitespace()
+            .collect::<String>();
+    }
+    let mut types = Vec::new();
+    let mut cursor = node.walk();
+    for parameter in node.named_children(&mut cursor) {
+        let Some(ty) = parameter.child_by_field_name("type") else {
+            continue;
+        };
+        let mut cursor = parameter.walk();
+        let count = parameter
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "identifier")
+            .count()
+            .max(1);
+        let ty = format!(
+            "{}{}",
+            if parameter.kind() == "variadic_parameter_declaration" {
+                "..."
+            } else {
+                ""
+            },
+            node_text(source, ty).split_whitespace().collect::<String>()
+        );
+        types.extend(std::iter::repeat_n(ty, count));
+    }
+    types.join(",")
+}
+
+fn go_interface_live_methods(
+    contributions: &[DeadCodeContribution],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut used = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut methods = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    let mut interfaces = BTreeMap::<String, Vec<Vec<String>>>::new();
+    for contribution in contributions {
+        let Some(facts) = &contribution.go_dispatch else {
+            continue;
+        };
+        let package = Path::new(&contribution.file)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_string_lossy()
+            .to_string();
+        used.entry(package.clone())
+            .or_default()
+            .extend(facts.used_types.iter().cloned());
+        interfaces
+            .entry(facts.module.clone())
+            .or_default()
+            .extend(facts.interfaces.iter().cloned());
+        for method in &facts.methods {
+            methods
+                .entry((package.clone(), method.receiver.clone()))
+                .or_default()
+                .insert(method.signature.clone());
+        }
+    }
+    // Well-known implicit contracts, including the existing sort and list
+    // dispatch set. Name-only arbitrary external interfaces are not guessed.
+    let well_known = [
+        vec!["Len()(int)", "Less(int,int)(bool)", "Swap(int,int)()"],
+        vec!["FilterValue()(string)"],
+        vec!["Read([]byte)(int,error)"],
+        vec!["Write([]byte)(int,error)"],
+        vec!["Close()(error)"],
+        vec!["String()(string)"],
+        vec!["Error()(string)"],
+    ]
+    .into_iter()
+    .map(|methods| methods.into_iter().map(str::to_string).collect::<Vec<_>>())
+    .collect::<Vec<_>>();
+    let mut result = BTreeMap::<String, BTreeSet<String>>::new();
+    for contribution in contributions {
+        let Some(facts) = &contribution.go_dispatch else {
+            continue;
+        };
+        let package = Path::new(&contribution.file)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_string_lossy()
+            .to_string();
+        for method in &facts.methods {
+            if !used
+                .get(&package)
+                .is_some_and(|types| types.contains(&method.receiver))
+            {
+                continue;
+            }
+            let implemented = &methods[&(package.clone(), method.receiver.clone())];
+            if interfaces
+                .get(&facts.module)
+                .into_iter()
+                .flatten()
+                .chain(well_known.iter())
+                .any(|interface| {
+                    interface
+                        .iter()
+                        .all(|signature| implemented.contains(signature))
+                        && interface.contains(&method.signature)
+                })
+            {
+                result
+                    .entry(contribution.file.clone())
+                    .or_default()
+                    .insert(method.name.clone());
+            }
+        }
+    }
+    result
 }
 
 fn resolve_raw_imported_export_liveness_roots(
@@ -4837,6 +5770,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 struct DeadCodeContribution {
     file: String,
     #[serde(default)]
+    rust_api: Option<RustApiFacts>,
+    #[serde(default)]
+    go_dispatch: Option<GoDispatchFacts>,
+    #[serde(default)]
     generated: Option<bool>,
     exports: Vec<ExportContribution>,
     #[serde(default)]
@@ -4947,6 +5884,8 @@ struct ImportedExportContribution {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ExportContribution {
+    #[serde(default)]
+    public_api: bool,
     symbol: String,
     kind: String,
     line: u32,
@@ -4971,6 +5910,8 @@ struct ExportContribution {
 #[derive(Debug, Clone, Deserialize)]
 struct InternalCallContribution {
     #[serde(default)]
+    line: u32,
+    #[serde(default)]
     caller_symbol: String,
     file: String,
     symbol: String,
@@ -4981,6 +5922,7 @@ struct InternalCallContribution {
 impl From<InternalCall> for InternalCallContribution {
     fn from(call: InternalCall) -> Self {
         Self {
+            line: call.line,
             caller_symbol: call.caller_symbol,
             file: call.file,
             symbol: call.symbol,
@@ -5113,7 +6055,8 @@ mod tests {
             ("src/service.ts", "handle"),
             ("src/service.ts", "missing"),
             ("src/worker.py", "process"),
-            // Go: only methods the file itself exports and that are dispatched.
+            // Go: a bare dispatched name without a used receiver and a known
+            // interface contract is insufficient to make an implicit root.
             ("src/server.go", "Serve"),
             ("src/server.go", "Handle"),
             ("src/server.go", "helper"),
@@ -5135,7 +6078,6 @@ mod tests {
                 ("src/service.ts".to_string(), "render".to_string()),
                 ("src/service.ts".to_string(), "handle".to_string()),
                 ("src/worker.py".to_string(), "process".to_string()),
-                ("src/server.go".to_string(), "Serve".to_string()),
             ])
         );
     }
@@ -5643,6 +6585,248 @@ mod tests {
         ))
     }
 
+    fn library_fixture_scan(lib: &str, hidden: &str) -> Value {
+        let (_temp, root, paths) = canonical_fixture(&[
+            (
+                "Cargo.toml",
+                "[package]\nname = 'demo'\nversion = '0.1.0'\n",
+            ),
+            ("src/lib.rs", lib),
+            ("src/hidden.rs", hidden),
+        ]);
+        let mut analyzer = DeadCodeFileAnalyzer::default();
+        let exports = paths
+            .iter()
+            .filter_map(|file| {
+                let lang = detect_language(file)?;
+                let source = fs::read_to_string(file).unwrap();
+                let tree = analyzer.parse_source(lang, &source).unwrap();
+                Some(
+                    crate::parser::extract_symbols_from_tree(&source, &tree, lang)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|symbol| symbol.exported)
+                        .map(|symbol| CallgraphExport {
+                            file: file.clone(),
+                            symbol: symbol.name,
+                            kind: serde_json::to_value(symbol.kind)
+                                .unwrap()
+                                .as_str()
+                                .unwrap()
+                                .to_string(),
+                            line: symbol.range.start_line + 1,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect();
+        scan(job(
+            &root,
+            paths.clone(),
+            snapshot(paths, exports, Vec::new()),
+        ))
+    }
+
+    #[test]
+    fn rust_public_api_requires_public_module_path() {
+        let hidden = "pub fn exposed() {}\npub(crate) fn spare() {}\n";
+        let public = library_fixture_scan("pub mod hidden;\n", hidden);
+        assert!(
+            !aggregate_has_item(&public, "src/hidden.rs", "exposed"),
+            "{public:#}"
+        );
+        assert!(
+            aggregate_has_item(&public, "src/hidden.rs", "spare"),
+            "{public:#}"
+        );
+        let private = library_fixture_scan("mod hidden;\n", hidden);
+        assert!(
+            aggregate_has_item(&private, "src/hidden.rs", "exposed"),
+            "{private:#}"
+        );
+    }
+
+    #[test]
+    fn rust_public_api_named_and_aliased_reexports_are_per_item() {
+        for use_statement in [
+            "pub use hidden::exposed;",
+            "pub use hidden::exposed as shown;",
+        ] {
+            let aggregate = library_fixture_scan(
+                &format!("mod hidden;\n{use_statement}\n"),
+                "pub fn exposed() {}\npub fn spare() {}\n",
+            );
+            assert!(
+                !aggregate_has_item(&aggregate, "src/hidden.rs", "exposed"),
+                "{aggregate:#}"
+            );
+            assert!(
+                aggregate_has_item(&aggregate, "src/hidden.rs", "spare"),
+                "{aggregate:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_public_api_reexported_type_exposes_only_public_methods() {
+        let source =
+            "pub struct S;\nimpl S {\n pub fn exposed() {}\n pub(crate) fn spare() {}\n}\n";
+        let aggregate = library_fixture_scan("mod hidden;\npub use hidden::S;\n", source);
+        assert!(
+            !aggregate_has_item(&aggregate, "src/hidden.rs", "exposed"),
+            "{aggregate:#}"
+        );
+        assert!(
+            aggregate_has_item(&aggregate, "src/hidden.rs", "spare"),
+            "{aggregate:#}"
+        );
+        let private = library_fixture_scan("mod hidden;\n", source);
+        assert!(
+            aggregate_has_item(&private, "src/hidden.rs", "exposed"),
+            "{private:#}"
+        );
+    }
+
+    #[test]
+    fn rust_public_api_same_named_method_on_private_type_remains_candidate() {
+        let aggregate = library_fixture_scan("mod hidden;\npub use hidden::S;\n",
+            "pub struct S;\npub struct Private;\nimpl S { pub fn exposed() {} }\nimpl Private { pub fn exposed() {} }\n");
+        let item = aggregate_item(&aggregate, "src/hidden.rs", "exposed").unwrap();
+        assert_eq!(
+            item["line"], 4,
+            "only Private::exposed is dead: {aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn rust_public_api_inline_glob_alias_chain_and_macro_reexports() {
+        for statement in [
+            "pub use hidden::*;",
+            "pub use facade::shown;",
+            "macro_rules! expose { () => { pub use hidden::exposed; }; }\nexpose!();",
+            "macro_rules! expose { ($module:ident, $item:ident) => { pub use $module::$item; }; }\nexpose!(hidden, exposed);",
+        ] {
+            let aggregate = library_fixture_scan(&format!(
+                "mod hidden {{ pub fn exposed() {{}} pub(crate) fn spare() {{}} }}\nmod facade {{ pub use crate::hidden::exposed as shown; }}\n{statement}\n"), "");
+            assert!(
+                !aggregate_has_item(&aggregate, "src/lib.rs", "exposed"),
+                "{aggregate:#}"
+            );
+            assert!(
+                aggregate_has_item(&aggregate, "src/lib.rs", "spare"),
+                "{aggregate:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_public_api_trait_method_needs_public_type_and_trait() {
+        let hidden = "pub struct S;\npub trait T { fn invoke(); }\nimpl T for S { fn invoke() { helper(); } }\npub(crate) fn helper() {}\n";
+        for (public_trait, statement) in [
+            (true, "pub use hidden::{S, T};"),
+            (false, "pub use hidden::S;"),
+        ] {
+            let (_temp, root, paths) = canonical_fixture(&[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = 'demo'\nversion = '0.1.0'\n",
+                ),
+                ("src/lib.rs", &format!("mod hidden;\n{statement}\n")),
+                ("src/hidden.rs", hidden),
+            ]);
+            let mut call = outbound(
+                &root,
+                "src/hidden.rs",
+                "T for S::invoke",
+                &resolved_target(&root, "src/hidden.rs", "helper"),
+            );
+            call.line = 3;
+            let aggregate = scan(job(
+                &root,
+                paths.clone(),
+                snapshot(
+                    paths,
+                    vec![export(&root, "src/hidden.rs", "helper", "function")],
+                    vec![call],
+                ),
+            ));
+            assert_eq!(
+                aggregate_has_item(&aggregate, "src/hidden.rs", "helper"),
+                !public_trait,
+                "{aggregate:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_macro_body_edges_require_reachable_invocation() {
+        let (_temp, root, paths) = canonical_fixture(&[(
+            "src/main.rs",
+            "macro_rules! m { () => { helper() }; }\npub(crate) fn helper() {}\nfn main() {}\n",
+        )]);
+        let exports = vec![export(&root, "src/main.rs", "helper", "function")];
+        let macro_body = outbound(
+            &root,
+            "src/main.rs",
+            "m!",
+            &resolved_target(&root, "src/main.rs", "helper"),
+        );
+        let invocation = outbound(
+            &root,
+            "src/main.rs",
+            "main",
+            &resolved_target(&root, "src/main.rs", "m!"),
+        );
+        for (invoked, calls) in [
+            (true, vec![macro_body.clone(), invocation]),
+            (false, vec![macro_body.clone()]),
+        ] {
+            let aggregate = scan(job(
+                &root,
+                paths.clone(),
+                snapshot_with_entry_points(
+                    paths.clone(),
+                    exports.clone(),
+                    calls,
+                    BTreeSet::from([root.join("src/main.rs")]),
+                ),
+            ));
+            assert_eq!(
+                aggregate_has_item(&aggregate, "src/main.rs", "helper"),
+                !invoked,
+                "{aggregate:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_library_private_pub_function_used_by_cfg_test_names_call_line() {
+        let (_temp, root, paths) = canonical_fixture(&[
+            ("Cargo.toml", "[package]\nname = 'demo'\nversion = '0.1.0'\n"),
+            ("src/lib.rs", "mod hidden;\n#[cfg(test)]\nmod tests {\n fn check() { crate::hidden::exposed(); }\n}\n"),
+            ("src/hidden.rs", "pub fn exposed() {}\n"),
+        ]);
+        let exports = vec![export(&root, "src/hidden.rs", "exposed", "function")];
+        let mut call = outbound(
+            &root,
+            "src/lib.rs",
+            "tests::check",
+            &resolved_target(&root, "src/hidden.rs", "exposed"),
+        );
+        call.line = 4;
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot(paths, exports, vec![call]),
+        ));
+        let item = aggregate_test_only_item(&aggregate, "src/hidden.rs", "exposed").unwrap();
+        assert_eq!(item["used_by"], json!(["src/lib.rs:4"]));
+        let public = library_fixture_scan("pub mod hidden;\n", "pub fn exposed() {}\n");
+        assert!(!aggregate_has_item(&public, "src/hidden.rs", "exposed"));
+        assert!(aggregate_test_only_item(&public, "src/hidden.rs", "exposed").is_none());
+    }
+
     fn scan_success_with_oxc(job: InspectJob) -> InspectScanSuccess {
         let entry_points = crate::inspect::entry_points::resolve_entry_points(&job.project_root);
         let options = AnalyzeOptions {
@@ -6048,6 +7232,98 @@ mod tests {
         assert_eq!(aggregate["count"], 1);
         assert_eq!(aggregate["items"][0]["symbol"], "render");
         assert_eq!(aggregate["uncertain_count"], 0);
+    }
+
+    #[test]
+    fn go_interface_method_liveness_requires_used_receiver() {
+        let (_temp, root, paths) = canonical_fixture(&[
+            ("go.mod", "module example.com/demo\n"),
+            ("main.go", "package main\ntype Webhooks interface { DeleteWebhookByID(id int) error }\ntype Store struct {}\ntype Unused struct {}\nfunc (s *Store) DeleteWebhookByID(id int) error { return nil }\nfunc (s *Unused) DeleteWebhookByID(id int) error { return nil }\nfunc (s *Store) Unrelated() {}\nfunc main() { _ = Store{} }\n"),
+        ]);
+        let mut exports = vec![
+            export(&root, "main.go", "DeleteWebhookByID", "method"),
+            export(&root, "main.go", "Unrelated", "method"),
+        ];
+        exports[0].line = 5;
+        let mut unused = exports[0].clone();
+        unused.file = root.join("unused.go");
+        unused.line = 3;
+        fs::write(root.join("unused.go"), "package main\ntype Never struct {}\nfunc (s *Never) DeleteWebhookByID(id int) error { return nil }\n").unwrap();
+        let mut paths = paths;
+        paths.push(root.join("unused.go"));
+        exports.push(unused);
+        let aggregate = scan(job(
+            &root,
+            paths.clone(),
+            snapshot_with_entry_points(
+                paths,
+                exports,
+                vec![],
+                BTreeSet::from([root.join("main.go")]),
+            ),
+        ));
+        assert!(
+            !aggregate_has_item(&aggregate, "main.go", "DeleteWebhookByID"),
+            "{aggregate:#}"
+        );
+        assert!(
+            aggregate_has_item(&aggregate, "unused.go", "DeleteWebhookByID"),
+            "{aggregate:#}"
+        );
+        assert!(
+            aggregate_has_item(&aggregate, "main.go", "Unrelated"),
+            "{aggregate:#}"
+        );
+    }
+
+    #[test]
+    fn go_interface_dispatch_requires_known_matching_contract() {
+        for contract in [
+            "",
+            "type API interface { DeleteWebhookByID(id string) error }",
+        ] {
+            let source = format!("package main\n{contract}\ntype Store struct {{}}\nfunc (s *Store) DeleteWebhookByID(id int) error {{ return nil }}\nfunc main() {{ _ = Store{{}} }}\n");
+            let (_temp, root, paths) = canonical_fixture(&[
+                ("go.mod", "module example.com/demo\n"),
+                ("main.go", &source),
+            ]);
+            let graph = snapshot_with_entry_points(
+                paths.clone(),
+                vec![export(&root, "main.go", "DeleteWebhookByID", "method")],
+                vec![],
+                BTreeSet::from([root.join("main.go")]),
+            );
+            let aggregate = scan(job(&root, paths, graph));
+            assert!(aggregate_has_item(&aggregate, "main.go", "DeleteWebhookByID"), "neither arbitrary names nor incompatible signatures imply a contract: {aggregate:#}");
+        }
+    }
+
+    #[test]
+    fn dead_code_returns_full_stably_ranked_list_even_with_limit() {
+        let (_temp, root, paths) = fixture_project(&[("src/unused.ts", "")]);
+        let exports = (0..150)
+            .rev()
+            .map(|index| {
+                let mut item = export(
+                    &root,
+                    "src/unused.ts",
+                    &format!("dead{index:03}"),
+                    "function",
+                );
+                item.line = index + 1;
+                item
+            })
+            .collect();
+        let aggregate = scan(job(&root, paths.clone(), snapshot(paths, exports, vec![])));
+        let items = aggregate["items"].as_array().unwrap();
+        assert_eq!(items.len(), 150, "{aggregate:#}");
+        assert_eq!(items[0]["symbol"], "dead000");
+        assert_eq!(items[149]["symbol"], "dead149");
+    }
+
+    #[test]
+    fn go_module_manifest_invalidates_rollup_semantics() {
+        assert!(rollup_semantics_file("nested/go.mod"));
     }
 
     #[test]
@@ -6633,7 +7909,7 @@ pub fn false_helper() -> String { "dead".to_string() }
 
         assert_eq!(
             headline_symbols(&aggregate),
-            vec!["src/util.rs::planted_dead".to_string()],
+            Vec::<String>::new(),
             "{aggregate:#}"
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
@@ -6927,7 +8203,7 @@ pub fn false_helper() -> String { "dead".to_string() }
         );
         let walk = aggregate_test_only_item(&aggregate, "src/calls.rs", "walk")
             .unwrap_or_else(|| panic!("walk is reached only from tests: {aggregate:#}"));
-        assert_eq!(walk["used_by"], json!(["src/calls.rs"]), "{walk:#}");
+        assert_eq!(walk["used_by"], json!(["tests/calls_test.rs"]), "{walk:#}");
         assert!(
             aggregate_test_only_item(&aggregate, "src/calls.rs", "extract_in_range").is_some(),
             "{aggregate:#}"

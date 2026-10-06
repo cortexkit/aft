@@ -1366,7 +1366,7 @@ mod tests {
                 first_success.aggregate
             )
         });
-    assert_eq!(test_only["used_by"], json!(["src/handlers.rs"]));
+    assert_eq!(test_only["used_by"], json!(["src/handlers.rs:17"]));
     let test_file_only =
         aggregate_test_only_item(&first_success, "src/handlers.rs", "test_file_only")
             .unwrap_or_else(|| {
@@ -1476,7 +1476,7 @@ fn inspect_dead_code_ignored_manifest_does_not_suppress_fallback_entry_points() 
 }
 
 #[test]
-fn inspect_dead_code_caps_drill_down_after_one_hundred_items() {
+fn inspect_dead_code_retains_full_drill_down_past_one_hundred_items() {
     let source = (0..101)
         .map(|index| format!("export function unused_{index}() {{}}\n"))
         .collect::<String>();
@@ -1500,9 +1500,21 @@ fn inspect_dead_code_caps_drill_down_after_one_hundred_items() {
     assert_eq!(success.aggregate["by_language"]["typescript"], 101);
     assert_eq!(
         success.aggregate["items"].as_array().expect("items").len(),
-        100
+        101
     );
-    assert_eq!(success.aggregate["drill_down_capped"], true);
+    assert_eq!(success.aggregate["drill_down_capped"], false);
+    let symbols = success.aggregate["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["symbol"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        symbols,
+        (0..101)
+            .map(|index| json!(format!("unused_{index}")))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1553,7 +1565,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/app.ts".to_string(),
             json!({
                 "file": "src/app.ts",
-                "facts_format_version": 5,
+                "facts_format_version": 6,
                 "generated": false,
                 "exports": [
                     {"symbol": "main", "kind": "function", "line": 2}
@@ -1568,7 +1580,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/barrel.ts".to_string(),
             json!({
                 "file": "src/barrel.ts",
-                "facts_format_version": 5,
+                "facts_format_version": 6,
                 "generated": false,
                 "exports": [
                     {"symbol": "Result", "kind": "re_export", "line": 1}
@@ -1582,24 +1594,35 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/foo.rs".to_string(),
             json!({
                 "file": "src/foo.rs",
-                "facts_format_version": 5,
+                "facts_format_version": 6,
                 "generated": false,
                 "exports": [
                     {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
                     {"symbol": "Dead", "kind": "struct", "line": 2, "is_type_like": true}
-                ]
+                ],
+                "rust_api": {
+                    "items": [
+                        {"name": "Foo", "scope": [], "public": true, "line": 1, "owner": null, "trait_name": null},
+                        {"name": "Dead", "scope": [], "public": true, "line": 2, "owner": null, "trait_name": null}
+                    ], "modules": [], "uses": []
+                }
             }),
         ),
         (
             "src/lib.rs".to_string(),
             json!({
                 "file": "src/lib.rs",
-                "facts_format_version": 5,
+                "facts_format_version": 6,
                 "generated": false,
                 "exports": [
                     {"symbol": "Foo", "kind": "struct", "line": 1, "is_type_like": true},
                     {"symbol": "use_foo", "kind": "function", "line": 3}
                 ],
+                "rust_api": {
+                    "items": [{"name": "use_foo", "scope": [], "public": true, "line": 3, "owner": null, "trait_name": null}],
+                    "modules": [{"scope": [], "name": "foo", "public": false, "file": "src/foo.rs"}],
+                    "uses": [{"scope": [], "path": ["foo", "Foo"], "alias": "Foo", "public": true, "line": 1}]
+                },
                 "raw_reexports": [
                     {"language": "rust", "source": "foo", "kind": "named", "imported": "Foo", "exported": "Foo", "line": 1}
                 ],
@@ -1613,7 +1636,7 @@ fn inspect_dead_code_contributions_are_byte_identical_for_mixed_fixture() {
             "src/service.ts".to_string(),
             json!({
                 "file": "src/service.ts",
-                "facts_format_version": 5,
+                "facts_format_version": 6,
                 "generated": false,
                 "exports": [
                     {"symbol": "Service", "kind": "class", "line": 1},
@@ -1669,7 +1692,7 @@ fn inspect_dead_code_contribution_shape_matches_contract() {
         contribution.contribution,
         json!({
             "file": "src/foo.ts",
-            "facts_format_version": 5,
+            "facts_format_version": 6,
                 "generated": false,
             "exports": [
                 {"symbol": "Foo", "kind": "class", "line": 1},
