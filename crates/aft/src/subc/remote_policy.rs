@@ -31,7 +31,6 @@ pub(super) fn catalog(
     identity: &RouteIdentity,
     ctx: &AppContext,
 ) -> Result<Value, subc_protocol::ErrorBody> {
-    let scoped = identity.scope.is_some();
     let preset = body
         .get("preset")
         .and_then(Value::as_str)
@@ -42,30 +41,31 @@ pub(super) fn catalog(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    if scoped {
-        let args = body.get_mut("params").and_then(Value::as_object_mut);
-        if let Some(args) = args {
-            for (name, value) in &original {
-                let valid = match name.as_str() {
-                    "behavior" => matches!(value.as_str(), Some("autonomous" | "interactive")),
-                    "tool_descs" => matches!(value.as_str(), Some("concise" | "full")),
-                    "scope" => match preset.as_str() {
-                        "reader" => value == "read",
-                        "head" | "worker" => value == "readwrite" || value == "all",
-                        _ => false,
-                    },
-                    "host" => value.as_str().is_some_and(|s| !s.is_empty()),
-                    "remote_exec" | "siblings" if preset == "worker" => true,
-                    _ => continue,
-                };
-                if !valid {
-                    return Err(cortexkit_role_tool_provider::errors::invalid_request(
-                        &format!("params.{name}"),
-                        format!("unsupported {name} value {value}"),
-                    ));
-                }
-                args.remove(name);
+    // Validate and strip the known plan params on every route. A session
+    // starter preflights its plan on an unscoped route before any scoped
+    // session exists, so the same params must be accepted there; only a
+    // scoped worker fetch freezes routing settings (see `key`).
+    if let Some(args) = body.get_mut("params").and_then(Value::as_object_mut) {
+        for (name, value) in &original {
+            let valid = match name.as_str() {
+                "behavior" => matches!(value.as_str(), Some("autonomous" | "interactive")),
+                "tool_descs" => matches!(value.as_str(), Some("concise" | "full")),
+                "scope" => match preset.as_str() {
+                    "reader" => value == "read",
+                    "head" | "worker" => value == "readwrite" || value == "all",
+                    _ => false,
+                },
+                "host" => value.as_str().is_some_and(|s| !s.is_empty()),
+                "remote_exec" | "siblings" if preset == "worker" => true,
+                _ => continue,
+            };
+            if !valid {
+                return Err(cortexkit_role_tool_provider::errors::invalid_request(
+                    &format!("params.{name}"),
+                    format!("unsupported {name} value {value}"),
+                ));
             }
+            args.remove(name);
         }
     }
     let answer = tool_provider::catalog(

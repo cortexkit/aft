@@ -207,10 +207,35 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
             .unwrap()
         );
     }
-    assert!(
-        catalog(fetch(&plan("broca-worker")), &bind, &ctx).is_err(),
-        "unscoped params retain their existing refusal"
+    // A session starter preflights its worker plan on an unscoped route. The
+    // plan's params are validated and accepted there, the answer is the same
+    // as a paramless fetch, and nothing is frozen without a scope.
+    let planned_fetch = fetch(&plan("broca-worker"));
+    let mut paramless_fetch = planned_fetch.clone();
+    paramless_fetch.as_object_mut().unwrap().remove("params");
+    let paramless = catalog(paramless_fetch, &bind, &ctx).unwrap();
+    let planned = catalog(planned_fetch, &bind, &ctx).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&planned).unwrap(),
+        serde_json::to_vec(&paramless).unwrap()
     );
+    assert!(lookup(&ctx, key(&bind, Some("worker")).as_ref()).is_none());
+    let error = catalog(
+        json!({"preset":"worker","params":{"not_a_key":true}}),
+        &bind,
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(serde_json::to_string(&error).unwrap().contains("not_a_key"));
+    let error = catalog(
+        json!({"preset":"head","params":{"remote_exec":{"enabled":true}}}),
+        &bind,
+        &ctx,
+    )
+    .unwrap_err();
+    assert!(serde_json::to_string(&error)
+        .unwrap()
+        .contains("remote_exec"));
 }
 
 #[tokio::test]
