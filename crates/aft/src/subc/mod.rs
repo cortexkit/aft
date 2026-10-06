@@ -530,6 +530,14 @@ impl PendingSubcResponses {
         self.entries.retain(|entry| {
             let keep = entry.route != route || entry.corr != corr;
             if !keep {
+                // An incremental delete owes the caller its partial progress,
+                // not a generic cancellation frame that discards that progress.
+                if entry.bare_name == "delete" {
+                    if let Some(cancellation) = &entry.pending.cancellation {
+                        cancellation.request_cancel();
+                    }
+                    return true;
+                }
                 cancelled = true;
                 if let Some(cancellation) = &entry.pending.cancellation {
                     cancellation.request_cancel();
@@ -581,8 +589,9 @@ impl PendingSubcResponses {
     /// Answers every waiting deferred response at once because the module is
     /// draining: each gets its own shutdown terminal, or a retryable
     /// `module_reloading` error when it has none, and its background work is
-    /// cancelled. Deferred responses are read-only (`inspect`, LSP navigation),
-    /// so the caller can retry on the restarted module.
+    /// cancelled. Read-only responses (`inspect`, LSP navigation) can be retried
+    /// on the restarted module. Incremental deletes stop at a checkpoint and
+    /// log their partial progress when their detailed terminal cannot be sent.
     fn drain_for_module_drain(&mut self, executor: &Executor) -> Vec<ResolvedSubcResponse> {
         let mut resolved = Vec::with_capacity(self.entries.len());
         for mut entry in self.entries.drain(..) {
@@ -742,7 +751,8 @@ fn active_tool_call_is_registered(
 /// metadata when the caller now owns the call's terminal frame: the call's own
 /// response task will find it gone and send nothing. Returns `None` when the
 /// call is not tracked, or when its response task has already claimed it and
-/// will answer it itself.
+/// will answer it itself. Incremental deletes also answer themselves after
+/// cancellation, with the removed counts and remaining tree location.
 fn cancel_active_tool_call(
     active: &ActiveToolCalls,
     executor: &Executor,
@@ -755,6 +765,15 @@ fn cancel_active_tool_call(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if calls.get(&(route, corr)).is_none_or(|call| call.answering) {
+            return None;
+        }
+        if let Some(call) = calls
+            .get(&(route, corr))
+            .filter(|call| call.tool == "delete")
+        {
+            // Keep both the active call and its deferred response tracked. The
+            // next delete checkpoint returns the detailed cancellation result.
+            executor.cancel_job(&call.root_id, &call.cancellation);
             return None;
         }
         calls.remove(&(route, corr))?
@@ -7974,6 +7993,7 @@ async fn handle_tool_call(
 
     let uses_deferred_response_seam = bare_name == "inspect"
         || bare_name == "bash_watch"
+        || bare_name == "delete"
         || crate::commands::lsp_navigation::is_lsp_navigation_command(&bare_name);
     if uses_deferred_response_seam {
         let Some(deferred_ctx) = executor.actor_context(&identity.root) else {
@@ -8032,6 +8052,12 @@ async fn handle_tool_call(
                     Ok(prepared) => {
                         let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_restriction(
+                                &prepared.request,
+                                Arc::clone(&deferred_ctx),
+                                matches!(bind_trust, BindTrust::Untrusted),
+                            )
+                        } else if bare_name_for_run == "delete" {
+                            crate::commands::delete_file::handle_delete_deferred_with_restriction(
                                 &prepared.request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
@@ -9710,6 +9736,105 @@ pub(crate) mod test_support {
             crate::commands::inspect::deferred_inspect_root_count_for_test(),
             0
         );
+    }
+
+    #[test]
+    fn cancelled_external_delete_keeps_its_partial_terminal() {
+        let executor = Executor::new();
+        let (project, root) = test_root("cancelled-external-delete");
+        let external = tempfile::tempdir().unwrap();
+        let tree = std::fs::canonicalize(external.path()).unwrap();
+        std::fs::write(tree.join("leaf"), "fixture").unwrap();
+        let ctx = inspect_context(project.path());
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let request: RawRequest = serde_json::from_value(json!({
+            "id": "delete-cancel", "command": "delete_file", "file": tree, "recursive": true
+        }))
+        .unwrap();
+        let route = RouteChannel {
+            channel: 7,
+            epoch: 1,
+        };
+        let active: ActiveToolCalls = Arc::default();
+        let (started, release) = crate::commands::delete_file::install_delete_gate_for_test(&tree);
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let worker_ctx = Arc::clone(&ctx);
+        let setup = submit_active_tool_call(
+            &executor,
+            &active,
+            route,
+            41,
+            root.clone(),
+            Lane::Mutating,
+            "delete-cancel".into(),
+            RouteDetachPolicy::CancelOnDetach,
+            "delete",
+            test_request_meta(),
+            Box::new(move |_| {
+                let DispatchOutcome::Deferred(pending) =
+                    crate::commands::delete_file::handle_delete_deferred_with_restriction(
+                        &request, worker_ctx, false,
+                    )
+                else {
+                    panic!("external unbacked delete must defer")
+                };
+                pending_tx.send(pending).unwrap();
+                Response::success("delete-cancel", json!({}))
+            }),
+        );
+        let pending = pending_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        setup.blocking_recv().unwrap();
+        started.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut responses = PendingSubcResponses::default();
+        responses.register(PendingSubcResponse {
+            route,
+            corr: 41,
+            flags: Flags::new(false, Priority::Passive, false),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "test".into(),
+            bare_name: "delete".into(),
+            format_context: crate::subc_format::FormatContext::default(),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        let terminal_owner = cancel_active_tool_call(&active, &executor, route, 41, "Cancel frame");
+        let dropped = responses.cancel_request(route, 41);
+        release.send(()).unwrap();
+        assert!(
+            terminal_owner.is_none(),
+            "delete worker must own its detailed terminal"
+        );
+        assert!(
+            !dropped,
+            "Cancel must retain the pending partial-delete response"
+        );
+        assert!(active_tool_call_is_registered(&active, route, 41));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut ready = responses.poll_ready(&executor);
+            if let Some(resolved) = ready.pop() {
+                assert_eq!(resolved.response.data["code"], "request_cancelled");
+                assert_eq!(resolved.response.data["files_deleted"], 0);
+                assert_eq!(resolved.response.data["remaining_entries"], 2);
+                assert!(tree.join("leaf").exists());
+                assert!(claim_active_tool_call(&active, route, 41));
+                finish_active_tool_call(&active, route, 41);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled delete must return a terminal"
+            );
+            std::thread::yield_now();
+        }
     }
 
     #[test]

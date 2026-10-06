@@ -9,11 +9,288 @@ use serde_json::Value;
 
 use crate::commands::delete_tree::{
     delete_recorded_tree, plan_file_backups, walk_tree, BudgetExceeded, BudgetLimit, CollectError,
-    FileBackup, NodeKind, RecursiveDeleteBackupBudget, TreeManifest, UnsupportedKind,
+    FileBackup, NodeKind, RecursiveDeleteBackupBudget, TreeEntry, TreeManifest, UnsupportedKind,
 };
 use crate::context::AppContext;
 use crate::edit;
 use crate::protocol::{RawRequest, Response};
+
+#[cfg(test)]
+#[derive(Default, Debug)]
+struct DeleteOperations {
+    entries: usize,
+    notifications: usize,
+    unlinks: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static DELETE_OPERATIONS: std::cell::RefCell<DeleteOperations> = Default::default();
+}
+
+#[cfg(test)]
+pub(crate) fn count_unlink_for_test() {
+    DELETE_OPERATIONS.with(|ops| ops.borrow_mut().unlinks += 1);
+}
+
+#[cfg(test)]
+type DeleteGate = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+#[cfg(test)]
+static DELETE_GATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, DeleteGate>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) fn install_delete_gate_for_test(
+    path: &Path,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::SyncSender<()>,
+) {
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    DELETE_GATES
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), (started_tx, release_rx));
+    (started_rx, release_tx)
+}
+
+#[cfg(test)]
+pub(crate) fn delete_gate_for_test(path: &Path) {
+    let gate = DELETE_GATES.lock().unwrap().remove(path);
+    if let Some((started, release)) = gate {
+        let _ = started.send(());
+        let _ = release.recv_timeout(std::time::Duration::from_secs(10));
+    }
+}
+
+#[cfg(test)]
+mod incident_tests {
+    use super::*;
+
+    fn context(root: &Path) -> AppContext {
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.to_path_buf());
+        // Keep fixtures unbacked independently of the integration-only temp override.
+        config.backup.enabled = Some(false);
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        ctx
+    }
+
+    #[test]
+    fn large_temp_delete_has_linear_operations() {
+        let project = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let files = 30_000;
+        for i in 0..files {
+            let dir = tree.path().join(format!("d{}", i / 300));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("f{i}")), b"fixture").unwrap();
+        }
+        let ctx = context(project.path());
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "large-delete", "command": "delete_file",
+            "file": tree.path(), "recursive": true
+        }))
+        .unwrap();
+        DELETE_OPERATIONS.with(|ops| *ops.borrow_mut() = DeleteOperations::default());
+        let started = std::time::Instant::now();
+        let response = handle_delete_file(&req, &ctx);
+        let elapsed = started.elapsed();
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["files_deleted"], files);
+        DELETE_OPERATIONS.with(|ops| {
+            let ops = ops.borrow();
+            eprintln!(
+                "large temp delete: {} entries, {:.3}s, {:.0} entries/s; {ops:?}",
+                files + 101,
+                elapsed.as_secs_f64(),
+                (files + 101) as f64 / elapsed.as_secs_f64()
+            );
+            assert_eq!(
+                ops.entries,
+                files + 100,
+                "preflight must visit each descendant once"
+            );
+            assert_eq!(
+                ops.notifications, 0,
+                "outside-root entries must not trigger per-file LSP work"
+            );
+            assert_eq!(
+                ops.unlinks,
+                files + 101,
+                "one unlink per recorded entry, with no second enumeration"
+            );
+        });
+    }
+
+    fn delete_request(path: &Path) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "incident-delete", "command": "delete_file",
+            "file": path, "recursive": true
+        }))
+        .unwrap()
+    }
+
+    fn bind_beside_delete(inside: bool) {
+        use crate::executor::{Executor, Lane};
+        use crate::path_identity::ProjectRootId;
+        use crate::response_finalize::DispatchOutcome;
+        use std::sync::Arc;
+        use std::time::Duration;
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let tree = if inside {
+            project.path().join("tree")
+        } else {
+            external.path().join("tree")
+        };
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("leaf"), b"fixture").unwrap();
+        let tree = std::fs::canonicalize(tree).unwrap();
+        let ctx = Arc::new(context(project.path()));
+        let root = ProjectRootId::from_path(project.path()).unwrap();
+        let executor = Executor::new();
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let (started, release) = install_delete_gate_for_test(&tree);
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let delete_ctx = Arc::clone(&ctx);
+        let req = delete_request(&tree);
+        let delete = executor.submit(
+            root.clone(),
+            Lane::Mutating,
+            "subc-delete-incident".into(),
+            Box::new(move |_| {
+                match handle_delete_deferred_with_restriction(&req, delete_ctx, false) {
+                    DispatchOutcome::Immediate(response) => response,
+                    DispatchOutcome::Deferred(pending) => {
+                        pending_tx.send(pending).unwrap();
+                        Response::success(&req.id, serde_json::json!({"response_deferred": true}))
+                    }
+                }
+            }),
+        );
+        started
+            .recv_timeout(Duration::from_secs(3))
+            .expect("real delete reached removal");
+        let bind = executor.submit(
+            root,
+            Lane::Mutating,
+            "subc-bind-beside-delete".into(),
+            Box::new(|_| Response::success("bind", serde_json::json!({"bound": true}))),
+        );
+        let early = bind.recv_timeout(Duration::from_millis(300));
+        // Release before asserting so a red control never strands the worker.
+        release.send(()).unwrap();
+        if inside {
+            assert!(
+                early.is_err(),
+                "inside-root delete must keep the writer barrier"
+            );
+            assert!(bind.recv_timeout(Duration::from_secs(3)).unwrap().success);
+        } else {
+            assert!(
+                early
+                    .expect("outside-root delete must not hold the bind barrier")
+                    .success
+            );
+            let mut pending = pending_rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("external delete deferred");
+            // Blocking here is only a test rendezvous: the gate has been released.
+            assert!(delete.recv_timeout(Duration::from_secs(3)).unwrap().success);
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(response) = (pending.poll)(&ctx) {
+                    assert!(response.success, "{:?}", response.data);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "detached delete did not finish"
+                );
+                std::thread::yield_now();
+            }
+        }
+        assert!(!tree.exists());
+    }
+
+    #[test]
+    fn bind_beside_outside_root_delete_proceeds() {
+        bind_beside_delete(false);
+    }
+
+    #[test]
+    fn bind_beside_inside_root_delete_waits() {
+        bind_beside_delete(true);
+    }
+
+    #[test]
+    fn cancelled_delete_stops_between_entries_and_reports_remaining() {
+        let project = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        for i in 0..200 {
+            std::fs::write(tree.path().join(format!("f{i}")), b"fixture").unwrap();
+        }
+        let ctx = context(project.path());
+        let token = crate::executor::JobCancellation::new();
+        let _guard = crate::executor::install_job_cancellation(token.clone());
+        crate::commands::delete_tree::DELETE_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |deleted| {
+                if deleted == 7 {
+                    token.request_cancel();
+                }
+            }));
+        });
+        let response = handle_delete_file(&delete_request(tree.path()), &ctx);
+        crate::commands::delete_tree::DELETE_OBSERVER
+            .with(|observer| *observer.borrow_mut() = None);
+        assert!(!response.success, "cancel must interrupt deletion");
+        assert_eq!(response.data["code"], "request_cancelled");
+        assert_eq!(
+            response.data["files_deleted"], 7,
+            "no more unlinks after Cancel checkpoint"
+        );
+        assert_eq!(response.data["directories_deleted"], 0);
+        assert_eq!(response.data["remaining_entries"], 194); // 193 files and the root
+        assert_eq!(std::fs::read_dir(tree.path()).unwrap().count(), 193);
+        assert_eq!(
+            response.data["remaining_root"],
+            tree.path().display().to_string()
+        );
+        assert_eq!(response.data["complete"], false);
+    }
+
+    #[test]
+    fn external_delete_admission_rejects_ancestors_mixed_batches_and_parent_links() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("project");
+        std::fs::create_dir(&root).unwrap();
+        let outside = parent.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let ctx = context(&root);
+        assert!(external_unbacked_request(&delete_request(&outside), &ctx).is_some());
+        assert!(external_unbacked_request(&delete_request(parent.path()), &ctx).is_none());
+        let mut batch = delete_request(&outside);
+        batch.params["files"] = serde_json::json!([outside, root]);
+        assert!(external_unbacked_request(&batch, &ctx).is_none());
+        #[cfg(unix)]
+        {
+            let link = parent.path().join("link");
+            std::os::unix::fs::symlink(&root, &link).unwrap();
+            std::fs::write(root.join("leaf"), b"fixture").unwrap();
+            assert!(external_unbacked_request(&delete_request(&link.join("leaf")), &ctx).is_none());
+        }
+    }
+}
 
 /// Handle a `delete_file` request.
 ///
@@ -37,6 +314,14 @@ use crate::protocol::{RawRequest, Response};
 /// Returns directory:   `{ file, deleted, is_directory, files_deleted, backup_ids }`
 /// Returns batch:       `{ complete, deleted: [...], skipped_files: [...] }`
 pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
+    handle_delete_file_with_skip(req, ctx, None)
+}
+
+fn handle_delete_file_with_skip(
+    req: &RawRequest,
+    ctx: &AppContext,
+    forced_skip: Option<crate::backup::BackupSkippedReason>,
+) -> Response {
     let op_id = crate::backup::new_op_id();
     let recursive = req
         .params
@@ -71,11 +356,12 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
                 skipped.push(serde_json::json!({"file": value, "reason": "not a string"}));
                 continue;
             };
-            match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget) {
+            match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget, forced_skip) {
                 Ok(result) => deleted.push(result),
                 Err(resp) => skipped.push(serde_json::json!({
                     "file": file,
                     "reason": resp.data.get("message").and_then(|v| v.as_str()).unwrap_or("delete failed"),
+                    "details": resp.data,
                 })),
             }
         }
@@ -134,7 +420,7 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget) {
+    match delete_one_or_dir(req, ctx, file, recursive, &op_id, &mut budget, forced_skip) {
         Ok(result) => Response::success(&req.id, result),
         Err(resp) => resp,
     }
@@ -151,7 +437,16 @@ fn delete_one_or_dir(
     recursive: bool,
     op_id: &str,
     budget: &mut RecursiveDeleteBackupBudget,
+    forced_skip: Option<crate::backup::BackupSkippedReason>,
 ) -> Result<serde_json::Value, Response> {
+    if crate::executor::current_job_cancelled() {
+        return Err(Response::error_with_data(
+            req.id.clone(),
+            "request_cancelled",
+            "delete_file: request cancelled before deleting this target",
+            serde_json::json!({"file": file, "complete": false, "files_deleted": 0, "remaining_root": file}),
+        ));
+    }
     let path = match ctx.validate_write_location(&req.id, Path::new(file)) {
         Ok(path) => path,
         Err(resp) => return Err(resp),
@@ -179,7 +474,7 @@ fn delete_one_or_dir(
     let _view_intent = crate::views::intent::record_paths([path.as_path()]);
     let is_symlink = metadata.file_type().is_symlink();
     let is_dir = metadata.is_dir();
-    let no_backup = no_backup_reason(ctx, &path, is_dir);
+    let no_backup = forced_skip.or_else(|| no_backup_reason(ctx, &path, is_dir));
 
     if is_symlink && no_backup.is_none() {
         let unsupported = crate::commands::delete_tree::symlink_support(&path).map_err(|e| {
@@ -316,6 +611,117 @@ fn delete_one_or_dir(
     Ok(result)
 }
 
+/// An external, unbacked delete needs no project epoch write gate: it cannot
+/// change this root's files, indexes, config or undo snapshots. Validate and
+/// resolve all locations under the admitted config before releasing the gate.
+/// Ancestors of the root and mixed batches remain writers, as do external
+/// backed-up deletes (their undo state still belongs to the actor).
+pub(crate) fn handle_delete_deferred_with_restriction(
+    req: &RawRequest,
+    ctx: std::sync::Arc<AppContext>,
+    force_restrict: bool,
+) -> crate::response_finalize::DispatchOutcome {
+    use crate::response_finalize::{DispatchOutcome, PendingResponse};
+    let Some((request, reason)) = external_unbacked_request(req, &ctx) else {
+        return DispatchOutcome::Immediate(handle_delete_file(req, &ctx));
+    };
+    let config = ctx.config();
+    let cancellation = crate::executor::current_job_cancellation()
+        .unwrap_or_else(crate::executor::JobCancellation::new);
+    let worker_cancellation = cancellation.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _config_pin = ctx.pin_config_to(config);
+        let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
+        let _restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
+        // Preserve the admitted no-backup decision even if a concurrent bind
+        // changes the policy; this continuation must never acquire snapshots.
+        let response = handle_delete_file_with_skip(&request, &ctx, Some(reason));
+        let _ = tx.send(response);
+    });
+    DispatchOutcome::Deferred(PendingResponse {
+        request_id: req.id.clone(),
+        session_id: req.session().to_string(),
+        attach_command: "delete".to_string(),
+        poll: Box::new(move |_| rx.try_recv().ok()),
+        cancellation: Some(cancellation),
+        on_shutdown: None,
+    })
+}
+
+fn outside_project_root(ctx: &AppContext, path: &Path) -> bool {
+    let config = ctx.config();
+    let Some(root) = config
+        .project_root
+        .as_ref()
+        .and_then(|root| std::fs::canonicalize(root).ok())
+    else {
+        return false;
+    };
+    // Resolve ancestors, not the final symlink: that link is unlinked, never
+    // followed. Fail closed if identity cannot be established.
+    let Some(path) = resolved_delete_location(path) else {
+        return false;
+    };
+    !path.starts_with(&root) && !root.starts_with(&path)
+}
+
+fn resolved_delete_location(path: &Path) -> Option<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some(std::fs::canonicalize(parent).ok()?.join(path.file_name()?))
+}
+
+fn external_unbacked_request(
+    req: &RawRequest,
+    ctx: &AppContext,
+) -> Option<(RawRequest, crate::backup::BackupSkippedReason)> {
+    let files: Vec<String> = match req.params.get("files") {
+        Some(Value::String(raw)) => serde_json::from_str(raw).ok()?,
+        Some(value) => serde_json::from_value(value.clone()).ok()?,
+        None => vec![req.params.get("file")?.as_str()?.to_owned()],
+    };
+    if files.is_empty() {
+        return None;
+    }
+    let mut resolved = Vec::new();
+    let mut reason = None;
+    for file in files {
+        let path = ctx
+            .validate_write_location(&req.id, Path::new(&file))
+            .ok()?;
+        let path = resolved_delete_location(&path)?;
+        if !outside_project_root(ctx, &path) {
+            return None;
+        }
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        let skip = no_backup_reason(ctx, &path, metadata.is_dir())?;
+        if reason.is_some_and(|reason| reason != skip) {
+            return None;
+        }
+        reason = Some(skip);
+        resolved.push(path);
+    }
+    let mut params = req.params.clone();
+    if req.params.get("files").is_some() {
+        params["files"] = serde_json::json!(resolved);
+    } else {
+        params["file"] = serde_json::json!(resolved[0]);
+    }
+    Some((
+        RawRequest {
+            id: req.id.clone(),
+            command: req.command.clone(),
+            lsp_hints: req.lsp_hints.clone(),
+            session_id: req.session_id.clone(),
+            params,
+        },
+        reason?,
+    ))
+}
+
 /// Why nothing at `path` would be backed up, if that holds for the whole
 /// entry. A directory is judged by itself; any other entry by the directory
 /// that holds it, because judging a symlink by its own path would resolve the
@@ -353,7 +759,9 @@ fn delete_entry_without_backup(
     ctx.backup()
         .lock()
         .record_skipped_without_snapshot(req.session(), path, op_id, reason);
-    ctx.lsp_notify_watched_config_file(path, FileChangeType::DELETED);
+    if !outside_project_root(ctx, path) {
+        ctx.lsp_notify_watched_config_file(path, FileChangeType::DELETED);
+    }
     let mut result = serde_json::json!({
         "file": file,
         "deleted": true,
@@ -430,7 +838,11 @@ fn delete_directory(
         Err(CollectError::Io(e)) => {
             return Err(Response::error(
                 &req.id,
-                "io_error",
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    "request_cancelled"
+                } else {
+                    "io_error"
+                },
                 format!(
                     "delete_file: failed to walk directory '{}': {}",
                     original, e
@@ -459,6 +871,15 @@ fn delete_directory(
     // Entries are backed up in walk order: each directory before its
     // contents, and each hard link after the path whose content it shares.
     for entry in &manifest.entries {
+        if crate::executor::current_job_cancelled() {
+            discard_delete_backups(ctx, req.session(), op_id, &backed_up_paths);
+            return Err(Response::error_with_data(
+                req.id.clone(),
+                "request_cancelled",
+                "delete_file: request cancelled during backup; nothing deleted",
+                serde_json::json!({"complete": false, "files_deleted": 0, "remaining_root": original}),
+            ));
+        }
         let entry_path = entry.path.as_path();
         let display = entry_path.display().to_string();
         let snapshot = match entry.kind {
@@ -475,6 +896,7 @@ fn delete_directory(
                 warnings.push(socket_warning(&display));
                 Ok(None)
             }
+            NodeKind::Unbacked => unreachable!("backup manifests never contain unbacked leaves"),
             NodeKind::File { .. } => match file_plan.get(&entry.path) {
                 Some(FileBackup::LinkTo(first)) => ctx.backup().lock().snapshot_hard_link_with_op(
                     req.session(),
@@ -544,7 +966,7 @@ fn delete_directory(
         );
         return Err(Response::error_with_data(
             req.id.clone(),
-            "io_error",
+            if stopped.cancelled { "request_cancelled" } else { "io_error" },
             format!(
                 "delete_file: stopped deleting '{}' partway: could not remove '{}': {}. Entries already removed can be restored with undo; '{}' and whatever still holds it were left in place.",
                 original,
@@ -554,6 +976,11 @@ fn delete_directory(
             ),
             serde_json::json!({
                 "partial": true,
+                "complete": false,
+                "files_deleted": stopped.files_deleted,
+                "directories_deleted": stopped.directories_deleted,
+                "remaining_entries": manifest.entries.len() - stopped.files_deleted - stopped.directories_deleted,
+                "remaining_root": original,
                 "stopped_at": stopped.path.display().to_string(),
             }),
         ));
@@ -630,16 +1057,22 @@ fn delete_directory_without_backups(
     boundary: &crate::walk_boundary::DeviceBoundary,
     reason: crate::backup::BackupSkippedReason,
 ) -> Result<serde_json::Value, Response> {
-    let mut files = Vec::new();
+    let mut manifest = TreeManifest::default();
+    manifest.entries.push(TreeEntry {
+        path: path.to_path_buf(),
+        kind: NodeKind::Directory,
+    });
     let mut mounts = Vec::new();
-    collect_for_unbacked_delete(path, boundary, &mut files, &mut mounts).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
+    let mut visits = 0;
+    collect_for_unbacked_delete(path, boundary, &mut manifest, &mut mounts, &mut visits).map_err(|e| {
+        Response::error_with_data(
+            req.id.clone(),
+            if e.kind() == std::io::ErrorKind::Interrupted { "request_cancelled" } else { "io_error" },
             format!(
                 "delete_file: failed to walk directory '{}': {}",
                 original, e
             ),
+            serde_json::json!({"complete": false, "files_deleted": 0, "remaining_root": original, "remaining_entries": null}),
         )
     })?;
     if !mounts.is_empty() {
@@ -655,29 +1088,62 @@ fn delete_directory_without_backups(
         ));
     }
 
-    // Rust's remove_dir_all unlinks symlinks without following them.
-    std::fs::remove_dir_all(path).map_err(|e| {
-        Response::error(
-            &req.id,
-            "io_error",
-            format!(
-                "delete_file: failed to remove directory '{}': {}",
-                original, e
-            ),
-        )
-    })?;
+    // Reuse preflight instead of enumerating the tree again in remove_dir_all.
+    // Descriptor-relative removal never follows links and can stop between
+    // entries, including for an explicit Cancel after some unlinks succeeded.
+    let stopped = delete_recorded_tree(&manifest).err();
     ctx.backup()
         .lock()
         .record_skipped_without_snapshot(req.session(), path, op_id, reason);
-    for file_path in &files {
-        ctx.lsp_notify_watched_config_file(file_path.as_path(), FileChangeType::DELETED);
+    let files = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind != NodeKind::Directory)
+        .count();
+    let directories = manifest.entries.len() - files;
+    // External temp trees do not belong to this actor's workspace. Sending
+    // thousands of config probes (including global TS invalidations) for them
+    // cannot refresh its indexes and needlessly competes for LSP/config locks.
+    if !outside_project_root(ctx, path) {
+        for entry in &manifest.entries {
+            if entry.kind != NodeKind::Directory
+                && (stopped.is_none() || std::fs::symlink_metadata(&entry.path).is_err())
+            {
+                #[cfg(test)]
+                DELETE_OPERATIONS.with(|ops| ops.borrow_mut().notifications += 1);
+                ctx.lsp_notify_watched_config_file(&entry.path, FileChangeType::DELETED);
+            }
+        }
+    }
+    if let Some(stopped) = stopped {
+        crate::slog_warn!(
+            "delete_file stopped unbacked delete root='{}' at='{}' cancelled={} files_deleted={} directories_deleted={} remaining_recorded_entries={}: {}",
+            original, stopped.path.display(), stopped.cancelled, stopped.files_deleted,
+            stopped.directories_deleted,
+            manifest.entries.len() - stopped.files_deleted - stopped.directories_deleted,
+            stopped.reason
+        );
+        return Err(Response::error_with_data(req.id.clone(),
+            if stopped.cancelled { "request_cancelled" } else { "io_error" },
+            format!("delete_file: stopped deleting '{original}' at '{}': {}. Removed {} file(s) and {} directories; {} recorded entries remain at '{original}'. No undo is available.",
+                stopped.path.display(), stopped.reason, stopped.files_deleted, stopped.directories_deleted,
+                manifest.entries.len() - stopped.files_deleted - stopped.directories_deleted),
+            serde_json::json!({
+                "file": original, "partial": stopped.files_deleted + stopped.directories_deleted > 0,
+                "complete": false, "files_deleted": stopped.files_deleted,
+                "directories_deleted": stopped.directories_deleted,
+                "remaining_entries": manifest.entries.len() - stopped.files_deleted - stopped.directories_deleted,
+                "remaining_root": original, "stopped_at": stopped.path,
+                "backup_skipped_reason": reason.as_str(),
+            })));
     }
 
     let mut result = serde_json::json!({
         "file": original,
         "deleted": true,
         "is_directory": true,
-        "files_deleted": files.len(),
+        "files_deleted": files,
+        "directories_deleted": directories,
         "backup_ids": Vec::<String>::new(),
     });
     edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
@@ -689,21 +1155,38 @@ fn delete_directory_without_backups(
 fn collect_for_unbacked_delete(
     dir: &Path,
     boundary: &crate::walk_boundary::DeviceBoundary,
-    files: &mut Vec<PathBuf>,
+    manifest: &mut TreeManifest,
     mounts: &mut Vec<String>,
+    visits: &mut usize,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
+        *visits += 1;
+        if crate::executor::current_job_cancellation().is_some_and(|token| {
+            token.cancel_already_requested()
+                || (*visits % 64 == 1 && token.cancel_requested_before_commit())
+        }) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
         let entry = entry?;
+        #[cfg(test)]
+        DELETE_OPERATIONS.with(|ops| ops.borrow_mut().entries += 1);
         let path = entry.path();
         // `DirEntry::file_type` does not follow symlinks.
         if entry.file_type()?.is_dir() {
             if boundary.should_descend(&path)? {
-                collect_for_unbacked_delete(&path, boundary, files, mounts)?;
+                manifest.entries.push(TreeEntry {
+                    path: path.clone(),
+                    kind: NodeKind::Directory,
+                });
+                collect_for_unbacked_delete(&path, boundary, manifest, mounts, visits)?;
             } else {
                 mounts.push(path.display().to_string());
             }
         } else {
-            files.push(path);
+            manifest.entries.push(TreeEntry {
+                path,
+                kind: NodeKind::Unbacked,
+            });
         }
     }
     Ok(())

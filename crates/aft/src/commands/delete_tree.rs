@@ -91,6 +91,8 @@ pub(crate) enum NodeKind {
     /// Deleted but never restored: a socket holds no data, and one recreated
     /// by undo would have no process listening on it.
     Socket,
+    /// An unbacked leaf: unlink it without inspecting its content or target.
+    Unbacked,
 }
 
 /// Entries a recursive delete refuses, because removing them would reach
@@ -219,6 +221,9 @@ impl Walk<'_> {
 
     fn walk_dir(&mut self, dir: &Path) -> Result<(), CollectError> {
         for entry in std::fs::read_dir(dir)? {
+            if crate::executor::current_job_cancelled() {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+            }
             let entry = entry?;
             let path = entry.path();
             // Neither `DirEntry::file_type` nor `DirEntry::metadata` follows
@@ -359,6 +364,48 @@ pub(crate) fn plan_file_backups(manifest: &TreeManifest) -> HashMap<PathBuf, Fil
 pub(crate) struct DeleteStopped {
     pub(crate) path: PathBuf,
     pub(crate) reason: String,
+    pub(crate) cancelled: bool,
+    pub(crate) files_deleted: usize,
+    pub(crate) directories_deleted: usize,
+}
+
+/// Deletes are incremental, not an atomic commit: keep the job cancellable
+/// through the last unlink. Explicit Cancel is read before every entry; root
+/// abandonment (which probes disk) is checked every 64 entries instead of
+/// adding a root stat to every leaf unlink. A syscall already in progress
+/// cannot be interrupted by cooperative cancellation.
+#[derive(Default)]
+struct DeleteProgress {
+    token: Option<crate::executor::JobCancellation>,
+    checkpoints: usize,
+    files: usize,
+    directories: usize,
+}
+
+impl DeleteProgress {
+    fn checkpoint(&mut self, path: &Path) -> Result<(), DeleteStopped> {
+        #[cfg(test)]
+        DELETE_OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(self.files + self.directories);
+            }
+        });
+        self.checkpoints += 1;
+        if self.token.as_ref().is_some_and(|token| {
+            token.cancel_already_requested()
+                || (self.checkpoints % 64 == 1 && token.cancel_requested_before_commit())
+        }) {
+            let mut error = stopped(path, "request cancelled between entries");
+            error.cancelled = true;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DELETE_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> = Default::default();
 }
 
 /// Remove exactly the entries in `manifest`, deepest first. Each directory is
@@ -371,25 +418,39 @@ pub(crate) fn delete_recorded_tree(manifest: &TreeManifest) -> Result<(), Delete
     let Some(root) = manifest.entries.first() else {
         return Ok(());
     };
+    let mut progress = DeleteProgress {
+        token: crate::executor::current_job_cancellation(),
+        ..Default::default()
+    };
     let mut children: HashMap<&Path, Vec<&TreeEntry>> = HashMap::new();
     for entry in &manifest.entries[1..] {
+        progress.checkpoint(&entry.path)?;
         if let Some(parent) = entry.path.parent() {
             children.entry(parent).or_default().push(entry);
         }
     }
-    platform::delete_tree(&root.path, &children)
+    #[cfg(test)]
+    crate::commands::delete_file::delete_gate_for_test(&root.path);
+    platform::delete_tree(&root.path, &children, &mut progress).map_err(|mut error| {
+        error.files_deleted = progress.files;
+        error.directories_deleted = progress.directories;
+        error
+    })
 }
 
 fn stopped(path: &Path, reason: impl std::fmt::Display) -> DeleteStopped {
     DeleteStopped {
         path: path.to_path_buf(),
         reason: reason.to_string(),
+        cancelled: false,
+        files_deleted: 0,
+        directories_deleted: 0,
     }
 }
 
 #[cfg(unix)]
 mod platform {
-    use super::{stopped, DeleteStopped, NodeKind, TreeEntry};
+    use super::{stopped, DeleteProgress, DeleteStopped, NodeKind, TreeEntry};
     use std::collections::HashMap;
     use std::ffi::{CString, OsStr};
     use std::io;
@@ -419,6 +480,8 @@ mod platform {
     }
 
     fn unlink(parent: &OwnedFd, name: &CString, directory: bool) -> io::Result<()> {
+        #[cfg(test)]
+        crate::commands::delete_file::count_unlink_for_test();
         let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
         // SAFETY: valid descriptor and NUL-terminated name.
         if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } != 0 {
@@ -456,13 +519,16 @@ mod platform {
             NodeKind::Symlink => format == libc::S_IFLNK,
             NodeKind::Socket => format == libc::S_IFSOCK,
             NodeKind::Directory => format == libc::S_IFDIR,
+            NodeKind::Unbacked => format != libc::S_IFDIR,
         }
     }
 
     pub(super) fn delete_tree(
         root: &Path,
         children: &HashMap<&Path, Vec<&TreeEntry>>,
+        progress: &mut DeleteProgress,
     ) -> Result<(), DeleteStopped> {
+        progress.checkpoint(root)?;
         let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
             return Err(stopped(root, "cannot delete a filesystem root"));
         };
@@ -479,9 +545,12 @@ mod platform {
             open_dir(libc::AT_FDCWD, &parent_name, false).map_err(|e| stopped(parent, e))?;
         let name = c_name(name).map_err(|e| stopped(root, e))?;
         let root_fd = open_dir(parent_fd.as_raw_fd(), &name, true).map_err(|e| stopped(root, e))?;
-        delete_contents(&root_fd, root, children)?;
+        delete_contents(&root_fd, root, children, progress)?;
         drop(root_fd);
-        unlink(&parent_fd, &name, true).map_err(|e| stopped(root, not_empty_reason(e)))
+        progress.checkpoint(root)?;
+        unlink(&parent_fd, &name, true).map_err(|e| stopped(root, not_empty_reason(e)))?;
+        progress.directories += 1;
+        Ok(())
     }
 
     fn not_empty_reason(error: io::Error) -> String {
@@ -498,12 +567,25 @@ mod platform {
         dir_fd: &OwnedFd,
         dir: &Path,
         children: &HashMap<&Path, Vec<&TreeEntry>>,
+        progress: &mut DeleteProgress,
     ) -> Result<(), DeleteStopped> {
         for entry in children.get(dir).into_iter().flatten() {
+            progress.checkpoint(&entry.path)?;
             let Some(file_name) = entry.path.file_name() else {
                 continue;
             };
             let name = c_name(file_name).map_err(|e| stopped(&entry.path, e))?;
+            // unlinkat does not follow a leaf symlink, and without AT_REMOVEDIR
+            // refuses a directory swapped in after preflight. No leaf stat or
+            // readlink is needed when there is no backup identity to preserve.
+            if entry.kind == NodeKind::Unbacked {
+                match unlink(dir_fd, &name, false) {
+                    Ok(()) => progress.files += 1,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(stopped(&entry.path, e)),
+                }
+                continue;
+            }
             let stat = match stat_entry(dir_fd, &name) {
                 Ok(stat) => stat,
                 // Already gone: nothing left to remove.
@@ -522,16 +604,33 @@ mod platform {
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(stopped(&entry.path, e)),
                 };
-                delete_contents(&child_fd, &entry.path, children)?;
+                // Recheck the opened directory's device as well as preflight:
+                // a mount introduced during the walk must never be entered.
+                let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
+                let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: both descriptors are live directories; stat out-parameters are valid.
+                if unsafe { libc::fstat(child_fd.as_raw_fd(), &mut child_stat) } != 0
+                    || unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut parent_stat) } != 0
+                {
+                    return Err(stopped(&entry.path, io::Error::last_os_error()));
+                }
+                if child_stat.st_dev != parent_stat.st_dev {
+                    return Err(stopped(
+                        &entry.path,
+                        "directory now belongs to another filesystem",
+                    ));
+                }
+                delete_contents(&child_fd, &entry.path, children, progress)?;
                 drop(child_fd);
+                progress.checkpoint(&entry.path)?;
                 match unlink(dir_fd, &name, true) {
-                    Ok(()) => {}
+                    Ok(()) => progress.directories += 1,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(stopped(&entry.path, not_empty_reason(e))),
                 }
             } else {
                 match unlink(dir_fd, &name, false) {
-                    Ok(()) => {}
+                    Ok(()) => progress.files += 1,
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(stopped(&entry.path, e)),
                 }
@@ -543,7 +642,7 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
-    use super::{stopped, DeleteStopped, NodeKind, TreeEntry};
+    use super::{stopped, DeleteProgress, DeleteStopped, NodeKind, TreeEntry};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -553,15 +652,19 @@ mod platform {
     pub(super) fn delete_tree(
         root: &Path,
         children: &HashMap<&Path, Vec<&TreeEntry>>,
+        progress: &mut DeleteProgress,
     ) -> Result<(), DeleteStopped> {
-        delete_dir(root, children)
+        delete_dir(root, children, progress)
     }
 
     fn delete_dir(
         dir: &Path,
         children: &HashMap<&Path, Vec<&TreeEntry>>,
+        progress: &mut DeleteProgress,
     ) -> Result<(), DeleteStopped> {
+        progress.checkpoint(dir)?;
         for entry in children.get(dir).into_iter().flatten() {
+            progress.checkpoint(&entry.path)?;
             let metadata = match std::fs::symlink_metadata(&entry.path) {
                 Ok(metadata) => metadata,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -570,7 +673,7 @@ mod platform {
             let is_link = metadata.file_type().is_symlink();
             match entry.kind {
                 NodeKind::Directory if metadata.is_dir() && !is_link => {
-                    delete_dir(&entry.path, children)?;
+                    delete_dir(&entry.path, children, progress)?;
                 }
                 NodeKind::Directory => {
                     return Err(stopped(
@@ -584,10 +687,20 @@ mod platform {
                         "it was replaced after the delete started",
                     ));
                 }
-                _ => std::fs::remove_file(&entry.path).map_err(|e| stopped(&entry.path, e))?,
+                _ => {
+                    #[cfg(test)]
+                    crate::commands::delete_file::count_unlink_for_test();
+                    std::fs::remove_file(&entry.path).map_err(|e| stopped(&entry.path, e))?;
+                    progress.files += 1;
+                }
             }
         }
-        std::fs::remove_dir(dir).map_err(|e| stopped(dir, e))
+        progress.checkpoint(dir)?;
+        #[cfg(test)]
+        crate::commands::delete_file::count_unlink_for_test();
+        std::fs::remove_dir(dir).map_err(|e| stopped(dir, e))?;
+        progress.directories += 1;
+        Ok(())
     }
 }
 
