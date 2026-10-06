@@ -121,17 +121,33 @@ impl Drop for ScopedEnvVar {
     }
 }
 
-#[cfg(windows)]
-const HERMETIC_GIT_CONFIG_PATH: &str = "NUL";
-#[cfg(not(windows))]
-const HERMETIC_GIT_CONFIG_PATH: &str = "/dev/null";
+/// An empty git config file. Git for Windows refuses the `NUL` device as a
+/// config path ("unable to access 'NUL': Invalid argument"), so Windows uses
+/// a real empty file; elsewhere `/dev/null` reads as empty.
+fn hermetic_git_config_path() -> &'static OsStr {
+    #[cfg(windows)]
+    {
+        static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+        PATH.get_or_init(|| {
+            let path = std::env::temp_dir()
+                .join(format!("aft-test-empty-gitconfig-{}", std::process::id()));
+            std::fs::write(&path, b"").expect("write empty hermetic git config");
+            path
+        })
+        .as_os_str()
+    }
+    #[cfg(not(windows))]
+    {
+        OsStr::new("/dev/null")
+    }
+}
 
 /// Test-only git env overrides that suppress user/system config reads.
 #[allow(dead_code)]
 pub(crate) fn hermetic_git_env() -> [(&'static str, &'static OsStr); 2] {
     [
-        ("GIT_CONFIG_GLOBAL", OsStr::new(HERMETIC_GIT_CONFIG_PATH)),
-        ("GIT_CONFIG_SYSTEM", OsStr::new(HERMETIC_GIT_CONFIG_PATH)),
+        ("GIT_CONFIG_GLOBAL", hermetic_git_config_path()),
+        ("GIT_CONFIG_SYSTEM", hermetic_git_config_path()),
     ]
 }
 
