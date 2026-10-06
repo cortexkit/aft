@@ -7418,13 +7418,15 @@ async fn handle_tool_call(
                 .await
             }
         };
-        let role = match tool_provider::admit(
+        let role = match tool_provider::admit_on_route(
             &call,
             identity.scope.is_some(),
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
             !matches!(identity.trust, BindTrust::Untrusted),
+            &identity.project_root,
+            frame.header.channel,
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -7551,7 +7553,17 @@ async fn handle_tool_call(
     // same error frame a v1 refusal gets.
     let role = match call.caller_role(scoped_route && agent_tool) {
         Ok(role) => role,
-        Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        Err(error) => {
+            if scoped_route && agent_tool && call.preset.is_none() {
+                tool_provider::log_scoped_preset_refusal(
+                    &identity.session,
+                    &identity.project_root,
+                    frame.header.channel,
+                    &call.name,
+                );
+            }
+            return send_provider_error(tx, metrics, frame, error).await;
+        }
     };
     if agent_tool && call.preset.is_none() && !scoped_route {
         metrics.record_presetless_tool_call(&identity.harness);

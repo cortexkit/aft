@@ -247,6 +247,48 @@ static INDEX_EVENT_CAPTURE: LazyLock<Mutex<Option<Vec<String>>>> =
 #[cfg(test)]
 static INDEX_EVENT_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(test)]
+thread_local! {
+    static LOG_LINE_CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+static LOG_LINE_CAPTURE_INIT: OnceLock<()> = OnceLock::new();
+
+#[cfg(test)]
+struct TestLogCapture;
+
+#[cfg(test)]
+impl log::Log for TestLogCapture {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            LOG_LINE_CAPTURE.with(|slot| {
+                if let Some(lines) = slot.borrow_mut().as_mut() {
+                    lines.push(format!("{} {}", record.level(), record.args()));
+                }
+            });
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+#[cfg(test)]
+pub(crate) fn capture_log_lines<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    LOG_LINE_CAPTURE_INIT.get_or_init(|| {
+        let _ = log::set_boxed_logger(Box::new(TestLogCapture));
+        log::set_max_level(log::LevelFilter::Info);
+    });
+    LOG_LINE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let lines = LOG_LINE_CAPTURE.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    (result, lines)
+}
+
 /// Mint a stable per-attempt id (`b-<pid>-<n>`) at `build_started`.
 pub(crate) fn mint_index_build_id() -> String {
     let n = INDEX_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);

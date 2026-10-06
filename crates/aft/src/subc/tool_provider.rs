@@ -1,7 +1,9 @@
 //! The v1 catalog and admission boundary, separate from plugin tool forwarding.
 
-use std::collections::BTreeMap;
-use std::sync::{LazyLock, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
@@ -481,6 +483,118 @@ pub(super) fn admit(
     let role = resolve_caller_role(call.preset.as_deref(), scoped_route, false)?;
     admit_as(call, disabled, powershell_available, session, trusted, role)?;
     Ok(role)
+}
+
+const SCOPED_PRESET_REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct RefusalLogState {
+    last_logged_at: Option<Instant>,
+    suppressed: u64,
+}
+
+static SCOPED_PRESET_REFUSALS: LazyLock<Mutex<HashMap<(String, String), RefusalLogState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Admit a provider call with the route identity available for refusal diagnostics.
+pub(super) fn admit_on_route(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    scoped_route: bool,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    root: &Path,
+    channel: u16,
+) -> Result<CallerRole, ErrorBody> {
+    admit_on_route_at(
+        call,
+        scoped_route,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+        root,
+        channel,
+        Instant::now(),
+    )
+}
+
+fn admit_on_route_at(
+    call: &cortexkit_role_tool_provider::call::ToolCallRequest,
+    scoped_route: bool,
+    disabled: &[String],
+    powershell_available: bool,
+    session: &str,
+    trusted: bool,
+    root: &Path,
+    channel: u16,
+    now: Instant,
+) -> Result<CallerRole, ErrorBody> {
+    let result = admit(
+        call,
+        scoped_route,
+        disabled,
+        powershell_available,
+        session,
+        trusted,
+    );
+    if scoped_route
+        && call.preset.is_none()
+        && result
+            .as_ref()
+            .err()
+            .is_some_and(|error| errors::invalid_request_field(error) == Some("preset"))
+    {
+        log_scoped_preset_refusal_at(session, root, channel, &call.name, now);
+    }
+    result
+}
+
+/// Log a scoped route's missing-preset refusal, keeping repeated broken calls quiet.
+pub(super) fn log_scoped_preset_refusal(session: &str, root: &Path, channel: u16, tool: &str) {
+    log_scoped_preset_refusal_at(session, root, channel, tool, Instant::now());
+}
+
+fn log_scoped_preset_refusal_at(
+    session: &str,
+    root: &Path,
+    channel: u16,
+    tool: &str,
+    now: Instant,
+) {
+    let root = root.display().to_string();
+    let key = (session.to_string(), root.clone());
+    let (should_log, suppressed) = {
+        let Ok(mut refusals) = SCOPED_PRESET_REFUSALS.lock() else {
+            return;
+        };
+        let state = refusals.entry(key).or_default();
+        let elapsed = state
+            .last_logged_at
+            .and_then(|last| now.checked_duration_since(last))
+            .unwrap_or_default();
+        if state.last_logged_at.is_some() && elapsed < SCOPED_PRESET_REFUSAL_WINDOW {
+            state.suppressed = state.suppressed.saturating_add(1);
+            (false, 0)
+        } else {
+            let suppressed = std::mem::take(&mut state.suppressed);
+            state.last_logged_at = Some(now);
+            (true, suppressed)
+        }
+    };
+    if !should_log {
+        return;
+    }
+    if suppressed > 0 {
+        let line =
+            format!("tool call refusals suppressed={suppressed} session={session} root={root}");
+        crate::slog_warn!("{line}");
+    }
+    let line = format!(
+        "tool call refused: scoped route without preset tool={tool} session={session} root={root} channel={channel}"
+    );
+    crate::slog_warn!("{line}");
 }
 
 /// [`admit`] for a call whose role is already resolved.
@@ -1443,6 +1557,60 @@ mod tests {
             let role = CallerRole::from_preset(preset);
             assert_eq!(role.is_worker(), preset == CatalogPreset::Worker);
         }
+    }
+
+    #[test]
+    fn scoped_presetless_call_logs_once_and_reports_suppressed_refusals() {
+        let call = call("status", json!({}));
+        let session = format!("preset-refusal-test-{}", std::process::id());
+        let root = std::env::temp_dir().join(format!("preset-refusal-test-{}", std::process::id()));
+        let channel = 42;
+        let start = Instant::now();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for second in 0..5 {
+                let error = admit_on_route_at(
+                    &call,
+                    true,
+                    &[],
+                    true,
+                    &session,
+                    true,
+                    &root,
+                    channel,
+                    start + Duration::from_secs(second),
+                )
+                .unwrap_err();
+                assert_eq!(errors::invalid_request_field(&error), Some("preset"));
+            }
+            let error = admit_on_route_at(
+                &call,
+                true,
+                &[],
+                true,
+                &session,
+                true,
+                &root,
+                channel,
+                start + SCOPED_PRESET_REFUSAL_WINDOW,
+            )
+            .unwrap_err();
+            assert_eq!(errors::invalid_request_field(&error), Some("preset"));
+        });
+
+        let root = root.display().to_string();
+        assert_eq!(lines.len(), 3, "captured warning lines: {lines:?}");
+        let refusal = format!(
+            "tool call refused: scoped route without preset tool=status session={session} root={root} channel={channel}"
+        );
+        assert!(lines[0].ends_with(&refusal), "{}", lines[0]);
+        assert!(
+            lines[1].ends_with(&format!(
+                "tool call refusals suppressed=4 session={session} root={root}"
+            )),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].ends_with(&refusal), "{}", lines[2]);
     }
 
     #[test]

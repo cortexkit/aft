@@ -87,6 +87,22 @@ pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 const KILL_IN_FLIGHT_WAIT: Duration =
     Duration::from_secs(super::process::TERMINATE_GRACE.as_secs() + 2);
 
+fn log_bash_spawn(task_id: &str, pid: u32, session: &str, root: &Path, command: &str) {
+    let command: String = command
+        .chars()
+        .take(200)
+        .map(|character| match character {
+            '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect();
+    let line = format!(
+        "bash spawned task={task_id} pid={pid} session={session} root={} cmd={command}",
+        root.display()
+    );
+    crate::slog_info!("{line}");
+}
+
 /// Bound the ConPTY close/output drain after the child has exited. A stuck
 /// conhost or reader must not keep the task running forever or claim that all
 /// output was captured.
@@ -2488,6 +2504,7 @@ impl BgTaskRegistry {
         };
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
+        let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
 
         if self.task(&task_id).is_some() {
             let _ = delete_resolved_task(&task_layout);
@@ -2499,7 +2516,7 @@ impl BgTaskRegistry {
             session_id.clone(),
             command.to_string(),
             workdir.clone(),
-            project_root,
+            project_root.clone(),
             timeout_ms,
             notify_on_completion,
             compressed,
@@ -2575,6 +2592,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
         metadata.mark_running(child_pid, child_pid as i32);
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
@@ -2737,13 +2755,14 @@ impl BgTaskRegistry {
             .map_err(|error| format!("failed to create PTY task layout: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
+        let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
             session_id.clone(),
             command.to_string(),
             workdir.clone(),
-            project_root,
+            project_root.clone(),
             timeout_ms,
             notify_on_completion,
             compressed,
@@ -2790,6 +2809,7 @@ impl BgTaskRegistry {
         };
 
         if let Some(child_pid) = runtime.child_pid {
+            log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
             metadata.mark_running(child_pid, child_pid as i32);
         } else {
             metadata.status = BgTaskStatus::Running;
@@ -2924,13 +2944,14 @@ impl BgTaskRegistry {
             .map_err(|error| format!("failed to create background task layout: {error}"))?;
         let task_id = task_layout.paths.task_id.clone();
         let paths = task_layout.paths.clone();
+        let spawn_log_root = project_root.as_deref().unwrap_or(&workdir).to_path_buf();
 
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
             session_id.clone(),
             command.to_string(),
             workdir.clone(),
-            project_root,
+            project_root.clone(),
             timeout_ms,
             notify_on_completion,
             compressed,
@@ -2969,6 +2990,7 @@ impl BgTaskRegistry {
         };
 
         let child_pid = child.id();
+        log_bash_spawn(&task_id, child_pid, &session_id, &spawn_log_root, command);
         metadata.status = BgTaskStatus::Running;
         metadata.child_pid = Some(child_pid);
         metadata.pgid = None;
@@ -12777,6 +12799,68 @@ mod tests {
                 Some(project.to_path_buf()),
             )
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_bash_task_logs_child_pid_and_truncated_command() {
+        let storage = tempfile::tempdir().expect("storage dir");
+        let root = storage.path().join("project");
+        fs::create_dir_all(&root).unwrap();
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        let session = "spawn-log-session";
+        let command = format!("sleep 30\n#{}", "x".repeat(220));
+        let ((task_id, child_pid), lines) = crate::logging::capture_log_lines(|| {
+            let task_id = registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    &command,
+                    session.to_string(),
+                    root.clone(),
+                    HashMap::new(),
+                    super::super::HardKill::After(Duration::from_secs(60)),
+                    storage.path().to_path_buf(),
+                    10,
+                    true,
+                    false,
+                    Some(root.clone()),
+                )
+                .unwrap();
+            let child_pid = registry
+                .task_for_session(&task_id, session)
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .child_pid
+                .unwrap();
+            (task_id, child_pid)
+        });
+
+        let expected_command: String = command
+            .chars()
+            .take(200)
+            .map(|character| match character {
+                '\n' | '\r' => ' ',
+                other => other,
+            })
+            .collect();
+        let spawn_logs: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("bash spawned task="))
+            .collect();
+        assert_eq!(spawn_logs.len(), 1, "captured spawn logs: {lines:?}");
+        assert!(
+            spawn_logs[0].ends_with(&format!(
+                "bash spawned task={task_id} pid={child_pid} session={session} root={} cmd={expected_command}",
+                root.display()
+            )),
+            "{}",
+            spawn_logs[0]
+        );
+        assert!(registry.kill(&task_id, session).is_ok());
+        registry.shutdown();
     }
 
     #[cfg(unix)]
