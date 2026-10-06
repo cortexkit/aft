@@ -381,9 +381,12 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
     // budget. A daemon that predates the field ignores it and treats the
     // module as ready, which is the behaviour before readiness existed.
     //
-    // The builder leaves `capabilities`, `self_signals` and `provenance`
-    // unset, so neither of the first two reaches the wire; `provenance` is
-    // added at HELLO time by `declare_provenance`, because where the launch
+    // `capabilities.provides` lists `tool-provider/v1`: that catalog entry is
+    // how a session starter discovers a tool provider before it builds a
+    // worker's fetch plan. Without it, no worker gets a plan, so its calls
+    // carry no preset and run as `head`. Nothing goes in `requires`.
+    // The builder leaves `self_signals` and `provenance` unset; `provenance`
+    // is added at HELLO time by `declare_provenance`, because where the launch
     // nonce came from is a fact about the running process, not the build.
     // `consumes` is descriptive (the
     // daemon doesn't read it) and lists the modules AFT opens routes to: the
@@ -397,6 +400,11 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
         .protocol_ver(PROTOCOL_VERSION)
         .trust_tier(Some(TrustTier::FirstParty))
         .ready(false)
+        .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec![cortexkit_role_tool_provider::PROVIDES.to_string()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
         .provides(vec![
             ProviderRole::ToolProvider {
                 tools: [
@@ -637,6 +645,21 @@ mod tests {
             status.get("additionalProperties").and_then(|v| v.as_bool()),
             Some(false),
             "status schema must forbid additionalProperties"
+        );
+    }
+
+    /// A session starter finds tool providers by this catalog field, so a
+    /// manifest without it leaves every worker without a plan or preset.
+    #[test]
+    fn build_manifest_lists_tool_provider_capability_without_requirements() {
+        let manifest = build_manifest_for_host(true);
+        let capabilities = manifest.capabilities.as_ref().expect("capabilities");
+        assert_eq!(capabilities.provides, vec!["tool-provider/v1".to_string()]);
+        assert!(capabilities.requires.is_empty());
+        let wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(
+            wire.pointer("/capabilities/provides"),
+            Some(&serde_json::json!(["tool-provider/v1"]))
         );
     }
 
@@ -898,6 +921,15 @@ mod tests {
         );
         // The scheduled-task vocabulary was retired from the manifest.
         assert_eq!(top.remove("scheduled_tasks"), Some(json!([])));
+        // The snapshot predates the catalog capability that lets a session
+        // starter discover AFT as a tool provider.
+        assert_eq!(
+            top.insert(
+                "capabilities".to_string(),
+                json!({"provides": ["tool-provider/v1"], "requires": [], "must_never_reach": []}),
+            ),
+            None
+        );
         // The management role now always serializes its delivery concurrency;
         // AFT declares the value the daemon assumes when the key is absent.
         let management = expected["provides"][1]
