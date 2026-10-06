@@ -71,6 +71,8 @@ pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 pub(crate) const RENEWAL_PERSIST_STEP_MS: u64 = 60_000;
 const PERSISTED_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Bounded retries keep transient file locks from losing task history forever.
+const FINISHED_DELETE_MAX_ATTEMPTS: usize = 5;
 
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
@@ -555,6 +557,8 @@ pub(crate) struct RegistryInner {
     #[cfg(unix)]
     db_schema_hints: AtomicBool,
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    /// Failed finished-task bundle deletions and their bounded retry count.
+    finished_delete_attempts: Mutex<HashMap<String, usize>>,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
@@ -632,6 +636,10 @@ pub(crate) struct BgTask {
     pub(crate) paths: TaskPaths,
     artifact_root: PathBuf,
     pub(crate) started: Instant,
+    /// Completion of the PTY reader thread, which owns an output-file handle
+    /// independently of `PtyRuntime` while it drains the pseudoterminal. Piped
+    /// and replayed tasks have no reader and start complete.
+    terminal_reader_done: Arc<AtomicBool>,
     /// Whether a delegated worker's wait may push this task's hard kill later
     /// ([`BgTaskRegistry::renew_hard_kill`]): true only for the implicit
     /// default kill, which the task's record carries (`default_hard_kill`) so
@@ -844,8 +852,8 @@ pub(crate) struct BgTaskState {
     /// the process lifetime. Daemon writes never reopen child-writable names.
     pub(crate) io_handles: Option<TaskIoHandles>,
     pub(crate) detached: bool,
-    /// True once `reap_child` has observed the direct child handle's exit
-    /// via `try_wait()`. Used by the two-pass watchdog to skip the racy
+    /// True once an owned child handle has observed the direct child's exit
+    /// via `try_wait()` or `wait()`. Used by the two-pass watchdog to skip the racy
     /// `is_process_alive(child_pid)` probe on the second pass — we already
     /// have authoritative evidence that the child is dead, no need to
     /// re-verify via PID liveness which is unreliable on Windows where
@@ -896,6 +904,7 @@ impl BgTaskRegistry {
                 #[cfg(unix)]
                 db_schema_hints: AtomicBool::new(true),
                 tasks: Mutex::new(HashMap::new()),
+                finished_delete_attempts: Mutex::new(HashMap::new()),
                 watchdog_tasks: Mutex::new(HashMap::new()),
                 completions: Mutex::new(VecDeque::new()),
                 progress_sender,
@@ -2605,6 +2614,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
+            terminal_reader_done: Arc::new(AtomicBool::new(true)),
             hard_kill_renewable: hard_kill.renewable(),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
@@ -2818,6 +2828,7 @@ impl BgTaskRegistry {
         self.persist_task(&paths, &metadata)
             .map_err(|e| format!("failed to persist running background task metadata: {e}"))?;
 
+        let terminal_reader_done = Arc::clone(&runtime.reader_done);
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
@@ -2826,6 +2837,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
+            terminal_reader_done,
             hard_kill_renewable: hard_kill.renewable(),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
@@ -3005,6 +3017,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started: Instant::now(),
+            terminal_reader_done: Arc::new(AtomicBool::new(true)),
             hard_kill_renewable: hard_kill.renewable(),
             persisted_hard_kill_ms: AtomicU64::new(timeout_ms.unwrap_or(0)),
             last_reminder_at: Mutex::new(None),
@@ -4843,6 +4856,7 @@ impl BgTaskRegistry {
                     }
                     match delete_task_bundle(&resolved.paths) {
                         Ok(()) => {
+                            self.forget_finished_delete_attempts(&metadata.task_id);
                             self.delete_gc_task_from_db(&metadata);
                             self.evaluate_erased_watch_targets();
                             deleted += 1;
@@ -5196,22 +5210,100 @@ impl BgTaskRegistry {
                 Vec::new()
             };
         for (task_id, task) in removable_tasks {
-            match delete_bundle(&task.paths) {
-                Ok(()) => log::debug!("deleted persisted background task bundle {task_id}"),
-                Err(error) => match self.inner.tasks.lock() {
-                    Ok(mut tasks) => {
-                        tasks.entry(task_id.clone()).or_insert(task);
+            let handles_released = release_terminal_io_handles(&task);
+            let paths = task.paths.clone();
+            if self.finished_delete_attempt_count(&task_id) >= FINISHED_DELETE_MAX_ATTEMPTS {
+                self.retire_watchdog_task(&task_id);
+                continue;
+            }
+
+            let delete_result = if handles_released {
+                // The watchdog map can hold another `Arc<BgTask>`. The task's
+                // runtime and pre-opened IO handles are closed before delete.
+                self.retire_watchdog_task(&task_id);
+                delete_bundle(&paths)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "terminal task runtime still owns a child or PTY handle",
+                ))
+            };
+
+            match delete_result {
+                Ok(()) => {
+                    self.forget_finished_delete_attempts(&task_id);
+                    log::debug!("deleted persisted background task bundle {task_id}");
+                }
+                Err(error) => {
+                    let attempts = self.note_finished_delete_attempt(&task_id);
+                    if attempts == 1 {
                         crate::slog_warn!(
-                            "failed to delete persisted background task bundle {task_id}; retained for a later cleanup retry: {error}"
+                            "failed to delete persisted background task bundle {task_id}; retrying up to {FINISHED_DELETE_MAX_ATTEMPTS} attempts: {error}"
                         );
                     }
-                    Err(lock_error) => crate::slog_warn!(
-                        "failed to delete persisted background task bundle {task_id}: {error}; registry lock also failed, so it could not be retained for retry: {lock_error}"
-                    ),
-                },
+                    if attempts >= FINISHED_DELETE_MAX_ATTEMPTS {
+                        self.retire_watchdog_task(&task_id);
+                        crate::slog_warn!(
+                            "giving up deleting background task bundle {task_id} after {attempts} attempts; leftover path {} will be eligible for persisted-task GC on a later replay after its grace period: {error}",
+                            paths.dir.display()
+                        );
+                        continue;
+                    }
+
+                    match self.inner.tasks.lock() {
+                        Ok(mut tasks) => {
+                            tasks.entry(task_id.clone()).or_insert(task);
+                        }
+                        Err(lock_error) => {
+                            self.retire_watchdog_task(&task_id);
+                            self.note_finished_delete_abandoned(&task_id);
+                            crate::slog_warn!(
+                                "giving up deleting background task bundle {task_id}; leftover path {} could not be retained for retry because the registry lock failed: {error}; {lock_error}. Persisted-task GC can reclaim it on a later replay after its grace period",
+                                paths.dir.display()
+                            );
+                        }
+                    }
+                }
             }
         }
         self.prune_session_harnesses();
+    }
+
+    fn finished_delete_attempt_count(&self, task_id: &str) -> usize {
+        self.inner
+            .finished_delete_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(task_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn note_finished_delete_attempt(&self, task_id: &str) -> usize {
+        let mut attempts = self
+            .inner
+            .finished_delete_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let attempts = attempts.entry(task_id.to_string()).or_default();
+        *attempts = attempts.saturating_add(1);
+        *attempts
+    }
+
+    fn note_finished_delete_abandoned(&self, task_id: &str) {
+        self.inner
+            .finished_delete_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(task_id.to_string(), FINISHED_DELETE_MAX_ATTEMPTS);
+    }
+
+    fn forget_finished_delete_attempts(&self, task_id: &str) {
+        self.inner
+            .finished_delete_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(task_id);
     }
 
     pub fn drain_completions(&self) -> Vec<BgCompletion> {
@@ -5865,6 +5957,7 @@ impl BgTaskRegistry {
             paths: paths.clone(),
             artifact_root: canonical_artifact_root(&paths),
             started,
+            terminal_reader_done: Arc::new(AtomicBool::new(true)),
             hard_kill_renewable: renewable,
             persisted_hard_kill_ms: AtomicU64::new(persisted_hard_kill_ms),
             last_reminder_at: Mutex::new(suppress_replayed_running_reminder.then(Instant::now)),
@@ -6232,7 +6325,11 @@ impl BgTaskRegistry {
                         // (issue #91). The active-kill branch below already
                         // `wait()`s after signaling, so this is the only kill
                         // path that needed the explicit reap.
-                        TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
+                        TaskRuntime::Piped(child_slot) => {
+                            if reap_piped_child(child_slot) {
+                                state.child_exit_observed = true;
+                            }
+                        }
                         TaskRuntime::Pty(_) => {}
                     }
                     // Move the PTY runtime out of the task while holding the lock;
@@ -6323,9 +6420,7 @@ impl BgTaskRegistry {
                 #[cfg(test)]
                 wait_on_kill_signal_gate_for_test(&task.task_id);
                 terminate_piped_task(pgid, child_pid, child.as_mut());
-                if let Some(child) = child.as_mut() {
-                    let _ = child.wait();
-                }
+                let child_exit_observed = child.as_mut().is_some_and(|child| child.wait().is_ok());
                 drop(child);
 
                 let mut db = DeferredDbWrites::new(self, &task);
@@ -6334,6 +6429,7 @@ impl BgTaskRegistry {
                     .lock()
                     .map_err(|_| "background task lock poisoned".to_string())?;
                 state.kill_in_flight = false;
+                state.child_exit_observed |= child_exit_observed;
                 task.kill_settled.notify_all();
                 // A terminal state published while the signal was in flight
                 // (the task's own exit marker, read by the watchdog) stands.
@@ -6621,7 +6717,11 @@ impl BgTaskRegistry {
                 // does not linger as a `<defunct>` zombie (issue #91). The
                 // wrapper writes the exit marker as its final act, so the
                 // child is already exiting and `wait()` returns immediately.
-                TaskRuntime::Piped(child_slot) => reap_piped_child(child_slot),
+                TaskRuntime::Piped(child_slot) => {
+                    if reap_piped_child(child_slot) {
+                        state.child_exit_observed = true;
+                    }
+                }
                 TaskRuntime::Pty(runtime) => {
                     pty_reader_done = runtime
                         .as_ref()
@@ -8633,7 +8733,8 @@ impl BgTask {
 
 /// Closes a finished task's pre-opened I/O handles: the pinned session, task,
 /// `io` and `control` directories plus the stdout, stderr, exit and
-/// sandbox-unavailable files (8 descriptors for a piped task).
+/// sandbox-unavailable files (8 descriptors for a piped task). Returns false
+/// while a terminal PTY reader still owns its output file.
 ///
 /// The daemon keeps them only so it can write the exit or kill marker through
 /// the original O_EXCL handle while the child may still be running. Once the
@@ -8646,20 +8747,20 @@ impl BgTask {
 /// path-based writes when the handles are gone.
 ///
 /// The handles are taken under the state lock and closed after it is released.
-fn release_terminal_io_handles(task: &BgTask) {
-    let handles = match task.state.lock() {
-        Ok(mut state)
-            if state.metadata.status.is_terminal()
-                && matches!(
-                    state.runtime,
-                    TaskRuntime::Piped(None) | TaskRuntime::Pty(None)
-                ) =>
-        {
-            state.io_handles.take()
+fn release_terminal_io_handles(task: &BgTask) -> bool {
+    let (handles, runtime_released) = match task.state.lock() {
+        Ok(mut state) if state.metadata.status.is_terminal() => {
+            let runtime_released = matches!(
+                state.runtime,
+                TaskRuntime::Piped(None) | TaskRuntime::Pty(None)
+            );
+            let handles = runtime_released.then(|| state.io_handles.take()).flatten();
+            (handles, runtime_released)
         }
-        _ => None,
+        _ => (None, false),
     };
     drop(handles);
+    runtime_released && task.terminal_reader_done.load(Ordering::SeqCst)
 }
 
 /// Calls [`release_terminal_io_handles`] when dropped, for functions with
@@ -8672,42 +8773,20 @@ impl Drop for ReleaseIoHandlesOnExit<'_> {
     }
 }
 
-/// Reap an exited direct child handle, then clear the slot.
-///
-/// Dropping a [`std::process::Child`] does NOT `wait()` on the underlying OS
-/// process. On Unix a finished-but-unreaped child lingers as a `<defunct>`
-/// zombie until the AFT process itself exits (issue #91: `[mv] <defunct>`).
-/// The terminal-transition paths that learn of completion from the
-/// exit-marker file — rather than from [`BgTaskRegistry::reap_child`]'s
-/// `try_wait()` — must therefore reap the handle explicitly instead of just
-/// nulling it.
-///
-/// The exit marker is written by the wrapper's final statement (an atomic
-/// `mv` rename), so by the time we observe the marker the direct child has
-/// finished its work and is exiting; `wait()` returns essentially
-/// immediately. We attempt a non-blocking `try_wait()` first so the common
-/// case never blocks at all, falling back to a (bounded) `wait()` only to
-/// cover the microsecond window between the rename and process teardown.
-///
-/// Callers hold the task state mutex, so this is serialized against
-/// `reap_child` — there is no double-`wait()` hazard: whichever path acquires
-/// the lock first reaps and clears the slot, and the other observes `None`.
-#[cfg(unix)]
-fn reap_piped_child(child_slot: &mut Option<Child>) {
-    if let Some(mut child) = child_slot.take() {
-        if matches!(child.try_wait(), Ok(None)) {
-            let _ = child.wait();
-        }
+/// Reap an exited direct child handle, then clear the slot. The wrapper writes
+/// its exit marker as its final statement, so waiting after observing that
+/// marker should be brief. Waiting also makes Windows child handles on stdout
+/// and stderr close before finished-task cleanup tries to remove those files.
+/// Callers hold the task state mutex, which serializes this with `reap_child`.
+fn reap_piped_child(child_slot: &mut Option<Child>) -> bool {
+    let Some(mut child) = child_slot.take() else {
+        return false;
+    };
+    match child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => child.wait().is_ok(),
+        Err(_) => false,
     }
-}
-
-/// Windows has no zombie/`<defunct>` concept: dropping the [`Child`] closes
-/// the process handle, which is the correct release. Preserve the historical
-/// behavior of simply clearing the slot so the documented Windows PID-recycle
-/// handling in `reap_child` is unaffected.
-#[cfg(windows)]
-fn reap_piped_child(child_slot: &mut Option<Child>) {
-    *child_slot = None;
 }
 
 fn terminal_metadata_from_marker(
@@ -9138,7 +9217,9 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
-    use crate::bash_background::persistence::{read_task, task_paths, write_task};
+    use crate::bash_background::persistence::{
+        create_task_layout, read_task, task_paths, write_task, write_task_at,
+    };
 
     #[cfg(unix)]
     const QUICK_SUCCESS_COMMAND: &str = "true";
@@ -10669,6 +10750,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_child_reaper_observes_exit_before_releasing_handle() {
+        let mut child = Some(spawn_dead_child());
+
+        assert!(
+            reap_piped_child(&mut child),
+            "the terminal reaper must observe process exit before cleanup"
+        );
+        assert!(
+            child.is_none(),
+            "the exited process handle must be released"
+        );
+    }
+
+    #[test]
     fn ack_marks_delivered_even_when_completion_was_already_consumed_locally() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
@@ -11006,9 +11101,98 @@ mod tests {
             vec![task_id.clone()]
         );
 
-        registry.cleanup_finished(Duration::ZERO);
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let delete_attempted = AtomicBool::new(false);
+        let delete_error = Mutex::new(None);
+        registry.cleanup_finished_at_with(Duration::ZERO, Instant::now(), |paths| {
+            delete_attempted.store(true, Ordering::SeqCst);
+            let state = task.state.lock().unwrap();
+            assert!(
+                state.io_handles.is_none(),
+                "cleanup must close task IO handles before deleting its bundle"
+            );
+            assert!(
+                matches!(
+                    &state.runtime,
+                    TaskRuntime::Piped(None) | TaskRuntime::Pty(None)
+                ),
+                "cleanup must drop the child or PTY runtime before deleting its bundle"
+            );
+            assert!(
+                state.child_exit_observed,
+                "cleanup must observe the direct child exit before deleting its output files"
+            );
+            assert!(
+                task.terminal_reader_done.load(Ordering::SeqCst),
+                "cleanup must wait for the PTY reader's output-file handle"
+            );
+            drop(state);
+            match delete_task_bundle(paths) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    *delete_error.lock().unwrap() = Some(error.to_string());
+                    Err(error)
+                }
+            }
+        });
 
-        assert!(registry.inner.tasks.lock().unwrap().is_empty());
+        let delete_result = delete_error.lock().unwrap().clone().unwrap_or_else(|| {
+            if delete_attempted.load(Ordering::SeqCst) {
+                "delete_bundle returned success".to_string()
+            } else {
+                "delete_bundle was skipped because task handles remained open".to_string()
+            }
+        });
+        assert!(
+            registry.inner.tasks.lock().unwrap().is_empty(),
+            "finished task was not removed after one sweep; delete result: {delete_result}"
+        );
+        assert!(
+            !task.paths.json.exists(),
+            "finished task metadata remains after one sweep; delete result: {delete_result}"
+        );
+    }
+
+    #[test]
+    fn cleanup_closes_preopened_task_handles_before_deleting_the_bundle() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let task_id = random_slug();
+        let layout = create_task_layout(storage.path(), "session", &task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "true".to_string(),
+            storage.path().to_path_buf(),
+            Some(storage.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        metadata.completion_delivered = true;
+        write_task_at(&layout, &metadata).unwrap();
+        let io_handles = TaskIoHandles::create(&layout, BgMode::Pipes, false).unwrap();
+        let paths = layout.paths.clone();
+        registry
+            .insert_rehydrated_task(metadata, paths.clone(), true)
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        task.state.lock().unwrap().io_handles = Some(io_handles);
+        drop(layout);
+        *task.terminal_at.lock().unwrap() = Some(Instant::now());
+        let cleanup_now = Instant::now() + Duration::from_secs(1);
+
+        registry.cleanup_finished_at_with(Duration::ZERO, cleanup_now, |paths| {
+            assert!(
+                task.state.lock().unwrap().io_handles.is_none(),
+                "cleanup must close preopened file and directory handles before deletion"
+            );
+            delete_task_bundle(paths)
+        });
+
+        assert!(registry.task_for_session(&task_id, "session").is_none());
+        assert!(!paths.json.exists());
     }
 
     #[test]
@@ -11133,6 +11317,105 @@ mod tests {
         assert!(
             !task_json.exists(),
             "successful retry must delete the bundle"
+        );
+    }
+
+    #[test]
+    fn cleanup_finished_waits_for_the_pty_reader_file_handle() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let (task_id, task) = insert_terminal_pty_task(&registry, &storage, "pty output\n");
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.completion_delivered = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        let task_json = task.paths.json.clone();
+        task.terminal_reader_done.store(false, Ordering::SeqCst);
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+        let cleanup_now = clock_origin + Duration::from_secs(1);
+        let delete_attempts = AtomicUsize::new(0);
+        let delete_bundle = |paths: &TaskPaths| {
+            delete_attempts.fetch_add(1, Ordering::SeqCst);
+            delete_task_bundle(paths)
+        };
+
+        registry.cleanup_finished_at_with(Duration::ZERO, cleanup_now, delete_bundle);
+
+        assert_eq!(delete_attempts.load(Ordering::SeqCst), 0);
+        assert!(registry.task_for_session(&task_id, "session").is_some());
+        assert!(task_json.exists());
+
+        task.terminal_reader_done.store(true, Ordering::SeqCst);
+        registry.cleanup_finished_at_with(Duration::ZERO, cleanup_now, delete_bundle);
+
+        assert_eq!(delete_attempts.load(Ordering::SeqCst), 1);
+        assert!(registry.task_for_session(&task_id, "session").is_none());
+        assert!(!task_json.exists());
+    }
+
+    #[test]
+    fn cleanup_finished_gives_up_after_bounded_delete_attempts() {
+        let registry = BgTaskRegistry::default();
+        let storage = tempfile::tempdir().unwrap();
+        let (task_id, task) = insert_terminal_piped_task(
+            &registry,
+            &storage,
+            "true",
+            "completed output\n",
+            "",
+            false,
+        );
+        {
+            let mut state = task.state.lock().unwrap();
+            state.metadata.completion_delivered = true;
+            write_task(&task.paths.json, &state.metadata).unwrap();
+        }
+        let task_json = task.paths.json.clone();
+        let clock_origin = Instant::now();
+        *task.terminal_at.lock().unwrap() = Some(clock_origin);
+        let cleanup_now = clock_origin + Duration::from_secs(24 * 60 * 60 + 1);
+        let delete_attempts = AtomicUsize::new(0);
+        let always_fail = |_: &TaskPaths| {
+            delete_attempts.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected persistent bundle deletion failure",
+            ))
+        };
+
+        for attempt in 0..FINISHED_DELETE_MAX_ATTEMPTS {
+            registry.cleanup_finished_at_with(
+                crate::bash_background::watchdog::FINISHED_RETENTION,
+                cleanup_now,
+                always_fail,
+            );
+            assert_eq!(
+                registry.task_for_session(&task_id, "session").is_some(),
+                attempt + 1 < FINISHED_DELETE_MAX_ATTEMPTS,
+                "task retention after deletion attempt {}",
+                attempt + 1
+            );
+        }
+
+        assert_eq!(
+            delete_attempts.load(Ordering::SeqCst),
+            FINISHED_DELETE_MAX_ATTEMPTS
+        );
+        assert!(
+            task_json.exists(),
+            "the test leaves an on-disk orphan for GC"
+        );
+        registry.cleanup_finished_at_with(
+            crate::bash_background::watchdog::FINISHED_RETENTION,
+            cleanup_now,
+            always_fail,
+        );
+        assert_eq!(
+            delete_attempts.load(Ordering::SeqCst),
+            FINISHED_DELETE_MAX_ATTEMPTS,
+            "an abandoned task must not be retried or warned on every sweep"
         );
     }
 

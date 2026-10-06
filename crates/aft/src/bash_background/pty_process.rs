@@ -274,6 +274,7 @@ pub(crate) fn spawn_reader(
             }
             Ok(())
         })();
+        drop(file);
         if let Err(ref error) = result {
             crate::slog_warn!(
                 "PTY reader for {}:{} stopped with error: {error}",
@@ -384,6 +385,7 @@ pub(crate) fn spawn_waiter(
                 coordinator.task_id
             );
         }
+        drop(exit_file);
         exit_observed.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
     });
