@@ -20,6 +20,10 @@ use crate::executor::DispatchLoopLiveness;
 
 /// How long a loop may owe work without progressing before it is a stall.
 pub(super) const STALL_THRESHOLD: Duration = Duration::from_secs(15);
+/// A wedged subc frame loop cannot answer supervisor health requests. Fail
+/// after this much owed work without a new turn so the supervisor restarts it.
+pub(super) const FRAME_LOOP_EXIT_THRESHOLD: Duration = Duration::from_secs(30);
+pub(super) const STALL_EXIT_CODE: i32 = 1;
 /// How often the watchdog samples the markers.
 pub(super) const WATCHDOG_TICK: Duration = Duration::from_secs(1);
 /// At most one evidence capture per this interval, however many stalls occur.
@@ -61,8 +65,9 @@ impl StallStats {
     }
 }
 
-/// Where watchdog lines go. Production writes to the daemon log; tests record.
+/// Where watchdog lines go. Production writes directly to stderr; tests record.
 pub(super) type StallLogSink = Arc<dyn Fn(&str) + Send + Sync>;
+pub(super) type StallExit = Arc<dyn Fn(i32) + Send + Sync>;
 
 /// What a capture produced.
 pub(super) enum CaptureStarted {
@@ -151,6 +156,9 @@ pub(super) struct StallWatchdogConfig {
     pub(super) pid: u32,
     pub(super) capture: Arc<dyn StallCapture>,
     pub(super) log: StallLogSink,
+    pub(super) frame_loop_exit_threshold: Duration,
+    pub(super) stderr: StallLogSink,
+    pub(super) exit: StallExit,
 }
 
 impl StallWatchdogConfig {
@@ -163,9 +171,72 @@ impl StallWatchdogConfig {
             diagnostics_dir: storage_dir.join("diagnostics"),
             pid: std::process::id(),
             capture: Arc::new(PlatformCapture),
-            log: Arc::new(|line| log::warn!("{line}")),
+            // Never wait for the logger's lock from the recovery thread: the
+            // frame loop may be stalled while holding that very lock.
+            log: Arc::new(write_stderr_line),
+            frame_loop_exit_threshold: FRAME_LOOP_EXIT_THRESHOLD,
+            stderr: Arc::new(write_stderr_line),
+            // No unwinding, registry locks, or native exit handlers. In
+            // particular, BgTaskRegistry/PTY drop glue must not kill detached
+            // bash children. Calling detach here would itself take task locks
+            // that the stalled loop might hold; bypassing all cleanup preserves
+            // the children and their already-persisted recovery records.
+            exit: Arc::new(|code| crate::ort_lifecycle::exit_without_native_teardown(code)),
         }
     }
+}
+
+fn write_stderr_line(line: &str) {
+    let line = format!("{line}\n");
+    #[cfg(unix)]
+    {
+        // SAFETY: the buffer remains valid for this write. Bypass Rust's stderr
+        // lock as well as the logger so a lock stall cannot prevent recovery.
+        unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+            fn WriteFile(
+                handle: *mut std::ffi::c_void,
+                bytes: *const u8,
+                len: u32,
+                written: *mut u32,
+                overlapped: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        let Ok(len) = u32::try_from(line.len()) else {
+            return;
+        };
+        let mut written = 0;
+        // SAFETY: STD_ERROR_HANDLE (-12) is the inherited stderr handle, the
+        // buffer and byte-count pointer live through this synchronous write,
+        // and a null OVERLAPPED requests synchronous I/O. Like the Unix write,
+        // this does not acquire Rust's stderr or logger locks.
+        unsafe {
+            WriteFile(
+                GetStdHandle(-12_i32 as u32),
+                line.as_ptr(),
+                len,
+                &mut written,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::Write;
+        let _ = io::stderr().write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+pub(super) struct FrameLoopTestHooks {
+    pub(super) metrics: Arc<DispatchPathMetrics>,
+    pub(super) config: Option<StallWatchdogConfig>,
+    pub(super) before_frame: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Handle to the watchdog thread. Dropping it stops the thread without
@@ -217,6 +288,7 @@ fn run_watchdog(
     let mut detector = StallDetector::new(config.threshold, markers.len());
     let mut expected_wake = Instant::now() + config.tick;
     let mut last_capture_at: Option<Instant> = None;
+    let mut last_capture = "none".to_string();
     let mut capture_children: Vec<Child> = Vec::new();
     loop {
         match stop_rx.recv_timeout(config.tick) {
@@ -249,7 +321,8 @@ fn run_watchdog(
                     } else {
                         last_capture_at = Some(now);
                         stats.captures.fetch_add(1, Ordering::Relaxed);
-                        start_capture(&config, &mut capture_children)
+                        last_capture = start_capture(&config, &mut capture_children);
+                        last_capture.clone()
                     };
                     (config.log)(&format!(
                         "stall watchdog: stall detected marker={} stalled_for_ms={} watchdog_wake_late_ms={} capture={capture}",
@@ -270,6 +343,27 @@ fn run_watchdog(
                         wake_late.as_millis(),
                     ));
                 }
+            }
+            // Reuse the capture detector's pending run and the very same
+            // progress observation. Advancing turns reset progress_age, even
+            // during an arbitrarily long burst of ready frames; an idle or
+            // finished loop without an overdue promised wake owes nothing.
+            let stalled_for =
+                StallDetector::stalled_for(&detector.watches[index], progress_age, now);
+            if marker.restart_on_stall() && stalled_for >= config.frame_loop_exit_threshold {
+                (config.stderr)(&format!(
+                    "stall watchdog: exiting marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} capture={} exit_code={}",
+                    marker.name(),
+                    stalled_for.as_millis(),
+                    marker.context(),
+                    wake_late.as_millis(),
+                    last_capture,
+                    STALL_EXIT_CODE,
+                ));
+                (config.exit)(STALL_EXIT_CODE);
+                // Production exit never returns. An injected exit does, and
+                // must end this thread rather than repeatedly requesting exit.
+                return;
             }
         }
     }
@@ -348,6 +442,13 @@ pub(super) trait LivenessMarker: Send + Sync {
     /// Whether the loop currently owes work. An idle loop owes nothing, so a
     /// long `progress_age` alone never reads as a stall.
     fn has_pending_work(&self) -> bool;
+    /// Only the supervisor-owned frame loop may force a module restart.
+    fn restart_on_stall(&self) -> bool {
+        false
+    }
+    fn context(&self) -> String {
+        "phase=unknown frame=unknown".to_string()
+    }
 }
 
 /// The subc module (frame) loop. It shares a current-thread runtime with the
@@ -366,6 +467,14 @@ impl LivenessMarker for FrameLoopMarker {
 
     fn has_pending_work(&self) -> bool {
         self.0.frame_loop_has_pending_work()
+    }
+
+    fn restart_on_stall(&self) -> bool {
+        true
+    }
+
+    fn context(&self) -> String {
+        self.0.frame_loop_context()
     }
 }
 
@@ -443,11 +552,7 @@ impl StallDetector {
         } else {
             watch.pending_observed_at = None;
         }
-        let stalled_for = watch
-            .pending_observed_at
-            .map_or(Duration::ZERO, |observed| {
-                progress_age.min(now.saturating_duration_since(observed))
-            });
+        let stalled_for = Self::stalled_for(watch, progress_age, now);
 
         match watch.stall_started_at {
             None if stalled_for >= self.threshold => {
@@ -474,6 +579,14 @@ impl StallDetector {
             }
             _ => None,
         }
+    }
+
+    fn stalled_for(watch: &MarkerWatch, progress_age: Duration, now: Instant) -> Duration {
+        watch
+            .pending_observed_at
+            .map_or(Duration::ZERO, |observed| {
+                progress_age.min(now.saturating_duration_since(observed))
+            })
     }
 }
 
@@ -510,6 +623,7 @@ mod tests {
     impl StallCapture for RecordingCapture {
         fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
             self.0.lock().unwrap().push((pid, path.to_path_buf()));
+            std::fs::write(path, "recorded stall capture")?;
             Ok(CaptureStarted::Written)
         }
     }
@@ -536,6 +650,9 @@ mod tests {
             pid: TEST_PID,
             capture: Arc::clone(capture) as Arc<dyn StallCapture>,
             log: log.sink(),
+            frame_loop_exit_threshold: TEST_THRESHOLD * 2,
+            stderr: log.sink(),
+            exit: Arc::new(|_| panic!("unexpected frame loop exit")),
         }
     }
 
@@ -555,6 +672,265 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A real module loop on its own current-thread runtime, as in production.
+    /// Its watchdog uses shorter deadlines and records exits instead of killing
+    /// the test process. The daemon end remains on the test runtime, so its
+    /// deadlines still run while the module thread is deliberately parked.
+    struct FrameLoopFixture {
+        daemon: tokio::io::DuplexStream,
+        module: JoinHandle<Result<super::super::ModuleLoopExit, super::super::SubcError>>,
+        metrics: Arc<DispatchPathMetrics>,
+        stderr: RecordedLog,
+        exits: Arc<Mutex<Vec<(i32, Vec<String>)>>>,
+        capture: Arc<RecordingCapture>,
+        _storage: tempfile::TempDir,
+    }
+
+    impl FrameLoopFixture {
+        async fn start(before_frame: Arc<dyn Fn() + Send + Sync>) -> Self {
+            use super::super::*;
+            let storage = tempfile::tempdir().unwrap();
+            let path = storage.path().to_path_buf();
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let stderr = RecordedLog::default();
+            let capture = Arc::new(RecordingCapture::default());
+            let exits = Arc::new(Mutex::new(Vec::new()));
+            let mut config =
+                test_config(&RecordedLog::default(), &capture, &path.join("diagnostics"));
+            config.stderr = stderr.sink();
+            let recorded_exits = Arc::clone(&exits);
+            let exit_stderr = stderr.clone();
+            config.exit = Arc::new(move |code| {
+                recorded_exits
+                    .lock()
+                    .unwrap()
+                    .push((code, exit_stderr.lines()));
+            });
+            let hooks = FrameLoopTestHooks {
+                metrics: Arc::clone(&metrics),
+                config: Some(config),
+                before_frame,
+            };
+            let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
+            let module = thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let (read, write) = tokio::io::split(module_stream);
+                runtime.block_on(run_module_loop(
+                    read,
+                    write,
+                    &path.join("absent-connection.json"),
+                    crate::context::App::default_shared(),
+                    Arc::new(crate::executor::Executor::new()),
+                    |request, _| Response::success(request.id, json!({})),
+                    Some(path.join("absent-user-config.json")),
+                    false,
+                    usize::MAX,
+                    None,
+                    &path,
+                    None,
+                    Some(hooks),
+                ))
+            });
+            let hello = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut daemon))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(hello.header.ty, FrameType::Hello);
+            let ack = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                b"{}".to_vec(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack).await.unwrap();
+            Self {
+                daemon,
+                module,
+                metrics,
+                stderr,
+                exits,
+                capture,
+                _storage: storage,
+            }
+        }
+
+        async fn send_ping(&mut self, corr: u64) {
+            use super::super::*;
+            let ping =
+                Frame::build(FrameType::Ping, control_flags(), 0, 0, corr, Vec::new()).unwrap();
+            write_frame(&mut self.daemon, &ping).await.unwrap();
+        }
+
+        async fn ping(&mut self, corr: u64) {
+            use super::super::*;
+            self.send_ping(corr).await;
+            let pong = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut self.daemon))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!((pong.header.ty, pong.header.corr), (FrameType::Pong, corr));
+        }
+
+        fn finish(self) {
+            drop(self.daemon);
+            self.module.join().unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_loop_restart_parked_frame_exits_nonzero_after_stderr_with_capture() {
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let mut fixture = FrameLoopFixture::start(Arc::new(move || {
+            parked_tx.send(()).unwrap();
+            // Bounded even on the broken baseline, so the test cannot hang.
+            let _ = release_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5));
+        }))
+        .await;
+        fixture.send_ping(91).await;
+        parked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let exits = fixture.exits.lock().unwrap().clone();
+        let stderr = fixture.stderr.lines();
+        let calls = fixture.capture.calls();
+        let capture_written = calls.first().is_some_and(|(_, path)| path.is_file());
+        release_tx.send(()).unwrap();
+        fixture.finish();
+
+        assert_eq!(
+            exits.len(),
+            1,
+            "watchdog must request one nonzero exit: {exits:?}"
+        );
+        assert_eq!(exits[0].0, 1, "exit 0 would suppress supervisor restart");
+        assert_eq!(exits[0].1, stderr, "stderr must be written before exiting");
+        assert_eq!(stderr.len(), 1, "one terminal stall line");
+        assert_eq!(calls.len(), 1);
+        assert!(capture_written, "a capture was actually written");
+        let line = &stderr[0];
+        eprintln!("captured terminal stderr: {line}");
+        assert!(
+            line.starts_with("stall watchdog: exiting marker=subc_frame_loop stalled_for_ms="),
+            "{line}"
+        );
+        assert!(
+            line.contains("phase=handle_frame") && line.contains("channel=0 epoch=0 corr=91"),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("capture={} exit_code=1", calls[0].1.display())),
+            "{line}"
+        );
+        let duration_ms: u128 = line
+            .split("stalled_for_ms=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            duration_ms >= (TEST_THRESHOLD * 2).as_millis(),
+            "must honor the exit bound: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_loop_restart_idle_past_bound_does_not_exit() {
+        let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+        fixture.ping(1).await; // Prove the loop has started before measuring idle.
+        let tick_before = fixture
+            .metrics
+            .frame_loop_last_tick_ms
+            .load(Ordering::Relaxed);
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let tick_after = fixture
+            .metrics
+            .frame_loop_last_tick_ms
+            .load(Ordering::Relaxed);
+        let exits = fixture.exits.lock().unwrap().clone();
+        let stderr = fixture.stderr.lines();
+        fixture.ping(2).await; // An idle loop must still serve new frames.
+        fixture.finish();
+        assert!(
+            tick_after > tick_before,
+            "idle drain-timer turns count as progress"
+        );
+        assert!(exits.is_empty(), "idle loop must not exit: {exits:?}");
+        assert!(stderr.is_empty(), "{stderr:?}");
+
+        // Also exercise the unarmed idle signal (no promised timer turn). An
+        // old progress timestamp alone must never qualify for capture or exit.
+        let start = Instant::now();
+        let mut detector = StallDetector::new(STALL_THRESHOLD, 1);
+        for second in 0..=60 {
+            let now = start + secs(second);
+            assert_eq!(detector.observe(0, false, secs(second), now), None);
+            assert_eq!(
+                StallDetector::stalled_for(&detector.watches[0], secs(second), now),
+                Duration::ZERO
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_loop_restart_long_fast_frame_burst_does_not_exit() {
+        let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+        let started = Instant::now();
+        let mut frames = 0;
+        while started.elapsed() < TEST_THRESHOLD * 5 {
+            frames += 1;
+            fixture.ping(frames).await;
+            // Use I/O and a paced stream of frames, not synthetic CPU load.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let exits = fixture.exits.lock().unwrap().clone();
+        let stderr = fixture.stderr.lines();
+        fixture.finish();
+        assert!(
+            frames > 50,
+            "a genuinely long burst, not a single slow frame"
+        );
+        assert!(exits.is_empty(), "advancing burst must not exit: {exits:?}");
+        assert!(stderr.is_empty(), "{stderr:?}");
+
+        // Stress the other sampling extreme deterministically: every sample
+        // sees owed work throughout a two-minute burst, but each frame starts a
+        // new turn. This must remain safe even without seeing idle gaps between
+        // fast frames or renewed future timer deadlines.
+        let start = Instant::now();
+        let mut detector = StallDetector::new(STALL_THRESHOLD, 1);
+        for second in 0..=120 {
+            let now = start + secs(second);
+            assert_eq!(detector.observe(0, true, Duration::ZERO, now), None);
+            assert_eq!(
+                StallDetector::stalled_for(&detector.watches[0], Duration::ZERO, now),
+                Duration::ZERO
+            );
+        }
+    }
+
+    #[test]
+    fn production_frame_loop_restart_bound_and_exit_code_are_fixed() {
+        let storage = tempfile::tempdir().unwrap();
+        let config = StallWatchdogConfig::production(storage.path());
+        assert_eq!(config.frame_loop_exit_threshold, Duration::from_secs(30));
+        assert_eq!(STALL_EXIT_CODE, 1);
     }
 
     #[test]

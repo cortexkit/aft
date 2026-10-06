@@ -5,9 +5,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    json, Arc, AtomicBool, AtomicU64, AtomicUsize, BgSubsBySession, Duration, Executor, HashMap,
-    HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot,
-    RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
+    json, Arc, AtomicBool, AtomicU64, AtomicUsize, BgSubsBySession, Duration, Executor, Frame,
+    HashMap, HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId,
+    RootHealthSnapshot, RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER,
+    WRITER_QUEUE_CAPACITY,
 };
 use crate::context::{App, AppContext, ArtifactEvictionBlocker};
 use crate::executor::BindBlockerSnapshot;
@@ -508,6 +509,12 @@ pub(super) struct DispatchPathMetrics {
     /// When the frame loop next promised to wake (its drain-tick timer), as
     /// milliseconds since `origin` plus one; `0` means no loop is running.
     frame_loop_wake_deadline_ms_plus_one: AtomicU64,
+    /// Diagnostic context only, not another progress signal. Zero means turn
+    /// work, one means select wait, and two means handling a received frame.
+    frame_loop_phase: AtomicUsize,
+    /// Best-effort header context; no locks are taken by the watchdog reader.
+    frame_loop_frame_header: AtomicU64,
+    frame_loop_frame_corr: AtomicU64,
     /// Stall counts published by the stall watchdog thread.
     pub(super) stall_stats: Arc<super::stall_watchdog::StallStats>,
     pub(super) writer_queued: AtomicUsize,
@@ -548,6 +555,9 @@ impl DispatchPathMetrics {
             origin: Instant::now(),
             frame_loop_last_tick_ms: AtomicU64::new(0),
             frame_loop_wake_deadline_ms_plus_one: AtomicU64::new(0),
+            frame_loop_phase: AtomicUsize::new(0),
+            frame_loop_frame_header: AtomicU64::new(0),
+            frame_loop_frame_corr: AtomicU64::new(0),
             stall_stats: Arc::default(),
             writer_queued: AtomicUsize::new(0),
             writer_active: AtomicBool::new(false),
@@ -624,6 +634,7 @@ impl DispatchPathMetrics {
     }
 
     pub(super) fn mark_frame_loop_tick(&self) {
+        self.frame_loop_phase.store(0, Ordering::Relaxed);
         self.frame_loop_last_tick_ms
             .store(self.now_ms(), Ordering::Relaxed);
     }
@@ -631,6 +642,7 @@ impl DispatchPathMetrics {
     /// Records that the frame loop is about to park and will wake again within
     /// `within` because its drain-tick timer fires then.
     pub(super) fn publish_frame_loop_wake_deadline(&self, within: Duration) {
+        self.frame_loop_phase.store(1, Ordering::Relaxed);
         let deadline = self
             .now_ms()
             .saturating_add(duration_millis_u64(within))
@@ -646,7 +658,10 @@ impl DispatchPathMetrics {
             .store(0, Ordering::Relaxed);
     }
 
-    /// Time since the frame loop last started a turn.
+    /// Progress means starting a new loop turn, before taking any loop-owned
+    /// locks. Both received frames and idle drain-timer wakes start turns. A
+    /// burst's total duration is irrelevant as long as turns keep advancing;
+    /// publishing a future wake deadline alone is not progress.
     pub(super) fn frame_loop_progress_age(&self) -> Duration {
         let last = self.frame_loop_last_tick_ms.load(Ordering::Relaxed);
         Duration::from_millis(self.now_ms().saturating_sub(last))
@@ -661,6 +676,35 @@ impl DispatchPathMetrics {
             .frame_loop_wake_deadline_ms_plus_one
             .load(Ordering::Relaxed);
         deadline != 0 && self.now_ms() >= deadline
+    }
+
+    pub(super) fn mark_frame_loop_frame(&self, frame: &Frame) {
+        self.frame_loop_frame_header.store(
+            (frame.header.ty as u64)
+                | (u64::from(frame.header.channel) << 8)
+                | (u64::from(frame.header.epoch) << 24),
+            Ordering::Relaxed,
+        );
+        self.frame_loop_frame_corr
+            .store(frame.header.corr, Ordering::Relaxed);
+        self.frame_loop_phase.store(2, Ordering::Release);
+    }
+
+    pub(super) fn frame_loop_context(&self) -> String {
+        match self.frame_loop_phase.load(Ordering::Acquire) {
+            0 => "phase=turn_work frame=none".to_string(),
+            1 => "phase=select_wait frame=none".to_string(),
+            _ => {
+                let header = self.frame_loop_frame_header.load(Ordering::Relaxed);
+                format!(
+                    "phase=handle_frame frame_type={} channel={} epoch={} corr={}",
+                    header & 0xff,
+                    (header >> 8) & 0xffff,
+                    header >> 24,
+                    self.frame_loop_frame_corr.load(Ordering::Relaxed),
+                )
+            }
+        }
     }
 
     /// Returns whether the retained-roots summary changed since the last sweep.

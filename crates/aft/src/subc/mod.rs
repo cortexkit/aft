@@ -3465,6 +3465,8 @@ fn run_subc_mode_inner(
             &storage_dir,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
         .await
     });
@@ -4139,6 +4141,7 @@ async fn run_module_loop<R, W>(
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     storage_dir: &Path,
     #[cfg(test)] standing_actor_override: Option<Arc<standing::StandingActor>>,
+    #[cfg(test)] mut watchdog_test: Option<stall_watchdog::FrameLoopTestHooks>,
 ) -> Result<ModuleLoopExit, SubcError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4200,9 +4203,23 @@ where
 
     let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
     shared_app.set_subc_connection_file(connection_file_path.to_path_buf());
+    #[cfg(test)]
+    let dispatch_path_metrics = watchdog_test
+        .as_ref()
+        .map(|hooks| Arc::clone(&hooks.metrics))
+        .unwrap_or(dispatch_path_metrics);
     // Lives until this function returns, i.e. for the whole attached session,
     // including teardown. Dropping it stops the thread.
-    let _stall_watchdog = spawn_stall_watchdog(&dispatch_path_metrics, &executor, storage_dir);
+    #[cfg(test)]
+    let watchdog_config = watchdog_test.as_mut().and_then(|hooks| hooks.config.take());
+    #[cfg(not(test))]
+    let watchdog_config = None;
+    let _stall_watchdog = spawn_stall_watchdog(
+        &dispatch_path_metrics,
+        &executor,
+        storage_dir,
+        watchdog_config,
+    );
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
     let control_replies = readiness::PendingControlReplies::default();
@@ -4319,10 +4336,13 @@ where
         Arc::clone(&shared_app),
     );
 
+    // Arm the existing promised-wake marker before the first turn too: a lock
+    // taken before the first select must be just as recoverable as a later one.
+    dispatch_path_metrics.publish_frame_loop_wake_deadline(DRAIN_TICK_PERIOD);
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
+        dispatch_path_metrics.mark_frame_loop_tick();
         shared_app.set_open_route_count(routes.len() + management_routes.len());
         crate::logging::perf_tick(Some(&executor));
-        dispatch_path_metrics.mark_frame_loop_tick();
         let ready_inspects = pending_responses.poll_if_woken(executor.as_ref(), &deferred_wake);
         for resolved in ready_inspects {
             if let Err(error) = deliver_resolved_subc_response(
@@ -4563,6 +4583,11 @@ where
                 };
                 let phase_trace = frame.phase_trace;
                 let frame = frame.frame;
+                dispatch_path_metrics.mark_frame_loop_frame(&frame);
+                #[cfg(test)]
+                if let Some(hooks) = watchdog_test.as_ref() {
+                    (hooks.before_frame)();
+                }
 
                 if !ingress_route_should_be_processed(
                     &installed_route_epochs,
@@ -5430,6 +5455,7 @@ fn spawn_stall_watchdog(
     dispatch_path_metrics: &Arc<DispatchPathMetrics>,
     executor: &Executor,
     storage_dir: &Path,
+    config_override: Option<stall_watchdog::StallWatchdogConfig>,
 ) -> Option<stall_watchdog::StallWatchdog> {
     let markers: Vec<Box<dyn stall_watchdog::LivenessMarker>> = vec![
         Box::new(stall_watchdog::FrameLoopMarker(Arc::clone(
@@ -5442,7 +5468,8 @@ fn spawn_stall_watchdog(
     match stall_watchdog::StallWatchdog::spawn(
         markers,
         Arc::clone(&dispatch_path_metrics.stall_stats),
-        stall_watchdog::StallWatchdogConfig::production(storage_dir),
+        config_override
+            .unwrap_or_else(|| stall_watchdog::StallWatchdogConfig::production(storage_dir)),
     ) {
         Ok(watchdog) => Some(watchdog),
         Err(error) => {
@@ -10450,6 +10477,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 Some(actor),
+                None,
             ))
         });
         let bind_result: Result<(), String> = async {
@@ -10601,6 +10629,7 @@ mod tests {
                 None,
                 &fixture_path.join("storage"),
                 Some(actor),
+                None,
             ))
         });
         let while_held: Result<(), String> = async {
