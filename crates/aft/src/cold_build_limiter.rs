@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod progress;
+
 #[cfg(not(test))]
 const DEFAULT_COLD_BUILD_LIMIT: usize = 2;
 #[cfg(test)]
@@ -531,6 +533,7 @@ impl ColdBuildLimiter {
             limiter: Arc::clone(self),
             census_id,
             root: root.map(ToOwned::to_owned),
+            _progress: progress::admitted(census_root.unwrap_or("unknown"), kind),
         });
         let weak = Arc::downgrade(&lease);
         state.holders.insert(
@@ -635,6 +638,7 @@ struct AdmissionWaiter {
     limiter: Arc<ColdBuildLimiter>,
     class: ColdBuildAdmissionClass,
     census_id: u64,
+    _progress: progress::Job,
 }
 
 impl AdmissionWaiter {
@@ -665,6 +669,7 @@ impl AdmissionWaiter {
             limiter: Arc::clone(limiter),
             class: request.class,
             census_id,
+            _progress: progress::queued(request.census_label().unwrap_or("unknown"), kind),
         }
     }
 }
@@ -712,6 +717,7 @@ struct ColdBuildPermitLease {
     limiter: Arc<ColdBuildLimiter>,
     census_id: u64,
     root: Option<String>,
+    _progress: Option<progress::Job>,
 }
 
 impl Drop for ColdBuildPermitLease {

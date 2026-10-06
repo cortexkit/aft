@@ -2084,6 +2084,7 @@ fn build_health_diagnostic_rollup(
     let mut metrics = json!({
         "actor_count": actor_count,
         "root_count": root_count,
+        "warming_roots": warming_roots,
         "root_details_omitted": root_details_omitted,
         "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
         "callgraph_repair_roots_annotated": repair_roots_annotated,
@@ -2199,6 +2200,14 @@ pub(super) fn build_health_report(
         "cold_build_limiter".to_string(),
         render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),
     );
+    let indexing = crate::cold_build_limiter::progress::snapshot(
+        metrics
+            .get("warming_roots")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    let indexing_detail = indexing_detail(&indexing);
+    metrics.insert("indexing".to_string(), json!(indexing));
     metrics.insert(
         "dispatch_liveness".to_string(),
         dispatch_liveness_metrics(executor),
@@ -2220,22 +2229,93 @@ pub(super) fn build_health_report(
         "write_ledger_folds_deferred_total".to_string(),
         json!(crate::db::write_ledger::folds_deferred_total()),
     );
+    // ck's default health rendering displays top-level scalars. Selecting the
+    // nested indexing block must not hide any of those existing defaults.
+    let mut headline = vec![json!("indexing")];
+    headline.extend(
+        metrics
+            .iter()
+            .filter(|(_, value)| !value.is_object() && !value.is_array())
+            .map(|(key, _)| json!(key)),
+    );
+    // The budget adds this scalar after the headline has been selected.
+    headline.push(json!("metrics_bytes"));
+    metrics.insert("headline".to_string(), json!(headline));
     budget_health_metrics(&mut metrics);
 
     let scheduler_busy = executor.try_actor_count().is_none();
+    let warning = if scheduler_busy {
+        Some("executor scheduler state could not be snapshotted without contention".to_string())
+    } else {
+        rollup.detail.clone()
+    };
+    let detail = match (indexing_detail, warning) {
+        (Some(indexing), Some(warning)) if !warning.contains("warming background indexes") => {
+            Some(format!("{indexing}; {warning}"))
+        }
+        (Some(indexing), _) => Some(indexing),
+        (None, warning) => warning,
+    };
     HealthReport {
         status: if scheduler_busy {
             HealthStatus::Degraded
         } else {
             rollup.status.clone()
         },
-        detail: if scheduler_busy {
-            Some("executor scheduler state could not be snapshotted without contention".to_string())
-        } else {
-            rollup.detail.clone()
-        },
+        detail,
         metrics: Some(Value::Object(metrics)),
     }
+}
+
+fn grouped_count(count: u64) -> String {
+    let digits = count.to_string();
+    let mut result = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            result.push(',');
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> Option<String> {
+    let running = indexing.running.len() + indexing.omitted.running;
+    let queued = indexing.queued.len() + indexing.omitted.queued;
+    if running == 0 && queued == 0 {
+        return None;
+    }
+    let mut detail = if let Some(job) = indexing.running.first() {
+        let total = job.total.map_or_else(|| "?".to_owned(), grouped_count);
+        let eta = job.eta_seconds.map_or_else(String::new, |seconds| {
+            if seconds >= 3600.0 {
+                format!(" (~{:.0} h)", seconds / 3600.0)
+            } else if seconds >= 60.0 {
+                format!(" (~{:.0} min)", seconds / 60.0)
+            } else {
+                format!(" (~{:.0} s)", seconds)
+            }
+        });
+        format!(
+            "indexing: {} {} {}/{} files{} [{}]",
+            job.kind,
+            job.root_label,
+            grouped_count(job.done),
+            total,
+            eta,
+            job.phase
+        )
+    } else {
+        "indexing:".to_owned()
+    };
+    if running > 1 {
+        detail.push_str(&format!(", {} other running", running - 1));
+    }
+    if queued > 0 {
+        detail.push_str(&format!(", {queued} queued"));
+    }
+    detail.push_str(&format!("; {} roots warming", indexing.warming_roots));
+    Some(detail)
 }
 
 #[cfg(test)]
@@ -2259,6 +2339,63 @@ mod tests {
             refresh_until_root_count(&cache, executor, app, root_count);
         }
         build_health_report(&cache, executor, pending_binds, metrics, app)
+    }
+
+    #[test]
+    fn health_reports_live_indexing_and_root_identity_headline() {
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let app = crate::context::App::default_shared();
+        let root = Path::new("/fake/openclaw");
+        let _fill =
+            crate::cold_build_limiter::progress::start(root, "semantic view fill", Some(31_705));
+        crate::cold_build_limiter::progress::phase("embedding", Some(31_705));
+        crate::cold_build_limiter::progress::advance(1_280);
+        crate::cold_build_limiter::progress::embedded(9_000);
+        let _queued =
+            crate::cold_build_limiter::progress::queued("/fake/hermes-agent", "semantic build");
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let value = report.metrics.as_ref().unwrap();
+        let indexing = &value["indexing"];
+        let running = indexing["running"].as_array().expect("live indexing block");
+        let fill = running
+            .iter()
+            .find(|row| row["root"] == "/fake/openclaw")
+            .unwrap();
+        assert_eq!(fill["done"], 1_280);
+        assert_eq!(fill["total"], 31_705);
+        assert_eq!(fill["chunks_embedded"], 9_000);
+        assert_eq!(fill["phase"], "embedding");
+        assert!(fill["eta_seconds"].is_null());
+        assert_eq!(indexing["warming_roots"], 0);
+        assert!(report
+            .detail
+            .as_ref()
+            .unwrap()
+            .contains("semantic view fill openclaw 1,280/31,705 files"));
+        assert!(!report.detail.as_ref().unwrap().contains('\n'));
+        let headline = value["headline"]
+            .as_array()
+            .expect("CLI headline selection");
+        assert!(headline.contains(&json!("indexing")));
+        // Without an explicit headline ck displays top-level scalars. Retain
+        // all those existing defaults when opting into the indexing block.
+        for (key, scalar) in value.as_object().unwrap() {
+            if !scalar.is_object() && !scalar.is_array() {
+                assert!(
+                    headline.contains(&json!(key)),
+                    "missing default scalar {key}"
+                );
+            }
+        }
+        for row in running.iter().chain(indexing["queued"].as_array().unwrap()) {
+            let identity = ["project_root", "id", "name", "module_id", "path", "root"]
+                .into_iter()
+                .find(|key| row[*key].is_string());
+            assert_eq!(identity, Some("root"));
+        }
+        eprintln!("SAMPLE detail: {}", report.detail.unwrap());
+        eprintln!("SAMPLE indexing: {}", indexing);
     }
 
     #[test]

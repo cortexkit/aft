@@ -323,6 +323,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "a last-resort byte cut on every tool's rendered text, not a list surface; emits a cut-at-N-of-M-bytes notice and a WARN naming the tool whose own cap failed",
     },
     ExclusionEntry {
+        file: "cold_build_limiter/progress.rs",
+        enclosing_item: "snapshot",
+        location_or_primitive: "take(LIST_CAP)",
+        reason: "management health telemetry, not an agent list; running and queued are bounded at their iterators and disclose exact omitted counts",
+    },
+    ExclusionEntry {
         file: "github_read/fetch.rs",
         enclosing_item: "read_capped",
         location_or_primitive: "bounded gh subprocess reader",

@@ -648,6 +648,9 @@ impl JobCancellation {
             let _wait_guard = self.inner.wait_lock.lock();
             self.inner.wake.notify_all();
         }
+        if observed != JOB_CANCEL_STATE_COMMITTED {
+            crate::cold_build_limiter::progress::cancel_token(self.progress_key());
+        }
         observed
     }
 
@@ -660,6 +663,10 @@ impl JobCancellation {
     /// the scheduler's running-job table.
     pub fn request_cancel(&self) {
         self.signal_cancel();
+    }
+
+    pub(crate) fn progress_key(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
     }
 
     /// True when a cancel has already won the state race. A pure read: unlike

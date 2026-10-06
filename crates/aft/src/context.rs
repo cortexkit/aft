@@ -6528,6 +6528,9 @@ impl AppContext {
             return false;
         }
         if !self.deleted_view_root_retired.swap(true, Ordering::AcqRel) {
+            if let Some(root) = self.canonical_cache_root_opt() {
+                crate::cold_build_limiter::progress::cancel_root(&root);
+            }
             crate::executor::view_publication::cancel_for_context(self);
             self.clear_view_runtime();
             log::info!(
@@ -6546,6 +6549,9 @@ impl AppContext {
     }
 
     pub(crate) fn clear_view_runtime(&self) {
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::cold_build_limiter::progress::cancel_root(&root);
+        }
         self.reset_view_publication_retry();
         self.checkout_driver.clear();
         self.checkout_semantic.clear();
@@ -8525,6 +8531,9 @@ impl AppContext {
     /// (transactional take in the TTL reaper), whose strict invalidation
     /// subsumes their purpose.
     pub(crate) fn cancel_unbound_artifact_work(&self) {
+        if let Some(root) = self.canonical_cache_root_opt() {
+            crate::cold_build_limiter::progress::cancel_root(&root);
+        }
         // A cancelled non-ready search corpus refresh left the resident index
         // marked not-ready; retiring its receiver alone would strand it
         // (equivalent rebind only reloads a MISSING index). Drop the resident
