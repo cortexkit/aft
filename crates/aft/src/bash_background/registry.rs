@@ -3862,68 +3862,89 @@ impl BgTaskRegistry {
                     continue;
                 }
             }
-            let paths = resolved.paths;
-            #[cfg(unix)]
-            if metadata.remote.is_some() && !metadata.is_terminal() {
-                let task_id = metadata.task_id.clone();
+            self.rehydrate_resolved_task(metadata, resolved.paths, session_id)?;
+        }
+
+        // Every recovery write for this replay has landed; release the
+        // directories so the sweep can judge them as settled storage.
+        drop(recovering);
+        Ok(())
+    }
+
+    /// Recover only the requested task when a watch arrives before configure's
+    /// deferred session replay. The lookup is confined to the route's storage
+    /// namespace and session directory: it never scans other sessions or uses
+    /// the project-wide relaxed status fallback.
+    pub(crate) fn recover_watch_task(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+        task_id: &str,
+        project_root: Option<&Path>,
+        harness: Option<&str>,
+    ) -> Result<(), String> {
+        if validate_task_id(task_id).is_err() || self.task(task_id).is_some() {
+            return Ok(());
+        }
+        let _recovering = self.begin_session_recovery(storage_dir, session_id);
+        let session_dir = session_tasks_dir(storage_dir, session_id);
+        let resolved = match resolve_task_layout(&session_dir, task_id) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("background task record could not be read: {error}")),
+        };
+        let metadata = read_task_at(&resolved).map_err(|error| error.to_string())?;
+        if metadata.task_id != task_id
+            || metadata.session_id != session_id
+            || metadata
+                .harness
+                .as_deref()
+                .is_some_and(|owner| Some(owner) != harness)
+            || project_root.is_some_and(|project| {
+                metadata.project_root.as_deref().map(canonicalized_path)
+                    != Some(canonicalized_path(project))
+            })
+        {
+            return Ok(());
+        }
+        self.rehydrate_resolved_task(metadata, resolved.paths, session_id)?;
+        self.start_watchdog();
+        Ok(())
+    }
+
+    /// Apply the same restart rules to a single-task watch recovery and the
+    /// configure replay, including exit markers, lost PTYs and dead processes.
+    fn rehydrate_resolved_task(
+        &self,
+        mut metadata: PersistedTask,
+        paths: TaskPaths,
+        session_id: &str,
+    ) -> Result<(), String> {
+        #[cfg(unix)]
+        if metadata.remote.is_some() && !metadata.is_terminal() {
+            let task_id = metadata.task_id.clone();
+            self.insert_rehydrated_task(metadata, paths, true)?;
+            self.resume_remote_task(&task_id)?;
+            return Ok(());
+        }
+        match metadata.status {
+            BgTaskStatus::Starting => {
+                let completion_was_delivered = metadata.completion_delivered;
+                metadata.mark_terminal(
+                    BgTaskStatus::Failed,
+                    None,
+                    Some("spawn aborted".to_string()),
+                );
+                metadata.completion_delivered |= completion_was_delivered;
+                let _ = self.persist_task(&paths, &metadata);
+                self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
                 self.insert_rehydrated_task(metadata, paths, true)?;
-                self.resume_remote_task(&task_id)?;
-                continue;
             }
-            match metadata.status {
-                BgTaskStatus::Starting => {
-                    let completion_was_delivered = metadata.completion_delivered;
-                    metadata.mark_terminal(
-                        BgTaskStatus::Failed,
-                        None,
-                        Some("spawn aborted".to_string()),
-                    );
-                    metadata.completion_delivered |= completion_was_delivered;
-                    let _ = self.persist_task(&paths, &metadata);
-                    self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
-                    self.insert_rehydrated_task(metadata, paths, true)?;
-                }
-                BgTaskStatus::Running | BgTaskStatus::Killing => {
-                    if metadata.mode == BgMode::Pty {
-                        if let Ok(Some(marker)) = read_exit_marker(&paths) {
-                            let completion_was_delivered = metadata.completion_delivered;
-                            metadata = terminal_metadata_from_marker(metadata, marker, None);
-                            metadata.completion_delivered |= completion_was_delivered;
-                            let _ = self.persist_task(&paths, &metadata);
-                            self.enqueue_replay_completion_if_needed(
-                                &mut metadata,
-                                &paths,
-                                session_id,
-                            )?;
-                            self.insert_rehydrated_task(metadata, paths, true)?;
-                        } else if metadata.status.is_terminal() {
-                            self.insert_rehydrated_task(metadata, paths, true)?;
-                        } else {
-                            let completion_was_delivered = metadata.completion_delivered;
-                            metadata.mark_terminal(
-                                BgTaskStatus::Killed,
-                                None,
-                                Some("pty_lost_on_bridge_restart".to_string()),
-                            );
-                            metadata.completion_delivered |= completion_was_delivered;
-                            let _ = self.persist_task(&paths, &metadata);
-                            self.enqueue_replay_completion_if_needed(
-                                &mut metadata,
-                                &paths,
-                                session_id,
-                            )?;
-                            self.insert_rehydrated_task(metadata, paths, true)?;
-                        }
-                    } else if let Ok(Some(marker)) = read_exit_marker(&paths) {
-                        let reason = (metadata.status == BgTaskStatus::Killing).then(|| {
-                            "recovered from inconsistent killing state on replay".to_string()
-                        });
-                        if reason.is_some() {
-                            crate::slog_warn!("background task {} had killing state with exit marker; preferring marker",
-                            metadata.task_id);
-                        }
+            BgTaskStatus::Running | BgTaskStatus::Killing => {
+                if metadata.mode == BgMode::Pty {
+                    if let Ok(Some(marker)) = read_exit_marker(&paths) {
                         let completion_was_delivered = metadata.completion_delivered;
-                        metadata = terminal_metadata_from_marker(metadata, marker, reason);
+                        metadata = terminal_metadata_from_marker(metadata, marker, None);
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -3932,33 +3953,14 @@ impl BgTaskRegistry {
                             session_id,
                         )?;
                         self.insert_rehydrated_task(metadata, paths, true)?;
-                    } else if metadata.status == BgTaskStatus::Killing {
-                        let recovered = "recovered from inconsistent killing state on replay";
-                        let reason = match write_kill_marker_if_absent(&paths) {
-                            Ok(()) => recovered.to_string(),
-                            Err(error) => kill_marker_failure_reason(
-                                Some(recovered),
-                                &format!("failed to write kill marker: {error}"),
-                            ),
-                        };
-                        let completion_was_delivered = metadata.completion_delivered;
-                        metadata.mark_terminal(BgTaskStatus::Killed, None, Some(reason));
-                        metadata.completion_delivered |= completion_was_delivered;
-                        let _ = self.persist_task(&paths, &metadata);
-                        self.enqueue_replay_completion_if_needed(
-                            &mut metadata,
-                            &paths,
-                            session_id,
-                        )?;
-                        self.insert_rehydrated_task(metadata, paths, true)?;
-                    } else if Self::persisted_task_process_is_alive(&metadata) {
+                    } else if metadata.status.is_terminal() {
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else {
                         let completion_was_delivered = metadata.completion_delivered;
                         metadata.mark_terminal(
-                            BgTaskStatus::FateUnknown,
+                            BgTaskStatus::Killed,
                             None,
-                            Some(restart_fate_unknown_reason(&metadata, &paths)),
+                            Some("pty_lost_on_bridge_restart".to_string()),
                         );
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
@@ -3969,23 +3971,60 @@ impl BgTaskRegistry {
                         )?;
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     }
-                }
-                _ if metadata.status.is_terminal() => {
-                    // Borrow `paths` for the completion enqueue BEFORE
-                    // `insert_rehydrated_task` consumes it. The completion
-                    // helper only reads from `paths` (stdout/stderr/exit) to
-                    // reconstruct a tail preview, so it must see the same
-                    // paths the rehydrated task will own.
+                } else if let Ok(Some(marker)) = read_exit_marker(&paths) {
+                    let reason = (metadata.status == BgTaskStatus::Killing)
+                        .then(|| "recovered from inconsistent killing state on replay".to_string());
+                    if reason.is_some() {
+                        crate::slog_warn!("background task {} had killing state with exit marker; preferring marker",
+                            metadata.task_id);
+                    }
+                    let completion_was_delivered = metadata.completion_delivered;
+                    metadata = terminal_metadata_from_marker(metadata, marker, reason);
+                    metadata.completion_delivered |= completion_was_delivered;
+                    let _ = self.persist_task(&paths, &metadata);
+                    self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
+                    self.insert_rehydrated_task(metadata, paths, true)?;
+                } else if metadata.status == BgTaskStatus::Killing {
+                    let recovered = "recovered from inconsistent killing state on replay";
+                    let reason = match write_kill_marker_if_absent(&paths) {
+                        Ok(()) => recovered.to_string(),
+                        Err(error) => kill_marker_failure_reason(
+                            Some(recovered),
+                            &format!("failed to write kill marker: {error}"),
+                        ),
+                    };
+                    let completion_was_delivered = metadata.completion_delivered;
+                    metadata.mark_terminal(BgTaskStatus::Killed, None, Some(reason));
+                    metadata.completion_delivered |= completion_was_delivered;
+                    let _ = self.persist_task(&paths, &metadata);
+                    self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
+                    self.insert_rehydrated_task(metadata, paths, true)?;
+                } else if Self::persisted_task_process_is_alive(&metadata) {
+                    self.insert_rehydrated_task(metadata, paths, true)?;
+                } else {
+                    let completion_was_delivered = metadata.completion_delivered;
+                    metadata.mark_terminal(
+                        BgTaskStatus::FateUnknown,
+                        None,
+                        Some(restart_fate_unknown_reason(&metadata, &paths)),
+                    );
+                    metadata.completion_delivered |= completion_was_delivered;
+                    let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
                     self.insert_rehydrated_task(metadata, paths, true)?;
                 }
-                _ => {}
             }
+            _ if metadata.status.is_terminal() => {
+                // Borrow `paths` for the completion enqueue BEFORE
+                // `insert_rehydrated_task` consumes it. The completion
+                // helper only reads from `paths` (stdout/stderr/exit) to
+                // reconstruct a tail preview, so it must see the same
+                // paths the rehydrated task will own.
+                self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
+                self.insert_rehydrated_task(metadata, paths, true)?;
+            }
+            _ => {}
         }
-
-        // Every recovery write for this replay has landed; release the
-        // directories so the sweep can judge them as settled storage.
-        drop(recovering);
         Ok(())
     }
 
@@ -6183,11 +6222,20 @@ impl BgTaskRegistry {
         });
         self.record_live_delivery_session(&task.session_id);
         self.remember_session_harness(&task);
-        self.inner
-            .tasks
-            .lock()
-            .map_err(|_| "background task registry lock poisoned".to_string())?
-            .insert(task_id.clone(), Arc::clone(&task));
+        // A watch's single-record recovery can race configure replay. Keep the
+        // first registered task and its runtime instead of replacing its state
+        // with another disk snapshot (or orphaning an authoritative child).
+        {
+            let mut tasks = self
+                .inner
+                .tasks
+                .lock()
+                .map_err(|_| "background task registry lock poisoned".to_string())?;
+            if tasks.contains_key(&task_id) {
+                return Ok(());
+            }
+            tasks.insert(task_id.clone(), Arc::clone(&task));
+        }
         if task.is_running() {
             self.inner
                 .watchdog_tasks
@@ -9601,6 +9649,35 @@ mod tests {
             .expect("insert terminal task");
         let task = registry.task_for_session(&task_id, "session").unwrap();
         (task_id, task)
+    }
+
+    #[test]
+    fn concurrent_watch_recovery_keeps_the_first_registered_task() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (task_id, first) = insert_terminal_piped_task(&registry, &dir, "exit 1", "", "", false);
+        let stale_metadata = read_task(&first.paths.json).unwrap();
+        // Model replay reading a stale record, then inserting that snapshot
+        // after a watch registered the task and updated its live state.
+        first.state.lock().unwrap().metadata.status_reason = Some("live observation".into());
+        registry
+            .insert_rehydrated_task(stale_metadata, first.paths.clone(), true)
+            .unwrap();
+        let current = registry.task_for_session(&task_id, "session").unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &current),
+            "replay must not replace the live task"
+        );
+        assert_eq!(
+            current
+                .state
+                .lock()
+                .unwrap()
+                .metadata
+                .status_reason
+                .as_deref(),
+            Some("live observation")
+        );
     }
 
     #[test]

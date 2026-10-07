@@ -282,51 +282,74 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
             format_erased_task_message(&task_id),
         ));
     }
-    if registry.observed_status(&task_id, &session, 0).is_none() {
-        return DispatchOutcome::Immediate(Response::error(
-            &id,
-            "task_not_found",
-            format_unknown_task_message(&task_id),
-        ));
-    }
     let storage_dir = crate::bash_background::task_storage_dir(&ctx);
     let project_root = ctx.config().project_root.clone();
+    let principal = crate::sandbox_spawn::current_authenticated_principal();
+    let harness = crate::bash_background::route_harness()
+        .or_else(|| ctx.config().harness.clone())
+        .map(|harness| harness.storage_segment());
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
     let (tx, rx) = crate::response_finalize::pending_response_channel();
     let thread_id = id.clone();
     std::thread::spawn(move || {
-        let watch = WatchJob {
-            registry,
-            task_id,
-            session,
-            pattern,
-            limit_ms,
-            worker,
-            worker_limit_ms,
-            primary_cap_ms,
-        };
-        let Some(waited) = watch.wait(&worker_cancellation) else {
-            // Cancelled: the transport already answered the call.
-            return;
-        };
-        let snapshot = watch.registry.status_settled(
-            &watch.task_id,
-            &watch.session,
-            project_root.as_deref(),
-            Some(&storage_dir),
-            PREVIEW_BYTES,
-        );
-        let response = match snapshot {
-            Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
-            None => Response::error(
-                &thread_id,
-                "task_not_found",
-                format_unknown_task_message(&watch.task_id),
-            ),
-        };
-        let _ = tx.send(response);
+        crate::sandbox_spawn::with_authenticated_principal(principal, || {
+            // Configure acknowledges the route before its replay tail finishes.
+            // Resolve the durable record before starting the wait, off executor
+            // slots, and without replaying unrelated tasks or relaxing the session.
+            if registry.observed_status(&task_id, &session, 0).is_none() {
+                registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
+                if let Err(error) = registry.recover_watch_task(
+                    &storage_dir,
+                    &session,
+                    &task_id,
+                    project_root.as_deref(),
+                    harness.as_deref(),
+                ) {
+                    let _ = tx.send(Response::error(&thread_id, "task_recovery_failed", error));
+                    return;
+                }
+            }
+            if registry.observed_status(&task_id, &session, 0).is_none() {
+                let _ = tx.send(Response::error(
+                    &thread_id,
+                    "task_not_found",
+                    format_unknown_task_message(&task_id),
+                ));
+                return;
+            }
+            let watch = WatchJob {
+                registry,
+                task_id,
+                session,
+                pattern,
+                limit_ms,
+                worker,
+                worker_limit_ms,
+                primary_cap_ms,
+            };
+            let Some(waited) = watch.wait(&worker_cancellation) else {
+                // Cancelled: the transport already answered the call.
+                return;
+            };
+            // The task was already resolved under this route's identity. Do not
+            // re-adopt another session's task through status's relaxed fallback if
+            // the record disappears while the watch is waiting.
+            let snapshot =
+                watch
+                    .registry
+                    .observed_status(&watch.task_id, &watch.session, PREVIEW_BYTES);
+            let response = match snapshot {
+                Some(snapshot) => watch.reply(&thread_id, snapshot, &waited),
+                None => Response::error(
+                    &thread_id,
+                    "task_not_found",
+                    format_unknown_task_message(&watch.task_id),
+                ),
+            };
+            let _ = tx.send(response);
+        })
     });
 
     let mut settled = false;
@@ -645,9 +668,213 @@ fn output_tail(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
+    use crate::config::Config;
+    use crate::harness::Harness;
+    use crate::sandbox_spawn::{
+        with_authenticated_principal, AuthenticatedPrincipal, PrincipalTrust,
+    };
+
+    const SESSION: &str = "alfonso:watch-restart-worker";
+    const TASK: &str = "bash-0123456789abcdef";
+
+    fn context(project: &std::path::Path, storage: &std::path::Path) -> Arc<AppContext> {
+        Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(project.into()),
+                storage_dir: Some(storage.into()),
+                // Another route configured this shared root most recently.
+                harness: Some(Harness::Opencode),
+                experimental_bash_background: true,
+                sandbox: crate::config::SandboxConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+        ))
+    }
+
+    fn principal(project: &std::path::Path) -> AuthenticatedPrincipal {
+        AuthenticatedPrincipal::RouteBind {
+            trust: PrincipalTrust::FirstParty,
+            route_channel: 41,
+            route_epoch: 1,
+            project_root: project.into(),
+            harness: "runner".into(),
+            session_id: SESSION.into(),
+            principal_id: Some("reserved:broca".into()),
+        }
+    }
+
+    fn request(task: &str, session: &str) -> RawRequest {
+        serde_json::from_value(json!({
+            "id": "watch-restart",
+            "command": "bash_watch",
+            "session_id": session,
+            "worker_session": true,
+            "task_id": task,
+            "timeout_ms": MAX_WATCH_TIMEOUT_MS,
+        }))
+        .unwrap()
+    }
+
+    async fn watch_with_deadline(ctx: Arc<AppContext>, request: RawRequest) -> Response {
+        let worker = principal(ctx.config().project_root.as_deref().unwrap());
+        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let producer_wake = wake.clone();
+        let producer_ctx = Arc::clone(&ctx);
+        tokio::time::timeout(Duration::from_secs(3), async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _wake = producer_wake.install();
+                with_authenticated_principal(worker, || handle_deferred(&request, producer_ctx))
+            })
+            .await
+            .unwrap();
+            match outcome {
+                DispatchOutcome::Immediate(response) => response,
+                DispatchOutcome::Deferred(mut pending) => {
+                    // The completion signal, not sleeps or repeated polling,
+                    // proves the watch answered well before its 30-minute window.
+                    wake.notified().await;
+                    (pending.poll)(&ctx).expect("response queued before completion wake")
+                }
+            }
+        })
+        .await
+        .expect("worker watch must answer within three seconds, not its 30-minute window")
+    }
+
+    fn persist_failed_task(ctx: &AppContext) {
+        let worker = principal(ctx.config().project_root.as_deref().unwrap());
+        with_authenticated_principal(worker, || {
+            let project = ctx.config().project_root.clone().unwrap();
+            let storage = crate::bash_background::task_storage_dir(ctx);
+            let resolved = create_task_layout(&storage, SESSION, TASK).unwrap();
+            let mut metadata = PersistedTask::starting(
+                TASK.into(),
+                SESSION.into(),
+                "exit 1".into(),
+                project.clone(),
+                Some(project),
+                None,
+                false,
+                false,
+            );
+            metadata.mark_terminal(BgTaskStatus::Failed, Some(1), None);
+            write_task_at(&resolved, &metadata).unwrap();
+            std::fs::write(&resolved.paths.stdout, "durable worker output\n").unwrap();
+            std::fs::write(&resolved.paths.stderr, "").unwrap();
+            std::fs::write(&resolved.paths.exit, "1\n").unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn worker_watch_unknown_task_does_not_wait_for_window() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let response = watch_with_deadline(
+            context(project.path(), storage.path()),
+            request(TASK, SESSION),
+        )
+        .await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "task_not_found");
+    }
+
+    #[tokio::test]
+    async fn worker_watch_recovers_terminal_task_before_configure_replay() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let old = context(project.path(), storage.path());
+        persist_failed_task(&old);
+        old.bash_background().detach();
+        let restarted = context(project.path(), storage.path());
+        assert!(restarted
+            .bash_background()
+            .observed_status(TASK, SESSION, 0)
+            .is_none());
+        let response = watch_with_deadline(restarted, request(TASK, SESSION)).await;
+        assert!(
+            response.success,
+            "durable task must be recovered: {response:?}"
+        );
+        assert_eq!(response.data["status"], "failed");
+        assert_eq!(response.data["exit_code"], 1);
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("durable worker output"));
+        assert_eq!(response.data["waited"]["reason"], "exited");
+    }
+
+    #[tokio::test]
+    async fn worker_watch_recovery_does_not_adopt_another_session() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), storage.path());
+        persist_failed_task(&ctx);
+        let response = watch_with_deadline(Arc::clone(&ctx), request(TASK, "other-worker")).await;
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "task_not_found");
+        assert!(ctx
+            .bash_background()
+            .observed_status(TASK, SESSION, 0)
+            .is_none());
+    }
 
     fn params(value: Value) -> BashWatchParams {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_watch_recovers_running_task_started_before_restart() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let old = context(project.path(), storage.path());
+        let spawn: RawRequest = serde_json::from_value(json!({
+            "id": "start-before-restart", "command": "bash", "session_id": SESSION,
+            "worker_session": true,
+            "params": {"command": "printf restart-ready; sleep 30", "background": true, "timeout": 10000, "compressed": false},
+        })).unwrap();
+        let launched = with_authenticated_principal(principal(project.path()), || {
+            crate::commands::bash::handle(&spawn, &old)
+        });
+        assert!(launched.success, "{launched:?}");
+        let task_id = launched.data["task_id"].as_str().unwrap().to_string();
+        let paths = old
+            .bash_background()
+            .task_json_path(&task_id, SESSION)
+            .unwrap();
+        let metadata = crate::bash_background::persistence::read_task(&paths).unwrap();
+        // Always stop the real fixture child, including a baseline/mutation
+        // failure that leaves the restarted registry unable to address it.
+        struct StopChild(i32);
+        impl Drop for StopChild {
+            fn drop(&mut self) {
+                let _ = crate::bash_background::process::terminate_pgid(self.0, None);
+            }
+        }
+        let _stop = StopChild(metadata.pgid.unwrap());
+        old.bash_background().detach();
+        let restarted = context(project.path(), storage.path());
+        let mut watch = request(&task_id, SESSION);
+        watch.params["pattern"] = json!("restart-ready");
+        let response = watch_with_deadline(Arc::clone(&restarted), watch).await;
+        assert!(
+            response.success,
+            "live task must be recovered: {response:?}"
+        );
+        assert_eq!(response.data["status"], "running");
+        assert_eq!(response.data["waited"]["reason"], "matched");
+        let killed = restarted.bash_background().kill(&task_id, SESSION).unwrap();
+        assert_eq!(killed.info.status, BgTaskStatus::Killed);
+        let finished = watch_with_deadline(restarted, request(&task_id, SESSION)).await;
+        assert!(finished.success, "{finished:?}");
+        assert_eq!(finished.data["status"], "killed");
+        assert_eq!(finished.data["waited"]["reason"], "exited");
     }
 
     #[test]

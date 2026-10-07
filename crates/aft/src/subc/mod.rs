@@ -8230,11 +8230,20 @@ async fn handle_tool_call(
                         }
                     }
                 };
-                if matches!(bind_trust, BindTrust::Untrusted) {
-                    ctx.with_force_restrict(&request_id_for_force, run)
-                } else {
-                    run()
-                }
+                // Deferred bash watches must use the same durable namespace as
+                // the route that spawned the task, not the last route to
+                // configure this shared root. The handler captures this scope
+                // for its off-executor recovery and wait thread.
+                crate::sandbox_spawn::with_authenticated_principal(
+                    identity_for_run.spawn_principal.clone(),
+                    || {
+                        if matches!(bind_trust, BindTrust::Untrusted) {
+                            ctx.with_force_restrict(&request_id_for_force, run)
+                        } else {
+                            run()
+                        }
+                    },
+                )
             })
         });
         let deferred_setup_guard =
@@ -9611,6 +9620,196 @@ pub(crate) mod test_support {
         assert_eq!(response.data["status"], "completed");
         assert_eq!(response.data["waited"]["reason"], "exited");
         assert!((pending.poll)(&ctx).is_none(), "terminal is delivered once");
+    }
+
+    #[tokio::test]
+    async fn scoped_worker_watch_recovers_under_route_harness_before_replay() {
+        use crate::bash_background::persistence::{
+            create_task_layout, write_task_at, PersistedTask,
+        };
+        let (dir, root) = test_root("scoped-watch-restart");
+        let storage = dir.path().join("storage");
+        let session = "alfonso:scoped-watch-worker";
+        let task_id = "bash-0123456789abcdef";
+        let task = create_task_layout(&storage.join("runner"), session, task_id).unwrap();
+        let mut metadata = PersistedTask::starting(
+            task_id.into(),
+            session.into(),
+            "exit 1".into(),
+            root.as_path().into(),
+            Some(root.as_path().into()),
+            None,
+            false,
+            false,
+        );
+        metadata.harness = Some("runner".into());
+        metadata.mark_terminal(crate::bash_background::BgTaskStatus::Failed, Some(1), None);
+        write_task_at(&task, &metadata).unwrap();
+        std::fs::write(&task.paths.stdout, "scoped durable output\n").unwrap();
+        std::fs::write(&task.paths.stderr, "").unwrap();
+        std::fs::write(&task.paths.exit, "1\n").unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(storage),
+                // A different harness owns the root's latest config snapshot.
+                harness: Some(crate::harness::Harness::Opencode),
+                ..Config::default()
+            },
+        ));
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), Arc::clone(&ctx));
+        let identity = RouteIdentity(Arc::new(RouteIdentityData {
+            root: root.clone(),
+            project_root: root.as_path().into(),
+            harness: "runner".into(),
+            session: session.into(),
+            role: tool_provider::RouteRole::Legacy,
+            trust: BindTrust::FirstParty,
+            spawn_principal: AuthenticatedPrincipal::RouteBind {
+                trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
+                route_channel: 41,
+                route_epoch: 1,
+                project_root: root.as_path().into(),
+                harness: "runner".into(),
+                session_id: session.into(),
+                principal_id: Some("reserved:broca".into()),
+            },
+            consumer_elicitation_capable: false,
+            disabled_tools: Arc::new(vec![]),
+            scope: Some(
+                serde_json::from_value(json!({
+                    "owner": {"kind": "direct"}, "ref": "worker-scope", "scope_epoch": 1,
+                    "kind": "worker", "owner_authorized": true,
+                }))
+                .unwrap(),
+            ),
+            made_tool_call: AtomicBool::new(false),
+        }));
+        let routes = HashMap::from([(route_key(41, 1), identity)]);
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            41,
+            1,
+            7,
+            serde_json::to_vec(&json!({
+                "name": "bash_watch", "preset": "worker",
+                "arguments": {"taskId": task_id, "timeoutMs": 1_800_000},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (writer, mut replies) = mpsc::channel(8);
+        let (bash_tx, _bash_rx) = mpsc::channel(8);
+        let (touch_tx, _touch_rx) = mpsc::channel(8);
+        let (entries, mut deferred_rx) = mpsc::unbounded_channel();
+        let deferred_tx = DeferredResponseSender {
+            entries,
+            wake: crate::response_finalize::DeferredResponseWake::default(),
+        };
+        handle_tool_call(
+            &writer,
+            &frame,
+            PhaseTrace::new(Instant::now()),
+            &routes,
+            &HashMap::new(),
+            &ReclaimedRoutes::default(),
+            &mut HashMap::new(),
+            &executor,
+            &Arc::default(),
+            &Arc::new(AtomicUsize::new(0)),
+            &Arc::new(Notify::new()),
+            &PersistentCancelSignal::new(),
+            &bash_tx,
+            &touch_tx,
+            &Arc::new(DispatchPathMetrics::new()),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut 1,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |_, _| panic!("watch must use the deferred seam"),
+            &deferred_tx,
+            false,
+            1024 * 1024,
+            &drain::ModuleDrainWindow::default(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                entry = deferred_rx.recv() => {
+                    let mut entry = entry.expect("deferred watch setup");
+                    deferred_tx.wake.notified().await;
+                    (entry.pending.poll)(&ctx).expect("watch terminal queued before wake")
+                }
+                reply = replies.recv() => panic!("watch should recover, not refuse: {}", String::from_utf8_lossy(&reply.unwrap().frame.body)),
+            }
+        }).await.expect("scoped watch must recover before its 30-minute window");
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "failed");
+        assert_eq!(response.data["exit_code"], 1);
+        assert_eq!(response.data["waited"]["reason"], "exited");
+        assert!(response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("scoped durable output"));
+    }
+
+    #[test]
+    fn draining_worker_watch_reports_restart_not_record_loss() {
+        let executor = Executor::new();
+        let (dir, root) = test_root("watch-drain-wording");
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(dir.path().join("storage")),
+                ..Config::default()
+            },
+        ));
+        executor.register_actor(root.clone(), ctx);
+        let cancellation = JobCancellation::new();
+        let pending = PendingResponse::polling(
+            "draining-watch".into(),
+            "worker".into(),
+            "bash_watch".into(),
+            Box::new(|_| None),
+        )
+        .with_cancellation(cancellation.clone());
+        let mut registry = PendingSubcResponses::default();
+        registry.register(PendingSubcResponse {
+            route: route_key(41, 1),
+            corr: 7,
+            flags: control_flags(),
+            ver: PROTOCOL_VERSION,
+            root,
+            session_id: "worker".into(),
+            bare_name: "bash_watch".into(),
+            format_context: crate::subc_format::FormatContext::from_tool_call(
+                "bash_watch",
+                &json!({}),
+                dir.path(),
+            ),
+            bind_trust: BindTrust::FirstParty,
+            pending,
+            surface_downgraded: false,
+            phase_trace: PhaseTrace::new(Instant::now()),
+            held_since: Instant::now(),
+        });
+        let drained = registry.drain_for_module_drain(&executor);
+        assert_eq!(drained.len(), 1);
+        assert!(cancellation.cancel_already_requested());
+        assert_eq!(drained[0].response.data["code"], "module_reloading");
+        assert_eq!(drained[0].response.data["retryable"], true);
+        assert_eq!(
+            drained[0].response.data["message"],
+            "bash_watch was not completed because AFT is restarting; retry the call"
+        );
     }
 
     #[tokio::test]
