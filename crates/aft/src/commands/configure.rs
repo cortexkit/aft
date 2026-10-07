@@ -6648,6 +6648,8 @@ fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
     if !crate::storage_retention::startup_sweeps_ready(&view.storage) {
         return;
     }
+    #[cfg(test)]
+    crate::storage_retention::test_hook(&view.storage, "configure-view-sweep-start");
     #[cfg(any(test, feature = "test-timing-hooks"))]
     crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_SWEEP");
     if let Ok(store) = crate::views::ViewStore::open(&view.storage, &view.scope) {
@@ -17034,6 +17036,57 @@ mod inspect_orphan_sweep_tests {
                 .unwrap()
                 .removed_roots,
             1
+        );
+    }
+}
+
+#[cfg(test)]
+mod startup_view_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn startup_view_sweep_waits_for_the_storage_grace() {
+        let storage = tempfile::tempdir().unwrap();
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = starts.clone();
+        let _observer = crate::storage_retention::observe_test_hook(
+            storage.path(),
+            Arc::new(move |step| {
+                if step == "configure-view-sweep-start" {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let scope = "0123456789abcdef";
+        let view = ViewRuntimeSnapshot {
+            query_pin: None,
+            storage: storage.path().to_path_buf(),
+            family: "startup-sweep-fixture".to_owned(),
+            scope: scope.to_owned(),
+            view_dir: storage.path().join("views").join(scope),
+            generation: None,
+            manifest: Some(crate::views::Manifest::new(Vec::new()).unwrap()),
+            head_fingerprint: String::new(),
+            head_metadata: crate::alias::GitHeadMetadata {
+                head_path: PathBuf::new(),
+                head_mtime: None,
+                resolved_ref_path: None,
+                resolved_ref_mtime: None,
+            },
+            pending_paths: BTreeSet::new(),
+        };
+        run_configure_view_sweep(&view);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            0,
+            "view/blob GC started during startup warm-up"
+        );
+        crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
+        run_configure_view_sweep(&view);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "view/blob GC never became eligible after startup grace"
         );
     }
 }

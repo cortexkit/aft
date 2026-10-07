@@ -96,7 +96,32 @@ pub(crate) fn snapshot(storage: &Path) -> Option<SweepReport> {
 }
 
 #[cfg(test)]
-type TestHook = Arc<dyn Fn(&str) + Send + Sync>;
+pub(crate) type TestHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+pub(crate) struct TestHookGuard {
+    path: PathBuf,
+    previous: Option<TestHook>,
+}
+
+#[cfg(test)]
+impl Drop for TestHookGuard {
+    fn drop(&mut self) {
+        let mut hooks = test_hooks().lock().unwrap();
+        if let Some(previous) = self.previous.take() {
+            hooks.insert(self.path.clone(), previous);
+        } else {
+            hooks.remove(&self.path);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_test_hook(path: &Path, hook: TestHook) -> TestHookGuard {
+    let path = path.to_path_buf();
+    let previous = test_hooks().lock().unwrap().insert(path.clone(), hook);
+    TestHookGuard { path, previous }
+}
 
 #[cfg(test)]
 fn test_hooks() -> &'static Mutex<HashMap<PathBuf, TestHook>> {
@@ -1002,17 +1027,37 @@ mod storage_retention_tests {
     fn startup_grace_does_not_admit_retention_or_blob_sweeps() {
         let temp = tempfile::tempdir().unwrap();
         let now = Instant::now();
-        let mut starts = 0;
-        for elapsed in [Duration::ZERO, STARTUP_GRACE - Duration::from_nanos(1)] {
-            if startup_sweeps_ready_at(temp.path(), now + elapsed) {
-                starts += 1;
-            }
-        }
-        assert_eq!(starts, 0, "storage sweeps started during startup warm-up");
-        if startup_sweeps_ready_at(temp.path(), now + STARTUP_GRACE) {
-            starts += 1;
-        }
-        assert_eq!(starts, 1, "storage sweeps never became eligible");
+        assert!(!startup_sweeps_ready_at(temp.path(), now));
+        assert!(!startup_sweeps_ready_at(
+            temp.path(),
+            now + STARTUP_GRACE - Duration::from_nanos(1)
+        ));
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                storage_dir: Some(temp.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        schedule(
+            temp.path().to_path_buf(),
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            ctx.configure_generation(),
+        );
+        // Scheduling records admission synchronously, before spawning a worker.
+        // Counting that record checks the actual scheduling lane without racing
+        // the background worker or sleeping through the startup grace.
+        let admitted = states()
+            .lock()
+            .unwrap()
+            .get(temp.path())
+            .unwrap()
+            .last_run
+            .iter()
+            .count();
+        assert_eq!(admitted, 0, "retention started during startup warm-up");
+        assert!(startup_sweeps_ready_at(temp.path(), now + STARTUP_GRACE));
     }
 
     // Gate the maintenance worker at a named phase, without making the request
