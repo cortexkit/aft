@@ -2132,15 +2132,24 @@ fn os_cstring(value: &OsStr) -> io::Result<CString> {
 }
 
 fn validate_directory_handle(file: &File) -> io::Result<()> {
+    // Reject reparse points before classifying a non-directory as a file that
+    // recursive cleanup may unlink. Junctions must never enter that fallback.
+    #[cfg(windows)]
+    validate_windows_handle(file, true)?;
     let metadata = file.metadata()?;
     if !metadata.is_dir() {
+        #[cfg(unix)]
+        let kind = io::ErrorKind::InvalidData;
+        // CreateFile's BACKUP_SEMANTICS permits opening directories, but unlike
+        // Unix O_DIRECTORY it also opens regular files. Match O_DIRECTORY's
+        // error so remove_tree_contents can unlink ordinary IO artifacts.
+        #[cfg(windows)]
+        let kind = io::ErrorKind::NotADirectory;
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            kind,
             "expected a non-reparse directory handle",
         ));
     }
-    #[cfg(windows)]
-    validate_windows_handle(file, true)?;
     Ok(())
 }
 
@@ -2575,6 +2584,70 @@ mod tests {
 
         // The victim's control content is untouched because the swap never happened.
         assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_handle_validation_reports_not_a_directory_for_regular_files() {
+        let storage = tempfile::tempdir().unwrap();
+        let dir = PinnedDir::open(storage.path()).unwrap();
+        fs::write(storage.path().join("output.bin"), b"output").unwrap();
+
+        let error = dir
+            .open_dir_at(OsStr::new("output.bin"))
+            .err()
+            .expect("a regular file must not become a pinned directory");
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+        remove_tree_contents(&dir).unwrap();
+        assert!(!storage.path().join("output.bin").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_handle_validation_refuses_junctions() {
+        let storage = tempfile::tempdir().unwrap();
+        let io_path = storage.path().join("io");
+        let target = storage.path().join("outside-task");
+        fs::create_dir(&io_path).unwrap();
+        fs::create_dir(&target).unwrap();
+        let victim = target.join("victim");
+        fs::write(&victim, b"victim-bytes").unwrap();
+        let junction = io_path.join("junction");
+        // Directory junctions do not require the symbolic-link privilege.
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&junction)
+            .unwrap();
+        assert_ne!(
+            file.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
+            0,
+            "the handle must refer to the junction itself, not its target"
+        );
+        let error = validate_directory_handle(&file).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "task path is a reparse point");
+        drop(file);
+
+        let dir = PinnedDir::open(&io_path).unwrap();
+        let error = remove_tree_contents(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "task path is a reparse point");
+        assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
+        fs::remove_dir(&junction).unwrap();
     }
 
     #[test]
