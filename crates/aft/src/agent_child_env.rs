@@ -74,6 +74,14 @@ const SUBC_IDENTITY_ENV_KEYS: [&str; 3] = [
 ];
 
 static WORKER_TEST_THREAD_LOGGED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static WORKER_TEST_THREAD_OVERSIZE_LOGGED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> =
+    OnceLock::new();
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerTestThreadBudgetIssue {
+    Invalid(&'static str),
+    Oversized(String),
+}
 
 /// Supply bounded test-run concurrency to a worker-preset bash child without
 /// replacing a value the caller already chose.
@@ -99,9 +107,9 @@ fn inject_worker_test_threads_with(
         return;
     }
 
-    let (threads, reason) = worker_test_thread_budget(project_root);
-    if let Some(reason) = reason {
-        log_worker_test_thread_fallback_once(project_root, reason);
+    let (threads, issue) = worker_test_thread_budget(project_root);
+    if let Some(issue) = issue {
+        log_worker_test_thread_fallback_once(project_root, issue);
     }
     let threads = threads.to_string();
     for name in missing {
@@ -120,75 +128,116 @@ fn has_test_thread_override(environment: &HashMap<String, String>, name: &str) -
     }
 }
 
-fn worker_test_thread_budget(project_root: &Path) -> (u32, Option<&'static str>) {
-    let Some(worktree_parent) = project_root.parent() else {
+fn worker_test_thread_budget_path(project_root: &Path) -> Option<PathBuf> {
+    project_root.parent().map(|worktree_parent| {
+        worktree_parent
+            .join(".cargo")
+            .join(ALFONSO_TEST_THREADS_FILE)
+    })
+}
+
+/// Reject oversized budgets instead of letting a corrupt file overwhelm the
+/// shared machine; valid values are always between one and 256 threads.
+fn worker_test_thread_budget(project_root: &Path) -> (u32, Option<WorkerTestThreadBudgetIssue>) {
+    let Some(path) = worker_test_thread_budget_path(project_root) else {
         return (
             DEFAULT_WORKER_TEST_THREADS,
-            Some("worktree has no parent directory"),
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "worktree has no parent directory",
+            )),
         );
     };
-    let path = worktree_parent
-        .join(".cargo")
-        .join(ALFONSO_TEST_THREADS_FILE);
     let contents = match fs::read(&path) {
         Ok(contents) => contents,
         Err(_) => {
             return (
                 DEFAULT_WORKER_TEST_THREADS,
-                Some("budget file is absent or unreadable"),
+                Some(WorkerTestThreadBudgetIssue::Invalid(
+                    "budget file is absent or unreadable",
+                )),
             )
         }
     };
     let Ok(contents) = std::str::from_utf8(&contents) else {
         return (
             DEFAULT_WORKER_TEST_THREADS,
-            Some("budget file is not valid UTF-8"),
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file is not valid UTF-8",
+            )),
         );
     };
     let Some(digits) = contents.strip_suffix('\n') else {
         return (
             DEFAULT_WORKER_TEST_THREADS,
-            Some("budget file must contain a decimal integer and newline"),
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file must contain a decimal integer and newline",
+            )),
         );
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return (
             DEFAULT_WORKER_TEST_THREADS,
-            Some("budget file does not contain a positive decimal integer"),
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file does not contain a positive decimal integer",
+            )),
         );
     }
     let significant = digits.trim_start_matches('0');
     if significant.is_empty() {
         return (
             DEFAULT_WORKER_TEST_THREADS,
-            Some("budget file does not contain a positive decimal integer"),
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file does not contain a positive decimal integer",
+            )),
         );
     }
     if significant.len() > 3 || (significant.len() == 3 && significant > "256") {
         return (
-            MAX_WORKER_TEST_THREADS,
-            Some("budget exceeds 256 test threads and was clamped"),
+            DEFAULT_WORKER_TEST_THREADS,
+            Some(WorkerTestThreadBudgetIssue::Oversized(digits.to_string())),
         );
     }
     match significant.parse::<u32>() {
         Ok(threads) => (threads, None),
         Err(_) => (
             DEFAULT_WORKER_TEST_THREADS,
-            Some("budget file does not contain a positive decimal integer"),
+            Some(WorkerTestThreadBudgetIssue::Invalid(
+                "budget file does not contain a positive decimal integer",
+            )),
         ),
     }
 }
 
-fn log_worker_test_thread_fallback_once(worktree: &Path, reason: &'static str) {
-    let logged = WORKER_TEST_THREAD_LOGGED_WORKTREES.get_or_init(Default::default);
-    let Ok(mut logged) = logged.lock() else {
-        return;
-    };
-    if logged.insert(worktree.to_path_buf()) {
-        log::debug!(
-            "using {DEFAULT_WORKER_TEST_THREADS} test threads for worker bash in {}: {reason}",
-            worktree.display()
-        );
+fn log_worker_test_thread_fallback_once(worktree: &Path, issue: WorkerTestThreadBudgetIssue) {
+    match issue {
+        WorkerTestThreadBudgetIssue::Invalid(reason) => {
+            let logged = WORKER_TEST_THREAD_LOGGED_WORKTREES.get_or_init(Default::default);
+            let Ok(mut logged) = logged.lock() else {
+                return;
+            };
+            if logged.insert(worktree.to_path_buf()) {
+                log::debug!(
+                    "using {DEFAULT_WORKER_TEST_THREADS} test threads for worker bash in {}: {reason}",
+                    worktree.display()
+                );
+            }
+        }
+        WorkerTestThreadBudgetIssue::Oversized(value) => {
+            let logged = WORKER_TEST_THREAD_OVERSIZE_LOGGED_WORKTREES.get_or_init(Default::default);
+            let Ok(mut logged) = logged.lock() else {
+                return;
+            };
+            if logged.insert(worktree.to_path_buf()) {
+                let path = worker_test_thread_budget_path(worktree)
+                    .unwrap_or_else(|| PathBuf::from(ALFONSO_TEST_THREADS_FILE));
+                log::warn!(
+                    "worker test thread budget file {} contains value {}; using {DEFAULT_WORKER_TEST_THREADS} threads for {} because budgets above {MAX_WORKER_TEST_THREADS} are invalid",
+                    path.display(),
+                    value,
+                    worktree.display()
+                );
+            }
+        }
     }
 }
 
@@ -1548,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_thread_budget_defaults_invalid_files_and_caps_large_values() {
+    fn worker_thread_budget_defaults_invalid_and_oversized_files() {
         let container = tempfile::tempdir().unwrap();
         let root = container.path().join("worktree");
         fs::create_dir(&root).unwrap();
@@ -1567,8 +1616,21 @@ mod tests {
         }
         test_thread_file(&root, Some(b"9\n"));
         assert_eq!(worker_test_thread_budget(&root), (9, None));
+        test_thread_file(&root, Some(b"256\n"));
+        assert_eq!(worker_test_thread_budget(&root), (256, None));
+        test_thread_file(&root, Some(b"257\n"));
+        assert_eq!(
+            worker_test_thread_budget(&root),
+            (
+                DEFAULT_WORKER_TEST_THREADS,
+                Some(WorkerTestThreadBudgetIssue::Oversized("257".into()))
+            )
+        );
         test_thread_file(&root, Some(b"999999999999999999999999999999999\n"));
-        assert_eq!(worker_test_thread_budget(&root).0, MAX_WORKER_TEST_THREADS);
+        assert_eq!(
+            worker_test_thread_budget(&root).0,
+            DEFAULT_WORKER_TEST_THREADS
+        );
 
         let path = root
             .parent()
