@@ -30,7 +30,7 @@ const DOMAINS: [&str; 6] = [
     "symbols",
 ];
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct Binding {
     pub root: PathBuf,
     pub artifact_key: String,
@@ -76,6 +76,23 @@ fn states() -> &'static Mutex<HashMap<PathBuf, State>> {
 
 pub(crate) fn snapshot(storage: &Path) -> Option<SweepReport> {
     states().lock().ok()?.get(storage)?.report.clone()
+}
+
+#[cfg(test)]
+type TestHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+fn test_hooks() -> &'static Mutex<HashMap<PathBuf, TestHook>> {
+    static HOOKS: OnceLock<Mutex<HashMap<PathBuf, TestHook>>> = OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+pub(crate) fn test_hook(path: &Path, step: &str) {
+    let hook = test_hooks().lock().unwrap().get(path).cloned();
+    if let Some(hook) = hook {
+        hook(step);
+    }
 }
 
 #[cfg(test)]
@@ -483,6 +500,8 @@ fn owner_has_residency_marker(
 
 /// Metadata only: never open a raw file descriptor on a SQLite file set.
 fn tree_files(cache: &Path, deadline: Instant) -> io::Result<Vec<(PathBuf, u64)>> {
+    #[cfg(test)]
+    test_hook(cache, "walk");
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(cache)?;
     let mut pending = vec![cache.to_path_buf()];
     let mut result = Vec::new();
@@ -511,12 +530,9 @@ fn tree_files(cache: &Path, deadline: Instant) -> io::Result<Vec<(PathBuf, u64)>
 }
 
 pub(crate) fn remove_directory_if_closed(cache: &Path) -> io::Result<()> {
+    tree_files(cache, Instant::now() + PASS_BUDGET)?;
     let _files = crate::db::file_identity::filesystem_guard();
-    let entries = tree_files(cache, Instant::now() + PASS_BUDGET)?;
-    if entries
-        .iter()
-        .any(|(path, _)| crate::db::file_identity::open_connections(path) != 0)
-    {
+    if crate::db::file_identity::has_open_connections_under(cache) {
         return Err(io::Error::other("open SQLite cache retained"));
     }
     fs::remove_dir_all(cache)
@@ -577,12 +593,11 @@ fn candidate(
     } else {
         directory.join(key)
     };
-    let files_guard = crate::db::file_identity::filesystem_guard();
     let before = tree_files(&cache, deadline)?;
     if directory.file_name().is_some_and(|name| name == "views") {
         if let Some(store) = crate::views::ViewStore::existing_dir(cache.clone()) {
             report.removed_generations += store
-                .sweep_generations_locked()
+                .sweep_generations()
                 .map_err(|error| io::Error::other(error.to_string()))?;
         }
     }
@@ -688,14 +703,20 @@ fn candidate(
         report.skipped_recent += 1;
         return Ok(());
     }
-    if protected(&cache)? {
+    // Walks run without either admission or SQLite's process-wide open gate.
+    // Recheck protection and binding history under admission immediately before
+    // deletion, since a configure or query may have arrived during the walks.
+    let _barrier = barrier(storage)?;
+    let current_history = bindings(storage)?;
+    if !eligible(storage, key, &current_history, now, report)?
+        || crate::root_cache::live_scope_keys_for_storage(storage).contains(key)
+        || protected(&cache)?
+    {
         report.skipped_protected += 1;
         return Ok(());
     }
-    if after
-        .iter()
-        .any(|(path, _)| crate::db::file_identity::open_connections(path) != 0)
-    {
+    let files_guard = crate::db::file_identity::filesystem_guard();
+    if crate::db::file_identity::has_open_connections_under(&cache) {
         report.skipped_protected += 1;
         return Ok(());
     }
@@ -739,7 +760,6 @@ pub(crate) fn run_pass(storage: &Path, cancelled: &dyn Fn() -> bool) -> SweepRep
         if !crate::root_cache::storage_allows_root_keyed(storage)? {
             return Err(io::Error::other("network storage retained"));
         }
-        let _barrier = barrier(storage)?;
         prune_bindings(storage, cancelled, &mut report)?;
         let history = bindings(storage)?;
         let domains = domain_paths(storage)?;
@@ -918,6 +938,116 @@ mod storage_retention_tests {
         fs::create_dir_all(&path).unwrap();
         fs::write(path.join("payload.bin"), b"rebuildable").unwrap();
         path
+    }
+
+    // Gate the maintenance worker at a named phase, without making the request
+    // thread depend on scheduler speed or an artificial sleep.
+    fn paused_pass(
+        storage: &Path,
+        cache: &Path,
+        phase: &'static str,
+    ) -> (
+        std::thread::JoinHandle<SweepReport>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let once = std::sync::atomic::AtomicBool::new(false);
+        test_hooks().lock().unwrap().insert(
+            cache.to_path_buf(),
+            Arc::new(move |step| {
+                if step == phase && !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(20))
+                        .unwrap();
+                }
+            }),
+        );
+        let storage = storage.to_path_buf();
+        let cache = cache.to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let report = run_pass(&storage, &|| false);
+            test_hooks().lock().unwrap().remove(&cache);
+            report
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        (worker, release_tx)
+    }
+
+    #[test]
+    fn retention_walk_allows_view_load_without_lock_waits() {
+        let (temp, _root, scope) = fixture();
+        let view = crate::views::ViewStore::open(temp.path(), &scope).unwrap();
+        fs::write(view.derived_path("old").unwrap(), b"generation").unwrap();
+        let (worker, release) = paused_pass(temp.path(), view.view_dir(), "walk");
+        let waits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = waits.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let loader = std::thread::spawn(move || {
+            let _observer = crate::fs_lock::observe_retry_sleeps_for_test(observed);
+            let result = crate::pins::QueryPin::acquire(view.view_dir(), "old")
+                .map_err(|error| error.to_string())
+                .and_then(|pin| {
+                    view.current_generation_read_only()
+                        .map(|generation| (pin, generation))
+                        .map_err(|error| error.to_string())
+                });
+            done_tx.send(result).unwrap();
+        });
+        let loaded = done_rx.recv_timeout(Duration::from_secs(6));
+        release.send(()).unwrap();
+        let report = worker.join().unwrap();
+        loader.join().unwrap();
+        let (pin, current) = loaded
+            .expect("view load blocked by retention walk")
+            .unwrap();
+        assert_eq!(waits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(current, None);
+        assert_eq!(report.removed_generations, 0, "{report:?}");
+        drop(pin);
+    }
+
+    #[test]
+    fn retention_rechecks_a_generation_pinned_during_the_walk() {
+        let (temp, _root, scope) = fixture();
+        let view = crate::views::ViewStore::open(temp.path(), &scope).unwrap();
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"generation").unwrap();
+        let (worker, release) = paused_pass(temp.path(), view.view_dir(), "walk");
+        let pin = crate::pins::QueryPin::acquire(view.view_dir(), "old");
+        release.send(()).unwrap();
+        let report = worker.join().unwrap();
+        let pin = pin.unwrap();
+        assert_eq!(report.removed_generations, 0, "{report:?}");
+        assert!(old.is_file());
+        drop(pin);
+        assert_eq!(run_pass(temp.path(), &|| false).removed_generations, 1);
+    }
+
+    #[test]
+    fn retention_generation_delete_excludes_pin_admission() {
+        let (temp, _root, scope) = fixture();
+        let view = crate::views::ViewStore::open(temp.path(), &scope).unwrap();
+        let old = view.derived_path("old").unwrap();
+        fs::write(&old, b"generation").unwrap();
+        let (worker, release) = paused_pass(temp.path(), view.view_dir(), "generation-delete");
+        // Pin admission acquires this exact lock. A nonwaiting attempt must be
+        // refused while the deletion is paused after its protection recheck.
+        let admission =
+            crate::fs_lock::try_acquire(&temp.path().join("retention/sweep.lock"), Duration::ZERO);
+        release.send(()).unwrap();
+        let report = worker.join().unwrap();
+        assert!(matches!(
+            admission,
+            Err(crate::fs_lock::AcquireError::Timeout)
+        ));
+        assert_eq!(report.removed_generations, 1, "{report:?}");
+        assert!(!old.exists());
+        assert!(crate::pins::QueryPin::acquire(view.view_dir(), "next").is_ok());
     }
 
     #[test]
@@ -1221,6 +1351,19 @@ fn prune_bindings(
             }
         }
         if legacy_present {
+            continue;
+        }
+        let _barrier = barrier(storage)?;
+        // A rebind can replace the record while the cache inventory is being
+        // read. Never erase that newer observation or its root's history.
+        if read_json::<Binding>(&entry.path())? != binding
+            || DOMAINS.iter().any(|domain| {
+                storage.join(domain).join(&scope).exists()
+                    || storage.join(domain).join(&binding.artifact_key).exists()
+            })
+            || storage.join("views/v2").join(&scope).exists()
+            || crate::root_cache::protected_read_marker_exists(&storage.join("retention"), &scope)
+        {
             continue;
         }
         fs::remove_file(entry.path())?;

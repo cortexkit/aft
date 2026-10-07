@@ -1309,7 +1309,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-struct RetrySleepObserverGuard {
+pub(crate) struct RetrySleepObserverGuard {
     previous: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
@@ -1323,7 +1323,7 @@ impl Drop for RetrySleepObserverGuard {
 }
 
 #[cfg(test)]
-fn observe_retry_sleeps_for_test(
+pub(crate) fn observe_retry_sleeps_for_test(
     observer: Arc<std::sync::atomic::AtomicUsize>,
 ) -> RetrySleepObserverGuard {
     let previous = RETRY_SLEEP_OBSERVER.with(|slot| slot.replace(Some(observer)));

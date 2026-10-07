@@ -102,11 +102,14 @@ impl ViewStore {
     /// Remove generation files only after checking both durable publication and
     /// liveness. A dead assembler can leave a derived file before any manifest.
     pub fn sweep_generations(&self) -> Result<usize> {
-        let _barrier = crate::storage_retention::pin_barrier(self.view_dir())?;
-        self.sweep_generations_locked()
+        self.sweep_generations_impl(false)
     }
 
     pub(crate) fn sweep_generations_locked(&self) -> Result<usize> {
+        self.sweep_generations_impl(true)
+    }
+
+    fn sweep_generations_impl(&self, admission_locked: bool) -> Result<usize> {
         // A publisher cannot add a reference after the ownership snapshot and
         // release its base pin before the sweep checks that pin.
         let mut pointer = self.open_pointer_connection()?;
@@ -173,6 +176,15 @@ impl ViewStore {
             if current.as_deref() == Some(&generation) {
                 continue;
             }
+            // Directory enumeration and ownership reads do not exclude query
+            // admission. Only the protection recheck and this generation's
+            // unlink need to serialize with pins. The pointer transaction still
+            // excludes publication of a new reference to a derived owner.
+            let _barrier = if admission_locked {
+                None
+            } else {
+                crate::storage_retention::pin_barrier(self.view_dir())?
+            };
             let (metadata_path, keys_path) = crate::pins::pin_paths(self.view_dir(), &generation);
             if metadata_path.exists() {
                 let Ok(bytes) = fs::read(&metadata_path) else {
@@ -191,6 +203,8 @@ impl ViewStore {
             if crate::root_cache::sweep_read_markers(self.view_dir(), &generation).protected {
                 continue;
             }
+            #[cfg(test)]
+            crate::storage_retention::test_hook(self.view_dir(), "generation-delete");
             // The pointer write transaction still excludes publication here.
             if let Some(paths) = temporaries.remove(&generation) {
                 for path in paths {
