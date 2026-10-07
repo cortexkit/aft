@@ -1409,14 +1409,22 @@ pub(crate) fn with_task_io_fault<T>(fault: TaskIoFault, run: impl FnOnce() -> T)
 #[cfg(test)]
 fn task_io_fault_for_test(running: bool) -> io::Result<()> {
     TASK_IO_FAULT.with(|slot| match slot.get() {
-        Some(TaskIoFault::LayoutEnospc) if !running => Err(io::Error::from_raw_os_error(28)),
-        Some(TaskIoFault::RunningEnospc) if running => Err(io::Error::from_raw_os_error(28)),
+        Some(TaskIoFault::LayoutEnospc) if !running => Err(task_storage_full_for_test()),
+        Some(TaskIoFault::RunningEnospc) if running => Err(task_storage_full_for_test()),
         Some(TaskIoFault::RunningDelay(delay)) if running => {
             std::thread::sleep(delay);
             Ok(())
         }
         _ => Ok(()),
     })
+}
+
+#[cfg(test)]
+fn task_storage_full_for_test() -> io::Error {
+    // OS code 28 is ENOSPC on Unix but a printer error on Windows. Inject the
+    // portable error kind and a stable message so the test exercises disk-full
+    // handling on every host without depending on localized system text.
+    io::Error::new(io::ErrorKind::StorageFull, "No space left on device")
 }
 
 pub fn update_task_at<F>(task: &ResolvedTask, update: F) -> io::Result<PersistedTask>
