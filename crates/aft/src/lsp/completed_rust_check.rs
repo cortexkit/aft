@@ -1602,11 +1602,15 @@ mod tests {
         let disk: serde_json::Value =
             serde_json::from_slice(&fs::read(&cache.path).unwrap()).unwrap();
         let ledger = disk["record"]["fingerprint"]["files"].as_object().unwrap();
+        // PathBuf's JSON spelling uses the host separator; the ledger's
+        // contract is a relative workspace path, not a Unix-only string.
+        let relative = Path::new("member").join("src").join("lib.rs");
+        let key = relative.to_str().unwrap();
         assert!(
-            ledger.contains_key("member/src/lib.rs"),
+            ledger.contains_key(key),
             "workspace input paths must be relative"
         );
-        let entry = ledger["member/src/lib.rs"]
+        let entry = ledger[key]
             .as_array()
             .expect("stamps must not repeat field names for every input");
         assert_eq!(
