@@ -1032,6 +1032,7 @@ pub(crate) fn recovered_bash_frame(
             snapshot,
             now,
             true,
+            false,
             now,
             &key.call_key,
         )
@@ -9790,6 +9791,7 @@ pub(crate) mod test_support {
             root,
             session_id: "worker".into(),
             bare_name: "bash_watch".into(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "bash_watch",
                 &json!({}),
@@ -9840,6 +9842,7 @@ pub(crate) mod test_support {
             root,
             session_id: "session".into(),
             bare_name: "inspect".into(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "inspect",
                 &json!({}),
@@ -9959,6 +9962,7 @@ pub(crate) mod test_support {
             root,
             session_id: "polled-bash-session".into(),
             bare_name: "bash".into(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "bash",
                 &json!({}),
@@ -10144,6 +10148,7 @@ pub(crate) mod test_support {
             root,
             session_id: "test".into(),
             bare_name: "delete".into(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::default(),
             bind_trust: BindTrust::FirstParty,
             pending,

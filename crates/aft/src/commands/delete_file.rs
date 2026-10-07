@@ -629,7 +629,7 @@ pub(crate) fn handle_delete_deferred_with_restriction(
     let cancellation = crate::executor::current_job_cancellation()
         .unwrap_or_else(crate::executor::JobCancellation::new);
     let worker_cancellation = cancellation.clone();
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let (tx, rx) = crate::response_finalize::pending_response_channel();
     std::thread::spawn(move || {
         let _config_pin = ctx.pin_config_to(config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
@@ -639,14 +639,16 @@ pub(crate) fn handle_delete_deferred_with_restriction(
         let response = handle_delete_file_with_skip(&request, &ctx, Some(reason));
         let _ = tx.send(response);
     });
-    DispatchOutcome::Deferred(PendingResponse {
-        request_id: req.id.clone(),
-        session_id: req.session().to_string(),
-        attach_command: "delete".to_string(),
-        poll: Box::new(move |_| rx.try_recv().ok()),
-        cancellation: Some(cancellation),
-        on_shutdown: None,
-    })
+    DispatchOutcome::Deferred(
+        PendingResponse::from_receiver(
+            req.id.clone(),
+            req.session().to_string(),
+            "delete".to_string(),
+            rx,
+            |_, response| response.ok(),
+        )
+        .with_cancellation(cancellation),
+    )
 }
 
 fn outside_project_root(ctx: &AppContext, path: &Path) -> bool {

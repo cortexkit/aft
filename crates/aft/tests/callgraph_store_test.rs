@@ -874,6 +874,11 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
         &project_files(&root),
     )
     .unwrap();
+    // Keep the superseded source available for migration; retention may otherwise
+    // reclaim it as soon as its replacement is published.
+    let source_reader = CallGraphStore::open_readonly(legacy_build_dir.clone(), root.clone())
+        .unwrap()
+        .expect("legacy migration source reader");
     write_file(
         &root.join("main.ts"),
         "export function entry() { newLeaf(); }\nfunction newLeaf() {}\n",
@@ -884,6 +889,7 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
         &project_files(&root),
     )
     .unwrap();
+    drop(source_reader);
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     let ctx = AppContext::new(
@@ -963,6 +969,10 @@ fn writer_access_serves_legacy_fallback_while_background_migration_and_refresh_c
         &project_files(&root),
     )
     .unwrap();
+    // Hold a reader so the intentionally stale migration source survives GC.
+    let source_reader = CallGraphStore::open_readonly(legacy_build_dir.clone(), root.clone())
+        .unwrap()
+        .expect("legacy migration source reader");
     write_file(
         &source,
         "export function entry() { fallbackLeaf(); }\nfunction fallbackLeaf() {}\n",
@@ -973,6 +983,7 @@ fn writer_access_serves_legacy_fallback_while_background_migration_and_refresh_c
         &project_files(&root),
     )
     .unwrap();
+    drop(source_reader);
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     let ctx = root_keyed_test_context(&root, &storage, false);
@@ -1834,6 +1845,11 @@ fn store_cold_rebuilds_when_concurrent_clone_root_still_exists() {
         vec![root_a.display().to_string()]
     );
     drop(store);
+    // The test inspects A's immutable bytes after B publishes a replacement;
+    // protect the old generation rather than relying on incidental GC grace.
+    let source_reader = CallGraphStore::open_readonly(store_dir.clone(), root_a.clone())
+        .unwrap()
+        .expect("root A source reader");
 
     let root_b_raw = dir.path().join("root-b");
     copy_dir_all(&root_a, &root_b_raw).unwrap();
@@ -1881,6 +1897,7 @@ fn store_cold_rebuilds_when_concurrent_clone_root_still_exists() {
         vec![root_a.display().to_string()],
         "old generation file must not have been cheap re-rooted in place (root A still on disk)"
     );
+    drop(source_reader);
 }
 
 #[test]

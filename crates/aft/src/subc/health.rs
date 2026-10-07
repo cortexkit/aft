@@ -1386,6 +1386,27 @@ fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
     }
 }
 
+fn retention_report_totals(
+    reports: &std::collections::BTreeMap<String, crate::storage_retention::SweepReport>,
+) -> Value {
+    let mut totals = serde_json::Map::from_iter([("reports".into(), json!(reports.len()))]);
+    for report in reports.values() {
+        for (field, value) in serde_json::to_value(report).unwrap().as_object().unwrap() {
+            let (key, count) = match value {
+                Value::Number(number) if field != "at_ms" => {
+                    (field.clone(), number.as_u64().unwrap_or(0))
+                }
+                Value::Bool(value) => (format!("{field}_reports"), u64::from(*value)),
+                Value::Array(errors) if field == "errors" => (field.clone(), errors.len() as u64),
+                _ => continue,
+            };
+            let total = totals.get(&key).and_then(Value::as_u64).unwrap_or(0);
+            totals.insert(key, json!(total.saturating_add(count)));
+        }
+    }
+    Value::Object(totals)
+}
+
 fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
     let mut ledger_compacted = false;
     loop {
@@ -1408,6 +1429,23 @@ fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
         if !ledger_compacted {
             compact_write_ledger_root_ids(metrics);
             ledger_compacted = true;
+            continue;
+        }
+        let retention_key = metrics
+            .get("storage_retention")
+            .and_then(Value::as_object)
+            .and_then(|reports| reports.keys().next_back().cloned());
+        if let Some(key) = retention_key {
+            metrics["storage_retention"]
+                .as_object_mut()
+                .unwrap()
+                .remove(&key);
+            let omitted = metrics
+                .get("storage_retention_reports_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            metrics.insert("storage_retention_reports_omitted".into(), json!(omitted));
             continue;
         }
         return;
@@ -2209,6 +2247,15 @@ fn build_health_diagnostic_rollup(
         None
     };
 
+    let storage_retention = lifecycle_contexts
+        .iter()
+        .filter_map(|ctx| {
+            let storage = ctx.storage_dir();
+            crate::storage_retention::snapshot(&storage)
+                .map(|report| (storage.display().to_string(), report))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let storage_retention_totals = retention_report_totals(&storage_retention);
     let mut metrics = json!({
         "actor_count": actor_count,
         "root_count": root_count,
@@ -2230,10 +2277,9 @@ fn build_health_diagnostic_rollup(
         },
         "memory": memory,
         "bash_task_retention": bash_task_retention_metrics(shared_app),
-        "storage_retention": lifecycle_contexts.iter().filter_map(|ctx| {
-            let storage = ctx.storage_dir();
-            crate::storage_retention::snapshot(&storage).map(|report| (storage.display().to_string(), report))
-        }).collect::<std::collections::BTreeMap<_, _>>(),
+        "storage_retention": storage_retention,
+        "storage_retention_totals": storage_retention_totals,
+        "storage_retention_reports_omitted": 0,
         "bash_db_schema_hints": bash_db_hint_metrics(),
         "bash_task_refusals": bash_task_refusals,
         "mutating_lanes": mutating_lanes_metrics(executor),
@@ -3166,7 +3212,14 @@ mod tests {
             "bash-0000000000000001",
         )
         .unwrap();
-        std::fs::write(&task.paths.json, br#"{"schema_version":7}"#).unwrap();
+        std::fs::write(
+            &task.paths.json,
+            serde_json::to_vec(
+                &json!({"schema_version": crate::bash_background::persistence::SCHEMA_VERSION + 1}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         ctx.bash_background()
             .maybe_gc_persisted(&harness_storage)
             .unwrap();
@@ -4011,6 +4064,52 @@ mod tests {
             .expect("mutating lock holder completes");
 
         assert_eq!(report.status, HealthStatus::Degraded);
+    }
+
+    #[test]
+    fn health_retention_reports_fit_budget_with_exact_omissions_and_totals() {
+        let reports = (0..128)
+            .map(|index| {
+                (
+                    format!(
+                        "/storage/long-checkout-name-{index:04}/{}",
+                        "subdirectory/".repeat(12)
+                    ),
+                    crate::storage_retention::SweepReport {
+                        examined: 17,
+                        removed_roots: 3,
+                        removed_bytes: 4096,
+                        errors: vec!["example maintenance error".repeat(8)],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let totals = retention_report_totals(&reports);
+        let mut metrics = json!({
+            "roots": [],
+            "storage_retention": reports,
+            "storage_retention_totals": totals,
+            "storage_retention_reports_omitted": 0,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        budget_health_metrics(&mut metrics);
+        let retained = metrics["storage_retention"].as_object().unwrap().len() as u64;
+        let omitted = metrics["storage_retention_reports_omitted"]
+            .as_u64()
+            .unwrap();
+        assert!(omitted > 0, "the fixture must exceed the detail budget");
+        assert_eq!(retained + omitted, 128);
+        assert_eq!(metrics["storage_retention_totals"]["reports"], 128);
+        assert_eq!(metrics["storage_retention_totals"]["examined"], 2176);
+        assert_eq!(metrics["storage_retention_totals"]["removed_roots"], 384);
+        assert_eq!(metrics["storage_retention_totals"]["removed_bytes"], 524288);
+        assert_eq!(metrics["storage_retention_totals"]["errors"], 128);
+        let encoded = serde_json::to_vec(&metrics).unwrap();
+        assert!(encoded.len() <= 12 * 1024);
+        assert_eq!(metrics["metrics_bytes"], encoded.len());
     }
 
     #[test]

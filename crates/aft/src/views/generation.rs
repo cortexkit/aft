@@ -252,10 +252,15 @@ impl ViewStore {
         .flatten()
         {
             if keep_derived
-                && path
+                && (path
                     .extension()
                     .is_some_and(|extension| extension == "sqlite")
+                    || self
+                        .manifest_path(generation)
+                        .is_ok_and(|manifest| path == manifest))
             {
+                // The referenced database's manifest is the incremental clone
+                // baseline. Its trigram is not referenced and can be reclaimed.
                 continue;
             }
             for suffix in ["", "-wal", "-shm"] {
@@ -834,7 +839,7 @@ mod ownership_tests {
 mod storage_retention_tests {
     use super::*;
     #[test]
-    fn storage_retention_shared_derived_owner_does_not_retain_obsolete_manifest_or_trigram() {
+    fn storage_retention_shared_derived_owner_keeps_manifest_until_unreferenced() {
         let temp = tempfile::tempdir().unwrap();
         let view = ViewStore::open(temp.path(), "0123456789abcdef").unwrap();
         let database = view.derived_path("old").unwrap();
@@ -850,8 +855,20 @@ mod storage_retention_tests {
             .unwrap();
         assert_eq!(view.sweep_generations().unwrap(), 1);
         assert!(database.exists());
-        assert!(!manifest.exists());
+        assert!(manifest.exists());
         assert!(!trigram.exists());
+        fs::write(view.derived_path("next").unwrap(), b"next database").unwrap();
+        fs::write(view.manifest_path("next").unwrap(), b"next manifest").unwrap();
+        view.open_pointer_connection()
+            .unwrap()
+            .execute("UPDATE pointer SET generation = 'next'", [])
+            .unwrap();
+        // The first pass removes obsolete references; the second certifies
+        // that the formerly shared owner has no remaining references.
+        view.sweep_generations().unwrap();
+        view.sweep_generations().unwrap();
+        assert!(!database.exists());
+        assert!(!manifest.exists());
     }
 
     #[test]

@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v14_installs_call_ledger_from_v13() {
+    fn migration_v15_installs_call_ledger_from_v13() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);")
             .unwrap();
@@ -1197,8 +1197,46 @@ mod tests {
             apply_migration(&mut conn, version).unwrap();
         }
         assert_eq!(schema_version(&conn), 13);
-        assert_eq!(run_migrations(&mut conn).unwrap(), 14);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 15);
         assert!(sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+    }
+
+    #[test]
+    fn migration_v15_preserves_v14_remote_exec_policies() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);")
+            .unwrap();
+        for version in 1..=14 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(schema_version(&conn), 14);
+        assert!(!sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+        conn.execute_batch(
+            "INSERT INTO remote_exec_policies VALUES (
+              'project', 'harness', 'session', 'principal', 'owner', 'scope',
+              'epoch', 'preset', '{\"mode\":\"remote\"}', 123
+            );",
+        )
+        .unwrap();
+
+        assert_eq!(run_migrations(&mut conn).unwrap(), 15);
+        assert_eq!(schema_version(&conn), 15);
+        assert!(sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+        assert!(sqlite_names(&conn, "index").contains(&"idx_remote_exec_policies_used".to_string()));
+        let policy: (String, i64) = conn
+            .query_row(
+                "SELECT params, last_used FROM remote_exec_policies",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(policy, ("{\"mode\":\"remote\"}".to_string(), 123));
+        let count: u32 = conn
+            .query_row("SELECT COUNT(*) FROM remote_exec_policies", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -1219,14 +1257,14 @@ mod tests {
                 supported,
             } => {
                 assert_eq!(db_version, CURRENT_SCHEMA_VERSION + 1);
-                assert_eq!(supported, 14);
+                assert_eq!(supported, 15);
             }
             error => panic!("expected downgrade refusal, got {error:?}"),
         }
         let mut conn = Connection::open(&path).unwrap();
         assert!(matches!(
             run_migrations(&mut conn),
-            Err(OpenError::DowngradeRefused { supported: 14, .. })
+            Err(OpenError::DowngradeRefused { supported: 15, .. })
         ));
     }
 

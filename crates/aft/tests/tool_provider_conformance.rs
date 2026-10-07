@@ -637,7 +637,9 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
             response["structuredContent"]["code"], "database_unavailable",
             "{response}"
         );
-        assert_eq!(response["structuredContent"]["retryable"], false);
+        // The persistence gate retries opening on the next call. Refusal occurs
+        // before durable admission or execution, so retrying cannot duplicate work.
+        assert_eq!(response["structuredContent"]["retryable"], true);
     }
     let plain = route
         .raw(
@@ -676,6 +678,125 @@ async fn s1_keyless_untrusted_shell_keeps_slice_a_refusal() {
     assert_eq!(reply.header.ty, FrameType::Error);
     assert_eq!(response_json(&reply)["code"], "capability_not_admitted");
     assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn s1_untrusted_keyed_shell_without_elicitation_is_refused_at_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = bind_route_stamped_with_elicitation(
+        &process,
+        &root.join("project"),
+        "runner",
+        "conformance-session",
+        Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+        &scoped_stamp("carrier", "owner", "scope"),
+        false,
+    )
+    .await
+    .unwrap();
+    let marker = root.join("project/no-elicitation-marker");
+    let reply = route
+        .raw(
+            json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"no-elicitation"}),
+            false,
+        )
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+    assert_eq!(response_json(&reply)["code"], "capability_not_admitted");
+    assert!(!marker.exists());
+    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let executions: usize = conn
+        .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(executions, 0);
+    let admissions: usize = conn
+        .query_row("SELECT COUNT(*) FROM call_ledger", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(admissions, 0);
+}
+
+#[tokio::test]
+async fn s1_untrusted_keyed_shell_denial_and_elicitation_errors_never_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let warm = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"read","arguments":{"path":"input.txt"}}),
+        false,
+    )
+    .await;
+    let route = Subject::HEAD
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    for (case, ty, body) in [
+        (
+            "deny",
+            FrameType::Response,
+            br#"{"decision":"deny"}"#.to_vec(),
+        ),
+        ("malformed", FrameType::Response, b"not JSON".to_vec()),
+        (
+            "failed",
+            FrameType::Error,
+            br#"{"code":"elicitation_failed"}"#.to_vec(),
+        ),
+    ] {
+        let marker = root.join(format!("project/{case}-marker"));
+        let mut call =
+            json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":case});
+        route.adapt_preset(&mut call);
+        let mut wire = route.wire.lock().await;
+        let corr = wire.next_corr;
+        wire.next_corr += 1;
+        write_frame(
+            &mut wire.stream,
+            &Frame::build(
+                FrameType::Request,
+                flags(),
+                route.channel,
+                1,
+                corr,
+                serde_json::to_vec(&call).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ask = next_frame(&mut wire.stream).await.unwrap();
+        assert_eq!(ask.header.ty, FrameType::Request, "{case}: {ask:?}");
+        assert_eq!(ask.header.channel, route.channel);
+        assert!(!marker.exists(), "{case}: execution must wait for a grant");
+        write_frame(
+            &mut wire.stream,
+            &Frame::build(ty, flags(), route.channel, 1, ask.header.corr, body).unwrap(),
+        )
+        .await
+        .unwrap();
+        let reply = next_frame(&mut wire.stream).await.unwrap();
+        assert_eq!(reply.header.corr, corr, "{case}");
+        assert_eq!(reply.header.ty, FrameType::Response, "{case}");
+        assert_eq!(response_json(&reply)["isError"], true, "{case}");
+        assert!(
+            !marker.exists(),
+            "{case}: refusal must never spawn the shell"
+        );
+    }
+    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    let executions: usize = conn
+        .query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(executions, 0);
+    let refusals: usize = conn
+        .query_row("SELECT COUNT(*) FROM call_ledger WHERE state = 'Settled' AND outcome = 'bash_denied_untrusted'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(refusals, 3);
 }
 
 #[tokio::test]
@@ -1299,6 +1420,27 @@ async fn bind_route_stamped(
     role_versions: Option<BTreeMap<String, String>>,
     stamp: &RouteStamp,
 ) -> Result<Route, HarnessError> {
+    bind_route_stamped_with_elicitation(
+        handle,
+        project,
+        harness,
+        session,
+        role_versions,
+        stamp,
+        stamp.scope.is_some(),
+    )
+    .await
+}
+
+async fn bind_route_stamped_with_elicitation(
+    handle: &Process,
+    project: &Path,
+    harness: &str,
+    session: &str,
+    role_versions: Option<BTreeMap<String, String>>,
+    stamp: &RouteStamp,
+    elicitation: bool,
+) -> Result<Route, HarnessError> {
     let mut wire = handle.stream.lock().await;
     let channel = wire.next_channel;
     wire.next_channel += 1;
@@ -1312,7 +1454,7 @@ async fn bind_route_stamped(
         },
         identity: BindIdentity::new(project, harness, session),
         principal: Some(decode_principal(&stamp.principal)?),
-        consumer_capabilities: stamp.scope.as_ref().map(|_| vec!["elicitation".into()]),
+        consumer_capabilities: elicitation.then(|| vec!["elicitation".into()]),
         admission_facts: None,
         scope: stamp
             .scope

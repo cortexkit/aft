@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};

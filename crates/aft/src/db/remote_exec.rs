@@ -332,7 +332,7 @@ mod tests {
             conn.execute_batch("DROP TABLE remote_exec_policies; CREATE TABLE unrelated (v TEXT); INSERT INTO unrelated VALUES ('keep');").unwrap();
             conn.execute("UPDATE schema_version SET version=?1", [previous])
                 .unwrap();
-            assert_eq!(crate::db::run_migrations(&mut conn).unwrap(), 14);
+            assert_eq!(crate::db::run_migrations(&mut conn).unwrap(), 15);
             assert_eq!(
                 conn.query_row("SELECT v FROM unrelated", [], |r| r.get::<_, String>(0))
                     .unwrap(),

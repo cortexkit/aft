@@ -8,7 +8,9 @@ use crate::executor::Executor;
 use crate::run_tool_call::{ToolCallPhaseDurations, WaitingOn};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

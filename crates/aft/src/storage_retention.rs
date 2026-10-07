@@ -78,6 +78,26 @@ pub(crate) fn snapshot(storage: &Path) -> Option<SweepReport> {
     states().lock().ok()?.get(storage)?.report.clone()
 }
 
+#[cfg(test)]
+pub(crate) fn allow_next_scheduled_pass_for_test(storage: &Path) {
+    let mut states = states().lock().unwrap();
+    let state = states.get_mut(storage).expect("scheduled retention state");
+    assert!(
+        !state.running,
+        "previous scheduled pass must have completed"
+    );
+    state.last_run = None;
+}
+
+#[cfg(test)]
+pub(crate) fn scheduled_pass_finished_for_test(storage: &Path) -> bool {
+    states()
+        .lock()
+        .unwrap()
+        .get(storage)
+        .is_some_and(|state| !state.running && state.report.is_some())
+}
+
 fn key_valid(key: &str) -> bool {
     key.len() == 16 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

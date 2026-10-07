@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Train 343 assembles accepted bash, delete, storage, edit, persisted diagnostics, tool-call ledger, semantic and callgraph deliveries on train 340. Derived from git diff --name-only 45a0c7685..HEAD against RANKING_FENCE_PREFIXES: fenced paths are crates/aft/src/commands/semantic_search/memo.rs, crates/aft/src/lib.rs, crates/aft/src/search_index.rs and crates/aft/src/semantic_index.rs. These changes reduce repeated work and harden storage without changing search ranking or routing. All 93 benchmark rows must remain byte-identical to the reference. Per-branch descriptors are replaced by this train descriptor."
+}

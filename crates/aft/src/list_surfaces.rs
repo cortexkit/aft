@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "subc/health.rs",
+        enclosing_item: "budget_health_metrics",
+        location_or_primitive: "storage_retention map removal under HEALTH_METRICS_BUDGET_BYTES",
+        reason: "management health detail, not an agent result list; omitted retention reports are counted exactly and aggregate retention counters remain present",
+    },
+    ExclusionEntry {
         file: "bash_background/remote.rs",
         enclosing_item: "append_executor_environment_disclosure",
         location_or_primitive: "executor environment name preview min(10)",

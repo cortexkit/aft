@@ -685,18 +685,26 @@ pub(super) fn submit_deferred_bash(
                     let (response, storage_dir) =
                         crate::sandbox_spawn::with_authenticated_principal(spawn_principal, || {
                             crate::bash_background::with_call_key(call_key, || {
-                                crate::bash_background::registry::with_ledger_spawn(ledger_key.clone(), || {
-                                (
-                                    crate::bash_background::with_spawn_receipt(
-                                        Arc::clone(&receipt_for_spawn),
-                                        || crate::bash_background::with_remote_policy(
-                                            super::remote_policy::lookup(ctx, remote_key.as_ref()),
-                                            || dispatch(raw_req, ctx),
-                                        ),
-                                    ),
-                                    crate::bash_background::task_storage_dir(ctx),
+                                crate::bash_background::registry::with_ledger_spawn(
+                                    ledger_key.clone(),
+                                    || {
+                                        (
+                                            crate::bash_background::with_spawn_receipt(
+                                                Arc::clone(&receipt_for_spawn),
+                                                || {
+                                                    crate::bash_background::with_remote_policy(
+                                                        super::remote_policy::lookup(
+                                                            ctx,
+                                                            remote_key.as_ref(),
+                                                        ),
+                                                        || dispatch(raw_req, ctx),
+                                                    )
+                                                },
+                                            ),
+                                            crate::bash_background::task_storage_dir(ctx),
+                                        )
+                                    },
                                 )
-                                })
                             })
                         });
                     if let (Some(key), Some(db)) = (&ledger_key, ctx.db()) {
@@ -869,7 +877,7 @@ pub(super) fn submit_deferred_bash(
                 let task_id = receipt.expire();
                 if task_id.is_none() { spawn_cancel.request_cancel(); }
                 let response = match task_id {
-                    Some(task_id) if !server_completion => deadline_handoff_response(&request_id, &task_id, startup_window, worker_session),
+                    Some(task_id) if !server_completion => deadline_handoff_response(&request_id, &task_id, startup_window, worker_session, format_context.bash_watch_available.unwrap_or(worker_session)),
                     _ => Response::error(&request_id, "bash_start_deadline", startup_refusal_reason(&executor, &root_for_task, admitted.load(Ordering::Relaxed))),
                 };
                 log::warn!("bash startup reply deadline channel={} corr={corr} elapsed_ms={} admitted={} code={}", route.channel, received_at.elapsed().as_millis(), admitted.load(Ordering::Relaxed), response.data.get("code").and_then(Value::as_str).unwrap_or("promoted"));
@@ -889,18 +897,21 @@ pub(super) fn submit_deferred_bash(
                 ..
             }) = spawn_control
             {
-                detach_held_bash_in_background(drain::BashDetachTarget {
-                    task_id,
-                    session_id,
-                    wait_mode: detach_on_user_message,
-                    worker_session,
-                    server_completion,
-                    registry: spawn_ctx.bash_background().clone(),
-                    request_id,
-                    ver,
-                    flags,
-                    format_context,
-                });
+                detach_held_bash_in_background(
+                    drain::BashDetachTarget {
+                        task_id,
+                        session_id,
+                        wait_mode: detach_on_user_message,
+                        worker_session,
+                        server_completion,
+                        registry: spawn_ctx.bash_background().clone(),
+                        request_id,
+                        ver,
+                        flags,
+                        format_context,
+                    },
+                    false,
+                );
             }
             return;
         }
@@ -1005,9 +1016,9 @@ pub(super) fn submit_deferred_bash(
                     _ = wait_future => {}
                     _ = tokio::time::sleep_until(reply_deadline.into()), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
                         if claim.claim_for_wait_task() {
-                            let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session);
+                            let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session));
                             let result = bash_result_from_response(response, &deadline_target.format_context);
-                            detach_held_bash_in_background(deadline_target);
+                            detach_held_bash_in_background(deadline_target, false);
                             send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;
                         }
                     }
@@ -1039,11 +1050,12 @@ fn deadline_handoff_response(
     task_id: &str,
     wait_window_ms: u64,
     worker_session: bool,
+    bash_watch_available: bool,
 ) -> Response {
     Response::success(
         request_id,
         json!({
-            "output": crate::commands::bash_orchestrate::format_promotion_message(task_id, None, wait_window_ms, worker_session),
+            "output": crate::commands::bash_orchestrate::format_promotion_message(task_id, None, wait_window_ms, worker_session, bash_watch_available),
             "task_id": task_id, "status": "running",
         }),
     )
@@ -1934,6 +1946,7 @@ mod grant_path_tests {
             None,
             false,
             false,
+            None,
             received_at,
         );
         rx

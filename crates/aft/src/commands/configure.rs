@@ -16966,9 +16966,10 @@ mod inspect_orphan_sweep_tests {
     use super::*;
 
     #[test]
-    fn configure_storage_sweep_removes_old_unbound_inspect_scope() {
+    fn configure_scheduled_storage_sweep_reaps_dead_inspect_scope_after_grace() {
         let storage = tempfile::tempdir().expect("storage");
-        let scope = storage.path().join("inspect").join("orphan-scope");
+        let key = "0123456789abcdef";
+        let scope = storage.path().join("inspect").join(key);
         fs::create_dir_all(&scope).expect("scope directory");
         let cache = scope.join("cache.sqlite");
         fs::write(&cache, vec![0_u8; 4096]).expect("cache fixture");
@@ -16981,10 +16982,52 @@ mod inspect_orphan_sweep_tests {
         .expect("age cache fixture");
 
         run_configure_storage_sweeps(storage.path(), Harness::Opencode);
-
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let run_scheduled_pass = || {
+            crate::storage_retention::schedule(
+                storage.path().to_path_buf(),
+                ctx.subc_lifecycle_admission(),
+                ctx.configure_generation_flag(),
+                ctx.configure_generation(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !crate::storage_retention::scheduled_pass_finished_for_test(storage.path()) {
+                assert!(
+                    Instant::now() < deadline,
+                    "scheduled retention did not finish"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        run_scheduled_pass();
+        assert!(
+            scope.exists(),
+            "an unknown inspect scope needs observation grace"
+        );
+        let observed = storage.path().join(format!("retention/unknown/{key}.json"));
+        assert!(
+            observed.is_file(),
+            "scheduled retention must observe the unknown key"
+        );
+        // Age the durable first-observed clock instead of sleeping for a week.
+        fs::write(observed, "0\n").unwrap();
+        crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
+        run_scheduled_pass();
         assert!(
             !scope.exists(),
-            "old scope without a live route must be reaped"
+            "a dead inspect scope must be reaped once observation grace expires"
+        );
+        assert_eq!(
+            crate::storage_retention::snapshot(storage.path())
+                .unwrap()
+                .removed_roots,
+            1
         );
     }
 }

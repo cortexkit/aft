@@ -274,6 +274,7 @@ mod tests {
     const COMPLETED_TASK: &str = "bash-0000000000000003";
     const DELIVERED_TASK: &str = "bash-0000000000000004";
     const SESSION: &str = "restore-session";
+    const FUTURE_VERSION: u64 = crate::bash_background::persistence::SCHEMA_VERSION as u64 + 1;
 
     struct RestoreFixture {
         root: tempfile::TempDir,
@@ -305,7 +306,7 @@ mod tests {
             // The version header must suffice: an older reader cannot assume
             // the rest of a newer record still has its own payload shape.
             let future_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 7,
+                "schema_version": FUTURE_VERSION,
                 "task_id": FUTURE_TASK,
                 "future_payload": { "do_not_touch": true },
             }))
@@ -470,7 +471,7 @@ mod tests {
             &fixture.future.json,
         )
         .unwrap();
-        assert_eq!(refusal.found, 7);
+        assert_eq!(refusal.found, FUTURE_VERSION);
         assert!(refusal.to_string().contains(FUTURE_TASK));
     }
 
@@ -482,7 +483,8 @@ mod tests {
         assert_eq!(response.data["code"], crate::persisted_format::CODE);
         let message = response.data["message"].as_str().unwrap();
         assert!(
-            message.contains(FUTURE_TASK) && message.contains("format version 7"),
+            message.contains(FUTURE_TASK)
+                && message.contains(&format!("format version {FUTURE_VERSION}")),
             "{message}"
         );
         let health = fixture.ctx.build_status_snapshot();
@@ -511,7 +513,7 @@ mod tests {
         let floor = UnsupportedPersistedFormat::floor(
             PersistedStore::BashTask,
             fixture.storage().join(crate::reader_floor::FLOOR_FILE),
-            7,
+            FUTURE_VERSION,
         );
         crate::persisted_format::record(&floor, &fixture.storage());
         let health = fixture.ctx.build_status_snapshot();

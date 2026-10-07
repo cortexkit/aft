@@ -186,7 +186,13 @@ fn root_keyed_migration_mid_crash_cleans_partial_and_preserves_legacy_source() {
     let legacy_build_dir = root.join("legacy-build");
 
     publish_project_generation(&root, &legacy_build_dir, "oldLeaf");
+    // Migration needs a superseded source, which retention otherwise correctly
+    // reclaims when the replacement is published. Protect that source explicitly.
+    let source_reader = CallGraphStore::open_readonly(legacy_build_dir.clone(), root.clone())
+        .unwrap()
+        .expect("legacy source reader");
     publish_project_generation(&root, &legacy_build_dir, "newLeaf");
+    drop(source_reader);
     copy_dir_all(&legacy_build_dir, &legacy_dir).unwrap();
 
     let legacy_source = newest_superseded_generation(&legacy_dir, &root)

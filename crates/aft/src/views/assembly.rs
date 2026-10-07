@@ -546,21 +546,29 @@ pub fn prepare_checkout(
     let derived = view.derived_path(&next_generation)?;
     if !reused_derived {
         let clone_started = Instant::now();
+        let mut cold_build = unusable_base;
         let base = match current_generation.as_deref() {
             Some(base) if base_ready => {
                 let base_path = view.derived_path(base)?;
                 if base_path.is_file() {
-                    let base_manifest = view
-                        .derived_owner(base)
-                        .and_then(|owner| view.load_manifest(&owner))?;
-                    Some((base_path, base_manifest))
+                    let owner = view.derived_owner(base)?;
+                    match view.load_manifest(&owner) {
+                        Ok(base_manifest) => Some((base_path, base_manifest)),
+                        Err(ViewError::IoAt { source, .. })
+                            if source.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            cold_build = Some((ColdBuildReason::BaseNotReady,
+                                format!("derived owner {owner} manifest is missing; forcing a cold rebuild")));
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    }
                 } else {
                     None
                 }
             }
             _ => None,
         };
-        let mut cold_build = unusable_base;
         let mut incremental_base = None;
         if let Some((base_path, base_manifest)) = base {
             let size = super::materialization::manifest_diff_size(&base_manifest, &manifest);

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 #[cfg(any(windows, test))]
+#[cfg(all(test, unix))]
 use std::fs;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};

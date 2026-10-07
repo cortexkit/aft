@@ -2035,7 +2035,11 @@ mod tests {
         assert!(valid(&cache).is_none());
     }
 
+    /// Measures fingerprint cost on the current checkout, not a fixed fixture.
+    /// Run manually with `cargo test -p agent-file-tools --lib --
+    /// repository_fingerprint_completes_and_reuses_unchanged_hashes --ignored --nocapture`.
     #[test]
+    #[ignore = "measures the live checkout; run manually"]
     fn repository_fingerprint_completes_and_reuses_unchanged_hashes() {
         let root = canonical(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
         let temp = tempfile::tempdir().unwrap();
