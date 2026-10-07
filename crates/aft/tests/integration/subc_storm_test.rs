@@ -20,7 +20,9 @@ use aft::watcher_filter::{
     WatcherThreadHandle,
 };
 use serde_json::{json, Value};
-use subc_protocol::session::{HealthReport, ModuleControlRequest, ModuleControlResponse};
+use subc_protocol::session::{
+    HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
+};
 use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Principal, Priority, RouteTarget};
 use subc_transport::{read_frame, write_frame};
 use tokio::sync::mpsc;
@@ -619,7 +621,15 @@ async fn drive_max_paths_single_event_inner(input: FakeDaemonInput, report: bool
 
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 30_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "max-paths").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "max-paths",
+    )
+    .await;
     for (index, path) in paths.iter().enumerate() {
         write_storm_file(&root.join(path), &format!("max_new_{index:04}"));
     }
@@ -690,7 +700,15 @@ async fn drive_reads_during_maintenance(input: FakeDaemonInput) {
     init_git(&root);
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 31_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "reads-maintenance").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "reads-maintenance",
+    )
+    .await;
 
     let mut events = Vec::with_capacity(WATCHER_BACKLOG_EVENTS);
     for index in 0..WATCHER_BACKLOG_EVENTS {
@@ -749,7 +767,15 @@ async fn drive_pool_size_two(input: FakeDaemonInput) {
     init_git(&root);
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 32_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "pool-two").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "pool-two",
+    )
+    .await;
 
     let path = "src/pool_two.rs";
     write_storm_file(&root.join(path), "pool_two_maintenance_marker");
@@ -802,7 +828,15 @@ async fn drive_generation_supersession_mid_drain(input: FakeDaemonInput) {
     init_git(&root);
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 33_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "generation-old").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "generation-old",
+    )
+    .await;
 
     let mut events = Vec::with_capacity(WATCHER_BACKLOG_EVENTS);
     for index in 0..WATCHER_BACKLOG_EVENTS {
@@ -834,6 +868,7 @@ async fn drive_generation_supersession_mid_drain(input: FakeDaemonInput) {
     );
     expect_ack_within(&mut rx, corr, SETUP_BIND_BOUND).await;
     wait_for_ready_health(
+        &session.executor,
         &tx,
         &mut rx,
         &mut corr,
@@ -888,7 +923,15 @@ async fn drive_ignore_edit_ordering(input: FakeDaemonInput) {
     init_git(&root);
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 34_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "ignore-ordering").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "ignore-ordering",
+    )
+    .await;
     wait_for_grep_total(&tx, &mut rx, &mut corr, "newly_unignored_marker", 0).await;
     wait_for_grep_total(&tx, &mut rx, &mut corr, "newly_ignored_marker", 1).await;
 
@@ -916,7 +959,15 @@ async fn drive_rename_pair(input: FakeDaemonInput) {
     init_git(&root);
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 35_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "rename-pair").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "rename-pair",
+    )
+    .await;
     wait_for_grep_total(&tx, &mut rx, &mut corr, "rename_source_marker", 1).await;
 
     std::fs::create_dir_all(root.join("target")).expect("ignored target dir");
@@ -945,7 +996,15 @@ async fn drive_overflow_control(input: FakeDaemonInput) {
     init_git(&root);
     let (tx, mut rx) = start_io(session.stream);
     let mut corr = 36_000_u64;
-    bind_ready_search_root(&tx, &mut rx, &mut corr, &root, "overflow-control").await;
+    bind_ready_search_root(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &root,
+        "overflow-control",
+    )
+    .await;
 
     write_storm_file(&root.join("granular_before.rs"), "granular_before_marker");
     write_storm_file(&root.join("overflow_only.rs"), "overflow_rescan_marker");
@@ -1196,7 +1255,15 @@ async fn drive_fresh_worktree_borrow_only_daemon(input: FakeDaemonInput) {
     expect_ack_within(&mut rx, corr, SETUP_BIND_BOUND).await;
 
     let roots = vec![parent_root.clone()];
-    wait_for_ready_health(&tx, &mut rx, &mut corr, &roots, &HashSet::new()).await;
+    wait_for_ready_health(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &roots,
+        &HashSet::new(),
+    )
+    .await;
     let shared_key = aft::search_index::artifact_cache_key(&parent_root);
     assert_eq!(
         shared_key,
@@ -1429,7 +1496,15 @@ async fn drive_storm_daemon(input: FakeDaemonInput, scale: StormScale) {
         Duration::from_secs(20),
     )
     .await;
-    wait_for_ready_health(&tx, &mut rx, &mut corr, &roots, &semantic_roots).await;
+    wait_for_ready_health(
+        &session.executor,
+        &tx,
+        &mut rx,
+        &mut corr,
+        &roots,
+        &semantic_roots,
+    )
+    .await;
     assert_eq!(
         aft::commands::configure::semantic_stale_generation_discards_for_test(),
         0,
@@ -2039,6 +2114,7 @@ fn write_storm_file(path: &Path, marker: &str) {
 }
 
 async fn bind_ready_search_root(
+    executor: &Executor,
     tx: &mpsc::UnboundedSender<Frame>,
     rx: &mut mpsc::UnboundedReceiver<Frame>,
     corr: &mut u64,
@@ -2055,7 +2131,15 @@ async fn bind_ready_search_root(
         storm_project_config(true, false, false, 0),
     );
     expect_ack_within(rx, *corr, SETUP_BIND_BOUND).await;
-    wait_for_ready_health(tx, rx, corr, &[root.to_path_buf()], &HashSet::new()).await;
+    wait_for_ready_health(
+        executor,
+        tx,
+        rx,
+        corr,
+        &[root.to_path_buf()],
+        &HashSet::new(),
+    )
+    .await;
 }
 
 async fn collect_tool_responses(
@@ -2757,6 +2841,7 @@ fn assert_pending_bind_age(report: &HealthReport) {
 }
 
 async fn wait_for_ready_health(
+    executor: &Executor,
     tx: &mpsc::UnboundedSender<Frame>,
     rx: &mut mpsc::UnboundedReceiver<Frame>,
     corr: &mut u64,
@@ -2773,7 +2858,18 @@ async fn wait_for_ready_health(
         let response =
             read_control_response(rx, *corr, Duration::from_secs(5), "ready health").await;
         let report = response.health_report().expect("health report");
-        if health_has_ready_roots(&report, roots, semantic_roots) {
+        // Health's root details are a byte-budgeted diagnostic sample, not a
+        // complete inventory. Read the same live actor snapshots for omitted
+        // roots so every plane still has to reach its expected state. Keep
+        // polling health over the transport above to prove the module is live.
+        if health_has_ready_roots(&report, roots, semantic_roots, |root| {
+            let root_id = ProjectRootId::from_path(root).ok()?;
+            let (_, ctx) = executor
+                .try_actor_entries()?
+                .into_iter()
+                .find(|(id, _)| id == &root_id)?;
+            serde_json::to_value(ctx.try_health_snapshot(root)).ok()
+        }) {
             return;
         }
         assert!(
@@ -2788,6 +2884,7 @@ fn health_has_ready_roots(
     report: &HealthReport,
     roots: &[PathBuf],
     semantic_roots: &HashSet<usize>,
+    mut omitted_root_health: impl FnMut(&Path) -> Option<Value>,
 ) -> bool {
     let Some(metrics) = report.metrics.as_ref() else {
         return false;
@@ -2798,15 +2895,31 @@ fn health_has_ready_roots(
     for (index, root) in roots.iter().enumerate() {
         let expected = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
         let expected = strip_verbatim(&expected.to_string_lossy());
-        let Some(entry) = entries.iter().find(|entry| {
+        let entry = entries.iter().find(|entry| {
             entry
                 .get("project_root")
                 .and_then(Value::as_str)
                 .map(strip_verbatim)
                 .as_deref()
                 == Some(expected.as_str())
-        }) else {
-            return false;
+        });
+        let omitted_snapshot;
+        let entry = if let Some(entry) = entry {
+            entry
+        } else {
+            if metrics
+                .get("root_details_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                == 0
+            {
+                return false;
+            }
+            let Some(snapshot) = omitted_root_health(root) else {
+                return false;
+            };
+            omitted_snapshot = snapshot;
+            &omitted_snapshot
         };
         if entry.get("state").and_then(Value::as_str) != Some("ready") {
             return false;
@@ -2836,6 +2949,102 @@ fn health_has_ready_roots(
 
 fn strip_verbatim(path: &str) -> String {
     path.trim_start_matches(r"\\?\").to_string()
+}
+
+fn readiness_fixture() -> (Vec<tempfile::TempDir>, Vec<PathBuf>, HealthReport, Value) {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let roots: Vec<_> = dirs.iter().map(|dir| dir.path().to_path_buf()).collect();
+    let report = HealthReport {
+        status: HealthStatus::Ok,
+        detail: None,
+        metrics: Some(json!({
+            "root_count": 2,
+            "root_details_omitted": 1,
+            // A zero aggregate alone must never replace checking each plane.
+            "warming_roots": 0,
+            "roots": [{
+                "project_root": strip_verbatim(&std::fs::canonicalize(&roots[0]).unwrap().to_string_lossy()),
+                "state": "ready",
+                "search_index": {"status": "ready"},
+                "semantic_index": {"status": "disabled"}
+            }]
+        })),
+    };
+    let omitted = json!({
+        "project_root": roots[1],
+        "state": "ready",
+        "search_index": {"status": "ready"},
+        "semantic_index": {"status": "ready"}
+    });
+    (dirs, roots, report, omitted)
+}
+
+#[test]
+fn subc_storm_readiness_accepts_only_verified_omitted_roots() {
+    let (_dirs, roots, mut report, omitted) = readiness_fixture();
+    let semantic_roots = HashSet::from([1]);
+    assert!(health_has_ready_roots(
+        &report,
+        &roots,
+        &semantic_roots,
+        |root| {
+            assert_eq!(root, roots[1]);
+            Some(omitted.clone())
+        }
+    ));
+    assert!(!health_has_ready_roots(
+        &report,
+        &roots,
+        &semantic_roots,
+        |_| None
+    ));
+    report.metrics.as_mut().unwrap()["root_details_omitted"] = json!(0);
+    assert!(!health_has_ready_roots(
+        &report,
+        &roots,
+        &semantic_roots,
+        |_| { panic!("an unexplained missing root must not be treated as budget omission") }
+    ));
+}
+
+#[test]
+fn subc_storm_readiness_rejects_unready_omitted_planes() {
+    let (_dirs, roots, report, omitted) = readiness_fixture();
+    for (pointer, status) in [
+        ("/state", "busy"),
+        ("/search_index/status", "building"),
+        ("/search_index/status", "disabled"),
+        ("/semantic_index/status", "building"),
+        ("/semantic_index/status", "disabled"),
+        ("/semantic_index/status", "degraded"),
+    ] {
+        let mut unready = omitted.clone();
+        *unready.pointer_mut(pointer).unwrap() = json!(status);
+        assert!(
+            !health_has_ready_roots(&report, &roots, &HashSet::from([1]), |_| Some(
+                unready.clone()
+            )),
+            "omitted root was accepted with {pointer}={status}"
+        );
+    }
+}
+
+#[test]
+fn subc_storm_readiness_preserves_disabled_semantic_expectation() {
+    let (_dirs, roots, report, mut omitted) = readiness_fixture();
+    assert!(!health_has_ready_roots(
+        &report,
+        &roots,
+        &HashSet::new(),
+        |_| Some(omitted.clone())
+    ));
+    omitted["semantic_index"]["status"] = json!("disabled");
+    assert!(health_has_ready_roots(
+        &report,
+        &roots,
+        &HashSet::new(),
+        |_| Some(omitted.clone())
+    ));
 }
 
 fn assert_bind_stats(latencies: &[Duration]) {
