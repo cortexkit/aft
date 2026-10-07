@@ -17,6 +17,9 @@ use crate::context::SubcLifecycleAdmission;
 
 pub(crate) const ROOT_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const INTERVAL: Duration = Duration::from_secs(10 * 60);
+// Startup can warm many checkout views at once. Keep storage-wide V1 blob
+// marking (which must exclude pin admission) off that request-critical lane.
+const STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
 const PASS_BUDGET: Duration = Duration::from_secs(5);
 const PASS_ENTRIES: usize = 64;
 const TREE_ENTRIES: usize = 4096;
@@ -62,11 +65,25 @@ pub(crate) struct SweepReport {
 
 #[derive(Default)]
 struct State {
+    startup_observed_at: Option<Instant>,
     last_run: Option<Instant>,
     running: bool,
     domain: usize,
     entries: Option<ReadDir>,
     report: Option<SweepReport>,
+}
+
+pub(crate) fn startup_sweeps_ready(storage: &Path) -> bool {
+    startup_sweeps_ready_at(storage, Instant::now())
+}
+
+fn startup_sweeps_ready_at(storage: &Path, now: Instant) -> bool {
+    let mut states = states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = states.entry(storage.to_path_buf()).or_default();
+    let started = *state.startup_observed_at.get_or_insert(now);
+    now.saturating_duration_since(started) >= STARTUP_GRACE
 }
 
 fn states() -> &'static Mutex<HashMap<PathBuf, State>> {
@@ -98,7 +115,8 @@ pub(crate) fn test_hook(path: &Path, step: &str) {
 #[cfg(test)]
 pub(crate) fn allow_next_scheduled_pass_for_test(storage: &Path) {
     let mut states = states().lock().unwrap();
-    let state = states.get_mut(storage).expect("scheduled retention state");
+    let state = states.entry(storage.to_path_buf()).or_default();
+    state.startup_observed_at = Some(Instant::now() - STARTUP_GRACE);
     assert!(
         !state.running,
         "previous scheduled pass must have completed"
@@ -940,6 +958,23 @@ mod storage_retention_tests {
         path
     }
 
+    #[test]
+    fn startup_grace_does_not_admit_retention_or_blob_sweeps() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = Instant::now();
+        let mut starts = 0;
+        for elapsed in [Duration::ZERO, STARTUP_GRACE - Duration::from_nanos(1)] {
+            if startup_sweeps_ready_at(temp.path(), now + elapsed) {
+                starts += 1;
+            }
+        }
+        assert_eq!(starts, 0, "storage sweeps started during startup warm-up");
+        if startup_sweeps_ready_at(temp.path(), now + STARTUP_GRACE) {
+            starts += 1;
+        }
+        assert_eq!(starts, 1, "storage sweeps never became eligible");
+    }
+
     // Gate the maintenance worker at a named phase, without making the request
     // thread depend on scheduler speed or an artificial sleep.
     fn paused_pass(
@@ -1379,6 +1414,9 @@ pub(crate) fn schedule(
     expected: u64,
 ) {
     if !admission.is_current(&generation, expected) {
+        return;
+    }
+    if !startup_sweeps_ready(&storage) {
         return;
     }
     {

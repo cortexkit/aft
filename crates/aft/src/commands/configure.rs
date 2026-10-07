@@ -6645,6 +6645,9 @@ fn import_legacy_view_once(
 }
 
 fn run_configure_view_sweep(view: &ViewRuntimeSnapshot) {
+    if !crate::storage_retention::startup_sweeps_ready(&view.storage) {
+        return;
+    }
     #[cfg(any(test, feature = "test-timing-hooks"))]
     crate::views::semantic_runtime::delay_startup_io_for_test("VIEW_SWEEP");
     if let Ok(store) = crate::views::ViewStore::open(&view.storage, &view.scope) {
@@ -16990,6 +16993,9 @@ mod inspect_orphan_sweep_tests {
             },
         );
         let run_scheduled_pass = || {
+            // Advance the startup clock explicitly; this fixture checks the
+            // separate durable observation grace, not daemon warm-up admission.
+            crate::storage_retention::allow_next_scheduled_pass_for_test(storage.path());
             crate::storage_retention::schedule(
                 storage.path().to_path_buf(),
                 ctx.subc_lifecycle_admission(),
