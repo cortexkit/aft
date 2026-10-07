@@ -1623,6 +1623,10 @@ fn remove_windows_directory_task(
         }
         control.remove_self()?;
     }
+    // Native Windows shell/PTY wrappers also live directly in the task root.
+    // Remove those remaining entries through the same pinned, no-reparse walk
+    // before unlinking the directory that contains them.
+    remove_tree_contents(task)?;
     task.remove_self()?;
     session.ensure_current_identity()
 }
@@ -2372,6 +2376,8 @@ const GENERIC_READ: u32 = 0x8000_0000;
 #[cfg(windows)]
 const DELETE_ACCESS: u32 = 0x0001_0000;
 #[cfg(windows)]
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+#[cfg(windows)]
 const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
 #[cfg(windows)]
 const FILE_DISPOSITION_INFO: i32 = 4;
@@ -2381,6 +2387,14 @@ const FILE_DISPOSITION_INFO_EX: i32 = 21;
 const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
 #[cfg(windows)]
 const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+#[cfg(windows)]
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+#[cfg(windows)]
+const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+#[cfg(windows)]
+const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+#[cfg(windows)]
+const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2409,22 +2423,80 @@ fn windows_delete_with_fallback(
 }
 
 #[cfg(windows)]
-fn windows_delete_pinned_handle(file: &File, directory: bool) -> io::Result<()> {
-    // ReOpenFile targets the pinned object, not a path that could be swapped.
-    // A distinct DELETE handle is necessary: POSIX disposition unlinks the name
-    // when that handle closes, even if the original pins remain open.
-    let handle = unsafe {
-        ReOpenFile(
-            file.as_raw_handle(),
-            GENERIC_READ | DELETE_ACCESS,
+fn windows_reopen_directory_for_delete(file: &File) -> io::Result<File> {
+    // ReOpenFile rejects directories with STATUS_FILE_IS_A_DIRECTORY, mapped
+    // to Win32 Access Denied, even when BACKUP_SEMANTICS is requested. An empty
+    // NT-relative name reopens the pinned object without resolving its path.
+    let mut empty_name = 0_u16;
+    let mut name = WindowsUnicodeString {
+        length: 0,
+        maximum_length: 2,
+        buffer: &mut empty_name,
+    };
+    let mut object = WindowsObjectAttributes {
+        length: std::mem::size_of::<WindowsObjectAttributes>() as u32,
+        root_directory: file.as_raw_handle(),
+        object_name: &mut name,
+        attributes: 0,
+        security_descriptor: std::ptr::null_mut(),
+        security_quality_of_service: std::ptr::null_mut(),
+    };
+    let mut handle = std::ptr::null_mut();
+    let mut io_status = std::mem::MaybeUninit::<WindowsIoStatusBlock>::uninit();
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            GENERIC_READ | DELETE_ACCESS | SYNCHRONIZE_ACCESS,
+            &mut object,
+            io_status.as_mut_ptr(),
             FILE_SHARE_READ_WRITE_DELETE,
-            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_DIRECTORY_FILE
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_OPEN_REPARSE_POINT,
         )
     };
-    if handle as isize == -1 {
-        return Err(io::Error::last_os_error());
+    if status < 0 {
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
     }
-    let deletion = unsafe { File::from_raw_handle(handle) };
+    let reopened = unsafe { File::from_raw_handle(handle) };
+    let pinned_identity = windows_file_information(file)?;
+    let reopened_identity = windows_file_information(&reopened)?;
+    if pinned_identity.volume_serial_number != reopened_identity.volume_serial_number
+        || pinned_identity.file_index_high != reopened_identity.file_index_high
+        || pinned_identity.file_index_low != reopened_identity.file_index_low
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "delete handle does not refer to the pinned task directory",
+        ));
+    }
+    Ok(reopened)
+}
+
+#[cfg(windows)]
+fn windows_delete_pinned_handle(file: &File, directory: bool) -> io::Result<()> {
+    // Reopen the pinned object, not a path that could be swapped. A distinct
+    // DELETE file object is necessary: POSIX disposition unlinks the name when
+    // that handle closes, even if the original pins remain open.
+    let deletion = if directory {
+        windows_reopen_directory_for_delete(file)?
+    } else {
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle(),
+                GENERIC_READ | DELETE_ACCESS,
+                FILE_SHARE_READ_WRITE_DELETE,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        };
+        if handle as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { File::from_raw_handle(handle) }
+    };
     if directory {
         validate_directory_handle(&deletion)?;
     } else {
@@ -2536,6 +2608,47 @@ struct ByHandleFileInformation {
     number_of_links: u32,
     file_index_high: u32,
     file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsUnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsObjectAttributes {
+    length: u32,
+    root_directory: std::os::windows::io::RawHandle,
+    object_name: *mut WindowsUnicodeString,
+    attributes: u32,
+    security_descriptor: *mut std::ffi::c_void,
+    security_quality_of_service: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsIoStatusBlock {
+    // The first member is an opaque union of NTSTATUS and a pointer.
+    status_or_pointer: usize,
+    information: usize,
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtOpenFile(
+        handle: *mut std::os::windows::io::RawHandle,
+        access: u32,
+        object: *mut WindowsObjectAttributes,
+        io_status: *mut WindowsIoStatusBlock,
+        share: u32,
+        options: u32,
+    ) -> i32;
+    fn RtlNtStatusToDosError(status: i32) -> u32;
 }
 
 #[cfg(windows)]
@@ -2943,6 +3056,46 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_delete_handle_reopens_directory_without_following_renamed_path() {
+        let storage = tempfile::tempdir().unwrap();
+        let original = storage.path().join("original");
+        let moved = storage.path().join("moved");
+        fs::create_dir(&original).unwrap();
+        let dir = PinnedDir::open(&original).unwrap();
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        let victim = original.join("victim");
+        fs::write(&victim, b"victim-bytes").unwrap();
+
+        windows_delete_pinned_handle(&dir.file, true).unwrap();
+
+        assert!(
+            !moved.exists(),
+            "the pinned directory must be unlinked immediately"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"victim-bytes");
+        // The original pin remains live even though its name has disappeared.
+        assert!(dir.file.metadata().unwrap().is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_delete_handle_unlinks_plain_file_with_retained_reader() {
+        let storage = tempfile::tempdir().unwrap();
+        let path = storage.path().join("output");
+        fs::write(&path, b"retained-output").unwrap();
+        let mut reader = File::open(&path).unwrap();
+
+        windows_delete_pinned_handle(&reader, false).unwrap();
+
+        assert!(!path.exists());
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"retained-output");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_bundle_deletion_unlinks_names_while_pins_remain_open() {
         let storage = tempfile::tempdir().unwrap();
         let (task, _) = counted_task(storage.path());
@@ -2963,6 +3116,21 @@ mod tests {
         assert_eq!(output, b"retained-output");
         // Keep all original pins and IO handles live through the assertions.
         drop((stdout, nested, handles, task));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bundle_deletion_removes_native_wrapper_at_task_root() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let wrapper = task.paths.dir.join("metadata.ps1");
+        fs::write(&wrapper, b"exit 0").unwrap();
+
+        delete_task_bundle(&task.paths).unwrap();
+
+        assert!(!wrapper.exists());
+        assert!(!task.paths.dir.exists());
+        assert!(task.dirs.session.list_names().unwrap().is_empty());
     }
 
     #[cfg(windows)]
