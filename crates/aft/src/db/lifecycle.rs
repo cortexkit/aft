@@ -471,6 +471,15 @@ pub struct TrackedConnection {
     file_identity_key: Option<PathBuf>,
 }
 
+pub(super) fn production_write_gate(path: &Path) -> rusqlite::Result<()> {
+    crate::production_storage::refuse_write(path).map_err(|error| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+            Some(error.to_string()),
+        )
+    })
+}
+
 impl TrackedConnection {
     pub fn open(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
         Self::open_attributed(path, store, path.display().to_string())
@@ -481,6 +490,7 @@ impl TrackedConnection {
         store: SqliteStore,
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
+        production_write_gate(path)?;
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, OpenFlags::default())?;
         Self::from_connection_attributed(Connection::open(path)?, store, root_id)
@@ -491,6 +501,9 @@ impl TrackedConnection {
         flags: OpenFlags,
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
+        if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            production_write_gate(Path::new(path))?;
+        }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(Path::new(path), flags)?;
         Self::from_connection_attributed(
@@ -505,6 +518,9 @@ impl TrackedConnection {
         flags: OpenFlags,
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
+        if !flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            production_write_gate(path)?;
+        }
         let _guard = crate::db::file_identity::filesystem_guard();
         crate::private_storage::prepare_sqlite(path, flags)?;
         Self::from_connection_attributed(
@@ -527,6 +543,11 @@ impl TrackedConnection {
         store: SqliteStore,
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
+        if connection.path().is_some_and(|path| {
+            !path.is_empty() && crate::production_storage::protected(Path::new(path))
+        }) {
+            connection.pragma_update(None, "query_only", true)?;
+        }
         // Register before the first PRAGMA: it can enter WAL recovery and fault
         // on a truncated shared-memory mapping before later registration runs.
         let file_identity_key = connection

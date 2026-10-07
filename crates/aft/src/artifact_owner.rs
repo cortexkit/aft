@@ -517,6 +517,7 @@ fn create_owner_manifest(
     checkout_path: &str,
     git_common_dir: Option<&str>,
 ) -> io::Result<ArtifactOwnerClaim> {
+    crate::production_storage::refuse_write(path)?;
     let manifest = new_manifest(project_scope_key, checkout_path, git_common_dir);
     let mut file = crate::private_storage::options()
         .write(true)
@@ -680,6 +681,7 @@ pub(crate) fn check_manifest_format(
 }
 
 fn atomic_write_manifest(path: &Path, manifest: &ArtifactOwnerManifest) -> io::Result<()> {
+    crate::production_storage::refuse_write(path)?;
     let tmp = temp_path(path);
     let write_result = (|| -> io::Result<()> {
         let mut file = crate::private_storage::create(&tmp)?;

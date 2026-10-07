@@ -192,6 +192,10 @@ impl ArtifactAccess {
     /// Return whether this root may write the keyed artifact, logging the first
     /// denial for each concrete path so read-only degradation stays observable.
     pub fn allows_write(&self, artifact_key: &str, write_path: &Path) -> bool {
+        if let Err(error) = crate::production_storage::refuse_write(write_path) {
+            crate::slog_warn!("{error}");
+            return false;
+        }
         let writes_keyed_dir = write_path
             .ancestors()
             .any(|ancestor| ancestor.file_name() == Some(OsStr::new(artifact_key)));
@@ -221,6 +225,10 @@ impl ArtifactAccess {
         artifact_key: &str,
         write_path: &Path,
     ) -> bool {
+        if let Err(error) = crate::production_storage::refuse_write(write_path) {
+            crate::slog_warn!("{error}");
+            return false;
+        }
         // Classify the layout from a comparison-local canonical copy rather
         // than trusting key equality. A key derived while the root's final
         // component was absent can encode a symlink alias (for example,

@@ -199,6 +199,10 @@ pub fn raise(
     storage_root: &Path,
     requirements: &[(PersistedStore, u32)],
 ) -> Result<ReaderFloor, FloorError> {
+    crate::production_storage::refuse_write(storage_root).map_err(|error| FloorError::Io {
+        path: storage_root.to_path_buf(),
+        error,
+    })?;
     let path = floor_path(storage_root);
     crate::private_storage::open_root(storage_root).map_err(|error| FloorError::Io {
         path: storage_root.to_path_buf(),

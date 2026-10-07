@@ -5373,12 +5373,14 @@ pub(crate) const PRIVATE_FILE_MODE: u32 = crate::private_storage::FILE_MODE;
 /// Use this for backup-store directories only, never for directories that hold
 /// restored user files.
 pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    crate::production_storage::refuse_write(path)?;
     crate::private_storage::create_dir_all(path)
 }
 
 /// Publish a new durable store directory and any missing ancestors into their
 /// parents before committing records inside it. Existing directories cost no sync.
 pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
+    crate::production_storage::refuse_write(path)?;
     if path.is_dir() {
         return Ok(());
     }
@@ -5410,6 +5412,7 @@ pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
 /// left over from an earlier run keeps its old mode bits on open, so it is
 /// tightened through the open handle before any new content is written.
 fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    crate::production_storage::refuse_write(path)?;
     let mut options = crate::private_storage::options();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -5440,6 +5443,7 @@ fn write_temp_atomic_rename(
     content: &[u8],
     durable: bool,
 ) -> std::io::Result<()> {
+    crate::production_storage::refuse_write(&dir.join(final_name))?;
     let tmp_name = format!(
         ".{}.{}.{}.tmp",
         final_name,

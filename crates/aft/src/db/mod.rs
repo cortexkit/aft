@@ -622,6 +622,14 @@ pub(crate) enum OpenMode {
 pub(crate) fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, OpenError> {
     #[cfg(test)]
     crate::test_storage::assert_database(path);
+    // Decide before mkdir, journal PRAGMAs, or a writable SQLite open. A dev
+    // reader can inspect a matching schema, but cannot create even one record.
+    if crate::production_storage::protected(path) {
+        if peek_schema_version(path) == Some(CURRENT_SCHEMA_VERSION) {
+            return open_readonly(path);
+        }
+        crate::production_storage::refuse_write(path)?;
+    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             crate::private_storage::open_root(parent)?;
@@ -769,6 +777,16 @@ fn apply_pragmas_with_timeout(
 /// Returns the post-migration schema version. Refuses to open databases created
 /// by newer AFT versions.
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
+    // Also fence callers that supply their own connection. Read the version
+    // on that connection, never a second descriptor while it is live.
+    if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
+        if crate::production_storage::protected(Path::new(path)) {
+            if current_schema_version(conn).ok() == Some(CURRENT_SCHEMA_VERSION) {
+                return Ok(CURRENT_SCHEMA_VERSION);
+            }
+            crate::production_storage::refuse_write(Path::new(path))?;
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY);",
     )?;

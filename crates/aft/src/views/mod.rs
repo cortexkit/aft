@@ -747,6 +747,8 @@ impl ViewStore {
     /// Opens `<storage>/views/<project_scope_key>` and initializes its singleton
     /// pointer row under `BEGIN IMMEDIATE` so concurrent first opens agree.
     pub fn open(storage: impl AsRef<Path>, project_scope_key: &str) -> Result<Self> {
+        crate::production_storage::refuse_write(storage.as_ref())
+            .map_err(|error| ViewError::io_at("opening writable view", storage.as_ref(), error))?;
         validate_scope_key(project_scope_key)?;
         let view_dir = storage.as_ref().join("views").join(project_scope_key);
         crate::private_storage::open_dir(storage.as_ref(), &view_dir)
@@ -760,6 +762,8 @@ impl ViewStore {
     /// per-checkout (v2) layout keeps views under `views/v2/<scope>` and
     /// reaches this only through a registered view.
     pub(crate) fn open_dir(view_dir: PathBuf) -> Result<Self> {
+        crate::production_storage::refuse_write(&view_dir)
+            .map_err(|error| ViewError::io_at("opening writable view", &view_dir, error))?;
         crate::private_storage::open_dir(view_storage_root(&view_dir), &view_dir)
             .map_err(|error| ViewError::io_at("creating directory", &view_dir, error))?;
         let store = Self { view_dir };
@@ -1206,6 +1210,8 @@ fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
 }
 
 fn write_manifest_once(path: &Path, manifest: &Manifest) -> Result<()> {
+    crate::production_storage::refuse_write(path)
+        .map_err(|error| ViewError::io_at("writing manifest", path, error))?;
     let parent = path.parent().ok_or_else(|| {
         ViewError::InvalidManifest("manifest path must have a parent directory".to_string())
     })?;

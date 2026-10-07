@@ -19,6 +19,7 @@ import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
 import { hermeticGitChildEnv, withHermeticGitEnv } from "../../../../../tests/helpers/git-env.js";
 import { warmMacosExec } from "../../../../../tests/helpers/macos-exec-warm.js";
+import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
@@ -279,7 +280,7 @@ export async function createHarness(
       // callgraph_building). Tests need the store ready synchronously; fixtures
       // are tiny so a few seconds is ample headroom.
       childEnv: hermeticGitChildEnv({
-        AFT_CACHE_DIR: join(tempDir, ".aft-cache"),
+        ...isolatedAftEnvironment(join(tempDir, ".aft-env")),
         AFT_CALLGRAPH_BUILD_WAIT_MS: "15000",
       }),
     },

@@ -654,6 +654,7 @@ fn create_publication_artifacts(
     semantic_database: &Path,
     alias_database: &Path,
 ) -> Result<PublicationArtifacts, MigrationError> {
+    crate::production_storage::refuse_write(view_dir)?;
     let derived_database = view_dir.join("derived.sqlite");
     let derived = Connection::open(&derived_database)?;
     derived.execute_batch(

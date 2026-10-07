@@ -887,6 +887,7 @@ pub fn create_task_layout(
 }
 
 fn create_private_task_store(session_dir: &Path) -> io::Result<()> {
+    crate::production_storage::refuse_write(session_dir)?;
     #[cfg(test)]
     task_io_fault_for_test(false)?;
     let root = session_dir.parent().and_then(Path::parent).ok_or_else(|| {
@@ -1331,6 +1332,7 @@ fn read_task_file(file: &mut File, path: &Path) -> io::Result<PersistedTask> {
 }
 
 pub fn write_task(path: &Path, task: &PersistedTask) -> io::Result<()> {
+    crate::production_storage::refuse_write(path)?;
     validate_task_id(&task.task_id)?;
     if let Some(parent) = path.parent() {
         crate::private_storage::create_dir_all(parent)?;
@@ -1358,6 +1360,7 @@ pub fn write_task_at(task: &ResolvedTask, metadata: &PersistedTask) -> io::Resul
 }
 
 fn write_task_in_dir(dir: &PinnedDir, name: &OsStr, task: &PersistedTask) -> io::Result<()> {
+    crate::production_storage::refuse_write(&dir.path().join(name))?;
     #[cfg(test)]
     if task.status == BgTaskStatus::Running {
         task_io_fault_for_test(true)?;

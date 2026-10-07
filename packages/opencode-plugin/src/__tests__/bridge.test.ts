@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
 import { cachedExecutable } from "../../../aft-bridge/src/__tests__/test-utils/cached-executable.js";
+import { isolatedAftEnvironment } from "../../../aft-bridge/src/test-child-environment.js";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
 
@@ -56,8 +57,7 @@ function isolatedBridgeOptions<T extends object>(options: T) {
     ...options,
     childEnv: {
       ...childEnv,
-      AFT_STORAGE_DIR: join(projectRoot, ".aft-storage"),
-      AFT_CACHE_DIR: join(projectRoot, ".aft-cache"),
+      ...isolatedAftEnvironment(join(projectRoot, ".aft-env"), { ...process.env, ...childEnv }),
       XDG_DATA_HOME: canaryDataHome,
     },
   };

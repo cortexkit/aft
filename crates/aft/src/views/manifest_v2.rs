@@ -561,6 +561,8 @@ impl ViewStore {
 }
 
 fn write_bytes_once(path: &Path, bytes: &[u8]) -> Result<()> {
+    crate::production_storage::refuse_write(path)
+        .map_err(|error| ViewError::io_at("writing manifest", path, error))?;
     let parent = path.parent().ok_or_else(|| {
         ViewError::InvalidManifest("manifest path must have a parent directory".to_string())
     })?;

@@ -5,6 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join, relative, resolve, sep } from "node:path";
 
 import { type CatalogEntry, SubcClient } from "@cortexkit/subc-client";
+import { isolatedAftEnvironment } from "../../test-child-environment.js";
 
 const AFT_BINARY_NAME = process.platform === "win32" ? "aft.exe" : "aft";
 const SUBC_BINARY_NAME = process.platform === "win32" ? "subc-core.exe" : "subc-core";
@@ -139,6 +140,9 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
   const projectDir = join(tempDir, "project");
   const cacheDir = join(tempDir, "cache");
   const storageDir = join(tempDir, "aft-storage");
+  const childEnv = isolatedAftEnvironment(tempDir);
+  childEnv.AFT_STORAGE_DIR = storageDir;
+  await mkdir(storageDir, { recursive: true });
   const connectionFile = join(runtimeDir, "subc-connection.json");
   // Logs live outside the disposable fixture, including on startup failure.
   const logRoot = resolve(process.env.AFT_SUBC_E2E_LOG_DIR || join(tmpdir(), "aft-subc-e2e-logs"));
@@ -190,6 +194,7 @@ export async function startSubcRig(prepared: PreparedSubcLane): Promise<SubcRig>
             program: process.platform === "win32" ? prepared.aftBinaryPath : moduleWrapper,
             args: process.platform === "win32" ? [] : [moduleStderrPath, prepared.aftBinaryPath],
             env: {
+              ...childEnv,
               HOME: homeDir,
               XDG_CONFIG_HOME: configHome,
               XDG_DATA_HOME: dataHome,
@@ -532,6 +537,7 @@ async function spawnReadyDaemon(
     const daemon = spawn(subcCorePath, [], {
       env: {
         ...process.env,
+        ...isolatedAftEnvironment(resolve(dirs.homeDir, "..")),
         HOME: dirs.homeDir,
         XDG_CONFIG_HOME: dirs.configHome,
         XDG_RUNTIME_DIR: dirs.runtimeDir,

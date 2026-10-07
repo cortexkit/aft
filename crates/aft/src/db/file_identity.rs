@@ -266,6 +266,7 @@ pub(crate) struct IdentityConnection {
 
 impl IdentityConnection {
     pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
+        super::lifecycle::production_write_gate(path.as_ref())?;
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), rusqlite::OpenFlags::default())?;
         Ok(Self::new(rusqlite::Connection::open(path)?, seam))
@@ -276,6 +277,9 @@ impl IdentityConnection {
         flags: rusqlite::OpenFlags,
         seam: &'static str,
     ) -> rusqlite::Result<Self> {
+        if !flags.contains(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            super::lifecycle::production_write_gate(path.as_ref())?;
+        }
         let _guard = filesystem_guard();
         crate::private_storage::prepare_sqlite(path.as_ref(), flags)?;
         Ok(Self::new(

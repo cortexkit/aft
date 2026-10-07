@@ -387,6 +387,7 @@ pub fn write_segment(
     segment: &SegmentBytes,
     observer: Option<&dyn DurabilityObserver>,
 ) -> SegmentResult<PathBuf> {
+    crate::production_storage::refuse_write(storage)?;
     if store.plane() != FamilyPlane::Trigram {
         return Err(SegmentError::Malformed(
             "segments are written through the trigram store".to_string(),

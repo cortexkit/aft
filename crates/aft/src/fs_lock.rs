@@ -302,6 +302,7 @@ fn acquire_with_config(
     timeout: Option<Duration>,
     config: LockConfig,
 ) -> Result<LockGuard, AcquireError> {
+    crate::production_storage::refuse_write(path)?;
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let hostname = current_hostname();
     let mut warned_live_owner = false;

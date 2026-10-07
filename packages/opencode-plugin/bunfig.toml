@@ -1,0 +1,2 @@
+[test]
+preload = ["../aft-bridge/src/__tests__/test-utils/suite-setup.ts"]

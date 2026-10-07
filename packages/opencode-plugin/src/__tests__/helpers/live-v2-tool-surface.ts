@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { join, resolve } from "node:path";
+import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-environment.js";
 
 const repo = resolve(import.meta.dir, "../../../../..");
 const binary = resolve(process.argv[2]);
@@ -15,17 +16,7 @@ for (const key of Object.keys(env)) {
     delete env[key];
 }
 env.PWD = project;
-for (const key of [
-  "HOME",
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
-  "XDG_STATE_HOME",
-  "XDG_CACHE_HOME",
-  "XDG_RUNTIME_DIR",
-]) {
-  env[key] = join(root, key.toLowerCase());
-  mkdirSync(env[key]!);
-}
+Object.assign(env, isolatedAftEnvironment(root, env));
 assert.equal(Bun.spawnSync(["git", "init", "--quiet"], { cwd: project, env }).exitCode, 0);
 const reservation = createServer();
 await new Promise<void>((done) => reservation.listen(0, "127.0.0.1", done));

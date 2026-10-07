@@ -23,6 +23,7 @@ import {
   spawn as nodeSpawn,
   spawnSync as nodeSpawnSync,
 } from "node:child_process";
+import { testChildEnvironment } from "./test-child-environment.js";
 
 export type {
   ChildProcess,
@@ -68,8 +69,16 @@ type AnyFunction = (...args: unknown[]) => unknown;
  * that replaces the module still sees its replacement called.
  */
 function hidden<T>(resolve: () => T, takesArgv: boolean): T {
-  return ((...args: unknown[]) =>
-    (resolve() as unknown as AnyFunction)(...withWindowsHidden(args, takesArgv))) as T;
+  return ((...args: unknown[]) => {
+    const out = withWindowsHidden(args, takesArgv);
+    if (process.env.AFT_TEST_ISOLATION_ROOT) {
+      const index =
+        takesArgv && (Array.isArray(out[1]) || (out[1] == null && out.length > 2)) ? 2 : 1;
+      const options = out[index] as { env?: NodeJS.ProcessEnv };
+      options.env = testChildEnvironment(options.env ?? process.env);
+    }
+    return (resolve() as unknown as AnyFunction)(...out);
+  }) as T;
 }
 
 /** `child_process.spawn` with `windowsHide: true` forced. */
