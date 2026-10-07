@@ -223,14 +223,20 @@ describe("OpenCode 2 built-in tool overlap notice", () => {
   test("a host without tool.list() stays silent and logs why once at debug level", async () => {
     const debugSpy = spyOn(logger, "debug");
     try {
-      const host = fakeHost({ hostTools: ["patch", "shell"], hasToolList: false });
-      await boot(host);
-      await prompt(host, "session-a");
-      await prompt(host, "session-b");
-      expect(host.synthetic).toEqual([]);
+      const first = fakeHost({ hostTools: ["patch", "shell"], hasToolList: false });
+      const second = fakeHost({ hostTools: ["patch"], hasToolList: false });
+      await boot(first);
+      await boot(second);
+      await prompt(first, "session-a");
+      await prompt(first, "session-b");
+      await prompt(second, "session-c");
+      expect(first.synthetic).toEqual([]);
+      expect(second.synthetic).toEqual([]);
+      // Only this reason is counted: a server effect booted by another test
+      // file in the same process may log its own, unrelated reason.
       const reasons = debugSpy.mock.calls
         .map((call) => String(call[0]))
-        .filter((message) => message.startsWith("Built-in tool overlap check skipped"));
+        .filter((message) => message.includes("no tool.list()"));
       expect(reasons).toEqual([
         "Built-in tool overlap check skipped: the host context has no tool.list(); no notice shown",
       ]);
@@ -248,7 +254,7 @@ describe("OpenCode 2 built-in tool overlap notice", () => {
       expect(host.synthetic).toEqual([]);
       const reasons = debugSpy.mock.calls
         .map((call) => String(call[0]))
-        .filter((message) => message.startsWith("Built-in tool overlap check skipped"));
+        .filter((message) => message.includes("tool.list() failed"));
       expect(reasons).toHaveLength(1);
       expect(reasons[0]).toContain("tool.list() failed");
     } finally {

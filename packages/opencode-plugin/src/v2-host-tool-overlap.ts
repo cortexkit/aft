@@ -72,17 +72,18 @@ export function hostToolOverlapNotice(overlaps: readonly HostToolOverlap[]): str
 // same process, and the user should see the notice once, not once per
 // Location or session.
 let noticeClaimed = false;
-let unavailableLogged = false;
+const loggedUnavailableReasons = new Set<string>();
 
 /** Reset the once-per-process state. Tests only. */
 export function __resetHostToolOverlapNoticeForTests(): void {
   noticeClaimed = false;
-  unavailableLogged = false;
+  loggedUnavailableReasons.clear();
 }
 
+/** Log why the check could not run, once per distinct reason per process. */
 function logDetectionUnavailable(reason: string): void {
-  if (unavailableLogged) return;
-  unavailableLogged = true;
+  if (loggedUnavailableReasons.has(reason)) return;
+  loggedUnavailableReasons.add(reason);
   debug(`Built-in tool overlap check skipped: ${reason}; no notice shown`);
 }
 
