@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
     catalog::{
-        composition_digest, schema_digest, CatalogAnswer, CatalogRequest, CatalogTool,
-        SystemTextAnswer,
+        composition_digest, schema_digest, system_text_digest, CatalogAnswer, CatalogRequest,
+        CatalogTool, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
     errors,
@@ -422,11 +422,10 @@ pub(super) fn catalog(
             CatalogPreset::Reader => reader_text(&names),
         };
         // The item digest is the SHA-256 hex of the exact UTF-8 text returned,
-        // so a runner can check the text against it from this reply alone.
-        let digest = {
-            use sha2::{Digest, Sha256};
-            format!("{:x}", Sha256::digest(text.as_bytes()))
-        };
+        // so a runner can check the text against it from this reply alone. The
+        // protocol crate owns that definition; the preflight digest reuses it
+        // because the text is the only input that changes the rendered item.
+        let digest = system_text_digest(&text);
         let mut rendered = SystemTextAnswer::new(&digest, &digest)
             .with_text(text)
             // The text is composed for exactly the tools served in this reply;
@@ -1185,6 +1184,16 @@ mod tests {
                     format!("{:x}", Sha256::digest(text.as_bytes()))
                 );
             }
+            // The preflight digest and the protocol crate's helper agree with
+            // the independently computed item digest.
+            assert_eq!(
+                answer["system_text"]["preflight_digest"],
+                answer["system_text"]["item_digest"]
+            );
+            assert_eq!(
+                answer["system_text"]["item_digest"].as_str().unwrap(),
+                system_text_digest(text)
+            );
             assert!(!text.contains("bash_watch"));
             assert!(!text.contains("Long-running-commands"));
             assert_eq!(text.contains("wait: true"), disabled.is_empty());
@@ -1333,6 +1342,16 @@ mod tests {
                     format!("{:x}", Sha256::digest(text.as_bytes()))
                 );
             }
+            // The preflight digest and the protocol crate's helper agree with
+            // the independently computed item digest.
+            assert_eq!(
+                worker["system_text"]["preflight_digest"],
+                worker["system_text"]["item_digest"]
+            );
+            assert_eq!(
+                worker["system_text"]["item_digest"].as_str().unwrap(),
+                system_text_digest(text)
+            );
             assert!(text.contains("bash_watch"), "{text}");
             assert!(text.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
             for phrase in HEAD_ONLY_WORDING {

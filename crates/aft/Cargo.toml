@@ -198,7 +198,7 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-role-tool-provider = "=0.5.0"
+cortexkit-role-tool-provider = "=0.5.1"
 jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.29.0"
 subc-transport = "=0.10.0"
