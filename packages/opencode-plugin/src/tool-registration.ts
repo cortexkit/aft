@@ -209,9 +209,9 @@ export function buildOpenCodeToolMap(
  * Register the shared definition inventory on V2 as direct provider tools.
  *
  * The transform removes only the host tools AFT replaces, does not mutate the
- * shared V1 definitions, and never calls `update`. Provider and model data are
- * deliberately not inputs, so the same definitions produce the same registered
- * projection on every turn.
+ * shared V1 definitions, and never calls `update`. Projection runs when the
+ * host reads its tool transform, so the live runon gate is reflected without
+ * changing the registered inventory.
  */
 export function registerAftTools(
   context: V2ToolRegistrationContext,
@@ -219,11 +219,10 @@ export function registerAftTools(
   definitions: Readonly<Record<string, ToolDefinition>>,
   consumers: V2ToolConsumers = {},
 ): unknown {
-  const projected = Object.entries(definitions).map(([name, definition]) =>
-    projectV2Tool(name, definition, location, consumers),
-  );
-
   return context.tool.transform((editor) => {
+    const projected = Object.entries(definitions).map(([name, definition]) =>
+      projectV2Tool(name, definition, location, consumers),
+    );
     for (const definition of projected) {
       if (V2_BUILTIN_REPLACEMENTS.has(definition.name)) editor.remove(definition.name);
       editor.add(definition);

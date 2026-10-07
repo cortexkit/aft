@@ -20,6 +20,7 @@ import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
 import { remoteRunsOffered, resolveBashConfig, toolEnabled } from "../config.js";
 import { flushLog, sessionLog } from "../logger.js";
+import { normalizeToolArgSchemas } from "../normalize-schemas.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
 import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "./_shared.js";
@@ -516,8 +517,7 @@ export function createBashTool(
   // config (and not turned off by the project), decided once here; runner
   // health never adds or removes it.
   const remoteRuns = () => remoteRunsOffered(ctx.config);
-  const runonArg = () =>
-    remoteRuns() ? { runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION) } : {};
+  const runonArg = { runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION) };
   const args = {
     command: z
       .string()
@@ -548,26 +548,39 @@ export function createBashTool(
   // probes the module first; it only records whether the previous command used the
   // host path so the first successful module call clears fallback mode immediately.
   let hostFallbackActive = false;
+  let surfaceDescription: string | undefined;
 
   return {
     get description() {
-      return bashToolDescription(
-        false,
-        initialBashCfg.compress,
-        initialBashCfg.background,
-        true,
-        toolEnabled(ctx.config, "aft_zoom"),
-        bashCompanionRegistered(ctx.config, "bash_watch"),
-        {
-          outline: toolEnabled(ctx.config, "aft_outline"),
-          status: statusRegistered,
-          write: writeRegistered,
-          remoteRuns: remoteRuns(),
-        },
-      );
+      const baseDescription =
+        surfaceDescription ??
+        bashToolDescription(
+          false,
+          initialBashCfg.compress,
+          initialBashCfg.background,
+          true,
+          toolEnabled(ctx.config, "aft_zoom"),
+          bashCompanionRegistered(ctx.config, "bash_watch"),
+          {
+            outline: toolEnabled(ctx.config, "aft_outline"),
+            status: statusRegistered,
+            write: writeRegistered,
+            remoteRuns: false,
+          },
+        );
+      return remoteRuns() ? `${baseDescription}\n\n${BASH_RUNON_GUIDANCE}` : baseDescription;
+    },
+    set description(value: string) {
+      // Registration narrows companion wording after disabled tools are known.
+      // Keep that wording, but derive remote guidance from the live gate.
+      surfaceDescription = value
+        .replaceAll(` ${BASH_RUNON_GUIDANCE}`, "")
+        .replaceAll(`\n\n${BASH_RUNON_GUIDANCE}`, "");
     },
     get args() {
-      return { ...args, ...runonArg() } as ToolDefinition["args"];
+      return normalizeToolArgSchemas({
+        args: { ...args, ...(remoteRuns() ? runonArg : {}) } as ToolDefinition["args"],
+      }).args;
     },
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);
