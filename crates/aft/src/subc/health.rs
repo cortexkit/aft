@@ -2028,13 +2028,20 @@ fn build_health_diagnostic_rollup(
             }
             if let Some(object) = value.as_object_mut() {
                 if let Some(configured) = candidate.disclaim_privacy {
-                    object.insert(
-                        "bash".to_owned(),
-                        json!({
-                            "disclaim_privacy": configured,
-                            "privacy_disclaim_effective": configured && cfg!(target_os = "macos"),
-                        }),
-                    );
+                    // The root snapshot may already carry a `bash` block with
+                    // background task counts; add the privacy fields to it
+                    // rather than replacing those counts.
+                    let bash = object.entry("bash".to_owned()).or_insert_with(|| json!({}));
+                    if !bash.is_object() {
+                        *bash = json!({});
+                    }
+                    if let Some(bash) = bash.as_object_mut() {
+                        bash.insert("disclaim_privacy".to_owned(), json!(configured));
+                        bash.insert(
+                            "privacy_disclaim_effective".to_owned(),
+                            json!(configured && cfg!(target_os = "macos")),
+                        );
+                    }
                 }
                 if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
                     object.insert(
