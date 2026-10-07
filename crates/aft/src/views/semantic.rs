@@ -136,8 +136,11 @@ impl SemanticProducer {
     fn chunk_identity(&self) -> String {
         format!(
             "{};caps={}/{}/{}/{}",
-            self.id(), self.caps.signature_chars, self.caps.body_lines,
-            self.caps.body_chars, self.caps.total_chars
+            self.id(),
+            self.caps.signature_chars,
+            self.caps.body_lines,
+            self.caps.body_chars,
+            self.caps.total_chars
         )
     }
 
@@ -166,8 +169,8 @@ fn load_chunk(
     key: &FamilyKey,
     identity: &str,
     text: &str,
-) -> Result<Option<Vec<f32>>, String> {
-    let Some(payload) = store.get(key).map_err(|error| error.to_string())? else {
+) -> Result<Option<Vec<f32>>, crate::blob_store::v2::StoreError> {
+    let Some(payload) = store.get(key)? else {
         return Ok(None);
     };
     let Ok(row) = serde_json::from_slice::<ChunkVector>(&payload) else {
@@ -711,7 +714,9 @@ impl SemanticPlane {
                 self.producer.caps,
             ) {
                 Ok(file_chunks) => {
-                    chunks.push(file_chunks.unwrap_or_default());
+                    let file_chunks = file_chunks.unwrap_or_default();
+                    report.chunks += file_chunks.len();
+                    chunks.push(file_chunks);
                     to_embed.push((item, relative, group.full_key, claim));
                 }
                 Err(reason) => failures.push((item, group.full_key, reason)),
@@ -726,7 +731,12 @@ impl SemanticPlane {
             .iter()
             .map(|(_, key)| *key)
             .chain(to_embed.iter().map(|(_, _, _, claim)| *claim.key()))
-            .chain(chunks.iter().flatten().map(|chunk| self.producer.chunk_key(&chunk.embed_text)))
+            .chain(
+                chunks
+                    .iter()
+                    .flatten()
+                    .map(|chunk| self.producer.chunk_key(&chunk.embed_text)),
+            )
             .collect::<Vec<_>>();
         protect(&view, &keys)?;
         let mut pending = to_embed.into_iter().zip(chunks).peekable();
@@ -752,7 +762,11 @@ impl SemanticPlane {
                 let mut rows = |batch: Vec<String>| {
                     self.embed_chunks(&arena, &store, batch, embed, &mut report)
                 };
-                crate::semantic_index::embed_view_files_with_rows(chunks, &mut rows, budget.max_batch)
+                crate::semantic_index::embed_view_files_with_rows(
+                    chunks,
+                    &mut rows,
+                    budget.max_batch,
+                )
             };
             match embedded {
                 Ok(runs) => {
@@ -877,14 +891,21 @@ impl SemanticPlane {
         // model batch without acquiring chunk claims in conflicting orders.
         let _gate = arena.chunk_batch();
         let identity = self.producer.chunk_identity();
-        let keys = texts.iter().map(|text| self.producer.chunk_key(text)).collect::<Vec<_>>();
+        let keys = texts
+            .iter()
+            .map(|text| self.producer.chunk_key(text))
+            .collect::<Vec<_>>();
         let mut rows = Vec::with_capacity(texts.len());
         let mut misses = Vec::new();
-        report.chunks += texts.len();
         for (text, key) in texts.iter().zip(&keys) {
-            if let Some(vector) = load_chunk(store, key, &identity, text)? {
+            if let Some(vector) = load_chunk(store, key, &identity, text)
+                .map_err(|error| chunk_store_error(error, report))?
+            {
                 report.chunk_reused += 1;
-                rows.push(Some(BuildEmbeddingRow::Embedded { embedded_text: text.clone(), vector }));
+                rows.push(Some(BuildEmbeddingRow::Embedded {
+                    embedded_text: text.clone(),
+                    vector,
+                }));
             } else {
                 misses.push(text.clone());
                 rows.push(None);
@@ -895,35 +916,61 @@ impl SemanticPlane {
             report.embedded_texts += misses.len();
             // Validate backend rows and consume adaptive HTTP metadata before
             // caching: shortened or skipped input must not poison the original.
-            let mut embedded = crate::semantic_index::execute_build_embedding_batch(misses, embed)?.into_iter();
+            let mut embedded =
+                crate::semantic_index::execute_build_embedding_batch(misses, embed)?.into_iter();
             for ((row, text), key) in rows.iter_mut().zip(&texts).zip(&keys) {
-                if row.is_some() { continue; }
+                if row.is_some() {
+                    continue;
+                }
                 let mut result = embedded.next().expect("validated embedding count");
-                if let BuildEmbeddingRow::Embedded { embedded_text, vector } = &mut result {
+                if let BuildEmbeddingRow::Embedded {
+                    embedded_text,
+                    vector,
+                } = &mut result
+                {
                     if embedded_text == text {
                         let payload = serde_json::to_vec(&ChunkVector {
-                            producer: identity.clone(), text: text.clone(),
+                            producer: identity.clone(),
+                            text: text.clone(),
                             bits: vector.iter().map(|value| value.to_bits()).collect(),
-                        }).map_err(|error| error.to_string())?;
+                        })
+                        .map_err(|error| error.to_string())?;
                         match store.put_or_touch(key, &payload) {
-                            Ok(_) => {},
+                            Ok(_) => {}
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
                                 // A different process may have won. Only adopt
                                 // its floats after the same exact-text check.
-                                if let Some(stored) = load_chunk(store, key, &identity, text)? {
+                                if let Some(stored) = load_chunk(store, key, &identity, text)
+                                    .map_err(|error| chunk_store_error(error, report))?
+                                {
                                     *vector = stored;
                                 }
-                            },
-                            Err(error) => return Err(error.to_string()),
+                            }
+                            Err(error) => return Err(chunk_store_error(error, report)),
                         }
                     }
                 }
                 *row = Some(result);
             }
         }
-        store.touch(&keys).map_err(|error| error.to_string())?;
-        Ok(rows.into_iter().map(|row| row.expect("resolved chunk")).collect())
+        store
+            .touch(&keys)
+            .map_err(|error| chunk_store_error(error, report))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.expect("resolved chunk"))
+            .collect())
     }
+}
+
+/// Chunk-cache storage has the same retry policy as per-file storage. Do not
+/// turn a permanent store refusal into an embedding outage that retries forever.
+fn chunk_store_error(error: crate::blob_store::v2::StoreError, report: &mut FillReport) -> String {
+    let reason = error.to_string();
+    if !store_error_is_busy(&error) {
+        report.store_errors.push(reason.clone());
+    }
+    reason
 }
 
 fn admit_ready(
@@ -1661,7 +1708,9 @@ mod tests {
 
     fn large_source() -> String {
         (0..LARGE_DEFINITIONS)
-            .map(|i| format!("pub fn definition_{i}(input: u32) -> u32 {{\n    input + {i}\n}}\n\n"))
+            .map(|i| {
+                format!("pub fn definition_{i}(input: u32) -> u32 {{\n    input + {i}\n}}\n\n")
+            })
             .collect()
     }
 
@@ -1670,8 +1719,11 @@ mod tests {
         write_tree(&checkout.root, &[("src/large.rs", text)]);
         let mut delta = LiveDelta::new(Arc::clone(generation.generation()));
         crate::views::live_delta::reconcile(
-            &mut delta, &checkout.root,
-            &crate::blob_store::v2::TrigramPolicy { max_file_size: 1 << 20 },
+            &mut delta,
+            &checkout.root,
+            &crate::blob_store::v2::TrigramPolicy {
+                max_file_size: 1 << 20,
+            },
         );
         delta.snapshot()
     }
@@ -1679,15 +1731,35 @@ mod tests {
     fn assert_canonical_blob(checkout: &Checkout, source: &str) {
         let producer = checkout.plane.semantic_producer();
         let chunks = crate::semantic_index::chunk_view_file(
-            &checkout.root, Path::new("src/large.rs"), source.as_bytes(), producer.caps,
-        ).unwrap().unwrap();
+            &checkout.root,
+            Path::new("src/large.rs"),
+            source.as_bytes(),
+            producer.caps,
+        )
+        .unwrap()
+        .unwrap();
         let mut full = crate::semantic_index::embed_view_files(
-            vec![chunks], &mut |texts| Model::default().embed("model-a", texts), 64,
-        ).unwrap();
+            vec![chunks],
+            &mut |texts| Model::default().embed("model-a", texts),
+            64,
+        )
+        .unwrap();
         let expected = full.remove(0).encode_view_payload(&producer.payload());
-        let key = producer.key(source.as_bytes(), &RelPath::new(b"src/large.rs".to_vec()).unwrap());
-        let actual = checkout.owner.open_store(FamilyPlane::Semantic).unwrap().get(&key).unwrap().unwrap();
-        assert_eq!(actual, expected, "reuse changed the canonical per-file payload");
+        let key = producer.key(
+            source.as_bytes(),
+            &RelPath::new(b"src/large.rs".to_vec()).unwrap(),
+        );
+        let actual = checkout
+            .owner
+            .open_store(FamilyPlane::Semantic)
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "reuse changed the canonical per-file payload"
+        );
     }
 
     #[test]
@@ -1699,14 +1771,28 @@ mod tests {
         let plane = new_plane(storage.path(), "model-a");
         let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
         let initial = checkout.fill(&checkout.load(), &Model::default(), "model-a");
-        assert_eq!((initial.model_calls, initial.embedded_texts), (5, LARGE_DEFINITIONS));
+        assert_eq!(
+            (initial.model_calls, initial.embedded_texts),
+            (5, LARGE_DEFINITIONS)
+        );
         let edited = source.replace("input + 149\n", "input * 149\n");
         let snapshot = edit_snapshot(&checkout, &edited);
         let report = checkout.fill(&snapshot, &Model::default(), "model-a");
         assert_eq!(report.embedded_texts, 1, "one-definition edit: {report:?}");
-        assert_eq!((report.chunks, report.chunk_reused, report.model_calls, report.installed), (300, 299, 1, 1));
+        assert_eq!(
+            (
+                report.chunks,
+                report.chunk_reused,
+                report.model_calls,
+                report.installed
+            ),
+            (300, 299, 1, 1)
+        );
         assert_canonical_blob(&checkout, &edited);
-        println!("measurement one-function edit: full=5 calls/300 texts reuse={} calls/{} texts", report.model_calls, report.embedded_texts);
+        println!(
+            "measurement one-function edit: full=5 calls/300 texts reuse={} calls/{} texts",
+            report.model_calls, report.embedded_texts
+        );
     }
 
     #[test]
@@ -1721,7 +1807,15 @@ mod tests {
         let snapshot = edit_snapshot(&checkout, &shifted);
         let report = checkout.fill(&snapshot, &Model::default(), "model-a");
         assert_eq!(report.embedded_texts, 0, "line shift: {report:?}");
-        assert_eq!((report.chunks, report.chunk_reused, report.model_calls, report.installed), (300, 300, 0, 1));
+        assert_eq!(
+            (
+                report.chunks,
+                report.chunk_reused,
+                report.model_calls,
+                report.installed
+            ),
+            (300, 300, 0, 1)
+        );
         assert_canonical_blob(&checkout, &shifted);
     }
 
@@ -1751,8 +1845,14 @@ mod tests {
         write_tree(second.path(), &[("src/large.rs", &edited)]);
         let worker = Checkout::open(storage.path(), "scope-c", second.path(), &plane);
         let report = worker.fill(&worker.load(), &Model::default(), "model-a");
-        assert_eq!(report.embedded_texts, 1, "fresh changed checkout: {report:?}");
-        assert_eq!((report.chunk_reused, report.model_calls, report.installed), (299, 1, 1));
+        assert_eq!(
+            report.embedded_texts, 1,
+            "fresh changed checkout: {report:?}"
+        );
+        assert_eq!(
+            (report.chunk_reused, report.model_calls, report.installed),
+            (299, 1, 1)
+        );
         assert_canonical_blob(&worker, &edited);
     }
 
@@ -1766,13 +1866,35 @@ mod tests {
         let producer = plane.semantic_producer();
         let text = "file:src/a.rs\nfn correct()";
         let key = producer.chunk_key(text);
-        store.put_or_touch(&key, &serde_json::to_vec(&ChunkVector {
-            producer: producer.chunk_identity(), text: "different text at colliding hash".into(), bits: vec![999f32.to_bits(); 16],
-        }).unwrap()).unwrap();
+        store
+            .put_or_touch(
+                &key,
+                &serde_json::to_vec(&ChunkVector {
+                    producer: producer.chunk_identity(),
+                    text: "different text at colliding hash".into(),
+                    bits: vec![999f32.to_bits(); 16],
+                })
+                .unwrap(),
+            )
+            .unwrap();
         let mut report = FillReport::default();
-        let result = plane.embed_chunks(&plane.arena("family"), &store, vec![text.into()], &mut |texts| Model::default().embed("model-a", texts), &mut report).unwrap();
+        let result = plane
+            .embed_chunks(
+                &plane.arena("family"),
+                &store,
+                vec![text.into()],
+                &mut |texts| Model::default().embed("model-a", texts),
+                &mut report,
+            )
+            .unwrap();
         match &result[0] {
-            crate::semantic_index::BuildEmbeddingRow::Embedded { vector: actual, .. } => assert_eq!(*actual, vector("model-a", text), "colliding text installed the wrong vector"),
+            crate::semantic_index::BuildEmbeddingRow::Embedded { vector: actual, .. } => {
+                assert_eq!(
+                    *actual,
+                    vector("model-a", text),
+                    "colliding text installed the wrong vector"
+                )
+            }
             _ => panic!("expected vector"),
         }
         assert_eq!((report.embedded_texts, report.chunk_reused), (1, 0));
@@ -1792,8 +1914,76 @@ mod tests {
                 "chunker" => other.chunker_version.push_str("-new"),
                 _ => unreachable!(),
             }
-            assert_ne!(key, other.chunk_key(text), "{component} is missing from chunk identity");
+            assert_ne!(
+                key,
+                other.chunk_key(text),
+                "{component} is missing from chunk identity"
+            );
         }
+    }
+
+    #[test]
+    fn chunk_cache_store_refusal_is_not_an_embedding_retry() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        write_tree(root.path(), &[("src/large.rs", &large_source())]);
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
+        let snapshot = checkout.load();
+        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        connection.execute_batch("CREATE TRIGGER refuse_chunk_cache BEFORE INSERT ON blob_payloads BEGIN SELECT RAISE(ABORT, 'chunk cache storage refused'); END;").unwrap();
+        let report = checkout.fill(&snapshot, &Model::default(), "model-a");
+        assert_eq!(report.installed, 0);
+        assert_eq!(
+            report.store_errors.len(),
+            1,
+            "permanent cache refusal was classified as an embedding retry: {report:?}"
+        );
+        assert!(report.store_errors[0].contains("chunk cache storage refused"));
+    }
+
+    #[test]
+    fn chunk_reuse_concurrent_different_file_keys_embed_each_text_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let source = large_source();
+        write_tree(first.path(), &[("src/large.rs", &source)]);
+        write_tree(
+            second.path(),
+            &[(
+                "src/large.rs",
+                &source.replace("input + 149\n", "input * 149\n"),
+            )],
+        );
+        let plane = new_plane(storage.path(), "model-a");
+        let a = Checkout::open(storage.path(), "scope-a", first.path(), &plane);
+        let b = Checkout::open(storage.path(), "scope-b", second.path(), &plane);
+        let sa = a.load();
+        let sb = b.load();
+        let model = Model::default();
+        let start = std::sync::Barrier::new(2);
+        let (ra, rb) = std::thread::scope(|scope| {
+            let left = scope.spawn(|| {
+                start.wait();
+                a.fill(&sa, &model, "model-a")
+            });
+            let right = scope.spawn(|| {
+                start.wait();
+                b.fill(&sb, &model, "model-a")
+            });
+            (left.join().unwrap(), right.join().unwrap())
+        });
+        assert_eq!(
+            model.texts(),
+            301,
+            "overlapping versions duplicated chunk work: {ra:?} {rb:?}"
+        );
+        assert_eq!(ra.chunk_reused + rb.chunk_reused, 299);
+        assert_eq!((ra.installed, rb.installed), (1, 1));
+        assert_canonical_blob(&a, &source);
+        assert_canonical_blob(&b, &source.replace("input + 149\n", "input * 149\n"));
     }
 
     #[test]
@@ -1801,9 +1991,22 @@ mod tests {
         for path in ["mutations.toml", "config.yaml", "config.yml"] {
             let relative = RelPath::new(path.as_bytes().to_vec()).unwrap();
             assert!(!applies_to(&relative), "views admitted {path}");
-            assert!(!crate::semantic_index::is_semantic_indexed_extension(Path::new(path)), "legacy admitted {path}");
-            assert!(crate::semantic_index::chunk_view_file(Path::new("."), Path::new(path), b"[table]\nkey = 1\n", EmbedTextCaps::default()).unwrap().is_none());
-            assert!(crate::parser::detect_language(Path::new(path)).is_some(), "parser support must remain");
+            assert!(
+                !crate::semantic_index::is_semantic_indexed_extension(Path::new(path)),
+                "legacy admitted {path}"
+            );
+            assert!(crate::semantic_index::chunk_view_file(
+                Path::new("."),
+                Path::new(path),
+                b"[table]\nkey = 1\n",
+                EmbedTextCaps::default()
+            )
+            .unwrap()
+            .is_none());
+            assert!(
+                crate::parser::detect_language(Path::new(path)).is_some(),
+                "parser support must remain"
+            );
         }
     }
 

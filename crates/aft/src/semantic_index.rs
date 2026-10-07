@@ -9385,6 +9385,7 @@ pub(crate) fn chunk_view_file(
 /// Embeds several files' chunks in shared batches of `max_batch_size` texts and
 /// returns one run per file, in input order. Rows the backend skips are dropped
 /// exactly as a full build drops them.
+#[cfg(test)]
 pub(crate) fn embed_view_files<F>(
     files: Vec<Vec<SemanticChunk>>,
     embed_fn: &mut F,
@@ -9393,7 +9394,11 @@ pub(crate) fn embed_view_files<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
-    embed_view_files_with_rows(files, &mut |texts| execute_build_embedding_batch(texts, embed_fn), max_batch_size)
+    embed_view_files_with_rows(
+        files,
+        &mut |texts| execute_build_embedding_batch(texts, embed_fn),
+        max_batch_size,
+    )
 }
 
 /// Assembles the same canonical file runs from validated fresh or reused rows.

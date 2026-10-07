@@ -208,7 +208,8 @@ fn family_fill_rechecks_completed_work_after_acquiring_claim() {
     );
     assert_eq!(model.calls(), 1);
     assert_eq!(report.embedded_keys, 0);
-    assert_eq!(usage.rows, 1);
+    // One canonical file run and one reusable chunk vector.
+    assert_eq!(usage.rows, 2);
     assert_eq!(
         a.installed()
             .generation()
@@ -273,7 +274,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
         (1, 1),
         "a later batch error must not discard an already complete file run"
     );
-    assert_eq!(store.usage().unwrap().rows, 1);
+    assert_eq!(store.usage().unwrap().rows, 2);
     runtime
         .refresh(budget, &mut |texts| model.embed(texts))
         .unwrap();
@@ -283,7 +284,7 @@ fn completed_embedding_batches_survive_a_later_batch_failure() {
         "retry must not re-embed the completed first file"
     );
     assert_eq!(model.calls(), 4);
-    assert_eq!(store.usage().unwrap().rows, 3);
+    assert_eq!(store.usage().unwrap().rows, 6);
     let answer = query(&runtime, "chunk");
     assert!(answer.complete());
     assert_eq!(
@@ -319,12 +320,11 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
     let successful_texts = std::cell::Cell::new(0usize);
     let mut failed_texts = 0usize;
     let mut embed = |texts: Vec<String>| {
-        // One chunk per file makes completed text count independent of the
-        // actual store's row count. Each completed request must already have
-        // reached the store before another request is sent.
+        // One chunk per file produces a file row and a chunk-vector row. Each
+        // completed request must persist both before another request is sent.
         assert_eq!(
             store.usage().unwrap().rows as usize,
-            successful_texts.get(),
+            successful_texts.get() * 2,
             "completed batches were not persisted before the next request"
         );
         for text in &texts {
@@ -370,11 +370,12 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
         }
     }
     for round in 0..8 {
-        // A new whole-file key can legitimately have the same chunk text
-        // (the template need not include a changed body). Reject duplicates
-        // within a content revision/retry schedule, not across new keys.
-        completed.borrow_mut().clear();
-        let source = format!("pub fn revised_item() -> u32 {{ {} }}\n", round + 9000);
+        // Change the signature so each revision has genuinely new embed text;
+        // body-only edits of these single-line summaries reuse the vector.
+        let source = format!(
+            "pub fn revised_item_{round}() -> u32 {{ {} }}\n",
+            round + 9000
+        );
         for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
             let file = root.path().join("file_0000.rs");
             std::fs::write(&file, &source).unwrap();
@@ -401,7 +402,7 @@ fn repeated_worktree_edits_with_periodic_backend_failures_never_repeat_stored_te
     drop(embed);
     assert_eq!(successful_texts.get(), 2056);
     assert_eq!(new_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056);
+    assert_eq!(store.usage().unwrap().rows, 2056 * 2);
     assert_eq!(failed_texts, 321);
     assert_eq!(model.texts(), 2377);
     assert_eq!(model.calls(), 46);
@@ -461,7 +462,11 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
         );
     }
     for round in 0..8 {
-        let source = format!("pub fn revised_item() -> u32 {{ {} }}\n", round + 9000);
+        // Each revision must change embedded text, not only whole-file bytes.
+        let source = format!(
+            "pub fn revised_item_{round}() -> u32 {{ {} }}\n",
+            round + 9000
+        );
         for (i, (runtime, root)) in runtimes.iter().zip(&roots).enumerate() {
             let file = root.path().join("file_0000.rs");
             {
@@ -493,7 +498,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
     assert_eq!(model.texts(), 2056);
     assert_eq!(model.calls(), 40);
     assert_eq!(embedded_keys, 2056);
-    assert_eq!(store.usage().unwrap().rows, 2056);
+    assert_eq!(store.usage().unwrap().rows, 2056 * 2);
 
     // A source completion rejected at admission still stores its immutable
     // payload first. Retry and a sibling must reuse it, not re-embed it.
@@ -546,7 +551,7 @@ fn repeated_worktree_edits_embed_only_new_family_keys_even_after_dropped_admissi
     assert_eq!(model.texts(), before);
     assert_eq!(model.texts(), 2057);
     assert_eq!(model.calls(), 41);
-    assert_eq!(store.usage().unwrap().rows, 2057);
+    assert_eq!(store.usage().unwrap().rows, 2057 * 2);
     for (runtime, root) in runtimes.iter().zip(&roots) {
         let answer = query(runtime, "revised item");
         assert!(answer.complete());
@@ -690,7 +695,8 @@ fn large_semantic_fill_batches_pin_writes() {
         cold(root.path(), "item").0
     );
     assert_eq!((after.0 - writes, after.1 - syncs), (1, 0));
-    assert_eq!(key_file_bytes() - bytes, 2048 * 65);
+    // File keys and chunk-vector keys share one linear pin write.
+    assert_eq!(key_file_bytes() - bytes, 2048 * 2 * 65);
 }
 
 #[test]
