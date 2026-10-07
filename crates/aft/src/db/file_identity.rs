@@ -412,6 +412,18 @@ pub fn open_connections(path: &Path) -> usize {
         .sum()
 }
 
+/// Called under the filesystem gate before unlinking a whole cache directory.
+/// Consult the registry, not a pre-gate directory inventory: another opener may
+/// have created a new database after that inventory was collected.
+pub(crate) fn has_open_connections_under(path: &Path) -> bool {
+    let key = registry_key(path);
+    open_databases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|(path, database)| path.starts_with(&key) && !database.openers.is_empty())
+}
+
 /// Report `action` if it is about to delete, rename, or replace the database
 /// file at `path` while this process still has a connection open on it.
 ///
