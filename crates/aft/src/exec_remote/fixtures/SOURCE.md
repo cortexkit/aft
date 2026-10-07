@@ -1,11 +1,8 @@
-Policy fixtures copied byte-for-byte from prefrontal commit `519c93ee4a5e`,
-`test-vectors/exec-remote-v1/policy/`. The adjacent upstream README documents
-the reference generator. Tests verify canonical bytes, SHA-256 digests and
-every independent expected routing decision. Do not regenerate these from
-AFT's matcher.
-
-`plans/broca-worker*` comes from the same commit's
-`test-vectors/fetch-plan-v1/plans/`. These are the actual frozen core plans;
+`plans/broca-worker*` comes from prefrontal commit `519c93ee4a5e`,
+`test-vectors/fetch-plan-v1/plans/`. Their `remote_exec.commands` lists date
+from the command-prefix matcher AFT no longer has; AFT accepts and ignores
+them, since a call now runs remotely only when it sets `runon`. That commit's
+policy vectors tested the matcher and were removed with it. These are the actual frozen core plans;
 catalog tests use their AFT tool item's params verbatim and verify the JCS
 bytes against the published SHA-256, not against an AFT-generated expectation.
 
@@ -21,7 +18,7 @@ Older protocol outcomes/replies remain embedded in
 `tests/fixtures/exec-remote/published-v0.2.0.json`, so unit tests do not run Cargo
 or depend on its registry cache. All 26 outcomes and 16 replies, including their
 original digests, were checked byte-for-byte against the locked published 0.2.1
-package and are unchanged. The core policy/plans above retain their separate
+package and are unchanged. The core plans above retain their separate
 519c93ee4a5e provenance; they are not the earlier motor-protocol corpus.
 
 The matching upstream `SHA256SUMS` entries are:

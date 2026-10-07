@@ -106,7 +106,7 @@ pub(super) const METADATA: &[(&str, &str, bool)] = &[
 
 #[cfg(test)]
 pub(super) fn tools(disabled: &[String], powershell_available: bool) -> Vec<CatalogTool> {
-    tools_for(CatalogPreset::Head, disabled, powershell_available)
+    tools_for_session(CatalogPreset::Head, disabled, powershell_available, false)
 }
 
 /// The named catalog variants AFT serves. A consumer's plan item names one
@@ -177,10 +177,14 @@ pub(super) const PRESET_ONLY_METADATA: &[(&str, &str, bool)] =
 
 /// The catalog entries `preset` serves, in manifest order, with a worker-only
 /// tool placed after the head tool it accompanies.
-pub(super) fn tools_for(
+///
+/// A session that may run commands on the remote runner (`runon`) also sees
+/// bash's `runon` argument; no other session does.
+pub(super) fn tools_for_session(
     preset: CatalogPreset,
     disabled: &[String],
     powershell_available: bool,
+    runon: bool,
 ) -> Vec<CatalogTool> {
     served_tools(preset)
         .iter()
@@ -189,7 +193,10 @@ pub(super) fn tools_for(
         .filter(|tool| {
             tool.catalog.name != "bash_watch" || crate::tool_gate::catalog_keeps("bash", disabled)
         })
-        .map(|tool| tool.catalog.clone())
+        .map(|tool| match (&tool.with_runon, runon) {
+            (Some(with_runon), true) => with_runon.clone(),
+            _ => tool.catalog.clone(),
+        })
         .collect()
 }
 
@@ -198,6 +205,10 @@ pub(super) fn tools_for(
 // its schemas, so neither digests nor validators need request-scoped rebuilding.
 struct ServedTool {
     catalog: CatalogTool,
+    /// The same entry with bash's `runon` argument, served only to a session
+    /// that may run commands remotely. Admission validates every call against
+    /// it, so a call from either kind of session is checked the same way.
+    with_runon: Option<CatalogTool>,
     validator: OnceLock<jsonschema::Validator>,
 }
 
@@ -205,8 +216,9 @@ static SERVED_TOOLS: LazyLock<[Vec<ServedTool>; 3]> = LazyLock::new(|| {
     CatalogPreset::ALL.map(|preset| {
         build_tools(preset)
             .into_iter()
-            .map(|catalog| ServedTool {
+            .map(|(catalog, with_runon)| ServedTool {
                 catalog,
+                with_runon,
                 validator: OnceLock::new(),
             })
             .collect()
@@ -221,7 +233,7 @@ fn served_tools(preset: CatalogPreset) -> &'static [ServedTool] {
     }]
 }
 
-fn build_tools(preset: CatalogPreset) -> Vec<CatalogTool> {
+fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)> {
     #[cfg(test)]
     ADMISSION_WORK.with(|count| {
         let (catalogs, validators) = count.get();
@@ -278,16 +290,30 @@ fn build_tools(preset: CatalogPreset) -> Vec<CatalogTool> {
                 .as_object_mut()
                 .expect("tool schemas are objects")
                 .remove("description");
-            let digest = schema_digest(&schema).expect("embedded schema has a structural digest");
-            let mut entry = CatalogTool::new(name, digest, 1, schema);
-            if !tag.is_empty() {
-                entry.capabilities.push((*tag).into());
-            }
-            entry.description = description;
-            if *restrict_replace {
-                entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
-            }
-            entry
+            let entry = |schema: Value| {
+                let digest =
+                    schema_digest(&schema).expect("embedded schema has a structural digest");
+                let mut entry = CatalogTool::new(name.clone(), digest, 1, schema);
+                if !tag.is_empty() {
+                    entry.capabilities.push((*tag).into());
+                }
+                entry.description = description.clone();
+                if *restrict_replace {
+                    entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
+                }
+                entry
+            };
+            let preset_name = (preset != CatalogPreset::Head).then(|| preset.name());
+            let with_runon = manifest::runon_property(preset_name, &name).map(|(key, property)| {
+                let mut schema = schema.clone();
+                schema
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .expect("embedded schemas have properties")
+                    .insert(key, property);
+                entry(schema)
+            });
+            (entry(schema), with_runon)
         })
         .collect()
 }
@@ -373,6 +399,17 @@ pub(super) fn catalog(
     disabled: &[String],
     powershell_available: bool,
 ) -> Result<Value, ErrorBody> {
+    catalog_for_session(body, disabled, powershell_available, false)
+}
+
+/// [`catalog`] for a session that may (`runon`) or may not run commands on
+/// the remote runner; only the first sees bash's `runon` argument.
+pub(super) fn catalog_for_session(
+    body: Value,
+    disabled: &[String],
+    powershell_available: bool,
+    runon: bool,
+) -> Result<Value, ErrorBody> {
     let request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
     let preset = CatalogPreset::parse("preset", request.preset.as_deref())?;
@@ -382,8 +419,12 @@ pub(super) fn catalog(
             "unsupported catalog parameter",
         ));
     }
-    let mut answer =
-        CatalogAnswer::new("", "").with_tools(tools_for(preset, disabled, powershell_available));
+    let mut answer = CatalogAnswer::new("", "").with_tools(tools_for_session(
+        preset,
+        disabled,
+        powershell_available,
+        runon,
+    ));
     let composition = request.composition.as_ref().map(|composition| {
         composition_digest(&Value::Object(composition.clone())).expect("composition is JSON")
     });
@@ -1340,11 +1381,15 @@ fn admit_as(
         .iter()
         .find(|tool| tool.catalog.name == call.name)
         .expect("admitted tool has a schema");
-    let tool = &served.catalog;
+    // A bash call is checked against the schema with `runon`: whether the
+    // session may run remotely is decided when the call runs, by name.
+    let tool = served.with_runon.as_ref().unwrap_or(&served.catalog);
     if let Some(encoded) = &call.schema_pin {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
-        if pin.schema_digest != tool.schema_digest {
+        if pin.schema_digest != tool.schema_digest
+            && pin.schema_digest != served.catalog.schema_digest
+        {
             return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
         }
         if pin.semantics != tool.semantics {
@@ -1786,10 +1831,11 @@ mod tests {
             for fixture in fixtures.as_array_mut().unwrap() {
                 let disabled: Vec<String> =
                     serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
-                fixture["reply"] = catalog(
+                fixture["reply"] = catalog_for_session(
                     fixture["request"].clone(),
                     &disabled,
                     fixture["powershell_available"].as_bool().unwrap(),
+                    remote_runs(fixture),
                 )
                 .unwrap();
             }
@@ -1823,12 +1869,40 @@ mod tests {
         assert_eq!(presets_seen, every, "every preset has a golden");
     }
 
+    /// Whether a golden is for a session that may run commands remotely
+    /// (absent means it may not).
+    fn remote_runs(fixture: &Value) -> bool {
+        fixture["remote_runs"].as_bool().unwrap_or(false)
+    }
+
     fn check_catalog_golden(fixture: &Value) {
         let disabled: Vec<String> =
             serde_json::from_value(fixture["disabled_tools"].clone()).unwrap();
         let available = fixture["powershell_available"].as_bool().unwrap();
+        let runon = remote_runs(fixture);
+        let catalog = |request: Value, disabled: &[String], available: bool| {
+            catalog_for_session(request, disabled, available, runon)
+        };
         let request = fixture["request"].clone();
         let actual = catalog(request.clone(), &disabled, available).unwrap();
+        // `runon` is in bash's schema exactly when the session may run remotely.
+        let bash_has_runon = actual["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|tool| tool["name"] == "bash")
+            .any(|tool| tool["input_schema"]["properties"].get("runon").is_some());
+        assert_eq!(
+            bash_has_runon,
+            runon
+                && actual["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["name"] == "bash"),
+            "{}",
+            fixture["name"]
+        );
         assert!(
             serde_json::to_vec(&actual).unwrap() == serde_json::to_vec(&fixture["reply"]).unwrap(),
             "full catalog bytes differ for {}; regenerate with: {}",

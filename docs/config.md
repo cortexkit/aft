@@ -421,6 +421,14 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "read_deny": []
   },
 
+  // Remote runs requested per bash call with `runon` (subc mode). Default: off.
+  "remote_exec": {
+    // User config only; a project config may set false to turn them off.
+    "enabled": false,
+    // The runner demand a `runon` call without specifics runs under. User config only.
+    "default_demand": "linux"
+  },
+
   "experimental": {
     // Use the experimental Astral `ty` Python type checker.
     // Implied when `lsp.python === "ty"`.
@@ -568,6 +576,12 @@ The `opencode` block is honored only in your user config. A project config that 
 ## Git co-authorship
 
 `git.co_author` controls commit attribution for AFT-spawned agent children. `"off"` is the default, `"auto"` derives the repository's bound agent from the gh-shim manifest and cached GitHub numeric ID, and an explicit `"Name <email>"` value is used verbatim. When enabled, AFT selects a complete dispatcher set through child-only `GIT_CONFIG_*` variables; it does not edit global or repository Git configuration. The dispatchers are identical for every project and storage root, so AFT writes them once per user to a directory named by a hash of their content, `<aft-cache>/git-hooks/<content-hash>`, where `<aft-cache>` is `AFT_CACHE_DIR` when set, otherwise `%LOCALAPPDATA%\aft` on Windows and `$XDG_CACHE_HOME/aft` or `~/.cache/aft` elsewhere (`<storage_root>/git-hooks/<content-hash>` when no home directory is known). The set is created atomically and never rewritten while intact, so each hook version is a single new executable per user. Each dispatcher preserves arguments, stdin, and exit status while chaining to the first executable repository hook from local `core.hooksPath`, the repository's Git directory, or `.githooks`. The `prepare-commit-msg` dispatcher adds attribution first so the repository hook can validate or amend it. AFT quarantines unknown or modified entries in its managed directory and regenerates the expected dispatchers before child launch. Project config may override this attribution key because attribution is not a trust boundary.
+
+## Remote runs
+
+`remote_exec.enabled: true` in your user config offers bash's `runon` argument to OpenCode and Pi sessions running in subc mode: a call with `runon: "linux"` runs its whole command line on the remote Linux build server instead of this machine (see [bash](tools.md#bash)). Nothing runs remotely unless a call asks for it. `remote_exec.default_demand` names the runner demand a `runon` call without specifics runs under; it never makes a call remote by itself.
+
+Both keys are honored only in user config. A project config may set `remote_exec.enabled: false` to turn remote runs off for that project, and then a `runon` call there is refused with `remote runs are off for this project`; a project value of `true`, or any `default_demand`, is ignored with a warning. Whether `runon` is offered is decided when the session starts, so a change takes effect after a restart. Broca workers take the same two fields from their plan's `remote_exec` item instead of this config; an older plan's `remote_exec.commands` list is accepted and ignored.
 
 ## Native command sandbox
 

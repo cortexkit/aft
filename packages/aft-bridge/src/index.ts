@@ -54,6 +54,7 @@ export {
   BASH_HOST_FALLBACK_MAX_OUTPUT_BYTES,
   BASH_HOST_FALLBACK_MAX_TIMEOUT_MS,
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RUNON_DESCRIPTION,
   type BashHostFallbackOptions,
   type BashHostFallbackResult,
   bashHostFallbackAskPattern,

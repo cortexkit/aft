@@ -15,14 +15,14 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectConfig, OpenCodeHostConfig, RerankBackendKind, RerankConfig, SandboxConfig,
-    SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
-    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES, MAX_IDLE_ROOT_TTL_MINUTES,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
-    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
-    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    InspectConfig, OpenCodeHostConfig, RemoteExecConfig, RerankBackendKind, RerankConfig,
+    SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
+    WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+    DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
+    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES,
+    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config::{self, PolicyPhase};
 use crate::harness::Harness;
@@ -45,6 +45,8 @@ const PROTECTED_TOOL_REASON: &str =
     "security: a project config cannot disable aft_safety or a host tool slot (read, write, edit, apply_patch, grep, glob, bash)";
 const LSP_USER_ONLY_REASON: &str =
     "security: LSP executable-origin and diagnostic-suppression settings must come from user-level config";
+const REMOTE_EXEC_PROJECT_REASON: &str =
+    "security: a project config may only turn remote_exec off; enabling remote runs and choosing their runner must come from user-level config";
 const RERANK_PROJECT_REASON: &str =
     "security: a project config may only turn search.rerank off; every other rerank setting must come from user-level config";
 
@@ -145,6 +147,11 @@ pub struct RawAftConfig {
     pub bridge: Option<RawBridge>,
     pub subc: Option<RawSubc>,
     pub opencode: Option<RawOpenCode>,
+    pub remote_exec: Option<RawRemoteExec>,
+    /// Set by the resolver, never read from a file: a project tier turned
+    /// `remote_exec.enabled` off.
+    #[serde(skip)]
+    pub remote_exec_project_off: bool,
     /// Raw per-harness objects stay opaque until the resolver knows the active
     /// configure harness. Unknown harness names are intentionally ignored.
     pub harnesses: Option<BTreeMap<String, Value>>,
@@ -645,6 +652,15 @@ pub struct RawBackup {
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_depth: Option<usize>,
     pub max_file_size: Option<u64>,
+}
+
+/// `remote_exec`: whether bash calls may ask to run on the remote build server
+/// with `runon`. User tier only, except that a project may turn it off.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawRemoteExec {
+    pub enabled: Option<bool>,
+    pub default_demand: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -1187,6 +1203,15 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.opencode.is_some() {
         base.opencode = override_config.opencode;
     }
+    if let Some(remote_exec) = override_config.remote_exec {
+        let merged = base.remote_exec.get_or_insert_with(RawRemoteExec::default);
+        if remote_exec.enabled.is_some() {
+            merged.enabled = remote_exec.enabled;
+        }
+        if remote_exec.default_demand.is_some() {
+            merged.default_demand = remote_exec.default_demand;
+        }
+    }
 }
 
 fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
@@ -1229,6 +1254,15 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     base.pi = merge_pi_config(base.pi.clone(), project.pi);
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+    // A project may turn remote runs off for itself, never on: running a
+    // repository's commands on a shared build server is the user's decision.
+    if project
+        .remote_exec
+        .as_ref()
+        .is_some_and(|remote| remote.enabled == Some(false))
+    {
+        base.remote_exec_project_off = true;
+    }
 }
 
 /// A project may set `search.rerank.backend` to `"off"` and nothing else;
@@ -1698,6 +1732,24 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.gh_shim.is_some() {
         push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
     }
+    if let Some(remote_exec) = &raw.remote_exec {
+        if remote_exec.enabled == Some(true) {
+            push_drop(
+                dropped,
+                "remote_exec.enabled",
+                tier,
+                REMOTE_EXEC_PROJECT_REASON,
+            );
+        }
+        if remote_exec.default_demand.is_some() {
+            push_drop(
+                dropped,
+                "remote_exec.default_demand",
+                tier,
+                REMOTE_EXEC_PROJECT_REASON,
+            );
+        }
+    }
     if raw
         .index
         .as_ref()
@@ -1887,6 +1939,7 @@ fn apply_resolved_config(
     config.opencode = resolve_opencode_host_config(raw.opencode.as_ref());
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
+    config.remote_exec = resolve_remote_exec_config(raw);
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config, warnings);
     Ok(())
@@ -2243,6 +2296,15 @@ fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
         enabled: raw.enabled.unwrap_or(false),
         write_allow: raw.write_allow.clone().unwrap_or_default(),
         read_deny: raw.read_deny.clone().unwrap_or_default(),
+    }
+}
+
+fn resolve_remote_exec_config(raw: &RawAftConfig) -> RemoteExecConfig {
+    let user = raw.remote_exec.as_ref();
+    RemoteExecConfig {
+        enabled: user.and_then(|r| r.enabled) == Some(true) && !raw.remote_exec_project_off,
+        default_demand: user.and_then(|r| r.default_demand.clone()),
+        project_off: raw.remote_exec_project_off,
     }
 }
 
@@ -3965,6 +4027,37 @@ mod tests {
         ] {
             assert!(dropped.contains(&key.to_string()), "{key}");
         }
+    }
+
+    #[test]
+    fn remote_exec_is_user_only_and_a_project_may_only_turn_it_off() {
+        assert_eq!(
+            resolve_config(&[]).config.remote_exec,
+            RemoteExecConfig::default()
+        );
+        let user = r#"{ "remote_exec": { "enabled": true, "default_demand": "linux" } }"#;
+        let on = resolve_config(&[tier("user", user)]).config.remote_exec;
+        assert!(on.enabled && !on.project_off);
+        assert_eq!(on.default_demand.as_deref(), Some("linux"));
+
+        // A project can neither enable remote runs nor pick their runner.
+        let project_on = resolve_config(&[tier(
+            "project",
+            r#"{ "remote_exec": { "enabled": true, "default_demand": "linux" } }"#,
+        )]);
+        assert_eq!(project_on.config.remote_exec, RemoteExecConfig::default());
+        let dropped = drop_keys(&project_on);
+        assert!(dropped.contains(&"remote_exec.enabled".to_string()));
+        assert!(dropped.contains(&"remote_exec.default_demand".to_string()));
+
+        // It can turn them off, and the refusal can then name the project.
+        let off = resolve_config(&[
+            tier("user", user),
+            tier("project", r#"{ "remote_exec": { "enabled": false } }"#),
+        ]);
+        assert!(!off.config.remote_exec.enabled);
+        assert!(off.config.remote_exec.project_off);
+        assert!(drop_keys(&off).is_empty());
     }
 
     #[test]

@@ -613,6 +613,25 @@ const CASES: ParityCase[] = [
     user: { gh_shim: { binary_path: "/tmp/aft-dev-profile/aft" } },
   },
   {
+    // Remote runs (`runon`) are a user-tier switch with the runner demand
+    // a call without specifics runs under.
+    name: "remote_exec_user",
+    user: { remote_exec: { enabled: true, default_demand: "linux" } },
+  },
+  {
+    // A project can neither enable remote runs nor choose their runner.
+    name: "remote_exec_project_dropped",
+    user: {},
+    project: { remote_exec: { enabled: true, default_demand: "linux" } },
+  },
+  {
+    // A project may turn remote runs off for itself, and the refusal can
+    // then name the project.
+    name: "remote_exec_project_off",
+    user: { remote_exec: { enabled: true } },
+    project: { remote_exec: { enabled: false } },
+  },
+  {
     // The gate controls a host-wide tool description, so the project attempt is dropped.
     name: "gh_read_project_dropped",
     user: { github: { read: false } },

@@ -174,6 +174,65 @@ pub(crate) struct RemoteLaunch {
     pub session: String,
 }
 
+/// Decide where a bash call that set `runon` runs, before anything is spawned.
+///
+/// The call names the remote runner itself; nothing about the command line
+/// is inspected. Every reason it cannot run remotely is a refusal naming that
+/// reason, never a silent local run. `runon` is the caller's demand, `pty`,
+/// `powershell` and `host_sandbox` describe the rest of the call, and the
+/// session's remote policy is the one installed by [`with_remote_policy`].
+pub(crate) fn remote_for_runon(
+    config: &crate::config::Config,
+    runon: &str,
+    pty: bool,
+    powershell: bool,
+    host_sandbox: bool,
+) -> Result<RemoteLaunch, String> {
+    if cfg!(not(unix)) {
+        return Err(
+            "runon is not available on Windows: remote runs need AFT on macOS or Linux".into(),
+        );
+    }
+    if pty {
+        return Err("runon cannot be combined with pty:true: a remote run has no terminal".into());
+    }
+    if powershell {
+        return Err(
+            "runon cannot run PowerShell: the remote runner runs the line with bash".into(),
+        );
+    }
+    if host_sandbox {
+        return Err("runon cannot be combined with sandbox: \"host\"; the command runs on the remote server, not on this host".into());
+    }
+    // An unknown demand is named before anything else is decided about it.
+    let requested = runon.trim();
+    if !requested.is_empty() && !crate::exec_remote::policy::KNOWN_DEMANDS.contains(&requested) {
+        return Err(crate::exec_remote::policy::unknown_demand(requested));
+    }
+    if config.remote_exec.project_off {
+        return Err("remote runs are off for this project".into());
+    }
+    let launch = CURRENT_REMOTE
+        .with(|s| s.borrow().clone())
+        .filter(|launch| {
+            launch
+                .params
+                .remote_exec
+                .as_ref()
+                .is_some_and(|policy| policy.enabled)
+        })
+        .ok_or_else(|| "this session has no remote runner".to_string())?;
+    crate::exec_remote::policy::resolve_demand(
+        runon,
+        launch
+            .params
+            .remote_exec
+            .as_ref()
+            .and_then(|policy| policy.default_demand.as_deref()),
+    )?;
+    Ok(launch)
+}
+
 pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<RemoteLaunch>);
     impl Drop for Restore {
@@ -382,7 +441,7 @@ impl HardKill {
 
 /// Spawn a bash command in the background. Returns a task_id immediately.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn(
+pub(crate) fn spawn(
     request_id: &str,
     session_id: &str,
     command: &str,
@@ -400,6 +459,7 @@ pub fn spawn(
     pty_cols: u16,
     scanner_report: Vec<PermissionAsk>,
     host_escalation: Option<HostEscalationAttempt>,
+    remote: Option<RemoteLaunch>,
 ) -> Response {
     if require_background_flag && !ctx.config().experimental_bash_background {
         return Response::error(
@@ -559,14 +619,6 @@ pub fn spawn(
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
-    let remote = CURRENT_REMOTE
-        .with(|s| s.borrow().clone())
-        .filter(|launch| {
-            !shell.is_powershell()
-                && launch.params.remote_exec.as_ref().is_some_and(|policy| {
-                    crate::exec_remote::policy::matches(policy, command, pty, false)
-                })
-        });
     #[cfg(unix)]
     let remote_result = remote.map(|launch| {
         ctx.bash_background().spawn_remote(

@@ -16,6 +16,22 @@ use std::path::PathBuf;
 #[cfg(unix)]
 const REMOTE_REATTACH_BUDGET: Duration = Duration::from_secs(5 * 60);
 
+/// The remote runner AFT dispatches to; named in every remote reply header.
+#[cfg(unix)]
+const RUNNER_ID: &str = "ck-motor";
+
+/// This machine's operating system as a reader names it, for the header of a
+/// run that fell back to it.
+#[cfg(unix)]
+fn local_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "freebsd" => "FreeBSD",
+        other => other,
+    }
+}
+
 /// Bound consecutive empty recovery attempts, not silence on an open stream.
 /// Accepted jobs can disappear with a wiped runner state; they must never rerun.
 #[cfg(unix)]
@@ -363,7 +379,7 @@ impl BgTaskRegistry {
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
         metadata.status = BgTaskStatus::Running;
-        metadata.execution_note = Some("remote execution requested on ck-motor".into());
+        metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
             connection_file: launch.connection_file,
             harness: launch.harness,
@@ -774,8 +790,10 @@ impl BgTaskRegistry {
         state.metadata.local_fallback_started = true;
         state.metadata.started_at = unix_millis();
         let reason = reason.replace(['\n', '\r'], " ");
-        state.metadata.execution_note =
-            Some(format!("ran locally: remote executor refused ({reason})"));
+        state.metadata.execution_note = Some(format!(
+            "ran locally on {}: remote refused: {reason}",
+            local_os_name()
+        ));
         if let Some(changes) = metadata
             .remote
             .as_ref()
@@ -946,7 +964,7 @@ impl BgTaskRegistry {
                     | BgTaskStatus::Killed
                     | BgTaskStatus::TimedOut
             ) {
-                state.metadata.execution_note = Some("ran remotely on ck-motor".into());
+                state.metadata.execution_note = Some(format!("ran remotely on {RUNNER_ID}"));
             }
             if let Some(terminal) = state
                 .metadata
@@ -955,13 +973,6 @@ impl BgTaskRegistry {
                 .and_then(|r| r.terminal.as_ref())
                 .cloned()
             {
-                let changes = terminal.workspace_changes.as_ref();
-                if let Some(changes) = changes.filter(|c| !c.is_empty()) {
-                    state.metadata.execution_note = Some(format!(
-                        "ran remotely on ck-motor\nworkspace_changes (not copied back): {}",
-                        changes.join(", ")
-                    ));
-                }
                 if let Some(pipestatus) = &terminal.pipestatus {
                     if let Some(handles) = state.io_handles.as_mut() {
                         let _ = handles.write(
@@ -985,7 +996,7 @@ impl BgTaskRegistry {
                 let note = state
                     .metadata
                     .execution_note
-                    .get_or_insert_with(|| "ran remotely on ck-motor".into());
+                    .get_or_insert_with(|| format!("ran remotely on {RUNNER_ID}"));
                 note.push_str(&format!("\n{reason}"));
             }
             task.mark_terminal_now();
@@ -1059,11 +1070,50 @@ fn append_output_loss(metadata: &mut PersistedTask) {
         );
         let note = metadata
             .execution_note
-            .get_or_insert_with(|| "remote execution on ck-motor".into());
+            .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
         if !note.contains(&warning) {
             note.push_str(&format!("\n{warning}"));
         }
     }
+}
+
+/// What the runner reported about the workspace after a remote run, printed
+/// after the command's output. Writes on the server are never copied back,
+/// so every change it reports is named, and every kind of change it did not
+/// report says so instead of reading as "nothing changed". `None` when the
+/// command did not run remotely.
+#[cfg(unix)]
+pub(crate) fn remote_report(
+    metadata: &crate::bash_background::persistence::PersistedTask,
+) -> Option<String> {
+    let terminal = metadata.remote.as_ref()?.terminal.as_ref()?;
+    if matches!(terminal.outcome, Outcome::RefusedBeforeStart { .. })
+        || terminal.ran == Some(Ran::None)
+    {
+        return None;
+    }
+    let mut report = String::new();
+    match terminal.workspace_changes.as_deref() {
+        Some([]) => report.push_str("No files changed on the server.\n"),
+        Some(changes) => {
+            report.push_str("These files changed on the server and were NOT copied back:\n");
+            for path in changes {
+                report.push_str(&format!("  {}\n", path.escape_default()));
+            }
+        }
+        None => report.push_str("changed files: not reported by the runner\n"),
+    }
+    // The published run report has no git-state, untracked-file or
+    // ignored-write fields yet, so they are always unreported here.
+    report.push_str("git state, untracked files and ignored writes: not reported by the runner");
+    Some(report)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remote_report(
+    _metadata: &crate::bash_background::persistence::PersistedTask,
+) -> Option<String> {
+    None
 }
 
 #[cfg(unix)]
@@ -1077,9 +1127,10 @@ fn append_environment_disclosure(metadata: &mut PersistedTask) {
     );
     let note = metadata
         .execution_note
-        .get_or_insert_with(|| "remote execution on ck-motor".into());
+        .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
+    // Each disclosure gets its own line, so the header stays the first line.
     if !note.contains(&disclosure) {
-        note.push_str(&format!("; {disclosure}"));
+        note.push_str(&format!("\n{disclosure}"));
     }
 }
 
@@ -1107,9 +1158,10 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
     }
     let note = metadata
         .execution_note
-        .get_or_insert_with(|| "remote execution on ck-motor".into());
+        .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));
+    // Each disclosure gets its own line, so the header stays the first line.
     if !note.contains(&disclosure) {
-        note.push_str(&format!("; {disclosure}"));
+        note.push_str(&format!("\n{disclosure}"));
     }
 }
 

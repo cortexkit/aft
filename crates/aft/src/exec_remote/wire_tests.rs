@@ -31,6 +31,9 @@ pub(crate) enum Script {
     GappedAttach(Duration),
     GappedCancel(Duration),
     AttachDisconnected,
+    /// Accepted, then exited 0 with a terminal record that reports nothing
+    /// about the workspace (no changed-file list).
+    Plain,
 }
 
 pub(crate) struct Daemon {

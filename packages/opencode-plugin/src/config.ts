@@ -432,6 +432,17 @@ const GhShimConfigSchema = z.object({
     .optional(),
 });
 
+/**
+ * `remote_exec`: whether bash calls may ask, with `runon`, to run on the remote
+ * build server. USER-tier only, except that a project may turn it off for
+ * itself (never on). `default_demand` is the runner demand a `runon` call
+ * without specifics runs under; it never makes a call remote by itself.
+ */
+const RemoteExecConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  default_demand: z.string().optional(),
+});
+
 const GithubConfigSchema = z.object({
   /** Interpose the governed `gh` shim in agent child PATHs. Default: true. */
   shim: z.boolean().optional(),
@@ -668,6 +679,8 @@ const AftConfigFieldsSchema = z.object({
   github: GithubConfigSchema.optional(),
   /** Managed `gh` shim binary override (user-only). Whether the shim is used is `github.shim`. */
   gh_shim: GhShimConfigSchema.optional(),
+  /** Remote runs requested per bash call with `runon` (user-only; a project may only turn it off). */
+  remote_exec: RemoteExecConfigSchema.optional(),
   /** Agent-child Git attribution. Project config may override user config. */
   git: GitConfigSchema.optional(),
   /** Pi and OMP harness-specific configuration. */
@@ -688,6 +701,14 @@ export const AftConfigSchema = z.preprocess(
 );
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
+/**
+ * `remote_exec` after the tiers are merged: `project_off` records that a
+ * project config turned remote runs off, so a `runon` call can be refused with
+ * that reason. It is set by the merge, never read from a file.
+ */
+export type MergedRemoteExecConfig = NonNullable<AftConfig["remote_exec"]> & {
+  project_off?: boolean;
+};
 export type GithubConfig = z.infer<typeof GithubConfigSchema>;
 export type OpenCodeHostConfig = z.infer<typeof OpenCodeHostConfigSchema>;
 
@@ -945,6 +966,16 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.github !== undefined) overrides.github = resolveGithubConfig(config);
   if (config.bash === false) overrides.bash = { enabled: false };
   if (config.git !== undefined) overrides.git = config.git;
+  if (config.remote_exec !== undefined) {
+    const remoteExec = config.remote_exec as MergedRemoteExecConfig;
+    overrides.remote_exec = {
+      enabled: remoteExec.enabled === true && remoteExec.project_off !== true,
+      ...(remoteExec.default_demand !== undefined
+        ? { default_demand: remoteExec.default_demand }
+        : {}),
+      ...(remoteExec.project_off === true ? { project_off: true } : {}),
+    };
+  }
 
   return overrides;
 }
@@ -1770,6 +1801,32 @@ function mergeInspectConfig(
   ) as AftConfig["inspect"];
 }
 
+/**
+ * Whether bash offers `runon`: only in subc mode (the remote runner is reached
+ * through the daemon), and only when the user config enables remote runs and
+ * the project has not turned them off. Decided once, when the tool is built.
+ */
+export function remoteRunsOffered(config: AftConfig): boolean {
+  const remoteExec = config.remote_exec as MergedRemoteExecConfig | undefined;
+  return (
+    Boolean(config.subc?.connection_file?.trim()) &&
+    remoteExec?.enabled === true &&
+    remoteExec.project_off !== true
+  );
+}
+
+/**
+ * Merge `remote_exec`: the user tier decides it, and a project may only turn it
+ * off (recorded as `project_off`, so the refusal can name the project).
+ */
+function mergeRemoteExecConfig(
+  base: AftConfig["remote_exec"],
+  project: AftConfig["remote_exec"],
+): MergedRemoteExecConfig | undefined {
+  if (project?.enabled !== false) return base;
+  return { ...base, enabled: false, project_off: true };
+}
+
 /** Merge sandbox settings while allowing project tiers to add only read denies or enable containment. */
 function mergeSandboxConfig(
   base: AftConfig["sandbox"],
@@ -1946,6 +2003,9 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.opencode !== undefined) stripped.push("opencode");
   if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
+  if (override.remote_exec?.enabled === true) stripped.push("remote_exec.enabled");
+  if (override.remote_exec?.default_demand !== undefined)
+    stripped.push("remote_exec.default_demand");
   for (const tool of partitionProjectDisables(override.disabled_tools).ignored) {
     stripped.push(`disabled_tools.${tool}`);
   }
@@ -2006,6 +2066,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
+  const remoteExec = mergeRemoteExecConfig(base.remote_exec, override.remote_exec);
   const backup = mergeProjectBackupConfig(base.backup, override.backup);
   const pi = mergePiConfig(base.pi, override.pi);
   const bridge = base.bridge;
@@ -2032,6 +2093,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(inspect !== undefined ? { inspect } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(remoteExec !== undefined ? { remote_exec: remoteExec } : {}),
     ...(backup !== undefined ? { backup } : {}),
     ...(pi !== undefined ? { pi } : {}),
     experimental,

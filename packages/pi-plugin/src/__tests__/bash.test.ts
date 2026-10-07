@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
+  BASH_RUNON_DESCRIPTION,
   type BinaryBridge,
   BridgeTransportUnavailableError,
 } from "@cortexkit/aft-bridge";
@@ -282,6 +283,61 @@ describe("bash tool adapter", () => {
     expect(bashTool!.description).not.toContain("bash_kill");
     expect(bashTool!.description).not.toContain("bash_watch");
     expect(bashTool!.description).not.toContain("pty: true");
+  });
+
+  test("runon is offered to bash only in subc mode with remote runs enabled in the user config", () => {
+    const properties = (config: Record<string, unknown>, shell: "bash" | "powershell" = "bash") => {
+      const tools = new Map<string, MockToolDef>();
+      registerBashTool(
+        makeMockApi(tools),
+        makeMockContext(makeMockBridge(), config as PluginContext["config"]),
+        false,
+        shell,
+        false,
+        shell,
+      );
+      return (tools.get(shell)!.parameters as { properties: Record<string, unknown> }).properties;
+    };
+    const subc = { subc: { connection_file: "/run/subc-connection.json" } };
+    expect(properties({ ...subc, remote_exec: { enabled: true } }).runon).toMatchObject({
+      type: "string",
+      description: BASH_RUNON_DESCRIPTION,
+    });
+    expect(properties({ ...subc }).runon).toBeUndefined();
+    expect(properties({ remote_exec: { enabled: true } }).runon).toBeUndefined();
+    expect(
+      properties({ ...subc, remote_exec: { enabled: false, project_off: true } }).runon,
+    ).toBeUndefined();
+    // The remote runner runs bash, so PowerShell never offers it.
+    expect(
+      properties({ ...subc, remote_exec: { enabled: true } }, "powershell").runon,
+    ).toBeUndefined();
+  });
+
+  test("runon is forwarded to the engine as the call wrote it", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({ output: "ok", exit_code: 0 });
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(bridge, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+      } as PluginContext["config"]),
+    );
+    await tools
+      .get("bash")!
+      .execute(
+        "test-call",
+        { command: "FOO=1 make | tail -1", runon: "linux" },
+        undefined,
+        undefined,
+        {
+          cwd: projectRoot,
+          hasUI: false,
+        },
+      );
+    const call = calls[0] as [string, Record<string, unknown>];
+    expect(call[1]).toMatchObject({ command: "FOO=1 make | tail -1", runon: "linux" });
   });
 
   test("PowerShell registration routes through the unified bash command family", async () => {

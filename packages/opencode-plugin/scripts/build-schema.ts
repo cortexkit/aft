@@ -819,6 +819,26 @@ function buildSchema(): Record<string, unknown> {
           "Managed gh shim binary override. Whether the shim is used is github.shim; binary_path is the advanced AFT-image override.",
       },
 
+      remote_exec: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: false,
+            description:
+              "Offer bash's runon argument, which runs a command line on the remote Linux build server (subc mode only). User-scoped: a project config may set false to turn remote runs off for itself, never true.",
+          },
+          default_demand: {
+            type: "string",
+            description:
+              'The runner demand a runon call without specifics runs under (today only "linux"). Never makes a call remote by itself. User-scoped only.',
+          },
+        },
+        additionalProperties: false,
+        description:
+          "Remote runs requested per bash call with runon. See docs/tools.md (bash: running on the remote build server).",
+      },
+
       git: {
         type: "object",
         properties: {

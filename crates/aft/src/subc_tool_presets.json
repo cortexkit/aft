@@ -72,6 +72,11 @@
           ],
           "description": "Consumer-set shell selector for Pi's PowerShell tool.",
           "x-aft-consumer-only": true
+        },
+        "runon": {
+          "type": "string",
+          "description": "Run this command on the remote Linux build server instead of this machine; the only value is \"linux\".",
+          "x-aft-runon": true
         }
       },
       "required": [

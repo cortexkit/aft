@@ -287,6 +287,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         80,
         Vec::new(),
         None,
+        None,
     );
     assert!(response.success, "spawn failed: {:?}", response.data);
     let task_id = response.data["task_id"].as_str().unwrap().to_string();
@@ -365,6 +366,7 @@ fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
         24,
         80,
         Vec::new(),
+        None,
         None,
     );
     assert!(default.success);

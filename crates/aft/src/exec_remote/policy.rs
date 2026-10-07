@@ -1,202 +1,105 @@
-//! Whole-line routing. The frozen worker envelope is the only policy source.
+//! Remote-run policy. Whether a call runs remotely is the caller's own choice
+//! (the bash `runon` argument); this policy only says whether a session may
+//! make that choice, and which runner demand fills in when the call names none.
 use serde::{Deserialize, Serialize};
+
+/// The runner demands `runon` accepts today.
+pub const KNOWN_DEMANDS: &[&str] = &["linux"];
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteExecPolicy {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub commands: Vec<String>,
+    /// The demand a `runon` call without specifics runs under. It never makes
+    /// a call remote by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_demand: Option<String>,
+    /// Older worker plans carried a list of command prefixes that were sent
+    /// to the remote runner automatically. Remote runs are now chosen per call,
+    /// so the list is read (to keep accepting those plans) and never used.
+    #[serde(default, rename = "commands", skip_serializing)]
+    pub legacy_commands: Option<serde_json::Value>,
 }
 
-/// Keep the entire line local whenever the literal bash grammar cannot prove
-/// that every command is allowed. Prefixes compare words, not substrings.
-pub fn matches(policy: &RemoteExecPolicy, line: &str, pty: bool, stdin: bool) -> bool {
-    if !policy.enabled || pty || stdin || policy.commands.iter().any(|p| !valid_prefix(p)) {
-        return false;
-    }
-    let Some(commands) = crate::bash_rewrite::parser::parse_top_level(line) else {
-        return false;
+/// Resolve the demand a `runon` call asks for. An empty value takes the
+/// session's default demand; any other value must be a known demand, and an
+/// unknown one is refused by name rather than guessed.
+pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<String, String> {
+    let requested = runon.trim();
+    let demand = if requested.is_empty() {
+        default_demand
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| {
+                format!(
+                "runon needs a runner demand and this session sets no default; use runon: \"{}\"",
+                KNOWN_DEMANDS[0]
+            )
+            })?
+    } else {
+        requested
     };
-    !commands.is_empty()
-        && commands.iter().all(|command| {
-            !forbidden_executable(&command[0])
-                && !command.iter().any(|word| {
-                    matches!(
-                        word.split('=').next().unwrap_or(""),
-                        "--fix" | "--run-ignored" | "--ignored" | "--include-ignored"
-                    )
-                })
-                && policy.commands.iter().any(|prefix| {
-                    let words: Vec<_> = prefix.split_whitespace().collect();
-                    command.len() >= words.len() && words.iter().zip(command).all(|(a, b)| *a == b)
-                })
-        })
+    if KNOWN_DEMANDS.contains(&demand) {
+        Ok(demand.to_owned())
+    } else {
+        Err(unknown_demand(demand))
+    }
 }
 
-fn forbidden_executable(executable: &str) -> bool {
-    let basename = executable
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(executable)
-        .to_ascii_lowercase();
-    let basename = basename.strip_suffix(".exe").unwrap_or(&basename);
-    matches!(basename, "git" | "gh" | "eval")
-}
-
-pub(super) fn valid_prefix(prefix: &str) -> bool {
-    !prefix.is_empty()
-        && !forbidden_executable(prefix.split(' ').next().unwrap_or(""))
-        && prefix.split(' ').all(|word| {
-            !word.is_empty()
-                && word
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_./+-".contains(&b))
-        })
+/// The refusal for a demand no runner serves.
+pub fn unknown_demand(demand: &str) -> String {
+    format!(
+        "unknown runner demand {demand:?}; runon accepts {}",
+        KNOWN_DEMANDS
+            .iter()
+            .map(|d| format!("{d:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
 
     #[test]
-    fn published_policy_vectors_match_and_verify_digests() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/exec_remote/fixtures/policy");
-        let mut count = 0;
-        for entry in std::fs::read_dir(&root).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let value: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let canonical = std::fs::read(path.with_extension("jcs")).unwrap();
-            assert_eq!(serde_json::to_vec(&value).unwrap(), canonical, "{path:?}");
-            assert_eq!(
-                format!("{:x}", Sha256::digest(&canonical)),
-                std::fs::read_to_string(path.with_extension("sha256")).unwrap(),
-                "{path:?}"
-            );
-            let policy = serde_json::from_value(value["policy"].clone()).unwrap();
-            assert_eq!(
-                matches(
-                    &policy,
-                    value["command"].as_str().unwrap(),
-                    value["pty"].as_bool().unwrap(),
-                    value["stdin"].as_bool().unwrap()
-                ),
-                value["matches"].as_bool().unwrap(),
-                "{path:?}"
-            );
-            count += 1;
-        }
-        assert_eq!(count, 39, "all published cases must be present");
+    fn plan_shapes_old_and_new_decode_and_commands_are_ignored() {
+        let new: RemoteExecPolicy =
+            serde_json::from_value(serde_json::json!({"enabled": true, "default_demand": "linux"}))
+                .unwrap();
+        assert!(new.enabled);
+        assert_eq!(new.default_demand.as_deref(), Some("linux"));
+        let old: RemoteExecPolicy = serde_json::from_value(
+            serde_json::json!({"enabled": true, "commands": ["cargo test", "not a valid prefix!"]}),
+        )
+        .unwrap();
+        assert!(old.enabled);
+        assert!(old.legacy_commands.is_some());
+        // A re-serialized policy never carries the ignored list forward.
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({"enabled": true})
+        );
+        assert!(serde_json::from_value::<RemoteExecPolicy>(
+            serde_json::json!({"enabled": true, "unexpected": 1})
+        )
+        .is_err());
     }
 
     #[test]
-    fn configured_git_gh_and_eval_stay_local() {
-        for line in [
-            "git status && cargo test",
-            "gh pr view; cargo test",
-            "eval cargo test",
-        ] {
-            let policy = RemoteExecPolicy {
-                enabled: true,
-                commands: vec![
-                    "git".into(),
-                    "gh".into(),
-                    "eval".into(),
-                    "cargo test".into(),
-                ],
-            };
-            assert!(!matches(&policy, line, false, false), "{line}");
-        }
-    }
-
-    #[test]
-    fn path_qualified_forbidden_executables_cannot_be_allowlisted() {
-        for name in [
-            "git", "gh", "eval", "GIT", "GH", "EVAL", "git.exe", "gh.exe", "eval.exe",
-        ] {
-            for directory in ["/usr/bin/", "./tools/", "../tools/", "a/b/", ""] {
-                let executable = format!("{directory}{name}");
-                let policy = RemoteExecPolicy {
-                    enabled: true,
-                    commands: vec![executable.clone()],
-                };
-                for spelling in [
-                    executable.clone(),
-                    format!("'{executable}'"),
-                    format!("\"{executable}\""),
-                ] {
-                    assert!(
-                        !matches(&policy, &format!("{spelling} status"), false, false),
-                        "{spelling} was admitted"
-                    );
-                }
-                assert!(
-                    !valid_prefix(&executable),
-                    "forbidden executable accepted as policy prefix: {executable}"
-                );
-            }
-        }
-        let policy = RemoteExecPolicy {
-            enabled: true,
-            commands: vec!["/tools/notgit".into()],
-        };
-        assert!(matches(&policy, "/tools/notgit status", false, false));
-    }
-
-    #[test]
-    fn unquoted_line_continuations_cannot_hide_forbidden_flags() {
-        let policy = RemoteExecPolicy {
-            enabled: true,
-            commands: vec!["cargo test".into()],
-        };
-        for flag in ["--fix", "--run-ignored", "--ignored", "--include-ignored"] {
-            for suffix in ["", "=true"] {
-                let word = format!("{flag}{suffix}");
-                for split in 1..word.len() {
-                    let continued = format!("{}\\\n{}", &word[..split], &word[split..]);
-                    for spelling in [continued.clone(), format!("\"{continued}\"")] {
-                        let line = format!("cargo test -- {spelling}");
-                        assert!(
-                            !matches(&policy, &line, false, false),
-                            "forbidden flag escaped through {line:?}"
-                        );
-                    }
-                }
-            }
-        }
-        assert!(matches(
-            &policy,
-            "cargo test -- harmless\\\nargument",
-            false,
-            false
-        ));
-    }
-
-    #[test]
-    fn policy_disabled_and_mixed_lines_stay_whole() {
-        let mut policy = RemoteExecPolicy {
-            enabled: true,
-            commands: vec!["cd".into(), "cargo test".into()],
-        };
-        for (line, pty, stdin, expected) in [
-            ("cargo test -p x", false, false, true),
-            ("cd x && cargo test", false, false, true),
-            ("cargo test && cargo fmt", false, false, false),
-            ("cargo test", true, false, false),
-            ("cargo test", false, true, false),
-            ("cargo test < input", false, false, false),
-            ("cargo testx", false, false, false),
-        ] {
-            assert_eq!(matches(&policy, line, pty, stdin), expected, "{line}");
-        }
-        policy.enabled = false;
-        assert!(!matches(&policy, "cargo test", false, false));
+    fn demand_resolution_names_unknown_demands_and_uses_the_default_only_when_unspecified() {
+        assert_eq!(resolve_demand("linux", None).unwrap(), "linux");
+        assert_eq!(resolve_demand("", Some("linux")).unwrap(), "linux");
+        assert!(resolve_demand("", None)
+            .unwrap_err()
+            .contains("runon needs a runner demand"));
+        let error = resolve_demand("windows", Some("linux")).unwrap_err();
+        assert!(
+            error.contains("unknown runner demand \"windows\""),
+            "{error}"
+        );
+        let error = resolve_demand("", Some("gpu")).unwrap_err();
+        assert!(error.contains("unknown runner demand \"gpu\""), "{error}");
     }
 }

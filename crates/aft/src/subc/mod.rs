@@ -2975,7 +2975,9 @@ async fn handle_bash_elicitation_reply(
                 routes.get(&key.route).is_some_and(|identity| {
                     identity.role == tool_provider::RouteRole::ToolProviderV1
                 }),
-                None,
+                // A call admitted through a permission prompt runs on a bind
+                // without first-party trust; remote runs are not offered there.
+                remote_policy::RemoteSource::None,
                 Instant::now(),
             );
             return Ok(());
@@ -8075,7 +8077,7 @@ async fn handle_tool_call(
             repeat,
             role.is_worker(),
             identity.role == tool_provider::RouteRole::ToolProviderV1,
-            remote_policy::key(&identity, call.preset.as_deref()),
+            remote_policy::source(&identity, call.preset.as_deref()),
             phase_trace.received_at(),
         );
         return Ok(());

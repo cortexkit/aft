@@ -3200,5 +3200,2365 @@
         ]
       }
     }
+  },
+  {
+    "name": "worker_preset_remote_runs_no_pwsh",
+    "request": {
+      "preset": "worker",
+      "system_text": {
+        "preset": "worker"
+      }
+    },
+    "disabled_tools": [],
+    "powershell_available": false,
+    "remote_runs": true,
+    "reply": {
+      "generation": "5c9b11f5b21f33bfa9780c97aa103e19f2acee631ecd458b9d5764b8da8a235a",
+      "catalog_digest": "5c9b11f5b21f33bfa9780c97aa103e19f2acee631ecd458b9d5764b8da8a235a",
+      "tools": [
+        {
+          "name": "status",
+          "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
+          "semantics": 1,
+          "capabilities": [],
+          "description": "Show AFT status, index health, cache usage, and runtime details",
+          "input_schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "bash",
+          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "semantics": 1,
+          "result_ops": [
+            "prepend",
+            "append"
+          ],
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "command": {
+                "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+                "type": "string"
+              },
+              "timeout": {
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "workdir": {
+                "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+                "type": "string"
+              },
+              "description": {
+                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "wait": {
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "type": "boolean"
+              },
+              "sandbox": {
+                "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+                "type": "string",
+                "const": "host"
+              },
+              "background": {
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "type": "boolean"
+              },
+              "compressed": {
+                "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+                "type": "boolean"
+              },
+              "pty": {
+                "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+                "type": "boolean"
+              },
+              "ptyRows": {
+                "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 60
+              },
+              "ptyCols": {
+                "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 140
+              },
+              "runon": {
+                "type": "string",
+                "description": "Run this command on the remote Linux build server instead of this machine; the only value is \"linux\"."
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        },
+        {
+          "name": "read",
+          "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
+          "semantics": 1,
+          "result_ops": [
+            "prepend",
+            "append"
+          ],
+          "capabilities": [
+            "code.read/v1"
+          ],
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "description": "Path to file or directory (absolute or relative to project root)",
+                "type": "string"
+              },
+              "startLine": {
+                "description": "1-based line or directory entry to start reading from",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "endLine": {
+                "description": "1-based line or directory entry to stop reading at (inclusive)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "limit": {
+                "description": "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "offset": {
+                "description": "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "filePath"
+            ]
+          }
+        },
+        {
+          "name": "write",
+          "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
+          "semantics": 1,
+          "capabilities": [
+            "code.edit/v1"
+          ],
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "description": "Path to the file to write (absolute or relative to project root)",
+                "type": "string"
+              },
+              "content": {
+                "description": "The full content to write to the file; for issue://N / pr://N, the comment body to post",
+                "type": "string"
+              }
+            },
+            "required": [
+              "filePath",
+              "content"
+            ]
+          }
+        },
+        {
+          "name": "edit",
+          "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
+          "semantics": 1,
+          "capabilities": [
+            "code.edit/v1"
+          ],
+          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "description": "Path to the file to edit (absolute or relative to project root)",
+                "type": "string"
+              },
+              "symbol": {
+                "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
+                "type": "string"
+              },
+              "content": {
+                "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
+                "type": "string"
+              },
+              "appendContent": {
+                "description": "Text to append to the end of path; creates the file if needed",
+                "type": "string"
+              },
+              "edits": {
+                "description": "Batch edits — non-empty array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "oldString": {
+                      "description": "Text to find for a batch find/replace edit",
+                      "type": "string"
+                    },
+                    "newString": {
+                      "description": "Replacement text for a batch find/replace edit",
+                      "type": "string"
+                    },
+                    "replaceAll": {
+                      "description": "Replace every occurrence for this batch item",
+                      "type": "boolean"
+                    },
+                    "occurrence": {
+                      "description": "1-based occurrence for this batch item (1 = first match)",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "startLine": {
+                      "description": "1-based start line for a batch line-range edit",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "endLine": {
+                      "description": "1-based end line for a batch line-range edit",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "content": {
+                      "description": "Replacement text for a batch line-range edit",
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "required": [
+              "filePath"
+            ]
+          }
+        },
+        {
+          "name": "apply_patch",
+          "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
+          "semantics": 1,
+          "capabilities": [
+            "code.edit/v1"
+          ],
+          "description": "Use the `apply_patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nWithin that envelope, you get a sequence of file operations.\nYou MUST include a header to specify the action you are taking.\nEach operation starts with one of three headers:\n\n*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).\n*** Delete File: <path> - remove an existing file. Nothing follows.\n*** Update File: <path> - patch an existing file in place (optionally with a rename).\n*** Move to: <path> - after update file header, renames the file.\n\n\nExample patch:\n\n```\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n```\n\n**Behavior:**\n- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. Use `aft_safety` undo if you need to revert the applied changes.\n- Files are backed up before modification\n- Parent directories are created automatically for new files\n- Fuzzy matching for context anchors (handles whitespace and Unicode differences)\n\n**It is important to remember:**\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even when creating a new file\n\nEdits return as soon as the write completes unless `lsp.diagnostics_on_edit` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "patchText": {
+                "description": "The full patch text including Begin/End markers",
+                "type": "string"
+              }
+            },
+            "required": [
+              "patchText"
+            ]
+          }
+        },
+        {
+          "name": "grep",
+          "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
+          "semantics": 1,
+          "capabilities": [
+            "code.search/v1"
+          ],
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "include": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "offset": {
+                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000
+              }
+            },
+            "required": [
+              "pattern"
+            ]
+          }
+        },
+        {
+          "name": "glob",
+          "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
+          "semantics": 1,
+          "capabilities": [
+            "code.search/v1"
+          ],
+          "description": "Find files matching a glob pattern. Returns matching file paths sorted by modification time. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "pattern"
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "semantics": 1,
+          "capabilities": [
+            "code.search/v1"
+          ],
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "query": {
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "type": "string"
+              },
+              "topK": {
+                "description": "Number of results (default: 10, max: 50)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50
+              },
+              "offset": {
+                "description": "Zero-based result offset (default: 0, max: 100000).",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000
+              },
+              "includeTests": {
+                "description": "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+                "type": "boolean"
+              },
+              "path": {
+                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "name": "outline",
+          "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
+          "semantics": 1,
+          "capabilities": [
+            "code.outline/v1"
+          ],
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "target": {
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "files": {
+                "description": "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
+                "type": "boolean"
+              },
+              "includeTests": {
+                "description": "Directory outline only: include test files. Defaults to false; tests are hidden.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "target"
+            ]
+          }
+        },
+        {
+          "name": "zoom",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "semantics": 1,
+          "capabilities": [
+            "code.outline/v1"
+          ],
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "contextLines": {
+                "description": "Lines of context before/after the symbol (default: 3)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "callgraph": {
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "name": "inspect",
+          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "semantics": 1,
+          "capabilities": [
+            "code.diagnostics/v1"
+          ],
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "sections": {
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "scope": {
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "topK": {
+                "description": "Max drill-down items per category. Default 20, max 100.",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 100
+              }
+            }
+          }
+        },
+        {
+          "name": "callgraph",
+          "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
+          "semantics": 1,
+          "capabilities": [
+            "code.callgraph/v1"
+          ],
+          "description": "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\nUse aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\nOps:\n- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n- 'call_tree': What a function calls (forward traversal). Use to understand a function's dependencies before modifying it.\n- 'trace_to': How execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toPath' to disambiguate.\n- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\nAll ops require both 'path' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\nMarkers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.\n",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "op": {
+                "description": "Navigation operation",
+                "type": "string",
+                "enum": [
+                  "call_tree",
+                  "callers",
+                  "trace_to",
+                  "trace_to_symbol",
+                  "impact",
+                  "trace_data"
+                ]
+              },
+              "path": {
+                "description": "Path to the source file containing the symbol (absolute or relative to project root)",
+                "type": "string"
+              },
+              "symbol": {
+                "description": "Name of the symbol to analyze",
+                "type": "string"
+              },
+              "depth": {
+                "description": "Max traversal depth (default: call_tree=5, callers=1, trace_to=10, trace_to_symbol=10 capped at 16, impact=5, trace_data=5)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "expression": {
+                "description": "Expression to track through data flow (required for trace_data op)",
+                "type": "string"
+              },
+              "toSymbol": {
+                "description": "Target symbol name for trace_to_symbol; the returned path ends at this symbol",
+                "type": "string"
+              },
+              "toPath": {
+                "description": "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
+                "type": "string"
+              },
+              "includeTests": {
+                "description": "Include test files in callers/paths. Defaults to false; tests are hidden.",
+                "type": "boolean"
+              },
+              "includeUnresolved": {
+                "description": "Show every unresolved external/stdlib call individually. Defaults to false; unresolved leaf calls are collapsed into one summary per parent.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "op",
+              "path",
+              "symbol"
+            ]
+          }
+        },
+        {
+          "name": "conflicts",
+          "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
+          "semantics": 1,
+          "capabilities": [
+            "aft:git.conflicts/v1"
+          ],
+          "description": "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call. Conflicts are discovered from the git repository's top level. By default it inspects the session's project repository; pass `path` to inspect a different repository or git worktree (e.g. where a rebase/merge is running).",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "path": {
+                "description": "Optional path inside the git repository or worktree to inspect (absolute or relative to project root). Conflicts are discovered from that repository's top level. Defaults to the session project root.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "name": "ast_search",
+          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "semantics": 1,
+          "capabilities": [
+            "aft:code.ast_grep/v1"
+          ],
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "description": "AST pattern with meta-variables ($VAR, $$$). Must be complete AST node.",
+                "type": "string"
+              },
+              "lang": {
+                "description": "Target language",
+                "type": "string",
+                "enum": [
+                  "typescript",
+                  "tsx",
+                  "javascript",
+                  "python",
+                  "rust",
+                  "go",
+                  "cuda",
+                  "metal",
+                  "pascal",
+                  "r",
+                  "objc"
+                ]
+              },
+              "paths": {
+                "description": "Paths to search (default: ['.'])",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "globs": {
+                "description": "Include/exclude globs (prefix ! to exclude)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "contextLines": {
+                "description": "Number of context lines to show around each match",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "pattern",
+              "lang"
+            ]
+          }
+        },
+        {
+          "name": "ast_replace",
+          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "semantics": 1,
+          "capabilities": [
+            "aft:code.ast_grep/v1"
+          ],
+          "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "description": "AST pattern with meta-variables ($VAR, $$$). Must be complete AST node.",
+                "type": "string"
+              },
+              "rewrite": {
+                "description": "Replacement pattern (can use $VAR from pattern)",
+                "type": "string"
+              },
+              "lang": {
+                "description": "Target language",
+                "type": "string",
+                "enum": [
+                  "typescript",
+                  "tsx",
+                  "javascript",
+                  "python",
+                  "rust",
+                  "go",
+                  "cuda",
+                  "metal",
+                  "pascal",
+                  "r",
+                  "objc"
+                ]
+              },
+              "paths": {
+                "description": "Paths to search (default: ['.'])",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "globs": {
+                "description": "Include/exclude globs (prefix ! to exclude)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "dryRun": {
+                "description": "Preview changes without applying (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "pattern",
+              "rewrite",
+              "lang"
+            ]
+          }
+        },
+        {
+          "name": "delete",
+          "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
+          "semantics": 1,
+          "capabilities": [
+            "code.files/v1"
+          ],
+          "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "files": {
+                "description": "Paths to delete (one or more). May include directories when recursive=true.",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "recursive": {
+                "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "files"
+            ]
+          }
+        },
+        {
+          "name": "move",
+          "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
+          "semantics": 1,
+          "capabilities": [
+            "code.files/v1"
+          ],
+          "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "path": {
+                "description": "Source file path to move (absolute or relative to project root)",
+                "type": "string"
+              },
+              "destination": {
+                "description": "Destination file path (absolute or relative to project root)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "destination"
+            ]
+          }
+        },
+        {
+          "name": "import",
+          "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
+          "semantics": 1,
+          "capabilities": [
+            "aft:code.imports/v1"
+          ],
+          "description": "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, and Vue.\n\nOps:\n- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'path'. Use aft_safety checkpoint/undo for recovery before broad cleanup.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "op": {
+                "description": "Import operation",
+                "type": "string",
+                "enum": [
+                  "add",
+                  "remove",
+                  "organize"
+                ]
+              },
+              "path": {
+                "description": "Path to the file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "module": {
+                "description": "Module path (required for add, remove — e.g. 'react', './utils', 'std::fmt')",
+                "type": "string"
+              },
+              "names": {
+                "description": "Named imports to add. Each entry uses the language's native named-import text, including per-name aliasing where the language uses `as` (e.g. ['useState', 'debounce as db'], Solidity ['ERC20', 'IERC20 as IToken']).",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "defaultImport": {
+                "description": "Default import name, ES only (e.g. 'React')",
+                "type": "string"
+              },
+              "namespace": {
+                "description": "Namespace binding: `import * as ns from 'mod'` (ES), `import * as N from \"./X.sol\"` (Solidity).",
+                "type": "string"
+              },
+              "alias": {
+                "description": "Whole-module alias. Solidity: `import \"./X.sol\" as X` (module=path, alias=X).",
+                "type": "string"
+              },
+              "modifiers": {
+                "description": "Statement-level modifier tokens, language-validated: Java/C# 'static'; C# 'global'/'unsafe'; Java/Kotlin/Scala 'wildcard'; Swift '@testable'. Unsupported tokens for the file's language return a clear error.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "importKind": {
+                "description": "Symbol-kind-specific import: PHP 'function'/'const'; Swift 'struct'/'class'/'enum'/'protocol'/'func'; Scala 'given'.",
+                "type": "string"
+              },
+              "typeOnly": {
+                "description": "Type-only import (TS only, default: false)",
+                "type": "boolean"
+              },
+              "removeName": {
+                "description": "Named import to remove for 'remove' op; omit to remove entire import",
+                "type": "string"
+              },
+              "validate": {
+                "description": "Validation level: 'syntax' (default) or 'full'. Syntax = tree-sitter parse check only. Full = also runs LSP type-checking (slower, catches more errors)",
+                "type": "string",
+                "enum": [
+                  "syntax",
+                  "full"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        },
+        {
+          "name": "safety",
+          "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
+          "semantics": 1,
+          "capabilities": [
+            "aft:safety/v1"
+          ],
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "op": {
+                "description": "Safety operation",
+                "type": "string",
+                "enum": [
+                  "undo",
+                  "history",
+                  "checkpoint",
+                  "restore",
+                  "list"
+                ]
+              },
+              "path": {
+                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+                "type": "string"
+              },
+              "name": {
+                "description": "Checkpoint name (required for checkpoint, restore)",
+                "type": "string"
+              },
+              "files": {
+                "description": "Specific files to include in checkpoint, or to restore from a checkpoint (optional; restore without path/files restores the whole checkpoint; explicit checkpoint files may be untracked or gitignored)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "op"
+            ]
+          }
+        },
+        {
+          "name": "bash_status",
+          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "type": "string"
+              },
+              "outputMode": {
+                "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
+                "type": "string",
+                "enum": [
+                  "screen",
+                  "raw",
+                  "both"
+                ]
+              }
+            },
+            "required": [
+              "taskId"
+            ]
+          }
+        },
+        {
+          "name": "bash_watch",
+          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background task ID returned by bash({ background: true }).",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Substring or regex pattern. Optional in sync mode; required with background:true. Sync substring watches keep only the overlap tail needed for boundary matches; sync regex watches use a 64 KB rolling output window.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "regex": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "regex"
+                    ]
+                  }
+                ]
+              },
+              "background": {
+                "description": "Accepted for compatibility. This watch always waits: a delegated session gets no async notification, so background: true waits up to the worker wait limit like a watch without a timeout.",
+                "type": "boolean"
+              },
+              "timeoutMs": {
+                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1800000
+              },
+              "once": {
+                "description": "Accepted for compatibility; only an async watch reads it.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "taskId"
+            ]
+          }
+        },
+        {
+          "name": "bash_kill",
+          "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "taskId"
+            ]
+          }
+        },
+        {
+          "name": "bash_write",
+          "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: \"pty\" first. Input is either a string (verbatim bytes) or an array mixing strings and { key: \"esc\" | \"enter\" | \"up\" | \"ctrl-c\" | ... } objects for atomic text+key sequences such as [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ]. Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. Maximum 1 MiB per call (post-expansion).",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background PTY task ID returned by bash({ pty: true, background: true }).",
+                "type": "string"
+              },
+              "input": {
+                "description": "Either a string of verbatim bytes (e.g. 'print(1)\\n') OR an array mixing strings and { key: '<name>' } objects for atomic text+key sequences. Example: [ 'iHello', { key: 'esc' }, ':wq', { key: 'enter' } ].",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "key": {
+                              "description": "Named control key, e.g. 'esc', 'enter', 'up', 'ctrl-c'. Case-insensitive.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "key"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "taskId",
+              "input"
+            ]
+          }
+        }
+      ],
+      "system_text": {
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\nA command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
+        "preflight_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_watch",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
+      }
+    }
+  },
+  {
+    "name": "worker_preset_remote_runs_pwsh",
+    "request": {
+      "preset": "worker",
+      "system_text": {
+        "preset": "worker"
+      }
+    },
+    "disabled_tools": [],
+    "powershell_available": true,
+    "remote_runs": true,
+    "reply": {
+      "generation": "b629e7fbe427d817fa9156d3550e3de3ed41bd65e341c0494c9109ba1c5cfe64",
+      "catalog_digest": "b629e7fbe427d817fa9156d3550e3de3ed41bd65e341c0494c9109ba1c5cfe64",
+      "tools": [
+        {
+          "name": "status",
+          "schema_digest": "99334726611ccf58a148b0814696bfa6fe08c1b2d027e946beccf5a74331c9aa",
+          "semantics": 1,
+          "capabilities": [],
+          "description": "Show AFT status, index health, cache usage, and runtime details",
+          "input_schema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+          }
+        },
+        {
+          "name": "bash",
+          "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
+          "semantics": 1,
+          "result_ops": [
+            "prepend",
+            "append"
+          ],
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "command": {
+                "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+                "type": "string"
+              },
+              "timeout": {
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "workdir": {
+                "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+                "type": "string"
+              },
+              "description": {
+                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "wait": {
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "type": "boolean"
+              },
+              "sandbox": {
+                "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+                "type": "string",
+                "const": "host"
+              },
+              "background": {
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "type": "boolean"
+              },
+              "compressed": {
+                "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+                "type": "boolean"
+              },
+              "pty": {
+                "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+                "type": "boolean"
+              },
+              "ptyRows": {
+                "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 60
+              },
+              "ptyCols": {
+                "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 140
+              },
+              "runon": {
+                "type": "string",
+                "description": "Run this command on the remote Linux build server instead of this machine; the only value is \"linux\"."
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        },
+        {
+          "name": "powershell",
+          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Execute PowerShell commands through AFT's bash task family with UTF-8 output and conservative per-command approval.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "command": {
+                "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+                "type": "string"
+              },
+              "timeout": {
+                "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "workdir": {
+                "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+                "type": "string"
+              },
+              "description": {
+                "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "wait": {
+                "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+                "type": "boolean"
+              },
+              "sandbox": {
+                "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+                "type": "string",
+                "const": "host"
+              },
+              "background": {
+                "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+                "type": "boolean"
+              },
+              "compressed": {
+                "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+                "type": "boolean"
+              },
+              "pty": {
+                "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+                "type": "boolean"
+              },
+              "ptyRows": {
+                "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 60
+              },
+              "ptyCols": {
+                "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 140
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        },
+        {
+          "name": "read",
+          "schema_digest": "ebd897cd5eb17d7ab3eaa037fafc9798cee370be1ea1309275d36cf99cca3b98",
+          "semantics": 1,
+          "result_ops": [
+            "prepend",
+            "append"
+          ],
+          "capabilities": [
+            "code.read/v1"
+          ],
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "description": "Path to file or directory (absolute or relative to project root)",
+                "type": "string"
+              },
+              "startLine": {
+                "description": "1-based line or directory entry to start reading from",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "endLine": {
+                "description": "1-based line or directory entry to stop reading at (inclusive)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "limit": {
+                "description": "Max lines (default: 2000) or directory entries (default and cap: 1000) to return",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "offset": {
+                "description": "1-based line or directory entry to start reading from (use with limit). Ignored if startLine is provided",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "filePath"
+            ]
+          }
+        },
+        {
+          "name": "write",
+          "schema_digest": "183d52944d3d22b68816e38bd6bd165e8006b301b66765003240cc51f59bb1df",
+          "semantics": 1,
+          "capabilities": [
+            "code.edit/v1"
+          ],
+          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "description": "Path to the file to write (absolute or relative to project root)",
+                "type": "string"
+              },
+              "content": {
+                "description": "The full content to write to the file; for issue://N / pr://N, the comment body to post",
+                "type": "string"
+              }
+            },
+            "required": [
+              "filePath",
+              "content"
+            ]
+          }
+        },
+        {
+          "name": "edit",
+          "schema_digest": "30cea47021d773a4abaa0409b9f1ec146a7dcac9673120fa8b372017b7575f71",
+          "semantics": 1,
+          "capabilities": [
+            "code.edit/v1"
+          ],
+          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "filePath": {
+                "description": "Path to the file to edit (absolute or relative to project root)",
+                "type": "string"
+              },
+              "symbol": {
+                "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
+                "type": "string"
+              },
+              "content": {
+                "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
+                "type": "string"
+              },
+              "appendContent": {
+                "description": "Text to append to the end of path; creates the file if needed",
+                "type": "string"
+              },
+              "edits": {
+                "description": "Batch edits — non-empty array of { oldString, newString }, { oldString, newString, replaceAll: true }, or { startLine, endLine, content } objects",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "oldString": {
+                      "description": "Text to find for a batch find/replace edit",
+                      "type": "string"
+                    },
+                    "newString": {
+                      "description": "Replacement text for a batch find/replace edit",
+                      "type": "string"
+                    },
+                    "replaceAll": {
+                      "description": "Replace every occurrence for this batch item",
+                      "type": "boolean"
+                    },
+                    "occurrence": {
+                      "description": "1-based occurrence for this batch item (1 = first match)",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "startLine": {
+                      "description": "1-based start line for a batch line-range edit",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "endLine": {
+                      "description": "1-based end line for a batch line-range edit",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "content": {
+                      "description": "Replacement text for a batch line-range edit",
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "required": [
+              "filePath"
+            ]
+          }
+        },
+        {
+          "name": "apply_patch",
+          "schema_digest": "fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548",
+          "semantics": 1,
+          "capabilities": [
+            "code.edit/v1"
+          ],
+          "description": "Use the `apply_patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:\n\n*** Begin Patch\n[ one or more file sections ]\n*** End Patch\n\nWithin that envelope, you get a sequence of file operations.\nYou MUST include a header to specify the action you are taking.\nEach operation starts with one of three headers:\n\n*** Add File: <path> - create a new file. Every following line is a + line (the initial contents).\n*** Delete File: <path> - remove an existing file. Nothing follows.\n*** Update File: <path> - patch an existing file in place (optionally with a rename).\n*** Move to: <path> - after update file header, renames the file.\n\n\nExample patch:\n\n```\n*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n```\n\n**Behavior:**\n- Per-file commit: each file's edits apply independently. If a later file fails, earlier successful changes are kept. Use `aft_safety` undo if you need to revert the applied changes.\n- Files are backed up before modification\n- Parent directories are created automatically for new files\n- Fuzzy matching for context anchors (handles whitespace and Unicode differences)\n\n**It is important to remember:**\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You must prefix new lines with `+` even when creating a new file\n\nEdits return as soon as the write completes unless `lsp.diagnostics_on_edit` requests legacy sync-wait behavior. Call `aft_inspect` afterward to check diagnostics across a batch of edits.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "patchText": {
+                "description": "The full patch text including Begin/End markers",
+                "type": "string"
+              }
+            },
+            "required": [
+              "patchText"
+            ]
+          }
+        },
+        {
+          "name": "grep",
+          "schema_digest": "0f7a077fe3aee4e28d4cdebb8093776db34692c342ef3b67c3b9e49fe7c31f19",
+          "semantics": 1,
+          "capabilities": [
+            "code.search/v1"
+          ],
+          "description": "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Shows up to 100 matching lines per call; lines longer than 500 characters are cut and marked `[line truncated]`, and a page stops early once its rows reach about 50 KB. Pass `offset` (skip that many matching lines) to page through the rest, or narrow with `path` or `include`. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "include": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "offset": {
+                "description": "Zero-based count of matching lines to skip, for paging (default: 0, max: 100000).",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000
+              }
+            },
+            "required": [
+              "pattern"
+            ]
+          }
+        },
+        {
+          "name": "glob",
+          "schema_digest": "f0710f894a9c43ff7709e5f5cb63c37f7cda4e969840379f728a6d55f353a659",
+          "semantics": 1,
+          "capabilities": [
+            "code.search/v1"
+          ],
+          "description": "Find files matching a glob pattern. Returns matching file paths sorted by modification time. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "pattern"
+            ]
+          }
+        },
+        {
+          "name": "search",
+          "schema_digest": "c01cfa3965f768c100253bb0d59285149d4883f5fa46d7b511cc98e0a7efb70e",
+          "semantics": 1,
+          "capabilities": [
+            "code.search/v1"
+          ],
+          "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen you know a name or string that must appear, put it in `pattern` (a regex, grep syntax, case-sensitive) and keep the question in `query`: both are ranked together, and the reply's first line says how many files the pattern matched and where it is defined. Example: query 'how is the config file loaded', pattern 'load_config|ConfigLoader'. `pattern` alone ranks the files it matches, definitions first.\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "query": {
+                "description": "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'. Optional when `pattern` is given.",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Regex (grep syntax, case-sensitive) for names or text that must appear, e.g. 'load_config|ConfigLoader'. Ranked with `query` when both are given.",
+                "type": "string"
+              },
+              "topK": {
+                "description": "Number of results (default: 10, max: 50)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50
+              },
+              "offset": {
+                "description": "Zero-based result offset (default: 0, max: 100000).",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100000
+              },
+              "includeTests": {
+                "description": "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
+                "type": "boolean"
+              },
+              "path": {
+                "description": "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "name": "outline",
+          "schema_digest": "264536293f3baca10d5e6b695baf9a29f71ea74b7e4241ceaed26e3b46e165cf",
+          "semantics": 1,
+          "capabilities": [
+            "code.outline/v1"
+          ],
+          "description": "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "target": {
+                "description": "What to outline: a file path, directory path, URL, or array of paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "files": {
+                "description": "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
+                "type": "boolean"
+              },
+              "includeTests": {
+                "description": "Directory outline only: include test files. Defaults to false; tests are hidden.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "target"
+            ]
+          }
+        },
+        {
+          "name": "zoom",
+          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "semantics": 1,
+          "capabilities": [
+            "code.outline/v1"
+          ],
+          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "path": {
+                "description": "Path to file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "url": {
+                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
+                "type": "string"
+              },
+              "symbols": {
+                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "targets": {
+                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "description": "Path to file (absolute or relative to project root)",
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "description": "Symbol name in that file",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "symbol"
+                    ]
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "path": {
+                          "description": "Path to file (absolute or relative to project root)",
+                          "type": "string"
+                        },
+                        "symbol": {
+                          "description": "Symbol name in that file",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "path",
+                        "symbol"
+                      ]
+                    }
+                  }
+                ]
+              },
+              "contextLines": {
+                "description": "Lines of context before/after the symbol (default: 3)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "callgraph": {
+                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "name": "inspect",
+          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "semantics": 1,
+          "capabilities": [
+            "code.diagnostics/v1"
+          ],
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "sections": {
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "scope": {
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              },
+              "topK": {
+                "description": "Max drill-down items per category. Default 20, max 100.",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 100
+              }
+            }
+          }
+        },
+        {
+          "name": "callgraph",
+          "schema_digest": "cc1143512feeca2585bd922ab9047a00ef2496807a1307dac19e9047ae4e86de",
+          "semantics": 1,
+          "capabilities": [
+            "code.callgraph/v1"
+          ],
+          "description": "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\nUse aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\nOps:\n- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n- 'call_tree': What a function calls (forward traversal). Use to understand a function's dependencies before modifying it.\n- 'trace_to': How execution reaches a function from entry points (routes, exports, main). Use to understand context around deeply-nested code.\n- 'trace_to_symbol': Shortest call path from one symbol to another. Requires 'toSymbol'. If multiple targets match, the error returns candidate files; retry with 'toPath' to disambiguate.\n- 'trace_data': Follow a value through variable assignments and function parameters across files. Requires 'symbol' (scope to trace from) and 'expression'.\n\nAll ops require both 'path' and 'symbol'. 'expression' is additionally required for trace_data; 'toSymbol' for trace_to_symbol.\n\nMarkers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.\n",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "op": {
+                "description": "Navigation operation",
+                "type": "string",
+                "enum": [
+                  "call_tree",
+                  "callers",
+                  "trace_to",
+                  "trace_to_symbol",
+                  "impact",
+                  "trace_data"
+                ]
+              },
+              "path": {
+                "description": "Path to the source file containing the symbol (absolute or relative to project root)",
+                "type": "string"
+              },
+              "symbol": {
+                "description": "Name of the symbol to analyze",
+                "type": "string"
+              },
+              "depth": {
+                "description": "Max traversal depth (default: call_tree=5, callers=1, trace_to=10, trace_to_symbol=10 capped at 16, impact=5, trace_data=5)",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "expression": {
+                "description": "Expression to track through data flow (required for trace_data op)",
+                "type": "string"
+              },
+              "toSymbol": {
+                "description": "Target symbol name for trace_to_symbol; the returned path ends at this symbol",
+                "type": "string"
+              },
+              "toPath": {
+                "description": "Optional target file for trace_to_symbol; required when toSymbol exists in multiple files",
+                "type": "string"
+              },
+              "includeTests": {
+                "description": "Include test files in callers/paths. Defaults to false; tests are hidden.",
+                "type": "boolean"
+              },
+              "includeUnresolved": {
+                "description": "Show every unresolved external/stdlib call individually. Defaults to false; unresolved leaf calls are collapsed into one summary per parent.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "op",
+              "path",
+              "symbol"
+            ]
+          }
+        },
+        {
+          "name": "conflicts",
+          "schema_digest": "702d9af7c4449b1601b49d0b7d7573d150aa564430f9fc0c39e7af1dcea92d0c",
+          "semantics": 1,
+          "capabilities": [
+            "aft:git.conflicts/v1"
+          ],
+          "description": "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call. Conflicts are discovered from the git repository's top level. By default it inspects the session's project repository; pass `path` to inspect a different repository or git worktree (e.g. where a rebase/merge is running).",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "path": {
+                "description": "Optional path inside the git repository or worktree to inspect (absolute or relative to project root). Conflicts are discovered from that repository's top level. Defaults to the session project root.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "name": "ast_search",
+          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "semantics": 1,
+          "capabilities": [
+            "aft:code.ast_grep/v1"
+          ],
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "description": "AST pattern with meta-variables ($VAR, $$$). Must be complete AST node.",
+                "type": "string"
+              },
+              "lang": {
+                "description": "Target language",
+                "type": "string",
+                "enum": [
+                  "typescript",
+                  "tsx",
+                  "javascript",
+                  "python",
+                  "rust",
+                  "go",
+                  "cuda",
+                  "metal",
+                  "pascal",
+                  "r",
+                  "objc"
+                ]
+              },
+              "paths": {
+                "description": "Paths to search (default: ['.'])",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "globs": {
+                "description": "Include/exclude globs (prefix ! to exclude)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "contextLines": {
+                "description": "Number of context lines to show around each match",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "pattern",
+              "lang"
+            ]
+          }
+        },
+        {
+          "name": "ast_replace",
+          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "semantics": 1,
+          "capabilities": [
+            "aft:code.ast_grep/v1"
+          ],
+          "description": "Replace code patterns across filesystem with AST-aware rewriting. Applies changes by default — set dryRun=true to preview.\n\nUse meta-variables in the rewrite pattern to preserve matched content from the pattern.\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n\nExample: pattern='console.log($MSG)' rewrite='logger.info($MSG)' lang='typescript' — replaces all console.log calls with logger.info across TypeScript files.\n\n**Warning: This tool modifies files directly.** Use dryRun=true to preview (shows per-file unified diff, capped at 8KB). Consider creating an aft_safety checkpoint before bulk replacements.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "pattern": {
+                "description": "AST pattern with meta-variables ($VAR, $$$). Must be complete AST node.",
+                "type": "string"
+              },
+              "rewrite": {
+                "description": "Replacement pattern (can use $VAR from pattern)",
+                "type": "string"
+              },
+              "lang": {
+                "description": "Target language",
+                "type": "string",
+                "enum": [
+                  "typescript",
+                  "tsx",
+                  "javascript",
+                  "python",
+                  "rust",
+                  "go",
+                  "cuda",
+                  "metal",
+                  "pascal",
+                  "r",
+                  "objc"
+                ]
+              },
+              "paths": {
+                "description": "Paths to search (default: ['.'])",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "globs": {
+                "description": "Include/exclude globs (prefix ! to exclude)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "dryRun": {
+                "description": "Preview changes without applying (default: false)",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "pattern",
+              "rewrite",
+              "lang"
+            ]
+          }
+        },
+        {
+          "name": "delete",
+          "schema_digest": "07bc6db89f72b9f24d4386fe7f68607d66aaddb420215fcc2ed6d57ec478fc6f",
+          "semantics": 1,
+          "capabilities": [
+            "code.files/v1"
+          ],
+          "description": "Delete one or more files (or directories).\n\nEach file is backed up before deletion — use aft_safety undo to recover any of them. A recursive delete backs up the whole tree: directories (empty ones too, with their permissions), file contents, hard links (relinked by undo) and symlinks (the link itself, never its target; restored exactly, even when dangling). Sockets are deleted but undo does not restore them, and a file hard-linked to paths outside the tree comes back as an independent copy; both are reported as warnings. Refused before anything is deleted: mount points of another filesystem, named pipes, device nodes, and symlinks undo cannot recreate exactly (non-UTF-8 target, or on Windows). Paths under the system temp directory are never backed up, so only mount points are refused there. The deleted file's contents stay in the undo store until its retention expires. A recursive delete whose backup would record more than 2,000 entries (files, directories and links) or copy 100 MiB in one call is refused before anything is deleted; delete such a tree in smaller pieces, or use bash `rm -rf` when no undo is needed. Directory deletion requires recursive: true. Without it, passing a directory returns an error.\n\nPartial success is allowed: deletable files are deleted; failed ones are reported in `skipped_files` with `complete: false`.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "files": {
+                "description": "Paths to delete (one or more). May include directories when recursive=true.",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "recursive": {
+                "description": "Required to delete a directory and its contents. Defaults to false; passing a directory without this returns an error.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "files"
+            ]
+          }
+        },
+        {
+          "name": "move",
+          "schema_digest": "f48d7c918c2557edb16221599142aee3d8fb52c2564866cdc37d4591ee5c1dad",
+          "semantics": 1,
+          "capabilities": [
+            "code.files/v1"
+          ],
+          "description": "Move or rename a file. Creates an undo backup before moving. Creates parent directories for destination automatically\nNote: This moves/renames whole files at the OS level; it does not relocate an individual symbol or rewrite imports.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "path": {
+                "description": "Source file path to move (absolute or relative to project root)",
+                "type": "string"
+              },
+              "destination": {
+                "description": "Destination file path (absolute or relative to project root)",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path",
+              "destination"
+            ]
+          }
+        },
+        {
+          "name": "import",
+          "schema_digest": "b52e0484b4abdaeb843b9738de9fd6927e229ca0337cacb87fb1e2cdcf24cbf4",
+          "semantics": 1,
+          "capabilities": [
+            "aft:code.imports/v1"
+          ],
+          "description": "Language-aware import management. Supports TS, JS, TSX, Python, Rust, Go, Solidity, Java, C#, PHP, Kotlin, Scala, Swift, Ruby, Lua, C, C++, Perl, and Vue.\n\nOps:\n- 'add': Add an import. Auto-detects group (stdlib/external/internal), deduplicates. Requires 'module'. Optional 'names', 'defaultImport', 'typeOnly'.\n- 'remove': Remove an import or a specific named import. Requires 'module'. Provide 'removeName' to remove a single named import; omit to remove the entire import.\n- 'organize': Re-sort and re-group all imports by language convention, deduplicate. Requires only 'path'. Use aft_safety checkpoint/undo for recovery before broad cleanup.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "op": {
+                "description": "Import operation",
+                "type": "string",
+                "enum": [
+                  "add",
+                  "remove",
+                  "organize"
+                ]
+              },
+              "path": {
+                "description": "Path to the file (absolute or relative to project root)",
+                "type": "string"
+              },
+              "module": {
+                "description": "Module path (required for add, remove — e.g. 'react', './utils', 'std::fmt')",
+                "type": "string"
+              },
+              "names": {
+                "description": "Named imports to add. Each entry uses the language's native named-import text, including per-name aliasing where the language uses `as` (e.g. ['useState', 'debounce as db'], Solidity ['ERC20', 'IERC20 as IToken']).",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "defaultImport": {
+                "description": "Default import name, ES only (e.g. 'React')",
+                "type": "string"
+              },
+              "namespace": {
+                "description": "Namespace binding: `import * as ns from 'mod'` (ES), `import * as N from \"./X.sol\"` (Solidity).",
+                "type": "string"
+              },
+              "alias": {
+                "description": "Whole-module alias. Solidity: `import \"./X.sol\" as X` (module=path, alias=X).",
+                "type": "string"
+              },
+              "modifiers": {
+                "description": "Statement-level modifier tokens, language-validated: Java/C# 'static'; C# 'global'/'unsafe'; Java/Kotlin/Scala 'wildcard'; Swift '@testable'. Unsupported tokens for the file's language return a clear error.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "importKind": {
+                "description": "Symbol-kind-specific import: PHP 'function'/'const'; Swift 'struct'/'class'/'enum'/'protocol'/'func'; Scala 'given'.",
+                "type": "string"
+              },
+              "typeOnly": {
+                "description": "Type-only import (TS only, default: false)",
+                "type": "boolean"
+              },
+              "removeName": {
+                "description": "Named import to remove for 'remove' op; omit to remove entire import",
+                "type": "string"
+              },
+              "validate": {
+                "description": "Validation level: 'syntax' (default) or 'full'. Syntax = tree-sitter parse check only. Full = also runs LSP type-checking (slower, catches more errors)",
+                "type": "string",
+                "enum": [
+                  "syntax",
+                  "full"
+                ]
+              }
+            },
+            "required": [
+              "op",
+              "path"
+            ]
+          }
+        },
+        {
+          "name": "safety",
+          "schema_digest": "aea9fb55c7b5b61784a4ee1aca61c92449be8eaff5925e177d5ce04dab670b0e",
+          "semantics": 1,
+          "capabilities": [
+            "aft:safety/v1"
+          ],
+          "description": "File safety and recovery operations.\n\nPer-file undo stack is capped at 20 entries (oldest evicted).\n\nOps:\n- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n- 'history': List all edit snapshots for a file. Requires 'path'.\n- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n- 'list': List all available named checkpoints. No extra params needed.\n\nEach op requires specific parameters — see parameter descriptions for requirements.\n\nUse checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "op": {
+                "description": "Safety operation",
+                "type": "string",
+                "enum": [
+                  "undo",
+                  "history",
+                  "checkpoint",
+                  "restore",
+                  "list"
+                ]
+              },
+              "path": {
+                "description": "File path (required for history, optional for undo, optional for checkpoint — snapshots only that file when files is omitted, optional for restore — restores only that file). Absolute or relative to project root",
+                "type": "string"
+              },
+              "name": {
+                "description": "Checkpoint name (required for checkpoint, restore)",
+                "type": "string"
+              },
+              "files": {
+                "description": "Specific files to include in checkpoint, or to restore from a checkpoint (optional; restore without path/files restores the whole checkpoint; explicit checkpoint files may be untracked or gitignored)",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "op"
+            ]
+          }
+        },
+        {
+          "name": "bash_status",
+          "schema_digest": "fc37e91b574024b0342f3b0b255341e472004f0203eac47f6b1abd9ff7f58f2c",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Read-only snapshot of a background or PTY bash task's current state and output. Returns immediately. Never waits. One look to check on a task is fine — never loop it to wait for completion. To wait, use bash_watch.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "type": "string"
+              },
+              "outputMode": {
+                "description": "PTY output rendering mode. Defaults to screen for PTY tasks and preserves existing behavior for piped tasks when omitted.",
+                "type": "string",
+                "enum": [
+                  "screen",
+                  "raw",
+                  "both"
+                ]
+              }
+            },
+            "required": [
+              "taskId"
+            ]
+          }
+        },
+        {
+          "name": "bash_watch",
+          "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background task ID returned by bash({ background: true }).",
+                "type": "string"
+              },
+              "pattern": {
+                "description": "Substring or regex pattern. Optional in sync mode; required with background:true. Sync substring watches keep only the overlap tail needed for boundary matches; sync regex watches use a 64 KB rolling output window.",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "regex": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "regex"
+                    ]
+                  }
+                ]
+              },
+              "background": {
+                "description": "Accepted for compatibility. This watch always waits: a delegated session gets no async notification, so background: true waits up to the worker wait limit like a watch without a timeout.",
+                "type": "boolean"
+              },
+              "timeoutMs": {
+                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1800000
+              },
+              "once": {
+                "description": "Accepted for compatibility; only an async watch reads it.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "taskId"
+            ]
+          }
+        },
+        {
+          "name": "bash_kill",
+          "schema_digest": "96f37c924532b6490161c9f1075beb7ae617aaa659dc32fa324835125163373e",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Terminate a running background bash task spawned with bash({ background: true }). Returns confirmation of kill or an error if the task already finished.",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background task ID returned by bash({ background: true }), e.g. bash-6b454047a1c39ded.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "taskId"
+            ]
+          }
+        },
+        {
+          "name": "bash_write",
+          "schema_digest": "d5dd71a3c339a699a8a07a4f411e98c10210a04d47f6bfc10415e950f59c4496",
+          "semantics": 1,
+          "capabilities": [
+            "shell.exec/v1"
+          ],
+          "description": "Write input bytes to a running PTY bash task. PTY-only; check bash_status reports mode: \"pty\" first. Input is either a string (verbatim bytes) or an array mixing strings and { key: \"esc\" | \"enter\" | \"up\" | \"ctrl-c\" | ... } objects for atomic text+key sequences such as [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ]. Named keys cover enter/return/tab/space/backspace/esc/escape, arrows, home/end/page-up/page-down/delete/insert, f1..f12, and ctrl-a..ctrl-z. Maximum 1 MiB per call (post-expansion).",
+          "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+              "taskId": {
+                "description": "Background PTY task ID returned by bash({ pty: true, background: true }).",
+                "type": "string"
+              },
+              "input": {
+                "description": "Either a string of verbatim bytes (e.g. 'print(1)\\n') OR an array mixing strings and { key: '<name>' } objects for atomic text+key sequences. Example: [ 'iHello', { key: 'esc' }, ':wq', { key: 'enter' } ].",
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "key": {
+                              "description": "Named control key, e.g. 'esc', 'enter', 'up', 'ctrl-c'. Case-insensitive.",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "key"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "taskId",
+              "input"
+            ]
+          }
+        }
+      ],
+      "system_text": {
+        "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\nA command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
+        "item_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
+        "preflight_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
+        "tool_names": [
+          "apply_patch",
+          "ast_replace",
+          "ast_search",
+          "bash",
+          "bash_kill",
+          "bash_status",
+          "bash_watch",
+          "bash_write",
+          "callgraph",
+          "conflicts",
+          "delete",
+          "edit",
+          "glob",
+          "grep",
+          "import",
+          "inspect",
+          "move",
+          "outline",
+          "powershell",
+          "read",
+          "safety",
+          "search",
+          "status",
+          "write",
+          "zoom"
+        ]
+      }
+    }
   }
 ]

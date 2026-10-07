@@ -1,6 +1,7 @@
 import {
   type AftProjectTransport,
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RUNON_DESCRIPTION,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
@@ -46,7 +47,7 @@ import {
   unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
-import { resolveBashConfig, toolEnabled } from "../config.js";
+import { remoteRunsOffered, resolveBashConfig, toolEnabled } from "../config.js";
 import { isPiWorkerSession } from "../session-kind.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
@@ -234,6 +235,10 @@ const BashPtyParams = {
   ptyCols: optionalInt(1, 140, "PTY terminal width in columns (minimum 1, maximum 140)"),
 };
 
+const BashRunonParam = {
+  runon: Type.Optional(Type.String({ description: BASH_RUNON_DESCRIPTION })),
+};
+
 /** The full argument set, used for the parameter types `execute` receives. */
 const BashParams = Type.Object({
   ...BashBaseParams,
@@ -242,14 +247,18 @@ const BashParams = Type.Object({
   ...BashBackgroundFlagParam,
   ...BashCompressionParam,
   ...BashPtyParams,
+  ...BashRunonParam,
 });
 
 /**
  * The argument set a model is shown: each optional argument exists only while
  * the feature it controls is on, so no knob that does nothing is offered.
  * `wait`, `background` and the PTY arguments need `bash.background`,
- * `compressed` needs `bash.compress`, and `sandbox` needs `sandbox.enabled`.
- * A stale call that still sends a removed argument is ignored in `execute`.
+ * `compressed` needs `bash.compress`, `sandbox` needs `sandbox.enabled`, and
+ * `runon` needs subc mode with remote runs enabled in the user config (bash
+ * only, never PowerShell). A stale call that still sends a removed argument
+ * is ignored in `execute`, except `runon`, which is forwarded so the engine
+ * refuses it by name rather than running the command locally.
  * Keys keep the order of the full set, so the all-on schema is unchanged.
  */
 function bashParamsForConfig(
@@ -258,6 +267,7 @@ function bashParamsForConfig(
     compress: boolean;
     sandbox: boolean;
     subagentBackground: boolean;
+    runon?: boolean;
   },
   companions: RegisteredCompanions,
 ): typeof BashParams {
@@ -285,6 +295,7 @@ function bashParamsForConfig(
           ),
         }
       : {}),
+    ...(features.runon ? BashRunonParam : {}),
   }) as unknown as typeof BashParams;
 }
 
@@ -733,6 +744,7 @@ export function registerBashTool(
         compress: bashCfg.compress,
         sandbox: nativeSandboxEnabled(ctx.config),
         subagentBackground: bashCfg.subagent_background,
+        runon: !isPowerShell && remoteRunsOffered(ctx.config),
       },
       companions,
     ),
@@ -845,6 +857,7 @@ export function registerBashTool(
             wait: requestedWait,
             sandbox: params.sandbox,
             ...(isPowerShell ? { shell: "powershell" } : {}),
+            ...(params.runon !== undefined ? { runon: params.runon } : {}),
           },
           extCtx,
           {
@@ -872,6 +885,11 @@ export function registerBashTool(
         }
         if (requestedPty) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
+        }
+        if (params.runon !== undefined) {
+          throw new Error(
+            `${BASH_HOST_FALLBACK_REFUSAL}; runon is unsupported, and the command was not run locally.`,
+          );
         }
         if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
           throw new BridgeError(

@@ -496,7 +496,7 @@ pub(super) fn submit_deferred_bash(
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
     server_completion: bool,
-    remote_key: Option<crate::db::remote_exec::PolicyKey>,
+    remote_source: super::remote_policy::RemoteSource,
     received_at: Instant,
 ) {
     // Leave room for writer queueing and the daemon relay under the shortest
@@ -695,7 +695,7 @@ pub(super) fn submit_deferred_bash(
                                                     crate::bash_background::with_remote_policy(
                                                         super::remote_policy::lookup(
                                                             ctx,
-                                                            remote_key.as_ref(),
+                                                            &remote_source,
                                                         ),
                                                         || dispatch(raw_req, ctx),
                                                     )
@@ -1821,6 +1821,7 @@ mod grant_path_tests {
             80,
             Vec::new(),
             None,
+            None,
         )
     }
 
@@ -1869,7 +1870,7 @@ mod grant_path_tests {
                 None,
                 false,
                 true,
-                None,
+                super::remote_policy::RemoteSource::None,
                 Instant::now(),
             );
             let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
@@ -2349,7 +2350,7 @@ mod grant_path_tests {
                 None,
                 false,
                 false,
-                None,
+                super::remote_policy::RemoteSource::None,
                 Instant::now(),
             );
         }
@@ -2499,7 +2500,7 @@ mod grant_path_tests {
             None,
             false,
             false,
-            None,
+            super::remote_policy::RemoteSource::None,
             Instant::now(),
         );
 

@@ -264,6 +264,7 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `compressed` | boolean | Opt in/out of output compression for this call (default true; requires compression flag) |
 | `pty` | boolean | Run in a real PTY for interactive programs. Implies `background: true`. |
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
+| `runon` | string | Run the whole line on the remote Linux build server (`"linux"`). Offered only where remote runs are configured; see below. |
 
 **Timeout model:** `timeout` is a hard-kill cap, never a polling parameter, and starts after
 process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
@@ -283,6 +284,39 @@ briefly then hard-kills at 2s. `background: true` skips polling entirely.
 
 Returns combined stdout/stderr plus `exit_code`, `duration_ms`, truncation status, and an
 `output_path` when large output spills to disk.
+
+**Running on the remote build server (`runon`)** — `runon: "linux"` sends the whole command
+line, exactly as written (pipes, lists, environment prefixes and all), to the remote Linux
+build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). It runs
+there under `bash -c` in the same working directory, with the same timeout and the same
+environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
+off-host request (the reply names them). Without `runon` a command always runs on this machine;
+AFT never decides on its own to send a command away.
+
+Who is offered `runon`:
+
+- OpenCode and Pi sessions in subc mode, when the user config sets `remote_exec.enabled: true`
+  (see [Configuration](config.md#remote-runs)). The decision is made once when the tool is
+  built; runner health never adds or removes the argument.
+- Broca workers, when their plan's `remote_exec` item is enabled. The catalog fetched for that
+  session shows `runon`; other catalogs do not.
+
+A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
+the project turned remote runs off (`remote runs are off for this project`), the session has no
+remote runner (`this session has no remote runner`), the demand is not one AFT knows
+(`unknown runner demand`), or the call also sets `pty: true`, a PowerShell shell, or
+`sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch needs AFT on macOS or
+Linux. `background: true` works as for local commands, and a background remote task re-attaches
+after a restart.
+
+The first line of the reply says where the command ran: `ran remotely on ck-motor`, or, when the
+runner refused the job before starting it, `ran locally on macOS: remote refused: <reason>`
+(the command then runs once on this machine). A job the runner accepted is never run again: if
+AFT loses track of it, the reply says the outcome is unknown instead of re-running it. After the
+output, the reply lists the files the run changed on the server under `These files changed on
+the server and were NOT copied back:`; whatever the runner's report does not cover (today git
+state, untracked files and ignored writes, and the changed-file list when it is absent) is named
+as `not reported by the runner`, never shown as "nothing changed".
 
 **Rewriter** — when `experimental.bash.rewrite: true`, common shell command shapes route to AFT
 tools instead of spawning bash:

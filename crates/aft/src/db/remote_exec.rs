@@ -233,7 +233,7 @@ mod tests {
         FrozenParams {
             remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
                 enabled,
-                commands: vec!["cargo test".into()],
+                ..Default::default()
             }),
             ..Default::default()
         }

@@ -1471,6 +1471,7 @@ impl BgTaskRegistry {
             if let Some(note) = &state.metadata.execution_note {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
+            append_remote_report(&mut snapshot.output_preview, &state.metadata);
         }
         snapshot
     }
@@ -7093,6 +7094,7 @@ impl BgTaskRegistry {
         if let Some(note) = &metadata.execution_note {
             output_preview = format!("{note}\n{output_preview}");
         }
+        append_remote_report(&mut output_preview, metadata);
         if metadata.status == BgTaskStatus::FateUnknown {
             if let Some(reason) = metadata.status_reason.as_deref() {
                 output_preview = if output_preview.is_empty() {
@@ -9471,6 +9473,17 @@ fn random_slug() -> String {
 #[cfg(test)]
 #[path = "pty_completion_test.rs"]
 mod pty_completion_tests;
+
+/// Print what a remote run's report says about the workspace after the
+/// command's output, where a reader looks once the output ends.
+fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
+    if let Some(report) = remote::remote_report(metadata) {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&report);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,7 @@
  * Shared by scripts/build-tool-schemas.ts and subc-tool-schemas-fresh.test.ts.
  */
 
-import type { BridgePool } from "@cortexkit/aft-bridge";
+import { BASH_RUNON_DESCRIPTION, type BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveBashConfig } from "./config.js";
@@ -117,6 +117,14 @@ function consumerOnly(property: Record<string, unknown>): Record<string, unknown
   return { ...property, [CONSUMER_ONLY_MARKER]: true };
 }
 
+/**
+ * JSON Schema extension key on bash's `runon` property. The Rust manifest and
+ * every catalog strip the property by default and add it back (without the
+ * marker) only for a session that may run commands remotely, so it appears
+ * exactly where remote runs are configured.
+ */
+export const RUNON_MARKER = "x-aft-runon";
+
 function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
   const wrapped = z.object(def.args);
   const jsonSchema = z.toJSONSchema(wrapped, { io: "input" }) as Record<string, unknown>;
@@ -208,10 +216,17 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   });
   // The powershell entry is always generated; whether it is advertised is
   // decided per host when the Rust manifest is served (only where pwsh runs).
+  // It never carries `runon`: the remote runner runs bash, not PowerShell.
   const powershellSchema = {
     ...bashSchema,
+    properties: { ...bashProperties },
     description:
       "Execute PowerShell commands through AFT's bash task family with UTF-8 output and conservative per-command approval.",
+  };
+  bashProperties.runon = {
+    type: "string",
+    description: BASH_RUNON_DESCRIPTION,
+    [RUNON_MARKER]: true,
   };
 
   return {

@@ -68,11 +68,8 @@ pub(super) fn catalog(
             args.remove(name);
         }
     }
-    let answer = tool_provider::catalog(
-        body,
-        &identity.disabled_tools,
-        crate::bash_background::powershell_available(),
-    )?;
+    let powershell = crate::bash_background::powershell_available();
+    let answer = tool_provider::catalog(body.clone(), &identity.disabled_tools, powershell)?;
     if let Some(key) = key(identity, Some(&preset)) {
         if original.contains_key("remote_exec") || original.contains_key("siblings") {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {
@@ -114,33 +111,108 @@ pub(super) fn catalog(
                     format!("cannot freeze routing params: {e}"),
                 )
             })?;
+            drop(conn);
+            // `runon` is offered once per fetch, from the policy actually
+            // frozen for this session (a freeze never changes once made), and
+            // only where the project has not turned remote runs off. Runner
+            // health never changes the answer.
+            let offered = !ctx.config().remote_exec.project_off
+                && lookup(ctx, &RemoteSource::Worker(Some(key))).is_some_and(|launch| {
+                    launch
+                        .params
+                        .remote_exec
+                        .as_ref()
+                        .is_some_and(|policy| policy.enabled)
+                });
+            if offered {
+                return tool_provider::catalog_for_session(
+                    body,
+                    &identity.disabled_tools,
+                    powershell,
+                    true,
+                );
+            }
         }
     }
     Ok(answer)
 }
 
+/// Where a bash call's remote-run policy comes from.
+#[derive(Clone, Debug)]
+pub(crate) enum RemoteSource {
+    /// No remote runs: the call came through a path that never offers them.
+    None,
+    /// A head session: the user config's `remote_exec` decides.
+    Head { harness: String, session: String },
+    /// A delegated worker: only the policy frozen from its plan decides, and
+    /// a worker whose route carries no frozen policy has none.
+    Worker(Option<PolicyKey>),
+}
+
+/// The remote-run policy source for a call made under `preset`.
+pub(super) fn source(identity: &RouteIdentity, preset: Option<&str>) -> RemoteSource {
+    if preset == Some("worker") {
+        RemoteSource::Worker(key(identity, preset))
+    } else {
+        RemoteSource::Head {
+            harness: identity.harness.clone(),
+            session: identity.session.clone(),
+        }
+    }
+}
+
+fn connection_file(ctx: &AppContext) -> Option<std::path::PathBuf> {
+    ctx.app()
+        .subc_connection_file()
+        .or_else(|| ctx.config().semantic.subc_connection_file.clone())
+}
+
+/// The session's remote-run policy, or `None` when it has none. A head's
+/// comes from the user config (with a project's opt-out applied by the config
+/// resolver); a worker's only from the policy frozen at its catalog fetch.
 pub(super) fn lookup(
     ctx: &AppContext,
-    key: Option<&PolicyKey>,
+    source: &RemoteSource,
 ) -> Option<crate::bash_background::RemoteLaunch> {
-    let key = key?;
-    let db = ctx.db()?;
-    let conn = db.lock().ok()?;
-    let policy = store::lookup(
-        &conn,
-        key,
-        crate::bash_background::persistence::unix_millis(),
-    )
-    .ok()??;
-    Some(crate::bash_background::RemoteLaunch {
-        params: policy,
-        connection_file: ctx
-            .app()
-            .subc_connection_file()
-            .or_else(|| ctx.config().semantic.subc_connection_file.clone()),
-        harness: key.harness.clone(),
-        session: key.session.clone(),
-    })
+    match source {
+        RemoteSource::None => None,
+        RemoteSource::Head { harness, session } => {
+            let config = ctx.config();
+            config
+                .remote_exec
+                .enabled
+                .then(|| crate::bash_background::RemoteLaunch {
+                    params: crate::exec_remote::FrozenParams {
+                        remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
+                            enabled: true,
+                            default_demand: config.remote_exec.default_demand.clone(),
+                            legacy_commands: None,
+                        }),
+                        ..Default::default()
+                    },
+                    connection_file: connection_file(ctx),
+                    harness: harness.clone(),
+                    session: session.clone(),
+                })
+        }
+        RemoteSource::Worker(key) => {
+            let key = key.as_ref()?;
+            let db = ctx.db()?;
+            let conn = db.lock().ok()?;
+            let policy = store::lookup(
+                &conn,
+                key,
+                crate::bash_background::persistence::unix_millis(),
+            )
+            .ok()??;
+            Some(crate::bash_background::RemoteLaunch {
+                params: policy,
+                connection_file: connection_file(ctx),
+                harness: key.harness.clone(),
+                session: key.session.clone(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]

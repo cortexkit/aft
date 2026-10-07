@@ -71,6 +71,9 @@ struct BashParams {
     permissions_requested: bool,
     #[serde(default)]
     env: HashMap<String, String>,
+    /// Run the whole line on the remote runner this demand names.
+    #[serde(default)]
+    runon: Option<String>,
 }
 
 /// The hard kill for a bash request: the caller's explicit `timeout`, or the
@@ -120,6 +123,23 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(description) = params.description.as_deref() {
         log::debug!("bash description: {description}");
     }
+
+    // `runon` sends the whole line, as written, to the remote runner. Every
+    // reason that cannot happen is refused here, before any local work (even
+    // resolving a local shell).
+    let remote = match params.runon.as_deref() {
+        None => None,
+        Some(runon) => match crate::bash_background::remote_for_runon(
+            &ctx.config(),
+            runon,
+            params.pty,
+            params.shell.is_powershell(),
+            matches!(params.sandbox, Some(BashSandbox::Host)),
+        ) {
+            Ok(launch) => Some(launch),
+            Err(message) => return Response::error(&req.id, "remote_run_refused", message),
+        },
+    };
 
     let shell_path = match crate::bash_background::resolve_shell_path(params.pty, params.shell) {
         Ok(path) => path,
@@ -319,6 +339,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // command verbatim when the workdir differs from the project root.
     if !params.shell.is_powershell()
         && host_escalation.is_none()
+        && remote.is_none()
         && workdir_matches_project_root(&workdir, ctx)
     {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
@@ -336,16 +357,19 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         let reason = if params.shell.is_powershell() {
             "PowerShell syntax bypasses POSIX rewrite rules"
+        } else if remote.is_some() {
+            "runon sends the whole line to the remote runner"
         } else if host_escalation.is_some() {
             "host escalation owns process execution"
         } else {
             "bash workdir differs from the project root"
         };
-        let branch = if params.shell.is_powershell() || host_escalation.is_some() {
-            "dispatch.native.no_rule"
-        } else {
-            "dispatch.native.non_root_workdir"
-        };
+        let branch =
+            if params.shell.is_powershell() || host_escalation.is_some() || remote.is_some() {
+                "dispatch.native.no_rule"
+            } else {
+                "dispatch.native.non_root_workdir"
+            };
         crate::bash_rewrite::dispatch::record_native(
             &req.id,
             crate::bash_rewrite::catalog::ControlRole::Native,
@@ -390,6 +414,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         pty_cols,
         scanner_report,
         host_escalation,
+        remote,
     )
 }
 

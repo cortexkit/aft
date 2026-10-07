@@ -1392,6 +1392,14 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
         }
         out.insert("sandbox".to_string(), sandbox.clone());
     }
+    // `runon` is forwarded as written; the bash handler names an unknown
+    // demand and decides whether this session may run remotely at all.
+    if let Some(runon) = map_in.get("runon").filter(|value| !value.is_null()) {
+        let Some(demand) = runon.as_str() else {
+            return Err(invalid_request("bash: 'runon' must be a string"));
+        };
+        out.insert("runon".to_string(), Value::String(demand.to_string()));
+    }
 
     Ok(Translated {
         command: "bash".into(),

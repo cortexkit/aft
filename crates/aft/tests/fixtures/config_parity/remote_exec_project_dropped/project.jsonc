@@ -1,0 +1,6 @@
+{
+  "remote_exec": {
+    "enabled": true,
+    "default_demand": "linux"
+  }
+}

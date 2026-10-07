@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
+  BASH_RUNON_DESCRIPTION,
   type BridgePool,
   type BridgeRequestOptions,
   BridgeTransportUnavailableError,
@@ -223,6 +224,68 @@ describe("OpenCode bash adapter", () => {
       };
       expect(jsonSchema.description?.length).toBeGreaterThan(20);
     }
+  });
+
+  test("runon is offered only in subc mode with remote runs enabled in the user config", () => {
+    const offered = (config: Record<string, unknown>) =>
+      "runon" in
+      createHarness(() => ({ success: true, output: "" }), undefined, false, {
+        disabled_tools: [],
+        ...config,
+      } as PluginContext["config"]).tool.args;
+    const subc = { subc: { connection_file: "/run/subc-connection.json" } };
+    expect(offered({ ...subc, remote_exec: { enabled: true } })).toBe(true);
+    // No user-tier switch, or standalone transport: never offered.
+    expect(offered({ ...subc })).toBe(false);
+    expect(offered({ ...subc, remote_exec: { enabled: false } })).toBe(false);
+    expect(offered({ remote_exec: { enabled: true } })).toBe(false);
+    // The project turned remote runs off.
+    expect(offered({ ...subc, remote_exec: { enabled: false, project_off: true } })).toBe(false);
+    const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+      ...subc,
+      remote_exec: { enabled: true },
+    } as PluginContext["config"]);
+    expect(safeParse(bash.args.runon, "linux").success).toBe(true);
+    const jsonSchema = tool.schema.toJSONSchema(bash.args.runon as never, { io: "input" }) as {
+      description?: string;
+    };
+    expect(jsonSchema.description).toBe(BASH_RUNON_DESCRIPTION);
+  });
+
+  test("runon is forwarded to the engine and never becomes a host-fallback run", async () => {
+    const { calls, tool: bash } = createHarness(
+      () => ({ success: true, output: "ran remotely on ck-motor\nok", exit_code: 0 }),
+      undefined,
+      false,
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+      } as PluginContext["config"],
+    );
+    await bash.execute(
+      { command: "FOO=1 cargo test | tail -1", runon: "linux" },
+      createMockSdkContext({}),
+    );
+    expect(calls[0].params).toMatchObject({
+      command: "FOO=1 cargo test | tail -1",
+      runon: "linux",
+    });
+
+    const dead = createHarness(
+      () => {
+        throw new BridgeTransportUnavailableError("transport down");
+      },
+      undefined,
+      false,
+      {
+        bash: { host_fallback: true },
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+      } as PluginContext["config"],
+    );
+    await expect(
+      dead.tool.execute({ command: "printf no", runon: "linux" }, createMockSdkContext({})),
+    ).rejects.toThrow("runon is unsupported, and the command was not run locally");
   });
 
   test("schema omits wait, background and PTY args when bash.background is disabled", () => {

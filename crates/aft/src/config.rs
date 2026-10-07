@@ -566,6 +566,23 @@ pub struct SandboxConfig {
     pub read_deny: Vec<PathBuf>,
 }
 
+/// Whether bash calls may ask to run on the remote build server (`runon`).
+/// The user config turns it on; a project config may only turn it off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RemoteExecConfig {
+    /// Offer `runon` to heads and accept their calls that set it. True only
+    /// when the user config enables it and the project config does not turn
+    /// it off.
+    pub enabled: bool,
+    /// The runner demand a `runon` call without specifics runs under. User
+    /// configuration only; it never makes a call remote by itself.
+    pub default_demand: Option<String>,
+    /// The project config turned remote runs off, so a `runon` call in this
+    /// project is refused with that reason rather than run anywhere.
+    pub project_off: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BashConfig {
@@ -691,6 +708,8 @@ pub struct Config {
     pub bash_permissions: bool,
     /// Native sandbox policy for first-party bash and PTY processes.
     pub sandbox: SandboxConfig,
+    /// Remote runs requested per bash call with `runon`. Off by default.
+    pub remote_exec: RemoteExecConfig,
     /// Maximum file size to fully index in bytes (default: 1MB).
     pub search_index_max_file_size: u64,
     pub semantic: SemanticBackendConfig,
@@ -796,6 +815,7 @@ impl Default for Config {
             bash: BashConfig::default(),
             bash_permissions: false,
             sandbox: SandboxConfig::default(),
+            remote_exec: RemoteExecConfig::default(),
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             search: SearchConfig::default(),

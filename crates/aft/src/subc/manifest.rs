@@ -247,9 +247,36 @@ fn is_consumer_only(property: &Value) -> bool {
     property.get(CONSUMER_ONLY_MARKER).and_then(Value::as_bool) == Some(true)
 }
 
-/// Removes consumer-only properties (and their `required` entries) from a
-/// tool schema so a consumer handing the catalog straight to a model does not
-/// invite the model to set them.
+/// JSON Schema extension key the generator puts on bash's `runon` property.
+/// It is served only to a session that may run commands remotely, so the
+/// manifest and every catalog strip it by default; a catalog for such a
+/// session adds it back with [`runon_property`].
+const RUNON_MARKER: &str = "x-aft-runon";
+
+fn is_runon(property: &Value) -> bool {
+    property.get(RUNON_MARKER).and_then(Value::as_bool) == Some(true)
+}
+
+/// The `runon` property tool `name` carries in the generated artifact for
+/// `preset` (the base artifact when the preset does not override the tool),
+/// with its marker removed, or `None` when the tool has none.
+pub(super) fn runon_property(preset: Option<&str>, name: &str) -> Option<(String, Value)> {
+    let schema = preset
+        .and_then(|preset| SUBC_TOOL_PRESETS.get(preset)?.get(name))
+        .or_else(|| SUBC_TOOL_SCHEMAS.get(name))?;
+    let (key, property) = schema
+        .get("properties")?
+        .as_object()?
+        .iter()
+        .find(|(_, property)| is_runon(property))?;
+    let mut property = property.clone();
+    property.as_object_mut()?.remove(RUNON_MARKER);
+    Some((key.clone(), property))
+}
+
+/// Removes consumer-only properties and the `runon` property (and their
+/// `required` entries) from a tool schema so a consumer handing the catalog
+/// straight to a model does not invite the model to set them.
 fn strip_consumer_only_properties(schema: &mut Value) {
     let Some(object) = schema.as_object_mut() else {
         return;
@@ -257,7 +284,7 @@ fn strip_consumer_only_properties(schema: &mut Value) {
     let mut removed = Vec::new();
     if let Some(Value::Object(properties)) = object.get_mut("properties") {
         properties.retain(|name, property| {
-            let keep = !is_consumer_only(property);
+            let keep = !is_consumer_only(property) && !is_runon(property);
             if !keep {
                 removed.push(name.clone());
             }
@@ -1101,6 +1128,34 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    #[test]
+    fn manifest_never_offers_runon_but_the_artifact_carries_it_for_bash_only() {
+        // The artifact must carry the marked property, or a session that may
+        // run remotely could never be offered it.
+        let (key, property) = runon_property(None, "bash").expect("bash carries runon");
+        assert_eq!(key, "runon");
+        assert!(
+            property.get(RUNON_MARKER).is_none(),
+            "the marker is not served"
+        );
+        assert!(runon_property(Some("worker"), "bash").is_some());
+        assert!(runon_property(None, "powershell").is_none());
+        assert!(runon_property(Some("worker"), "powershell").is_none());
+        for powershell_available in [true, false] {
+            let manifest = build_manifest_for_host(powershell_available);
+            let Some(ProviderRole::ToolProvider { tools, .. }) = manifest.provides.first() else {
+                panic!("expected ToolProvider");
+            };
+            for tool in tools {
+                assert!(
+                    tool.schema["properties"].get("runon").is_none(),
+                    "{} offers runon in the manifest",
+                    tool.name
+                );
+            }
         }
     }
 

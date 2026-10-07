@@ -1,5 +1,6 @@
 import {
   BASH_HOST_FALLBACK_REFUSAL,
+  BASH_RUNON_DESCRIPTION,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
@@ -16,7 +17,7 @@ import {
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
-import { resolveBashConfig, toolEnabled } from "../config.js";
+import { remoteRunsOffered, resolveBashConfig, toolEnabled } from "../config.js";
 import { flushLog, sessionLog } from "../logger.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
@@ -507,6 +508,12 @@ export function createBashTool(
         ),
       }
     : {};
+  // `runon` exists only in subc mode with remote runs enabled in the user
+  // config (and not turned off by the project), decided once here; runner
+  // health never adds or removes it.
+  const runonArg = remoteRunsOffered(ctx.config)
+    ? { runon: z.string().optional().describe(BASH_RUNON_DESCRIPTION) }
+    : {};
   const args = {
     command: z
       .string()
@@ -531,6 +538,7 @@ export function createBashTool(
     ...backgroundFlagArg,
     ...compressedArg,
     ...ptyArgs,
+    ...runonArg,
   };
 
   // This state is deliberately local to one registered tool. Every command still
@@ -626,6 +634,10 @@ export function createBashTool(
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);
+      // Forwarded whenever present, even if this surface does not offer it:
+      // the engine refuses a remote run it cannot make by name, and a stale
+      // `runon` must never quietly become a local run.
+      const runon = args.runon;
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);
       // Only log when the gate actually changes behavior (subagent path).
       // The common primary-session foreground case is the overwhelming
@@ -670,6 +682,7 @@ export function createBashTool(
             block_to_completion: blockToCompletion,
             wait: requestedWait,
             sandbox: args.sandbox,
+            ...(runon !== undefined ? { runon } : {}),
           },
           callBashBridge,
           {
@@ -694,6 +707,11 @@ export function createBashTool(
         }
         if (requestedPty) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; pty:true is unsupported.`);
+        }
+        if (runon !== undefined) {
+          throw new Error(
+            `${BASH_HOST_FALLBACK_REFUSAL}; runon is unsupported, and the command was not run locally.`,
+          );
         }
 
         const projectRoot = projectRootFor(context);
