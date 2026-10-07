@@ -79,6 +79,8 @@ fn standalone_configure_yields_to_back_to_back_ping_before_seeded_storage_sweeps
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_STORAGE_DIR", storage.path().as_os_str()),
         ("TMPDIR", transient_root.path().as_os_str()),
+        ("TMP", transient_root.path().as_os_str()),
+        ("TEMP", transient_root.path().as_os_str()),
         (
             "AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS",
             std::ffi::OsStr::new("3000"),
@@ -224,13 +226,19 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
     let storage = tempfile::tempdir().expect("create shared storage fixture");
     let transient_root = tempfile::tempdir().expect("create transient cache root");
     let sweep_signal = project.path().join("sweep-started");
-    let orphan = seed_stale_storage_entries(storage.path(), transient_root.path(), 1)
-        .pop()
-        .expect("seeded orphan path");
+    seed_stale_storage_entries(storage.path(), transient_root.path(), 1);
+    // Payload age no longer proves an abandoned checkout: durable retention
+    // gives unknown roots an observation grace. Transient caches still have an
+    // age-based sweep and exercise this detached configure maintenance worker.
+    let orphan = transient_root
+        .path()
+        .join("aft-search-cache.0000000000000000.1");
 
     let mut aft = AftProcess::spawn_with_env(&[
         ("AFT_STORAGE_DIR", storage.path().as_os_str()),
         ("TMPDIR", transient_root.path().as_os_str()),
+        ("TMP", transient_root.path().as_os_str()),
+        ("TEMP", transient_root.path().as_os_str()),
         (
             "AFT_TEST_CONFIGURE_STORAGE_SWEEP_DELAY_MS",
             std::ffi::OsStr::new("750"),
@@ -271,7 +279,7 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
     while orphan.exists() {
         assert!(
             Instant::now() < sweep_deadline,
-            "orphan sweep did not complete within ten seconds"
+            "transient cache sweep did not complete within ten seconds"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -279,8 +287,8 @@ fn standalone_storage_sweeps_run_detached_without_blocking_ping() {
     let (status, stderr) = aft.stderr_output();
     assert!(status.success());
     assert!(
-        stderr.contains("search index orphan sweep") && stderr.contains("scanned=1"),
-        "detached orphan sweep did not log its bounded effect: {stderr}"
+        stderr.contains("transient search cache sweep") && stderr.contains("removed=1"),
+        "detached transient cache sweep did not log its bounded effect: {stderr}"
     );
 }
 
