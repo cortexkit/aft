@@ -1199,8 +1199,40 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn without_test_thread_environment() -> impl Drop {
+        struct Restore {
+            values: [(&'static str, Option<std::ffi::OsString>); 2],
+            _lock: crate::test_env::ProcessEnvLockGuard,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (name, value) in &self.values {
+                    if let Some(value) = value {
+                        std::env::set_var(name, value);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
+        let lock = crate::test_env::process_env_lock();
+        let values = ["NEXTEST_TEST_THREADS", "RUST_TEST_THREADS"].map(|name| {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            (name, previous)
+        });
+        Restore {
+            values,
+            _lock: lock,
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn worker_preset_bash_reads_budget_file_and_defaults_missing_or_garbage_to_four() {
+        // Defaults apply only when the child inherits no caller-selected budget.
+        // Nextest itself sets NEXTEST_TEST_THREADS in the fixture's environment.
+        let _environment = without_test_thread_environment();
         let container = tempfile::tempdir().unwrap();
         let project = container.path().join("worktree");
         std::fs::create_dir(&project).unwrap();
@@ -1244,6 +1276,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn worker_bash_respects_call_environment_and_head_or_plugin_worker_gets_no_default() {
+        let _environment = without_test_thread_environment();
         let container = tempfile::tempdir().unwrap();
         let project = container.path().join("worktree");
         std::fs::create_dir(&project).unwrap();
@@ -1268,6 +1301,23 @@ mod tests {
         assert_eq!(
             bash_output_for_test(&ctx, &project, &head, false),
             "unset|unset"
+        );
+
+        std::env::set_var("NEXTEST_TEST_THREADS", "19");
+        std::env::set_var("RUST_TEST_THREADS", "23");
+        assert_eq!(
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget-inherited"),
+                true
+            ),
+            "19|23"
+        );
+        assert_eq!(bash_output_for_test(&ctx, &project, &head, false), "19|23");
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &explicit, true),
+            "13|17"
         );
     }
 
