@@ -3677,3 +3677,142 @@ fn es_add_import_follows_biome_semicolons_without_existing_imports() {
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.starts_with("import { c } from 'c'\n"), "{text}");
 }
+
+#[test]
+fn remove_named_specifier_preserves_existing_list_layout() {
+    let mut aft = AftProcess::spawn();
+    for (extension, source, module, name, expected) in [
+        (
+            "ts",
+            "import {\n  readdirSync,\n  readFileSync, // retained comment\n  linkSync,\n} from \"node:fs\";\n",
+            "node:fs",
+            "linkSync",
+            "import {\n  readdirSync,\n  readFileSync, // retained comment\n} from \"node:fs\";\n",
+        ),
+        (
+            "tsx",
+            "import {\n  readdirSync,\n  readFileSync,\n  linkSync,\n} from \"node:fs\";\n",
+            "node:fs",
+            "linkSync",
+            "import {\n  readdirSync,\n  readFileSync,\n} from \"node:fs\";\n",
+        ),
+        (
+            "js",
+            "import { readdirSync, readFileSync, linkSync } from \"node:fs\";\n",
+            "node:fs",
+            "linkSync",
+            "import { readdirSync, readFileSync } from \"node:fs\";\n",
+        ),
+        (
+            "py",
+            "from pathlib import (\n    Path,\n    PurePath,\n    PurePosixPath,\n)\n",
+            "pathlib",
+            "PurePath",
+            "from pathlib import (\n    Path,\n    PurePosixPath,\n)\n",
+        ),
+        (
+            "rs",
+            "use std::fs::{\n    read_dir,\n    read_to_string,\n    remove_file,\n};\n",
+            "std::fs",
+            "read_to_string",
+            "use std::fs::{\n    read_dir,\n    remove_file,\n};\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("layout.{extension}"));
+        fs::write(&file, source).unwrap();
+        let response = aft.send(
+            &serde_json::json!({
+                "id": format!("remove-layout-{extension}"),
+                "command": "remove_import",
+                "file": file,
+                "module": module,
+                "name": name,
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        let actual = fs::read_to_string(&file).unwrap();
+        assert_eq!(actual, expected, "{extension} import layout changed");
+    }
+
+    for (extension, source, module) in [
+        ("ts", "import { only } from \"pkg\";\n", "pkg"),
+        ("tsx", "import { only } from \"pkg\";\n", "pkg"),
+        ("js", "import { only } from \"pkg\";\n", "pkg"),
+        ("py", "from pkg import (only)\n", "pkg"),
+        ("rs", "pub use pkg::{only};\n", "pkg"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("only-one.{extension}"));
+        fs::write(&file, source).unwrap();
+        let response = aft.send(
+            &serde_json::json!({
+                "id": format!("remove-only-name-{extension}"),
+                "command": "remove_import",
+                "file": file,
+                "module": module,
+                "name": "only",
+            })
+            .to_string(),
+        );
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(response["only_name"], true, "{extension}: {response}");
+        assert!(fs::read_to_string(&file).unwrap().is_empty(), "{extension}");
+    }
+    aft.shutdown();
+}
+
+#[test]
+fn add_named_specifier_preserves_existing_multiline_layout() {
+    let mut aft = AftProcess::spawn();
+    for (extension, source, module, expected) in [
+        (
+            "ts",
+            "import {\n  alpha,\n  gamma,\n} from \"pkg\";\n",
+            "pkg",
+            "import {\n  alpha,\n  beta,\n  gamma,\n} from \"pkg\";\n",
+        ),
+        (
+            "tsx",
+            "import {\n  gamma,\n  alpha,\n} from \"pkg\";\n",
+            "pkg",
+            "import {\n  gamma,\n  alpha,\n  beta,\n} from \"pkg\";\n",
+        ),
+        (
+            "js",
+            "import { alpha, gamma } from \"pkg\";\n",
+            "pkg",
+            "import { alpha, beta, gamma } from \"pkg\";\n",
+        ),
+        (
+            "py",
+            "from pkg import (\n    alpha,\n    gamma,\n)\n",
+            "pkg",
+            "from pkg import (\n    alpha,\n    beta,\n    gamma,\n)\n",
+        ),
+        (
+            "rs",
+            "use pkg::{\n    alpha,\n    gamma,\n};\n",
+            "pkg",
+            "use pkg::{\n    alpha,\n    beta,\n    gamma,\n};\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("add-layout.{extension}"));
+        fs::write(&file, source).unwrap();
+        let response = send_add_import(
+            &mut aft,
+            &format!("add-layout-{extension}"),
+            file.to_str().unwrap(),
+            module,
+            Some(&["beta"]),
+            None,
+            false,
+        );
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        let actual = fs::read_to_string(&file).unwrap();
+        assert_eq!(actual, expected, "{extension} import layout changed");
+    }
+    aft.shutdown();
+}

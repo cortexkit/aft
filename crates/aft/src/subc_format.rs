@@ -619,23 +619,27 @@ fn format_import(data: &Value, ctx: &FormatContext) -> String {
         }
         Some("remove") => {
             let module = import_module_name(response, ctx);
-            let status = if response.get("removed").and_then(Value::as_bool) == Some(false) {
+            let removed = response.get("removed").and_then(Value::as_bool) != Some(false);
+            let status = if !removed {
                 format!("not present {module}")
-            } else {
-                format!("removed {module}")
-            };
-            let scope = ctx
+            } else if let Some(name) = ctx
                 .import_remove_name
                 .as_deref()
                 .filter(|name| !name.is_empty())
-                .map(|name| format!("name {name}"))
-                .unwrap_or_else(|| "scope entire import".to_string());
-            [
-                status,
-                format!("file {}", import_file_name(response, ctx)),
-                scope,
-            ]
-            .join("\n")
+            {
+                if response.get("only_name").and_then(Value::as_bool) == Some(true) {
+                    format!("removed the {module} import (its only name)")
+                } else {
+                    let remaining = response
+                        .get("remaining_names")
+                        .and_then(import_number_value)
+                        .unwrap_or_else(|| "0".to_string());
+                    format!("removed {name} from the {module} import ({remaining} names remain)")
+                }
+            } else {
+                format!("removed the {module} import")
+            };
+            [status, format!("file {}", import_file_name(response, ctx))].join("\n")
         }
         _ => "No import result.".to_string(),
     }
@@ -4603,6 +4607,47 @@ mod inspect_header_tests {
         assert_eq!(
             format_inspect(&response),
             "PARTIAL — dead code still building; retry aft_inspect.\nbody"
+        );
+    }
+}
+
+#[cfg(test)]
+mod import_format_tests {
+    use super::{format_import, FormatContext};
+    use serde_json::json;
+
+    #[test]
+    fn remove_reply_names_the_removed_specifier_and_import_scope() {
+        let context = FormatContext {
+            import_op: Some("remove".to_string()),
+            import_remove_name: Some("linkSync".to_string()),
+            ..FormatContext::default()
+        };
+        assert_eq!(
+            format_import(
+                &json!({
+                    "removed": true,
+                    "module": "node:fs",
+                    "file": "source.ts",
+                    "remaining_names": 8,
+                    "only_name": false
+                }),
+                &context
+            ),
+            "removed linkSync from the node:fs import (8 names remain)\nfile source.ts"
+        );
+        assert_eq!(
+            format_import(
+                &json!({
+                    "removed": true,
+                    "module": "node:fs",
+                    "file": "source.ts",
+                    "remaining_names": 0,
+                    "only_name": true
+                }),
+                &context
+            ),
+            "removed the node:fs import (its only name)\nfile source.ts"
         );
     }
 }

@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use super::import_specifier_edit;
 use super::organize_imports;
 use crate::context::AppContext;
 use crate::edit;
@@ -262,6 +263,26 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     if let Some(ref n) = name {
         result["name"] = serde_json::json!(n);
+        let remaining_names = matching
+            .iter()
+            .map(|(_, imp)| {
+                imp.names
+                    .iter()
+                    .filter(|specifier| !imports::specifier_matches(specifier, n))
+                    .count()
+            })
+            .sum::<usize>();
+        let only_name = matching.len() == 1
+            && matching[0].1.names.len() == 1
+            && matching[0]
+                .1
+                .names
+                .iter()
+                .any(|specifier| imports::specifier_matches(specifier, n))
+            && (lang == LangId::Rust || matching[0].1.default_import.is_none())
+            && matching[0].1.namespace_import.is_none();
+        result["remaining_names"] = serde_json::json!(remaining_names);
+        result["only_name"] = serde_json::json!(only_name);
     }
 
     if let Some(valid) = write_result.syntax_valid {
@@ -362,8 +383,15 @@ fn remove_name_from_imports(
                 let range = line_range(source, &imp.byte_range);
                 edits.push((range, String::new()));
             } else {
-                // Other bindings remain — regenerate without target
-                let new_line =
+                // Other bindings remain — edit the matched list entry in place when
+                // the language has a lossless named-import list editor.
+                let new_line = import_specifier_edit::remove_named_specifiers(
+                    &imp.raw_text,
+                    &imp.names,
+                    target_name,
+                    lang,
+                )
+                .unwrap_or_else(|| {
                     imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
                         lang,
                         &imp.module_path,
@@ -373,7 +401,8 @@ fn remove_name_from_imports(
                         imp.kind == imports::ImportKind::Type,
                         imports::es_import_attribute_clause(imp),
                         Some(imports::quotes::statement_style(&imp.raw_text)),
-                    );
+                    )
+                });
                 edits.push((imp.byte_range.clone(), new_line));
             }
         } else if lang != LangId::Rust && imp.default_import.as_deref() == Some(target_name) {

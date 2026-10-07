@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use super::import_specifier_edit;
 use super::organize_imports;
 use crate::context::AppContext;
 use crate::edit;
@@ -59,7 +60,9 @@ fn coerce_string_array_param(params: &serde_json::Value, key: &str) -> Result<Ve
     }
 }
 
-/// Merge named import specifiers while preserving aliases and deterministic order.
+/// Merge named import specifiers, sorting additions only when the existing list
+/// is already sorted. An unsorted source list is user-authored order and keeps
+/// new names appended rather than silently moving its existing entries.
 pub(crate) fn merge_named_import_specifiers(
     existing: &[String],
     additions: &[String],
@@ -75,9 +78,13 @@ pub(crate) fn merge_named_import_specifiers(
             merged.push(addition.clone());
         }
     }
-    merged.sort_by(|left, right| {
-        imports::specifier_local_name(left).cmp(imports::specifier_local_name(right))
-    });
+    if existing.windows(2).all(|pair| {
+        imports::specifier_local_name(&pair[0]) <= imports::specifier_local_name(&pair[1])
+    }) {
+        merged.sort_by(|left, right| {
+            imports::specifier_local_name(left).cmp(imports::specifier_local_name(right))
+        });
+    }
     merged
 }
 
@@ -462,7 +469,25 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         // Build the merged named-import list: union of existing + new, sorted.
         let merged_names = merge_named_import_specifiers(&existing.names, &names);
 
-        let merged_line =
+        let additions: Vec<String> = names
+            .iter()
+            .filter(|addition| {
+                !existing.names.iter().any(|current| {
+                    imports::specifier_imported_name(current)
+                        == imports::specifier_imported_name(addition)
+                        && imports::specifier_local_name(current)
+                            == imports::specifier_local_name(addition)
+                })
+            })
+            .cloned()
+            .collect();
+        let merged_line = import_specifier_edit::insert_named_specifiers(
+            &existing.raw_text,
+            &existing.names,
+            &additions,
+            lang,
+        )
+        .unwrap_or_else(|| {
             imports::generate_import_line_with_namespace_and_attribute_clause_and_style(
                 lang,
                 &existing.module_path,
@@ -472,7 +497,8 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                 type_only,
                 imports::es_import_attribute_clause(existing),
                 Some(imports::quotes::statement_style(&existing.raw_text)),
-            );
+            )
+        });
         (
             existing.byte_range.start,
             existing.byte_range.end,

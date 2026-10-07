@@ -36,6 +36,7 @@ pub mod grep;
 pub mod hashline;
 pub mod health_digest;
 pub mod impact;
+mod import_specifier_edit;
 pub mod inline_symbol;
 pub mod inspect;
 pub mod list_checkpoints;
