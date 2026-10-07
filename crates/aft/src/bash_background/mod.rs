@@ -503,14 +503,6 @@ pub(crate) fn spawn(
 
     let mut env = env.unwrap_or_default();
     let config = ctx.config();
-    let remote = CURRENT_REMOTE
-        .with(|s| s.borrow().clone())
-        .filter(|launch| {
-            !shell.is_powershell()
-                && launch.params.remote_exec.as_ref().is_some_and(|policy| {
-                    crate::exec_remote::policy::matches(policy, command, pty, false)
-                })
-        });
     let child_storage_root = self::storage_dir(config.storage_dir.as_deref());
     // The ticket lets this command's `gh` shim relay bot writes for the
     // session that spawned it. Dropping it on any early return revokes it; a

@@ -315,6 +315,13 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
         }
     });
     let dir = tempfile::tempdir().unwrap();
+    // Connection files contain authentication material, so their parent must
+    // stay private even when the test runner uses a permissive umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let connection = dir.path().join("connection.json");
     connection_file::write_atomic(
         &connection,
