@@ -1079,9 +1079,10 @@ fn append_output_loss(metadata: &mut PersistedTask) {
 
 /// What the runner reported about the workspace after a remote run, printed
 /// after the command's output. Writes on the server are never copied back,
-/// so every change it reports is named, and every kind of change it did not
-/// report says so instead of reading as "nothing changed". `None` when the
-/// command did not run remotely.
+/// so every change it reports is named. A kind of change the runner reported
+/// as empty says nothing; a kind it did not report says so, on its own line,
+/// instead of reading as "nothing changed". `None` when the command did not
+/// run remotely or there is nothing to say.
 #[cfg(unix)]
 pub(crate) fn remote_report(
     metadata: &crate::bash_background::persistence::PersistedTask,
@@ -1092,21 +1093,113 @@ pub(crate) fn remote_report(
     {
         return None;
     }
-    let mut report = String::new();
-    match terminal.workspace_changes.as_deref() {
-        Some([]) => report.push_str("No files changed on the server.\n"),
-        Some(changes) => {
-            report.push_str("These files changed on the server and were NOT copied back:\n");
-            for path in changes {
-                report.push_str(&format!("  {}\n", path.escape_default()));
-            }
-        }
-        None => report.push_str("changed files: not reported by the runner\n"),
+    render_terminal_report(terminal)
+}
+
+/// [`remote_report`] for one terminal record.
+#[cfg(unix)]
+fn render_terminal_report(terminal: &TerminalRecord) -> Option<String> {
+    // Paths come from another machine; escaping keeps one per line.
+    fn path(path: &str) -> String {
+        path.escape_default().to_string()
     }
-    // The published run report has no git-state, untracked-file or
-    // ignored-write fields yet, so they are always unreported here.
-    report.push_str("git state, untracked files and ignored writes: not reported by the runner");
-    Some(report)
+    fn id(id: Option<&str>) -> String {
+        id.map_or_else(|| "none".to_string(), |id| id.chars().take(12).collect())
+    }
+    let mut blocks: Vec<String> = Vec::new();
+    let mut unreported: Vec<&str> = Vec::new();
+
+    match terminal.workspace_changes.as_deref() {
+        Some([]) => {}
+        Some(changes) => {
+            let mut block =
+                String::from("These files changed on the server and were NOT copied back:");
+            for changed in changes {
+                block.push_str(&format!("\n  {}", path(changed)));
+            }
+            blocks.push(block);
+        }
+        None => unreported.push("changed files"),
+    }
+
+    match &terminal.git_state_changed {
+        Some(git) if git.changed() => {
+            let mut block =
+                String::from("Git state changed on the server and was NOT copied back:");
+            if git.head_before != git.head_after {
+                block.push_str(&format!(
+                    "\n  HEAD: {} -> {}",
+                    id(git.head_before.as_deref()),
+                    id(git.head_after.as_deref())
+                ));
+            }
+            if git.ref_before != git.ref_after {
+                let name = |r: Option<&str>| r.map_or_else(|| "detached".to_string(), path);
+                block.push_str(&format!(
+                    "\n  ref: {} -> {}",
+                    name(git.ref_before.as_deref()),
+                    name(git.ref_after.as_deref())
+                ));
+            }
+            if git.index_tree_before != git.index_tree_after {
+                block.push_str("\n  index tree changed (staged changes differ)");
+            }
+            if git.stash_count_before != git.stash_count_after {
+                let delta = i64::from(git.stash_count_after) - i64::from(git.stash_count_before);
+                block.push_str(&format!(
+                    "\n  stash count: {} -> {} ({delta:+})",
+                    git.stash_count_before, git.stash_count_after
+                ));
+            }
+            blocks.push(block);
+        }
+        Some(_) => {}
+        None => unreported.push("git state"),
+    }
+
+    match &terminal.untracked_files {
+        Some(untracked) if !untracked.paths.is_empty() || untracked.truncated => {
+            let mut block = String::from(
+                "These untracked files were created on the server and were NOT copied back:",
+            );
+            for created in &untracked.paths {
+                block.push_str(&format!("\n  {}", path(created)));
+            }
+            if untracked.truncated {
+                block.push_str("\n  (the runner listed only some of them; more were created)");
+            }
+            blocks.push(block);
+        }
+        Some(_) => {}
+        None => unreported.push("untracked files"),
+    }
+
+    match &terminal.ignored_writes {
+        Some(ignored) if ignored.count > 0 => {
+            let mut block = format!(
+                "{} write{} under ignored paths on the server {} NOT copied back",
+                ignored.count,
+                if ignored.count == 1 { "" } else { "s" },
+                if ignored.count == 1 { "was" } else { "were" },
+            );
+            if ignored.sample_paths.is_empty() {
+                block.push('.');
+            } else {
+                block.push_str(", for example:");
+                for written in &ignored.sample_paths {
+                    block.push_str(&format!("\n  {}", path(written)));
+                }
+            }
+            blocks.push(block);
+        }
+        Some(_) => {}
+        None => unreported.push("ignored writes"),
+    }
+
+    for field in unreported {
+        blocks.push(format!("{field}: not reported by the runner"));
+    }
+    (!blocks.is_empty()).then(|| blocks.join("\n"))
 }
 
 #[cfg(not(unix))]

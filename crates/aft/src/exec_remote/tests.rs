@@ -33,13 +33,15 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.1"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.2"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
     use sha2::{Digest, Sha256};
     // Retain the published 0.2.0 grading corpus and its original digests;
-    // the additive 0.2.1 accepted-frame contract is pinned separately above.
+    // the additive 0.2.1 accepted-frame contract is pinned separately above,
+    // and the additive 0.2.2 run-report vectors are rendered by the remote
+    // bash tests (see `fixtures/SOURCE.md`).
     // Runtime cargo metadata resolves unrelated target dependencies even in
     // offline mode, so unit tests embed the corpus rather than requiring those
     // packages in the caller's Cargo cache. Keep the singleton version fence
@@ -52,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.1"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.2"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))

@@ -426,7 +426,9 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
     assert!(
         done.output_preview.ends_with(
             "These files changed on the server and were NOT copied back:\n  generated.txt\n\
-             git state, untracked files and ignored writes: not reported by the runner"
+             git state: not reported by the runner\n\
+             untracked files: not reported by the runner\n\
+             ignored writes: not reported by the runner"
         ),
         "{}",
         done.output_preview
@@ -1396,7 +1398,9 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     assert!(
         rendered.ends_with(
             "changed files: not reported by the runner\n\
-             git state, untracked files and ignored writes: not reported by the runner"
+             git state: not reported by the runner\n\
+             untracked files: not reported by the runner\n\
+             ignored writes: not reported by the runner"
         ),
         "{rendered}"
     );
@@ -1499,4 +1503,82 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(exec_runs(&daemon).is_empty());
     assert!(!marker.exists());
+}
+
+#[test]
+fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_is_absent() {
+    use crate::exec_remote::wire_tests::report_vector;
+    // Reported and changed: every kind of change is named, none copied back.
+    let all = "These files changed on the server and were NOT copied back:\n  result.txt\n\
+         Git state changed on the server and was NOT copied back:\n  \
+         HEAD: 111111111111 -> 222222222222\n  \
+         ref: refs/heads/main -> refs/heads/build\n  \
+         index tree changed (staged changes differ)\n  \
+         stash count: 0 -> 1 (+1)\n\
+         These untracked files were created on the server and were NOT copied back:\n  \
+         generated/new.txt\n  notes.txt\n\
+         25 writes under ignored paths on the server were NOT copied back, for example:\n  \
+         scratch/debug.log\n  cache/result.bin";
+    assert_eq!(
+        render_terminal_report(&report_vector("all")).as_deref(),
+        Some(all)
+    );
+    // Reported and unchanged: a reporting runner sent every field, all
+    // empty, so there is nothing to say.
+    let unchanged = report_vector("unchanged");
+    assert!(unchanged.git_state_changed.is_some());
+    assert_eq!(render_terminal_report(&unchanged), None);
+    // Absent (an older runner): each missing report is named on its own line.
+    assert_eq!(
+        render_terminal_report(&report_vector("older-runner")).as_deref(),
+        Some(
+            "These files changed on the server and were NOT copied back:\n  result.txt\n\
+             git state: not reported by the runner\n\
+             untracked files: not reported by the runner\n\
+             ignored writes: not reported by the runner"
+        )
+    );
+    // A detached HEAD has no ref on either side, so no ref line; an index
+    // tree that became available counts as changed.
+    let detached = render_terminal_report(&report_vector("detached-head")).unwrap();
+    assert!(!detached.contains("ref:"), "{detached}");
+    assert!(detached.contains("HEAD: 111111111111 -> 222222222222\n  index tree changed"));
+    // A capped untracked list says the runner listed only some of them.
+    let truncated = render_terminal_report(&report_vector("truncated-untracked")).unwrap();
+    assert!(
+        truncated
+            .contains("  notes.txt\n  (the runner listed only some of them; more were created)\n"),
+        "{truncated}"
+    );
+}
+
+#[tokio::test]
+async fn a_reporting_runner_report_is_printed_after_the_output() {
+    let daemon = daemon(Script::Reported, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": "bash build.sh", "runon": "linux", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
+    assert_eq!(
+        rendered.lines().next(),
+        Some("ran remotely on ck-motor"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.ends_with(
+            &render_terminal_report(&crate::exec_remote::wire_tests::report_vector("all")).unwrap()
+        ),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("not reported by the runner"),
+        "{rendered}"
+    );
 }

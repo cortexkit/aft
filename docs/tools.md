@@ -313,10 +313,14 @@ The first line of the reply says where the command ran: `ran remotely on ck-moto
 runner refused the job before starting it, `ran locally on macOS: remote refused: <reason>`
 (the command then runs once on this machine). A job the runner accepted is never run again: if
 AFT loses track of it, the reply says the outcome is unknown instead of re-running it. After the
-output, the reply lists the files the run changed on the server under `These files changed on
-the server and were NOT copied back:`; whatever the runner's report does not cover (today git
-state, untracked files and ignored writes, and the changed-file list when it is absent) is named
-as `not reported by the runner`, never shown as "nothing changed".
+output, the reply prints what the runner reported about the server's workspace, none of which
+is copied back: the files the run changed (`These files changed on the server and were NOT
+copied back:`), a changed Git state (HEAD before -> after, the symbolic ref or `detached`,
+whether the index tree changed, and the stash count change), new untracked files (marked when
+the runner listed only some of them), and the number of writes under ignored paths with sample
+paths. A kind of change the runner reported as empty is not mentioned. A kind it did not report
+(an older runner) gets one line, such as `git state: not reported by the runner`, and is never
+shown as "nothing changed".
 
 **Rewriter** — when `experimental.bash.rewrite: true`, common shell command shapes route to AFT
 tools instead of spawning bash:

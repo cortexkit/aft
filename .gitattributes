@@ -29,3 +29,6 @@ benchmarks/aft-search/*.json text eol=lf
 # The real-query vector pack is float16 data read byte-for-byte by its digest.
 benchmarks/aft-search/*.bin binary
 benchmarks/aft-search/manifest.sha256 text eol=lf
+# Published exec-remote run-report vectors are pinned by SHA-256 of their
+# exact bytes; line endings must never be converted.
+crates/aft/src/exec_remote/fixtures/reports/** -text

@@ -11,6 +11,47 @@ pub(crate) fn id() -> Uuid {
     "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
 }
 
+/// The terminal record of a published `crate-local-server-reports-*` vector
+/// (see `fixtures/SOURCE.md`), after checking its bytes against the published
+/// SHA-256. Its job ID is [`id`].
+pub(crate) fn report_vector(name: &str) -> TerminalRecord {
+    use sha2::{Digest, Sha256};
+    let (jcs, sha): (&[u8], &str) = match name {
+        "all" => (
+            include_bytes!("fixtures/reports/crate-local-server-reports-all.jcs"),
+            include_str!("fixtures/reports/crate-local-server-reports-all.sha256"),
+        ),
+        "unchanged" => (
+            include_bytes!("fixtures/reports/crate-local-server-reports-unchanged.jcs"),
+            include_str!("fixtures/reports/crate-local-server-reports-unchanged.sha256"),
+        ),
+        "older-runner" => (
+            include_bytes!("fixtures/reports/crate-local-server-reports-older-runner.jcs"),
+            include_str!("fixtures/reports/crate-local-server-reports-older-runner.sha256"),
+        ),
+        "detached-head" => (
+            include_bytes!("fixtures/reports/crate-local-server-reports-detached-head.jcs"),
+            include_str!("fixtures/reports/crate-local-server-reports-detached-head.sha256"),
+        ),
+        "truncated-untracked" => (
+            include_bytes!("fixtures/reports/crate-local-server-reports-truncated-untracked.jcs"),
+            include_str!("fixtures/reports/crate-local-server-reports-truncated-untracked.sha256"),
+        ),
+        other => panic!("no report vector {other:?}"),
+    };
+    assert_eq!(format!("{:x}", Sha256::digest(jcs)), sha.trim(), "{name}");
+    let vector: Value = serde_json::from_slice(jcs).unwrap();
+    let stream = vector["stream"].as_array().unwrap();
+    assert_eq!(stream.len(), 1, "{name}");
+    match serde_json::from_value(stream[0].clone()).unwrap() {
+        StreamRecord::Terminal(terminal) => {
+            assert_eq!(terminal.job_id, id());
+            terminal
+        }
+        other => panic!("{name}: expected a terminal record, got {other:?}"),
+    }
+}
+
 // Most scripts drive the Unix-only remote bash tests.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy)]
@@ -31,6 +72,9 @@ pub(crate) enum Script {
     GappedAttach(Duration),
     GappedCancel(Duration),
     AttachDisconnected,
+    /// Accepted, then exited 0 with the published `all` report: changed files,
+    /// changed Git state, untracked files and ignored writes.
+    Reported,
     /// Accepted, then exited 0 with a terminal record that reports nothing
     /// about the workspace (no changed-file list).
     Plain,
@@ -146,6 +190,7 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
                                     if cancelled { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
+                                    if matches!(script, Script::Reported) { terminal = report_vector("all"); }
                                     if matches!(script, Script::Utf8) {
                                         terminal.pipestatus=Some(vec![3,0]);
                                         terminal.workspace_changes=Some(vec!["generated.txt".into()]);
