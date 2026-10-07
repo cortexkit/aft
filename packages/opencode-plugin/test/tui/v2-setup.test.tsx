@@ -4,7 +4,7 @@ import { describe, expect, test } from "bun:test";
 import { AftRpc } from "../../src/rpc/contract.js";
 import { setupV2Tui, subscribeV2StatusRefresh } from "../../src/tui/v2.js";
 
-type EventName = "statusInvalidated" | "showStatusDialog" | "indexProgress";
+type EventName = "statusInvalidated" | "showStatusDialog" | "indexProgress" | "hostToolOverlap";
 type EventHandler = (event: { data: { sessionID?: string } }) => void | Promise<void>;
 
 function statusResponse() {
@@ -158,7 +158,8 @@ describe("OpenCode V2 TUI setup", () => {
 
     cleanup();
     expect(h.slotCleanups()).toBe(3);
-    expect(h.eventCleanups()).toBe(1);
+    // The status dialog and the host tool overlap toast subscriptions.
+    expect(h.eventCleanups()).toBe(2);
   });
 
   test("opens the status dialog from the typed showStatusDialog event", async () => {

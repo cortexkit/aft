@@ -11,7 +11,14 @@ describe("AFT V2 RPC contract", () => {
       "statusInvalidated",
       "showStatusDialog",
       "indexProgress",
+      "hostToolOverlap",
     ]);
+  });
+
+  test("validates the one-off host tool overlap notice", () => {
+    const decode = Schema.decodeUnknownSync(AftRpc.events.hostToolOverlap.schema);
+    expect(decode({ message: "two editing tools" })).toEqual({ message: "two editing tools" });
+    expect(() => decode({})).toThrow();
   });
 
   test("validates session-scoped notifications and index progress", () => {

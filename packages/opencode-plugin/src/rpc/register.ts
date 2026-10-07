@@ -11,7 +11,12 @@ import {
   registerStatusChangeSink,
 } from "../shared/rpc-notifications";
 import { NOT_STARTED_STATUS_TEXT } from "../shared/status";
-import { type AftIndexProgress, AftRpc, type AftRpcSession } from "./contract";
+import {
+  type AftHostToolOverlapNotice,
+  type AftIndexProgress,
+  AftRpc,
+  type AftRpcSession,
+} from "./contract";
 
 type RpcRegistration = {
   dispose: Effect.Effect<void>;
@@ -42,6 +47,8 @@ export type RegisteredAftRpc = {
   emitStatusInvalidated(payload?: AftRpcSession): Promise<void>;
   emitShowStatusDialog(payload?: AftRpcSession): Promise<void>;
   emitIndexProgress(payload: AftIndexProgress): Promise<void>;
+  /** A one-off user notice the OpenCode 2 TUI shows as a toast. */
+  emitHostToolOverlap(payload: AftHostToolOverlapNotice): Promise<void>;
   dispose(): Promise<void>;
 };
 
@@ -239,6 +246,7 @@ export function registerAftRpc(
       emitStatusInvalidated: (payload = {}) => emit("statusInvalidated", payload),
       emitShowStatusDialog: (payload = {}) => emit("showStatusDialog", payload),
       emitIndexProgress: (payload) => emit("indexProgress", payload),
+      emitHostToolOverlap: (payload) => emit("hostToolOverlap", payload),
       async dispose() {
         if (disposed) return;
         disposed = true;
@@ -279,6 +287,7 @@ export function registerAftConfigErrorRpc(
       emitStatusInvalidated: (payload = {}) => emit("statusInvalidated", payload),
       emitShowStatusDialog: (payload = {}) => emit("showStatusDialog", payload),
       emitIndexProgress: (payload) => emit("indexProgress", payload),
+      emitHostToolOverlap: (payload) => emit("hostToolOverlap", payload),
       async dispose() {
         if (disposed) return;
         disposed = true;

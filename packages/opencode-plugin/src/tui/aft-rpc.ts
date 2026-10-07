@@ -24,8 +24,18 @@ export const IndexProgress = Schema.Struct({
   total: Schema.optional(Schema.Number),
 });
 
+/**
+ * A one-off notice for the user, shown by the OpenCode 2 TUI as a toast. It
+ * travels over RPC rather than into the session because anything written into
+ * a session (a synthetic record included) is sent to the model on later turns.
+ */
+export const HostToolOverlapNotice = Schema.Struct({
+  message: Schema.String,
+});
+
 export type AftRpcSession = typeof RpcSession.Type;
 export type AftIndexProgress = typeof IndexProgress.Type;
+export type AftHostToolOverlapNotice = typeof HostToolOverlapNotice.Type;
 
 export const AftRpc = Rpc.define({
   id: "aft",
@@ -39,5 +49,6 @@ export const AftRpc = Rpc.define({
     statusInvalidated: { schema: RpcSession },
     showStatusDialog: { schema: RpcSession },
     indexProgress: { schema: IndexProgress },
+    hostToolOverlap: { schema: HostToolOverlapNotice },
   },
 });

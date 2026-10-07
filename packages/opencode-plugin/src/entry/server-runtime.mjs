@@ -239,12 +239,14 @@ export function makeServerEffect(overrides = {}) {
       );
       yield* dependencies.registerToolHooks(context, runtime.toolContext, new Set(Object.keys(runtime.tools)));
       yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
-      // Tell the user once, in the chat, when the host's own patch or shell
-      // tool still runs beside AFT's apply_patch or bash. Checked on the first
-      // prompt, once every plugin has registered its tools.
+      // Tell the user once when the host's own patch or shell tool still runs
+      // beside AFT's apply_patch or bash. Checked on the first prompt, once
+      // every plugin has registered its tools, and shown by AFT's TUI plugin
+      // as a toast; nothing is written into the session, which the model reads.
       yield* dependencies.registerHostToolOverlapNotice(
         context,
         new Set(Object.keys(runtime.tools)),
+        (message) => rpc.emitHostToolOverlap({ message }),
       );
     });
   };

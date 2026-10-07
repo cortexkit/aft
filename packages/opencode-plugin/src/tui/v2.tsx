@@ -28,6 +28,11 @@ type AftRpcClient = {
       handler: (event: { data: { sessionID?: string } }) => void | Promise<void>,
       options?: { signal?: AbortSignal },
     ): () => void;
+    on(
+      name: "hostToolOverlap",
+      handler: (event: { data: { message: string } }) => void | Promise<void>,
+      options?: { signal?: AbortSignal },
+    ): () => void;
   };
 };
 
@@ -87,6 +92,14 @@ type V2TuiContext = {
   };
   ui: {
     dialog: { alert(input: { title: string; message: string }): Promise<void> };
+    toast?: {
+      show(input: {
+        title?: string;
+        message: string;
+        variant?: "info" | "success" | "warning" | "error";
+        duration?: number;
+      }): void;
+    };
     router: { current(): { type: string; sessionID?: string } };
     slot(claim: {
       append: "app" | "prompt.footer.status" | "sidebar.content";
@@ -316,6 +329,36 @@ function AftStatusCommands(props: { context: V2TuiContext; rpc: AftRpcClient }) 
   return null;
 }
 
+/** How long the built-in tool overlap toast stays up: long enough to read the command. */
+const HOST_TOOL_OVERLAP_TOAST_MS = 15_000;
+
+/**
+ * Show the server's one-off built-in tool overlap notice as a toast. A toast
+ * reaches the person at the terminal and nothing else; the server sends this
+ * at most once per host process, so every TUI subscribed at that moment shows
+ * it once. A host without a toast surface shows nothing.
+ */
+export function subscribeV2HostToolOverlapToast(
+  context: Pick<V2TuiContext, "ui">,
+  rpc: AftRpcClient,
+  options?: { signal?: AbortSignal },
+): () => void {
+  return rpc.events.on(
+    "hostToolOverlap",
+    (event) => {
+      const toast = context.ui.toast;
+      if (typeof toast?.show !== "function") return;
+      toast.show({
+        title: "AFT",
+        message: event.data.message,
+        variant: "warning",
+        duration: HOST_TOOL_OVERLAP_TOAST_MS,
+      });
+    },
+    options,
+  );
+}
+
 export async function setupV2Tui(context: V2TuiContext): Promise<() => void> {
   const rpc = context.client.rpc(AftRpc);
   const controller = new AbortController();
@@ -343,10 +386,14 @@ export async function setupV2Tui(context: V2TuiContext): Promise<() => void> {
     (event) => showStatusDialog(context, rpc, event.data.sessionID ?? activeSessionID(context)),
     { signal: controller.signal },
   );
+  const stopOverlapToasts = subscribeV2HostToolOverlapToast(context, rpc, {
+    signal: controller.signal,
+  });
 
   return () => {
     controller.abort();
     stopDialogEvents();
+    stopOverlapToasts();
     for (const cleanup of slotCleanups) cleanup();
   };
 }
