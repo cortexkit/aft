@@ -39,6 +39,7 @@ export interface LiveConfigKey<C> {
 export interface ResolvedBashForLiveReload {
   foreground_wait_window_ms: number;
   host_fallback: boolean;
+  runon_enabled?: boolean;
   subagent_background: boolean;
   watch_sync_max_ms: number;
   worker_wait_max_ms: number;
@@ -116,6 +117,7 @@ export function aftLiveConfigKeys<C>(
     pathKey<C>("inspect.tier2_idle_minutes"),
     bashKey<C>("foreground_wait_window_ms", resolveBash),
     bashKey<C>("host_fallback", resolveBash),
+    bashKey<C>("runon_enabled", resolveBash),
     bashKey<C>("subagent_background", resolveBash),
     bashKey<C>("watch_sync_max_ms", resolveBash),
     bashKey<C>("worker_wait_max_ms", resolveBash),
@@ -451,6 +453,10 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
     {
       key: pick("restrict_to_project_root"),
       loosens: (current, next) => current === true && next !== true,
+    },
+    {
+      key: pick("bash.runon_enabled"),
+      loosens: (current, next) => current !== true && next === true,
     },
     {
       key: pick("bash.host_fallback"),

@@ -400,6 +400,12 @@ function buildSchema(): Record<string, unknown> {
                 description:
                   "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after the foreground wait window (default 8s) regardless of this flag.",
               },
+              runon_enabled: {
+                type: "boolean",
+                description:
+                  "User-only live safety gate for whole-line runon. Default false; legacy prefix routing is unaffected.",
+                default: false,
+              },
               host_fallback: {
                 type: "boolean",
                 default: false,

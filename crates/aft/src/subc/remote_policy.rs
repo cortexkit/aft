@@ -112,29 +112,27 @@ pub(super) fn catalog(
                 )
             })?;
             drop(conn);
-            // `runon` is offered once per fetch, from the policy actually
-            // frozen for this session (a freeze never changes once made), and
-            // only where the project has not turned remote runs off. Runner
-            // health never changes the answer.
-            let offered = !ctx.config().remote_exec.project_off
-                && lookup(ctx, &RemoteSource::Worker(Some(key))).is_some_and(|launch| {
-                    launch
-                        .params
-                        .remote_exec
-                        .as_ref()
-                        .is_some_and(|policy| policy.enabled)
-                });
-            if offered {
-                return tool_provider::catalog_for_session(
-                    body,
-                    &identity.disabled_tools,
-                    powershell,
-                    true,
-                );
-            }
         }
     }
-    Ok(answer)
+    // Render from the policy available to this session, including on a
+    // paramless refetch after its worker plan has already been persisted.
+    // Head sessions use the user setting; worker sessions cannot borrow it.
+    let offered = cfg!(unix)
+        && ctx.config().bash.runon_enabled
+        && !ctx.config().remote_exec.project_off
+        && matches!(identity.trust, BindTrust::FirstParty)
+        && lookup(ctx, &source(identity, Some(&preset))).is_some_and(|launch| {
+            launch
+                .params
+                .remote_exec
+                .as_ref()
+                .is_some_and(|policy| policy.enabled)
+        });
+    if offered {
+        tool_provider::catalog_for_session(body, &identity.disabled_tools, powershell, true)
+    } else {
+        Ok(answer)
+    }
 }
 
 /// Where a bash call's remote-run policy comes from.
@@ -182,6 +180,7 @@ pub(super) fn lookup(
                 .remote_exec
                 .enabled
                 .then(|| crate::bash_background::RemoteLaunch {
+                    explicit_runon: false,
                     params: crate::exec_remote::FrozenParams {
                         remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
                             enabled: true,
@@ -206,6 +205,7 @@ pub(super) fn lookup(
             )
             .ok()??;
             Some(crate::bash_background::RemoteLaunch {
+                explicit_runon: false,
                 params: policy,
                 connection_file: connection_file(ctx),
                 harness: key.harness.clone(),

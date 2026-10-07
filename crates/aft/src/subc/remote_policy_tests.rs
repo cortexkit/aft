@@ -27,11 +27,22 @@ fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdenti
 }
 
 fn context(root: &Path, storage: &Path, connection: Option<PathBuf>) -> AppContext {
+    context_with_user_remote(root, storage, connection, false)
+}
+
+fn context_with_user_remote(
+    root: &Path,
+    storage: &Path,
+    connection: Option<PathBuf>,
+    enabled: bool,
+) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
     config.experimental_bash_background = true;
     config.sandbox.enabled = false;
+    config.remote_exec.enabled = enabled;
+    config.bash.runon_enabled = true;
     config.semantic.subc_connection_file = connection;
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
@@ -58,6 +69,110 @@ fn plan(name: &str) -> Value {
 
 fn fetch(plan: &Value) -> Value {
     json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
+}
+
+#[cfg(unix)]
+fn bash_catalog_entry(reply: &Value) -> &Value {
+    reply["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "bash")
+        .unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_without_remote_execution_omit_runon_and_guidance() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let worker = identity(root.path(), "disabled-worker", 7, true);
+    for reply in [
+        catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap(),
+        catalog(fetch(&plan("broca-worker-policy-disabled")), &worker, &ctx).unwrap(),
+        catalog(
+            json!({"preset":"head"}),
+            &identity(root.path(), "head", 7, false),
+            &ctx,
+        )
+        .unwrap(),
+    ] {
+        let bash = bash_catalog_entry(&reply);
+        assert!(
+            bash["input_schema"]["properties"].get("runon").is_none(),
+            "{bash}"
+        );
+        assert!(
+            !bash["description"].as_str().unwrap().contains("runon"),
+            "{bash}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn enabled_worker_sessions_offer_runon_and_guidance_from_the_persisted_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let worker = identity(root.path(), "enabled-worker", 7, true);
+    let ctx = context(root.path(), storage.path(), None);
+    let first = catalog(fetch(&plan("broca-worker")), &worker, &ctx).unwrap();
+    drop(ctx);
+    let restarted = context(root.path(), storage.path(), None);
+    let refetch = catalog(json!({"preset":"worker"}), &worker, &restarted).unwrap();
+    for reply in [first, refetch] {
+        let bash = bash_catalog_entry(&reply);
+        assert_eq!(
+            bash["input_schema"]["properties"]["runon"]["type"],
+            "string"
+        );
+        assert!(
+            bash["description"]
+                .as_str()
+                .unwrap()
+                .contains("When remote runs are available"),
+            "{bash}"
+        );
+        assert!(bash["description"]
+            .as_str()
+            .unwrap()
+            .contains("including chains and pipes"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn enabled_head_sessions_offer_runon_and_guidance_from_user_config() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_with_user_remote(
+        root.path(),
+        storage.path(),
+        Some(root.path().join("connection.json")),
+        true,
+    );
+    let head = identity(root.path(), "configured-head", 7, false);
+    let reply = catalog(json!({"preset":"head"}), &head, &ctx).unwrap();
+    let bash = bash_catalog_entry(&reply);
+    assert_eq!(
+        bash["input_schema"]["properties"]["runon"]["type"],
+        "string"
+    );
+    assert!(bash["description"]
+        .as_str()
+        .unwrap()
+        .contains("When remote runs are available"));
+    // The user setting does not grant a worker a remote runner without its own plan.
+    let worker = catalog(
+        json!({"preset":"worker"}),
+        &identity(root.path(), "unplanned-worker", 7, true),
+        &ctx,
+    )
+    .unwrap();
+    assert!(bash_catalog_entry(&worker)["input_schema"]["properties"]
+        .get("runon")
+        .is_none());
 }
 
 // Remote routing runs only on Unix; the plan fixtures carry Unix sibling paths,
@@ -443,6 +558,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         let task = registry
             .spawn_remote(
                 crate::bash_background::RemoteLaunch {
+                    explicit_runon: false,
                     params: Default::default(),
                     connection_file: Some(daemon.connection.clone()),
                     harness: "runner".into(),

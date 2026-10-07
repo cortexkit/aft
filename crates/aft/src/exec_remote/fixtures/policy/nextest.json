@@ -1,0 +1,18 @@
+{
+  "command": "cargo nextest run -p x",
+  "matches": true,
+  "policy": {
+    "commands": [
+      "cd",
+      "cargo build",
+      "cargo check",
+      "cargo test",
+      "cargo nextest",
+      "cargo clippy",
+      "bun test"
+    ],
+    "enabled": true
+  },
+  "pty": false,
+  "stdin": false
+}

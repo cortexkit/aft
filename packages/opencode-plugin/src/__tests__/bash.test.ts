@@ -226,31 +226,93 @@ describe("OpenCode bash adapter", () => {
     }
   });
 
-  test("runon is offered only in subc mode with remote runs enabled in the user config", () => {
-    const offered = (config: Record<string, unknown>) =>
-      "runon" in
-      createHarness(() => ({ success: true, output: "" }), undefined, false, {
+  test("bash runon schema and guidance are absent without available remote execution", () => {
+    for (const config of [
+      {},
+      { subc: { connection_file: "/run/subc-connection.json" } },
+      { remote_exec: { enabled: true } },
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true, project_off: true },
+      },
+    ]) {
+      const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
         disabled_tools: [],
         ...config,
-      } as PluginContext["config"]).tool.args;
-    const subc = { subc: { connection_file: "/run/subc-connection.json" } };
-    expect(offered({ ...subc, remote_exec: { enabled: true } })).toBe(true);
-    // No user-tier switch, or standalone transport: never offered.
-    expect(offered({ ...subc })).toBe(false);
-    expect(offered({ ...subc, remote_exec: { enabled: false } })).toBe(false);
-    expect(offered({ remote_exec: { enabled: true } })).toBe(false);
-    // The project turned remote runs off.
-    expect(offered({ ...subc, remote_exec: { enabled: false, project_off: true } })).toBe(false);
-    const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
-      ...subc,
-      remote_exec: { enabled: true },
-    } as PluginContext["config"]);
-    expect(safeParse(bash.args.runon, "linux").success).toBe(true);
-    const jsonSchema = tool.schema.toJSONSchema(bash.args.runon as never, { io: "input" }) as {
-      description?: string;
-    };
-    expect(jsonSchema.description).toBe(BASH_RUNON_DESCRIPTION);
+      } as PluginContext["config"]).tool;
+      expect(bash.args.runon).toBeUndefined();
+      expect(bash.description).not.toContain("runon");
+    }
   });
+
+  test.skipIf(process.platform === "win32")(
+    "bash runon schema and guidance are present with available remote execution",
+    () => {
+      const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]).tool;
+      expect(bash.args.runon).toBeDefined();
+      expect(bash.description).toContain('When remote runs are available, put `runon: "linux"`');
+      expect(bash.description).toContain("including chains and pipes");
+      expect(bash.description).toContain(
+        "keep git, gh, interactive and file-editing commands local",
+      );
+    },
+  );
+
+  // Remote task dispatch is Unix-only; a user switch cannot make it usable on Windows.
+  test.skipIf(process.platform !== "win32")(
+    "Windows bash omits runon even with daemon mode and enabled user config",
+    () => {
+      const bash = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"]).tool;
+      expect(bash.args.runon).toBeUndefined();
+      expect(bash.description).not.toContain("runon");
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "runon is offered only in subc mode with remote runs enabled in the user config",
+    () => {
+      const offered = (config: Record<string, unknown>) =>
+        "runon" in
+        createHarness(() => ({ success: true, output: "" }), undefined, false, {
+          disabled_tools: [],
+          ...config,
+        } as PluginContext["config"]).tool.args;
+      const subc = {
+        subc: { connection_file: "/run/subc-connection.json" },
+        bash: { runon_enabled: true },
+      };
+      expect(offered({ ...subc, remote_exec: { enabled: true } })).toBe(true);
+      // No user-tier switch, or standalone transport: never offered.
+      expect(offered({ ...subc })).toBe(false);
+      expect(offered({ ...subc, remote_exec: { enabled: false } })).toBe(false);
+      expect(offered({ remote_exec: { enabled: true } })).toBe(false);
+      // The project turned remote runs off.
+      expect(offered({ ...subc, remote_exec: { enabled: false, project_off: true } })).toBe(false);
+      const { tool: bash } = createHarness(
+        () => ({ success: true, output: "" }),
+        undefined,
+        false,
+        {
+          ...subc,
+          remote_exec: { enabled: true },
+          bash: { runon_enabled: true },
+        } as PluginContext["config"],
+      );
+      expect(safeParse(bash.args.runon, "linux").success).toBe(true);
+      const jsonSchema = tool.schema.toJSONSchema(bash.args.runon as never, { io: "input" }) as {
+        description?: string;
+      };
+      expect(jsonSchema.description).toBe(BASH_RUNON_DESCRIPTION);
+    },
+  );
 
   test("runon is forwarded to the engine and never becomes a host-fallback run", async () => {
     const { calls, tool: bash } = createHarness(
@@ -260,6 +322,7 @@ describe("OpenCode bash adapter", () => {
       {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
       } as PluginContext["config"],
     );
     await bash.execute(
@@ -278,7 +341,7 @@ describe("OpenCode bash adapter", () => {
       undefined,
       false,
       {
-        bash: { host_fallback: true },
+        bash: { host_fallback: true, runon_enabled: true },
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
       } as PluginContext["config"],

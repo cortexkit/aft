@@ -280,40 +280,33 @@ fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)>
     }
     served
         .into_iter()
-        .map(|(name, mut schema, description)| {
+        .map(|(name, schema, description)| {
             let (_, tag, restrict_replace) = METADATA
                 .iter()
                 .chain(PRESET_ONLY_METADATA)
                 .find(|(known, _, _)| *known == name)
                 .expect("every served tool has v1 metadata");
-            schema
-                .as_object_mut()
-                .expect("tool schemas are objects")
-                .remove("description");
-            let entry = |schema: Value| {
+            let entry = |mut schema: Value, description: Option<String>| {
+                schema
+                    .as_object_mut()
+                    .expect("tool schemas are objects")
+                    .remove("description");
                 let digest =
                     schema_digest(&schema).expect("embedded schema has a structural digest");
                 let mut entry = CatalogTool::new(name.clone(), digest, 1, schema);
                 if !tag.is_empty() {
                     entry.capabilities.push((*tag).into());
                 }
-                entry.description = description.clone();
+                entry.description = description;
                 if *restrict_replace {
                     entry.result_ops = Some(vec!["prepend".into(), "append".into()]);
                 }
                 entry
             };
             let preset_name = (preset != CatalogPreset::Head).then(|| preset.name());
-            let with_runon = manifest::runon_property(preset_name, &name).map(|(key, property)| {
-                let mut schema = schema.clone();
-                schema
-                    .get_mut("properties")
-                    .and_then(Value::as_object_mut)
-                    .expect("embedded schemas have properties")
-                    .insert(key, property);
-                entry(schema)
-            });
-            (entry(schema), with_runon)
+            let with_runon = manifest::remote_tool(preset_name, &name)
+                .map(|(schema, description)| entry(schema, description));
+            (entry(schema, description), with_runon)
         })
         .collect()
 }

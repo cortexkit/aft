@@ -804,6 +804,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("bash.disclaim_privacy", bash.disclaim_privacy);
     live!("bash.foreground_wait_window_ms", foreground_wait_window_ms);
     live!("bash.host_fallback", bash.host_fallback);
+    live!("bash.runon_enabled", bash.runon_enabled);
     live!("bash.watch_sync_max_ms", bash.watch_sync_max_ms);
     live!("bash.worker_wait_max_ms", bash.worker_wait_max_ms);
     later!("bash.detach_on_user_message", bash.detach_on_user_message);
@@ -930,6 +931,7 @@ fn classification_is_exhaustive(config: &Config) {
     let crate::config::BashConfig {
         enabled: _,
         host_fallback: _,
+        runon_enabled: _,
         detach_on_user_message: _,
         db_schema_hints: _,
         watch_sync_max_ms: _,

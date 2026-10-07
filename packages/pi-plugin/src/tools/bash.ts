@@ -2,6 +2,7 @@ import {
   type AftProjectTransport,
   BASH_HOST_FALLBACK_REFUSAL,
   BASH_RUNON_DESCRIPTION,
+  BASH_RUNON_GUIDANCE,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
@@ -720,12 +721,15 @@ export function registerBashTool(
   const tasksSentence = bashCfg.background
     ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, \`bash.worker_wait_max_ms\`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
+  const remoteRuns = () => !isPowerShell && remoteRunsOffered(ctx.config);
   pi.registerTool<typeof BashParams, BashDetails>({
     name: registeredName,
     label: registeredName,
-    description: isPowerShell
-      ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
-      : `Execute shell commands.${compressionSentence}${tasksSentence} \`timeout\` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.${bashCfg.background ? " Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report." : ""}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
+    get description() {
+      return isPowerShell
+        ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
+        : `Execute shell commands.${compressionSentence}${tasksSentence} \`timeout\` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.${bashCfg.background ? " Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report." : ""}${remoteRuns() ? ` ${BASH_RUNON_GUIDANCE}` : ""}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`;
+    },
     promptSnippet: isPowerShell
       ? `Run PowerShell commands (timeout in milliseconds; supports ${supported})`
       : `Run shell commands (timeout in milliseconds; supports ${supported})`,
@@ -738,17 +742,24 @@ export function registerBashTool(
             : []),
           "Piped commands run verbatim and show the pipeline's output; run test/build tools without pipes when you need AFT's summary.",
         ],
-    parameters: bashParamsForConfig(
-      {
-        background: bashCfg.background,
-        compress: bashCfg.compress,
-        sandbox: nativeSandboxEnabled(ctx.config),
-        subagentBackground: bashCfg.subagent_background,
-        runon: !isPowerShell && remoteRunsOffered(ctx.config),
-      },
-      companions,
-    ),
+    get parameters() {
+      return bashParamsForConfig(
+        {
+          background: bashCfg.background,
+          compress: bashCfg.compress,
+          sandbox: nativeSandboxEnabled(ctx.config),
+          subagentBackground: bashCfg.subagent_background,
+          runon: remoteRuns(),
+        },
+        companions,
+      );
+    },
     async execute(_toolCallId, params: Static<typeof BashParams>, signal, onUpdate, extCtx) {
+      if (params.runon !== undefined && !remoteRuns()) {
+        throw new Error(
+          "runon refused: remote execution or bash.runon_enabled is unavailable in this session",
+        );
+      }
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const bashCfg = resolveBashConfig(ctx.config);
       const foregroundWaitMs = resolveForegroundWaitMs(bashCfg.foreground_wait_window_ms);

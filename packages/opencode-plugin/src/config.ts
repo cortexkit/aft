@@ -305,6 +305,7 @@ const BashFeaturesSchema = z.object({
    * prompt. Default: false.
    */
   host_fallback: z.boolean().optional(),
+  runon_enabled: z.boolean().optional(),
   /**
    * Allow OpenCode subagents to use real background bash (`background: true`
    * and auto-promotion). Default: true. When false, subagent background
@@ -921,6 +922,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (
     typeof config.bash === "object" &&
     (config.bash.enabled !== undefined ||
+      config.bash.runon_enabled !== undefined ||
       config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
       config.bash.db_schema_hints !== undefined ||
@@ -934,6 +936,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         ? { disclaim_privacy: config.bash.disclaim_privacy }
         : {}),
       ...(config.bash.enabled !== undefined ? { enabled: config.bash.enabled } : {}),
+      ...(config.bash.runon_enabled !== undefined
+        ? { runon_enabled: config.bash.runon_enabled }
+        : {}),
       ...(config.bash.host_fallback !== undefined
         ? { host_fallback: config.bash.host_fallback }
         : {}),
@@ -997,6 +1002,7 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** Emergency local execution gate. Default false, including for `bash: true`. */
   host_fallback: boolean;
+  runon_enabled: boolean;
   /** See BashFeaturesSchema.subagent_background. Default true. */
   subagent_background: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides and is stripped before delivery. */
@@ -1097,6 +1103,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     compress: false,
     background: false,
     host_fallback: false,
+    runon_enabled: false,
     subagent_background: true,
     detach_on_user_message: true,
     db_schema_hints: typeof top === "object" && top !== null ? (top.db_schema_hints ?? true) : true,
@@ -1126,6 +1133,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       compress: top.compress ?? true,
       background: top.background ?? true,
       host_fallback: top.host_fallback ?? false,
+      runon_enabled: top.runon_enabled ?? false,
       subagent_background: topSubagentBg,
       detach_on_user_message: topDetachOnUserMessage,
       powershell_tool: top.powershell_tool ?? false,
@@ -1809,6 +1817,8 @@ function mergeInspectConfig(
 export function remoteRunsOffered(config: AftConfig): boolean {
   const remoteExec = config.remote_exec as MergedRemoteExecConfig | undefined;
   return (
+    process.platform !== "win32" &&
+    resolveBashConfig(config).runon_enabled &&
     Boolean(config.subc?.connection_file?.trim()) &&
     remoteExec?.enabled === true &&
     remoteExec.project_off !== true
@@ -2062,6 +2072,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   if (typeof projectBash === "object" && projectBash.disclaim_privacy !== true)
     delete projectBash.disclaim_privacy;
   // Strip only the weakening direction before the usual field-wise merge.
+  if (typeof projectBash === "object") delete projectBash.runon_enabled;
   const bash = mergeBashConfig(base.bash, projectBash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);

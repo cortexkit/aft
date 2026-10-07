@@ -1,0 +1,18 @@
+{
+  "command": "cargo nextest run -p prefrontal-core-module --test persona_material_contract --test it -E 'binary(=persona_material_contract) | test(/^role_migration_host_prompts::/)'",
+  "matches": true,
+  "policy": {
+    "commands": [
+      "cd",
+      "cargo build",
+      "cargo check",
+      "cargo test",
+      "cargo nextest",
+      "cargo clippy",
+      "bun test"
+    ],
+    "enabled": true
+  },
+  "pty": false,
+  "stdin": false
+}

@@ -60,6 +60,7 @@ fn registry() -> BgTaskRegistry {
 
 pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunch {
     crate::bash_background::RemoteLaunch {
+        explicit_runon: false,
         connection_file: Some(connection),
         harness: "broca".into(),
         session: "session".into(),
@@ -703,6 +704,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        explicit_runon: false,
         connection_file: Some(daemon.connection.clone()),
         harness: "broca".into(),
         session: "session".into(),
@@ -854,6 +856,7 @@ fn persist_accepted_with_snapshot(
     metadata.status = BgTaskStatus::Running;
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        explicit_runon: false,
         connection_file: Some(connection),
         harness: "runner".into(),
         session: "session".into(),
@@ -880,12 +883,20 @@ fn persist_accepted_with_snapshot(
 }
 
 fn restarted_context(dir: &Path) -> crate::context::AppContext {
+    restarted_context_with_runon(dir, true)
+}
+
+fn restarted_context_with_runon(dir: &Path, enabled: bool) -> crate::context::AppContext {
     // A fresh configuration would choose ordinary unsandboxed inheritance;
     // the saved Host plan must still clear ambient HOME before its command.
     crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(dir.into()),
+            bash: crate::config::BashConfig {
+                runon_enabled: enabled,
+                ..Default::default()
+            },
             sandbox: crate::config::SandboxConfig {
                 enabled: false,
                 ..Default::default()
@@ -1419,6 +1430,86 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
 }
 
 #[tokio::test]
+async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works_when_enabled() {
+    for enabled in [false, true] {
+        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context_with_runon(dir.path(), enabled);
+        let mut old = launch(daemon.connection.clone());
+        old.params.remote_exec.as_mut().unwrap().legacy_commands =
+            Some(serde_json::json!(["cd", "cargo test"]));
+        let plain = handle_with_policy(
+            &ctx,
+            Some(old.clone()),
+            serde_json::json!({"command":"cargo test", "compressed":false}),
+        );
+        assert!(plain.success, "{plain:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            plain.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(done.info.status, BgTaskStatus::Completed);
+        assert_eq!(
+            exec_runs(&daemon).len(),
+            1,
+            "plain cargo must keep using the deployed route"
+        );
+        let whole = handle_with_policy(
+            &ctx,
+            Some(old),
+            serde_json::json!({"command":"FOO=1 cargo test | tail -1", "runon":"linux"}),
+        );
+        if enabled {
+            assert!(whole.success, "{whole:?}");
+            let done = terminal(
+                ctx.bash_background(),
+                whole.data["task_id"].as_str().unwrap(),
+            )
+            .await;
+            assert_eq!(done.info.status, BgTaskStatus::Completed);
+            assert_eq!(exec_runs(&daemon).len(), 2);
+        } else {
+            assert!(!whole.success);
+            assert!(whole.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("bash.runon_enabled"));
+            assert_eq!(exec_runs(&daemon).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn runon_is_refused_when_the_daemon_has_no_exec_remote_provider() {
+    let daemon = daemon(Script::Plain, "exec.remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("must-not-run-locally");
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("echo SHOULD_NOT_RUN > '{}'", marker.display()),
+            "runon": "linux"
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let task = response.data["task_id"].as_str().unwrap();
+    let snapshot = terminal(ctx.bash_background(), task).await;
+    assert_eq!(snapshot.info.status, BgTaskStatus::Failed);
+    let rendered = crate::commands::bash_orchestrate::format_foreground_result(&snapshot);
+    assert!(rendered.contains("runon refused"), "{rendered}");
+    assert!(rendered.contains("exec-remote/v1"), "{rendered}");
+    assert!(!rendered.contains("ran locally"), "{rendered}");
+    assert!(exec_runs(&daemon).is_empty());
+    assert!(
+        !marker.exists(),
+        "missing providers must not cause local execution"
+    );
+}
+
+#[tokio::test]
 async fn without_runon_nothing_goes_remote_even_with_an_enabled_policy() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -1460,6 +1551,7 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
     };
     project_off.sandbox.enabled = false;
     project_off.remote_exec.project_off = true;
+    project_off.bash.runon_enabled = true;
     let project_off_ctx = crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         project_off,

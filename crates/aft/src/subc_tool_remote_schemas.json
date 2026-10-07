@@ -1,0 +1,172 @@
+{
+  "head": {
+    "bash": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "workdir": {
+          "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+          "type": "string"
+        },
+        "wait": {
+          "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+          "type": "boolean"
+        },
+        "sandbox": {
+          "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+          "type": "string",
+          "const": "host"
+        },
+        "background": {
+          "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+          "type": "boolean"
+        },
+        "compressed": {
+          "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+          "type": "boolean"
+        },
+        "pty": {
+          "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+          "type": "boolean"
+        },
+        "ptyRows": {
+          "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "ptyCols": {
+          "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 140
+        },
+        "foreground_orchestrate": {
+          "type": "boolean",
+          "description": "Consumer-set flag enabling server-side foreground orchestration.",
+          "x-aft-consumer-only": true
+        },
+        "block_to_completion": {
+          "type": "boolean",
+          "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
+          "x-aft-consumer-only": true
+        },
+        "shell": {
+          "type": "string",
+          "enum": [
+            "powershell"
+          ],
+          "description": "Consumer-set shell selector for Pi's PowerShell tool.",
+          "x-aft-consumer-only": true
+        },
+        "runon": {
+          "type": "string",
+          "description": "Run this command on the remote Linux build server instead of this machine; the only value is \"linux\"."
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; the task keeps running after the call returns, a completion reminder arrives when it exits, and bash_status reports its state and output. Use bash({wait:true}) instead when the result is needed before anything else. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes; keep git, gh, interactive and file-editing commands local.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete."
+    }
+  },
+  "worker": {
+    "bash": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "command": {
+          "description": "Shell command to execute. Supports pipes, redirection, and normal shell syntax.",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "workdir": {
+          "description": "Working directory for command execution. Relative paths resolve through the bridge; defaults to the current tool context/project root when omitted.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+          "type": "string"
+        },
+        "wait": {
+          "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+          "type": "boolean"
+        },
+        "sandbox": {
+          "description": "Request one-command approval to run unsandboxed on the host; use only when native sandboxing blocks required work, and note that it is a no-op when sandboxing is disabled.",
+          "type": "string",
+          "const": "host"
+        },
+        "background": {
+          "description": "When true, spawn the command in the background and return a taskId for bash_status/bash_kill instead of waiting for completion. Defaults to false. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.",
+          "type": "boolean"
+        },
+        "compressed": {
+          "description": "When true or omitted, return compressed output with noisy terminal control sequences reduced. Set to false for raw output.",
+          "type": "boolean"
+        },
+        "pty": {
+          "description": "When true, spawn the command in a real PTY for interactive programs (python/node/bash REPLs, vim). Implies background: true automatically. Inspect with bash_status({ taskId, outputMode: \"screen\" }) and drive interactively with bash_write — its input accepts either a string OR an array like [ \"iHello\", { key: \"esc\" }, \":wq\", { key: \"enter\" } ] for atomic text+key sequences.",
+          "type": "boolean"
+        },
+        "ptyRows": {
+          "description": "PTY terminal height in rows — ignored when pty is false. Defaults to 24 when pty: true. Minimum 1, maximum 60.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 60
+        },
+        "ptyCols": {
+          "description": "PTY terminal width in columns — ignored when pty is false. Defaults to 80 when pty: true. Minimum 1, maximum 140.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 140
+        },
+        "foreground_orchestrate": {
+          "type": "boolean",
+          "description": "Consumer-set flag enabling server-side foreground orchestration.",
+          "x-aft-consumer-only": true
+        },
+        "block_to_completion": {
+          "type": "boolean",
+          "description": "Consumer-set flag forcing foreground bash to wait until terminal instead of promoting.",
+          "x-aft-consumer-only": true
+        },
+        "shell": {
+          "type": "string",
+          "enum": [
+            "powershell"
+          ],
+          "description": "Consumer-set shell selector for Pi's PowerShell tool.",
+          "x-aft-consumer-only": true
+        },
+        "runon": {
+          "type": "string",
+          "description": "Run this command on the remote Linux build server instead of this machine; the only value is \"linux\"."
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes; keep git, gh, interactive and file-editing commands local.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete."
+    }
+  }
+}

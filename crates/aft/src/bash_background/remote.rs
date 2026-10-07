@@ -89,6 +89,8 @@ impl ReattachBudget {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     pub connection_file: Option<PathBuf>,
+    #[serde(default)]
+    pub explicit_runon: bool,
     pub harness: String,
     pub session: String,
     pub job_id: Option<Uuid>,
@@ -382,6 +384,7 @@ impl BgTaskRegistry {
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
             connection_file: launch.connection_file,
+            explicit_runon: launch.explicit_runon,
             harness: launch.harness,
             session: launch.session,
             job_id: None,
@@ -598,7 +601,11 @@ impl BgTaskRegistry {
                 Ok(c) => break c,
                 Err(error) => {
                     if let Some((_, fallback)) = initial.take() {
-                        return self.remote_fallback(&task, fallback, &error);
+                        return if remote.explicit_runon {
+                            self.refuse_remote_before_dispatch(&task, &error)
+                        } else {
+                            self.remote_fallback(&task, fallback, &error)
+                        };
                     }
                     if let Some(point) = remote.point().filter(|_| remote.connection_file.is_some())
                     {
@@ -615,17 +622,23 @@ impl BgTaskRegistry {
         let mut stream = if let Some((request, local)) = initial.take() {
             let request = match request {
                 Ok(r) => r,
-                Err(error) => return self.remote_fallback(&task, local, &error.to_string()),
+                Err(error) => {
+                    return if remote.explicit_runon {
+                        self.refuse_remote_before_dispatch(&task, &error.to_string())
+                    } else {
+                        self.remote_fallback(&task, local, &error.to_string())
+                    }
+                }
             };
             fallback = Some(local);
             match client.run(&request).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
-                    return self.remote_fallback(
-                        &task,
-                        fallback.take().unwrap(),
-                        &error.to_string(),
-                    )
+                    return if remote.explicit_runon {
+                        self.refuse_remote_before_dispatch(&task, &error.to_string())
+                    } else {
+                        self.remote_fallback(&task, fallback.take().unwrap(), &error.to_string())
+                    }
                 }
                 Err(error) => {
                     return Err(format!("remote outcome unknown; not resubmitted: {error}"))
@@ -908,6 +921,22 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    fn refuse_remote_before_dispatch(&self, task: &Arc<BgTask>, error: &str) -> Result<(), String> {
+        // Missing discovery providers and other proven pre-dispatch failures
+        // cannot satisfy an explicit remote demand. Do not turn them into a
+        // local run; executor-authored refusals still follow their own policy.
+        self.remote_terminal(
+            task,
+            Verdict::RunLocally {
+                reason: RefusalReason::Unreachable,
+            },
+            Some(format!(
+                "runon refused: remote execution is unavailable; command did not run: {error}"
+            )),
+        );
+        Ok(())
+    }
+
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
         // Known terminals keep their real status. Only unknown outcomes lose
         // their fate; no non-refusal terminal permits another execution.
@@ -956,7 +985,19 @@ impl BgTaskRegistry {
                 return;
             }
             if refused {
-                state.metadata.execution_note = Some("remote executor refused before start".into());
+                state.metadata.execution_note = Some(
+                    if state
+                        .metadata
+                        .remote
+                        .as_ref()
+                        .is_some_and(|remote| remote.terminal.is_some())
+                    {
+                        "remote executor refused before start"
+                    } else {
+                        "runon refused before remote dispatch; command did not run"
+                    }
+                    .into(),
+                );
             } else if matches!(
                 status,
                 BgTaskStatus::Completed

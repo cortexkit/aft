@@ -292,24 +292,37 @@ line, exactly as written (pipes, lists, environment prefixes and all), to the re
 build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). It runs
 there under `bash -c` in the same working directory, with the same timeout and the same
 environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
-off-host request (the reply names them). Without `runon` a command always runs on this machine;
-AFT never decides on its own to send a command away.
+off-host request (the reply names them). New plans require `runon` to send a line away. Deployed
+worker plans with an enabled `commands` prefix list retain their existing automatic routing:
+every literal command must match an allowed prefix, and unsupported syntax stays local.
+Explicit whole-line `runon` also requires the user-only live safety switch
+`bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
+hides and refuses `runon` without disabling legacy prefix routing.
 
 Who is offered `runon`:
 
-- OpenCode and Pi sessions in subc mode, when the user config sets `remote_exec.enabled: true`
-  (see [Configuration](config.md#remote-runs)). The decision is made once when the tool is
-  built; runner health never adds or removes the argument.
-- Broca workers, when their plan's `remote_exec` item is enabled. The catalog fetched for that
-  session shows `runon`; other catalogs do not.
+- OpenCode and Pi sessions on macOS or Linux in subc mode, when the user config sets
+  `remote_exec.enabled: true`, the user safety switch `bash.runon_enabled: true`, and the project
+  has not turned remote runs off (see
+  [Configuration](config.md#remote-runs)). The decision is made once when the tool is built;
+  provider discovery happens at call time, without a startup round trip.
+- Head catalogs follow the same user setting. Broca worker catalogs instead use that session's
+  persisted plan, and offer `runon` only when its `remote_exec.enabled` and the user safety switch
+  are true, including after
+  a paramless refetch or restart.
+
+Default schemas and unavailable sessions contain neither the parameter nor remote-build
+instructions. Standalone NDJSON sessions and Windows never advertise it, whatever the user
+setting says.
 
 A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
 the project turned remote runs off (`remote runs are off for this project`), the session has no
 remote runner (`this session has no remote runner`), the demand is not one AFT knows
 (`unknown runner demand`), or the call also sets `pty: true`, a PowerShell shell, or
 `sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch needs AFT on macOS or
-Linux. `background: true` works as for local commands, and a background remote task re-attaches
-after a restart.
+Linux. If no `exec-remote/v1` provider answers, or daemon discovery fails before dispatch,
+the task is refused by name and the command is not run locally. `background: true` works as
+for local commands, and a background remote task re-attaches after a restart.
 
 The first line of the reply says where the command ran: `ran remotely on ck-motor`, or, when the
 runner refused the job before starting it, `ran locally on macOS: remote refused: <reason>`

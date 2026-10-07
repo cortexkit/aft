@@ -430,6 +430,7 @@ pub struct RawBashFeatures {
     pub compress: Option<bool>,
     pub background: Option<bool>,
     pub host_fallback: Option<bool>,
+    pub runon_enabled: Option<bool>,
     pub subagent_background: Option<bool>,
     pub detach_on_user_message: Option<bool>,
     pub db_schema_hints: Option<bool>,
@@ -1516,11 +1517,33 @@ fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
         RawBash::Bool(enabled) => RawBash::Bool(enabled),
         RawBash::Features(mut features) => {
             features.linux_scope = None;
+            features.runon_enabled = None;
             // A repository may tighten privacy, never restore inherited grants.
             features.disclaim_privacy = features.disclaim_privacy.filter(|value| *value);
             RawBash::Features(features)
         }
     })
+}
+
+#[cfg(test)]
+#[test]
+fn runon_safety_switch_is_user_only_and_defaults_off() {
+    assert!(!resolve_config(&[]).config.bash.runon_enabled);
+    for enabled in [false, true] {
+        let result = resolve_config(&[
+            ConfigTier {
+                tier: "user".into(),
+                source: "user.jsonc".into(),
+                doc: format!("{{\"bash\":{{\"runon_enabled\":{enabled}}}}}"),
+            },
+            ConfigTier {
+                tier: "project".into(),
+                source: "project.jsonc".into(),
+                doc: format!("{{\"bash\":{{\"runon_enabled\":{}}}}}", !enabled),
+            },
+        ]);
+        assert_eq!(result.config.bash.runon_enabled, enabled);
+    }
 }
 
 fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
@@ -1537,6 +1560,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 compress: override_features.compress.or(base.compress),
                 background: override_features.background.or(base.background),
                 host_fallback: override_features.host_fallback.or(base.host_fallback),
+                runon_enabled: base.runon_enabled,
                 subagent_background: override_features
                     .subagent_background
                     .or(base.subagent_background),
@@ -1577,6 +1601,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             compress: Some(*enabled),
             background: Some(*enabled),
             host_fallback: None,
+            runon_enabled: None,
             subagent_background: None,
             detach_on_user_message: None,
             db_schema_hints: None,
@@ -1694,6 +1719,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
             tier,
             "projects may only enable privacy disclaiming",
         );
+    }
+    if matches!(&raw.bash, Some(RawBash::Features(features)) if features.runon_enabled.is_some()) {
+        push_drop(dropped, "bash.runon_enabled", tier, USER_ONLY_REASON);
     }
     if raw.restrict_to_project_root.is_some() {
         push_drop(dropped, "restrict_to_project_root", tier, USER_ONLY_REASON);
@@ -2378,6 +2406,7 @@ struct ResolvedBashConfig {
     compress: bool,
     background: bool,
     host_fallback: bool,
+    runon_enabled: bool,
     subagent_background: bool,
     detach_on_user_message: bool,
     db_schema_hints: bool,
@@ -2398,6 +2427,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     let _plugin_only = bash.subagent_background;
     config.bash.enabled = bash.enabled;
     config.bash.host_fallback = bash.host_fallback;
+    config.bash.runon_enabled = bash.runon_enabled;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
     config.bash.db_schema_hints = bash.db_schema_hints;
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
@@ -2470,6 +2500,9 @@ fn resolve_bash_config(
         compress: false,
         background: false,
         host_fallback: false,
+        runon_enabled: top_features
+            .and_then(|features| features.runon_enabled)
+            .unwrap_or(false),
         subagent_background: true,
         detach_on_user_message: true,
         db_schema_hints: top_features

@@ -128,7 +128,12 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     // reason that cannot happen is refused here, before any local work (even
     // resolving a local shell).
     let remote = match params.runon.as_deref() {
-        None => None,
+        None => crate::bash_background::remote_for_legacy_command(
+            &ctx.config(),
+            &params.command,
+            params.pty,
+            params.shell.is_powershell(),
+        ),
         Some(runon) => match crate::bash_background::remote_for_runon(
             &ctx.config(),
             runon,
@@ -137,7 +142,13 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             matches!(params.sandbox, Some(BashSandbox::Host)),
         ) {
             Ok(launch) => Some(launch),
-            Err(message) => return Response::error(&req.id, "remote_run_refused", message),
+            Err(message) => {
+                return Response::error(
+                    &req.id,
+                    "remote_run_refused",
+                    format!("runon refused: {message}"),
+                );
+            }
         },
     };
 
@@ -585,6 +596,40 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     use crate::windows_shell::WindowsShell;
+
+    #[test]
+    fn standalone_runon_is_refused_by_name_even_with_remote_execution_enabled() {
+        for enabled in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            let mut config = crate::config::Config::default();
+            config.project_root = Some(root.path().into());
+            config.storage_dir = Some(storage.path().into());
+            config.remote_exec.enabled = enabled;
+            config.bash.runon_enabled = true;
+            config.sandbox.enabled = false;
+            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+            let marker = root.path().join("must-not-run-locally");
+            let req = RawRequest {
+                id: "standalone-runon".into(),
+                command: "bash".into(),
+                lsp_hints: None,
+                session_id: Some("standalone".into()),
+                params: serde_json::json!({
+                    "command": format!("echo SHOULD_NOT_RUN > \"{}\"", marker.display()),
+                    "runon": "linux"
+                }),
+            };
+            let response = handle(&req, &ctx);
+            assert!(!response.success, "{response:?}");
+            assert_eq!(response.data["code"], "remote_run_refused");
+            assert!(
+                response.data["message"].as_str().unwrap().contains("runon"),
+                "{response:?}"
+            );
+            assert!(!marker.exists(), "unsupported runon must never run locally");
+        }
+    }
 
     fn ctx_with_root(root: &std::path::Path) -> AppContext {
         AppContext::new(

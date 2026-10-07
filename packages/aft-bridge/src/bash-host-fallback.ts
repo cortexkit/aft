@@ -20,6 +20,10 @@ export const BASH_HOST_FALLBACK_REFUSAL =
 export const BASH_RUNON_DESCRIPTION =
   'Run this command on the remote Linux build server instead of this machine; the only value is "linux".';
 
+/** Guidance served only beside an available remote-run parameter. */
+export const BASH_RUNON_GUIDANCE =
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes; keep git, gh, interactive and file-editing commands local.';
+
 export interface BashHostFallbackOptions {
   command: string;
   projectRoot: string;

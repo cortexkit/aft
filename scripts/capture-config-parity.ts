@@ -804,6 +804,20 @@ const CASES: ParityCase[] = [
   },
   { name: "bash_subagent", user: { bash: { subagent_background: true } } },
   {
+    name: "bash_runon_project_cannot_enable",
+    user: { bash: { runon_enabled: false } },
+    project: { bash: { runon_enabled: true } },
+  },
+  {
+    name: "bash_runon_user_enabled",
+    user: { bash: { runon_enabled: true } },
+    project: { bash: { runon_enabled: false } },
+  },
+  {
+    name: "bash_runon_project_only_dropped",
+    project: { bash: { runon_enabled: true } },
+  },
+  {
     name: "bash_host_fallback_project",
     user: { bash: { host_fallback: false } },
     project: { bash: { host_fallback: true } },

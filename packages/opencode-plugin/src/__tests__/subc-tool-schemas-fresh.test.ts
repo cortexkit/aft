@@ -3,7 +3,10 @@ import { describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  buildSubcRemoteToolSchemasJson,
+  buildSubcToolPresets,
   buildSubcToolPresetsJson,
+  buildSubcToolSchemas,
   buildSubcToolSchemasJson,
   CONSUMER_ONLY_MARKER,
   SUBC_BARE_TOOL_NAMES,
@@ -13,9 +16,44 @@ const REPO_ROOT = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const ARTIFACT_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_schemas.json");
 const PRESETS_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_presets.json");
 
+const REMOTE_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_remote_schemas.json");
+const REMOTE_GUIDANCE =
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes; keep git, gh, interactive and file-editing commands local.';
+
 const PLACEHOLDER = JSON.stringify({ type: "object" });
 
 describe("subc tool schemas artifact", () => {
+  test("default schemas omit the remote parameter and guidance", () => {
+    const schemas = [
+      ...Object.values(buildSubcToolSchemas()),
+      ...Object.values(buildSubcToolPresets().worker),
+      ...Object.values(JSON.parse(fs.readFileSync(ARTIFACT_PATH, "utf8"))),
+      ...Object.values(JSON.parse(fs.readFileSync(PRESETS_PATH, "utf8")).worker),
+    ] as Array<{ properties?: Record<string, unknown>; description: string }>;
+    for (const schema of schemas) {
+      expect(schema.properties?.runon).toBeUndefined();
+      expect(schema.description).not.toContain("runon");
+    }
+  });
+
+  test("enabled bash schemas include the remote parameter and guidance", () => {
+    const head = buildSubcToolSchemas(true);
+    const worker = buildSubcToolPresets(true).worker;
+    for (const bash of [head.bash, worker.bash]) {
+      expect((bash.properties as Record<string, unknown>).runon).toMatchObject({ type: "string" });
+      expect((bash.description as string).split(REMOTE_GUIDANCE)).toHaveLength(2);
+    }
+    for (const schemas of [head, worker]) {
+      for (const [name, schema] of Object.entries(schemas)) {
+        if (name !== "bash") expect(schema.description as string).not.toContain("runon");
+      }
+    }
+  });
+
+  test("committed enabled-only artifact matches in-memory generation byte-for-byte", () => {
+    expect(buildSubcRemoteToolSchemasJson()).toBe(fs.readFileSync(REMOTE_PATH, "utf8"));
+  });
+
   test("committed artifact matches in-memory generation byte-for-byte", () => {
     const committed = fs.readFileSync(ARTIFACT_PATH, "utf8");
     const fresh = buildSubcToolSchemasJson();

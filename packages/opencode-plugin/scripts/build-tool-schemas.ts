@@ -7,7 +7,11 @@
  */
 
 import * as path from "node:path";
-import { buildSubcToolPresetsJson, buildSubcToolSchemasJson } from "../src/subc-tool-schemas.js";
+import {
+  buildSubcRemoteToolSchemasJson,
+  buildSubcToolPresetsJson,
+  buildSubcToolSchemasJson,
+} from "../src/subc-tool-schemas.js";
 
 async function main() {
   const pluginRoot = path.resolve(import.meta.dir, "..");
@@ -47,6 +51,16 @@ async function main() {
     await Bun.write(presetsPath, presetsJson);
   }
 
+  const remotePath = path.join(repoRoot, "crates", "aft", "src", "subc_tool_remote_schemas.json");
+  const remoteJson = buildSubcRemoteToolSchemasJson();
+  if (checkOnly) {
+    if ((await Bun.file(remotePath).text()) !== remoteJson) {
+      throw new Error(`subc remote tool schema byte drift detected at ${remotePath}`);
+    }
+  } else {
+    await Bun.write(remotePath, remoteJson);
+  }
+
   // The generator is a tiny debug binary, so a compile cache buys nothing and
   // the sccache wrapper configured in .cargo/config.toml has wedged this step
   // twice (its client sleeps on the server socket, the check never returns).
@@ -84,6 +98,7 @@ async function main() {
   console.log(
     `✓ subc tool schemas (${count} tools) ${checkOnly ? "match" : "written"}: ${outputPath}`,
   );
+  console.log(`✓ enabled-only subc bash schemas ${checkOnly ? "match" : "written"}: ${remotePath}`);
   console.log(
     `✓ governed hashline edit schemas ${checkOnly ? "match" : "written"}: ${hashlineOutputPath}`,
   );

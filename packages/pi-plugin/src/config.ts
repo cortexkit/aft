@@ -335,6 +335,7 @@ export interface BashConfig {
   background?: boolean;
   /** Permit per-command host fallback after AFT transport failure. Default false. */
   host_fallback?: boolean;
+  runon_enabled?: boolean;
   /**
    * Allow worker sessions (headless `pi -p` / JSON runs, or MAGIC_CONTEXT_PI_SUBAGENT=1)
    * to use background bash; when false, requests block to completion and async
@@ -517,6 +518,7 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** Emergency local execution gate. Default false, including for `bash: true`. */
   host_fallback: boolean;
+  runon_enabled: boolean;
   /** Allow subagents to use background bash; default true. */
   subagent_background: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
@@ -609,6 +611,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     compress: false,
     background: false,
     host_fallback: false,
+    runon_enabled: false,
     subagent_background: true,
     detach_on_user_message: true,
     db_schema_hints: typeof top === "object" && top !== null ? (top.db_schema_hints ?? true) : true,
@@ -635,6 +638,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       compress: top.compress ?? true,
       background: top.background ?? true,
       host_fallback: top.host_fallback ?? false,
+      runon_enabled: top.runon_enabled ?? false,
       subagent_background: top.subagent_background ?? true,
       detach_on_user_message: topDetachOnUserMessage,
     };
@@ -836,6 +840,7 @@ const BashFeaturesSchema = z.object({
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
   host_fallback: z.boolean().optional(),
+  runon_enabled: z.boolean().optional(),
   /** When false, subagent background requests block up to the hard cap. Default true for multi-turn workers using bash_watch. */
   subagent_background: z.boolean().optional(),
   detach_on_user_message: z.boolean().optional(),
@@ -1190,6 +1195,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (
     typeof config.bash === "object" &&
     (config.bash.enabled !== undefined ||
+      config.bash.runon_enabled !== undefined ||
       config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
       config.bash.db_schema_hints !== undefined ||
@@ -1203,6 +1209,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
         ? { disclaim_privacy: config.bash.disclaim_privacy }
         : {}),
       ...(config.bash.enabled !== undefined ? { enabled: config.bash.enabled } : {}),
+      ...(config.bash.runon_enabled !== undefined
+        ? { runon_enabled: config.bash.runon_enabled }
+        : {}),
       ...(config.bash.host_fallback !== undefined
         ? { host_fallback: config.bash.host_fallback }
         : {}),
@@ -1844,6 +1853,8 @@ function mergeInspectConfig(
  */
 export function remoteRunsOffered(config: AftConfig): boolean {
   return (
+    process.platform !== "win32" &&
+    resolveBashConfig(config).runon_enabled &&
     Boolean(config.subc?.connection_file?.trim()) &&
     config.remote_exec?.enabled === true &&
     config.remote_exec.project_off !== true
@@ -2080,6 +2091,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   if (typeof projectBash === "object" && projectBash.disclaim_privacy !== true)
     delete projectBash.disclaim_privacy;
   // Strip only the weakening direction before the usual field-wise merge.
+  if (typeof projectBash === "object") delete projectBash.runon_enabled;
   const bash = mergeBashConfig(base.bash, projectBash);
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);

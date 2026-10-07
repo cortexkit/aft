@@ -285,34 +285,105 @@ describe("bash tool adapter", () => {
     expect(bashTool!.description).not.toContain("pty: true");
   });
 
-  test("runon is offered to bash only in subc mode with remote runs enabled in the user config", () => {
-    const properties = (config: Record<string, unknown>, shell: "bash" | "powershell" = "bash") => {
-      const tools = new Map<string, MockToolDef>();
-      registerBashTool(
-        makeMockApi(tools),
-        makeMockContext(makeMockBridge(), config as PluginContext["config"]),
-        false,
-        shell,
-        false,
-        shell,
-      );
-      return (tools.get(shell)!.parameters as { properties: Record<string, unknown> }).properties;
-    };
-    const subc = { subc: { connection_file: "/run/subc-connection.json" } };
-    expect(properties({ ...subc, remote_exec: { enabled: true } }).runon).toMatchObject({
-      type: "string",
-      description: BASH_RUNON_DESCRIPTION,
-    });
-    expect(properties({ ...subc }).runon).toBeUndefined();
-    expect(properties({ remote_exec: { enabled: true } }).runon).toBeUndefined();
-    expect(
-      properties({ ...subc, remote_exec: { enabled: false, project_off: true } }).runon,
-    ).toBeUndefined();
-    // The remote runner runs bash, so PowerShell never offers it.
-    expect(
-      properties({ ...subc, remote_exec: { enabled: true } }, "powershell").runon,
-    ).toBeUndefined();
+  const remoteConfiguredBash = (config: Record<string, unknown>) => {
+    const tools = new Map<string, MockToolDef>();
+    registerBashTool(
+      makeMockApi(tools),
+      makeMockContext(makeMockBridge(), config as PluginContext["config"]),
+    );
+    return tools.get("bash")!;
+  };
+
+  test("bash runon schema and guidance are absent without available remote execution", () => {
+    for (const config of [
+      {},
+      { subc: { connection_file: "/run/subc-connection.json" } },
+      { remote_exec: { enabled: true } },
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true, project_off: true },
+      },
+    ]) {
+      const bash = remoteConfiguredBash(config);
+      expect(
+        (bash.parameters as { properties: Record<string, unknown> }).properties.runon,
+      ).toBeUndefined();
+      expect(bash.description).not.toContain("runon");
+    }
   });
+
+  test.skipIf(process.platform === "win32")(
+    "bash runon schema and guidance are present with available remote execution",
+    () => {
+      const bash = remoteConfiguredBash({
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      });
+      expect(
+        (bash.parameters as { properties: Record<string, unknown> }).properties.runon,
+      ).toMatchObject({ type: "string" });
+      expect(bash.description).toContain('When remote runs are available, put `runon: "linux"`');
+      expect(bash.description).toContain("including chains and pipes");
+      expect(bash.description).toContain(
+        "keep git, gh, interactive and file-editing commands local",
+      );
+    },
+  );
+
+  // Remote task dispatch is Unix-only; a user switch cannot make it usable on Windows.
+  test.skipIf(process.platform !== "win32")(
+    "Windows bash omits runon even with daemon mode and enabled user config",
+    () => {
+      const bash = remoteConfiguredBash({
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      });
+      expect(
+        (bash.parameters as { properties: Record<string, unknown> }).properties.runon,
+      ).toBeUndefined();
+      expect(bash.description).not.toContain("runon");
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "runon is offered to bash only in subc mode with remote runs enabled in the user config",
+    () => {
+      const properties = (
+        config: Record<string, unknown>,
+        shell: "bash" | "powershell" = "bash",
+      ) => {
+        const tools = new Map<string, MockToolDef>();
+        registerBashTool(
+          makeMockApi(tools),
+          makeMockContext(makeMockBridge(), config as PluginContext["config"]),
+          false,
+          shell,
+          false,
+          shell,
+        );
+        return (tools.get(shell)!.parameters as { properties: Record<string, unknown> }).properties;
+      };
+      const subc = {
+        subc: { connection_file: "/run/subc-connection.json" },
+        bash: { runon_enabled: true },
+      };
+      expect(properties({ ...subc, remote_exec: { enabled: true } }).runon).toMatchObject({
+        type: "string",
+        description: BASH_RUNON_DESCRIPTION,
+      });
+      expect(properties({ ...subc }).runon).toBeUndefined();
+      expect(properties({ remote_exec: { enabled: true } }).runon).toBeUndefined();
+      expect(
+        properties({ ...subc, remote_exec: { enabled: false, project_off: true } }).runon,
+      ).toBeUndefined();
+      // The remote runner runs bash, so PowerShell never offers it.
+      expect(
+        properties({ ...subc, remote_exec: { enabled: true } }, "powershell").runon,
+      ).toBeUndefined();
+    },
+  );
 
   test("runon is forwarded to the engine as the call wrote it", async () => {
     const tools = new Map<string, MockToolDef>();
@@ -322,6 +393,7 @@ describe("bash tool adapter", () => {
       makeMockContext(bridge, {
         subc: { connection_file: "/run/subc-connection.json" },
         remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
       } as PluginContext["config"]),
     );
     await tools

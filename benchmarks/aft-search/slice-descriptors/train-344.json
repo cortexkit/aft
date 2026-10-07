@@ -1,9 +1,9 @@
 {
-  "slice_class": "engine_unwired",
+  "slice_class": "non_ranking",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
-  "note": "Train 344 stacks the accepted bash runon whole-line remote routing, 0.2.2 run reports, worker test-thread budgets, oversized-budget defaults and payload-free view-publication membership on train 343 (c8a4f5aa3). Derived from git diff --name-only c8a4f5aa3..HEAD against RANKING_FENCE_PREFIXES: the only fenced path is crates/aft/src/subc_tool_schemas.json, whose change adds the bash runon argument without changing search ranking or routing. All 93 benchmark rows must remain byte-identical to the reference. Train 343's engine_unwired descriptor supplies the harness contract; targeted_mechanism remains none."
+  "note": "Train 344 stacks accepted whole-line bash runon routing, 0.2.2 run reports, worker test-thread budgets and oversized-budget defaults, payload-free view-publication membership, and the pinned Windows task-deletion fix on train 343 (c8a4f5aa3). Remote parameters and guidance are rendered only for enabled sessions, with separate generated bash overrides for head and worker catalogs. Derived from git diff --name-only c8a4f5aa3..HEAD against RANKING_FENCE_PREFIXES: no fenced paths remain changed. The default crates/aft/src/subc_tool_schemas.json is byte-identical to the base after removing unconditional runon metadata; enabled variants are pinned separately. Search ranking and routing are unchanged, and targeted_mechanism remains explicitly none."
 }

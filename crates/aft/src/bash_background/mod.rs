@@ -168,6 +168,8 @@ thread_local! {
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteLaunch {
     pub params: crate::exec_remote::FrozenParams,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub explicit_runon: bool,
     // Remote dispatch runs only on Unix; Windows carries the policy but never dials.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub connection_file: Option<PathBuf>,
@@ -191,6 +193,9 @@ pub(crate) fn remote_for_runon(
     powershell: bool,
     host_sandbox: bool,
 ) -> Result<RemoteLaunch, String> {
+    if !config.bash.runon_enabled {
+        return Err("runon is disabled by the user safety setting bash.runon_enabled".into());
+    }
     if cfg!(not(unix)) {
         return Err(
             "runon is not available on Windows: remote runs need AFT on macOS or Linux".into(),
@@ -215,7 +220,7 @@ pub(crate) fn remote_for_runon(
     if config.remote_exec.project_off {
         return Err("remote runs are off for this project".into());
     }
-    let launch = CURRENT_REMOTE
+    let mut launch = CURRENT_REMOTE
         .with(|s| s.borrow().clone())
         .filter(|launch| {
             launch
@@ -233,7 +238,31 @@ pub(crate) fn remote_for_runon(
             .as_ref()
             .and_then(|policy| policy.default_demand.as_deref()),
     )?;
+    launch.explicit_runon = true;
     Ok(launch)
+}
+
+/// Preserve automatic routing only for deployed plans carrying a prefix list.
+pub(crate) fn remote_for_legacy_command(
+    config: &crate::config::Config,
+    command: &str,
+    pty: bool,
+    powershell: bool,
+) -> Option<RemoteLaunch> {
+    if !cfg!(unix) || powershell || config.remote_exec.project_off {
+        return None;
+    }
+    CURRENT_REMOTE
+        .with(|current| current.borrow().clone())
+        .filter(|launch| {
+            launch.params.remote_exec.as_ref().is_some_and(|policy| {
+                crate::exec_remote::policy::matches(policy, command, pty, false)
+            })
+        })
+        .map(|mut launch| {
+            launch.explicit_runon = false;
+            launch
+        })
 }
 
 pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {

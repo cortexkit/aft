@@ -86,6 +86,8 @@ export type SubcBareToolName = (typeof BARE_TOOL_ORDER)[number];
  * project that does enable the feature could never see it. `sandbox.enabled` is
  * exactly that case: it is project-settable one-way hardening, and the subc
  * bash path reads a passed `sandbox` argument regardless of this manifest.
+ * Remote execution is different: the default artifacts omit it, and a
+ * separately generated bash override is selected only for an enabled session.
  */
 export function makeSubcSchemaStubCtx(): PluginContext {
   return {
@@ -117,14 +119,6 @@ function consumerOnly(property: Record<string, unknown>): Record<string, unknown
   return { ...property, [CONSUMER_ONLY_MARKER]: true };
 }
 
-/**
- * JSON Schema extension key on bash's `runon` property. The Rust manifest and
- * every catalog strip the property by default and add it back (without the
- * marker) only for a session that may run commands remotely, so it appears
- * exactly where remote runs are configured.
- */
-export const RUNON_MARKER = "x-aft-runon";
-
 function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
   const wrapped = z.object(def.args);
   const jsonSchema = z.toJSONSchema(wrapped, { io: "input" }) as Record<string, unknown>;
@@ -137,7 +131,9 @@ function argsToJsonSchema(def: ToolDefinition): Record<string, unknown> {
 /**
  * Build the bare-name → JSON Schema map for subc build_manifest.
  */
-export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, unknown>> {
+export function buildSubcToolSchemas(
+  remoteRuns = false,
+): Record<SubcBareToolName, Record<string, unknown>> {
   const ctx = makeSubcSchemaStubCtx();
   const bash = createBashTool(ctx);
   const read = createReadTool(ctx);
@@ -198,6 +194,7 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     true,
     true,
     false,
+    { remoteRuns },
   );
   const bashProperties = (bashSchema.properties ??= {}) as Record<string, unknown>;
   bashProperties.foreground_orchestrate = consumerOnly({
@@ -223,11 +220,12 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     description:
       "Execute PowerShell commands through AFT's bash task family with UTF-8 output and conservative per-command approval.",
   };
-  bashProperties.runon = {
-    type: "string",
-    description: BASH_RUNON_DESCRIPTION,
-    [RUNON_MARKER]: true,
-  };
+  if (remoteRuns) {
+    bashProperties.runon = {
+      type: "string",
+      description: BASH_RUNON_DESCRIPTION,
+    };
+  }
 
   return {
     status: { ...STATUS_SCHEMA, description: STATUS_DESCRIPTION },
@@ -295,16 +293,18 @@ export const SUBC_BARE_TOOL_NAMES: readonly SubcBareToolName[] = BARE_TOOL_ORDER
  *
  * A worker is a delegated session: once its turn ends it has delivered its
  * result, and nothing (no completion reminder, no async notification) wakes
- * it. Every text here is therefore the worker wording of the same builders
- * the OpenCode tools use, so the strings are never forked: `bash` and
+ * it. Waiting descriptions use the same builders as the OpenCode tools;
+ * remote-run advice appears only in the enabled session override. `bash` and
  * `powershell` keep their arguments but describe promotion and waiting for a
  * worker, `bash_status` is the OpenCode tool's own (which points at
  * `bash_watch`), and `bash_watch` is the OpenCode tool's schema with its
  * worker description.
  */
-export function buildSubcToolPresets(): Record<string, Record<string, Record<string, unknown>>> {
+export function buildSubcToolPresets(
+  remoteRuns = false,
+): Record<string, Record<string, Record<string, unknown>>> {
   const ctx = makeSubcSchemaStubCtx();
-  const base = buildSubcToolSchemas();
+  const base = buildSubcToolSchemas(remoteRuns);
   const bashConfig = resolveBashConfig(ctx.config);
   const statusRegistered = bashCompanionRegistered(ctx.config, "bash_status");
   const workerTimeout = bashTimeoutDescription(bashConfig.background, "worker");
@@ -322,7 +322,7 @@ export function buildSubcToolPresets(): Record<string, Record<string, Record<str
     true,
     true,
     true,
-    { role: "worker" },
+    { role: "worker", remoteRuns },
   );
   return {
     worker: {
@@ -371,4 +371,16 @@ export function buildSubcToolPresetsJson(): string {
     sorted[preset] = tools;
   }
   return `${JSON.stringify(sorted, null, 2)}\n`;
+}
+
+/** Enabled-only bash overrides; default schemas never advertise remote execution. */
+export function buildSubcRemoteToolSchemasJson(): string {
+  return `${JSON.stringify(
+    {
+      head: { bash: buildSubcToolSchemas(true).bash },
+      worker: { bash: buildSubcToolPresets(true).worker.bash },
+    },
+    null,
+    2,
+  )}\n`;
 }
