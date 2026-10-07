@@ -122,6 +122,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deployed_legacy_policy_vectors_match_and_verify_digests() {
+        use sha2::{Digest, Sha256};
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/exec_remote/fixtures/policy");
+        let mut count = 0;
+        for entry in std::fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let canonical = std::fs::read(path.with_extension("jcs")).unwrap();
+            assert_eq!(serde_json::to_vec(&value).unwrap(), canonical);
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&canonical)),
+                std::fs::read_to_string(path.with_extension("sha256")).unwrap()
+            );
+            let policy = serde_json::from_value(value["policy"].clone()).unwrap();
+            assert_eq!(
+                matches(
+                    &policy,
+                    value["command"].as_str().unwrap(),
+                    value["pty"].as_bool().unwrap(),
+                    value["stdin"].as_bool().unwrap()
+                ),
+                value["matches"].as_bool().unwrap(),
+                "{path:?}"
+            );
+            count += 1;
+        }
+        assert_eq!(count, 39);
+    }
+
+    #[test]
     fn old_prefix_plans_survive_persistence_while_new_plans_require_runon() {
         let new: RemoteExecPolicy =
             serde_json::from_value(serde_json::json!({"enabled": true, "default_demand": "linux"}))

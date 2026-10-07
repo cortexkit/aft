@@ -294,6 +294,32 @@ describe("bash tool adapter", () => {
     return tools.get("bash")!;
   };
 
+  test("live runon safety switch updates the schema and refuses a stale call", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const { bridge, calls } = makeTrackableMockBridge({ output: "" });
+    const ctx = makeMockContext(bridge, {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+    } as PluginContext["config"]);
+    registerBashTool(makeMockApi(tools), ctx);
+    const bash = tools.get("bash")!;
+    const offered = () =>
+      (bash.parameters as { properties: Record<string, unknown> }).properties.runon;
+    expect(offered()).toBeUndefined();
+    ctx.config = { ...ctx.config, bash: { runon_enabled: true } };
+    expect(offered()).toBeDefined();
+    ctx.config = { ...ctx.config, bash: { runon_enabled: false } };
+    expect(offered()).toBeUndefined();
+    expect(bash.description).not.toContain("runon");
+    await expect(
+      bash.execute("stale", { command: "echo never", runon: "linux" }, undefined, undefined, {
+        cwd: projectRoot,
+        hasUI: false,
+      }),
+    ).rejects.toThrow("runon refused");
+    expect(calls).toHaveLength(0);
+  });
+
   test("bash runon schema and guidance are absent without available remote execution", () => {
     for (const config of [
       {},

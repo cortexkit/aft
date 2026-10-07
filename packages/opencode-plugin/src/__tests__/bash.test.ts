@@ -166,7 +166,7 @@ function createHarness(
     config,
     storageDir: "/tmp/aft-test",
   };
-  return { calls, tool: createBashTool(ctx, aftSearchRegistered) };
+  return { calls, ctx, tool: createBashTool(ctx, aftSearchRegistered) };
 }
 
 function safeParse(schema: unknown, value: unknown): { success: boolean } {
@@ -174,6 +174,26 @@ function safeParse(schema: unknown, value: unknown): { success: boolean } {
 }
 
 describe("OpenCode bash adapter", () => {
+  test("live runon safety switch updates the schema and refuses a stale call", async () => {
+    const {
+      tool: bash,
+      ctx,
+      calls,
+    } = createHarness(() => ({ success: true, output: "" }), undefined, false, {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+    } as PluginContext["config"]);
+    expect(bash.args.runon).toBeUndefined();
+    ctx.config = { ...ctx.config, bash: { runon_enabled: true } };
+    expect(bash.args.runon).toBeDefined();
+    ctx.config = { ...ctx.config, bash: { runon_enabled: false } };
+    expect(bash.args.runon).toBeUndefined();
+    expect(bash.description).not.toContain("runon");
+    await expect(
+      bash.execute({ command: "echo never", runon: "linux" }, createMockSdkContext()),
+    ).rejects.toThrow("runon refused");
+    expect(calls).toHaveLength(0);
+  });
   test("schema accepts valid unified bash params and rejects invalid shapes", () => {
     // `sandbox` is only offered while the native sandbox is enabled.
     const { tool: bash } = createHarness(() => ({ success: true, output: "" }), undefined, false, {

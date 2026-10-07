@@ -36,13 +36,23 @@ fn context_with_user_remote(
     connection: Option<PathBuf>,
     enabled: bool,
 ) -> AppContext {
+    context_with_switch(root, storage, connection, enabled, true)
+}
+
+fn context_with_switch(
+    root: &Path,
+    storage: &Path,
+    connection: Option<PathBuf>,
+    enabled: bool,
+    runon_enabled: bool,
+) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
     config.experimental_bash_background = true;
     config.sandbox.enabled = false;
     config.remote_exec.enabled = enabled;
-    config.bash.runon_enabled = true;
+    config.bash.runon_enabled = runon_enabled;
     config.semantic.subc_connection_file = connection;
     let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
@@ -108,6 +118,29 @@ fn sessions_without_remote_execution_omit_runon_and_guidance() {
             "{bash}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn safety_switch_hides_runon_without_disabling_the_persisted_old_prefix_plan() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context_with_switch(root.path(), storage.path(), None, true, false);
+    let worker = identity(root.path(), "old-worker", 7, true);
+    let mut old = plan("broca-worker");
+    old["tool_items"][0]["params"]["remote_exec"] =
+        json!({"enabled":true,"commands":["cargo test"]});
+    let reply = catalog(fetch(&old), &worker, &ctx).unwrap();
+    let bash = bash_catalog_entry(&reply);
+    assert!(bash["input_schema"]["properties"].get("runon").is_none());
+    assert!(!bash["description"].as_str().unwrap().contains("runon"));
+    let launch = lookup(&ctx, &source(&worker, Some("worker"))).unwrap();
+    assert!(crate::exec_remote::policy::matches(
+        launch.params.remote_exec.as_ref().unwrap(),
+        "cargo test",
+        false,
+        false
+    ));
 }
 
 #[cfg(unix)]

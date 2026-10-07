@@ -94,6 +94,10 @@ impl Drop for Daemon {
 }
 
 pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
+    daemon_with_clients(script, claim, 1).await
+}
+
+pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: usize) -> Daemon {
     use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -104,39 +108,40 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
     let server_key = key.clone();
     let claim = claim.to_string();
     let server = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        subc_transport::authenticate_server(
-            &mut socket,
-            &server_key,
-            &daemon_id,
-            "exec-client-test",
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-        let (mut reader, writer) = tokio::io::split(socket);
-        let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut producers = Vec::new();
-        let mut cancelled = false;
-        while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
-            let header = frame.header;
-            let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
-            server_log.lock().unwrap().push((header, body.clone()));
-            let reply = |ty, value: Value| {
-                Frame::build_with_version(
-                    header.ver,
-                    ty,
-                    header.flags,
-                    header.channel,
-                    header.epoch,
-                    header.corr,
-                    serde_json::to_vec(&value).unwrap(),
-                )
-                .unwrap()
-            };
-            let mut replies = Vec::new();
-            match header.ty {
+        for _ in 0..clients {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            subc_transport::authenticate_server(
+                &mut socket,
+                &server_key,
+                &daemon_id,
+                "exec-client-test",
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            let (mut reader, writer) = tokio::io::split(socket);
+            let writer = Arc::new(tokio::sync::Mutex::new(writer));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut producers = Vec::new();
+            let mut cancelled = false;
+            while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
+                let header = frame.header;
+                let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
+                server_log.lock().unwrap().push((header, body.clone()));
+                let reply = |ty, value: Value| {
+                    Frame::build_with_version(
+                        header.ver,
+                        ty,
+                        header.flags,
+                        header.channel,
+                        header.epoch,
+                        header.corr,
+                        serde_json::to_vec(&value).unwrap(),
+                    )
+                    .unwrap()
+                };
+                let mut replies = Vec::new();
+                match header.ty {
                 FrameType::Hello => replies.push(reply(FrameType::HelloAck, serde_json::to_value(ModuleHelloAckBody {
                     negotiated_ver: PROTOCOL_VERSION, subc_ops: vec!["catalog.list".into()], subc_capabilities: vec![], storage: None, machine_id: None,
                 }).unwrap())),
@@ -208,18 +213,89 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                 FrameType::Cancel => {cancelled = true; stop.store(true,std::sync::atomic::Ordering::SeqCst);},
                 _ => {},
             }
-            for response in replies {
-                subc_transport::write_frame(&mut *writer.lock().await, &response)
-                    .await
-                    .unwrap();
-            }
-            if body["method"] == "exec.attach" {
-                if let Script::GappedAttach(gap) | Script::GappedCancel(gap) = script {
+                for response in replies {
+                    subc_transport::write_frame(&mut *writer.lock().await, &response)
+                        .await
+                        .unwrap();
+                }
+                if body["method"] == "exec.attach" {
+                    if let Script::GappedAttach(gap) | Script::GappedCancel(gap) = script {
+                        let writer = writer.clone();
+                        let seq = body["params"]["from_seq"].as_u64().unwrap();
+                        producers.push(tokio::spawn(async move {
+                            let data = |record| {
+                                Frame::build_with_version(
+                                    header.ver,
+                                    FrameType::StreamData,
+                                    header.flags,
+                                    header.channel,
+                                    header.epoch,
+                                    header.corr,
+                                    serde_json::to_vec(&record).unwrap(),
+                                )
+                                .unwrap()
+                            };
+                            let output = data(StreamRecord::Output(Output::new(
+                                seq,
+                                OutputStream::Stdout,
+                                BytePayload(vec![b'A' + seq as u8]),
+                            )));
+                            if subc_transport::write_frame(&mut *writer.lock().await, &output)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(gap).await;
+                            if matches!(script, Script::GappedCancel(_)) || seq == 2 {
+                                let outcome = if cancelled {
+                                    Outcome::Signal { signal: 15 }
+                                } else {
+                                    Outcome::Exit { code: 0 }
+                                };
+                                let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
+                                if cancelled {
+                                    terminal = terminal.with_killed(Killed::Cancel);
+                                }
+                                if subc_transport::write_frame(
+                                    &mut *writer.lock().await,
+                                    &data(StreamRecord::Terminal(terminal)),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let end = Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamEnd,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                vec![],
+                            )
+                            .unwrap();
+                            let _ =
+                                subc_transport::write_frame(&mut *writer.lock().await, &end).await;
+                        }));
+                    }
+                }
+                if matches!(script, Script::Continuous) && body["method"] == "exec.run" {
                     let writer = writer.clone();
-                    let seq = body["params"]["from_seq"].as_u64().unwrap();
+                    let stop = stop.clone();
                     producers.push(tokio::spawn(async move {
-                        let data = |record| {
-                            Frame::build_with_version(
+                        let mut seq = 0;
+                        let mut tick = tokio::time::interval(Duration::from_millis(1));
+                        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            tick.tick().await;
+                            let record = StreamRecord::Output(Output::new(
+                                seq,
+                                OutputStream::Stdout,
+                                BytePayload(b"x".to_vec()),
+                            ));
+                            let frame = Frame::build_with_version(
                                 header.ver,
                                 FrameType::StreamData,
                                 header.flags,
@@ -228,90 +304,21 @@ pub(crate) async fn daemon(script: Script, claim: &str) -> Daemon {
                                 header.corr,
                                 serde_json::to_vec(&record).unwrap(),
                             )
-                            .unwrap()
-                        };
-                        let output = data(StreamRecord::Output(Output::new(
-                            seq,
-                            OutputStream::Stdout,
-                            BytePayload(vec![b'A' + seq as u8]),
-                        )));
-                        if subc_transport::write_frame(&mut *writer.lock().await, &output)
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                        tokio::time::sleep(gap).await;
-                        if matches!(script, Script::GappedCancel(_)) || seq == 2 {
-                            let outcome = if cancelled {
-                                Outcome::Signal { signal: 15 }
-                            } else {
-                                Outcome::Exit { code: 0 }
-                            };
-                            let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
-                            if cancelled {
-                                terminal = terminal.with_killed(Killed::Cancel);
-                            }
-                            if subc_transport::write_frame(
-                                &mut *writer.lock().await,
-                                &data(StreamRecord::Terminal(terminal)),
-                            )
-                            .await
-                            .is_err()
+                            .unwrap();
+                            if subc_transport::write_frame(&mut *writer.lock().await, &frame)
+                                .await
+                                .is_err()
                             {
-                                return;
+                                break;
                             }
+                            seq += 1;
                         }
-                        let end = Frame::build_with_version(
-                            header.ver,
-                            FrameType::StreamEnd,
-                            header.flags,
-                            header.channel,
-                            header.epoch,
-                            header.corr,
-                            vec![],
-                        )
-                        .unwrap();
-                        let _ = subc_transport::write_frame(&mut *writer.lock().await, &end).await;
                     }));
                 }
             }
-            if matches!(script, Script::Continuous) && body["method"] == "exec.run" {
-                let writer = writer.clone();
-                let stop = stop.clone();
-                producers.push(tokio::spawn(async move {
-                    let mut seq = 0;
-                    let mut tick = tokio::time::interval(Duration::from_millis(1));
-                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                        tick.tick().await;
-                        let record = StreamRecord::Output(Output::new(
-                            seq,
-                            OutputStream::Stdout,
-                            BytePayload(b"x".to_vec()),
-                        ));
-                        let frame = Frame::build_with_version(
-                            header.ver,
-                            FrameType::StreamData,
-                            header.flags,
-                            header.channel,
-                            header.epoch,
-                            header.corr,
-                            serde_json::to_vec(&record).unwrap(),
-                        )
-                        .unwrap();
-                        if subc_transport::write_frame(&mut *writer.lock().await, &frame)
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        seq += 1;
-                    }
-                }));
+            for producer in producers {
+                producer.abort();
             }
-        }
-        for producer in producers {
-            producer.abort();
         }
     });
     let dir = tempfile::tempdir().unwrap();

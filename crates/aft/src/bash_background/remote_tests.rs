@@ -1432,7 +1432,9 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
 #[tokio::test]
 async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works_when_enabled() {
     for enabled in [false, true] {
-        let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+        let daemon =
+            crate::exec_remote::wire_tests::daemon_with_clients(Script::Plain, "exec-remote/v1", 2)
+                .await;
         let dir = tempfile::tempdir().unwrap();
         let ctx = restarted_context_with_runon(dir.path(), enabled);
         let mut old = launch(daemon.connection.clone());
@@ -1510,14 +1512,13 @@ async fn runon_is_refused_when_the_daemon_has_no_exec_remote_provider() {
 }
 
 #[tokio::test]
-async fn without_runon_nothing_goes_remote_even_with_an_enabled_policy() {
+async fn without_runon_new_shape_plans_keep_commands_local() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
-    // An older plan's command list naming this very command is ignored.
+    // New-shape plans have no prefix list and require an explicit remote demand.
     let mut policy = launch(daemon.connection.clone());
-    policy.params.remote_exec.as_mut().unwrap().legacy_commands =
-        Some(serde_json::json!(["printf"]));
+    policy.params.remote_exec.as_mut().unwrap().default_demand = Some("linux".into());
     let response = handle_with_policy(
         &ctx,
         Some(policy),
