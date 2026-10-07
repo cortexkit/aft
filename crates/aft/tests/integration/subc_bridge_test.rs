@@ -1707,6 +1707,17 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
         pid: std::process::id(),
         daemon_ver: "subc-test".to_string(),
     };
+    // The connection-file contract rejects writable shared parents, even
+    // when a permissive runner umask gives its temporary directories 0775.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            conn_path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
     connection_file::write_atomic(&conn_path, &conn).expect("write connection file");
 
     let daemon_state = Arc::clone(&state);

@@ -820,6 +820,13 @@ pub(super) fn write_user_config(config_home: &Path, storage: &Path) {
 }
 
 pub(super) async fn write_connection_file(conn_dir: &Path) -> TcpListener {
+    // The connection-file contract rejects writable shared parents, even
+    // when a permissive runner umask gives its temporary directories 0775.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(conn_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
     std_listener
         .set_nonblocking(true)
