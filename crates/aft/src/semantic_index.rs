@@ -4281,12 +4281,22 @@ pub struct SemanticResult {
     pub source: &'static str,
 }
 
+fn shared_relative_path(project_root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = cache_relative_path(project_root, path)?;
+    // The portable disk spelling uses '/'. Rebuild components only on Windows
+    // so joining an in-memory base matches native paths recorded by the private
+    // index; persistence still goes through cache_relative_path unchanged.
+    #[cfg(windows)]
+    let relative = relative.components().collect();
+    Some(relative)
+}
+
 fn relativize_semantic_map<T>(
     project_root: &Path,
     map: HashMap<PathBuf, T>,
 ) -> Option<HashMap<PathBuf, T>> {
     map.into_iter()
-        .map(|(path, value)| cache_relative_path(project_root, &path).map(|path| (path, value)))
+        .map(|(path, value)| shared_relative_path(project_root, &path).map(|path| (path, value)))
         .collect()
 }
 
@@ -4610,7 +4620,7 @@ impl SemanticIndex {
         // root hands the index back intact instead of leaving a half-moved
         // one behind. Only the path strings are copied here; the vectors move.
         let root = self.project_root.clone();
-        let relative = |path: &Path| cache_relative_path(&root, path);
+        let relative = |path: &Path| shared_relative_path(&root, path);
         let Some(entry_files) = self
             .entries
             .iter()
@@ -12567,6 +12577,32 @@ Connection: close
             200,
             "private eligibility must be cached per file"
         );
+    }
+
+    #[test]
+    fn shared_semantic_native_paths_preserve_persisted_bytes_and_identity() {
+        let root = test_project_root();
+        let file = root.join("src").join("lib.rs");
+        let mut index = SemanticIndex::new(root.clone(), 2);
+        add_invalidation_fixture_entry(&mut index, file.clone(), 0);
+        let private_bytes = index.to_bytes();
+        let private_identity = blake3::hash(&private_bytes);
+        let private_results = index.search(&[1.0, 0.5], 1);
+        let borrowed =
+            SemanticIndex::from_shared_base(root, Arc::new(index.into_shared_base().ok().unwrap()));
+        let shared_results = borrowed.search(&[1.0, 0.5], 1);
+        assert_eq!(private_results.len(), 1);
+        assert_eq!(shared_results.len(), 1);
+        // Compare spelling, not Path equality, which accepts either separator
+        // on Windows and would hide the mixed-separator regression.
+        assert_eq!(shared_results[0].file.as_os_str(), file.as_os_str());
+        assert_eq!(
+            shared_results[0].score.to_bits(),
+            private_results[0].score.to_bits()
+        );
+        let shared_bytes = borrowed.to_bytes();
+        assert_eq!(shared_bytes, private_bytes);
+        assert_eq!(blake3::hash(&shared_bytes), private_identity);
     }
 
     #[test]
