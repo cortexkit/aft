@@ -456,7 +456,8 @@ impl AppContext {
         } else {
             serde_json::Value::Null
         };
-        let status_bar_values = serde_json::json!({
+        let disabled_categories = status_bar_values.disabled_categories.clone();
+        let mut status_bar_values = serde_json::json!({
             "errors": status_bar_values.errors,
             "warnings": status_bar_values.warnings,
             "diagnostics": diagnostics_state,
@@ -466,6 +467,9 @@ impl AppContext {
             "todos": status_bar_values.todos,
             "tier2_stale": status_bar_values.tier2_stale,
         });
+        if !disabled_categories.is_empty() {
+            status_bar_values["disabled_categories"] = serde_json::json!(disabled_categories);
+        }
         let memory_root = self
             .canonical_cache_root_opt()
             .or_else(|| config.project_root.clone());

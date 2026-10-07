@@ -6916,13 +6916,8 @@ fn memory_census_with_lifecycle(
                     "lsp_idle_ttl_ms".to_string(),
                     json!(executor
                         .actor_context(root_id)
-                        .map(|ctx| ctx
-                            .config()
-                            .idle
-                            .lsp_ttl()
-                            .as_millis()
-                            .min(u128::from(u64::MAX)) as u64)
-                        .unwrap_or(0)),
+                        .and_then(|ctx| ctx.config().lsp_idle_minutes.ttl())
+                        .map(|ttl| ttl.as_millis().min(u128::from(u64::MAX)) as u64)),
                 );
                 row.insert(
                     "evictable_in_ms".to_string(),

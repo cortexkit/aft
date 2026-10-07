@@ -222,6 +222,13 @@ function translateBlock(
   blockLabel: string,
   out: DocumentTranslation,
 ): void {
+  for (const [path, replacement] of [
+    ["idle.lsp_ttl_minutes", "lsp.idle_minutes"],
+    ["inspect.tier2_soft_deadline_ms", "inspect.tier2_pass_timeout_ms"],
+    ["inspect.max_drill_down_items", "aft_inspect.topK"],
+  ] as const) {
+    if (hasPath(map, path)) out.errors.push(removed(path, replacement));
+  }
   if (Object.hasOwn(map, "gh_read")) out.errors.push(removed("gh_read", "github.read"));
   if (isRecord(map.gh_shim) && Object.hasOwn(map.gh_shim, "enabled")) {
     out.errors.push(removed("gh_shim", "github.shim"));

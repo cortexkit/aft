@@ -133,7 +133,14 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     let mut gaps = Gaps::default();
     let mut summary = Map::new();
     for category in &categories {
-        summary.insert(category.as_str().into(), Value::Object(Map::new()));
+        summary.insert(
+            category.as_str().into(),
+            if config.inspect.category_enabled(*category) {
+                Value::Object(Map::new())
+            } else {
+                json!({"off":true,"complete":true})
+            },
+        );
     }
     let children = session
         .children()
@@ -147,6 +154,9 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
     for child in &children {
         let cache = read(&child.inspect).clone();
         for category in &categories {
+            if !config.inspect.category_enabled(*category) {
+                continue;
+            }
             if !category.is_tier2() {
                 gaps.push(
                     "parent_inspect_category",
@@ -192,6 +202,13 @@ pub(super) fn answer(req: &RawRequest, ctx: &AppContext, session: &ParentSession
         children.len()
     )];
     for (category, merged) in &summary {
+        if merged["off"] == true {
+            lines.push(format!(
+                "{}: off (inspect.categories.{category})",
+                category.replace('_', " ")
+            ));
+            continue;
+        }
         let count = merged
             .get("count")
             .or_else(|| merged.get("total"))

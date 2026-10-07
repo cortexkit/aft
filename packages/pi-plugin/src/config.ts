@@ -237,9 +237,18 @@ export interface InspectConfig {
   diagnostics_timeout_ms?: number;
   tier2_idle_minutes?: number;
   tier2_pass_timeout_ms?: number;
-  categories?: Record<string, boolean>;
-  tier2_soft_deadline_ms?: number;
-  max_drill_down_items?: number;
+  categories?: Partial<
+    Record<
+      | "diagnostics"
+      | "todos"
+      | "dead_code"
+      | "unused_exports"
+      | "duplicates"
+      | "cycles"
+      | "complexity",
+      boolean
+    >
+  >;
   duplicates?: {
     expected_mirrors?: [string, string][];
   };
@@ -248,8 +257,6 @@ export interface InspectConfig {
 export interface IdleConfig {
   /** Unbound-root artifact eviction idle window in minutes. Default 30; clamped to 5..=30. */
   root_ttl_minutes?: number;
-  /** Language-server idle window in minutes. Default 10; clamped to 1..=10. */
-  lsp_ttl_minutes?: number;
 }
 
 export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
@@ -277,6 +284,8 @@ export interface BackupConfig {
 }
 
 export interface LspConfig {
+  /** Minutes since the last AFT tool call on that repository; default 60. */
+  idle_minutes?: number | "never";
   servers?: Record<string, Omit<LspServerConfig, "id">>;
   disabled?: string[];
   python?: "pyright" | "ty" | "auto";
@@ -782,6 +791,15 @@ const LspServerEntrySchema = z.object({
 });
 
 const LspConfigSchema = z.object({
+  idle_minutes: z
+    .union([
+      z
+        .number()
+        .int()
+        .transform((value) => Math.min(1440, Math.max(5, value))),
+      z.literal("never"),
+    ])
+    .optional(),
   servers: z.record(z.string().trim().min(1), LspServerEntrySchema).optional(),
   disabled: z.array(z.string().trim().min(1)).optional(),
   python: z.enum(["pyright", "ty", "auto"]).optional(),
@@ -958,9 +976,18 @@ const InspectConfigSchema = z.object({
     ),
   tier2_idle_minutes: z.number().min(0).optional(),
   tier2_pass_timeout_ms: z.number().int().positive().optional(),
-  categories: z.record(z.string(), z.boolean()).optional(),
-  tier2_soft_deadline_ms: z.number().int().positive().optional(),
-  max_drill_down_items: z.number().int().positive().max(100).optional(),
+  categories: z
+    .object({
+      diagnostics: z.boolean().optional(),
+      todos: z.boolean().optional(),
+      dead_code: z.boolean().optional(),
+      unused_exports: z.boolean().optional(),
+      duplicates: z.boolean().optional(),
+      cycles: z.boolean().optional(),
+      complexity: z.boolean().optional(),
+    })
+    .strict()
+    .optional(),
   duplicates: z
     .object({
       expected_mirrors: z
@@ -974,21 +1001,12 @@ function clampIdleRootTtlMinutes(value: number): number {
   return Math.min(30, Math.max(5, value));
 }
 
-function clampIdleLspTtlMinutes(value: number): number {
-  return Math.min(10, Math.max(1, value));
-}
-
 const IdleConfigSchema = z.object({
   root_ttl_minutes: z
     .number()
     .int()
     .optional()
     .transform((value) => (value === undefined ? undefined : clampIdleRootTtlMinutes(value))),
-  lsp_ttl_minutes: z
-    .number()
-    .int()
-    .optional()
-    .transform((value) => (value === undefined ? undefined : clampIdleLspTtlMinutes(value))),
 });
 
 const ViewsConfigSchema = z.object({
@@ -1233,6 +1251,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     };
   }
   Object.assign(overrides, resolveLspConfigForConfigure(config));
+  if (config.lsp?.idle_minutes !== undefined) overrides.lsp_idle_minutes = config.lsp.idle_minutes;
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   const rerank = definedEntries(config.search?.rerank);
   if (rerank !== undefined) overrides.search = { rerank };
@@ -1784,6 +1803,11 @@ function mergeLspConfig(base?: LspConfig, override?: LspConfig): LspConfig | und
   if (override?.diagnostics_on_edit !== undefined) {
     projectSafe.diagnostics_on_edit = override.diagnostics_on_edit;
   }
+  const floor = base?.idle_minutes ?? 60;
+  const idle = override?.idle_minutes;
+  if (idle !== undefined && (floor === "never" || (idle !== "never" && idle <= floor))) {
+    projectSafe.idle_minutes = idle;
+  }
 
   // disabled comes from user config ONLY.
   const userDisabled = base?.disabled ?? [];
@@ -1829,6 +1853,19 @@ function mergeInspectConfig(
   const inspect = {
     ...baseInspect,
     ...overrideInspect,
+    categories:
+      baseInspect?.categories || overrideInspect?.categories
+        ? Object.fromEntries([
+            ...Object.entries(baseInspect?.categories ?? {}),
+            ...Object.entries(overrideInspect?.categories ?? {}).map(([key, enabled]) => [
+              key,
+              enabled &&
+                (baseInspect?.categories as Record<string, boolean | undefined> | undefined)?.[
+                  key
+                ] !== false,
+            ]),
+          ])
+        : undefined,
     ...(diagnosticsTimeoutConfigured ? { diagnostics_timeout_ms: diagnosticsTimeoutMs } : {}),
     duplicates:
       baseInspect?.duplicates || overrideInspect?.duplicates

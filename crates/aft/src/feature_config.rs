@@ -104,6 +104,16 @@ pub const RETIRED_PATHS: [(&str, &str); 9] = [
     ("github.enabled", "github.read,github.write,github.shim"),
 ];
 
+/// Clean-cut removals, rejected independently of the older translation window.
+pub const REMOVED_INSPECT_LSP_PATHS: [(&str, &str); 3] = [
+    ("idle.lsp_ttl_minutes", "lsp.idle_minutes"),
+    (
+        "inspect.tier2_soft_deadline_ms",
+        "inspect.tier2_pass_timeout_ms",
+    ),
+    ("inspect.max_drill_down_items", "aft_inspect.topK"),
+];
+
 /// Index leaf, its immediate legacy key and (when one exists) the older
 /// experimental alias, in precedence order after the canonical leaf.
 pub const INDEX_INPUTS: [(&str, &str, Option<&str>); 3] = [
@@ -269,6 +279,11 @@ fn translate_block(
     out: &mut DocumentTranslation,
 ) {
     reject_retired_github_aliases(map, &mut out.errors);
+    for (path, replacement) in REMOVED_INSPECT_LSP_PATHS {
+        if has_path(map, path) {
+            out.errors.push(removed(path, replacement));
+        }
+    }
 
     // Canonicalize (or reject) historical prefixed names inside disabled lists.
     let mut explicit_list = None;

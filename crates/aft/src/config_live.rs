@@ -581,6 +581,27 @@ fn reload_config_inner(ctx: &AppContext) -> ReloadOutcome {
 /// The next connect resolves the files afresh and applies a held loosening.
 fn hold_project_loosening(candidate: &mut Config, floor: &Config) -> Vec<&'static str> {
     let mut held = Vec::new();
+    if !candidate.lsp_idle_minutes.tightens(floor.lsp_idle_minutes) {
+        candidate.lsp_idle_minutes = floor.lsp_idle_minutes;
+        held.push("lsp.idle_minutes");
+    }
+    let next = &mut candidate.inspect.categories;
+    let before = &floor.inspect.categories;
+    macro_rules! keep_off {
+        ($field:ident, $key:literal) => {
+            if !before.$field && next.$field {
+                next.$field = false;
+                held.push($key);
+            }
+        };
+    }
+    keep_off!(diagnostics, "inspect.categories.diagnostics");
+    keep_off!(todos, "inspect.categories.todos");
+    keep_off!(dead_code, "inspect.categories.dead_code");
+    keep_off!(unused_exports, "inspect.categories.unused_exports");
+    keep_off!(duplicates, "inspect.categories.duplicates");
+    keep_off!(cycles, "inspect.categories.cycles");
+    keep_off!(complexity, "inspect.categories.complexity");
     if floor.restrict_to_project_root && !candidate.restrict_to_project_root {
         candidate.restrict_to_project_root = true;
         held.push("restrict_to_project_root");
@@ -709,7 +730,9 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
             after.bash_long_running_reminder_interval_ms,
         );
     }
-    if before.inspect.enabled != after.inspect.enabled {
+    if before.inspect.enabled != after.inspect.enabled
+        || before.inspect.categories != after.inspect.categories
+    {
         ctx.reset_tier2_refresh_scheduler();
     }
     if before.git.co_author == "off" && after.git.co_author != "off" {
@@ -775,6 +798,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("callgraph_chunk_size", callgraph_chunk_size);
     // Inspect.
     live!("inspect.enabled", inspect.enabled);
+    live!("inspect.categories", inspect.categories);
     live!(
         "inspect.diagnostics_timeout_ms",
         inspect.diagnostics_timeout_ms
@@ -786,7 +810,7 @@ pub fn apply_live_config(published: &Config, candidate: &Config, connected: &Con
     live!("inspect.duplicates.expected_mirrors", inspect.duplicates);
     // Idle, worktree, backup.
     live!("idle.root_ttl_minutes", idle.root_ttl_minutes);
-    live!("idle.lsp_ttl_minutes", idle.lsp_ttl_minutes);
+    live!("lsp.idle_minutes", lsp_idle_minutes);
     live!("worktree.ram_overlay", worktree.ram_overlay);
     later!("backup.enabled", backup.enabled);
     later!("backup.max_depth", backup.max_depth);
@@ -919,6 +943,7 @@ fn classification_is_exhaustive(config: &Config) {
         lsp_servers: _,
         disabled_lsp: _,
         diagnostics_on_edit: _,
+        lsp_idle_minutes: _,
         url_fetch_allow_private: _,
         disabled_tools: _,
         idle,
@@ -965,6 +990,7 @@ fn classification_is_exhaustive(config: &Config) {
         enabled: _,
         diagnostics_timeout_ms: _,
         tier2_pass_timeout_ms: _,
+        categories: _,
         duplicates: _,
     } = inspect;
     let crate::config::BackupConfig {
@@ -979,7 +1005,6 @@ fn classification_is_exhaustive(config: &Config) {
     } = github;
     let crate::config::IdleConfig {
         root_ttl_minutes: _,
-        lsp_ttl_minutes: _,
     } = idle;
 }
 

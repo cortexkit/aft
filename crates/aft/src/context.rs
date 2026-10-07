@@ -504,6 +504,7 @@ pub struct StatusBarCounts {
 /// value and remains absent instead of being converted to a clean zero.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StatusBarCountValues {
+    pub disabled_categories: Vec<&'static str>,
     pub errors: Option<usize>,
     pub warnings: Option<usize>,
     pub dead_code: Option<usize>,
@@ -514,6 +515,39 @@ pub struct StatusBarCountValues {
 }
 
 impl StatusBarCountValues {
+    fn mask_disabled(mut self, inspect: &crate::config::InspectConfig) -> Self {
+        self.disabled_categories = InspectCategory::active()
+            .iter()
+            .copied()
+            .filter(|category| {
+                *category != InspectCategory::Metrics && !inspect.category_enabled(*category)
+            })
+            .map(InspectCategory::as_str)
+            .collect();
+        if self.disabled_categories.contains(&"diagnostics") {
+            self.errors = None;
+            self.warnings = None;
+        }
+        if self.disabled_categories.contains(&"dead_code") {
+            self.dead_code = None;
+        }
+        if self.disabled_categories.contains(&"unused_exports") {
+            self.unused_exports = None;
+        }
+        if self.disabled_categories.contains(&"duplicates") {
+            self.duplicates = None;
+        }
+        if self.disabled_categories.contains(&"todos") {
+            self.todos = None;
+        }
+        if ["dead_code", "unused_exports", "duplicates"]
+            .iter()
+            .all(|key| self.disabled_categories.contains(key))
+        {
+            self.tier2_stale = false;
+        }
+        self
+    }
     pub(crate) fn legacy_projection(&self) -> Option<StatusBarCounts> {
         let [Some(errors), Some(warnings), Some(dead_code), Some(unused_exports), Some(duplicates), Some(todos)] = [
             self.errors,
@@ -3905,23 +3939,26 @@ impl AppContext {
     /// checked before project scoping or tsconfig-membership work, so a cache hit
     /// faithfully reuses each category's presence or absence.
     pub fn status_bar_count_values(&self) -> StatusBarCountValues {
-        self.try_status_bar_count_values().unwrap_or_else(|| {
-            // Explicit status reads may still report independent Tier-2
-            // categories. Publishers use the try accessor and skip contention.
-            let tier2 = self
-                .status_bar_tier2
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            StatusBarCountValues {
-                errors: None,
-                warnings: None,
-                dead_code: tier2.dead_code,
-                unused_exports: tier2.unused_exports,
-                duplicates: tier2.duplicates,
-                todos: tier2.todos,
-                tier2_stale: tier2.stale,
-            }
-        })
+        self.try_status_bar_count_values()
+            .unwrap_or_else(|| {
+                // Explicit status reads may still report independent Tier-2
+                // categories. Publishers use the try accessor and skip contention.
+                let tier2 = self
+                    .status_bar_tier2
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                StatusBarCountValues {
+                    errors: None,
+                    warnings: None,
+                    dead_code: tier2.dead_code,
+                    unused_exports: tier2.unused_exports,
+                    duplicates: tier2.duplicates,
+                    todos: tier2.todos,
+                    tier2_stale: tier2.stale,
+                    disabled_categories: Vec::new(),
+                }
+            })
+            .mask_disabled(&self.config().inspect)
     }
 
     /// A busy manager is not a missing diagnostic producer. Publishers must
@@ -3944,7 +3981,7 @@ impl AppContext {
                 counts.errors = None;
                 counts.warnings = None;
             }
-            counts
+            counts.mask_disabled(&self.config().inspect)
         };
 
         {
@@ -4004,6 +4041,7 @@ impl AppContext {
             duplicates: tier2.duplicates,
             todos: tier2.todos,
             tier2_stale: tier2.stale,
+            disabled_categories: Vec::new(),
         };
 
         *self
@@ -8999,7 +9037,12 @@ impl AppContext {
         // whole session in which nobody ran one. Refresh it on the same cadence
         // as the Tier-2 counts; its completion is drained with theirs. Linked
         // worktrees skip automatic scans for Tier-2 and do the same here.
-        if manager.automatic_tier2_refresh_enabled() {
+        if manager.automatic_tier2_refresh_enabled()
+            && snapshot
+                .config
+                .inspect
+                .category_enabled(InspectCategory::Todos)
+        {
             if let Err(error) = manager.submit_background(
                 snapshot.clone(),
                 InspectCategory::Todos,
@@ -9049,6 +9092,7 @@ impl AppContext {
             .iter()
             .copied()
             .filter(|category| category.is_tier2())
+            .filter(|category| snapshot.config.inspect.category_enabled(*category))
             .filter(|category| {
                 if *category == InspectCategory::DeadCode && !callgraph_store_enabled {
                     // With callgraph_store=false, the scan produces zero reusable

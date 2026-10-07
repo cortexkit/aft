@@ -70,6 +70,44 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("inspect and LSP resource settings are tighten-only", () => {
+    const fixture = createConfigFixture();
+    const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };
+    mkdirSync(env.HOME, { recursive: true });
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ lsp: { idle_minutes: 30 }, inspect: { categories: { dead_code: false } } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({
+        lsp: { idle_minutes: "never" },
+        inspect: { categories: { dead_code: true, todos: false } },
+      }),
+    );
+    const merged = JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout);
+    expect(merged.lsp.idle_minutes).toBe(30);
+    expect(merged.inspect.categories).toEqual({ dead_code: false, todos: false });
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ lsp: { idle_minutes: "never" } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ lsp: { idle_minutes: 5 } }));
+    expect(JSON.parse(runConfigLoader(fixture.projectDirectory, env).stdout).lsp.idle_minutes).toBe(
+      5,
+    );
+  });
+
+  test("inspect categories use exact boolean keys and idle minutes clamp the new range", () => {
+    expect(AftConfigSchema.parse({ lsp: { idle_minutes: 0 } }).lsp?.idle_minutes).toBe(5);
+    expect(AftConfigSchema.parse({ lsp: { idle_minutes: 2000 } }).lsp?.idle_minutes).toBe(1440);
+    expect(AftConfigSchema.parse({ lsp: { idle_minutes: "never" } }).lsp?.idle_minutes).toBe(
+      "never",
+    );
+    expect(AftConfigSchema.safeParse({ inspect: { categories: { metrics: false } } }).success).toBe(
+      false,
+    );
+    expect(
+      AftConfigSchema.safeParse({ inspect: { categories: { dead_code: "false" } } }).success,
+    ).toBe(false);
+  });
   test("no config resolves the default disables and default-on indexes", () => {
     const fixture = createConfigFixture();
     const result = runConfigLoader(fixture.projectDirectory, {

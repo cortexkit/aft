@@ -1,6 +1,7 @@
 import { type AftStatusSnapshot, degradedHeaderMarker, type StatusBar } from "../shared/status";
 
-function count(value: number | undefined): string {
+function count(value: number | undefined, off = false): string {
+  if (off) return "○";
   return value === undefined ? "?" : String(value);
 }
 
@@ -10,6 +11,7 @@ function count(value: number | undefined): string {
  * indefinitely.
  */
 function diagnosticsPart(bar: StatusBar): string {
+  if (bar.disabled_categories?.includes("diagnostics")) return "E○ W○";
   if (
     bar.errors === undefined &&
     bar.warnings === undefined &&
@@ -36,8 +38,8 @@ export function formatAftStatusSegment(status: AftStatusSnapshot | null): string
   const stale = bar.tier2_stale ? "~" : "";
   return (
     `AFT ${diagnosticsPart(bar)} | ` +
-    `${stale}D${count(bar.dead_code)} U${count(bar.unused_exports)} ` +
-    `C${count(bar.duplicates)} | T${count(bar.todos)}`
+    `${stale}D${count(bar.dead_code, bar.disabled_categories?.includes("dead_code"))} U${count(bar.unused_exports, bar.disabled_categories?.includes("unused_exports"))} ` +
+    `C${count(bar.duplicates, bar.disabled_categories?.includes("duplicates"))} | T${count(bar.todos, bar.disabled_categories?.includes("todos"))}`
   );
 }
 
@@ -53,8 +55,8 @@ function healthSummary(bar: StatusBar | undefined): string {
   const stale = bar.tier2_stale ? "~" : "";
   return (
     `${diagnosticsPart(bar)} ` +
-    `${stale}D${count(bar.dead_code)} U${count(bar.unused_exports)} ` +
-    `C${count(bar.duplicates)} T${count(bar.todos)}`
+    `${stale}D${count(bar.dead_code, bar.disabled_categories?.includes("dead_code"))} U${count(bar.unused_exports, bar.disabled_categories?.includes("unused_exports"))} ` +
+    `C${count(bar.duplicates, bar.disabled_categories?.includes("duplicates"))} T${count(bar.todos, bar.disabled_categories?.includes("todos"))}`
   );
 }
 

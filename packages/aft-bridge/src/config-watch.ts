@@ -115,6 +115,16 @@ export function aftLiveConfigKeys<C>(
     pathKey<C>("restrict_to_project_root"),
     pathKey<C>("inspect.diagnostics_timeout_ms"),
     pathKey<C>("inspect.tier2_idle_minutes"),
+    pathKey<C>("lsp.idle_minutes"),
+    ...[
+      "diagnostics",
+      "todos",
+      "dead_code",
+      "unused_exports",
+      "duplicates",
+      "cycles",
+      "complexity",
+    ].map((category) => pathKey<C>(`inspect.categories.${category}`)),
     bashKey<C>("foreground_wait_window_ms", resolveBash),
     bashKey<C>("host_fallback", resolveBash),
     bashKey<C>("runon_enabled", resolveBash),
@@ -462,6 +472,26 @@ export function aftLiveSecurityKeys<C>(keys: readonly LiveConfigKey<C>[]): LiveS
       key: pick("bash.host_fallback"),
       loosens: (current, next) => current !== true && next === true,
     },
+    {
+      key: pick("lsp.idle_minutes"),
+      loosens: (current, next) => {
+        const minutes = (value: unknown) =>
+          value === "never" ? Infinity : typeof value === "number" ? value : 60;
+        return minutes(next) > minutes(current);
+      },
+    },
+    ...[
+      "diagnostics",
+      "todos",
+      "dead_code",
+      "unused_exports",
+      "duplicates",
+      "cycles",
+      "complexity",
+    ].map((category) => ({
+      key: pick(`inspect.categories.${category}`),
+      loosens: (current: unknown, next: unknown) => current === false && next !== false,
+    })),
   ];
 }
 

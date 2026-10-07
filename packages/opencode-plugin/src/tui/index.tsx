@@ -230,6 +230,7 @@ const StatusDialog = (props: StatusDialogProps) => {
   // The earlier `formatCompressionDialogRows` returned padded strings that
   // looked offset against neighboring sections.
   const compressionAggregateRows = () => formatCompressionSidebarRows(status()?.compression);
+  const statusBar = () => status()?.status_bar ?? status()?.status_bar_values;
 
   return (
     <box
@@ -492,56 +493,59 @@ const StatusDialog = (props: StatusDialogProps) => {
 
       {/* Human health values are optional. Omit a category until the server
           proves it rather than displaying an unproven zero as clean. */}
-      {status()?.status_bar ? (
+      {statusBar() ? (
         <box flexDirection="column" width="100%" marginTop={1}>
           <text fg={t().text}>
-            <b>{status()!.status_bar!.tier2_stale ? "Code Health ~" : "Code Health"}</b>
+            <b>{statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}</b>
           </text>
-          {status()!.status_bar!.errors !== undefined ? (
+          {(statusBar()!.disabled_categories ?? []).map((key) => (
+            <R theme={t()} label={key.replaceAll("_", " ")} value="○ off" tone="muted" />
+          ))}
+          {statusBar()!.errors !== undefined ? (
             <R
               theme={t()}
               label="Errors"
-              value={formatCountShort(status()!.status_bar!.errors)}
-              tone={status()!.status_bar!.errors! > 0 ? "err" : "muted"}
+              value={formatCountShort(statusBar()!.errors)}
+              tone={statusBar()!.errors! > 0 ? "err" : "muted"}
             />
           ) : null}
-          {status()!.status_bar!.warnings !== undefined ? (
+          {statusBar()!.warnings !== undefined ? (
             <R
               theme={t()}
               label="Warnings"
-              value={formatCountShort(status()!.status_bar!.warnings)}
-              tone={status()!.status_bar!.warnings! > 0 ? "warn" : "muted"}
+              value={formatCountShort(statusBar()!.warnings)}
+              tone={statusBar()!.warnings! > 0 ? "warn" : "muted"}
             />
           ) : null}
-          {status()!.status_bar!.dead_code !== undefined ? (
+          {statusBar()!.dead_code !== undefined ? (
             <R
               theme={t()}
               label="Dead Code"
-              value={formatCountShort(status()!.status_bar!.dead_code)}
+              value={formatCountShort(statusBar()!.dead_code)}
               tone="muted"
             />
           ) : null}
-          {status()!.status_bar!.unused_exports !== undefined ? (
+          {statusBar()!.unused_exports !== undefined ? (
             <R
               theme={t()}
               label="Unused Exports"
-              value={formatCountShort(status()!.status_bar!.unused_exports)}
+              value={formatCountShort(statusBar()!.unused_exports)}
               tone="muted"
             />
           ) : null}
-          {status()!.status_bar!.duplicates !== undefined ? (
+          {statusBar()!.duplicates !== undefined ? (
             <R
               theme={t()}
               label="Duplicates"
-              value={formatCountShort(status()!.status_bar!.duplicates)}
+              value={formatCountShort(statusBar()!.duplicates)}
               tone="muted"
             />
           ) : null}
-          {status()!.status_bar!.todos !== undefined ? (
+          {statusBar()!.todos !== undefined ? (
             <R
               theme={t()}
               label="TODOs"
-              value={formatCountShort(status()!.status_bar!.todos)}
+              value={formatCountShort(statusBar()!.todos)}
               tone="muted"
             />
           ) : null}

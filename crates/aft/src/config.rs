@@ -43,9 +43,66 @@ pub const DEFAULT_IDLE_ROOT_TTL_MINUTES: u32 = 30;
 pub const MIN_IDLE_ROOT_TTL_MINUTES: u32 = 5;
 pub const MAX_IDLE_ROOT_TTL_MINUTES: u32 = 30;
 /// Language-server idle window, in minutes. Independent of artifact eviction.
-pub const DEFAULT_IDLE_LSP_TTL_MINUTES: u32 = 10;
-pub const MIN_IDLE_LSP_TTL_MINUTES: u32 = 1;
-pub const MAX_IDLE_LSP_TTL_MINUTES: u32 = 10;
+pub const DEFAULT_LSP_IDLE_MINUTES: u32 = 60;
+pub const MIN_LSP_IDLE_MINUTES: u32 = 5;
+pub const MAX_LSP_IDLE_MINUTES: u32 = 1440;
+
+/// Minutes since the last AFT tool call on that repository. `Never` disables
+/// only idle reaping, not unbind, eviction or shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub enum LspIdleMinutes {
+    Minutes(u32),
+    Never,
+}
+
+impl Default for LspIdleMinutes {
+    fn default() -> Self {
+        Self::Minutes(DEFAULT_LSP_IDLE_MINUTES)
+    }
+}
+
+impl TryFrom<serde_json::Value> for LspIdleMinutes {
+    type Error = &'static str;
+    fn try_from(value: serde_json::Value) -> Result<Self, Self::Error> {
+        if value.as_str() == Some("never") {
+            return Ok(Self::Never);
+        }
+        let minutes = value
+            .as_i64()
+            .ok_or("lsp.idle_minutes must be an integer or \"never\"")?;
+        Ok(Self::Minutes(minutes.clamp(
+            i64::from(MIN_LSP_IDLE_MINUTES),
+            i64::from(MAX_LSP_IDLE_MINUTES),
+        ) as u32))
+    }
+}
+
+impl From<LspIdleMinutes> for serde_json::Value {
+    fn from(value: LspIdleMinutes) -> Self {
+        match value {
+            LspIdleMinutes::Minutes(minutes) => Self::from(minutes),
+            LspIdleMinutes::Never => Self::from("never"),
+        }
+    }
+}
+
+impl LspIdleMinutes {
+    pub fn ttl(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Minutes(minutes) => Some(std::time::Duration::from_secs(u64::from(minutes) * 60)),
+            Self::Never => None,
+        }
+    }
+
+    pub fn tightens(self, floor: Self) -> bool {
+        match (self, floor) {
+            (_, Self::Never) => true,
+            (Self::Minutes(next), Self::Minutes(before)) => next <= before,
+            (Self::Never, _) => false,
+        }
+    }
+}
 
 const fn default_semantic_query_timeout_ms() -> u64 {
     DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
@@ -73,23 +130,20 @@ pub(crate) const fn default_bash_worker_wait_max_ms() -> u64 {
 
 use crate::harness::Harness;
 
-/// Idle reclamation windows for unbound-root artifacts and language servers.
+/// Idle reclamation window for unbound-root artifacts.
 ///
 /// `root_ttl_minutes` controls when an unbound root's indexes are evicted.
-/// `lsp_ttl_minutes` shuts down that root's language servers after no request,
-/// even while the root is still bound. Both rebuild/respawn on the next request.
+/// Reclaimed indexes rebuild on the next request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IdleConfig {
     pub root_ttl_minutes: u32,
-    pub lsp_ttl_minutes: u32,
 }
 
 impl Default for IdleConfig {
     fn default() -> Self {
         Self {
             root_ttl_minutes: DEFAULT_IDLE_ROOT_TTL_MINUTES,
-            lsp_ttl_minutes: DEFAULT_IDLE_LSP_TTL_MINUTES,
         }
     }
 }
@@ -97,10 +151,6 @@ impl Default for IdleConfig {
 impl IdleConfig {
     pub fn root_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_secs(u64::from(self.root_ttl_minutes) * 60)
-    }
-
-    pub fn lsp_ttl(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(u64::from(self.lsp_ttl_minutes) * 60)
     }
 }
 
@@ -307,6 +357,7 @@ impl Default for SemanticBackendConfig {
 #[serde(default)]
 pub struct InspectConfig {
     pub enabled: bool,
+    pub categories: InspectCategories,
     /// Deadline for the blocking LSP diagnostics phase of `aft_inspect`.
     #[serde(default = "default_inspect_diagnostics_timeout_ms")]
     pub diagnostics_timeout_ms: u64,
@@ -322,10 +373,72 @@ pub struct InspectDuplicatesConfig {
     pub expected_mirrors: Vec<[String; 2]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct InspectCategories {
+    pub diagnostics: bool,
+    pub todos: bool,
+    pub dead_code: bool,
+    pub unused_exports: bool,
+    pub duplicates: bool,
+    pub cycles: bool,
+    pub complexity: bool,
+}
+
+impl Default for InspectCategories {
+    fn default() -> Self {
+        Self {
+            diagnostics: true,
+            todos: true,
+            dead_code: true,
+            unused_exports: true,
+            duplicates: true,
+            cycles: true,
+            complexity: true,
+        }
+    }
+}
+
+impl InspectCategories {
+    pub const KEYS: [&'static str; 7] = [
+        "diagnostics",
+        "todos",
+        "dead_code",
+        "unused_exports",
+        "duplicates",
+        "cycles",
+        "complexity",
+    ];
+
+    pub fn enabled(&self, category: crate::inspect::InspectCategory) -> bool {
+        use crate::inspect::InspectCategory::*;
+        match category {
+            Diagnostics => self.diagnostics,
+            Todos => self.todos,
+            DeadCode => self.dead_code,
+            UnusedExports => self.unused_exports,
+            Duplicates => self.duplicates,
+            Cycles => self.cycles,
+            Complexity => self.complexity,
+            // Metrics is internal, not a rendered category. Scoped file counts
+            // need its scanner even when all user-facing categories are off.
+            Metrics => true,
+            _ => false,
+        }
+    }
+}
+
+impl InspectConfig {
+    pub fn category_enabled(&self, category: crate::inspect::InspectCategory) -> bool {
+        self.enabled && self.categories.enabled(category)
+    }
+}
+
 impl Default for InspectConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            categories: InspectCategories::default(),
             diagnostics_timeout_ms: default_inspect_diagnostics_timeout_ms(),
             tier2_pass_timeout_ms: default_inspect_tier2_pass_timeout_ms(),
             duplicates: InspectDuplicatesConfig::default(),
@@ -739,6 +852,7 @@ pub struct Config {
     /// Whether the system should request inline diagnostics after a tool call edits or writes a file.
     #[serde(skip)]
     pub diagnostics_on_edit: bool,
+    pub lsp_idle_minutes: LspIdleMinutes,
     /// Extra directories to search when resolving LSP binaries.
     /// The plugin populates these from its own auto-install cache (e.g.
     /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so an LSP binary
@@ -833,6 +947,7 @@ impl Default for Config {
             lsp_servers: Vec::new(),
             disabled_lsp: HashSet::new(),
             diagnostics_on_edit: false,
+            lsp_idle_minutes: LspIdleMinutes::default(),
             lsp_paths_extra: Vec::new(),
             lsp_auto_install_binaries: HashSet::new(),
             lsp_inflight_installs: HashSet::new(),

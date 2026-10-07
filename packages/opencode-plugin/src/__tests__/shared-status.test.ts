@@ -13,6 +13,7 @@ import {
   semanticIndexStatusKind,
   worktreeCacheRoleNote,
 } from "../shared/status.js";
+import { formatAftStatusSegment } from "../tui/v2-status.js";
 
 const baseResponse = Object.freeze({
   version: "0.0.0-test",
@@ -46,6 +47,19 @@ const baseResponse = Object.freeze({
 });
 
 describe("coerceAftStatus", () => {
+  test("off inspect categories survive status parsing and never show stale counts", () => {
+    const status = coerceAftStatus({
+      ...baseResponse,
+      cache_role: "main",
+      status_bar: null,
+      status_bar_values: { disabled_categories: ["dead_code", "todos"] },
+    });
+    expect(status.status_bar_values?.disabled_categories).toEqual(["dead_code", "todos"]);
+    expect(formatStatusDialogMessage(status)).toContain("dead code: ○ off");
+    expect(formatStatusDialogMessage(status)).toContain("todos: ○ off");
+    expect(formatAftStatusSegment(status)).toContain("D○");
+    expect(formatAftStatusSegment(status)).toContain("T○");
+  });
   test("adds backend and model when provided", () => {
     const status = coerceAftStatus(baseResponse as unknown as Record<string, unknown>);
 

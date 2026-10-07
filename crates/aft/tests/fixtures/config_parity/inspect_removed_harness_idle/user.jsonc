@@ -1,0 +1,9 @@
+{
+  "harnesses": {
+    "pi": {
+      "idle": {
+        "lsp_ttl_minutes": 10
+      }
+    }
+  }
+}

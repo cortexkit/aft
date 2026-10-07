@@ -35,6 +35,31 @@ const policy = JSON.parse(
 ) as { introduced_minor: string; reject_from_minor: string; paths: Record<string, string> };
 
 const roots: string[] = [];
+
+test("inspect and LSP removed keys reject even in the older translation window", () => {
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [
+      { idle: { lsp_ttl_minutes: 10 } },
+      "removed_config_key:idle.lsp_ttl_minutes:use:lsp.idle_minutes",
+    ],
+    [
+      { inspect: { tier2_soft_deadline_ms: 50 } },
+      "removed_config_key:inspect.tier2_soft_deadline_ms:use:inspect.tier2_pass_timeout_ms",
+    ],
+    [
+      { inspect: { max_drill_down_items: 20 } },
+      "removed_config_key:inspect.max_drill_down_items:use:aft_inspect.topK",
+    ],
+  ];
+  for (const [doc, expected] of cases) {
+    expect(translateConfigDocument(structuredClone(doc), "window", "user").errors).toEqual([
+      expected,
+    ]);
+    expect(
+      translateConfigDocument({ harnesses: { pi: doc } }, "rejecting", "project").errors,
+    ).toEqual([expected]);
+  }
+});
 afterEach(() => {
   for (const root of roots.splice(0)) {
     chmodSync(root, 0o755);

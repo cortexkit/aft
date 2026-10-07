@@ -3743,7 +3743,9 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 ctx.schedule_semantic_cold_seed_gate_for_configure();
             }
         }
-    } else if previous_config.inspect.enabled != next_config.inspect.enabled {
+    } else if previous_config.inspect.enabled != next_config.inspect.enabled
+        || previous_config.inspect.categories != next_config.inspect.categories
+    {
         // `inspect.enabled` is not part of the warm key (it selects no
         // artifact), but turning it on or off still restarts Tier-2 timing.
         ctx.reset_tier2_refresh_scheduler();

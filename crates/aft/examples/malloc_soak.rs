@@ -150,7 +150,8 @@ fn main() {
     if scaling {
         config["indexes"]["callgraph"] = json!(false);
         config["inspect"]["enabled"] = json!(false);
-        config["idle"] = json!({"root_ttl_minutes": 5, "lsp_ttl_minutes": 1});
+        config["idle"] = json!({"root_ttl_minutes": 5});
+        config["lsp"]["idle_minutes"] = json!(5);
     }
     fs::write(out.join("config/cortexkit/aft.jsonc"), config.to_string()).unwrap();
     for root in &roots {

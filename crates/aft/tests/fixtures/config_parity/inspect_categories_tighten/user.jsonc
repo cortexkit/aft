@@ -1,0 +1,8 @@
+{
+  "inspect": {
+    "categories": {
+      "dead_code": false,
+      "todos": true
+    }
+  }
+}

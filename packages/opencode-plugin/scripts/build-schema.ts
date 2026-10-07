@@ -231,22 +231,20 @@ function buildSchema(): Record<string, unknown> {
           },
           categories: {
             type: "object",
-            additionalProperties: { type: "boolean" },
+            properties: Object.fromEntries(
+              [
+                "diagnostics",
+                "todos",
+                "dead_code",
+                "unused_exports",
+                "duplicates",
+                "cycles",
+                "complexity",
+              ].map((key) => [key, { type: "boolean", default: true }]),
+            ),
+            additionalProperties: false,
             description:
-              "Per-category enable/disable overrides keyed by category id (e.g. { 'dead-code': false, 'todos': true }).",
-          },
-          tier2_soft_deadline_ms: {
-            type: "integer",
-            minimum: 1,
-            description:
-              "Soft deadline for Tier 2 inspect analysis in milliseconds. Analysis may be truncated beyond this.",
-          },
-          max_drill_down_items: {
-            type: "integer",
-            minimum: 1,
-            maximum: 100,
-            description:
-              "Maximum number of drill-down items returned per inspect category. Capped at 100.",
+              "Per-category computation switches, all true by default. Off categories run no scans or refreshes and render as off, never incomplete. Project config may only turn a category off.",
           },
           duplicates: {
             type: "object",
@@ -285,15 +283,9 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers.",
           },
-          lsp_ttl_minutes: {
-            type: "integer",
-            default: 10,
-            description:
-              "Minutes without a request before language servers for a root are shut down, even while the root is still bound. Default 10; values outside 1..=10 are clamped. Servers respawn on the next diagnostics request. Independent of root_ttl_minutes. User and project tiers.",
-          },
         },
         additionalProperties: false,
-        description: "Idle reclamation windows for unbound-root artifacts and language servers.",
+        description: "Idle reclamation window for unbound-root artifacts.",
       },
 
       worktree: {
@@ -547,6 +539,15 @@ function buildSchema(): Record<string, unknown> {
       lsp: {
         type: "object",
         properties: {
+          idle_minutes: {
+            anyOf: [
+              { type: "integer", minimum: 5, maximum: 1440 },
+              { type: "string", const: "never" },
+            ],
+            default: 60,
+            description:
+              "Minutes since the last AFT tool call on that repository. Default 60; integers are clamped to 5..=1440. 'never' disables only idle reaping; servers still stop on unbind, eviction and shutdown. Project config may only lower the user value, or set a number when the user has 'never'. Applies live.",
+          },
           servers: {
             type: "object",
             additionalProperties: lspServerEntry,

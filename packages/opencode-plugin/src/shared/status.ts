@@ -55,6 +55,7 @@ export interface StatusCompression {
  * absence as a clean zero.
  */
 export interface StatusBar {
+  disabled_categories?: string[];
   errors?: number;
   warnings?: number;
   dead_code?: number;
@@ -214,6 +215,9 @@ function readCompression(value: unknown): StatusCompression | undefined {
 function readStatusBar(value: unknown): StatusBar | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const bar = asRecord(value);
+  const disabled = Array.isArray(bar.disabled_categories)
+    ? bar.disabled_categories.filter((key): key is string => typeof key === "string")
+    : [];
   const errors = readOptionalNumber(bar.errors);
   const warnings = readOptionalNumber(bar.warnings);
   const deadCode = readOptionalNumber(bar.dead_code);
@@ -228,11 +232,13 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     unusedExports === null &&
     duplicates === null &&
     todos === null &&
-    !noLanguageServer
+    !noLanguageServer &&
+    disabled.length === 0
   ) {
     return undefined;
   }
   return {
+    ...(disabled.length > 0 ? { disabled_categories: disabled } : {}),
     ...(errors !== null ? { errors } : {}),
     ...(warnings !== null ? { warnings } : {}),
     ...(deadCode !== null ? { dead_code: deadCode } : {}),
@@ -437,8 +443,10 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     lines.push(`- storage dir: ${status.storage_dir ?? status.disk.storage_dir}`);
   }
 
-  if (status.status_bar) {
-    const sb = status.status_bar;
+  const sb = status.status_bar ?? status.status_bar_values;
+  if (sb) {
+    for (const key of sb.disabled_categories ?? [])
+      lines.push(`- ${key.replaceAll("_", " ")}: ○ off`);
     const rows = [
       ["errors", sb.errors],
       ["warnings", sb.warnings],
@@ -594,8 +602,10 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     lines.push(`- **Storage dir:** \`${status.storage_dir ?? status.disk.storage_dir}\``);
   }
 
-  if (status.status_bar) {
-    const sb = status.status_bar;
+  const sb = status.status_bar ?? status.status_bar_values;
+  if (sb) {
+    for (const key of sb.disabled_categories ?? [])
+      lines.push(`- **${key.replaceAll("_", " ")}:** ○ off`);
     const rows = [
       ["Errors", sb.errors],
       ["Warnings", sb.warnings],

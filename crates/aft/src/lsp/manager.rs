@@ -127,7 +127,7 @@ pub struct EnsureServerOutcomes {
 /// inspection root. The public record set is deliberately only `ServerKey`s;
 /// the definitions retained internally are used later by the explicit start
 /// step and never cause a process to be opened during resolution.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ApplicableServerSnapshot {
     pub server_keys: Vec<ServerKey>,
     /// Servers whose workspace root marker was found in the resolved area but

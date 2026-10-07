@@ -15,13 +15,12 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectConfig, OpenCodeHostConfig, RemoteExecConfig, RerankBackendKind, RerankConfig,
-    SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
-    WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
-    DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
-    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
-    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
-    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES,
+    InspectCategories, InspectConfig, LspIdleMinutes, OpenCodeHostConfig, RemoteExecConfig, RerankBackendKind,
+    RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
+    UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
     MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config::{self, PolicyPhase};
@@ -343,6 +342,7 @@ pub struct RawRerank {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct RawLsp {
+    pub idle_minutes: Option<LspIdleMinutes>,
     #[serde(default, deserialize_with = "deserialize_opt_lsp_servers")]
     pub servers: Option<BTreeMap<String, RawLspServerEntry>>,
     #[serde(
@@ -361,7 +361,8 @@ pub struct RawLsp {
 
 impl RawLsp {
     fn is_empty(&self) -> bool {
-        self.servers.is_none()
+        self.idle_minutes.is_none()
+            && self.servers.is_none()
             && self.disabled.is_none()
             && self.python.is_none()
             && self.diagnostics_on_edit.is_none()
@@ -496,11 +497,8 @@ pub struct RawInspect {
     pub tier2_pass_timeout_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_nonnegative_f64")]
     pub tier2_idle_minutes: Option<f64>,
-    pub categories: Option<HashMap<String, bool>>,
-    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
-    pub tier2_soft_deadline_ms: Option<u64>,
-    #[serde(deserialize_with = "deserialize_opt_drill_down_items")]
-    pub max_drill_down_items: Option<usize>,
+    #[serde(deserialize_with = "deserialize_opt_inspect_categories")]
+    pub categories: Option<BTreeMap<String, bool>>,
     pub duplicates: Option<RawInspectDuplicates>,
 }
 
@@ -511,8 +509,6 @@ impl RawInspect {
             && self.tier2_pass_timeout_ms.is_none()
             && self.tier2_idle_minutes.is_none()
             && self.categories.is_none()
-            && self.tier2_soft_deadline_ms.is_none()
-            && self.max_drill_down_items.is_none()
             && self.duplicates.is_none()
     }
 }
@@ -537,12 +533,11 @@ impl RawInspectDuplicates {
 #[serde(default)]
 pub struct RawIdle {
     pub root_ttl_minutes: Option<Value>,
-    pub lsp_ttl_minutes: Option<Value>,
 }
 
 impl RawIdle {
     fn is_empty(&self) -> bool {
-        self.root_ttl_minutes.is_none() && self.lsp_ttl_minutes.is_none()
+        self.root_ttl_minutes.is_none()
     }
 }
 
@@ -793,6 +788,7 @@ pub fn resolve_config_for_harness_with_phase(
             merge_trusted_config(&mut merged, raw);
         } else {
             record_project_drops(&raw, &tier.tier, &mut dropped);
+            record_resource_loosening(&merged, &raw, &tier.tier, &mut dropped);
             merge_project_config(&mut merged, raw);
         }
     }
@@ -1455,6 +1451,7 @@ fn merge_semantic_config(
 
 fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Option<RawLsp> {
     let mut lsp = base.unwrap_or(RawLsp {
+        idle_minutes: None,
         servers: None,
         disabled: None,
         python: None,
@@ -1465,6 +1462,11 @@ fn merge_lsp_config(base: Option<RawLsp>, override_lsp: Option<RawLsp>) -> Optio
     });
 
     if let Some(project) = override_lsp {
+        if let Some(idle) = project.idle_minutes {
+            if idle.tightens(lsp.idle_minutes.unwrap_or_default()) {
+                lsp.idle_minutes = Some(idle);
+            }
+        }
         if project.python.is_some() {
             lsp.python = project.python;
         }
@@ -1626,9 +1628,6 @@ fn merge_idle_config(base: Option<RawIdle>, override_idle: Option<RawIdle>) -> O
     if override_idle.root_ttl_minutes.is_some() {
         idle.root_ttl_minutes = override_idle.root_ttl_minutes;
     }
-    if override_idle.lsp_ttl_minutes.is_some() {
-        idle.lsp_ttl_minutes = override_idle.lsp_ttl_minutes;
-    }
     (!idle.is_empty()).then_some(idle)
 }
 
@@ -1659,13 +1658,13 @@ fn merge_inspect_config(
     inspect.tier2_idle_minutes = override_inspect
         .tier2_idle_minutes
         .or(inspect.tier2_idle_minutes);
-    inspect.categories = override_inspect.categories.or(inspect.categories);
-    inspect.tier2_soft_deadline_ms = override_inspect
-        .tier2_soft_deadline_ms
-        .or(inspect.tier2_soft_deadline_ms);
-    inspect.max_drill_down_items = override_inspect
-        .max_drill_down_items
-        .or(inspect.max_drill_down_items);
+    if let Some(project) = override_inspect.categories {
+        let categories = inspect.categories.get_or_insert_with(BTreeMap::new);
+        for (key, enabled) in project {
+            let user_enabled = categories.get(&key).copied().unwrap_or(true);
+            categories.insert(key, enabled && user_enabled);
+        }
+    }
     inspect.duplicates = merge_inspect_duplicates(inspect.duplicates, override_inspect.duplicates);
 
     (!inspect.is_empty()).then_some(inspect)
@@ -1708,6 +1707,45 @@ fn merge_inspect_duplicates(
         .or(duplicates.expected_mirrors);
 
     (!duplicates.is_empty()).then_some(duplicates)
+}
+
+/// Resource settings are ordered by cost: a shorter idle window or an off
+/// category tightens the user's budget. A project cannot increase that budget.
+fn record_resource_loosening(
+    base: &RawAftConfig,
+    project: &RawAftConfig,
+    tier: &str,
+    dropped: &mut Vec<DroppedKey>,
+) {
+    const REASON: &str = "resource: project settings may only tighten the user budget";
+    if let Some(next) = project.lsp.as_ref().and_then(|lsp| lsp.idle_minutes) {
+        let floor = base
+            .lsp
+            .as_ref()
+            .and_then(|lsp| lsp.idle_minutes)
+            .unwrap_or_default();
+        if !next.tightens(floor) {
+            push_drop(dropped, "lsp.idle_minutes", tier, REASON);
+        }
+    }
+    if let Some(categories) = project
+        .inspect
+        .as_ref()
+        .and_then(|inspect| inspect.categories.as_ref())
+    {
+        for (key, enabled) in categories {
+            let floor = base
+                .inspect
+                .as_ref()
+                .and_then(|inspect| inspect.categories.as_ref())
+                .and_then(|categories| categories.get(key))
+                .copied()
+                .unwrap_or(true);
+            if *enabled && !floor {
+                push_drop(dropped, &format!("inspect.categories.{key}"), tier, REASON);
+            }
+        }
+    }
 }
 
 fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<DroppedKey>) {
@@ -2133,14 +2171,6 @@ fn resolve_idle_config(raw: Option<&RawIdle>, warnings: &mut Vec<ConfigWarning>)
         MAX_IDLE_ROOT_TTL_MINUTES,
         warnings,
     );
-    idle.lsp_ttl_minutes = resolve_clamped_minutes(
-        raw.lsp_ttl_minutes.as_ref(),
-        "idle.lsp_ttl_minutes",
-        DEFAULT_IDLE_LSP_TTL_MINUTES,
-        MIN_IDLE_LSP_TTL_MINUTES,
-        MAX_IDLE_LSP_TTL_MINUTES,
-        warnings,
-    );
     idle
 }
 
@@ -2217,6 +2247,10 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
     };
     if let Some(enabled) = raw.enabled {
         inspect.enabled = enabled;
+    }
+    if let Some(categories) = &raw.categories {
+        inspect.categories = serde_json::from_value(serde_json::to_value(categories).unwrap())
+            .expect("validated inspect categories");
     }
     if let Some(value) = raw.diagnostics_timeout_ms {
         inspect.diagnostics_timeout_ms = value.clamp(
@@ -2338,6 +2372,7 @@ fn resolve_remote_exec_config(raw: &RawAftConfig) -> RemoteExecConfig {
 
 fn resolve_lsp_config(raw: &RawAftConfig, config: &mut Config) {
     let lsp = raw.lsp.as_ref();
+    config.lsp_idle_minutes = lsp.and_then(|lsp| lsp.idle_minutes).unwrap_or_default();
     let mut disabled: HashSet<String> = lsp
         .and_then(|lsp| lsp.disabled.as_ref())
         .into_iter()
@@ -2795,25 +2830,89 @@ where
     }
 }
 
-fn deserialize_opt_drill_down_items<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+fn deserialize_opt_inspect_categories<'de, D>(
+    deserializer: D,
+) -> Result<Option<BTreeMap<String, bool>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<u64>::deserialize(deserializer)?;
-    match value {
-        Some(value) if value == 0 || value > 100 => {
-            Err(de::Error::custom("max_drill_down_items must be in 1..=100"))
+    let value = Option::<BTreeMap<String, bool>>::deserialize(deserializer)?;
+    if let Some(categories) = &value {
+        if categories
+            .keys()
+            .any(|key| !InspectCategories::KEYS.contains(&key.as_str()))
+        {
+            return Err(de::Error::custom("unknown inspect category"));
         }
-        Some(value) => usize::try_from(value)
-            .map(Some)
-            .map_err(|_| de::Error::custom("max_drill_down_items is too large")),
-        None => Ok(None),
     }
+    Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_idle_default_never_and_project_tightening() {
+        let default = serde_json::to_value(resolve_config(&[]).config).unwrap();
+        assert_eq!(default["lsp_idle_minutes"], 60);
+        for (user, project, expected, refused) in [
+            ("60", "30", serde_json::json!(30), false),
+            ("30", "60", serde_json::json!(30), true),
+            ("30", "\"never\"", serde_json::json!(30), true),
+            ("\"never\"", "1440", serde_json::json!(1440), false),
+            ("\"never\"", "\"never\"", serde_json::json!("never"), false),
+        ] {
+            let result = resolve_config(&[
+                tier("user", &format!(r#"{{"lsp":{{"idle_minutes":{user}}}}}"#)),
+                tier(
+                    "project",
+                    &format!(r#"{{"lsp":{{"idle_minutes":{project}}}}}"#),
+                ),
+            ]);
+            assert!(result.errors.is_empty(), "{:?}", result.errors);
+            assert_eq!(
+                serde_json::to_value(&result.config).unwrap()["lsp_idle_minutes"],
+                expected
+            );
+            assert_eq!(
+                drop_keys(&result).contains(&"lsp.idle_minutes".to_string()),
+                refused
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_categories_project_can_only_disable() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"inspect":{"categories":{"dead_code":false,"todos":true}}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"inspect":{"categories":{"dead_code":true,"todos":false}}}"#,
+            ),
+        ]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let config = serde_json::to_value(&result.config).unwrap();
+        assert_eq!(config["inspect"]["categories"]["dead_code"], false);
+        assert_eq!(config["inspect"]["categories"]["todos"], false);
+        assert_eq!(config["inspect"]["categories"]["diagnostics"], true);
+        assert!(drop_keys(&result).contains(&"inspect.categories.dead_code".to_string()));
+    }
+
+    #[test]
+    fn inspect_cleanup_removed_keys_name_replacement() {
+        for (doc, diagnostic) in [
+            (r#"{"idle":{"lsp_ttl_minutes":10}}"#, "removed_config_key:idle.lsp_ttl_minutes:use:lsp.idle_minutes"),
+            (r#"{"inspect":{"tier2_soft_deadline_ms":50}}"#, "removed_config_key:inspect.tier2_soft_deadline_ms:use:inspect.tier2_pass_timeout_ms"),
+            (r#"{"inspect":{"max_drill_down_items":20}}"#, "removed_config_key:inspect.max_drill_down_items:use:aft_inspect.topK"),
+        ] {
+            let result = resolve_config(&[tier("user", doc)]);
+            assert_eq!(result.errors, [diagnostic], "{doc}");
+        }
+    }
 
     fn tier(tier: &str, doc: &str) -> ConfigTier {
         ConfigTier {
@@ -3662,30 +3761,18 @@ mod tests {
     }
 
     #[test]
-    fn idle_lsp_ttl_clamps_to_one_through_ten() {
-        let below = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 0 } }"#)]);
-        assert_eq!(below.config.idle.lsp_ttl_minutes, MIN_IDLE_LSP_TTL_MINUTES);
-        assert!(below
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "clamped_idle_ttl"
-                && warning.key == "idle.lsp_ttl_minutes"));
-
-        let above = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 20 } }"#)]);
-        assert_eq!(above.config.idle.lsp_ttl_minutes, MAX_IDLE_LSP_TTL_MINUTES);
-        assert!(above
-            .warnings
-            .iter()
-            .any(|warning| warning.code == "clamped_idle_ttl"
-                && warning.key == "idle.lsp_ttl_minutes"));
-
-        let at_min = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 1 } }"#)]);
-        assert_eq!(at_min.config.idle.lsp_ttl_minutes, 1);
-        assert!(at_min.warnings.is_empty());
-
-        let at_max = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 10 } }"#)]);
-        assert_eq!(at_max.config.idle.lsp_ttl_minutes, 10);
-        assert!(at_max.warnings.is_empty());
+    fn lsp_idle_clamps_to_five_through_1440() {
+        for (raw, expected) in [(0, 5), (5, 5), (1440, 1440), (2000, 1440)] {
+            let result = resolve_config(&[tier(
+                "user",
+                &format!(r#"{{"lsp":{{"idle_minutes":{raw}}}}}"#),
+            )]);
+            assert!(result.errors.is_empty());
+            assert_eq!(
+                result.config.lsp_idle_minutes,
+                LspIdleMinutes::Minutes(expected)
+            );
+        }
     }
 
     #[test]
@@ -3703,16 +3790,12 @@ mod tests {
     }
 
     #[test]
-    fn idle_project_tier_overrides_user_ttl() {
+    fn idle_project_tier_overrides_user_root_ttl() {
         let result = resolve_config(&[
-            tier("user", r#"{ "idle": { "lsp_ttl_minutes": 8 } }"#),
-            tier("project", r#"{ "idle": { "lsp_ttl_minutes": 3 } }"#),
+            tier("user", r#"{"idle":{"root_ttl_minutes":20}}"#),
+            tier("project", r#"{"idle":{"root_ttl_minutes":15}}"#),
         ]);
-        assert_eq!(result.config.idle.lsp_ttl_minutes, 3);
-        assert_eq!(
-            result.config.idle.root_ttl_minutes,
-            DEFAULT_IDLE_ROOT_TTL_MINUTES
-        );
+        assert_eq!(result.config.idle.root_ttl_minutes, 15);
     }
 
     #[test]

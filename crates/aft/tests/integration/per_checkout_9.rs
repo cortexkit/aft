@@ -889,6 +889,27 @@ fn parent_callgraph_reads_child_views_and_protects_served_generation() {
         "{reasons:?}"
     );
 
+    // A parent-folder inspect honours the same category switches without
+    // turning missing child aggregates into incomplete disabled categories.
+    parent.update_config(|config| {
+        config.inspect.categories.dead_code = false;
+        config.inspect.categories.todos = false;
+    });
+    let off = aft::views::parent::route(
+        &request(json!({
+            "id":"parent-inspect-off", "command":"inspect", "scope":"graph", "sections":["dead_code","todos"]
+        })),
+        &parent,
+    )
+    .unwrap();
+    assert_eq!(off.data["complete"], true, "{}", off.data);
+    assert!(off.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("dead code: off (inspect.categories.dead_code)"));
+    assert_eq!(off.data["summary"]["todos"]["off"], true);
+    assert_eq!(parent.inspect_manager().reuse_start_count_for_test(), 0);
+
     // Hold the served generation, let the child publish a new one, and sweep
     // the child's view: the parent's read marker keeps the old generation.
     session.pause_refresh(true);

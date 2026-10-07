@@ -3,6 +3,33 @@ use crate::config_resolve::{resolve_config_for_harness_with_phase, ConfigTier};
 use crate::harness::Harness;
 use serde_json::json;
 
+#[test]
+fn inspect_cleanup_doctor_maps_idle_and_drops_inert_keys() {
+    for (old, expected) in [(1, 5), (10, 10), (2000, 1440)] {
+        let doc = json!({"idle":{"root_ttl_minutes":20,"lsp_ttl_minutes":old},"inspect":{"tier2_soft_deadline_ms":50,"max_drill_down_items":20,"enabled":false},"harnesses":{"pi":{"idle":{"lsp_ttl_minutes":old}}}}).to_string();
+        let migrated = migrate_config_text(&doc, FixTier::User).unwrap();
+        assert!(migrated.changed);
+        let value: Value =
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&migrated.text)).unwrap();
+        assert_eq!(value["lsp"]["idle_minutes"], expected);
+        assert_eq!(value["idle"], json!({"root_ttl_minutes":20}));
+        assert_eq!(value["inspect"], json!({"enabled":false}));
+        assert_eq!(value["harnesses"]["pi"]["lsp"]["idle_minutes"], expected);
+        assert!(
+            !migrate_config_text(&migrated.text, FixTier::User)
+                .unwrap()
+                .changed
+        );
+    }
+    let migrated = migrate_config_text(
+        r#"{"idle":{"lsp_ttl_minutes":10},"lsp":{"idle_minutes":"never"}}"#,
+        FixTier::User,
+    )
+    .unwrap();
+    let value: Value = serde_json::from_str(&migrated.text).unwrap();
+    assert_eq!(value["lsp"]["idle_minutes"], "never", "canonical key wins");
+}
+
 fn resolved(doc: &str, tier: &str, harness: Option<&Harness>, phase: PolicyPhase) -> Value {
     let mut tiers = Vec::new();
     if tier == "project" {

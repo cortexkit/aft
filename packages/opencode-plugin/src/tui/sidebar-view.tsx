@@ -421,7 +421,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
   const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
   const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
-  const statusBar = () => s()?.status_bar;
+  const statusBar = () => s()?.status_bar ?? s()?.status_bar_values;
 
   const degradedSummary = () => {
     const snap = s();
@@ -653,6 +653,14 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
                 palette={props.palette}
                 title={statusBar()!.tier2_stale ? "Code Health ~" : "Code Health"}
               />
+              {(statusBar()!.disabled_categories ?? []).map((key) => (
+                <StatRow
+                  palette={props.palette}
+                  label={key.replaceAll("_", " ")}
+                  value="○ off"
+                  tone="muted"
+                />
+              ))}
               {statusBar()!.errors !== undefined && (
                 <StatRow
                   palette={props.palette}

@@ -1,0 +1,5 @@
+{
+  "rejected": [
+    "removed_config_key:inspect.max_drill_down_items:use:aft_inspect.topK"
+  ]
+}

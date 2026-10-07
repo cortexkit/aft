@@ -378,6 +378,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // consumer's diagnostic completeness.
     "diagnostics_timeout_ms": 120000,
     "tier2_idle_minutes": 5,      // debounce before idle-triggered Tier 2 background scans
+    // Computation switches, all true by default. Projects can turn categories
+    // off, never restore a category the user turned off. Applies live.
+    "categories": {
+      "diagnostics": true, "todos": true, "dead_code": true,
+      "unused_exports": true, "duplicates": true, "cycles": true,
+      "complexity": true
+    },
     "duplicates": {
       // Intentional mirror pairs, matched against project-root-relative
       // forward-slash paths. Groups fully spanning one pair are suppressed but
@@ -388,15 +395,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
 
   // Idle reclamation. User and project tiers. Values outside the documented
   // ranges are clamped with a warning; non-integers are dropped with a warning.
-  // Reclaimed indexes rebuild and language servers respawn on the next request.
+  // Reclaimed indexes rebuild on the next request.
   "idle": {
     // Minutes without tool traffic before an unbound root's artifacts are
     // evicted. Default 30; clamped to 5..=30.
-    "root_ttl_minutes": 30,
-    // Minutes without a request before language servers for a root shut down,
-    // even while the root is still bound. Default 10; clamped to 1..=10.
-    // Independent of root_ttl_minutes.
-    "lsp_ttl_minutes": 10
+    "root_ttl_minutes": 30
   },
 
   // Automatic undo snapshots. Existing-file mutations larger than 64 MiB and
@@ -711,6 +714,43 @@ canonical shape is the top-level `bash` block shown above. `experimental` now ho
 `lsp_ty`.
 
 ## Language servers (LSP)
+
+`lsp.idle_minutes` is **minutes since the last AFT tool call on that repository**,
+not time since the language server last emitted a diagnostic. It defaults to
+`60`; integer values are clamped to `5..=1440`. Set it to `"never"` to disable
+idle reaping. This does not prevent shutdown on unbind, eviction or daemon
+shutdown, and is independent of `idle.root_ttl_minutes`. Reaped servers respawn
+when next needed. The same activity definition applies to standalone and subc.
+
+This is a **tighten-only resource setting**: project config may lower the user's
+number, or choose a number when the user chose `"never"`. A larger project value
+or `"never"` over a user number is ignored and reported as a dropped key by the
+Rust resolver. Both plugins apply the same floor. The default `60` is the floor
+when the user did not set it. Active harness overrides obey their tier's trust
+rules. Changes apply live, at the next request/maintenance boundary, without
+restarting AFT. A project edit cannot remove an already published tightening
+until reconnect; trusted user edits may change the user budget in either direction.
+
+`inspect.categories` has exactly seven boolean keys: `diagnostics`, `todos`,
+`dead_code`, `unused_exports`, `duplicates`, `cycles`, `complexity`. All default
+to `true`. A false category is not scanned, built or refreshed, for scoped or
+unscoped inspections; it emits only e.g. `dead code: off (inspect.categories.dead_code)`.
+It cannot make the header PARTIAL and does not show a cached findings count.
+Status bars use **`○` for off** (e.g. `D○`), distinct from `?` for unknown and
+`0` for verified clean. Metrics remains internal and always computed for scoped
+file counts; it is not a configurable or rendered category. Project config can
+turn categories off, but cannot turn on a category the user turned off. Category
+changes apply live; work already admitted retains its pinned configuration.
+`inspect.enabled: false` remains the whole-tool runtime switch.
+
+`idle.lsp_ttl_minutes` is removed in favour of `lsp.idle_minutes`.
+`inspect.tier2_soft_deadline_ms` and `inspect.max_drill_down_items` were inert and
+are removed (the diagnostics name `inspect.tier2_pass_timeout_ms` and
+`aft_inspect.topK`, respectively). Loading any of these old keys is rejected as
+`removed_config_key`, including inside harness blocks. Run
+`npx @cortexkit/aft doctor --fix`: it moves the old idle value to `lsp.idle_minutes`,
+clamped to the new range (an existing canonical value wins), and drops the two
+inert inspect keys. There is no load-time compatibility translation.
 
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
 calls. Servers are spawned lazily — only when a file matching their extensions is touched, and

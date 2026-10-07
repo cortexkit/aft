@@ -208,7 +208,30 @@ fn migrate_block(
         }
     }
 
-    for (path, _) in RETIRED_PATHS {
+    if let Some(value) = raw.get("idle").and_then(|idle| idle.get("lsp_ttl_minutes")) {
+        if raw
+            .get("lsp")
+            .and_then(|lsp| lsp.get("idle_minutes"))
+            .is_none()
+        {
+            let minutes = value
+                .as_i64()
+                .unwrap_or(i64::from(crate::config::DEFAULT_LSP_IDLE_MINUTES))
+                .clamp(
+                    i64::from(crate::config::MIN_LSP_IDLE_MINUTES),
+                    i64::from(crate::config::MAX_LSP_IDLE_MINUTES),
+                );
+            doc.set(
+                &path_of(prefix, &["lsp", "idle_minutes"]),
+                &Value::from(minutes),
+            )?;
+        }
+    }
+
+    for (path, _) in RETIRED_PATHS
+        .into_iter()
+        .chain(feature_config::REMOVED_INSPECT_LSP_PATHS)
+    {
         let segments: Vec<&str> = path.split('.').collect();
         let present = match segments.as_slice() {
             [key] => raw.contains_key(*key),
@@ -265,8 +288,19 @@ pub fn migrate_config_text(text: &str, tier: FixTier) -> Result<Migration, Strin
     };
     let translation =
         feature_config::translate_document(&mut translated, PolicyPhase::Window, document_tier);
-    if !translation.errors.is_empty() {
-        return Err(translation.errors.join("\n"));
+    // The clean-cut inspect/LSP removals are repaired below, not translated at
+    // load time. Preserve all other rejection diagnostics.
+    let errors: Vec<_> = translation
+        .errors
+        .into_iter()
+        .filter(|error| {
+            !feature_config::REMOVED_INSPECT_LSP_PATHS
+                .iter()
+                .any(|(path, _)| error.starts_with(&format!("removed_config_key:{path}:")))
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
     }
     let translated = Value::Object(translated);
     for prefix in &prefixes {

@@ -1,0 +1,5 @@
+{
+  "rejected": [
+    "removed_config_key:inspect.tier2_soft_deadline_ms:use:inspect.tier2_pass_timeout_ms"
+  ]
+}

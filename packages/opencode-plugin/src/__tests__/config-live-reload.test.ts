@@ -85,6 +85,21 @@ function sdkContext(): ToolContext {
 }
 
 describe.serial("OpenCode live config reload", () => {
+  test("inspect categories and LSP idle minutes follow trusted user edits live", async () => {
+    const f = await fixture(
+      '{"lsp":{"idle_minutes":60},"inspect":{"categories":{"dead_code":true}}}',
+    );
+    writeFileSync(
+      f.userPath,
+      '{"lsp":{"idle_minutes":"never"},"inspect":{"categories":{"dead_code":false}}}',
+    );
+    const result = f.reload.reload();
+    expect(result?.applied).toContain("lsp.idle_minutes");
+    expect(result?.applied).toContain("inspect.categories.dead_code");
+    expect(result?.deferred).toEqual([]);
+    expect(f.ctx.config.lsp?.idle_minutes).toBe("never");
+    expect(f.ctx.config.inspect?.categories?.dead_code).toBe(false);
+  });
   test("a bash_watch cap edit reaches the next call; a restart-only key does not", async () => {
     const f = await fixture('{ "bash": { "watch_sync_max_ms": 120000, "background": true } }');
     const watchTool = createBashWatchTool(f.ctx);

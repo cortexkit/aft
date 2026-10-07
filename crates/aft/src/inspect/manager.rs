@@ -1316,6 +1316,9 @@ impl InspectManager {
         deadline: Instant,
     ) -> JobOutcome {
         let wait_started = Instant::now();
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return JobOutcome::off();
+        }
         let wait_budget = deadline.saturating_duration_since(wait_started);
         if !category.is_active() {
             return JobOutcome::Failed {
@@ -1374,6 +1377,9 @@ impl InspectManager {
         caller_scope: JobScope,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> Result<JobKey, String> {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return Err(format!("inspect.categories.{} is off", category.as_str()));
+        }
         if !category.is_active() {
             return Err(format!(
                 "inspect category '{category}' is disabled in v0.33"
@@ -1398,6 +1404,9 @@ impl InspectManager {
         snapshot: InspectSnapshot,
         category: InspectCategory,
     ) -> Result<Option<JobKey>, String> {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return Ok(None);
+        }
         if !category.is_active() {
             return Err(format!(
                 "inspect category '{category}' is disabled in v0.33"
@@ -1477,6 +1486,9 @@ impl InspectManager {
         let mut requested = Vec::new();
 
         for category in categories {
+            if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+                continue;
+            }
             if !category.is_active() {
                 submission.errors.push(Tier2RunSubmissionError {
                     category,
@@ -2168,6 +2180,9 @@ impl InspectManager {
         caller_scope: JobScope,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> JobOutcome {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return JobOutcome::off();
+        }
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
@@ -2222,6 +2237,9 @@ impl InspectManager {
         scope: JobScope,
         store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
     ) -> JobOutcome {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return JobOutcome::off();
+        }
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
@@ -2323,6 +2341,9 @@ impl InspectManager {
         caller_scope: JobScope,
         require_callgraph_snapshot: bool,
     ) -> JobOutcome {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return JobOutcome::off();
+        }
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
@@ -2469,6 +2490,9 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return JobOutcome::off();
+        }
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
@@ -2490,6 +2514,9 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
+        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            return JobOutcome::off();
+        }
         if let Err(outcome) = validate_tier2_read_category(category) {
             return outcome;
         }
@@ -2659,6 +2686,17 @@ impl InspectManager {
         permit_slot: Option<Tier2PermitSlot>,
     ) -> InspectResult {
         let started = Instant::now();
+        if job.category.is_active() && !job.config.inspect.category_enabled(job.category) {
+            return InspectResult::success(
+                &job,
+                InspectScanSuccess {
+                    scanned_files: Vec::new(),
+                    contributions: Vec::new(),
+                    aggregate: serde_json::json!({"off":true,"complete":true}),
+                },
+                Duration::ZERO,
+            );
+        }
         self.reuse_starts.fetch_add(1, Ordering::SeqCst);
         self.wait_for_tier2_reuse_waiter_for_debug(&job);
         panic_tier2_reuse_for_debug(&job);
@@ -6958,6 +6996,57 @@ mod guard_tests {
             count >= 1,
             "expected the fixture's TODO markers, got {count}"
         );
+    }
+
+    #[test]
+    fn disabled_inspect_category_starts_zero_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let mut snapshot = tier1_snapshot(&root);
+        let mut config = (*snapshot.config).clone();
+        config.inspect.categories.dead_code = false;
+        config.inspect.categories.todos = false;
+        snapshot.config = Arc::new(config);
+        let manager = Arc::new(InspectManager::new());
+        let scope = JobScope::for_project(root.clone());
+        let initial = manager.next_job_id.load(Ordering::Relaxed);
+        assert!(manager
+            .submit_background(snapshot.clone(), InspectCategory::Todos, scope.clone())
+            .is_err());
+        assert!(manager
+            .submit_tier2_run_with_reuse_background(snapshot.clone(), InspectCategory::DeadCode)
+            .unwrap()
+            .is_none());
+        let submission = manager.submit_tier2_run_with_reuse_serial_background(
+            snapshot.clone(),
+            vec![InspectCategory::DeadCode],
+        );
+        assert!(submission.queued_categories.is_empty());
+        let outcome = manager.tier2_run_with_reuse_blocking(
+            snapshot.clone(),
+            InspectCategory::DeadCode,
+            scope.clone(),
+        );
+        assert_eq!(outcome.payload().unwrap()["off"], true);
+        let outcome = manager.tier2_read_cached_readonly(
+            snapshot.clone(),
+            InspectCategory::DeadCode,
+            scope.clone(),
+        );
+        assert_eq!(outcome.payload().unwrap()["off"], true);
+        assert_eq!(manager.automatic_tier2_schedule_count_for_test(), 0);
+        assert_eq!(manager.reuse_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(manager.next_job_id.load(Ordering::Relaxed), initial);
+        assert!(
+            !snapshot.inspect_dir.exists(),
+            "off categories must not even open their cache"
+        );
+        // Positive control: the unchanged Metrics scanner actually dispatches.
+        assert!(matches!(
+            manager.submit_category(snapshot, InspectCategory::Metrics, scope),
+            JobOutcome::Fresh { .. }
+        ));
+        assert!(manager.next_job_id.load(Ordering::Relaxed) > initial);
     }
 
     fn snapshot_job(root: &Path, inspect_dir: &Path, callgraph_store: bool) -> InspectJob {

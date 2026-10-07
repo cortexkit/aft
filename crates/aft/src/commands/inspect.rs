@@ -374,6 +374,12 @@ fn resolve_inspect_applicability(
     config: &Config,
     deadline: Instant,
 ) -> Result<ApplicableServerSnapshot, ApplicabilityResolutionError> {
+    if !config
+        .inspect
+        .category_enabled(InspectCategory::Diagnostics)
+    {
+        return Ok(ApplicableServerSnapshot::default());
+    }
     let walk = crate::lsp::manager::walk_applicable_area(
         project_root,
         scoped_roots,
@@ -508,7 +514,10 @@ fn handle_inspect_payload(
 
     // Wait while the request's config/query guard is alive. The result is pinned
     // once and handed into workers; they must not open another generation.
-    let routed_store = if ctx.checkout_query_runtime_active() {
+    let tier2_enabled = InspectCategory::active()
+        .iter()
+        .any(|category| category.is_tier2() && snapshot.config.inspect.category_enabled(*category));
+    let routed_store = if tier2_enabled && ctx.checkout_query_runtime_active() {
         ctx.callgraph_store_for_ops()
     } else {
         crate::context::CallgraphStoreAccess::Unavailable
@@ -525,7 +534,7 @@ fn handle_inspect_payload(
     let manager = ctx.inspect_manager();
     // A writer-backed unscoped request must retain contribution reuse. Only
     // requests the legacy scanner cannot serve need an ephemeral view scan.
-    let needs_ephemeral_view = scope_was_provided || !ctx.inspect_writer();
+    let needs_ephemeral_view = (scope_was_provided || !ctx.inspect_writer()) && tier2_enabled;
     let checkout_store =
         if needs_ephemeral_view && snapshot.config.views.enabled && !checkout_routed {
             manager.current_checkout_view(&snapshot, observed_stats.map(|stats| stats.0.as_slice()))
@@ -542,11 +551,19 @@ fn handle_inspect_payload(
         )
     });
     let mut outcomes = BTreeMap::new();
+    for category in InspectCategory::active().iter().copied() {
+        if !snapshot.config.inspect.category_enabled(category) {
+            outcomes.insert(category, JobOutcome::off());
+        }
+    }
     if blocking_tier1_deadline.is_none() {
         // The nonblocking path gives each Tier-1 scan a short soft deadline. Join
         // those completion events before queuing parse-heavy Tier-2 work so the
         // request cannot consume its own budget waiting behind work it enqueued.
         for category in [InspectCategory::Metrics, InspectCategory::Todos] {
+            if outcomes.contains_key(&category) {
+                continue;
+            }
             if inspect_cancellation_requested() {
                 return inspect_interrupted_response(&req.id);
             }
@@ -565,6 +582,9 @@ fn handle_inspect_payload(
         .copied()
         .filter(|category| category.is_tier2())
     {
+        if outcomes.contains_key(&category) {
+            continue;
+        }
         if (scope_was_provided || !ctx.inspect_writer()) && !use_checkout_view {
             continue;
         }
@@ -2598,6 +2618,13 @@ fn build_inspect_payload(
     let mut gaps = Vec::new();
 
     for category in InspectCategory::active() {
+        if !snapshot.config.inspect.category_enabled(*category) {
+            summary.insert(
+                category.as_str().to_string(),
+                serde_json::json!({"off": true, "complete": true}),
+            );
+            continue;
+        }
         // `fresh_payloads` established this invariant before this emitter runs.
         // Keeping the fresh payload separate from JobOutcome prevents accidental
         // reintroduction of a stale or pending branch into a successful response.
@@ -2787,6 +2814,7 @@ fn build_inspect_payload(
             "tier2_trigger_reason": ctx.tier2_trigger_reason(),
             "disabled_categories": InspectCategory::disabled()
                 .iter()
+                .chain(InspectCategory::active().iter().filter(|category| !snapshot.config.inspect.category_enabled(**category)))
                 .map(|category| category.as_str())
                 .collect::<Vec<_>>(),
         }
@@ -2874,6 +2902,14 @@ fn render_inspect_text(
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary, details);
+    for (category, value) in summary {
+        if value["off"] == true {
+            lines.push(format!(
+                "{}: off (inspect.categories.{category})",
+                category.replace('_', " ")
+            ));
+        }
+    }
     // Uncomputed categories have no counts, so the incomplete-category notice
     // is their only output.
     let available_summary = summary
@@ -2881,6 +2917,7 @@ fn render_inspect_text(
         .filter(|(_, value)| {
             value.get("unavailable").and_then(Value::as_bool) != Some(true)
                 && value["not_computed"] != true
+                && value["off"] != true
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<String, Value>>();
@@ -5117,6 +5154,109 @@ mod fresh_payload_tests {
     use super::*;
     use crate::config::Config;
     use crate::parser::SymbolCache;
+
+    #[test]
+    fn disabled_inspect_categories_render_off_and_never_partial() {
+        let mut snapshot = snapshot();
+        let mut config = (*snapshot.config).clone();
+        config.inspect.categories = serde_json::from_value(serde_json::json!({
+            "diagnostics":false, "todos":false, "dead_code":false, "unused_exports":false,
+            "duplicates":false, "cycles":false, "complexity":false,
+        }))
+        .unwrap();
+        snapshot.config = Arc::new(config);
+        let mut payloads = fresh_payloads_for_all_categories();
+        // Stale/incomplete old cache rows must not leak into an off category.
+        for category in InspectCategory::active()
+            .iter()
+            .filter(|category| **category != InspectCategory::Metrics)
+        {
+            payloads.insert(*category, serde_json::json!({"unavailable":true,"complete":false,"gaps":[{"reason":"stale old cache"}]}));
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let roots = [PathBuf::from("/repo/src")];
+        for scope in [None, Some(roots.as_slice())] {
+            let payload =
+                build_inspect_payload(&snapshot, &payloads, &Sections::all(), 10, &ctx, scope);
+            let response = build_inspect_terminal(
+                "off",
+                &InspectPhaseLog::for_request("off"),
+                InspectTerminal::Fresh(payload),
+            );
+            assert_eq!(
+                response.data["inspect_terminal"], "fresh",
+                "{}",
+                response.data
+            );
+            assert_eq!(response.data["complete"], true);
+            let text = response.data["text"].as_str().unwrap();
+            for key in crate::config::InspectCategories::KEYS {
+                assert!(
+                    text.contains(&format!(
+                        "{}: off (inspect.categories.{key})",
+                        key.replace('_', " ")
+                    )),
+                    "{text}"
+                );
+                assert_eq!(
+                    response.data["summary"][key],
+                    serde_json::json!({"off":true,"complete":true})
+                );
+            }
+            assert!(!text.contains("PARTIAL"), "{text}");
+        }
+    }
+
+    #[test]
+    fn disabled_inspect_categories_tool_call_dispatches_no_tier2_jobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(
+            root.join("lib.ts"),
+            "export const unused = 1; // TODO: fixture\n",
+        )
+        .unwrap();
+        let mut config = Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(root.join("storage")),
+            harness: Some(crate::harness::Harness::Opencode),
+            ..Config::default()
+        };
+        config.inspect.categories = serde_json::from_value(serde_json::json!({
+            "diagnostics":false, "todos":false, "dead_code":false, "unused_exports":false,
+            "duplicates":false, "cycles":false, "complexity":false,
+        }))
+        .unwrap();
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let manager = ctx.inspect_manager();
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"scope":root.join("lib.ts")}),
+        ] {
+            let req = RawRequest {
+                id: "off".to_string(),
+                command: "inspect".to_string(),
+                lsp_hints: None,
+                session_id: None,
+                params,
+            };
+            let response = handle_inspect(&req, &ctx);
+            assert!(response.success, "{}", response.data);
+            assert_eq!(response.data["complete"], true, "{}", response.data);
+            assert!(response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("dead code: off"));
+            assert_eq!(manager.reuse_start_count_for_test(), 0);
+            assert_eq!(manager.automatic_tier2_schedule_count_for_test(), 0);
+            assert_eq!(manager.source_scan_files_for_test(), 0);
+            assert_eq!(ctx.lsp().server_count(), 0);
+        }
+    }
 
     fn snapshot() -> InspectSnapshot {
         InspectSnapshot::new(

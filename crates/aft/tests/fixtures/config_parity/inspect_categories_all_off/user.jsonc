@@ -1,0 +1,13 @@
+{
+  "inspect": {
+    "categories": {
+      "diagnostics": false,
+      "todos": false,
+      "dead_code": false,
+      "unused_exports": false,
+      "duplicates": false,
+      "cycles": false,
+      "complexity": false
+    }
+  }
+}

@@ -21,6 +21,15 @@ import {
 } from "../shared/status.js";
 
 describe("shared status helpers", () => {
+  test("off inspect categories survive status parsing and never show stale counts", () => {
+    const status = coerceAftStatus({
+      status_bar: null,
+      status_bar_values: { disabled_categories: ["dead_code", "todos"] },
+    });
+    expect(status.status_bar?.disabled_categories).toEqual(["dead_code", "todos"]);
+    expect(formatStatusDialogMessage(status)).toContain("dead code: ○ off");
+    expect(formatStatusDialogMessage(status)).toContain("todos: ○ off");
+  });
   test("coerceAftStatus tolerates missing and malformed fields without crashing", () => {
     const status = coerceAftStatus({
       version: 123,

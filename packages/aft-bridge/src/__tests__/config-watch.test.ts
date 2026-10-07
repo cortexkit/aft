@@ -16,6 +16,7 @@ import {
 } from "../config-watch.js";
 
 type TestConfig = {
+  lsp?: { idle_minutes?: number | "never" };
   restrict_to_project_root?: boolean;
   disabled_tools?: string[];
   bash?: boolean | Record<string, unknown>;
@@ -52,6 +53,22 @@ function tempDir(): string {
 }
 
 describe("applyLiveConfigKeys", () => {
+  test("inspect categories and LSP idle minutes apply live without deferral", () => {
+    const current: TestConfig = {
+      lsp: { idle_minutes: 60 },
+      inspect: { categories: { dead_code: true } },
+    };
+    const next: TestConfig = {
+      lsp: { idle_minutes: "never" },
+      inspect: { categories: { dead_code: false } },
+    };
+    const result = applyLiveConfigKeys(current, next, KEYS);
+    expect(result.applied).toContain("lsp.idle_minutes");
+    expect(result.applied).toContain("inspect.categories.dead_code");
+    expect(result.deferred).toEqual([]);
+    expect(result.config).toEqual(next);
+    expect(current.lsp?.idle_minutes).toBe(60);
+  });
   test("applies a live key and defers the rest", () => {
     const current: TestConfig = { restrict_to_project_root: false, disabled_tools: [] };
     const next: TestConfig = { restrict_to_project_root: true, disabled_tools: ["aft_zoom"] };

@@ -3590,14 +3590,16 @@ pub fn drain_lsp_events(ctx: &AppContext) {
 }
 
 /// Shut down language servers for a standalone runtime whose last request is
-/// older than `idle.lsp_ttl_minutes`. Subc uses the same helper with its own
+/// older than `lsp.idle_minutes`. Subc uses the same helper with its own
 /// per-root activity stamp.
 pub fn shutdown_idle_lsp(ctx: &AppContext) {
     shutdown_idle_lsp_at(ctx, Instant::now(), ctx.last_request_at());
 }
 
 pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Instant) {
-    let ttl = ctx.config().idle.lsp_ttl();
+    let Some(ttl) = ctx.config().lsp_idle_minutes.ttl() else {
+        return;
+    };
     let idle = now.saturating_duration_since(last_activity);
     if idle < ttl {
         return;
@@ -3627,7 +3629,7 @@ pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Insta
     aft::slog_info!(
         "idle lsp reap {root}: shut down {n} server(s) after {}m (ttl {}m)",
         idle.as_secs() / 60,
-        ctx.config().idle.lsp_ttl_minutes
+        ttl.as_secs() / 60
     );
     crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
 }
@@ -7893,7 +7895,7 @@ mod idle_lsp_tests {
     fn idle_lsp_ttl_shuts_down_stale_client_and_keeps_recent() {
         let tmp = tempfile::tempdir().unwrap();
         let mut stale_config = Config::default();
-        stale_config.idle.lsp_ttl_minutes = 1;
+        stale_config.lsp_idle_minutes = crate::config::LspIdleMinutes::Minutes(5);
         let stale = AppContext::new(
             crate::context::default_language_provider_factory(),
             stale_config,
@@ -7901,7 +7903,7 @@ mod idle_lsp_tests {
         let pid = spawn_sleep_client(&stale, tmp.path().to_path_buf());
         assert_eq!(stale.lsp().server_count(), 1);
         let now = Instant::now();
-        stale.set_last_request_at_for_test(now - Duration::from_secs(61));
+        stale.set_last_request_at_for_test(now - Duration::from_secs(301));
         let started = Instant::now();
         shutdown_idle_lsp_at(&stale, now, stale.last_request_at());
         assert!(
@@ -7912,7 +7914,7 @@ mod idle_lsp_tests {
         assert_eq!(
             stale.lsp().server_count(),
             0,
-            "a root idle longer than lsp_ttl_minutes must shut down its language servers"
+            "a root idle longer than lsp.idle_minutes must shut down its language servers"
         );
         assert!(
             wait_until_dead(pid, Duration::from_secs(6)),
@@ -7920,7 +7922,7 @@ mod idle_lsp_tests {
         );
 
         let mut fresh_config = Config::default();
-        fresh_config.idle.lsp_ttl_minutes = 1;
+        fresh_config.lsp_idle_minutes = crate::config::LspIdleMinutes::Minutes(5);
         let fresh = AppContext::new(
             crate::context::default_language_provider_factory(),
             fresh_config,
@@ -7933,5 +7935,24 @@ mod idle_lsp_tests {
             1,
             "a root with recent activity must keep its language servers"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_idle_never_keeps_server_past_any_idle_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.lsp_idle_minutes = crate::config::LspIdleMinutes::Never;
+        let ctx = AppContext::new(crate::context::default_language_provider_factory(), config);
+        let pid = spawn_sleep_client(&ctx, tmp.path().to_path_buf());
+        let last_activity = Instant::now();
+        shutdown_idle_lsp_at(
+            &ctx,
+            last_activity + Duration::from_secs(60 * 60 * 24 * 365),
+            last_activity,
+        );
+        assert_eq!(ctx.lsp().server_count(), 1);
+        assert!(crate::bash_background::process::is_process_alive(pid));
+        ctx.lsp().shutdown_all();
     }
 }

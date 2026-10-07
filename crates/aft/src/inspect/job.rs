@@ -668,6 +668,11 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
+    pub fn off() -> Self {
+        Self::Fresh {
+            payload: serde_json::json!({"off": true, "complete": true}),
+        }
+    }
     pub fn pending(in_flight: bool) -> Self {
         Self::Pending {
             in_flight,
