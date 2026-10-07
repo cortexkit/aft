@@ -4,7 +4,7 @@
 
 The publication candidate walk used `BlobStore::get` to decide whether to extract a callgraph blob already present in a repository family. `get` selected the entire payload, allocated its bytes, and validated its BLAKE3 digest. A new worktree has no previous manifest, so the same-key shortcut against the previous generation cannot help it. This made the walk read every shared callgraph payload, only to discard it.
 
-`BlobStore::contains` now checks key and payload schema using the covering `blob_presence(full_key, payload_schema)` index. The SQL explicitly selects that index because `blob_payloads` is WITHOUT ROWID: its primary-key tree contains the payload. The existing narrower `blob_membership` index remains available to closure probes. Creating the new index on an older store is a one-time migration scan, not a scan on each publication.
+`BlobStore::contains` probes only the key through the existing covering `blob_membership(full_key)` index. The SQL explicitly selects that index because `blob_payloads` is WITHOUT ROWID: its primary-key tree contains the payload. No new index is created at store open. In particular, an index on `(full_key, payload_schema)` is avoided: `payload_schema` follows `payload` in the SQLite record, so constructing it on an existing store would traverse payload overflow chains across the whole table.
 
 All production presence-only callers of the original `BlobStore::get` were changed:
 
@@ -16,11 +16,25 @@ The remaining production callers consume bytes and keep verification: `commands:
 
 ### Integrity policy
 
-Membership does **not** promise that a payload is uncorrupted. Compatible schema is checked cheaply; digest validation happens when bytes are consumed. `get` retains its digest/schema checks and rejection-as-miss behavior. No permanent verified bit is used: it would not detect corruption after verification without another read.
+Membership does **not** promise that a payload is uncorrupted or has a valid schema field. Both schema and digest validation happen when bytes are consumed. `get` retains its digest/schema checks and rejection-as-miss behavior. No permanent verified bit is used: it would not detect corruption after verification without another read.
 
 The original manifest materialization reader used direct `SELECT payload`, bypassing `get`. Therefore merely changing the presence probe would not have been a safe lazy-validation policy. Both `get` and that reader now use `read_verified_payload`; corrupt payloads cannot enter a newly joined derived graph. Existing immutable rows are still not repaired or overwritten. A rejected row can prevent publication until the existing quarantine/new-key recovery policy resolves it.
 
 The existing `views_corrupt_cached_payload_is_not_reused` test now asserts rejection at consumption, rather than expecting pointless re-extraction of an immutable corrupt row. The cached-content extraction test remains unchanged. Materialization tests now seed the real digest/schema columns rather than a payload-only mock table, and a new test rejects corrupt digest and schema at consumption. Already-published derived generations are not rescanned on a no-op publication.
+
+### Key derivation and opening deployed stores
+
+The numeric `payload_schema` column is **not directly hashed into FullKey**. Producer versions are:
+
+- `blob_store::SemanticKey::full_key` hashes the domain `aft/blob-store/semantic/v1` and the source digest, relative path, chunker version, embedding-template version, and model fingerprint. `SemanticKey::for_current` supplies `SEMANTIC_PRODUCER_VERSION` for both producer components.
+- `blob_store::CallgraphKey::full_key` hashes the domain `aft/blob-store/callgraph/v1` and the source digest, language, and extractor version. `CallgraphKey::for_current` supplies `CALLGRAPH_PRODUCER_VERSION`; publication instead supplies `views::callgraph::PRODUCER` (`ruled-callgraph-v3`) to `from_bytes`.
+- The private `blob_store::full_key` helper length-prefixes every field and BLAKE3-hashes the domain and fields. The contract above the payload-schema constants, defended by `payload_schema_and_producer_version_pairs_are_pinned`, requires a producer-key version bump with each payload-format change.
+
+Thus properly versioned producers cannot share a key across incompatible formats. This is a producer contract, not a SQLite constraint: a broken writer, an omitted version bump, or corrupted metadata can still create a same-key row with a bad schema field. Key-only membership deliberately makes no stronger claim; `get` and the materialization reader reject that row at consumption, and immutable `put` would not repair it by re-extracting anyway.
+
+`opening_populated_pre_presence_store_adds_no_payload_index` independently constructs the deployed pre-change schema with 64 payloads sized 4–100 KiB, then calls the real `BlobStore::open`. It asserts that the populated table's index definitions and SQLite schema version are unchanged. The fixture does not copy `BLOB_SCHEMA`, so adding a new index to the opener cannot silently alter the fixture to match. Before the correction it failed because opening created `blob_presence`; restoring that DDL as a mutation also fails this test alone. This is a no-new-index-DDL regression, not a claim that SQLite performs zero metadata page reads.
+
+No 1 GiB index-build benchmark is needed for this design: there is no new index or side table to build, and schema does not need a presence-time probe. No live stores were opened or modified for the investigation. An unused `blob_presence` left by an experimental earlier build is neither required nor rebuilt; no cleanup scan is added to the open path.
 
 ## Counted measurement
 
@@ -33,7 +47,7 @@ The existing `views_corrupt_cached_payload_is_not_reused` test now asserts rejec
 | After fix, actual cold materialization of the new view | 19,185,920 | 4,096 |
 | After fix, repeat publication of the established unchanged view | 0 | 0 |
 
-The cold materializer has two payload-consuming passes; these are real reads, now verified, not existence checks. Thus **zero payload reads applies to membership and to the subsequent unchanged no-op, not to building a new derived graph**. The baseline test went red with the exact nonzero candidate-phase counts above. The regression also requires successful publication with zero blob inserts. Additional tests check a large 8 MiB blob, the SQL covering-index plan, schema/plane mismatches, quota reuse, and a read-only publication with a concurrent late fill.
+The cold materializer has two payload-consuming passes; these are real reads, now verified, not existence checks. Thus **zero payload reads applies to membership and to the subsequent unchanged no-op, not to building a new derived graph**. The baseline test went red with the exact nonzero candidate-phase counts above. The regression also requires successful publication with zero blob inserts. Additional tests check a large 8 MiB blob, the existing key index's covering SQL plan, lazy schema rejection, plane mismatches, quota reuse, and a read-only publication with a concurrent late fill.
 
 ## Rollback-journal attribution
 

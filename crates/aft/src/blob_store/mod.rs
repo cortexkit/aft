@@ -113,15 +113,13 @@ CREATE TABLE IF NOT EXISTS blob_payloads (
 -- WITHOUT ROWID stores payload bytes in the primary-key tree. Membership probes
 -- need a separate, narrow tree to avoid reading payload overflow pages.
 CREATE INDEX IF NOT EXISTS blob_membership ON blob_payloads(full_key);
--- Schema-aware probes also stay entirely in a covering index.
-CREATE INDEX IF NOT EXISTS blob_presence ON blob_payloads(full_key, payload_schema);
 CREATE TABLE IF NOT EXISTS blob_quarantine (
     full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32)
 ) WITHOUT ROWID;
 "#;
 
-const CONTAINS_SQL: &str = "SELECT 1 FROM blob_payloads INDEXED BY blob_presence
-                           WHERE full_key = ?1 AND payload_schema = ?2";
+const CONTAINS_SQL: &str = "SELECT 1 FROM blob_payloads INDEXED BY blob_membership
+                           WHERE full_key = ?1";
 
 /// The two repository-family blob planes.  Trigram data is per-view derived
 /// state and deliberately is not represented here.
@@ -597,19 +595,16 @@ impl BlobStore {
         }))
     }
 
-    /// Probes schema-compatible membership without reading or hashing payloads.
-    /// This is not an integrity check: consumers must use `get` (or the verified
-    /// materialization reader) before using the bytes. A corrupt immutable row
-    /// may be present here but is still rejected when it is actually consumed.
+    /// Probes membership through the existing payload-free key index. Payload
+    /// format changes require new producer keys; consumers still must use `get`
+    /// (or the verified materialization reader) to check schema and digest before
+    /// using bytes. A corrupt immutable row can be present but is not consumable.
     pub fn contains(&self, full_key: &FullKey) -> Result<bool, BlobStoreError> {
         self.ensure_key_plane(full_key)?;
         Ok(self
             .connection
             .prepare_cached(CONTAINS_SQL)?
-            .query_row(
-                params![full_key.as_bytes().as_slice(), self.plane.payload_schema()],
-                |_| Ok(()),
-            )
+            .query_row(params![full_key.as_bytes().as_slice()], |_| Ok(()))
             .optional()?
             .is_some())
     }
@@ -866,6 +861,82 @@ fn move_corrupt_database_aside(path: &Path) -> Result<PathBuf, BlobStoreError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn opening_populated_pre_presence_store_adds_no_payload_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blobs/existing/callgraph.sqlite");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut connection = Connection::open(&path).unwrap();
+        // Describe the previously deployed schema independently of BLOB_SCHEMA:
+        // copying the current schema would hide an accidental index migration.
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+             CREATE TABLE blob_payloads (
+                 full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32),
+                 payload BLOB NOT NULL,
+                 payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
+                 payload_schema INTEGER NOT NULL,
+                 created_at_ms INTEGER NOT NULL DEFAULT 0
+             ) WITHOUT ROWID;
+             CREATE INDEX blob_membership ON blob_payloads(full_key);
+             CREATE TABLE blob_quarantine (
+                 full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32)
+             ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        let tx = connection.transaction().unwrap();
+        for index in 0..64u32 {
+            let key = CallgraphKey::for_current(&index.to_le_bytes(), "typescript").full_key();
+            let payload = vec![42; (4 + (index as usize % 5) * 24) * 1024];
+            tx.execute(
+                "INSERT INTO blob_payloads VALUES (?1, ?2, ?3, 1, 0)",
+                params![
+                    key.as_bytes().as_slice(),
+                    &payload,
+                    blake3::hash(&payload).as_bytes().as_slice()
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let indexes = |connection: &Connection| {
+            connection
+                .prepare(
+                    "SELECT name, sql FROM sqlite_schema
+                 WHERE type = 'index' AND tbl_name = 'blob_payloads' ORDER BY name",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = indexes(&connection);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].0, "blob_membership");
+        let schema_version: i64 = connection
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let store = BlobStore::open(dir.path(), "existing", BlobPlane::Callgraph).unwrap();
+        assert_eq!(
+            indexes(&store.connection),
+            before,
+            "opening a populated store must not build a new payload index"
+        );
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value::<i64, _>(None, "schema_version", |row| row.get(0))
+                .unwrap(),
+            schema_version
+        );
+    }
+
     /// Eight racing first-openers on a fresh file trip the WAL-switch BUSY that
     /// the busy handler does not cover. Without the retry this sees 1-3
     /// failures per 60 rounds on an idle laptop; 150 rounds make the red
@@ -1004,16 +1075,23 @@ mod tests {
             .connection
             .query_row(
                 &format!("EXPLAIN QUERY PLAN {CONTAINS_SQL}"),
-                params![key.as_bytes().as_slice(), CALLGRAPH_PAYLOAD_SCHEMA],
+                params![key.as_bytes().as_slice()],
                 |row| row.get(3),
             )
             .unwrap();
-        assert!(plan.contains("COVERING INDEX blob_presence"), "{plan}");
+        assert!(plan.contains("COVERING INDEX blob_membership"), "{plan}");
         store
             .connection
             .execute("UPDATE blob_payloads SET payload_schema = 999", [])
             .unwrap();
-        assert!(!store.contains(&key).unwrap());
+        assert!(
+            store.contains(&key).unwrap(),
+            "membership does not validate schema"
+        );
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "schema is checked at consumption"
+        );
         let semantic = SemanticKey::for_current(b"source", b"source.ts", "model").full_key();
         assert!(matches!(
             store.contains(&semantic),
