@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Combined landing of nine reviewed deliveries plus a protocol-crate bump. Ranking is not meant to change: the ranking-fenced files are touched only by plumbing (live indexing progress counters in search_index.rs and semantic_index.rs, a new module declaration in lib.rs, and the background bash tool description in subc_tool_schemas.json), so every benchmark row must be byte-equal."
+}
