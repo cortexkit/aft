@@ -1085,6 +1085,11 @@ impl BgTaskRegistry {
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         if let Ok(mut slot) = self.inner.db_pool.write() {
+            if slot.as_ref().is_none_or(|old| !Arc::ptr_eq(old, &conn)) {
+                if let Err(error) = crate::db::call_ledger::recover_pool_once(&conn) {
+                    crate::slog_warn!("call ledger restart recovery failed: {error}");
+                }
+            }
             *slot = Some(conn);
         }
         self.inner.compression_aggregates.clear();
@@ -1693,6 +1698,87 @@ impl BgTaskRegistry {
                 metadata.task_id,
                 error
             );
+        } else if let Some(key) = &metadata.call_key {
+            if !key.minted {
+                if let Err(error) = crate::db::call_ledger::observe_task(
+                    &conn,
+                    &key.requester,
+                    &key.key,
+                    &metadata.task_id,
+                    None,
+                    "unknown",
+                ) {
+                    crate::slog_warn!("call ledger task observation failed: {error}");
+                }
+            }
+        }
+        drop(conn);
+        self.settle_recovered_call(metadata, paths, row);
+    }
+
+    fn settle_recovered_call(&self, metadata: &PersistedTask, paths: &TaskPaths, row: BashTaskRow) {
+        let Some(key) = metadata
+            .call_key
+            .as_ref()
+            .filter(|key| !key.minted && metadata.status.is_terminal())
+        else {
+            return;
+        };
+        let Some(pool) = self.inner.db_pool.read().ok().and_then(|pool| pool.clone()) else {
+            return;
+        };
+        let recovered = pool
+            .lock()
+            .ok()
+            .and_then(|conn| {
+                crate::db::call_ledger::observe_task(
+                    &conn,
+                    &key.requester,
+                    &key.key,
+                    &metadata.task_id,
+                    None,
+                    "unknown",
+                )
+                .ok()
+            })
+            .unwrap_or(false);
+        if !recovered {
+            return;
+        }
+        // Output rendering may read artifacts and take registry locks. Keep it
+        // outside the database mutex and never take a task-state lock here.
+        let render = self.render_terminal_output_from_paths(metadata, paths);
+        let mut snapshot = terminal_db_row_snapshot(row, metadata.clone());
+        if let Some(render) = render {
+            snapshot.output_preview = render.output_preview.clone();
+            snapshot.bash_output_list_envelope =
+                append_bash_output_envelope(&render, &mut snapshot.output_preview);
+            snapshot.output_truncated = render.output_truncated;
+        }
+        let ledger_key = crate::db::call_ledger::Key {
+            carrier: key.requester.clone(),
+            call_key: key.key.clone(),
+        };
+        if let Some((frame, outcome)) = crate::subc::recovered_bash_frame(
+            snapshot,
+            &ledger_key,
+            metadata
+                .project_root
+                .as_deref()
+                .unwrap_or(&metadata.workdir),
+        ) {
+            if let Ok(conn) = pool.lock() {
+                if let Err(error) = crate::db::call_ledger::observe_task(
+                    &conn,
+                    &key.requester,
+                    &key.key,
+                    &metadata.task_id,
+                    Some(&frame),
+                    &outcome,
+                ) {
+                    crate::slog_warn!("call ledger recovered settlement failed: {error}");
+                }
+            }
         }
     }
 
@@ -6034,6 +6120,7 @@ impl BgTaskRegistry {
         }
         let suppress_replayed_running_reminder = metadata.status == BgTaskStatus::Running;
         let mode = metadata.mode.clone();
+        let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let task = Arc::new(BgTask {
             db_write_order: DbWriteOrder::for_task(&session_id, &task_id),
             db_harness: metadata.harness.clone(),
@@ -6089,6 +6176,17 @@ impl BgTaskRegistry {
         // gap matches (bytes written while the bridge was down) are scanned and
         // pending undelivered matches are re-pushed.
         self.rearm_persisted_watches(&task);
+        if let Some(metadata) = recovered_terminal {
+            if let Some(harness) = metadata
+                .harness
+                .as_deref()
+                .or_else(|| task.db_harness.as_deref())
+            {
+                if let Ok(row) = metadata.to_bash_task_row(harness, &paths) {
+                    self.settle_recovered_call(&metadata, &paths, row);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -9318,6 +9416,40 @@ mod tests {
     use crate::bash_background::persistence::{
         create_task_layout, read_task, task_paths, write_task, write_task_at,
     };
+
+    #[test]
+    fn shared_database_install_does_not_recover_another_live_actor_call() {
+        use crate::db::call_ledger::{self as ledger, Key, State};
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        let first = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        first.set_db_pool(pool.clone());
+        let key = Key {
+            carrier: "direct".into(),
+            call_key: "live".into(),
+        };
+        ledger::admit(&pool.lock().unwrap(), &key, "digest", None, State::Prepared).unwrap();
+        let second = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+        second.set_db_pool(pool.clone());
+        assert_eq!(
+            ledger::get(&pool.lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            State::Prepared
+        );
+        first.clear_db_pool();
+        first.set_db_pool(pool.clone());
+        assert_eq!(
+            ledger::get(&pool.lock().unwrap(), &key)
+                .unwrap()
+                .unwrap()
+                .state,
+            State::Prepared
+        );
+    }
 
     #[cfg(unix)]
     const QUICK_SUCCESS_COMMAND: &str = "true";

@@ -55,6 +55,7 @@ struct Wire {
 struct Route {
     wire: Arc<AsyncMutex<Wire>>,
     channel: u16,
+    scoped_preset: Option<&'static str>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -132,6 +133,10 @@ fn provider_command(root: &Path, connection_path: &Path) -> Result<Command, Harn
         .env_remove("SUBC_LAUNCH_NONCE")
         .env_remove("AFT_STORAGE_DIR")
         .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+        .env(
+            "AFT_TEST_CALL_LEDGER_CONTROL",
+            root.join("ledger-control.json"),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -295,29 +300,838 @@ impl Harness for Subject {
         })
     }
     async fn route(&self, handle: &Process, stamp: &RouteStamp) -> Result<Route, HarnessError> {
-        assert_eq!(stamp.principal, "direct");
-        assert!(stamp.scope.is_none());
-        bind_route(
+        let mut route = bind_route_stamped(
             handle,
             &handle.root.join("project"),
             "runner",
             "conformance-session",
+            Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+            stamp,
         )
-        .await
+        .await?;
+        route.scoped_preset = stamp.scope.as_ref().map(|_| self.preset.unwrap_or("head"));
+        Ok(route)
     }
     async fn kill_at(
         &self,
-        _handle: Process,
-        _point: &KillPoint,
-        _trigger: Trigger<'_>,
+        handle: Process,
+        point: &KillPoint,
+        trigger: Trigger<'_>,
     ) -> Result<KillReport, HarnessError> {
-        Err(HarnessError::new(
-            "Slice A does not declare durable kill points",
-        ))
+        #[cfg(not(feature = "test-timing-hooks"))]
+        {
+            let _ = (handle, point, trigger);
+            Err(HarnessError::new("kill hooks require test-timing-hooks"))
+        }
+        #[cfg(feature = "test-timing-hooks")]
+        {
+            let name = if point == &KillPoint::new("Prepared") {
+                "Prepared"
+            } else if point == &KillPoint::new("Authorized") {
+                "Authorized"
+            } else {
+                return Err(HarnessError::new("unsupported kill point"));
+            };
+            let signal = handle.root.join("ledger-signal");
+            let _ = std::fs::remove_file(&signal);
+            std::fs::write(
+                handle.root.join("ledger-control.json"),
+                serde_json::to_vec(&json!({"point":name,"signal_path":signal})).unwrap(),
+            )
+            .map_err(harness_error)?;
+            let reached = async {
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !signal.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .map_err(harness_error)
+            };
+            tokio::pin!(trigger);
+            tokio::select! {
+                result = reached => result?,
+                _ = &mut trigger => return Err(HarnessError::new("trigger ended before durable kill point")),
+            }
+            let mut child = handle.child.lock().unwrap();
+            child.kill().map_err(harness_error)?;
+            child.wait().map_err(harness_error)?;
+            Ok(KillReport {
+                point: point.clone(),
+                mechanism: cortexkit_role_harness::KillMechanism::FaultHookThenProcessKill,
+            })
+        }
     }
     async fn restart(&self, root: &Path) -> Result<Process, HarnessError> {
+        let _ = std::fs::remove_file(root.join("ledger-control.json"));
         self.spawn(root).await
     }
+}
+
+fn ledger_database(root: &Path) -> PathBuf {
+    fn visit(path: &Path) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(path).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = visit(&path) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|name| name == "aft.db") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    visit(root).expect("fixture database exists")
+}
+
+fn scoped_stamp(carrier: &str, owner: &str, scope_ref: &str) -> RouteStamp {
+    RouteStamp {
+        principal: format!("reserved:{carrier}"),
+        scope: Some(cortexkit_role_harness::ScopeStamp {
+            owner: format!("reserved:{owner}"),
+            scope_ref: scope_ref.into(),
+            scope_epoch: 7,
+        }),
+    }
+}
+
+fn marker_command(marker: &Path) -> String {
+    format!(
+        "printf ran > '{}'",
+        marker.display().to_string().replace('\'', "'\\''")
+    )
+}
+
+fn response_json(frame: &Frame) -> Value {
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+#[tokio::test]
+async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
+    use aft::db::call_ledger::{self as ledger, Key};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    std::fs::write(root.join("project/input.txt"), "first content\n").unwrap();
+    let body = json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"replay"});
+    let first = route.raw(body.clone(), false).await;
+    assert_eq!(first.header.ty, FrameType::Response);
+    assert_eq!(response_json(&first)["isError"], false);
+    std::fs::write(root.join("project/input.txt"), "changed content\n").unwrap();
+    let repeat = route.raw(body.clone(), false).await;
+    assert_ne!(first.header.corr, repeat.header.corr);
+    assert_eq!(first.header.ty, repeat.header.ty);
+    assert_eq!(first.body, repeat.body);
+    let other = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    let repeat = other.raw(body.clone(), false).await;
+    assert_ne!(first.header.channel, repeat.header.channel);
+    assert_eq!(first.body, repeat.body);
+    let conflict = route
+        .raw(
+            json!({"name":"read","arguments":{"filePath":"missing.txt"},"call_key":"replay"}),
+            false,
+        )
+        .await;
+    assert_eq!(conflict.header.ty, FrameType::Error);
+    assert_eq!(response_json(&conflict)["code"], "invalid_request");
+    assert_eq!(response_json(&conflict)["detail"]["field"], "call_key");
+    let plain = route
+        .raw(
+            json!({"name":"read","arguments":{"filePath":"input.txt"}}),
+            false,
+        )
+        .await;
+    assert!(String::from_utf8_lossy(&plain.body).contains("changed content"));
+    let legacy = bind_route_declaring(&process, &root.join("project"), "runner", "legacy", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        legacy
+            .raw(
+                json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"legacy"}),
+                false
+            )
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    drop(process);
+    // Direct database assertions and forced clock changes are offline: tests
+    // never open another SQLite handle while the actor owns this database.
+    let path = ledger_database(&root);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM call_ledger", [], |r| r
+            .get::<_, usize>(0))
+            .unwrap(),
+        1
+    );
+    let key = Key {
+        carrier: "direct".into(),
+        call_key: "replay".into(),
+    };
+    let row = ledger::get(&conn, &key).unwrap().unwrap();
+    assert!(row.scope.is_none());
+    assert!(row.late_entry.is_none());
+    assert_eq!(row.frame.unwrap().body, first.body);
+    conn.execute(
+        "UPDATE call_ledger SET settled_at=?1",
+        [ledger::now_ms() - ledger::RETENTION_MS],
+    )
+    .unwrap();
+    // An unscoped row expires by deletion, so expiry replay is covered on a
+    // scoped row below rather than confusing deletion with retained identity.
+    drop(conn);
+    let process = Subject::HEAD.restart(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&route.raw(body, false).await.body).contains("changed content"));
+}
+
+#[tokio::test]
+async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
+    use aft::db::call_ledger::{self as ledger, Key};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    std::fs::write(root.join("project/input.txt"), "content\n").unwrap();
+    let stamp = scoped_stamp("carrier-a", "owner-a", "same-ref");
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let body = json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"scoped"});
+    let first = route.raw(body.clone(), false).await;
+    assert_eq!(response_json(&first)["isError"], false);
+    let other = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let repeat = other.raw(body.clone(), false).await;
+    assert_eq!(first.body, repeat.body);
+    assert_eq!(first.header.ty, repeat.header.ty);
+    for conflict_stamp in [
+        scoped_stamp("carrier-a", "owner-b", "same-ref"),
+        scoped_stamp("carrier-a", "owner-a", "different-ref"),
+        RouteStamp {
+            scope: Some(cortexkit_role_harness::ScopeStamp {
+                scope_epoch: 8,
+                ..stamp.scope.clone().unwrap()
+            }),
+            ..stamp.clone()
+        },
+        RouteStamp {
+            principal: stamp.principal.clone(),
+            scope: None,
+        },
+    ] {
+        let other = Subject::HEAD
+            .route(&process, &conflict_stamp)
+            .await
+            .unwrap();
+        let refused = other.raw(body.clone(), false).await;
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(response_json(&refused)["detail"]["field"], "call_key");
+    }
+    let stamp_b = scoped_stamp("carrier-b", "owner-b", "same-ref");
+    let other = Subject::HEAD.route(&process, &stamp_b).await.unwrap();
+    assert_eq!(
+        response_json(&other.raw(body.clone(), false).await)["isError"],
+        false
+    );
+    let trusted = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    let missing = json!({"name":"read","arguments":{"filePath":"missing.txt"}});
+    let native = response_json(&trusted.raw(missing.clone(), false).await)["structuredContent"]
+        ["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut missing_keyed = missing;
+    missing_keyed["call_key"] = json!("error-replay");
+    let error = route.raw(missing_keyed.clone(), false).await;
+    assert_eq!(response_json(&error)["isError"], true);
+    assert!(response_json(&error).get("structuredContent").is_none());
+    drop(process);
+    let path = ledger_database(&root);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for (carrier, owner) in [("carrier-a", "owner-a"), ("carrier-b", "owner-b")] {
+        let row = ledger::get(
+            &conn,
+            &Key {
+                carrier: format!("reserved:{carrier}"),
+                call_key: "scoped".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.scope.unwrap().owner, format!("reserved:{owner}"));
+        assert_eq!(
+            serde_json::from_str::<Value>(row.late_entry.as_deref().unwrap()).unwrap()["owner"],
+            format!("reserved:{owner}")
+        );
+    }
+    conn.execute(
+        "UPDATE call_ledger SET settled_at=?1",
+        [ledger::now_ms() - ledger::RETENTION_MS],
+    )
+    .unwrap();
+    drop(conn);
+    let process = Subject::HEAD.restart(&root).await.unwrap();
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let expired = route.raw(body, false).await;
+    assert_eq!(expired.header.ty, FrameType::Error);
+    let expired = response_json(&expired);
+    assert_eq!(expired["code"], "result_not_retained");
+    assert_eq!(expired["detail"]["outcome"], "ok");
+    let expired_error = response_json(&route.raw(missing_keyed, false).await);
+    assert_eq!(expired_error["detail"]["outcome"], native);
+}
+
+#[tokio::test]
+async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    std::fs::write(root.join("project/input.txt"), "readable\n").unwrap();
+    route
+        .raw(
+            json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"seed"}),
+            false,
+        )
+        .await;
+    drop(process);
+    let path = ledger_database(&root);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM call_ledger", []).unwrap();
+    conn.execute(
+        "UPDATE schema_version SET version=?1",
+        [aft::db::CURRENT_SCHEMA_VERSION + 1],
+    )
+    .unwrap();
+    drop(conn);
+    let process = Subject::HEAD.restart(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    let marker = root.join("project/should-not-run");
+    for body in [
+        json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"blocked-read"}),
+        json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"blocked-bash"}),
+    ] {
+        let frame = route.raw(body, false).await;
+        let response = response_json(&frame);
+        assert_eq!(
+            response["structuredContent"]["code"], "database_unavailable",
+            "{response}"
+        );
+        assert_eq!(response["structuredContent"]["retryable"], false);
+    }
+    let plain = route
+        .raw(
+            json!({"name":"read","arguments":{"filePath":"input.txt"}}),
+            false,
+        )
+        .await;
+    assert!(String::from_utf8_lossy(&plain.body).contains("readable"));
+    assert!(!marker.exists());
+    drop(process);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM call_ledger", [], |r| r
+            .get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn s1_prepared_and_running_repeats_attach_without_second_question_or_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let warm = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        false,
+    )
+    .await;
+    let marker = root.join("project/executions");
+    let mut body = json!({"name":"bash","arguments":{"command":format!("printf x >> '{}'; sleep 1",marker.display())},"call_key":"held-repeat"});
+    route.adapt_preset(&mut body);
+    let mut wire = route.wire.lock().await;
+    let first = wire.next_corr;
+    wire.next_corr += 1;
+    let send = |corr| {
+        Frame::build(
+            FrameType::Request,
+            flags(),
+            route.channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    };
+    write_frame(&mut wire.stream, &send(first)).await.unwrap();
+    let ask = next_frame(&mut wire.stream).await.unwrap();
+    assert_eq!(
+        ask.header.ty,
+        FrameType::Request,
+        "{}",
+        String::from_utf8_lossy(&ask.body)
+    );
+    let held = wire.next_corr;
+    wire.next_corr += 1;
+    write_frame(&mut wire.stream, &send(held)).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), next_frame(&mut wire.stream))
+            .await
+            .is_err(),
+        "a Prepared repeat must not file a second question"
+    );
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Response,
+            flags(),
+            route.channel,
+            1,
+            ask.header.corr,
+            serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let running = wire.next_corr;
+    wire.next_corr += 1;
+    write_frame(&mut wire.stream, &send(running)).await.unwrap();
+    let mut replies = BTreeMap::new();
+    for _ in 0..3 {
+        let frame = next_frame(&mut wire.stream).await.unwrap();
+        assert_eq!(frame.header.ty, FrameType::Response);
+        assert_eq!(response_json(&frame)["isError"], false);
+        replies.insert(frame.header.corr, frame.body);
+    }
+    assert_eq!(replies.len(), 3);
+    assert_eq!(replies[&first], replies[&held]);
+    assert_eq!(replies[&first], replies[&running]);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"x");
+    drop(wire);
+    drop(process);
+    let conn = rusqlite::Connection::open(ledger_database(&root)).unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM call_ledger WHERE late_entry IS NOT NULL",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn s1_cross_actor_prepared_repeat_does_not_run_startup_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let stamp = scoped_stamp("carrier", "owner", "scope");
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let warm = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        false,
+    )
+    .await;
+    let marker = root.join("project/cross-actor");
+    let mut body = json!({"name":"bash","arguments":{"command":format!("printf x >> '{}'",marker.display())},"call_key":"cross-actor"});
+    route.adapt_preset(&mut body);
+    let mut wire = route.wire.lock().await;
+    let first = wire.next_corr;
+    wire.next_corr += 1;
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Request,
+            flags(),
+            route.channel,
+            1,
+            first,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let ask = next_frame(&mut wire.stream).await.unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    drop(wire);
+    let second_root = root.join("project2");
+    std::fs::create_dir_all(second_root.join(".cortexkit")).unwrap();
+    std::fs::copy(
+        root.join("project/.cortexkit/aft.jsonc"),
+        second_root.join(".cortexkit/aft.jsonc"),
+    )
+    .unwrap();
+    let second_warm = bind_route(&process, &second_root, "runner", "second-root")
+        .await
+        .unwrap();
+    second_warm
+        .raw(
+            json!({"name":"bash","arguments":{"command":"printf warm"}}),
+            false,
+        )
+        .await;
+    let second = bind_route_stamped(
+        &process,
+        &second_root,
+        "runner",
+        "conformance-session",
+        Some(BTreeMap::from([("tool-provider".into(), "v1".into())])),
+        &stamp,
+    )
+    .await
+    .unwrap();
+    let mut wire = route.wire.lock().await;
+    let repeat = wire.next_corr;
+    wire.next_corr += 1;
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Request,
+            flags(),
+            second.channel,
+            1,
+            repeat,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Response,
+            flags(),
+            route.channel,
+            1,
+            ask.header.corr,
+            serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut replies = BTreeMap::new();
+    for _ in 0..2 {
+        let frame = next_frame(&mut wire.stream).await.unwrap();
+        assert_eq!(
+            frame.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&frame.body)
+        );
+        replies.insert(frame.header.corr, frame.body);
+    }
+    assert_eq!(replies[&first], replies[&repeat]);
+    assert_eq!(std::fs::read(marker).unwrap(), b"x");
+}
+
+#[cfg(feature = "test-timing-hooks")]
+async fn crash_before_dispatch(point: &str, shell: &str) {
+    use aft::db::call_ledger::{self as ledger, Key, State};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let stamp = scoped_stamp("carrier", "owner", "scope");
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let marker = root.join("project/crash-marker");
+    let command = if shell == "powershell" {
+        format!(
+            "Set-Content -LiteralPath '{}' -Value ran",
+            marker.display().to_string().replace('\'', "''")
+        )
+    } else {
+        marker_command(&marker)
+    };
+    let body = json!({"name":shell,"arguments":{"command":command},"call_key":"crash"});
+    let trigger: Trigger<'_> = Box::pin(async {
+        let frame = route.raw(body, true).await;
+        panic!(
+            "call returned before kill point: {}",
+            String::from_utf8_lossy(&frame.body)
+        );
+    });
+    let report = Subject::HEAD
+        .kill_at(process, &KillPoint::new(point), trigger)
+        .await
+        .unwrap();
+    assert_eq!(report.point, KillPoint::new(point));
+    assert_eq!(
+        report.mechanism,
+        cortexkit_role_harness::KillMechanism::FaultHookThenProcessKill
+    );
+    let path = ledger_database(&root);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let key = Key {
+        carrier: "reserved:carrier".into(),
+        call_key: "crash".into(),
+    };
+    let row = ledger::get(&conn, &key).unwrap().unwrap();
+    assert_eq!(
+        row.state,
+        if point == "Prepared" {
+            State::Prepared
+        } else {
+            State::Authorized
+        }
+    );
+    assert!(row.task_id.is_none());
+    drop(conn);
+    let process = Subject::HEAD.restart(&root).await.unwrap();
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let replay = route
+        .raw(
+            json!({"name":shell,"arguments":{"command":command},"call_key":"crash"}),
+            false,
+        )
+        .await;
+    assert_eq!(replay.header.ty, FrameType::Error);
+    assert_eq!(
+        response_json(&replay)["detail"]["reason"],
+        "restart_before_dispatch"
+    );
+    assert!(!marker.exists());
+    drop(process);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let row = ledger::get(&conn, &key).unwrap().unwrap();
+    assert_eq!(row.state, State::Settled);
+    assert_eq!(row.seq, Some(1));
+    let entry: Value = serde_json::from_str(row.late_entry.as_deref().unwrap()).unwrap();
+    assert_eq!(entry["kind"], "not_started");
+    assert_eq!(entry["reason"], "restart_before_dispatch");
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM call_ledger WHERE seq IS NOT NULL",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test]
+async fn s1_crash_at_prepared_restarts_not_started() {
+    crash_before_dispatch("Prepared", "bash").await;
+}
+#[cfg(feature = "test-timing-hooks")]
+#[tokio::test]
+async fn s1_crash_at_authorized_restarts_not_started() {
+    crash_before_dispatch("Authorized", "bash").await;
+}
+#[cfg(all(windows, feature = "test-timing-hooks"))]
+#[tokio::test]
+async fn s1_powershell_crash_at_prepared_restarts_not_started() {
+    crash_before_dispatch("Prepared", "powershell").await;
+}
+
+#[tokio::test]
+async fn s1_unarmed_shell_commits_both_held_states_and_replays_before_injections() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let route = Subject::HEAD
+        .route(&process, &scoped_stamp("carrier", "owner", "scope"))
+        .await
+        .unwrap();
+    let marker = root.join("project/marker");
+    assert!(!root.join("ledger-control.json").exists());
+    let body =
+        json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"unarmed"});
+    let first = route.raw(body.clone(), true).await;
+    assert_eq!(
+        response_json(&first)["isError"],
+        false,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    assert!(marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+    let repeat = route.raw(body, false).await;
+    assert_eq!(first.body, repeat.body);
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
+async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
+    use aft::db::call_ledger::{self as ledger, Key, ScopeIdentity, State};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("module");
+    let process = Subject::HEAD.spawn(&root).await.unwrap();
+    let stamp = scoped_stamp("carrier", "owner", "scope");
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let warm = Subject::HEAD
+        .route(&process, &Subject::HEAD.plain_stamp())
+        .await
+        .unwrap();
+    warm.raw(
+        json!({"name":"bash","arguments":{"command":"printf warm"}}),
+        false,
+    )
+    .await;
+    let started = root.join("project/started");
+    let finished = root.join("project/finished");
+    let command = format!(
+        "{}; sleep 2; printf recovered-output; {}",
+        marker_command(&started),
+        marker_command(&finished)
+    );
+    let mut body =
+        json!({"name":"bash","arguments":{"command":command},"call_key":"recover-shell"});
+    route.adapt_preset(&mut body);
+    let mut wire = route.wire.lock().await;
+    let corr = wire.next_corr;
+    wire.next_corr += 1;
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Request,
+            flags(),
+            route.channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let ask = next_frame(&mut wire.stream).await.unwrap();
+    assert_eq!(ask.header.ty, FrameType::Request);
+    write_frame(
+        &mut wire.stream,
+        &Frame::build(
+            FrameType::Response,
+            flags(),
+            route.channel,
+            1,
+            ask.header.corr,
+            serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(wire);
+    drop(process);
+    let path = ledger_database(&root);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let shell_key = Key {
+        carrier: "reserved:carrier".into(),
+        call_key: "recover-shell".into(),
+    };
+    assert_eq!(
+        ledger::get(&conn, &shell_key).unwrap().unwrap().state,
+        State::DispatchStarted
+    );
+    let read_key = Key {
+        carrier: "reserved:reader".into(),
+        call_key: "unknown-read".into(),
+    };
+    let read_body = json!({"name":"read","schema_pin":null,"arguments":{"filePath":"missing.txt"}});
+    let digest = cortexkit_role_tool_provider::catalog::composition_digest(&read_body).unwrap();
+    ledger::admit(
+        &conn,
+        &read_key,
+        &digest,
+        Some(&ScopeIdentity {
+            owner: "reserved:owner".into(),
+            scope_ref: "scope".into(),
+            scope_epoch: 7,
+        }),
+        State::DispatchStarted,
+    )
+    .unwrap();
+    drop(conn);
+    let process = Subject::HEAD.restart(&root).await.unwrap();
+    let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
+    let response = route.raw(body, false).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response_json(&response)["isError"], false);
+    assert!(
+        response_json(&response)["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("recovered-output"),
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    assert!(finished.exists());
+    drop(process);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let shell = ledger::get(&conn, &shell_key).unwrap().unwrap();
+    assert_eq!(shell.state, State::Settled);
+    assert_eq!(
+        serde_json::from_str::<Value>(shell.late_entry.as_deref().unwrap()).unwrap()["kind"],
+        "result"
+    );
+    let read = ledger::get(&conn, &read_key).unwrap().unwrap();
+    assert_eq!(read.state, State::Settled);
+    assert_eq!(read.outcome.as_deref(), Some("unknown"));
+    assert_eq!(
+        serde_json::from_str::<Value>(read.late_entry.as_deref().unwrap()).unwrap()["outcome"],
+        "unknown"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM call_ledger WHERE late_entry IS NOT NULL",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        2
+    );
 }
 /// Bind a tool-provider v1 route, the way a consumer that declared
 /// `role_versions: {"tool-provider": "v1"}` on route open reaches AFT.
@@ -343,6 +1157,28 @@ async fn bind_route_declaring(
     session: &str,
     role_versions: Option<BTreeMap<String, String>>,
 ) -> Result<Route, HarnessError> {
+    bind_route_stamped(
+        handle,
+        project,
+        harness,
+        session,
+        role_versions,
+        &RouteStamp {
+            principal: "direct".into(),
+            scope: None,
+        },
+    )
+    .await
+}
+
+async fn bind_route_stamped(
+    handle: &Process,
+    project: &Path,
+    harness: &str,
+    session: &str,
+    role_versions: Option<BTreeMap<String, String>>,
+    stamp: &RouteStamp,
+) -> Result<Route, HarnessError> {
     let mut wire = handle.stream.lock().await;
     let channel = wire.next_channel;
     wire.next_channel += 1;
@@ -355,10 +1191,25 @@ async fn bind_route_declaring(
             module_id: "aft".into(),
         },
         identity: BindIdentity::new(project, harness, session),
-        principal: Some(Principal::Direct),
-        consumer_capabilities: None,
+        principal: Some(decode_principal(&stamp.principal)?),
+        consumer_capabilities: stamp.scope.as_ref().map(|_| vec!["elicitation".into()]),
         admission_facts: None,
-        scope: None,
+        scope: stamp
+            .scope
+            .as_ref()
+            .map(|scope| {
+                Ok(subc_protocol::scope::ScopeStamp {
+                    owner: decode_principal(&scope.owner)?,
+                    scope_ref: scope.scope_ref.clone(),
+                    scope_epoch: scope.scope_epoch,
+                    kind: subc_protocol::scope::ScopeKind::Head,
+                    parent: None,
+                    parent_state: None,
+                    attributes: Default::default(),
+                    owner_authorized: true,
+                })
+            })
+            .transpose()?,
         role_versions,
     };
     write_frame(
@@ -391,7 +1242,20 @@ async fn bind_route_declaring(
     Ok(Route {
         wire: handle.stream.clone(),
         channel,
+        scoped_preset: stamp.scope.as_ref().map(|_| "head"),
     })
+}
+fn decode_principal(principal: &str) -> Result<Principal, HarnessError> {
+    match principal {
+        "direct" => Ok(Principal::Direct),
+        "unverified" => Ok(Principal::Unverified),
+        _ => principal
+            .strip_prefix("reserved:")
+            .map(|module_id| Principal::Reserved {
+                module_id: module_id.into(),
+            })
+            .ok_or_else(|| HarnessError::new("invalid principal spelling")),
+    }
 }
 impl Route {
     async fn exchange(&self, body: Value, cancel: bool) -> Result<Exchange, RouteFailure> {
@@ -399,7 +1263,12 @@ impl Route {
             .await
             .map_err(|error| RouteFailure::new(error.to_string()))
     }
-    async fn exchange_inner(&self, body: Value, cancel: bool) -> Result<Exchange, HarnessError> {
+    async fn exchange_inner(
+        &self,
+        mut body: Value,
+        cancel: bool,
+    ) -> Result<Exchange, HarnessError> {
+        self.adapt_preset(&mut body);
         let mut wire = self.wire.lock().await;
         let corr = wire.next_corr;
         wire.next_corr += 1;
@@ -461,6 +1330,88 @@ impl Route {
             exchange.frames.push(observed);
         }
         Ok(exchange)
+    }
+
+    fn adapt_preset(&self, body: &mut Value) {
+        // The published runner omits presets on scoped calls. Adapt only tool
+        // calls, not role operations; production admission still requires one.
+        if let Some(preset) = self.scoped_preset {
+            let name = body["name"].as_str().unwrap_or_default();
+            if !matches!(
+                name,
+                "role.describe"
+                    | "tool.catalog"
+                    | "tool.withdraw"
+                    | "late_results"
+                    | "late_results.ack"
+            ) && body.get("name").is_some()
+            {
+                body.as_object_mut()
+                    .unwrap()
+                    .entry("preset")
+                    .or_insert(json!(preset));
+            }
+        }
+    }
+
+    async fn raw(&self, mut body: Value, approve: bool) -> Frame {
+        self.adapt_preset(&mut body);
+        let mut wire = self.wire.lock().await;
+        for _ in 0..100 {
+            let corr = wire.next_corr;
+            wire.next_corr += 1;
+            write_frame(
+                &mut wire.stream,
+                &Frame::build(
+                    FrameType::Request,
+                    flags(),
+                    self.channel,
+                    1,
+                    corr,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            loop {
+                let frame = next_frame(&mut wire.stream).await.unwrap();
+                if frame.header.ty == FrameType::Request && approve {
+                    write_frame(
+                        &mut wire.stream,
+                        &Frame::build(
+                            FrameType::Response,
+                            flags(),
+                            self.channel,
+                            1,
+                            frame.header.corr,
+                            serde_json::to_vec(&json!({"decision":"allow"})).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    continue;
+                }
+                assert_eq!(frame.header.channel, self.channel);
+                assert_eq!(frame.header.corr, corr);
+                assert!(matches!(
+                    frame.header.ty,
+                    FrameType::Response | FrameType::Error | FrameType::StreamEnd
+                ));
+                if frame.header.ty == FrameType::Response
+                    && (response_json(&frame)["structuredContent"]["code"]
+                        == "database_initializing"
+                        || String::from_utf8_lossy(&frame.body)
+                            .contains("Project persistence is still initializing"))
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    break;
+                }
+                return frame;
+            }
+        }
+        panic!("database initialization never completed");
     }
 }
 #[async_trait]

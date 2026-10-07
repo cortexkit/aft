@@ -213,8 +213,9 @@ jobs:
           # so use every core.
           NEXTEST_TEST_THREADS: "num-cpus"
           # The archive shards own the nextest integration inventory; keep the
-          # libtest and serialized watcher invocations byte-for-byte unchanged.
-          AFT_GATE_PHASES: lib,watcher
+          # libtest and serialized watcher invocations unchanged, and run the
+          # provider's durable crash hooks in the feature-enabled grouped suite.
+          AFT_GATE_PHASES: lib,watcher,conformance
           # The release-storm phase runs in its own parallel job
           # (unit-linux-storm) so its release-profile build is off this
           # job's critical path.
@@ -652,7 +653,7 @@ jobs:
           NEXTEST_TEST_THREADS: "num-cpus"
           # Archive shards own the integration inventory. These phases preserve
           # the isolated keychain probe and serialized watcher behavior.
-          AFT_GATE_PHASES: lib,watcher
+          AFT_GATE_PHASES: lib,watcher,conformance
           AFT_UNIT_TEST_RUNNER: nextest
           # The storm tests exercise no macOS-specific paths; the dedicated
           # unit-linux-storm job is the release-storm arbiter.
@@ -875,7 +876,7 @@ jobs:
         shell: bash
         env:
           AFT_TEST_DIAG: "1"
-          AFT_GATE_PHASES: lib,watcher
+          AFT_GATE_PHASES: lib,watcher,conformance
           AFT_GATE_SKIP_RELEASE_STORM: "1"
 
       - name: Upload Windows libtest output

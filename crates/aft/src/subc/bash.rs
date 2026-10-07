@@ -565,6 +565,19 @@ pub(super) fn submit_deferred_bash(
     // call the module loop answers instead (drain or cancel) carries no result
     // and is not observed.
     let mut repeat_for_spawn = repeat.clone();
+    let ledger_key =
+        call_key
+            .as_ref()
+            .filter(|_| server_completion)
+            .map(|key| crate::db::call_ledger::Key {
+                carrier: match &spawn_principal {
+                    AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+                        principal_id.clone().unwrap_or_else(|| "absent".into())
+                    }
+                    _ => "first-party".into(),
+                },
+                call_key: key.clone(),
+            });
     let submit_executor = executor.clone();
     let spawn_cancel = JobCancellation::new();
     let submit_cancel = spawn_cancel.clone();
@@ -684,6 +697,15 @@ pub(super) fn submit_deferred_bash(
                                 )
                             })
                         });
+                    if let (Some(key), Some(db)) = (&ledger_key, ctx.db()) {
+                        if let Ok(conn) = db.lock() {
+                            if let Err(error) =
+                                crate::db::call_ledger::note_native_outcome(&conn, key, &response)
+                            {
+                                log::warn!("call ledger shell outcome recording failed: {error}");
+                            }
+                        }
+                    }
                     if !response.success {
                         return finish_bash_spawn_immediate(
                             response,

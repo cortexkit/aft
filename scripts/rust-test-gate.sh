@@ -348,9 +348,9 @@ else
   IFS=',' read -r -a selected_phases <<< "$requested_phases"
   for selected_phase in "${selected_phases[@]}"; do
     case "$selected_phase" in
-      lib|nextest|watcher|storm) ;;
+      lib|nextest|watcher|conformance|storm) ;;
       *)
-        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, nextest, watcher, storm, or all)" >&2
+        echo "Unsupported AFT_GATE_PHASES entry '$selected_phase' (expected lib, nextest, watcher, conformance, storm, or all)" >&2
         exit 2
         ;;
     esac
@@ -434,6 +434,11 @@ if phase_enabled watcher; then
   # semantic quiet-window test holds; without the feature that test is not built.
   run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1" \
     cargo test -p agent-file-tools --features test-timing-hooks --test watcher_integration --quiet -- --test-threads=1
+fi
+
+if phase_enabled conformance; then
+  run_phase "cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance" \
+    cargo test -p agent-file-tools --features test-timing-hooks --test rest -- tool_provider_conformance
 fi
 
 # The main subc storm test asserts production-calibrated absolute latencies

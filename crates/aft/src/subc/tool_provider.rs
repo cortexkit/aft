@@ -618,6 +618,563 @@ fn log_scoped_preset_refusal_at(
     crate::slog_warn!("{line}");
 }
 
+// A keyed shell may ask an untrusted consumer for permission, but the
+// consumer's elicitation capability does not authorize shell observation.
+pub(super) fn admission_trusted(identity: &super::RouteIdentity, name: &str) -> bool {
+    !matches!(identity.trust, super::BindTrust::Untrusted)
+        || (identity.consumer_elicitation_capable && matches!(name, "bash" | "powershell"))
+}
+
+pub(super) fn ledger_scope(
+    scope: &subc_protocol::scope::ScopeStamp,
+) -> crate::db::call_ledger::ScopeIdentity {
+    crate::db::call_ledger::ScopeIdentity {
+        owner: super::principal_id(&Some(scope.owner.clone())).unwrap(),
+        scope_ref: scope.scope_ref.clone(),
+        scope_epoch: scope.scope_epoch,
+    }
+}
+
+pub(super) fn keyed_route_frame(
+    frame: &subc_protocol::Frame,
+    routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+) -> bool {
+    routes
+        .get(&super::route_key(frame.header.channel, frame.header.epoch))
+        .is_some_and(|identity| identity.role == RouteRole::ToolProviderV1)
+        && serde_json::from_slice::<Value>(&frame.body)
+            .is_ok_and(|body| body.get("call_key").and_then(Value::as_str).is_some())
+}
+
+pub(super) fn note_native_outcome(
+    ctx: &crate::context::AppContext,
+    key: Option<&crate::db::call_ledger::Key>,
+    response: &crate::protocol::Response,
+) {
+    if let (Some(key), Some(db)) = (key, ctx.db()) {
+        if let Ok(conn) = db.lock() {
+            if let Err(error) = crate::db::call_ledger::note_native_outcome(&conn, key, response) {
+                log::warn!("call ledger outcome recording failed: {error}");
+            }
+        }
+    }
+}
+
+/// The edge parks admission replies outside the frame loop. The executor
+/// commits admission before returning a frame to dispatch; terminal frames
+/// pass through the same edge and are committed before reaching the socket.
+pub(super) struct LedgerEdge {
+    calls: std::sync::Mutex<std::collections::HashMap<(super::RouteChannel, u64), LedgerCall>>,
+    ready: tokio::sync::mpsc::UnboundedSender<super::DecodedFrame>,
+}
+struct LedgerCall {
+    root: crate::path_identity::ProjectRootId,
+    key: crate::db::call_ledger::Key,
+    expires_at: std::time::Instant,
+}
+
+impl LedgerEdge {
+    pub(super) fn new() -> (
+        std::sync::Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<super::DecodedFrame>,
+    ) {
+        let (ready, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            std::sync::Arc::new(Self {
+                calls: Default::default(),
+                ready,
+            }),
+            receiver,
+        )
+    }
+
+    pub(super) fn key(
+        identity: &super::RouteIdentity,
+        call_key: &str,
+    ) -> crate::db::call_ledger::Key {
+        let carrier = match &identity.spawn_principal {
+            crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } => {
+                principal_id.clone().unwrap_or_else(|| "absent".into())
+            }
+            _ => "first-party".into(),
+        };
+        crate::db::call_ledger::Key {
+            carrier,
+            call_key: call_key.into(),
+        }
+    }
+
+    /// Returns the frame unchanged for keyless, legacy and refused calls.
+    /// A refused admission never consumes a key or writes a row.
+    pub(super) fn defer(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
+        executor: &std::sync::Arc<crate::executor::Executor>,
+        writer: &super::WriterSender,
+        metrics: &std::sync::Arc<super::DispatchPathMetrics>,
+    ) -> Result<(), super::DecodedFrame> {
+        use super::*;
+        use crate::db::call_ledger::{self as ledger, Admission, State};
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let Some(identity) = routes
+            .get(&route)
+            .filter(|i| i.role == RouteRole::ToolProviderV1)
+            .cloned()
+        else {
+            return Err(decoded);
+        };
+        let Ok(body) = serde_json::from_slice::<Value>(&decoded.frame.body) else {
+            return Err(decoded);
+        };
+        if body
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(|op| op != "tool.call")
+            || body
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(recognized_operation)
+        {
+            return Err(decoded);
+        }
+        let Ok(call) =
+            serde_json::from_value::<cortexkit_role_tool_provider::call::ToolCallRequest>(body)
+        else {
+            return Err(decoded);
+        };
+        let Some(call_key) = call.call_key.as_deref() else {
+            return Err(decoded);
+        };
+        if admit(
+            &call,
+            identity.scope.is_some(),
+            &identity.disabled_tools,
+            crate::bash_background::powershell_available(),
+            &identity.session,
+            admission_trusted(&identity, &call.name),
+        )
+        .is_err()
+        {
+            return Err(decoded);
+        };
+        let held = matches!(identity.trust, BindTrust::Untrusted)
+            && matches!(call.name.as_str(), "bash" | "powershell");
+        let mut plan_args = call.arguments.clone();
+        if held {
+            if !identity.consumer_elicitation_capable
+                || plan_args.get("sandbox").and_then(Value::as_str) == Some("host")
+            {
+                return Err(decoded);
+            };
+            if call.name == "powershell" {
+                plan_args
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("shell".into(), json!("powershell"));
+            }
+            if bash::prepare_bash_elicitation_plan(&plan_args, &identity.project_root).is_err() {
+                return Err(decoded);
+            };
+        }
+        let key = Self::key(&identity, call_key);
+        if let Some(response) = executor
+            .actor_context(&identity.root)
+            .and_then(|ctx| ctx.database_runtime_refusal("ledger-admission", "bash"))
+        {
+            let writer = writer.clone();
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let context = crate::subc_format::FormatContext::from_tool_call(
+                    &call.name,
+                    &call.arguments,
+                    &identity.project_root,
+                );
+                let result = ToolCallResult {
+                    text: crate::subc_format::format_response_with_context(
+                        &call.name, &response, &context,
+                    ),
+                    response,
+                };
+                if let Ok(frame) = build_tool_response_frame(
+                    decoded.frame.header.ver,
+                    route,
+                    decoded.frame.header.corr,
+                    decoded.frame.header.flags,
+                    &result,
+                    identity.trust,
+                ) {
+                    let _ = send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
+                        .await;
+                }
+            });
+            return Ok(());
+        }
+        let scope = identity.scope.as_ref().map(ledger_scope);
+        // composition_digest is the role crate's SHA-256 over JCS, without
+        // schema-description projection. Hash before server shell injections.
+        let digest = composition_digest(
+            &json!({"name":call.name,"schema_pin":call.schema_pin,"arguments":call.arguments}),
+        )
+        .expect("admitted JSON has canonical bytes");
+        let edge = self.clone();
+        let repeat_executor = executor.clone();
+        let writer = writer.clone();
+        let metrics = metrics.clone();
+        let root = identity.root.clone();
+        let request_id = format!("ledger-{}-{}", route.channel, decoded.frame.header.corr);
+        let response_key = key.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let rx = executor.submit_async(
+            root.clone(),
+            crate::executor::Lane::Mutating,
+            request_id.clone(),
+            Box::new(move |ctx| {
+                let result = (|| {
+                    // Use the database-dependent gate for every keyed tool, even a
+                    // read. Keyless reads continue through their existing gate.
+                    if let Some(refusal) = ctx.database_runtime_refusal(&request_id, "bash") {
+                        return Err(refusal);
+                    }
+                    let Some(db) = ctx.db() else {
+                        return Err(crate::protocol::Response::error_with_data(
+                            &request_id,
+                            "database_unavailable",
+                            "Call ledger is unavailable; no tool operation was performed.",
+                            json!({"retryable":false}),
+                        ));
+                    };
+                    let conn = db.lock().map_err(|_| {
+                        crate::protocol::Response::error(
+                            &request_id,
+                            "database_unavailable",
+                            "Call ledger database mutex is poisoned",
+                        )
+                    })?;
+                    ledger::sweep(&conn, ledger::now_ms())
+                        .and_then(|_| {
+                            ledger::reduce_expired(&conn, &key, ledger::now_ms())?;
+                            ledger::admit(
+                                &conn,
+                                &key,
+                                &digest,
+                                scope.as_ref(),
+                                if held {
+                                    State::Prepared
+                                } else {
+                                    State::DispatchStarted
+                                },
+                            )
+                        })
+                        .map_err(|error| {
+                            crate::protocol::Response::error_with_data(
+                                &request_id,
+                                "database_unavailable",
+                                error.to_string(),
+                                json!({"retryable":false}),
+                            )
+                        })
+                })();
+                let _ = result_tx.send(result);
+                crate::protocol::Response::success(request_id, json!({}))
+            }),
+        );
+        tokio::spawn(async move {
+            let response = await_executor_response(rx, "ledger-admission".into()).await;
+            let result = result_rx.await.unwrap_or(Err(response));
+            match result {
+                Ok(Admission::New) => {
+                    edge.calls.lock().unwrap().insert(
+                        (route, decoded.frame.header.corr),
+                        LedgerCall {
+                            root,
+                            key: response_key,
+                            expires_at: std::time::Instant::now() + bash_elicitation_timeout(),
+                        },
+                    );
+                    let _ = edge.ready.send(decoded);
+                }
+                Ok(Admission::Repeat(row)) if row.state != State::Settled => {
+                    // Repeats observe the same durable execution, including a
+                    // shell recovered after restart. They never dispatch again.
+                    loop {
+                        let key = response_key.clone();
+                        let (row_tx, row_rx) = oneshot::channel();
+                        let rx = repeat_executor.submit_async(
+                            root.clone(),
+                            Lane::Mutating,
+                            "ledger-attach".into(),
+                            Box::new(move |ctx| {
+                                let row = ctx.db().and_then(|db| {
+                                    db.lock()
+                                        .ok()
+                                        .and_then(|conn| ledger::get(&conn, &key).ok().flatten())
+                                });
+                                let _ = row_tx.send(row);
+                                Response::success("ledger-attach", json!({}))
+                            }),
+                        );
+                        let _ = await_executor_response(rx, "ledger-attach".into()).await;
+                        if let Ok(Some(row)) = row_rx.await {
+                            if row.state == State::Settled {
+                                if let Some(recorded) = row.frame {
+                                    if let Ok(frame) = Self::replay(&decoded.frame, &recorded) {
+                                        let _ = send_reliable_writer_frame(
+                                            &writer,
+                                            &metrics,
+                                            frame,
+                                            "attached ledger result",
+                                        )
+                                        .await;
+                                    }
+                                }
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+                Ok(Admission::Repeat(row)) => {
+                    if let Some(recorded) = row.frame {
+                        if let Ok(frame) = Self::replay(&decoded.frame, &recorded) {
+                            let _ = send_reliable_writer_frame(
+                                &writer,
+                                &metrics,
+                                frame,
+                                "ledger replay",
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Ok(Admission::Conflict) => {
+                    let _ = send_provider_error(
+                        &writer,
+                        &metrics,
+                        &decoded.frame,
+                        errors::invalid_request(
+                            "call_key",
+                            "key already names different content or scope",
+                        ),
+                    )
+                    .await;
+                }
+                Err(response) => {
+                    let context = crate::subc_format::FormatContext::from_tool_call(
+                        "read",
+                        &json!({}),
+                        &identity.project_root,
+                    );
+                    let result = ToolCallResult {
+                        text: crate::subc_format::format_response_with_context(
+                            "read", &response, &context,
+                        ),
+                        response,
+                    };
+                    if let Ok(frame) = build_tool_response_frame(
+                        decoded.frame.header.ver,
+                        route,
+                        decoded.frame.header.corr,
+                        decoded.frame.header.flags,
+                        &result,
+                        identity.trust,
+                    ) {
+                        let _ =
+                            send_reliable_writer_frame(&writer, &metrics, frame, "ledger refusal")
+                                .await;
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    fn replay(
+        request: &subc_protocol::Frame,
+        recorded: &crate::db::call_ledger::RecordedFrame,
+    ) -> Result<subc_protocol::Frame, subc_protocol::FrameBuildError> {
+        subc_protocol::Frame::build_with_version(
+            request.header.ver,
+            recorded.ty,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            recorded.body.clone(),
+        )
+    }
+
+    pub(super) fn authorize(
+        self: &std::sync::Arc<Self>,
+        decoded: super::DecodedFrame,
+        asks: &std::collections::HashMap<super::ReverseCorrKey, super::PendingBashAsk>,
+        executor: &std::sync::Arc<crate::executor::Executor>,
+    ) -> Result<(), super::DecodedFrame> {
+        use super::*;
+        use crate::db::call_ledger::{self as ledger, State};
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        if decoded.frame.header.ty != FrameType::Response
+            || !bash_elicitation_reply_is_allow(&decoded.frame.body)
+        {
+            return Err(decoded);
+        };
+        let Some(ask) = asks.get(&ReverseCorrKey {
+            route,
+            corr: decoded.frame.header.corr,
+        }) else {
+            return Err(decoded);
+        };
+        let (root, key) = {
+            let calls = self.calls.lock().unwrap();
+            let Some(call) = calls.get(&(route, ask.tool_corr)) else {
+                return Err(decoded);
+            };
+            (call.root.clone(), call.key.clone())
+        };
+        let edge = self.clone();
+        let rx = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "ledger-authorize".into(),
+            Box::new(move |ctx| {
+                let allowed = ctx
+                    .db()
+                    .and_then(|db| {
+                        db.lock().ok().map(|conn| {
+                            ledger::transition(&conn, &key, State::Prepared, State::Authorized)
+                                .and_then(|authorized| {
+                                    if authorized {
+                                        ledger::transition(
+                                            &conn,
+                                            &key,
+                                            State::Authorized,
+                                            State::DispatchStarted,
+                                        )
+                                    } else {
+                                        Ok(false)
+                                    }
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                Response::success("ledger-authorize", json!({"allowed":allowed}))
+            }),
+        );
+        tokio::spawn(async move {
+            let response = await_executor_response(rx, "ledger-authorize".into()).await;
+            if response.data["allowed"] == true {
+                let _ = edge.ready.send(decoded);
+            }
+        });
+        Ok(())
+    }
+
+    pub(super) fn proxy(
+        self: &std::sync::Arc<Self>,
+        actual: super::WriterSender,
+        executor: std::sync::Arc<crate::executor::Executor>,
+        metrics: std::sync::Arc<super::DispatchPathMetrics>,
+    ) -> (super::WriterSender, tokio::task::JoinHandle<()>) {
+        use super::*;
+        use crate::db::call_ledger::{self as ledger, RecordedFrame, State};
+        let (sender, mut receiver) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
+        let edge = self.clone();
+        let task = tokio::spawn(async move {
+            while let Some(outgoing) = receiver.recv().await {
+                let route = route_key(outgoing.header.channel, outgoing.header.epoch);
+                let terminal = matches!(
+                    outgoing.header.ty,
+                    FrameType::Response | FrameType::Error | FrameType::StreamEnd
+                );
+                let call = if terminal {
+                    edge.calls
+                        .lock()
+                        .unwrap()
+                        .remove(&(route, outgoing.header.corr))
+                } else {
+                    None
+                };
+                let Some(call) = call else {
+                    if actual.send(outgoing).await.is_err() {
+                        break;
+                    }
+                    continue;
+                };
+                let actual = actual.clone();
+                let metrics = metrics.clone();
+                let recorded = RecordedFrame {
+                    ty: outgoing.header.ty,
+                    body: outgoing.body.clone(),
+                };
+                let record_for_job = recorded.clone();
+                let rx = executor.submit_async(
+                    call.root.clone(),
+                    Lane::Mutating,
+                    "ledger-settle".into(),
+                    Box::new(move |ctx| {
+                        if let Some(db) = ctx.db() {
+                            if let Ok(conn) = db.lock() {
+                                let row = ledger::get(&conn, &call.key).ok().flatten();
+                                let reason = row
+                                    .as_ref()
+                                    .filter(|row| row.state == State::Prepared)
+                                    .map(|_| {
+                                        if std::time::Instant::now() >= call.expires_at {
+                                            "expired"
+                                        } else {
+                                            "denied"
+                                        }
+                                    });
+                                let inferred = ledger::outcome(&record_for_job);
+                                let outcome = if reason.is_some() {
+                                    "bash_denied_untrusted".into()
+                                } else if record_for_job.ty == FrameType::Response
+                                    && inferred == "unknown"
+                                {
+                                    row.and_then(|row| row.outcome)
+                                        .filter(|outcome| outcome != "ok")
+                                        .unwrap_or(inferred)
+                                } else {
+                                    inferred
+                                };
+                                if let Err(error) = ledger::settle(
+                                    &conn,
+                                    &call.key,
+                                    &record_for_job,
+                                    &outcome,
+                                    reason,
+                                    ledger::now_ms(),
+                                ) {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        error.to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        Response::success("ledger-settle", json!({}))
+                    }),
+                );
+                tokio::spawn(async move {
+                    let settled = await_executor_response(rx, "ledger-settle".into()).await;
+                    if !settled.success {
+                        decrement_counted_channel(&metrics.writer_queued);
+                        return;
+                    }
+                    if actual.send(outgoing).await.is_err() {
+                        return;
+                    }
+                });
+            }
+        });
+        (sender, task)
+    }
+}
+
 /// [`admit`] for a call whose role is already resolved.
 fn admit_as(
     call: &cortexkit_role_tool_provider::call::ToolCallRequest,
@@ -810,6 +1367,34 @@ pub(super) fn resolve_caller_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ledger_scope_owner_and_route_principal_have_identical_canonical_bytes() {
+        for principal in [
+            subc_protocol::Principal::Direct,
+            subc_protocol::Principal::Reserved {
+                module_id: "agent".into(),
+            },
+            subc_protocol::Principal::Unverified,
+        ] {
+            let stamp = subc_protocol::scope::ScopeStamp {
+                owner: principal.clone(),
+                scope_ref: "scope".into(),
+                scope_epoch: 7,
+                kind: subc_protocol::scope::ScopeKind::Head,
+                parent: None,
+                parent_state: None,
+                attributes: Default::default(),
+                owner_authorized: true,
+            };
+            assert_eq!(
+                ledger_scope(&stamp).owner.as_bytes(),
+                super::super::principal_id(&Some(principal))
+                    .unwrap()
+                    .as_bytes()
+            );
+        }
+    }
     use cortexkit_role_tool_provider::catalog::{check_flat_schema, structural_schema};
     use std::collections::BTreeSet;
 

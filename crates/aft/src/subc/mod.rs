@@ -416,6 +416,7 @@ struct PendingSubcResponse {
     format_context: crate::subc_format::FormatContext,
     bind_trust: BindTrust,
     pending: PendingResponse,
+    ledger_key: Option<crate::db::call_ledger::Key>,
     surface_downgraded: bool,
     phase_trace: PhaseTrace,
     /// When the deferred response was handed to the module loop.
@@ -1008,6 +1009,63 @@ fn principal_id(principal: &Option<Principal>) -> Option<String> {
 
 fn principal_label(principal: &Option<Principal>) -> String {
     principal_id(principal).unwrap_or_else(|| "absent".to_string())
+}
+
+/// Reconstruct a recovered shell's terminal result using the foreground
+/// formatter, rather than replacing its output with a task-status summary.
+/// The vanished route's trust facts cannot be recovered from a principal, so
+/// use the standard MCP text projection and never expose structured sidecars.
+pub(crate) fn recovered_bash_frame(
+    snapshot: crate::bash_background::registry::BgTaskSnapshot,
+    key: &crate::db::call_ledger::Key,
+    project_root: &Path,
+) -> Option<(crate::db::call_ledger::RecordedFrame, String)> {
+    if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
+        return Some((
+            crate::db::call_ledger::not_retained(key, "unknown"),
+            "unknown".into(),
+        ));
+    }
+    let now = Instant::now();
+    let crate::commands::bash_orchestrate::BashStep::Done(response) =
+        crate::commands::bash_orchestrate::decide_bash_step(
+            snapshot,
+            now,
+            true,
+            now,
+            &key.call_key,
+        )
+    else {
+        return None;
+    };
+    let outcome = if response.success {
+        "ok"
+    } else {
+        response.data["code"].as_str().unwrap_or("unknown")
+    }
+    .to_string();
+    let context =
+        crate::subc_format::FormatContext::from_tool_call("bash", &json!({}), project_root);
+    let result = ToolCallResult {
+        text: crate::subc_format::format_response_with_context("bash", &response, &context),
+        response,
+    };
+    let frame = build_tool_response_frame(
+        PROTOCOL_VERSION,
+        route_key(1, 1),
+        1,
+        control_flags(),
+        &result,
+        BindTrust::Untrusted,
+    )
+    .ok()?;
+    Some((
+        crate::db::call_ledger::RecordedFrame {
+            ty: frame.header.ty,
+            body: frame.body,
+        },
+        outcome,
+    ))
 }
 
 #[derive(Debug)]
@@ -2913,7 +2971,9 @@ async fn handle_bash_elicitation_reply(
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
-                false,
+                routes.get(&key.route).is_some_and(|identity| {
+                    identity.role == tool_provider::RouteRole::ToolProviderV1
+                }),
                 None,
                 Instant::now(),
             );
@@ -4242,6 +4302,12 @@ where
     );
     let (writer_tx, writer_rx) = mpsc::channel::<WriterFrame>(WRITER_QUEUE_CAPACITY);
     let writer_task = spawn_writer_task(write, writer_rx, Arc::clone(&dispatch_path_metrics));
+    let (ledger_edge, mut ledger_ready_rx) = tool_provider::LedgerEdge::new();
+    let (writer_tx, mut ledger_writer_task) = ledger_edge.proxy(
+        writer_tx,
+        Arc::clone(&executor),
+        Arc::clone(&dispatch_path_metrics),
+    );
     let control_replies = readiness::PendingControlReplies::default();
     let readiness_task = spawn_readiness(
         hello_ack,
@@ -4585,10 +4651,11 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            (maybe_frame, database_waited) = async {
+            (maybe_frame, database_waited, ledger_waited) = async {
                 tokio::select! {
-                    frame = reader_rx.recv() => (frame, false),
-                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true),
+                    frame = reader_rx.recv() => (frame, false, false),
+                    frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
+                    frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
                 }
             } => {
                 let frame = match maybe_frame {
@@ -4679,6 +4746,14 @@ where
                         }
                     }
                     FrameType::Response | FrameType::Error if frame.header.channel != 0 => {
+                        let decoded = DecodedFrame {frame, phase_trace};
+                        let decoded = if !ledger_waited {
+                            match ledger_edge.authorize(decoded, &pending_bash_asks, &executor) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else {decoded};
+                        let frame = decoded.frame;
                         if let Err(error) = handle_bash_elicitation_reply(
                             &writer_tx,
                             &frame,
@@ -4748,7 +4823,7 @@ where
                     FrameType::Request => {
                         let route = route_key(frame.header.channel, frame.header.epoch);
                         let decoded = DecodedFrame { frame, phase_trace };
-                        let decoded = if !database_waited && !management_routes.contains(&route) {
+                        let decoded = if !database_waited && !management_routes.contains(&route) && !tool_provider::keyed_route_frame(&decoded.frame, &routes) {
                             match database_waits.defer(decoded, &routes, &executor) {
                                 Ok(()) => continue,
                                 Err(decoded) => decoded,
@@ -4756,6 +4831,12 @@ where
                         } else {
                             decoded
                         };
+                        let decoded = if !ledger_waited && !management_routes.contains(&route) {
+                            match ledger_edge.defer(decoded, &routes, &executor, &writer_tx, &dispatch_path_metrics) {
+                                Ok(()) => continue,
+                                Err(decoded) => decoded,
+                            }
+                        } else {decoded};
                         let frame = decoded.frame;
                         let phase_trace = decoded.phase_trace;
                         let result = if management_routes.contains(&route)
@@ -5424,6 +5505,12 @@ where
     // the connection) and flush the writer.
     reader_task.abort();
     drop(writer_tx);
+    if tokio::time::timeout(Duration::from_secs(5), &mut ledger_writer_task)
+        .await
+        .is_err()
+    {
+        ledger_writer_task.abort();
+    }
     let writer_result = finish_writer_task(writer_task).await;
     log::info!(
         "subc exit phase=loop_teardown elapsed_ms={}",
@@ -7477,7 +7564,7 @@ async fn handle_tool_call(
             &identity.disabled_tools,
             crate::bash_background::powershell_available(),
             &identity.session,
-            !matches!(identity.trust, BindTrust::Untrusted),
+            tool_provider::admission_trusted(&identity, &call.name),
             &identity.project_root,
             frame.header.channel,
         ) {
@@ -7640,6 +7727,10 @@ async fn handle_tool_call(
         log::debug!("subc tool call {}: schema_pin={pin}", call.name);
     }
     let call_key = call.call_key;
+    let ledger_key = call_key
+        .as_deref()
+        .filter(|_| identity.role == tool_provider::RouteRole::ToolProviderV1)
+        .map(|key| tool_provider::LedgerEdge::key(&identity, key));
     let bare_name = call.name;
     let arguments = strip_agent_preview_arg_owned(call.arguments);
     // Decided before the arguments move into the job: slow-call logging needs
@@ -8023,6 +8114,7 @@ async fn handle_tool_call(
         let request_id_for_force = request_id.clone();
         let format_context_for_run = format_context.clone();
         let bare_name_for_run = bare_name.clone();
+        let ledger_key_for_setup = ledger_key.clone();
         let (setup_tx, setup_rx) = oneshot::channel::<DeferredSetupOutcome>();
         let completion_wake = deferred_response_tx.wake.clone();
         phase_trace.mark_executor_submitted();
@@ -8042,6 +8134,11 @@ async fn handle_tool_call(
                     Some(&mut phase_trace),
                 ) {
                     Err(result) => {
+                        tool_provider::note_native_outcome(
+                            ctx,
+                            ledger_key_for_setup.as_ref(),
+                            &result.response,
+                        );
                         let response = result.response;
                         let _ = setup_tx.send(DeferredSetupOutcome::Immediate {
                             text: result.text,
@@ -8105,6 +8202,11 @@ async fn handle_tool_call(
                                     prepared.surface_downgraded,
                                     Some(&finalizer),
                                     Some(&mut phase_trace),
+                                );
+                                tool_provider::note_native_outcome(
+                                    ctx,
+                                    ledger_key_for_setup.as_ref(),
+                                    &result.response,
                                 );
                                 let response = result.response;
                                 let _ = setup_tx.send(DeferredSetupOutcome::Immediate {
@@ -8174,6 +8276,7 @@ async fn handle_tool_call(
                         format_context,
                         bind_trust,
                         pending,
+                        ledger_key,
                         surface_downgraded,
                         phase_trace,
                         held_since: Instant::now(),
@@ -8309,6 +8412,11 @@ async fn handle_tool_call(
                     Some(&mut phase_trace),
                 ) {
                     ToolCallOutcome::Unary(result) => {
+                        tool_provider::note_native_outcome(
+                            ctx,
+                            ledger_key.as_ref(),
+                            &result.response,
+                        );
                         let response = result.response;
                         let _ = tool_call_tx.send(ToolCallCompletion {
                             text: result.text,
@@ -8647,6 +8755,32 @@ async fn deliver_resolved_subc_response(
         Some(&finalizer),
         Some(&mut entry.phase_trace),
     );
+    if let Some(key) = entry.ledger_key.clone() {
+        let outcome = if result.response.success {
+            "ok".to_string()
+        } else {
+            result.response.data["code"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string()
+        };
+        // Queue before terminal settlement on the same actor. The frame loop
+        // never locks or writes SQLite, including for deferred responses.
+        drop(executor.submit_async(
+            entry.root.clone(),
+            Lane::Mutating,
+            "ledger-deferred-outcome".into(),
+            Box::new(move |ctx| {
+                let response = if outcome == "ok" {
+                    Response::success("ledger-deferred-outcome", json!({}))
+                } else {
+                    Response::error("ledger-deferred-outcome", &outcome, "")
+                };
+                tool_provider::note_native_outcome(ctx, Some(&key), &response);
+                Response::success("ledger-deferred-outcome", json!({}))
+            }),
+        ));
+    }
     let fatal = note_fatal_panic_response(&result.response);
     let response_frame = build_tool_response_frame_with_limit(
         entry.ver,
@@ -9303,6 +9437,7 @@ pub(crate) mod test_support {
             root: root.clone(),
             session_id: "navigation-cancel-session".to_string(),
             bare_name: "lsp_hover".to_string(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "lsp_hover",
                 &json!({}),
@@ -10124,6 +10259,7 @@ pub(crate) mod test_support {
             root: root.clone(),
             session_id: "shutdown-session".to_string(),
             bare_name: "inspect".to_string(),
+            ledger_key: None,
             format_context: crate::subc_format::FormatContext::from_tool_call(
                 "inspect",
                 &json!({}),
@@ -10213,6 +10349,7 @@ pub(crate) mod test_support {
         let entry =
             |corr: u64, root: &ProjectRootId, name: &str, dir: &Path, pending: PendingResponse| {
                 PendingSubcResponse {
+                    ledger_key: None,
                     route,
                     corr,
                     flags: Flags::new(false, Priority::Passive, false),

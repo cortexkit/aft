@@ -15,6 +15,7 @@ use std::time::Duration;
 pub mod backups;
 pub mod bash_tasks;
 pub mod bash_watches;
+pub mod call_ledger;
 pub mod compression_events;
 pub mod github_read_cache;
 pub mod remote_exec;
@@ -28,9 +29,9 @@ pub mod state;
 #[cfg(test)]
 mod wal_credit_probe;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
-const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+const MIGRATION_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 const MIGRATION_V14: &str = r#"
 CREATE TABLE IF NOT EXISTS remote_exec_policies (
@@ -893,6 +894,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         12 => conn.execute_batch(MIGRATION_V12),
         13 => conn.execute_batch(MIGRATION_V13),
         14 => conn.execute_batch(MIGRATION_V14),
+        15 => conn.execute_batch(call_ledger::MIGRATION),
         _ => Ok(()),
     }
 }
@@ -1187,12 +1189,28 @@ mod tests {
     }
 
     #[test]
+    fn migration_v14_installs_call_ledger_from_v13() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);")
+            .unwrap();
+        for version in 1..=13 {
+            apply_migration(&mut conn, version).unwrap();
+        }
+        assert_eq!(schema_version(&conn), 13);
+        assert_eq!(run_migrations(&mut conn).unwrap(), 14);
+        assert!(sqlite_names(&conn, "table").contains(&"call_ledger".to_string()));
+    }
+
+    #[test]
     fn downgrade_refused() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("aft.db");
         let conn = open(&path).unwrap();
-        conn.execute("INSERT OR REPLACE INTO schema_version VALUES (999)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version VALUES (?1)",
+            [CURRENT_SCHEMA_VERSION + 1],
+        )
+        .unwrap();
         drop(conn);
 
         match open(&path).unwrap_err() {
@@ -1200,11 +1218,16 @@ mod tests {
                 db_version,
                 supported,
             } => {
-                assert_eq!(db_version, 999);
-                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
+                assert_eq!(db_version, CURRENT_SCHEMA_VERSION + 1);
+                assert_eq!(supported, 14);
             }
             error => panic!("expected downgrade refusal, got {error:?}"),
         }
+        let mut conn = Connection::open(&path).unwrap();
+        assert!(matches!(
+            run_migrations(&mut conn),
+            Err(OpenError::DowngradeRefused { supported: 14, .. })
+        ));
     }
 
     #[test]
