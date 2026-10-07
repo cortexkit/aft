@@ -3665,7 +3665,7 @@ impl EmbeddingEntry {
     }
 }
 
-enum BuildEmbeddingRow {
+pub(crate) enum BuildEmbeddingRow {
     Embedded {
         embedded_text: String,
         vector: Vec<f32>,
@@ -3676,7 +3676,7 @@ enum BuildEmbeddingRow {
     },
 }
 
-fn execute_build_embedding_batch<F>(
+pub(crate) fn execute_build_embedding_batch<F>(
     texts: Vec<String>,
     embed_fn: &mut F,
 ) -> Result<Vec<BuildEmbeddingRow>, String>
@@ -8826,8 +8826,6 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "sol"
                 | "scss"
                 | "vue"
-                | "yaml"
-                | "yml"
                 | "pas"
                 | "pp"
                 | "dpr"
@@ -8852,8 +8850,7 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "gsh"
                 | "gradle"
                 | "m"
-                | "mm"
-                | "toml",
+                | "mm",
         )
     )
 }
@@ -9266,9 +9263,8 @@ impl SemanticVectors {
     /// Decodes a stored view payload for `rel_path`. A payload stamped by any
     /// other producer is refused rather than read as current vectors.
     ///
-    /// The embedded text is not kept: views reuse whole runs by key, never
-    /// single chunks by text, and dropping it keeps the resident arena close to
-    /// the vectors themselves.
+    /// The embedded text is not kept in resident file runs. Chunk-vector reuse
+    /// uses separate indexed family rows, keeping the arena close to the vectors.
     pub(crate) fn decode_view_payload(
         payload: &[u8],
         rel_path: &Path,
@@ -9397,6 +9393,18 @@ pub(crate) fn embed_view_files<F>(
 where
     F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
 {
+    embed_view_files_with_rows(files, &mut |texts| execute_build_embedding_batch(texts, embed_fn), max_batch_size)
+}
+
+/// Assembles the same canonical file runs from validated fresh or reused rows.
+pub(crate) fn embed_view_files_with_rows<F>(
+    files: Vec<Vec<SemanticChunk>>,
+    rows_fn: &mut F,
+    max_batch_size: usize,
+) -> Result<Vec<SemanticVectors>, String>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<BuildEmbeddingRow>, String>,
+{
     let mut runs = files
         .iter()
         .map(|chunks| Vec::with_capacity(chunks.len()))
@@ -9412,7 +9420,7 @@ where
             .iter()
             .map(|(_, chunk)| chunk.embed_text.clone())
             .collect();
-        let rows = execute_build_embedding_batch(texts, embed_fn)?;
+        let rows = rows_fn(texts)?;
         for ((file, chunk), row) in batch.iter().zip(rows) {
             let mut chunk = chunk.clone();
             match row {

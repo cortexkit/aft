@@ -1217,11 +1217,13 @@ where
                     || !report.store_errors.is_empty()
                 {
                     crate::slog_info!(
-                        "semantic view fill root={} queued={} deferred={} embedded_keys={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={}",
+                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={}",
                         schedule.root.display(),
                         report.queued,
                         report.deferred,
                         report.embedded_keys,
+                        report.chunks,
+                        report.chunk_reused,
                         report.embedded_texts,
                         report.model_calls,
                         report.stored_hits,

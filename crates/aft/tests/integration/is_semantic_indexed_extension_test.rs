@@ -9,7 +9,7 @@ fn semantic_extension_policy_stays_in_sync_with_parser_code_arms() {
         "ts", "tsx", "js", "jsx", "py", "rs", "go", "c", "h", "cc", "cpp", "cxx", "hpp", "hh",
         "cu", "cuh", "metal", "zig", "cs", "sh", "bash", "zsh", "sol", "vue", "pas", "pp", "dpr",
         "dpk", "lpr", "java", "kt", "kts", "rb", "swift", "scala", "sc", "lua", "pl", "pm", "t",
-        "r", "R", "m", "mm", "toml",
+        "r", "R", "m", "mm",
     ];
     for extension in code_extensions {
         let path = format!("fixture.{extension}");
@@ -37,4 +37,12 @@ fn semantic_extension_policy_stays_in_sync_with_parser_code_arms() {
     }
 
     assert!(!is_semantic_indexed_extension(Path::new("package.json")));
+
+    // Structured data remains parser-supported but no longer spends semantic
+    // embeddings on each table/key; exact and lexical indexing are independent.
+    for extension in ["toml", "yaml", "yml"] {
+        let path = format!("fixture.{extension}");
+        assert!(detect_language(Path::new(&path)).is_some());
+        assert!(!is_semantic_indexed_extension(Path::new(&path)));
+    }
 }

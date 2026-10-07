@@ -37,6 +37,7 @@ pub struct SemanticArena {
     released: Condvar,
     decodes: AtomicU64,
     store_reads: AtomicU64,
+    chunk_batch: Mutex<()>,
 }
 
 /// Resident arena memory. Every key is counted once, whatever the number of
@@ -67,6 +68,7 @@ pub fn arena_for(storage: &Path, family: &str) -> Arc<SemanticArena> {
         released: Condvar::new(),
         decodes: AtomicU64::new(0),
         store_reads: AtomicU64::new(0),
+        chunk_batch: Mutex::new(()),
     });
     arenas.insert(key, Arc::downgrade(&arena));
     arena
@@ -94,6 +96,11 @@ impl Drop for ArenaClaim {
 }
 
 impl SemanticArena {
+    /// Serializes bounded chunk-vector batches across all views of the family.
+    pub(crate) fn chunk_batch(&self) -> MutexGuard<'_, ()> {
+        lock(&self.chunk_batch)
+    }
+
     pub fn storage(&self) -> &Path {
         &self.storage
     }
