@@ -144,6 +144,13 @@ impl PathStatusStore {
             path,
             "path_status::PathStatusStore::open_at",
         )?;
+        connection.busy_timeout(crate::db::STEADY_BUSY_TIMEOUT)?;
+        // This is a long-lived annotation store. A publication can update one
+        // row per source file, so rollback journaling creates and unlinks a
+        // journal for every annotation instead of appending to one WAL.
+        crate::blob_store::retry_while_busy(crate::db::STEADY_BUSY_TIMEOUT, || {
+            connection.pragma_update(None, "journal_mode", "WAL")
+        })?;
         connection.execute_batch(PATH_STATUS_SCHEMA)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -321,6 +328,39 @@ impl PathStatusStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_status_writes_use_wal_without_rollback_journals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derived.sqlite");
+        // Older views already have a DELETE-mode status database.
+        let old = rusqlite::Connection::open(&path).unwrap();
+        old.execute_batch(PATH_STATUS_SCHEMA).unwrap();
+        drop(old);
+        let mut store = PathStatusStore::open(dir.path()).unwrap();
+        let mode: String = store
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        for index in 0..32 {
+            store
+                .mark_pending(format!("file_{index}.ts").as_bytes(), "waiting", 1)
+                .unwrap();
+        }
+        assert_eq!(store.summary().unwrap().pending_count, 32);
+        assert!(dir.path().join("derived.sqlite-wal").is_file());
+        assert!(!dir.path().join("derived.sqlite-journal").exists());
+        drop(store);
+        assert_eq!(
+            PathStatusStore::open(dir.path())
+                .unwrap()
+                .summary()
+                .unwrap()
+                .pending_count,
+            32
+        );
+    }
 
     #[test]
     fn summary_counts_all_rows_but_caps_and_orders_visible_paths_by_bytes() {

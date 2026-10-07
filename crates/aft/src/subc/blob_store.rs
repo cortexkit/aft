@@ -118,7 +118,7 @@ impl BoundBlobStore {
         {
             // A cached figure can only conservatively predict a new row. Near
             // quota, preserve idempotence by allowing an existing key to reuse.
-            if self.store.get(full_key)?.is_some() {
+            if self.store.contains(full_key)? {
                 return match self.store.put(full_key, payload) {
                     Ok(report) => Ok(BoundPutOutcome::Stored(report)),
                     Err(error) => {
@@ -214,5 +214,44 @@ impl BoundBlobStore {
 
     fn is_first_party(&self) -> bool {
         matches!(self.trust, BindTrust::FirstParty)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob_store::{BlobPlane, CallgraphKey, PayloadReadCounts, PAYLOAD_READ_COUNTS};
+
+    #[test]
+    fn quota_reuse_probes_do_not_read_existing_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path(), "quota", BlobPlane::Callgraph).unwrap();
+        let mut bound = BoundBlobStore::with_quota(
+            store,
+            BindTrust::FirstParty,
+            "view",
+            BlobQuota {
+                rows: 1,
+                payload_bytes: 1024,
+            },
+        );
+        let key = CallgraphKey::for_current(b"source", "typescript").full_key();
+        assert!(matches!(
+            bound.put("quota", b"source.ts", &key, b"payload").unwrap(),
+            BoundPutOutcome::Stored(_)
+        ));
+        PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
+        assert!(matches!(
+            bound.put("quota", b"source.ts", &key, b"payload").unwrap(),
+            BoundPutOutcome::Stored(PutReport {
+                outcome: PutOutcome::Reused,
+                ..
+            })
+        ));
+        assert_eq!(
+            PAYLOAD_READ_COUNTS.with(|counts| counts.get()),
+            PayloadReadCounts::default()
+        );
+        assert!(bound.failed_paths().next().is_none());
     }
 }

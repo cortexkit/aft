@@ -1125,14 +1125,12 @@ impl<'a> ManifestViewBlobReader<'a> {
         let Some(key) = decode_manifest_full_key(full_key) else {
             return Ok(None);
         };
-        self.connection
-            .query_row(
-                "SELECT payload FROM blob_payloads WHERE full_key = ?1",
-                [key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| join::ManifestJoinError::InvalidBlob(error.to_string()))
+        crate::blob_store::read_verified_payload(
+            self.connection,
+            &key,
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .map_err(|error| join::ManifestJoinError::InvalidBlob(error.to_string()))
     }
 
     fn read_decoded(

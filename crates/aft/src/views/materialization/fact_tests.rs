@@ -6,8 +6,12 @@ fn config(conn: &Connection, manifest: &mut Manifest, path: &str, source: &str) 
         .unwrap();
     let key = blake3::hash(&payload);
     conn.execute(
-        "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2)",
-        params![key.as_bytes().as_slice(), payload],
+        "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+        params![
+            key.as_bytes().as_slice(),
+            payload,
+            blake3::hash(&payload).as_bytes().as_slice()
+        ],
     )
     .unwrap();
     *manifest = Manifest::new(

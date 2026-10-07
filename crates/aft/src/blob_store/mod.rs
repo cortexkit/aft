@@ -18,6 +18,22 @@ use crate::db::lifecycle::{SqliteStore, TrackedConnection};
 
 pub mod v2;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PayloadReadCounts {
+    pub bytes: usize,
+    pub blake3_calls: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    // Publication preparation and its blob readers run on the same thread.
+    // Thread-local counters exclude reads from unrelated parallel tests.
+    pub(crate) static PAYLOAD_READ_COUNTS: std::cell::Cell<PayloadReadCounts> = const {
+        std::cell::Cell::new(PayloadReadCounts { bytes: 0, blake3_calls: 0 })
+    };
+}
+
 /// The SQLite busy wait used by every blob-store connection.
 pub const BUSY_TIMEOUT_MS: u64 = 5_000;
 /// SQLite's documented connection default.  The blob store reads this value
@@ -97,10 +113,15 @@ CREATE TABLE IF NOT EXISTS blob_payloads (
 -- WITHOUT ROWID stores payload bytes in the primary-key tree. Membership probes
 -- need a separate, narrow tree to avoid reading payload overflow pages.
 CREATE INDEX IF NOT EXISTS blob_membership ON blob_payloads(full_key);
+-- Schema-aware probes also stay entirely in a covering index.
+CREATE INDEX IF NOT EXISTS blob_presence ON blob_payloads(full_key, payload_schema);
 CREATE TABLE IF NOT EXISTS blob_quarantine (
     full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32)
 ) WITHOUT ROWID;
 "#;
+
+const CONTAINS_SQL: &str = "SELECT 1 FROM blob_payloads INDEXED BY blob_presence
+                           WHERE full_key = ?1 AND payload_schema = ?2";
 
 /// The two repository-family blob planes.  Trigram data is per-view derived
 /// state and deliberately is not represented here.
@@ -576,50 +597,33 @@ impl BlobStore {
         }))
     }
 
-    /// Reads a payload only after verifying its stored digest and schema.  A
+    /// Probes schema-compatible membership without reading or hashing payloads.
+    /// This is not an integrity check: consumers must use `get` (or the verified
+    /// materialization reader) before using the bytes. A corrupt immutable row
+    /// may be present here but is still rejected when it is actually consumed.
+    pub fn contains(&self, full_key: &FullKey) -> Result<bool, BlobStoreError> {
+        self.ensure_key_plane(full_key)?;
+        Ok(self
+            .connection
+            .prepare_cached(CONTAINS_SQL)?
+            .query_row(
+                params![full_key.as_bytes().as_slice(), self.plane.payload_schema()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Reads a payload only after verifying its stored digest and schema. A
     /// malformed row is indistinguishable from a miss to consumers, but remains
     /// on disk for quarantine/forensics rather than being rewritten in place.
     pub fn get(&self, full_key: &FullKey) -> Result<Option<Vec<u8>>, BlobStoreError> {
         self.ensure_key_plane(full_key)?;
-        let row = self
-            .connection
-            .query_row(
-                "SELECT payload, payload_digest, payload_schema
-                 FROM blob_payloads WHERE full_key = ?1",
-                params![full_key.as_bytes().as_slice()],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((payload, payload_digest, payload_schema)) = row else {
-            return Ok(None);
-        };
-
-        let digest_matches = payload_digest.as_slice() == blake3::hash(&payload).as_bytes();
-        let schema_matches = payload_schema == i64::from(self.plane.payload_schema());
-        if digest_matches && schema_matches {
-            return Ok(Some(payload));
-        }
-
-        let reason = match (digest_matches, schema_matches) {
-            (false, false) => "payload digest and schema mismatch",
-            (false, true) => "payload digest mismatch",
-            (true, false) => "payload schema mismatch",
-            (true, true) => unreachable!("matching payload was returned above"),
-        };
-        log::warn!(
-            "blob store rejected committed payload for key {} in {}/{}: {}",
-            full_key,
-            self.artifact_key,
-            self.plane.as_str(),
-            reason
-        );
-        Ok(None)
+        Ok(read_verified_payload(
+            &self.connection,
+            full_key.as_bytes(),
+            self.plane,
+        )?)
     }
 
     /// Records a deterministic failure without modifying the immutable payload
@@ -648,6 +652,59 @@ impl BlobStore {
             })
         }
     }
+}
+
+/// Shared by direct blob reads and the manifest joiner, which owns a read-only
+/// connection rather than a BlobStore. Membership alone must never authorize
+/// using payload bytes in a derived graph.
+pub(crate) fn read_verified_payload(
+    connection: &Connection,
+    full_key: &[u8],
+    plane: BlobPlane,
+) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+    let row = connection
+        .query_row(
+            "SELECT payload, payload_digest, payload_schema
+         FROM blob_payloads WHERE full_key = ?1",
+            params![full_key],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((payload, payload_digest, payload_schema)) = row else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    PAYLOAD_READ_COUNTS.with(|counts| {
+        let old = counts.get();
+        counts.set(PayloadReadCounts {
+            bytes: old.bytes + payload.len(),
+            blake3_calls: old.blake3_calls + 1,
+        });
+    });
+    let digest_matches = payload_digest.as_slice() == blake3::hash(&payload).as_bytes();
+    let schema_matches = payload_schema == i64::from(plane.payload_schema());
+    if digest_matches && schema_matches {
+        return Ok(Some(payload));
+    }
+    let reason = match (digest_matches, schema_matches) {
+        (false, false) => "payload digest and schema mismatch",
+        (false, true) => "payload digest mismatch",
+        (true, false) => "payload schema mismatch",
+        (true, true) => unreachable!("matching payload was returned above"),
+    };
+    log::warn!(
+        "blob store rejected committed payload for key {:02x?} in {}: {}",
+        full_key,
+        plane.as_str(),
+        reason
+    );
+    Ok(None)
 }
 
 fn validate_artifact_key(artifact_key: &str) -> Result<(), BlobStoreError> {
@@ -928,5 +985,39 @@ mod tests {
                 matches!(outcome, PutOutcome::Inserted | PutOutcome::Reused)
             );
         }
+    }
+    #[test]
+    fn contains_uses_covering_index_without_payload_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(dir.path(), "presence", BlobPlane::Callgraph).unwrap();
+        let key = CallgraphKey::for_current(b"source", "typescript").full_key();
+        assert!(!store.contains(&key).unwrap());
+        let payload = vec![42; 8 * 1024 * 1024];
+        store.put(&key, &payload).unwrap();
+        PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
+        assert!(store.contains(&key).unwrap());
+        assert_eq!(
+            PAYLOAD_READ_COUNTS.with(|counts| counts.get()),
+            PayloadReadCounts::default()
+        );
+        let plan: String = store
+            .connection
+            .query_row(
+                &format!("EXPLAIN QUERY PLAN {CONTAINS_SQL}"),
+                params![key.as_bytes().as_slice(), CALLGRAPH_PAYLOAD_SCHEMA],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("COVERING INDEX blob_presence"), "{plan}");
+        store
+            .connection
+            .execute("UPDATE blob_payloads SET payload_schema = 999", [])
+            .unwrap();
+        assert!(!store.contains(&key).unwrap());
+        let semantic = SemanticKey::for_current(b"source", b"source.ts", "model").full_key();
+        assert!(matches!(
+            store.contains(&semantic),
+            Err(BlobStoreError::PlaneKeyMismatch { .. })
+        ));
     }
 }

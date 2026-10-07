@@ -451,10 +451,9 @@ pub fn prepare_checkout(
                     .seed_proven_alias(tracked, source)
                     .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
             }
-        } else if callgraph
-            .get(key)
+        } else if !callgraph
+            .contains(key)
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
-            .is_none()
         {
             blocking_paths.insert(candidate.path.as_bytes().to_vec());
         }
@@ -1252,12 +1251,12 @@ fn missing_callgraph_payload(
     resolution_input: bool,
 ) -> Result<Option<Vec<u8>>> {
     // A branch return can name content absent from the previous manifest but
-    // already stored by an earlier generation. Validate that payload before
-    // paying for extraction, serialization, and an immutable no-op put.
+    // already stored by an earlier generation. Probe membership before paying
+    // for extraction, serialization, and an immutable no-op put. The joiner
+    // verifies the digest when it actually consumes the payload.
     if store
-        .get(key)
+        .contains(key)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
-        .is_some()
     {
         return Ok(None);
     }
@@ -1280,6 +1279,64 @@ fn missing_callgraph_payload(
 #[cfg(test)]
 mod reuse_tests {
     use super::*;
+    use crate::blob_store::{PayloadReadCounts, PAYLOAD_READ_COUNTS};
+
+    #[test]
+    fn views_shared_checkout_presence_reads_no_payloads() {
+        const FILES: usize = 2048;
+        let project = super::cold_fallback_tests::repository(FILES);
+        let storage = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(storage.path(), "shared", BlobPlane::Callgraph).unwrap();
+        let mut payload_bytes = 0;
+        for index in 0..FILES {
+            let source = fs::read(project.path().join(format!("file_{index}.ts"))).unwrap();
+            let key =
+                CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
+                    .full_key();
+            let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
+                .unwrap()
+                .unwrap();
+            payload_bytes += payload.len();
+            store.put(&key, &payload).unwrap();
+        }
+        let request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: "shared".into(),
+            scope: "new-checkout".into(),
+            desired_head: "unchanged".into(),
+            changed_paths: Default::default(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: true,
+            callgraph: true,
+        };
+        PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
+        let mut measured = false;
+        let mut prepared = prepare_checkout(&request, &mut |phase| {
+            if phase == "derived" {
+                let counts = PAYLOAD_READ_COUNTS.with(|counts| counts.get());
+                eprintln!("checkout_presence files={FILES} stored_payload_bytes={payload_bytes} reads={counts:?}");
+                assert_eq!(counts, PayloadReadCounts::default());
+                measured = true;
+            }
+            Ok(())
+        }).unwrap();
+        assert!(measured, "must reach the boundary before materialization");
+        let report = prepared.commit().unwrap();
+        assert!(report.published);
+        assert_eq!(report.blob_puts, 0);
+        let materialization = PAYLOAD_READ_COUNTS.with(|counts| counts.get());
+        eprintln!("checkout_materialization files={FILES} reads={materialization:?}");
+        PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
+        let report = publish_checkout(&request).unwrap();
+        assert!(!report.published);
+        assert_eq!(report.blob_puts, 0);
+        assert_eq!(
+            PAYLOAD_READ_COUNTS.with(|counts| counts.get()),
+            PayloadReadCounts::default()
+        );
+    }
 
     #[test]
     fn views_corrupt_cached_payload_is_not_reused() {
@@ -1296,11 +1353,87 @@ mod reuse_tests {
             .unwrap()
             .execute("UPDATE blob_payloads SET payload_digest = zeroblob(32)", [])
             .unwrap();
+        assert!(store.contains(&key).unwrap());
         assert!(
             missing_callgraph_payload(&store, &key, source, "typescript", false)
                 .unwrap()
-                .is_some()
+                .is_none()
         );
+        assert!(
+            store.get(&key).unwrap().is_none(),
+            "membership must not let corrupt bytes reach a consumer"
+        );
+    }
+
+    #[test]
+    fn views_pending_first_publication_has_no_manifest_to_reuse() {
+        const FILES: usize = 8;
+        let project = super::cold_fallback_tests::repository(FILES);
+        let storage = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(storage.path(), "pending", BlobPlane::Callgraph).unwrap();
+        for index in 0..FILES - 1 {
+            let source = fs::read(project.path().join(format!("file_{index}.ts"))).unwrap();
+            let key =
+                CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
+                    .full_key();
+            let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
+                .unwrap()
+                .unwrap();
+            store.put(&key, &payload).unwrap();
+        }
+        let mut request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: "pending".into(),
+            scope: "pending-checkout".into(),
+            desired_head: "unchanged".into(),
+            changed_paths: Default::default(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: false,
+            callgraph: true,
+        };
+        let mut source_reads = 0;
+        let mut prepared = prepare_checkout(&request, &mut |phase| {
+            source_reads += usize::from(phase == "working_tree_read");
+            Ok(())
+        })
+        .unwrap();
+        let report = prepared.commit().unwrap();
+        assert!(!report.published);
+        assert_eq!(report.blob_puts, 0);
+        assert_eq!(
+            report.pending_paths,
+            BTreeSet::from([b"file_7.ts".to_vec()])
+        );
+        assert!(report.manifest.is_none());
+        assert_eq!(source_reads, FILES);
+        drop(prepared);
+        let view = ViewStore::open(storage.path(), &request.scope).unwrap();
+        assert!(view.current_generation().unwrap().is_none());
+
+        // Filling the missing blob cannot reconstruct the other seven entries:
+        // the failed publication did not persist its candidate manifest.
+        let source = fs::read(project.path().join("file_7.ts")).unwrap();
+        let key =
+            CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
+                .full_key();
+        let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
+            .unwrap()
+            .unwrap();
+        store.put(&key, &payload).unwrap();
+        request.changed_paths = report.pending_paths;
+        source_reads = 0;
+        let mut prepared = prepare_checkout(&request, &mut |phase| {
+            source_reads += usize::from(phase == "working_tree_read");
+            Ok(())
+        })
+        .unwrap();
+        let report = prepared.commit().unwrap();
+        assert!(report.published);
+        assert_eq!(report.blob_puts, 0);
+        assert_eq!(report.manifest.unwrap().entries().count(), FILES);
+        assert_eq!(source_reads, FILES);
     }
 
     #[test]
@@ -1320,6 +1453,55 @@ mod reuse_tests {
                 .is_none(),
             "cached content must not be extracted or put again"
         );
+    }
+
+    #[test]
+    fn views_read_only_assembly_late_fill_probe_reads_no_payloads() {
+        let project = super::cold_fallback_tests::repository(1);
+        let storage = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(storage.path(), "late-fill", BlobPlane::Callgraph).unwrap();
+        let source = fs::read(project.path().join("file_0.ts")).unwrap();
+        let key =
+            CallgraphKey::from_bytes(&source, "typescript", crate::views::callgraph::PRODUCER)
+                .full_key();
+        let payload = missing_callgraph_payload(&store, &key, &source, "typescript", false)
+            .unwrap()
+            .unwrap();
+        let request = AssemblyRequest {
+            storage: storage.path().to_path_buf(),
+            project_root: project.path().to_path_buf(),
+            family: "late-fill".into(),
+            scope: "late-fill-checkout".into(),
+            desired_head: "unchanged".into(),
+            changed_paths: Default::default(),
+            semantic_keys: Default::default(),
+            require_semantic: false,
+            allow_blob_put: false,
+            callgraph: true,
+        };
+        PAYLOAD_READ_COUNTS.with(|counts| counts.set(PayloadReadCounts::default()));
+        let mut measured = false;
+        let mut prepared = prepare_checkout(&request, &mut |phase| {
+            if phase == "blobs" {
+                // Another writer may fill a key between candidate assembly and
+                // the read-only publisher's availability check.
+                store.put(&key, &payload).unwrap();
+            }
+            if phase == "derived" {
+                assert_eq!(
+                    PAYLOAD_READ_COUNTS.with(|counts| counts.get()),
+                    PayloadReadCounts::default()
+                );
+                measured = true;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(measured);
+        let report = prepared.commit().unwrap();
+        assert!(report.published);
+        assert_eq!(report.blob_puts, 0);
+        assert!(report.pending_paths.is_empty());
     }
 }
 

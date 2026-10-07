@@ -1200,7 +1200,7 @@ fn build_view_store(root: &Path, name: &str) -> aft::callgraph_store::ReadonlyCa
     let blobs = storage.join("blobs.sqlite");
     let conn = rusqlite::Connection::open(&blobs).unwrap();
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)",
     )
     .unwrap();
     let mut files = project_files(root);
@@ -1242,8 +1242,12 @@ fn build_view_store(root: &Path, name: &str) -> aft::callgraph_store::ReadonlyCa
             let payload = blob.to_bytes().unwrap();
             let key = blake3::hash(&payload);
             conn.execute(
-                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2)",
-                params![key.as_bytes().as_slice(), payload],
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                params![
+                    key.as_bytes().as_slice(),
+                    payload,
+                    blake3::hash(&payload).as_bytes().as_slice()
+                ],
             )
             .unwrap();
             (

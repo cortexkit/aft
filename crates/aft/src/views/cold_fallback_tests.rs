@@ -15,7 +15,7 @@ fn git(project: &Path, args: &[&str]) {
 }
 
 /// A committed TypeScript repository with one cross-file call per pair.
-fn repository(files: usize) -> tempfile::TempDir {
+pub(super) fn repository(files: usize) -> tempfile::TempDir {
     let project = tempfile::tempdir().unwrap();
     for index in 0..files {
         fs::write(

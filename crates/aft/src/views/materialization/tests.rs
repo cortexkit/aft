@@ -2,6 +2,43 @@ use super::*;
 use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 use tempfile::TempDir;
 
+#[test]
+fn manifest_blob_reader_rejects_corrupt_digest_and_schema_at_consumption() {
+    for column in ["payload_digest", "payload_schema"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = crate::blob_store::BlobStore::open(
+            dir.path(),
+            "integrity",
+            crate::blob_store::BlobPlane::Callgraph,
+        )
+        .unwrap();
+        let source = "export function target() {}";
+        let key = crate::blob_store::CallgraphKey::for_current(source.as_bytes(), "typescript")
+            .full_key();
+        let payload =
+            join::CallgraphBlob::extract(source, "typescript", crate::views::callgraph::PRODUCER)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+        store.put(&key, &payload).unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        let reader = ManifestViewBlobReader::new(&connection);
+        assert_eq!(reader.read_payload(&key.to_hex()).unwrap(), Some(payload));
+        let value = if column == "payload_digest" {
+            "zeroblob(32)"
+        } else {
+            "999"
+        };
+        connection
+            .execute(&format!("UPDATE blob_payloads SET {column} = {value}"), [])
+            .unwrap();
+        assert!(
+            reader.read_payload(&key.to_hex()).unwrap().is_none(),
+            "must reject {column} corruption before joining a graph"
+        );
+    }
+}
+
 thread_local! {
     // Offline paired measurements keep the old SQL lookup as an in-process control.
     pub(super) static PER_REFERENCE_LOOKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -26,8 +63,12 @@ fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
         let key = blake3::hash(&payload);
         blobs
             .execute(
-                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2)",
-                params![key.as_bytes().as_slice(), payload],
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                params![
+                    key.as_bytes().as_slice(),
+                    payload,
+                    blake3::hash(&payload).as_bytes().as_slice()
+                ],
             )
             .unwrap();
         (
@@ -50,7 +91,7 @@ fn fixture() -> Fixture {
     let blobs = dir.path().join("blobs.sqlite");
     let conn = Connection::open(&blobs).unwrap();
     conn.execute_batch(
-        "CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL)",
+        "CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)",
     )
     .unwrap();
     let caller = "import { target } from './target'; export function caller() { return target(); }";
@@ -966,8 +1007,12 @@ fn changed_tsconfig_relinks_unchanged_importer_with_cold_parity() {
             .unwrap();
         let key = blake3::hash(&payload);
         conn.execute(
-            "INSERT INTO blob_payloads VALUES (?1, ?2)",
-            params![key.as_bytes().as_slice(), payload],
+            "INSERT INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+            params![
+                key.as_bytes().as_slice(),
+                payload,
+                blake3::hash(&payload).as_bytes().as_slice()
+            ],
         )
         .unwrap();
         manifest
@@ -1154,8 +1199,12 @@ fn colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows
     let payload = blob.to_bytes().unwrap();
     let key = blake3::hash(&payload);
     conn.execute(
-        "INSERT INTO blob_payloads VALUES(?1, ?2)",
-        params![key.as_bytes().as_slice(), payload],
+        "INSERT INTO blob_payloads VALUES(?1, ?2, ?3, 1)",
+        params![
+            key.as_bytes().as_slice(),
+            payload,
+            blake3::hash(&payload).as_bytes().as_slice()
+        ],
     )
     .unwrap();
     let manifest = Manifest::new(initial.entries().map(|(path, entry)| {

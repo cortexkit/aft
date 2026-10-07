@@ -11,8 +11,12 @@ fn manifest(connection: &Connection, types: &str) -> Manifest {
         let key = blake3::hash(&payload).to_hex().to_string();
         connection
             .execute(
-                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2)",
-                params![decode_manifest_full_key(&key).unwrap(), payload],
+                "INSERT OR IGNORE INTO blob_payloads VALUES (?1, ?2, ?3, 1)",
+                params![
+                    decode_manifest_full_key(&key).unwrap(),
+                    payload,
+                    blake3::hash(&payload).as_bytes().as_slice()
+                ],
             )
             .unwrap();
         (
@@ -33,7 +37,7 @@ fn blobs(path: &Path) -> Connection {
     let connection = Connection::open(path).unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL)",
+            "CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB NOT NULL, payload_digest BLOB NOT NULL, payload_schema INTEGER NOT NULL)",
         )
         .unwrap();
     connection
@@ -220,7 +224,7 @@ fn public_unknown_dynamic_counts_and_liveness_projection() {
         let key = blake3::hash(&payload).to_hex().to_string();
         let blob_path = dir.path().join("blobs.sqlite");
         let connection = blobs(&blob_path);
-        connection.execute("INSERT INTO blob_payloads VALUES (?1, ?2)", params![decode_manifest_full_key(&key).unwrap(), payload]).unwrap();
+        connection.execute("INSERT INTO blob_payloads VALUES (?1, ?2, ?3, 1)", params![decode_manifest_full_key(&key).unwrap(), payload, blake3::hash(&payload).as_bytes().as_slice()]).unwrap();
         drop(connection);
         let manifest = Manifest::new([(RelPath::new(b"fixture").unwrap(), ManifestEntry::Regular { mode: 0o100644, planes: RegularPlanes { callgraph: Some(key), semantic: None }, resolution_input: false })]).unwrap();
         let views = crate::views::ViewStore::open_dir(dir.path().join("view")).unwrap();
