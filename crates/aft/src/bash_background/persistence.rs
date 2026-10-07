@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(windows)]
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -447,10 +447,16 @@ impl PinnedDir {
         }
         #[cfg(windows)]
         {
-            self.ensure_current_identity()?;
-            fs::remove_file(self.path.join(name))?;
+            let file = self.open_file(name, false)?;
+            windows_delete_pinned_handle(&file, false)?;
             self.ensure_current_identity()
         }
+    }
+
+    #[cfg(windows)]
+    fn remove_self(&self) -> io::Result<()> {
+        self.ensure_current_identity()?;
+        windows_delete_pinned_handle(&self.file, true)
     }
 }
 
@@ -1390,6 +1396,10 @@ where
 pub fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
     validate_task_id(&paths.task_id)?;
     crate::gh_shim_ticket::revoke_task(&paths.task_id);
+    #[cfg(windows)]
+    if paths.layout == TaskLayout::Directory {
+        return delete_windows_directory_bundle(paths);
+    }
     let resolved = resolve_task_layout(&paths.session_dir, &paths.task_id)?;
     if resolved.paths.layout != paths.layout {
         return Err(io::Error::new(
@@ -1398,6 +1408,72 @@ pub fn delete_task_bundle(paths: &TaskPaths) -> io::Result<()> {
         ));
     }
     delete_resolved_task(&resolved)
+}
+
+#[cfg(windows)]
+fn delete_windows_directory_bundle(paths: &TaskPaths) -> io::Result<()> {
+    // A legacy disposition may finish removing IO/control directories only
+    // after the previous sweep's pins close. Resume that partial layout rather
+    // than requiring directories or metadata that cleanup already removed.
+    let session = match PinnedDir::open(&paths.session_dir) {
+        Ok(session) => session,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    match open_metadata_through_replacement(
+        &session,
+        &OsString::from(format!("{}.json", paths.task_id)),
+    ) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "background task layout changed before deletion",
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let Some(task) = open_optional_windows_directory(&session, OsStr::new(&paths.task_id))? else {
+        return Ok(());
+    };
+    let io_dir = open_optional_windows_directory(&task, OsStr::new(IO_DIR))?;
+    let control = open_optional_windows_directory(&task, OsStr::new(CONTROL_DIR))?;
+    if let Some(control) = &control {
+        match control.open_file(OsStr::new(METADATA_FILE), false) {
+            Ok(mut file) => {
+                let metadata = read_task_file(&mut file, &paths.json)?;
+                if metadata.task_id != paths.task_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "background task metadata identity mismatch",
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && io_dir.is_none() => {}
+            Err(error) => return Err(error),
+        }
+    } else if io_dir.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "background task control directory is missing before IO cleanup",
+        ));
+    }
+    remove_windows_directory_task(
+        &session,
+        &task,
+        io_dir.as_ref(),
+        control.as_ref(),
+        remove_tree_contents,
+    )
+}
+
+#[cfg(windows)]
+fn open_optional_windows_directory(dir: &PinnedDir, name: &OsStr) -> io::Result<Option<PinnedDir>> {
+    match dir.open_dir_at(name) {
+        Ok(child) => Ok(Some(child)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn delete_resolved_task(task: &ResolvedTask) -> io::Result<()> {
@@ -1438,20 +1514,28 @@ fn remove_directory_task_with_io_cleanup(
             "task directory identity changed before deletion",
         ));
     }
-    #[cfg(unix)]
-    let tombstone = rename_task_to_tombstone(task)?;
-    // Windows may refuse to delete an output file while the killed process
-    // still has it open. Remove the child-writable IO tree before control
-    // metadata so a partial failure leaves the task resolvable for the next
-    // cleanup pass. Keep metadata until every other control file is gone too.
-    remove_io_contents(&task.dirs.io)?;
-    let mut control_names = task.dirs.control.list_names()?;
-    control_names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));
-    for name in control_names {
-        task.dirs.control.remove_file(&name)?;
-    }
+    #[cfg(windows)]
+    return remove_windows_directory_task(
+        &task.dirs.session,
+        &task.dirs.task,
+        Some(&task.dirs.io),
+        Some(&task.dirs.control),
+        remove_io_contents,
+    );
+
     #[cfg(unix)]
     {
+        let tombstone = rename_task_to_tombstone(task)?;
+        // Windows may refuse to delete an output file while the killed process
+        // still has it open. Remove the child-writable IO tree before control
+        // metadata so a partial failure leaves the task resolvable for the next
+        // cleanup pass. Keep metadata until every other control file is gone too.
+        remove_io_contents(&task.dirs.io)?;
+        let mut control_names = task.dirs.control.list_names()?;
+        control_names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));
+        for name in control_names {
+            task.dirs.control.remove_file(&name)?;
+        }
         remove_dir_entry(&task.dirs.task, IO_DIR)?;
         remove_dir_entry(&task.dirs.task, CONTROL_DIR)?;
         let name = os_cstring(&tombstone)?;
@@ -1467,16 +1551,35 @@ fn remove_directory_task_with_io_cleanup(
         }
         Ok(())
     }
-    #[cfg(windows)]
-    {
-        task.dirs.io.ensure_current_identity()?;
-        task.dirs.control.ensure_current_identity()?;
-        task.dirs.session.ensure_current_identity()?;
-        fs::remove_dir(task.dirs.io.path())?;
-        fs::remove_dir(task.dirs.control.path())?;
-        fs::remove_dir(&task.paths.dir)?;
-        task.dirs.session.ensure_current_identity()
+}
+
+#[cfg(windows)]
+fn remove_windows_directory_task(
+    session: &PinnedDir,
+    task: &PinnedDir,
+    io_dir: Option<&PinnedDir>,
+    control: Option<&PinnedDir>,
+    remove_io_contents: impl FnOnce(&PinnedDir) -> io::Result<()>,
+) -> io::Result<()> {
+    session.ensure_current_identity()?;
+    task.ensure_current_identity()?;
+    // Keep control metadata until IO names are actually unlinked. Unsupported
+    // POSIX deletion must leave the task registered, not claim pending removal
+    // as success. A later sweep can resume after the retained handles close.
+    if let Some(io_dir) = io_dir {
+        remove_io_contents(io_dir)?;
+        io_dir.remove_self()?;
     }
+    if let Some(control) = control {
+        let mut names = control.list_names()?;
+        names.sort_by_key(|name| name == OsStr::new(METADATA_FILE));
+        for name in names {
+            control.remove_file(&name)?;
+        }
+        control.remove_self()?;
+    }
+    task.remove_self()?;
+    session.ensure_current_identity()
 }
 
 fn remove_tree_contents(dir: &PinnedDir) -> io::Result<()> {
@@ -1495,7 +1598,7 @@ fn remove_tree_contents(dir: &PinnedDir) -> io::Result<()> {
                     }
                 }
                 #[cfg(windows)]
-                fs::remove_dir(child.path())?;
+                child.remove_self()?;
             }
             Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
                 dir.remove_file(&name)?;
@@ -2219,6 +2322,104 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_TYPE_DISK: u32 = 0x0001;
 #[cfg(windows)]
 const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+#[cfg(windows)]
+const GENERIC_READ: u32 = 0x8000_0000;
+#[cfg(windows)]
+const DELETE_ACCESS: u32 = 0x0001_0000;
+#[cfg(windows)]
+const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+#[cfg(windows)]
+const FILE_DISPOSITION_INFO: i32 = 4;
+#[cfg(windows)]
+const FILE_DISPOSITION_INFO_EX: i32 = 21;
+#[cfg(windows)]
+const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0000_0001;
+#[cfg(windows)]
+const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x0000_0002;
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowsDeleteDisposition {
+    Posix,
+    Legacy,
+}
+
+#[cfg(any(windows, test))]
+fn windows_delete_with_fallback(
+    mut set_disposition: impl FnMut(WindowsDeleteDisposition) -> io::Result<()>,
+) -> io::Result<()> {
+    match set_disposition(WindowsDeleteDisposition::Posix) {
+        Ok(()) => Ok(()),
+        // ERROR_NOT_SUPPORTED / ERROR_INVALID_PARAMETER are capability failures,
+        // not permission, sharing, or non-empty-directory errors.
+        Err(error) if matches!(error.raw_os_error(), Some(50 | 87)) => {
+            set_disposition(WindowsDeleteDisposition::Legacy)?;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "POSIX delete unsupported on this volume; entry pending until handles close",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn windows_delete_pinned_handle(file: &File, directory: bool) -> io::Result<()> {
+    // ReOpenFile targets the pinned object, not a path that could be swapped.
+    // A distinct DELETE handle is necessary: POSIX disposition unlinks the name
+    // when that handle closes, even if the original pins remain open.
+    let handle = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            GENERIC_READ | DELETE_ACCESS,
+            FILE_SHARE_READ_WRITE_DELETE,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    };
+    if handle as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let deletion = unsafe { File::from_raw_handle(handle) };
+    if directory {
+        validate_directory_handle(&deletion)?;
+    } else {
+        validate_regular_handle(&deletion)?;
+    }
+    let result = windows_delete_with_fallback(|disposition| {
+        let success = match disposition {
+            WindowsDeleteDisposition::Posix => {
+                let mut flags =
+                    FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+                unsafe {
+                    SetFileInformationByHandle(
+                        deletion.as_raw_handle(),
+                        FILE_DISPOSITION_INFO_EX,
+                        (&mut flags as *mut u32).cast(),
+                        std::mem::size_of_val(&flags) as u32,
+                    )
+                }
+            }
+            WindowsDeleteDisposition::Legacy => {
+                let mut delete_file = 1_u8; // FILE_DISPOSITION_INFO::DeleteFile (BOOLEAN)
+                unsafe {
+                    SetFileInformationByHandle(
+                        deletion.as_raw_handle(),
+                        FILE_DISPOSITION_INFO,
+                        (&mut delete_file as *mut u8).cast(),
+                        std::mem::size_of_val(&delete_file) as u32,
+                    )
+                }
+            }
+        };
+        if success == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    drop(deletion);
+    result
+}
 
 #[cfg(windows)]
 fn windows_file_information(file: &File) -> io::Result<ByHandleFileInformation> {
@@ -2295,6 +2496,18 @@ struct ByHandleFileInformation {
 #[cfg(windows)]
 #[link(name = "kernel32")]
 extern "system" {
+    fn ReOpenFile(
+        original: std::os::windows::io::RawHandle,
+        access: u32,
+        share: u32,
+        flags: u32,
+    ) -> std::os::windows::io::RawHandle;
+    fn SetFileInformationByHandle(
+        file: std::os::windows::io::RawHandle,
+        class: i32,
+        information: *mut std::ffi::c_void,
+        size: u32,
+    ) -> i32;
     fn GetFileType(file: std::os::windows::io::RawHandle) -> u32;
     fn GetFileInformationByHandle(
         file: std::os::windows::io::RawHandle,
@@ -2336,6 +2549,87 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn windows_delete_unsupported_uses_legacy_and_reports_pending() {
+        for code in [50, 87] {
+            let mut calls = Vec::new();
+            let error = windows_delete_with_fallback(|disposition| {
+                calls.push(disposition);
+                match disposition {
+                    WindowsDeleteDisposition::Posix => Err(io::Error::from_raw_os_error(code)),
+                    WindowsDeleteDisposition::Legacy => Ok(()),
+                }
+            })
+            .unwrap_err();
+            assert_eq!(
+                calls,
+                [
+                    WindowsDeleteDisposition::Posix,
+                    WindowsDeleteDisposition::Legacy
+                ]
+            );
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(
+                error.to_string(),
+                "POSIX delete unsupported on this volume; entry pending until handles close"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_delete_other_errors_never_fall_back() {
+        // Access denied, sharing violation, directory not empty, and a synthetic
+        // error must not be mistaken for unsupported POSIX semantics.
+        for code in [Some(5), Some(32), Some(145), None] {
+            let mut calls = Vec::new();
+            let error = windows_delete_with_fallback(|disposition| {
+                calls.push(disposition);
+                match code {
+                    Some(code) => Err(io::Error::from_raw_os_error(code)),
+                    None => Err(io::Error::other("injected failure")),
+                }
+            })
+            .unwrap_err();
+            assert_eq!(calls, [WindowsDeleteDisposition::Posix]);
+            assert_eq!(error.raw_os_error(), code);
+            if code.is_none() {
+                assert_eq!(error.to_string(), "injected failure");
+            }
+        }
+    }
+
+    #[test]
+    fn windows_delete_legacy_failure_is_propagated() {
+        let mut calls = Vec::new();
+        let error = windows_delete_with_fallback(|disposition| {
+            calls.push(disposition);
+            match disposition {
+                WindowsDeleteDisposition::Posix => Err(io::Error::from_raw_os_error(87)),
+                WindowsDeleteDisposition::Legacy => Err(io::Error::from_raw_os_error(5)),
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            calls,
+            [
+                WindowsDeleteDisposition::Posix,
+                WindowsDeleteDisposition::Legacy
+            ]
+        );
+        assert_eq!(error.raw_os_error(), Some(5));
+    }
+
+    #[test]
+    fn windows_delete_posix_success_never_falls_back() {
+        let mut calls = Vec::new();
+        windows_delete_with_fallback(|disposition| {
+            calls.push(disposition);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, [WindowsDeleteDisposition::Posix]);
+    }
 
     fn valid_id(suffix: u64) -> String {
         format!("bash-{suffix:016x}")
@@ -2600,6 +2894,52 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
         remove_tree_contents(&dir).unwrap();
         assert!(!storage.path().join("output.bin").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bundle_deletion_unlinks_names_while_pins_remain_open() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task, _) = counted_task(storage.path());
+        let handles = TaskIoHandles::create(&task, BgMode::Pipes, false).unwrap();
+        fs::write(&task.paths.stdout, b"retained-output").unwrap();
+        let mut stdout = handles.clone_file(TaskArtifact::Stdout).unwrap();
+        let nested = task.dirs.io.create_dir_at(OsStr::new("nested")).unwrap();
+        fs::write(nested.path().join("output"), b"nested-output").unwrap();
+
+        delete_task_bundle(&task.paths).unwrap();
+
+        assert!(!task.paths.dir.exists());
+        assert!(!nested.path().exists());
+        assert!(task.dirs.session.list_names().unwrap().is_empty());
+        stdout.rewind().unwrap();
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).unwrap();
+        assert_eq!(output, b"retained-output");
+        // Keep all original pins and IO handles live through the assertions.
+        drop((stdout, nested, handles, task));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bundle_deletion_resumes_after_io_or_control_disappears() {
+        for remove_control in [false, true] {
+            let storage = tempfile::tempdir().unwrap();
+            let (task, _) = counted_task(storage.path());
+            task.dirs.io.remove_self().unwrap();
+            if remove_control {
+                remove_tree_contents(&task.dirs.control).unwrap();
+                task.dirs.control.remove_self().unwrap();
+            }
+
+            delete_task_bundle(&task.paths).unwrap();
+
+            assert!(!task.paths.dir.exists());
+            assert!(task.dirs.session.list_names().unwrap().is_empty());
+            // A completed legacy deletion is also safe to resume when its
+            // final task entry vanished after the previous sweep's pins closed.
+            delete_task_bundle(&task.paths).unwrap();
+        }
     }
 
     #[cfg(windows)]
