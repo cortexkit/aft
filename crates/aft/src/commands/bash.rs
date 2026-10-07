@@ -209,6 +209,14 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             "sandbox host escalation is unavailable to untrusted principals",
         );
     }
+    if host_requested && crate::bash_background::worker_preset_active() {
+        let bound_root = ctx
+            .config()
+            .project_root
+            .clone()
+            .unwrap_or_else(|| workdir.clone());
+        crate::agent_child_env::inject_worker_test_threads(&bound_root, &mut params.env);
+    }
 
     #[cfg(unix)]
     let mut spawn_workdir = params.workdir.clone();
@@ -1099,6 +1107,123 @@ mod tests {
         let response = handle(&request, ctx);
         assert!(response.success, "spawn failed: {:?}", response.data);
         response.data["task_id"].as_str().unwrap().to_string()
+    }
+
+    #[cfg(unix)]
+    fn bash_output_for_test(
+        ctx: &AppContext,
+        project_root: &Path,
+        request: &RawRequest,
+        worker_preset: bool,
+    ) -> String {
+        let response =
+            crate::bash_background::with_worker_preset(worker_preset, || handle(request, ctx));
+        assert!(response.success, "bash spawn failed: {:?}", response.data);
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let storage = crate::bash_background::task_storage_dir(ctx);
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = ctx
+                .bash_background()
+                .status(
+                    task_id,
+                    "sandbox-spawn-test",
+                    Some(project_root),
+                    Some(&storage),
+                    4096,
+                )
+                .expect("spawned task should be visible");
+            if snapshot.info.status.is_terminal() {
+                return snapshot.output_preview;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "bash test task did not finish: {snapshot:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(unix)]
+    fn worker_thread_output_request(id: &str) -> RawRequest {
+        spawn_test_request(
+            id,
+            r#"printf '%s|%s' "${NEXTEST_TEST_THREADS-unset}" "${RUST_TEST_THREADS-unset}""#,
+            true,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_preset_bash_reads_budget_file_and_defaults_missing_or_garbage_to_four() {
+        let container = tempfile::tempdir().unwrap();
+        let project = container.path().join("worktree");
+        std::fs::create_dir(&project).unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(&project, storage.path());
+        let budget_path = container.path().join(".cargo/alfonso-test-threads");
+
+        std::fs::create_dir_all(budget_path.parent().unwrap()).unwrap();
+        std::fs::write(&budget_path, "7\n").unwrap();
+        let mut budget_request = worker_thread_output_request("budget-file");
+        budget_request.params["params"]["workdir"] = json!(project.join("nested"));
+        std::fs::create_dir(project.join("nested")).unwrap();
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &budget_request, true),
+            "7|7"
+        );
+
+        std::fs::remove_file(&budget_path).unwrap();
+        assert_eq!(
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget-missing"),
+                true
+            ),
+            "4|4"
+        );
+
+        std::fs::write(&budget_path, "garbage\n").unwrap();
+        assert_eq!(
+            bash_output_for_test(
+                &ctx,
+                &project,
+                &worker_thread_output_request("budget-invalid"),
+                true
+            ),
+            "4|4"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_bash_respects_call_environment_and_head_or_plugin_worker_gets_no_default() {
+        let container = tempfile::tempdir().unwrap();
+        let project = container.path().join("worktree");
+        std::fs::create_dir(&project).unwrap();
+        let budget_path = container.path().join(".cargo/alfonso-test-threads");
+        std::fs::create_dir_all(budget_path.parent().unwrap()).unwrap();
+        std::fs::write(&budget_path, "8\n").unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = spawn_test_context(&project, storage.path());
+
+        let mut explicit = worker_thread_output_request("budget-explicit");
+        explicit.params["params"]["env"] = json!({
+            "NEXTEST_TEST_THREADS": "13",
+            "RUST_TEST_THREADS": "17"
+        });
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &explicit, true),
+            "13|17"
+        );
+
+        let mut head = worker_thread_output_request("budget-head");
+        head.params[crate::protocol::WORKER_SESSION_FIELD] = json!(true);
+        assert_eq!(
+            bash_output_for_test(&ctx, &project, &head, false),
+            "unset|unset"
+        );
     }
 
     #[cfg(unix)]

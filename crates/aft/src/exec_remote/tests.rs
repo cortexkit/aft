@@ -498,6 +498,8 @@ fn request_strips_secret_shaped_and_control_environment_names() {
         "NPM_TOKEN",
         "CARGO_REGISTRY_TOKEN",
         "SSH_AUTH_SOCK",
+        "NEXTEST_TEST_THREADS",
+        "RUST_TEST_THREADS",
         "AFT_STORAGE_DIR",
         "AFT_TEST_CONTROL",
         "CORTEXKIT_CONTROL_SOCKET",

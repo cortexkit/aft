@@ -4,7 +4,7 @@
 //! children. AFT never edits the user's shell startup files or global Git
 //! configuration, so an operator's terminal keeps its existing behavior.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,11 @@ use crate::config::Config;
 
 pub const SHIMS_DIR_NAME: &str = "shims";
 pub const GIT_HOOKS_DIR_NAME: &str = "git-hooks";
+const ALFONSO_TEST_THREADS_FILE: &str = "alfonso-test-threads";
+const DEFAULT_WORKER_TEST_THREADS: u32 = 4;
+const MAX_WORKER_TEST_THREADS: u32 = 256;
+const NEXT_TEST_THREADS_ENV: &str = "NEXTEST_TEST_THREADS";
+const RUST_TEST_THREADS_ENV: &str = "RUST_TEST_THREADS";
 const GIT_HOOKS_QUARANTINE_DIR_NAME: &str = "quarantine";
 const PREPARE_COMMIT_MSG: &str = "prepare-commit-msg";
 // This is the complete hook inventory documented by `githooks(5)`, including
@@ -67,6 +72,125 @@ const SUBC_IDENTITY_ENV_KEYS: [&str; 3] = [
     // number.
     subc_os::launch_nonce::LAUNCH_NONCE_FD_ENV,
 ];
+
+static WORKER_TEST_THREAD_LOGGED_WORKTREES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// Supply bounded test-run concurrency to a worker-preset bash child without
+/// replacing a value the caller already chose.
+pub(crate) fn inject_worker_test_threads(
+    project_root: &Path,
+    environment: &mut HashMap<String, String>,
+) {
+    inject_worker_test_threads_with(project_root, environment, |name| {
+        std::env::var_os(name).is_some()
+    });
+}
+
+fn inject_worker_test_threads_with(
+    project_root: &Path,
+    environment: &mut HashMap<String, String>,
+    inherited_has: impl Fn(&str) -> bool,
+) {
+    let missing = [NEXT_TEST_THREADS_ENV, RUST_TEST_THREADS_ENV]
+        .into_iter()
+        .filter(|name| !has_test_thread_override(environment, name) && !inherited_has(name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+
+    let (threads, reason) = worker_test_thread_budget(project_root);
+    if let Some(reason) = reason {
+        log_worker_test_thread_fallback_once(project_root, reason);
+    }
+    let threads = threads.to_string();
+    for name in missing {
+        environment.insert(name.to_string(), threads.clone());
+    }
+}
+
+fn has_test_thread_override(environment: &HashMap<String, String>, name: &str) -> bool {
+    #[cfg(windows)]
+    {
+        environment.keys().any(|key| key.eq_ignore_ascii_case(name))
+    }
+    #[cfg(not(windows))]
+    {
+        environment.contains_key(name)
+    }
+}
+
+fn worker_test_thread_budget(project_root: &Path) -> (u32, Option<&'static str>) {
+    let Some(worktree_parent) = project_root.parent() else {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some("worktree has no parent directory"),
+        );
+    };
+    let path = worktree_parent
+        .join(".cargo")
+        .join(ALFONSO_TEST_THREADS_FILE);
+    let contents = match fs::read(&path) {
+        Ok(contents) => contents,
+        Err(_) => {
+            return (
+                DEFAULT_WORKER_TEST_THREADS,
+                Some("budget file is absent or unreadable"),
+            )
+        }
+    };
+    let Ok(contents) = std::str::from_utf8(&contents) else {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some("budget file is not valid UTF-8"),
+        );
+    };
+    let Some(digits) = contents.strip_suffix('\n') else {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some("budget file must contain a decimal integer and newline"),
+        );
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some("budget file does not contain a positive decimal integer"),
+        );
+    }
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some("budget file does not contain a positive decimal integer"),
+        );
+    }
+    if significant.len() > 3 || (significant.len() == 3 && significant > "256") {
+        return (
+            MAX_WORKER_TEST_THREADS,
+            Some("budget exceeds 256 test threads and was clamped"),
+        );
+    }
+    match significant.parse::<u32>() {
+        Ok(threads) => (threads, None),
+        Err(_) => (
+            DEFAULT_WORKER_TEST_THREADS,
+            Some("budget file does not contain a positive decimal integer"),
+        ),
+    }
+}
+
+fn log_worker_test_thread_fallback_once(worktree: &Path, reason: &'static str) {
+    let logged = WORKER_TEST_THREAD_LOGGED_WORKTREES.get_or_init(Default::default);
+    let Ok(mut logged) = logged.lock() else {
+        return;
+    };
+    if logged.insert(worktree.to_path_buf()) {
+        log::debug!(
+            "using {DEFAULT_WORKER_TEST_THREADS} test threads for worker bash in {}: {reason}",
+            worktree.display()
+        );
+    }
+}
 
 /// Git for Windows runs shebang hooks through its bundled POSIX shell, so the
 /// same dispatcher bytes work there and on Unix. Only the repository hook
@@ -1410,6 +1534,74 @@ pub(crate) fn write_storage_permission_fixture(root: &Path) {
 mod tests {
     use super::*;
     use crate::config::{Config, GitConfig};
+
+    fn test_thread_file(root: &Path, contents: Option<&[u8]>) {
+        let path = root
+            .parent()
+            .unwrap()
+            .join(".cargo")
+            .join(ALFONSO_TEST_THREADS_FILE);
+        if let Some(contents) = contents {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+    }
+
+    #[test]
+    fn worker_thread_budget_defaults_invalid_files_and_caps_large_values() {
+        let container = tempfile::tempdir().unwrap();
+        let root = container.path().join("worktree");
+        fs::create_dir(&root).unwrap();
+
+        assert_eq!(worker_test_thread_budget(&root).0, 4);
+        for contents in [
+            b"\n".as_slice(),
+            b"garbage\n",
+            b"0\n",
+            b"4",
+            b"4\r\n",
+            b"\xff\n",
+        ] {
+            test_thread_file(&root, Some(contents));
+            assert_eq!(worker_test_thread_budget(&root).0, 4, "{contents:?}");
+        }
+        test_thread_file(&root, Some(b"9\n"));
+        assert_eq!(worker_test_thread_budget(&root), (9, None));
+        test_thread_file(&root, Some(b"999999999999999999999999999999999\n"));
+        assert_eq!(worker_test_thread_budget(&root).0, MAX_WORKER_TEST_THREADS);
+
+        let path = root
+            .parent()
+            .unwrap()
+            .join(".cargo")
+            .join(ALFONSO_TEST_THREADS_FILE);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            worker_test_thread_budget(&root).0,
+            DEFAULT_WORKER_TEST_THREADS
+        );
+    }
+
+    #[test]
+    fn worker_thread_defaults_preserve_inherited_and_call_environment_values() {
+        let container = tempfile::tempdir().unwrap();
+        let root = container.path().join("worktree");
+        fs::create_dir(&root).unwrap();
+        test_thread_file(&root, Some(b"6\n"));
+
+        let mut environment = HashMap::from([(NEXT_TEST_THREADS_ENV.into(), "13".into())]);
+        inject_worker_test_threads_with(&root, &mut environment, |name| {
+            name == RUST_TEST_THREADS_ENV
+        });
+        assert_eq!(environment[NEXT_TEST_THREADS_ENV], "13");
+        assert!(!environment.contains_key(RUST_TEST_THREADS_ENV));
+
+        let mut environment = HashMap::from([(RUST_TEST_THREADS_ENV.into(), "17".into())]);
+        inject_worker_test_threads_with(&root, &mut environment, |_| false);
+        assert_eq!(environment[RUST_TEST_THREADS_ENV], "17");
+        assert_eq!(environment[NEXT_TEST_THREADS_ENV], "6");
+    }
 
     #[cfg(unix)]
     const TEST_CO_AUTHOR: &str = "Pair Agent <pair@example.test>";

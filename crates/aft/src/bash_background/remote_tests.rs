@@ -446,6 +446,8 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
         ("SHELL_SECRET".into(), "secret-fixture-value".into()),
         ("AWS_REGION".into(), "not-off-host".into()),
         ("AFT_CONTROL_PATH".into(), "private-control-value".into()),
+        ("NEXTEST_TEST_THREADS".into(), "5".into()),
+        ("RUST_TEST_THREADS".into(), "6".into()),
     ]);
     let task_id = registry
         .spawn_remote(
@@ -474,12 +476,22 @@ async fn exec_remote_bash_discloses_only_names_aft_stripped() {
     assert!(request["params"]["env"].get("SHELL_SECRET").is_none());
     assert!(request["params"]["env"].get("AWS_REGION").is_none());
     assert!(request["params"]["env"].get("AFT_CONTROL_PATH").is_none());
+    assert!(request["params"]["env"]
+        .get("NEXTEST_TEST_THREADS")
+        .is_none());
+    assert!(request["params"]["env"].get("RUST_TEST_THREADS").is_none());
     assert_eq!(request["params"]["env"]["BUILD_LABEL"], "ordinary-build");
     assert!(
         done.output_preview.contains("AFT stripped env names:"),
         "{done:?}"
     );
-    for name in ["SHELL_SECRET", "AWS_REGION", "AFT_CONTROL_PATH"] {
+    for name in [
+        "SHELL_SECRET",
+        "AWS_REGION",
+        "AFT_CONTROL_PATH",
+        "NEXTEST_TEST_THREADS",
+        "RUST_TEST_THREADS",
+    ] {
         assert!(done.output_preview.contains(name), "{done:?}");
     }
     for value in [

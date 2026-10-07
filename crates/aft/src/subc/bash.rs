@@ -495,6 +495,7 @@ pub(super) fn submit_deferred_bash(
     permissions_granted: Option<Vec<String>>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     worker_session: bool,
+    worker_preset: bool,
     server_completion: bool,
     remote_source: super::remote_policy::RemoteSource,
     received_at: Instant,
@@ -692,12 +693,15 @@ pub(super) fn submit_deferred_bash(
                                             crate::bash_background::with_spawn_receipt(
                                                 Arc::clone(&receipt_for_spawn),
                                                 || {
-                                                    crate::bash_background::with_remote_policy(
-                                                        super::remote_policy::lookup(
-                                                            ctx,
-                                                            &remote_source,
+                                                    crate::bash_background::with_worker_preset(
+                                                        worker_preset,
+                                                        || crate::bash_background::with_remote_policy(
+                                                            super::remote_policy::lookup(
+                                                                ctx,
+                                                                &remote_source,
+                                                            ),
+                                                            || dispatch(raw_req, ctx),
                                                         ),
-                                                        || dispatch(raw_req, ctx),
                                                     )
                                                 },
                                             ),
@@ -1869,6 +1873,7 @@ mod grant_path_tests {
                 None,
                 None,
                 false,
+                false,
                 true,
                 super::remote_policy::RemoteSource::None,
                 Instant::now(),
@@ -2350,6 +2355,7 @@ mod grant_path_tests {
                 None,
                 false,
                 false,
+                false,
                 super::remote_policy::RemoteSource::None,
                 Instant::now(),
             );
@@ -2498,6 +2504,7 @@ mod grant_path_tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             super::remote_policy::RemoteSource::None,

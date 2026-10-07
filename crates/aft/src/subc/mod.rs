@@ -1286,6 +1286,8 @@ struct PendingBashAsk {
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     /// The caller is a delegated worker session (the call body's flag).
     worker_session: bool,
+    /// The call selected the catalog's worker preset rather than a plugin flag.
+    worker_preset: bool,
     asked_at: Instant,
     expires_at: Instant,
 }
@@ -2972,6 +2974,7 @@ async fn handle_bash_elicitation_reply(
                 Some(pending.grants),
                 pending.repeat,
                 pending.worker_session,
+                pending.worker_preset,
                 routes.get(&key.route).is_some_and(|identity| {
                     identity.role == tool_provider::RouteRole::ToolProviderV1
                 }),
@@ -7720,6 +7723,7 @@ async fn handle_tool_call(
             return send_provider_error(tx, metrics, frame, error).await;
         }
     };
+    let worker_preset = role.is_worker() && call.preset.as_deref() == Some("worker");
     if agent_tool && call.preset.is_none() && !scoped_route {
         metrics.record_presetless_tool_call(&identity.harness);
     }
@@ -8024,6 +8028,7 @@ async fn handle_tool_call(
                     grants: plan.grants,
                     repeat,
                     worker_session: role.is_worker(),
+                    worker_preset,
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + bash_elicitation_timeout(),
                 },
@@ -8076,6 +8081,7 @@ async fn handle_tool_call(
             None,
             repeat,
             role.is_worker(),
+            worker_preset,
             identity.role == tool_provider::RouteRole::ToolProviderV1,
             remote_policy::source(&identity, call.preset.as_deref()),
             phase_trace.received_at(),
@@ -12785,6 +12791,7 @@ mod tests {
                     grants: Vec::new(),
                     repeat: None,
                     worker_session: false,
+                    worker_preset: false,
                     asked_at: Instant::now(),
                     expires_at: Instant::now() + Duration::from_secs(60),
                 },

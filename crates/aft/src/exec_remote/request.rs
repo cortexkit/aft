@@ -82,6 +82,8 @@ pub(crate) fn denied_environment_name(name: &str) -> bool {
         .iter()
         .any(|prefix| name.starts_with(prefix))
         || name == "SSH_AUTH_SOCK"
+        || name == "NEXTEST_TEST_THREADS"
+        || name == "RUST_TEST_THREADS"
 }
 
 /// Build the caller request from bash's launch inputs. Secret-shaped and

@@ -160,6 +160,9 @@ thread_local! {
     static CURRENT_CALL_KEY: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
     static CURRENT_REMOTE: std::cell::RefCell<Option<RemoteLaunch>> = const { std::cell::RefCell::new(None) };
+    /// True only while dispatching a bash call admitted under the catalog's
+    /// worker preset. Plugin worker-session flags do not set this marker.
+    static CURRENT_WORKER_PRESET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone, Debug)]
@@ -242,6 +245,21 @@ pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOn
     }
     let _restore = Restore(CURRENT_REMOTE.with(|s| s.replace(policy)));
     run()
+}
+
+pub(crate) fn with_worker_preset<T>(worker_preset: bool, run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_WORKER_PRESET.with(|current| current.set(self.0));
+        }
+    }
+    let _restore = Restore(CURRENT_WORKER_PRESET.with(|current| current.replace(worker_preset)));
+    run()
+}
+
+pub(crate) fn worker_preset_active() -> bool {
+    CURRENT_WORKER_PRESET.with(std::cell::Cell::get)
 }
 
 /// Run `run` with `call_key` as the current call's key, restoring the
@@ -485,6 +503,14 @@ pub(crate) fn spawn(
 
     let mut env = env.unwrap_or_default();
     let config = ctx.config();
+    let remote = CURRENT_REMOTE
+        .with(|s| s.borrow().clone())
+        .filter(|launch| {
+            !shell.is_powershell()
+                && launch.params.remote_exec.as_ref().is_some_and(|policy| {
+                    crate::exec_remote::policy::matches(policy, command, pty, false)
+                })
+        });
     let child_storage_root = self::storage_dir(config.storage_dir.as_deref());
     // The ticket lets this command's `gh` shim relay bot writes for the
     // session that spawned it. Dropping it on any early return revokes it; a
@@ -504,6 +530,10 @@ pub(crate) fn spawn(
         gh_shim_ticket.value(),
     ) {
         return Response::error(request_id, "child_environment_unavailable", error);
+    }
+    if worker_preset_active() {
+        let worktree_root = project_root.as_deref().unwrap_or(&workdir);
+        crate::agent_child_env::inject_worker_test_threads(worktree_root, &mut env);
     }
     #[cfg(target_os = "linux")]
     if !pty && config.bash.linux_scope {

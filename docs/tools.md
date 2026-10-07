@@ -266,6 +266,8 @@ recommended tool surface; experimental flags gate advanced behavior, not the too
 | `ptyRows` / `ptyCols` | number | PTY dimensions (max 60 rows / 140 cols). Soft-ignored on non-PTY calls. |
 | `runon` | string | Run the whole line on the remote Linux build server (`"linux"`). Offered only where remote runs are configured; see below. |
 
+Calls admitted under the `worker` catalog preset set `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` for local bash children from `../.cargo/alfonso-test-threads` (one decimal integer plus newline), defaulting to 4 when the file is missing or invalid and capping values at 256. Existing inherited or per-call values take precedence, and shell command prefixes still override them; head sessions and unscoped plugin worker flags receive no defaults, and exec-remote requests never carry these variables.
+
 **Timeout model:** `timeout` is a hard-kill cap, never a polling parameter, and starts after
 process spawn (setup time does not count). Expiry sends SIGTERM to the Unix process group, then
 SIGKILL after up to 2 seconds (Windows uses `taskkill /T /F`) and reports exit 124. Unix processes
