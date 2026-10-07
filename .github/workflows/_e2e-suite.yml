@@ -66,9 +66,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build shared AFT binary (Linux x64)
-        env:
-          AFT_RELEASE_CARD_BUILD: ${{ inputs.publish_release_artifacts && '1' || '0' }}
-        run: cargo build --profile "$CARGO_PROFILE" --features "${{ inputs.publish_release_artifacts && 'release-card' || '' }}" -p agent-file-tools
+        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
 
       - name: Report shared binary size
         run: |
@@ -449,9 +447,7 @@ jobs:
         shell: pwsh
 
       - name: Build AFT binary (Windows x64)
-        env:
-          AFT_RELEASE_CARD_BUILD: ${{ inputs.publish_release_artifacts && '1' || '0' }}
-        run: cargo build --profile $env:CARGO_PROFILE --features "${{ inputs.publish_release_artifacts && 'release-card' || '' }}" --target x86_64-pc-windows-msvc -p agent-file-tools
+        run: cargo build --profile $env:CARGO_PROFILE --target x86_64-pc-windows-msvc -p agent-file-tools
         shell: pwsh
 
       - name: Install workspace deps + build aft-bridge
@@ -549,9 +545,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Build AFT binary (macOS native)
-        env:
-          AFT_RELEASE_CARD_BUILD: ${{ inputs.publish_release_artifacts && '1' || '0' }}
-        run: cargo build --profile "$CARGO_PROFILE" --features "${{ inputs.publish_release_artifacts && 'release-card' || '' }}" -p agent-file-tools
+        run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
 
       # Strip BEFORE signing and testing, never after: v0.51.1 shipped a
       # SIGKILL-on-load arm64 binary (#238) because strip ran after the e2e

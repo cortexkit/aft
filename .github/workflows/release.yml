@@ -153,9 +153,7 @@ jobs:
         run: node scripts/version-sync.mjs --from-tag
 
       - name: Build
-        env:
-          AFT_RELEASE_CARD_BUILD: "1"
-        run: cargo build --release --features release-card --target x86_64-apple-darwin
+        run: cargo build --release --target x86_64-apple-darwin
 
       - name: Strip binary
         run: strip target/x86_64-apple-darwin/release/aft
@@ -225,9 +223,7 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        env:
-          AFT_RELEASE_CARD_BUILD: "1"
-        run: cross build --release --features release-card --target aarch64-unknown-linux-gnu
+        run: cross build --release --target aarch64-unknown-linux-gnu
 
       - uses: actions/upload-artifact@v4
         with:
@@ -264,9 +260,7 @@ jobs:
       # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
       # musl produces static binaries where dlopen is a stub that always fails.
       - name: Build
-        env:
-          AFT_RELEASE_CARD_BUILD: "1"
-        run: cross build --release --features release-card --target x86_64-unknown-linux-gnu
+        run: cross build --release --target x86_64-unknown-linux-gnu
 
       - uses: actions/upload-artifact@v4
         with:
@@ -308,9 +302,7 @@ jobs:
         shell: pwsh
 
       - name: Build
-        env:
-          AFT_RELEASE_CARD_BUILD: "1"
-        run: cargo build --release --features release-card --target aarch64-pc-windows-msvc
+        run: cargo build --release --target aarch64-pc-windows-msvc
 
       - uses: actions/upload-artifact@v4
         with:

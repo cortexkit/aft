@@ -16,16 +16,6 @@ fn git(manifest_dir: &Path, args: &[&str]) -> Option<String> {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rustc-check-cfg=cfg(aft_release_card)");
-    println!("cargo:rerun-if-env-changed=AFT_RELEASE_CARD_BUILD");
-    // --all-features is common in test builds and must not authorize a card.
-    // Only the card/release build commands supply this compile-time marker.
-    if std::env::var_os("CARGO_FEATURE_RELEASE_CARD").is_some()
-        && std::env::var("PROFILE").as_deref() == Ok("release")
-        && std::env::var("AFT_RELEASE_CARD_BUILD").as_deref() == Ok("1")
-    {
-        println!("cargo:rustc-cfg=aft_release_card");
-    }
     let manifest_dir = std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo supplies the manifest directory"),
     );

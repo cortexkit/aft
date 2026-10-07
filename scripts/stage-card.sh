@@ -67,8 +67,8 @@ SHA="$(git rev-parse --short=12 HEAD)"
 
 BUILD_START="$(date +%s)"
 if [ "$SKIP_BUILD" -eq 0 ]; then
-  echo "==> AFT_RELEASE_CARD_BUILD=1 cargo build --release --features release-card -p agent-file-tools (sha $SHA)"
-  AFT_RELEASE_CARD_BUILD=1 cargo build --release --features release-card -p agent-file-tools --bin aft
+  echo "==> cargo build --release -p agent-file-tools (sha $SHA)"
+  cargo build --release -p agent-file-tools --bin aft
 fi
 BIN="target/release/aft"
 # Never write the dSYM to "$BIN.dSYM": cargo owns that name as a symlink

@@ -7,21 +7,21 @@ or Windows known folders. Changing `HOME`, `XDG_*`, `USERPROFILE`, `LOCALAPPDATA
 `AFT_CACHE_DIR`, or `AFT_STORAGE_DIR` cannot hide that root. Symlink aliases and
 not-yet-created descendants are checked against the same root.
 
-Only a release card is allowed to write there by default. `scripts/stage-card.sh`
-builds with `AFT_RELEASE_CARD_BUILD=1 cargo build --release --features release-card
--p agent-file-tools --bin aft`; published platform binaries use the same
-compile-time marker and explicit feature. The feature is **not** enabled by
-default, and even `--all-features` cannot authorize a card without the build
-marker. The build script emits the card discriminator only for release-profile
-builds with both signals; setting the marker at runtime does nothing.
-Debug assertions or a Rust unit-test
-build always keep the fence, even with that feature. Ordinary `--release` and
-local `--profile stage` builds are therefore protected too: the stage profile
-inherits release, so `cfg(debug_assertions)` alone would not distinguish them.
-A release build intentionally given both signals is an authorized card build;
-do not export the build marker or use these signals in development/test builds.
+Debug assertions identify the builds that tests and development rigs normally
+run: plain `cargo test` and the `target/debug/aft` children spawned by Bun tests.
+Those builds cannot write the account's production store by default. The fence
+uses `cfg!(debug_assertions)` directly; it does not require a release-card
+feature, a compile-time environment marker, or a packaging-specific build path.
 
-Non-card builds fail closed with `dev_build_refused_production_migration` before
+Optimized release builds, including ordinary `cargo build --release`,
+`cargo install`, distro packages and the release-inheriting `stage` profile,
+are allowed automatically. Requiring packagers to remember extra flags would
+risk shipping an upgrade that refuses every user's store migration. A test or
+benchmark that intentionally runs an optimized binary must therefore isolate
+its HOME/XDG and storage explicitly; the debug-build fence is not a substitute
+for harness isolation.
+
+Debug builds fail closed with `dev_build_refused_production_migration` before
 creating or migrating a production database. An existing `aft.db` at exactly
 the current schema can be opened **read-only**, without writable-open PRAGMAs.
 All production versioned-record writes are refused, not only forward schema
@@ -39,7 +39,7 @@ storage for test contexts.
 For a deliberate production migration, first stop writers and back up the
 **whole** storage root, including SQLite WAL files. Then opt in for that one
 invocation with `AFT_ALLOW_PRODUCTION_MIGRATION=1`. Only the exact value `1`
-authorizes the non-card writer. This bypasses the development write fence, not
+authorizes the debug writer. This bypasses the development write fence, not
 the newer-reader/downgrade refusal. Do not export it in a shell profile, test
 runner, CI job or harness. Prefer placing a reviewed release card instead.
 

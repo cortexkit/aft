@@ -1,4 +1,4 @@
-//! Non-card builds may inspect the account's store, but must not change it.
+//! Debug builds may inspect the account's store, but must not change it.
 //! Account directories come from the OS, never HOME/XDG or AFT overrides.
 
 use std::ffi::OsString;
@@ -144,9 +144,10 @@ fn migration_opt_in() -> bool {
 }
 
 pub(crate) fn protected(path: &Path) -> bool {
-    // A release flag alone is insufficient: stage inherits release, and tests
-    // can also be optimized. Only explicitly built cards may write production.
-    if cfg!(all(aft_release_card, not(debug_assertions), not(test))) {
+    // Tests and development rigs normally run debug builds (including the
+    // target/debug/aft children of Bun tests). Release builds must be allowed
+    // automatically: packaging cannot depend on remembering extra opt-ins.
+    if !cfg!(debug_assertions) {
         return false;
     }
     if migration_opt_in() {
@@ -201,8 +202,9 @@ mod tests {
         path
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn dev_production_migration_is_refused_without_touching_database() {
+    fn debug_production_migration_is_refused_without_touching_database() {
         let fixture = tempfile::tempdir().unwrap();
         let root = fixture.path().join("production");
         let path = old_database(&root);
@@ -211,7 +213,7 @@ mod tests {
         with_test_account(&root, false, || {
             let error = crate::db::open(&path)
                 .err()
-                .expect("dev production migration must be refused");
+                .expect("debug production migration must be refused");
             assert!(error.to_string().contains(CODE), "{error}");
         });
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -256,6 +258,7 @@ mod tests {
         });
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn matching_production_schema_opens_readonly() {
         let fixture = tempfile::tempdir().unwrap();
@@ -275,6 +278,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn direct_production_migration_is_refused() {
         let fixture = tempfile::tempdir().unwrap();
@@ -289,6 +293,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn production_bash_record_upgrade_is_refused_untouched() {
         use crate::bash_background::persistence::*;
@@ -326,6 +331,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn production_versioned_stores_and_floor_are_write_fenced() {
         let fixture = tempfile::tempdir().unwrap();
@@ -357,7 +363,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 0);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, debug_assertions))]
     #[test]
     fn production_alias_and_relative_tail_cannot_bypass_fence() {
         let fixture = tempfile::tempdir().unwrap();
@@ -368,6 +374,33 @@ mod tests {
         with_test_account(&root, false, || {
             assert!(refuse_write(&alias.join("uncreated/../aft.db")).is_err());
             assert!(refuse_write(&fixture.path().join("production-sibling/aft.db")).is_ok());
+        });
+    }
+
+    #[test]
+    fn production_write_fence_matches_build_debug_assertions() {
+        let fixture = tempfile::tempdir().unwrap();
+        with_test_account(fixture.path(), false, || {
+            assert_eq!(
+                protected(&fixture.path().join("aft.db")),
+                cfg!(debug_assertions)
+            );
+        });
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn optimized_build_migrates_fake_production_without_opt_in() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = old_database(fixture.path());
+        with_test_account(fixture.path(), false, || {
+            let conn = crate::db::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT MAX(version) FROM schema_version", [], |row| row
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                crate::db::CURRENT_SCHEMA_VERSION
+            );
         });
     }
 }

@@ -80,9 +80,6 @@ path = "tests/daemon_malloc_small_growth_repro.rs"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'] }
 
 [features]
-# Explicit card provenance; --release and the local stage profile alone do not
-# authorize writes to the account's production store.
-release-card = []
 # Explicit opt-in for cross-process timing controls used by integration tests.
 test-timing-hooks = []
 semantic-chunk-census = []
