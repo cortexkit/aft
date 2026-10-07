@@ -5833,7 +5833,13 @@ async fn drive_checkpoint_rebind_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
-    let nested = root1.join(".cortexkit/alfonso/implementation-worktrees/nested");
+    // Join one component at a time so the expected path uses the platform
+    // separator, as the paths AFT returns do on Windows.
+    let nested = root1
+        .join(".cortexkit")
+        .join("alfonso")
+        .join("implementation-worktrees")
+        .join("nested");
     std::fs::create_dir_all(&nested).unwrap();
     let file = nested.join("pool-authority.test.ts");
     std::fs::write(&file, "checkpoint contents").unwrap();
