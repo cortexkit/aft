@@ -373,7 +373,12 @@ pub(super) fn catalog(
             CatalogPreset::Worker => worker_text(&names),
             CatalogPreset::Reader => reader_text(&names),
         };
-        let digest = composition_digest(&json!({"text": text})).expect("text is JSON");
+        // The item digest is the SHA-256 hex of the exact UTF-8 text returned,
+        // so a runner can check the text against it from this reply alone.
+        let digest = {
+            use sha2::{Digest, Sha256};
+            format!("{:x}", Sha256::digest(text.as_bytes()))
+        };
         let mut rendered = SystemTextAnswer::new(&digest, &digest)
             .with_text(text)
             // The text is composed for exactly the tools served in this reply;
@@ -958,6 +963,15 @@ mod tests {
             .unwrap();
             assert_eq!(answer["system_text"]["text"], fixtures[fixture]);
             let text = answer["system_text"]["text"].as_str().unwrap();
+            // A runner checks the text against `item_digest` from this reply
+            // alone, as the SHA-256 hex of the exact text bytes.
+            {
+                use sha2::{Digest, Sha256};
+                assert_eq!(
+                    answer["system_text"]["item_digest"].as_str().unwrap(),
+                    format!("{:x}", Sha256::digest(text.as_bytes()))
+                );
+            }
             assert!(!text.contains("bash_watch"));
             assert!(!text.contains("Long-running-commands"));
             assert_eq!(text.contains("wait: true"), disabled.is_empty());
@@ -1099,6 +1113,13 @@ mod tests {
                 }
             }
             let text = worker["system_text"]["text"].as_str().unwrap();
+            {
+                use sha2::{Digest, Sha256};
+                assert_eq!(
+                    worker["system_text"]["item_digest"].as_str().unwrap(),
+                    format!("{:x}", Sha256::digest(text.as_bytes()))
+                );
+            }
             assert!(text.contains("bash_watch"), "{text}");
             assert!(text.contains("`bash.worker_wait_max_ms`, 30 minutes by default"));
             for phrase in HEAD_ONLY_WORDING {

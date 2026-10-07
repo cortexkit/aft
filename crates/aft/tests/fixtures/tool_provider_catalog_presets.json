@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "7358eab9976c8f828c84c321f546ee5645ada606767cae442aada22912e4ed27",
-      "catalog_digest": "7358eab9976c8f828c84c321f546ee5645ada606767cae442aada22912e4ed27",
+      "generation": "66dc6dd418e94f1dffabd17acc3952f9c59ad4cac4d4ce2a2927ed8d66e0fd7a",
+      "catalog_digest": "66dc6dd418e94f1dffabd17acc3952f9c59ad4cac4d4ce2a2927ed8d66e0fd7a",
       "tools": [
         {
           "name": "status",
@@ -1108,8 +1108,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\nA command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "7b30424f557958e68a67948b9dc77cdf5328ec555df70c84e8f69391a716d678",
-        "preflight_digest": "7b30424f557958e68a67948b9dc77cdf5328ec555df70c84e8f69391a716d678",
+        "item_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
+        "preflight_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -1150,8 +1150,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "34cb7364d87cfb90d47cf58ecfdeeed12a9838f4815cd4d530a2320180cdf77b",
-      "catalog_digest": "34cb7364d87cfb90d47cf58ecfdeeed12a9838f4815cd4d530a2320180cdf77b",
+      "generation": "b6f446b6d1f58377a6e8a53ad5f5b81826d27e3769039053c8f14f912fc3c93a",
+      "catalog_digest": "b6f446b6d1f58377a6e8a53ad5f5b81826d27e3769039053c8f14f912fc3c93a",
       "tools": [
         {
           "name": "status",
@@ -2317,8 +2317,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true when you need a long command's result before anything else; a blocking wait returns after the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default) and reports that the command is still running.\nA command in the background never wakes you: wait on it with bash_watch before you report a result, and watch again while it is still running. Don't poll bash_status or sleep to wait.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "7b30424f557958e68a67948b9dc77cdf5328ec555df70c84e8f69391a716d678",
-        "preflight_digest": "7b30424f557958e68a67948b9dc77cdf5328ec555df70c84e8f69391a716d678",
+        "item_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
+        "preflight_digest": "ed37b6e53df50ef40a9ca27b7cf3d4d8f8398d11c04b8b717f0e7ad49865b1ce",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -2360,8 +2360,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
-      "catalog_digest": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
+      "generation": "daa8afd64d4e027fe0c091c5f762f76fc758baef5eea0fe44bc291b121e3bc46",
+      "catalog_digest": "daa8afd64d4e027fe0c091c5f762f76fc758baef5eea0fe44bc291b121e3bc46",
       "tools": [
         {
           "name": "read",
@@ -2760,8 +2760,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nThis session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\n",
-        "item_digest": "c1ea5bd28b2b48f08246c23fd1d1d3460cce903b0192e322ade924196921e2ef",
-        "preflight_digest": "c1ea5bd28b2b48f08246c23fd1d1d3460cce903b0192e322ade924196921e2ef",
+        "item_digest": "9b9f5cc6f7a3b81130423bb7f33a3f2d5bbf9f2299ef29da7ca7bd795670a5e9",
+        "preflight_digest": "9b9f5cc6f7a3b81130423bb7f33a3f2d5bbf9f2299ef29da7ca7bd795670a5e9",
         "tool_names": [
           "callgraph",
           "glob",
@@ -2786,8 +2786,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
-      "catalog_digest": "4c6fd748b7f363d95224ca171a85c1bc6c4e145fb8d858c31c5d984e0726f1f1",
+      "generation": "daa8afd64d4e027fe0c091c5f762f76fc758baef5eea0fe44bc291b121e3bc46",
+      "catalog_digest": "daa8afd64d4e027fe0c091c5f762f76fc758baef5eea0fe44bc291b121e3bc46",
       "tools": [
         {
           "name": "read",
@@ -3186,8 +3186,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nThis session is read-only: it can read and search code, but it has no tool that runs commands or changes, moves or deletes files.\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\n",
-        "item_digest": "c1ea5bd28b2b48f08246c23fd1d1d3460cce903b0192e322ade924196921e2ef",
-        "preflight_digest": "c1ea5bd28b2b48f08246c23fd1d1d3460cce903b0192e322ade924196921e2ef",
+        "item_digest": "9b9f5cc6f7a3b81130423bb7f33a3f2d5bbf9f2299ef29da7ca7bd795670a5e9",
+        "preflight_digest": "9b9f5cc6f7a3b81130423bb7f33a3f2d5bbf9f2299ef29da7ca7bd795670a5e9",
         "tool_names": [
           "callgraph",
           "glob",

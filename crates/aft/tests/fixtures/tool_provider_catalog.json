@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e5d47e5a0b456fc1571b50a58bdd2de2b90f624dd8794766cec78c553c3264b4",
-      "catalog_digest": "e5d47e5a0b456fc1571b50a58bdd2de2b90f624dd8794766cec78c553c3264b4",
+      "generation": "20b2bdc6edb12d7fad79690a71d409482f20a7e32a9d47ee3d1b06f05fc20ae2",
+      "catalog_digest": "20b2bdc6edb12d7fad79690a71d409482f20a7e32a9d47ee3d1b06f05fc20ae2",
       "tools": [
         {
           "name": "status",
@@ -1059,8 +1059,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
-        "preflight_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
+        "item_digest": "eebf8f1bb04cc46250e7ee6423c9f62ed3606709922bf760640c1605a294b43b",
+        "preflight_digest": "eebf8f1bb04cc46250e7ee6423c9f62ed3606709922bf760640c1605a294b43b",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -1106,8 +1106,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fb211be23aa91967ee6fe78dc7eed13da2bd8603fe1dd02de1bea56774ab5875",
-      "catalog_digest": "fb211be23aa91967ee6fe78dc7eed13da2bd8603fe1dd02de1bea56774ab5875",
+      "generation": "02c4528b6a0f58641a861d26124996882b398e198876f14f0390c878be708556",
+      "catalog_digest": "02c4528b6a0f58641a861d26124996882b398e198876f14f0390c878be708556",
       "tools": [
         {
           "name": "status",
@@ -2149,8 +2149,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
-        "preflight_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
+        "item_digest": "ad043581a9aa7e3b9ccf90400758dbe78740dee7b5a5b65cccd7c29d22e2ffa8",
+        "preflight_digest": "ad043581a9aa7e3b9ccf90400758dbe78740dee7b5a5b65cccd7c29d22e2ffa8",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -2198,8 +2198,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f91683d66f65e61c6cf3f2c6cc58bfd09c08eb0650fbc0e7856dc67248718f83",
-      "catalog_digest": "f91683d66f65e61c6cf3f2c6cc58bfd09c08eb0650fbc0e7856dc67248718f83",
+      "generation": "bd47d95bcad59d8d28f2d451a729ba70d7efe65bc0d16fc3aa8ba34ffbb4bf5d",
+      "catalog_digest": "bd47d95bcad59d8d28f2d451a729ba70d7efe65bc0d16fc3aa8ba34ffbb4bf5d",
       "tools": [
         {
           "name": "status",
@@ -3168,8 +3168,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\n",
-        "item_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
-        "preflight_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
+        "item_digest": "6c7797c131ae18f8f423a0b4d274f6cfd80f4b8e6ad8294f32e089a02fbd242a",
+        "preflight_digest": "6c7797c131ae18f8f423a0b4d274f6cfd80f4b8e6ad8294f32e089a02fbd242a",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -3216,8 +3216,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5731ee021cbf26e1562790297676e4be57bed3e469422c93381949b391f3d14f",
-      "catalog_digest": "5731ee021cbf26e1562790297676e4be57bed3e469422c93381949b391f3d14f",
+      "generation": "6f79971cf6781ce8cbc53261e8fd3fd2a0c15731cfebeb73ce85c66e9e8827fc",
+      "catalog_digest": "6f79971cf6781ce8cbc53261e8fd3fd2a0c15731cfebeb73ce85c66e9e8827fc",
       "tools": [
         {
           "name": "status",
@@ -4219,8 +4219,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
-        "preflight_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
+        "item_digest": "983ffb22531c1c773731f9d7e8125aa8e915f3ff7033e066dfd9483527c1b79e",
+        "preflight_digest": "983ffb22531c1c773731f9d7e8125aa8e915f3ff7033e066dfd9483527c1b79e",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -4267,8 +4267,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "7eeadbf49b71992d380808dcf2d8bc2237bbff8df7bfc89a22b87bdcdfdaec3c",
-      "catalog_digest": "7eeadbf49b71992d380808dcf2d8bc2237bbff8df7bfc89a22b87bdcdfdaec3c",
+      "generation": "88a7e338c919b43243ce613fb907e00a347a07bf8eee35eba1cbcba02ef1bc90",
+      "catalog_digest": "88a7e338c919b43243ce613fb907e00a347a07bf8eee35eba1cbcba02ef1bc90",
       "tools": [
         {
           "name": "status",
@@ -5267,8 +5267,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
-        "preflight_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
+        "item_digest": "678c7cbf84ea2dd4450379a6486cef98a0f17ddc8f63b85f95c8c0e3d5c11c28",
+        "preflight_digest": "678c7cbf84ea2dd4450379a6486cef98a0f17ddc8f63b85f95c8c0e3d5c11c28",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -5316,8 +5316,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "81597e58a0e304dcb667b916a32d3f5dd6801782f94b1394340b317a67f500be",
-      "catalog_digest": "81597e58a0e304dcb667b916a32d3f5dd6801782f94b1394340b317a67f500be",
+      "generation": "dd5c1e03373ce03f025f1146c5cdad20da9ebbc4bf4020fb312ae61621693318",
+      "catalog_digest": "dd5c1e03373ce03f025f1146c5cdad20da9ebbc4bf4020fb312ae61621693318",
       "tools": [
         {
           "name": "status",
@@ -6270,8 +6270,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
-        "preflight_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
+        "item_digest": "40b0f5153aa7e0714ed5bd391c51935ae486c5504984c6ae39d3e8de154dc98e",
+        "preflight_digest": "40b0f5153aa7e0714ed5bd391c51935ae486c5504984c6ae39d3e8de154dc98e",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -6318,8 +6318,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "79874024a3d8e04b604f142900d402a6874aa7227ed8e85883f1ee6b0057626f",
-      "catalog_digest": "79874024a3d8e04b604f142900d402a6874aa7227ed8e85883f1ee6b0057626f",
+      "generation": "6d16e864c47fa9570e98eb70f10179df67f7cf2327dce559aded20516bd6fa6c",
+      "catalog_digest": "6d16e864c47fa9570e98eb70f10179df67f7cf2327dce559aded20516bd6fa6c",
       "tools": [
         {
           "name": "status",
@@ -7269,8 +7269,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
-        "preflight_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
+        "item_digest": "2fd7ad130c55769fcb999f641fb6996c72aa9734428681d28f06560e294a0358",
+        "preflight_digest": "2fd7ad130c55769fcb999f641fb6996c72aa9734428681d28f06560e294a0358",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -7317,8 +7317,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "56ebddbb88af39758b43d7571e37b64256143f5ff146868b59b015300d1f3c73",
-      "catalog_digest": "56ebddbb88af39758b43d7571e37b64256143f5ff146868b59b015300d1f3c73",
+      "generation": "dd51750141b059456a8fa27be26f2468a0825a8f857093e746d16ed7136195ab",
+      "catalog_digest": "dd51750141b059456a8fa27be26f2468a0825a8f857093e746d16ed7136195ab",
       "tools": [
         {
           "name": "status",
@@ -8231,8 +8231,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
-        "preflight_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
+        "item_digest": "8ccc219c417d71ed5dc4e6d7ba6f413b01cce8129b9603cde8fbf7eaceb7b58e",
+        "preflight_digest": "8ccc219c417d71ed5dc4e6d7ba6f413b01cce8129b9603cde8fbf7eaceb7b58e",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -8279,8 +8279,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b866e0e43d1f704ab1d701a6d92b6d69e35b338da9e671b7caf6aa99f79733b5",
-      "catalog_digest": "b866e0e43d1f704ab1d701a6d92b6d69e35b338da9e671b7caf6aa99f79733b5",
+      "generation": "c0760f304d3225245a23b383276385e032507652af66a4fd69f7b9ab33f1c64a",
+      "catalog_digest": "c0760f304d3225245a23b383276385e032507652af66a4fd69f7b9ab33f1c64a",
       "tools": [
         {
           "name": "status",
@@ -9190,8 +9190,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
-        "preflight_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
+        "item_digest": "f7b657cc4dfd36f996152207c3382a7383cf6639f76f15c8bd2c110062a45b08",
+        "preflight_digest": "f7b657cc4dfd36f996152207c3382a7383cf6639f76f15c8bd2c110062a45b08",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -9235,8 +9235,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "264b44d9ed44220e77e934a3caa2c3c14d4de4873064bc54c06d46c9f506807d",
-      "catalog_digest": "264b44d9ed44220e77e934a3caa2c3c14d4de4873064bc54c06d46c9f506807d",
+      "generation": "777f11fcfe5ba77f657862f8416c3f80eb30382f6b4170889ed8e8e04942923d",
+      "catalog_digest": "777f11fcfe5ba77f657862f8416c3f80eb30382f6b4170889ed8e8e04942923d",
       "tools": [
         {
           "name": "status",
@@ -10347,8 +10347,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
-        "preflight_digest": "3de21886ce3824560521660473b3fa24d896683ad8e2e09a5555ba16e0cf4600",
+        "item_digest": "eebf8f1bb04cc46250e7ee6423c9f62ed3606709922bf760640c1605a294b43b",
+        "preflight_digest": "eebf8f1bb04cc46250e7ee6423c9f62ed3606709922bf760640c1605a294b43b",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -10395,8 +10395,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "9b17f7233fa9ad04433324610c8a07658d43e5e95057fd6f5f9510dd4a73973d",
-      "catalog_digest": "9b17f7233fa9ad04433324610c8a07658d43e5e95057fd6f5f9510dd4a73973d",
+      "generation": "e33a90cd220dd320a339849c23fe0bff5e7c2044222d209877cc0090c31b701b",
+      "catalog_digest": "e33a90cd220dd320a339849c23fe0bff5e7c2044222d209877cc0090c31b701b",
       "tools": [
         {
           "name": "status",
@@ -11507,8 +11507,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\nAs a worker, keep changes within your assigned scope, verify them, and report the result to your parent.\n",
-        "item_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
-        "preflight_digest": "94261541d2403e9f89201f7700b412e504bf62e914564e326b8ac2d18f6c05ec",
+        "item_digest": "ad043581a9aa7e3b9ccf90400758dbe78740dee7b5a5b65cccd7c29d22e2ffa8",
+        "preflight_digest": "ad043581a9aa7e3b9ccf90400758dbe78740dee7b5a5b65cccd7c29d22e2ffa8",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -11557,8 +11557,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f90dab47f658a4f664fde2c78289cbf6cb34425974e1624085863a9413bbd5b5",
-      "catalog_digest": "f90dab47f658a4f664fde2c78289cbf6cb34425974e1624085863a9413bbd5b5",
+      "generation": "83662487900825b2e68b33ef24032fd2b5ed486088feaba68937e49fcb0405ea",
+      "catalog_digest": "83662487900825b2e68b33ef24032fd2b5ed486088feaba68937e49fcb0405ea",
       "tools": [
         {
           "name": "status",
@@ -12596,8 +12596,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\n",
-        "item_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
-        "preflight_digest": "0d51f03d7129bee144131bb2ab905fb79e1bd87d457806b03d6fd67bcb7d848b",
+        "item_digest": "6c7797c131ae18f8f423a0b4d274f6cfd80f4b8e6ad8294f32e089a02fbd242a",
+        "preflight_digest": "6c7797c131ae18f8f423a0b4d274f6cfd80f4b8e6ad8294f32e089a02fbd242a",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -12645,8 +12645,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "51cdd54e8b08dec9e918d82f33dd4ac9151c976fda4c41bbecd81d5e3984cfb6",
-      "catalog_digest": "51cdd54e8b08dec9e918d82f33dd4ac9151c976fda4c41bbecd81d5e3984cfb6",
+      "generation": "7d252a6039c2815037b9bd4fd0c24c0848fdea6d0b2d9e0d10f35910a6838374",
+      "catalog_digest": "7d252a6039c2815037b9bd4fd0c24c0848fdea6d0b2d9e0d10f35910a6838374",
       "tools": [
         {
           "name": "status",
@@ -13717,8 +13717,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
-        "preflight_digest": "edfe8becf760de53216aca3f8ef3b899e375d71c2ad32cba46965353e0dd25a4",
+        "item_digest": "983ffb22531c1c773731f9d7e8125aa8e915f3ff7033e066dfd9483527c1b79e",
+        "preflight_digest": "983ffb22531c1c773731f9d7e8125aa8e915f3ff7033e066dfd9483527c1b79e",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -13766,8 +13766,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ecde3e67034201c273f0f18509a974ae7dad30364839093cf2dce9a946c72aa7",
-      "catalog_digest": "ecde3e67034201c273f0f18509a974ae7dad30364839093cf2dce9a946c72aa7",
+      "generation": "714f2ed9ba0909ab1e1c9f3ff4918c168b4ee79a71297b0e2cd911f80f8ace58",
+      "catalog_digest": "714f2ed9ba0909ab1e1c9f3ff4918c168b4ee79a71297b0e2cd911f80f8ace58",
       "tools": [
         {
           "name": "status",
@@ -14835,8 +14835,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
-        "preflight_digest": "a61732cbac6a8ca61f841d622c527d265c675495395be13ad240da00babc9f44",
+        "item_digest": "678c7cbf84ea2dd4450379a6486cef98a0f17ddc8f63b85f95c8c0e3d5c11c28",
+        "preflight_digest": "678c7cbf84ea2dd4450379a6486cef98a0f17ddc8f63b85f95c8c0e3d5c11c28",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -14885,8 +14885,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "d4c4c9daf5bbf01f3cca295b8afeda44fae30bc07e439ebc02d6ac1274cc9b10",
-      "catalog_digest": "d4c4c9daf5bbf01f3cca295b8afeda44fae30bc07e439ebc02d6ac1274cc9b10",
+      "generation": "7671acd691948a1936a794b52ddbe25edd956a2eb3637418834e61e004ab5e56",
+      "catalog_digest": "7671acd691948a1936a794b52ddbe25edd956a2eb3637418834e61e004ab5e56",
       "tools": [
         {
           "name": "status",
@@ -15908,8 +15908,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
-        "preflight_digest": "220dce4e24b2cc3c93f3c59b220c77d4ca3b9c9b9838e5c198b66c85dee6a375",
+        "item_digest": "40b0f5153aa7e0714ed5bd391c51935ae486c5504984c6ae39d3e8de154dc98e",
+        "preflight_digest": "40b0f5153aa7e0714ed5bd391c51935ae486c5504984c6ae39d3e8de154dc98e",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -15957,8 +15957,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "e096f624598017b9c0b39ff24b7b5c0fd0b9fbbced33a4bacce8d3709dcc0ef4",
-      "catalog_digest": "e096f624598017b9c0b39ff24b7b5c0fd0b9fbbced33a4bacce8d3709dcc0ef4",
+      "generation": "d4cbb57c9904e8146f907fbd23cda8bb2ae132d498694757b0138df1c19c94eb",
+      "catalog_digest": "d4cbb57c9904e8146f907fbd23cda8bb2ae132d498694757b0138df1c19c94eb",
       "tools": [
         {
           "name": "status",
@@ -16977,8 +16977,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse zoom to inspect named symbols, with callgraph: true for one-level calls.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
-        "preflight_digest": "50845010feb976ca826d97b461ee6845ddcb70530464908f225af8aec7550f67",
+        "item_digest": "2fd7ad130c55769fcb999f641fb6996c72aa9734428681d28f06560e294a0358",
+        "preflight_digest": "2fd7ad130c55769fcb999f641fb6996c72aa9734428681d28f06560e294a0358",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -17026,8 +17026,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "a818b29df6eada1427bb31ef6eb5625201373faec016252f79ff97f7c537b6ca",
-      "catalog_digest": "a818b29df6eada1427bb31ef6eb5625201373faec016252f79ff97f7c537b6ca",
+      "generation": "b1b6ccb70e13877736fc8aba5c58dcaea5148bea606e01bd787aa1f9e60222ff",
+      "catalog_digest": "b1b6ccb70e13877736fc8aba5c58dcaea5148bea606e01bd787aa1f9e60222ff",
       "tools": [
         {
           "name": "status",
@@ -18009,8 +18009,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse search to locate code by concept, identifier, or literal before reading it.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
-        "preflight_digest": "01497e01edd6fe0675cd4f6b6f0016647c53910be570eb91ded61c64027f2789",
+        "item_digest": "8ccc219c417d71ed5dc4e6d7ba6f413b01cce8129b9603cde8fbf7eaceb7b58e",
+        "preflight_digest": "8ccc219c417d71ed5dc4e6d7ba6f413b01cce8129b9603cde8fbf7eaceb7b58e",
         "tool_names": [
           "apply_patch",
           "ast_replace",
@@ -18058,8 +18058,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "b9f4a7e05a9b24f81261ea6c8c4aae8c2411060d3891034cb82be233cfe4c378",
-      "catalog_digest": "b9f4a7e05a9b24f81261ea6c8c4aae8c2411060d3891034cb82be233cfe4c378",
+      "generation": "f92959ef6ff8aff82f7d27aae6a128b5a1de9e13029284fe637319f7d0b093a3",
+      "catalog_digest": "f92959ef6ff8aff82f7d27aae6a128b5a1de9e13029284fe637319f7d0b093a3",
       "tools": [
         {
           "name": "status",
@@ -19038,8 +19038,8 @@
       ],
       "system_text": {
         "text": "# Agent File Tools\n\nUse outline to map source structure before reading specific sections.\nUse callgraph for callers, impact, and multi-level execution or data-flow traces.\nUse inspect after editing for fresh diagnostics; run the project's typecheck and relevant tests as the authoritative gates.\nUse read for files and bounded line ranges, not shell commands to explore source.\nUse bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n",
-        "item_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
-        "preflight_digest": "d19ec2a1ec7ee2a154d76e60b25a341ffa1d7be70ce3cb086d9f7c9d4ec04ccc",
+        "item_digest": "f7b657cc4dfd36f996152207c3382a7383cf6639f76f15c8bd2c110062a45b08",
+        "preflight_digest": "f7b657cc4dfd36f996152207c3382a7383cf6639f76f15c8bd2c110062a45b08",
         "tool_names": [
           "apply_patch",
           "ast_replace",
