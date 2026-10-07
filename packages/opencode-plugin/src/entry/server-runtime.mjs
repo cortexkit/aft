@@ -18,6 +18,7 @@ import { debug, log, warn } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftConfigErrorRpc, registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers, v2PromptChannelFor } from "../tools/hoisted/v2.js";
+import { registerV2HostToolOverlapNotice } from "../v2-host-tool-overlap.js";
 import { registerV2PromptDetachHook } from "../v2-prompt-detach.js";
 import { registerV2ToolHooks } from "../v2-tool-hooks.js";
 import { registerV2WorkflowHints } from "../v2-workflow-hints.js";
@@ -41,6 +42,7 @@ const defaults = {
   registerPromptHook: registerV2PromptDetachHook,
   registerToolHooks: registerV2ToolHooks,
   registerWorkflowHints: registerV2WorkflowHints,
+  registerHostToolOverlapNotice: registerV2HostToolOverlapNotice,
   // The prompt server comes from the user-only `opencode` block of the
   // Location's config; without it AFT finds the server it runs inside.
   toolConsumers: (context, config) => ({
@@ -237,6 +239,13 @@ export function makeServerEffect(overrides = {}) {
       );
       yield* dependencies.registerToolHooks(context, runtime.toolContext, new Set(Object.keys(runtime.tools)));
       yield* dependencies.registerWorkflowHints(context, runtime.hintsBlock);
+      // Tell the user once, in the chat, when the host's own patch or shell
+      // tool still runs beside AFT's apply_patch or bash. Checked on the first
+      // prompt, once every plugin has registered its tools.
+      yield* dependencies.registerHostToolOverlapNotice(
+        context,
+        new Set(Object.keys(runtime.tools)),
+      );
     });
   };
 }
