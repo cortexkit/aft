@@ -418,7 +418,7 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
         .await
         .unwrap();
     std::fs::write(root.join("project/input.txt"), "first content\n").unwrap();
-    let body = json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"replay"});
+    let body = json!({"name":"read","arguments":{"path":"input.txt"},"call_key":"replay"});
     let first = route.raw(body.clone(), false).await;
     assert_eq!(first.header.ty, FrameType::Response);
     assert_eq!(response_json(&first)["isError"], false);
@@ -436,7 +436,7 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     assert_eq!(first.body, repeat.body);
     let conflict = route
         .raw(
-            json!({"name":"read","arguments":{"filePath":"missing.txt"},"call_key":"replay"}),
+            json!({"name":"read","arguments":{"path":"missing.txt"},"call_key":"replay"}),
             false,
         )
         .await;
@@ -445,7 +445,7 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     assert_eq!(response_json(&conflict)["detail"]["field"], "call_key");
     let plain = route
         .raw(
-            json!({"name":"read","arguments":{"filePath":"input.txt"}}),
+            json!({"name":"read","arguments":{"path":"input.txt"}}),
             false,
         )
         .await;
@@ -456,7 +456,7 @@ async fn s1_keyed_replay_headers_bytes_expiry_and_keyless_legacy_exclusion() {
     assert_eq!(
         legacy
             .raw(
-                json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"legacy"}),
+                json!({"name":"read","arguments":{"path":"input.txt"},"call_key":"legacy"}),
                 false
             )
             .await
@@ -508,7 +508,7 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
     std::fs::write(root.join("project/input.txt"), "content\n").unwrap();
     let stamp = scoped_stamp("carrier-a", "owner-a", "same-ref");
     let route = Subject::HEAD.route(&process, &stamp).await.unwrap();
-    let body = json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"scoped"});
+    let body = json!({"name":"read","arguments":{"path":"input.txt"},"call_key":"scoped"});
     let first = route.raw(body.clone(), false).await;
     assert_eq!(response_json(&first)["isError"], false);
     let other = Subject::HEAD.route(&process, &stamp).await.unwrap();
@@ -548,7 +548,7 @@ async fn s1_scoped_owner_identity_conflicts_and_expired_replay() {
         .route(&process, &Subject::HEAD.plain_stamp())
         .await
         .unwrap();
-    let missing = json!({"name":"read","arguments":{"filePath":"missing.txt"}});
+    let missing = json!({"name":"read","arguments":{"path":"missing.txt"}});
     let native = response_json(&trusted.raw(missing.clone(), false).await)["structuredContent"]
         ["code"]
         .as_str()
@@ -607,7 +607,7 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
     std::fs::write(root.join("project/input.txt"), "readable\n").unwrap();
     route
         .raw(
-            json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"seed"}),
+            json!({"name":"read","arguments":{"path":"input.txt"},"call_key":"seed"}),
             false,
         )
         .await;
@@ -628,7 +628,7 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
         .unwrap();
     let marker = root.join("project/should-not-run");
     for body in [
-        json!({"name":"read","arguments":{"filePath":"input.txt"},"call_key":"blocked-read"}),
+        json!({"name":"read","arguments":{"path":"input.txt"},"call_key":"blocked-read"}),
         json!({"name":"bash","arguments":{"command":marker_command(&marker)},"call_key":"blocked-bash"}),
     ] {
         let frame = route.raw(body, false).await;
@@ -643,7 +643,7 @@ async fn s1_database_unavailable_refuses_keyed_read_and_shell_but_not_keyless_re
     }
     let plain = route
         .raw(
-            json!({"name":"read","arguments":{"filePath":"input.txt"}}),
+            json!({"name":"read","arguments":{"path":"input.txt"}}),
             false,
         )
         .await;
@@ -1320,7 +1320,7 @@ async fn s1_restart_recovers_running_shell_once_and_reduces_unobserved_read() {
         carrier: "reserved:reader".into(),
         call_key: "unknown-read".into(),
     };
-    let read_body = json!({"name":"read","schema_pin":null,"arguments":{"filePath":"missing.txt"}});
+    let read_body = json!({"name":"read","schema_pin":null,"arguments":{"path":"missing.txt"}});
     let digest = cortexkit_role_tool_provider::catalog::composition_digest(&read_body).unwrap();
     ledger::admit(
         &conn,
