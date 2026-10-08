@@ -104,7 +104,9 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 ctx.bash_background()
                     .append_db_hint(&task_id, &mut snapshot.output_preview);
             }
-            if snapshot.sandbox_native
+            if let Some(refusal) = &snapshot.remote_refusal {
+                Response::error_with_data(&req.id, refusal.code, &refusal.message, json!(snapshot))
+            } else if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
                 && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
             {

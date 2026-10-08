@@ -364,6 +364,12 @@ impl HardKillDeadline {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RemoteRefusal {
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BgTaskSnapshot {
     #[serde(flatten)]
     pub info: BgTaskInfo,
@@ -391,6 +397,9 @@ pub struct BgTaskSnapshot {
     pub sandbox_native: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sandbox_unavailable: bool,
+    /// An explicit remote demand was refused before the command started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_refusal: Option<RemoteRefusal>,
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
@@ -8782,6 +8791,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
     let live_descendants_summary = live_descendants_summary(&metadata);
     let hard_kill =
         HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
+    let remote_refusal = remote::remote_refusal(&metadata);
     BgTaskSnapshot {
         info: BgTaskInfo {
             task_id: metadata.task_id,
@@ -8807,6 +8817,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         scanner_report: metadata.scanner_report,
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
+        remote_refusal,
         live_descendants: metadata.live_descendants.clone(),
         live_descendants_omitted: metadata.live_descendants_omitted,
         live_descendants_summary,
@@ -8890,6 +8901,7 @@ impl BgTask {
                 && open_task_artifact(&self.paths, TaskArtifact::SandboxUnavailable)
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
+            remote_refusal: remote::remote_refusal(metadata),
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
             live_descendants_summary: live_descendants_summary(metadata),

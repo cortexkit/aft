@@ -801,6 +801,19 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
         } else {
             (format_foreground_result(&snapshot), None)
         };
+    if let Some(refusal) = &snapshot.remote_refusal {
+        return Response::error_with_data(
+            request_id,
+            refusal.code,
+            &refusal.message,
+            json!({
+                "task_id": snapshot.info.task_id,
+                "status": snapshot.info.status,
+                "exit_code": snapshot.exit_code,
+                "output": output,
+            }),
+        );
+    }
     if snapshot.sandbox_native
         && snapshot.sandbox_unavailable
         && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
@@ -997,6 +1010,7 @@ mod tests {
             scanner_report: Vec::new(),
             sandbox_native: false,
             sandbox_unavailable: false,
+            remote_refusal: None,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
             live_descendants_summary: None,
@@ -1005,6 +1019,31 @@ mod tests {
             hard_kill: None,
             elapsed_ms: None,
         }
+    }
+
+    #[test]
+    fn runon_foreground_refusal_is_a_structured_error_not_a_command_failure() {
+        let mut refused = snapshot("", false, None, BgTaskStatus::Failed, None);
+        refused.remote_refusal = Some(crate::bash_background::registry::RemoteRefusal {
+            code: "remote_unavailable",
+            message: "runon refused: remote refused: unreachable; command was not run; retry, or omit runon to run locally".into(),
+        });
+        let response = foreground_result_response("refused", refused);
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "remote_unavailable");
+        assert_eq!(response.data["task_id"], "bash-test");
+        assert!(response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("remote refused: unreachable"));
+
+        let failed = snapshot("command failed", false, None, BgTaskStatus::Failed, Some(1));
+        let response = foreground_result_response("failed", failed);
+        assert!(
+            response.success,
+            "ordinary command exit is not a remote refusal: {response:?}"
+        );
+        assert_eq!(response.data["exit_code"], 1);
     }
 
     #[test]

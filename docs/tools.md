@@ -326,10 +326,18 @@ Linux. If no `exec-remote/v1` provider answers, or daemon discovery fails before
 the task is refused by name and the command is not run locally. `background: true` works as
 for local commands, and a background remote task re-attaches after a restart.
 
-The first line of the reply says where the command ran: `ran remotely on ck-motor`, or, when the
-runner refused the job before starting it, `ran locally on macOS: remote refused: <reason>`
-(the command then runs once on this machine). A job the runner accepted is never run again: if
-AFT loses track of it, the reply says the outcome is unknown instead of re-running it. After the
+When the runner refuses an explicit `runon` job before starting it, the call fails with code
+`remote_unavailable`: `runon refused: remote refused: <reason>; command was not run; retry, or
+omit runon to run locally`. The refusal reason is preserved, including reasons from newer
+runners. This also applies to pending tasks recovered after a restart. No local process is
+spawned. A deliberately backgrounded call still returns its task ID; a later refusal marks
+that task failed and its status includes `remote_refusal` with the same error text.
+
+Successful remote runs begin with `ran remotely on ck-motor`. Only automatic prefix routing
+(without an explicit `runon`) retains local fallback with the advisory
+`ran locally on macOS: remote refused: <reason>` (or the local OS name). A job that started
+remotely is never run again: if AFT loses track of it, the reply says the outcome is unknown
+instead of re-running it. After the
 output, the reply prints what the runner reported about the server's workspace, none of which
 is copied back: the files the run changed (`These files changed on the server and were NOT
 copied back:`), a changed Git state (HEAD before -> after, the symbolic ref or `detached`,

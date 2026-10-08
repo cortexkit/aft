@@ -13,6 +13,30 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+fn runon_refusal_message(reason: &str) -> String {
+    format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally")
+}
+
+/// Derive the error from persisted remote proof, never from command output.
+/// Keeping it in snapshots lets foreground and restarted/background readers
+/// report the same named refusal without changing older task records.
+pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::RemoteRefusal> {
+    if metadata.status != super::BgTaskStatus::Failed {
+        return None;
+    }
+    let remote = metadata.remote.as_ref().filter(|r| r.explicit_runon)?;
+    let crate::exec_remote::Verdict::RunLocally { reason } =
+        crate::exec_remote::grade(remote.terminal.as_ref()?)
+    else {
+        return None;
+    };
+    let reason = serde_json::to_value(reason).ok()?;
+    Some(super::RemoteRefusal {
+        code: "remote_unavailable",
+        message: runon_refusal_message(reason.as_str()?),
+    })
+}
+
 #[cfg(unix)]
 const REMOTE_REATTACH_BUDGET: Duration = Duration::from_secs(5 * 60);
 
@@ -785,6 +809,13 @@ impl BgTaskRegistry {
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
         let metadata = state.metadata.clone();
+        // Automatic prefix routing may fall back; an explicit remote demand
+        // must fail before any local launch state or process is created.
+        if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon) {
+            drop(state);
+            drop(db);
+            return self.refuse_remote_executor(task, reason);
+        }
         let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
             .map_err(|e| e.to_string())?;
         let durable = read_task_at(&layout).map_err(|e| e.to_string())?;
@@ -876,6 +907,11 @@ impl BgTaskRegistry {
         remote: &RemoteTask,
         reason: &str,
     ) -> Result<(), String> {
+        // Decide before even restoring a local launch plan: this also covers
+        // a refusal persisted just before the previous AFT process stopped.
+        if remote.explicit_runon {
+            return self.refuse_remote_executor(task, reason);
+        }
         let restore = (|| {
             let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
                 .map_err(|e| e.to_string())?;
@@ -921,10 +957,21 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    fn refuse_remote_executor(&self, task: &Arc<BgTask>, reason: &str) -> Result<(), String> {
+        self.remote_terminal(
+            task,
+            Verdict::RunLocally {
+                reason: RefusalReason::Unknown(reason.into()),
+            },
+            Some(runon_refusal_message(reason)),
+        );
+        Ok(())
+    }
+
     fn refuse_remote_before_dispatch(&self, task: &Arc<BgTask>, error: &str) -> Result<(), String> {
         // Missing discovery providers and other proven pre-dispatch failures
         // cannot satisfy an explicit remote demand. Do not turn them into a
-        // local run; executor-authored refusals still follow their own policy.
+        // local run.
         self.remote_terminal(
             task,
             Verdict::RunLocally {

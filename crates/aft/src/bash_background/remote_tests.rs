@@ -203,6 +203,18 @@ async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
         let task = ctx.bash_background().task(task_id).unwrap();
         assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
         assert_runon_refusal(&refusal_response(done), reason);
+        let status = crate::commands::bash_status::handle(
+            &crate::protocol::RawRequest {
+                id: "runon-status".into(),
+                command: "bash_status".into(),
+                session_id: Some("session".into()),
+                lsp_hints: None,
+                params: serde_json::json!({"task_id": task_id}),
+            },
+            &ctx,
+        );
+        assert_runon_refusal(&status, reason);
+        assert_eq!(status.data["remote_refusal"]["code"], "remote_unavailable");
         assert_eq!(exec_runs(&daemon).len(), 1);
     }
 }
@@ -220,12 +232,12 @@ async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
         let ctx = restarted_context(dir.path());
         let mut policy = launch(daemon.connection.clone());
         policy.params.remote_exec.as_mut().unwrap().legacy_commands =
-            Some(serde_json::json!(["printf"]));
+            Some(serde_json::json!(["touch"]));
         let response = handle_with_policy(
             &ctx,
             Some(policy),
             serde_json::json!({
-                "command": format!("printf local-proof > '{}'", marker.display()),
+                "command": format!("touch '{}'", marker.display()),
                 "compressed": false
             }),
         );
@@ -235,14 +247,36 @@ async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
             response.data["task_id"].as_str().unwrap(),
         )
         .await;
-        assert_eq!(fs::read_to_string(marker).unwrap(), "local-proof");
-        assert_eq!(done.exit_code, Some(0));
         assert!(
-            done.output_preview.contains(&format!(
-                "ran locally on {}: remote refused: {reason}",
-                local_os_name()
-            )),
-            "{done:?}"
+            marker.exists(),
+            "prefix routing must run locally after {reason}"
+        );
+        assert_eq!(done.exit_code, Some(0));
+        assert_eq!(
+            exec_runs(&daemon).len(),
+            1,
+            "the prefix must actually route remotely"
+        );
+        let status_request = crate::protocol::RawRequest {
+            id: "prefix-status".into(),
+            command: "bash_status".into(),
+            session_id: Some("session".into()),
+            lsp_hints: None,
+            params: serde_json::json!({"task_id": response.data["task_id"]}),
+        };
+        let status = crate::commands::bash_status::handle(&status_request, &ctx);
+        assert!(status.success, "{status:?}");
+        assert!(
+            status.data["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&format!(
+                    "ran locally on {}: remote refused: {reason}",
+                    local_os_name()
+                )),
+            "tool status: {status:?}; execution note: {:?}",
+            ctx.bash_background()
+                .execution_note(response.data["task_id"].as_str().unwrap(), "session")
         );
         assert!(refusal_response(done).success);
         assert_eq!(exec_runs(&daemon).len(), 1);
