@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/semantic_index.rs",
+    "crates/aft/src/subc_tool_schemas.json"
+  ],
+  "note": "Train 345 assembles accepted storage, import, inspect configuration, semantic chunk reuse, remote refusal, worktree callgraph and dead-code scanner deliveries on main 2eea2a8963e71decce17aea9773c58a4cc6e5446. Derived class is ranking from git diff --name-only origin/main...HEAD against RANKING_FENCE_PREFIXES in search_quality_lib.py; the fenced files are listed above. lib.rs wires the storage fence, subc_tool_schemas.json changes only the inspect description, and semantic_index.rs reuses unchanged chunk embeddings and excludes TOML/YAML from semantic indexing. The TOML/YAML exclusion may move benchmark rows. This engine_unwired declaration does not claim a local benchmark pass: the parent runs the full 93-row replay and determines parity before landing. No benchmark was run in the network-isolated worker."
+}

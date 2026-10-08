@@ -488,7 +488,8 @@ fn embed_counts_views_and_sessions_share_identical_content() {
         // The ten changed modules retain their Record struct chunks from main;
         // their other three chunks change, and all four chunks in each of the
         // five added modules are new: 10 * 3 + 5 * 4 = 50 model inputs.
-        older_branch, 50,
+        older_branch,
+        50,
         "the older branch re-embedded shared content"
     );
     let folded = c.load();
