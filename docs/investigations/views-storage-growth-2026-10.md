@@ -391,3 +391,184 @@ It deliberately preserves orphan `.ref` generations for the managed two-pass
 ownership sweep, and does not delete stale pin/reader records. A live-mode
 `rm derived-*`, SQLite hard-link replacement, or a read-only SQLite probe of the
 production store is not an acceptable cleanup procedure.
+
+## Follow-up: root grace survives daemon replacement
+
+Follow-up base: accepted commit `95bd24da8bf3081043ef921aaf2aa6b7b134e5aa`.
+
+### 1. The clock is already persisted; the suspected restart reset is absent
+
+There are **two different clocks**, and neither depends on process-local
+first-sighting memory:
+
+- **Attributed key:** `eligible` loads binding history and requires **every**
+  recorded root to be absent and every binding to pass `missing_and_old`.
+  That predicate ages `last_bound_ms`, not the time deletion was observed
+  ([storage_retention.rs:259–275](../../crates/aft/src/storage_retention.rs#L259-L275),
+  [587–607](../../crates/aft/src/storage_retention.rs#L587-L607)). The effective
+  age gate is seven days after the **latest** binding for the key, plus all
+  mount/protection checks. A root last bound eight days ago can become eligible
+  immediately when it disappears; there is not an additional seven days after
+  observing its disappearance.
+- **Unattributed key:** the first call to `eligible` that reaches the no-history
+  branch creates `<storage>/retention/unknown/<key>.json`, containing the
+  first-observed Unix time in milliseconds. Subsequent calls **read that file**;
+  only `NotFound` creates a new clock. Malformed/unreadable metadata returns an
+  error rather than restarting the clock
+  ([storage_retention.rs:608–626](../../crates/aft/src/storage_retention.rs#L608-L626)).
+  This clock is shared by that key across cache domains; it is not necessarily
+  the first time its *view* directory was visited, or a known root's deletion
+  time. The file is created with temporary-file write plus atomic rename
+  ([161–172](../../crates/aft/src/storage_retention.rs#L161-L172)). Ordinary daemon
+  exit/replacement does not erase it. This is atomic replacement, not a claim of
+  fsync-based power-loss durability; losing the file would restart a conservative
+  retention delay, not authorize early deletion.
+
+**No `retention/roots` record does not mean no binding history.** `bindings`
+loads `cache-keys.json` records as well as durable root files and owner manifests
+([348–428](../../crates/aft/src/storage_retention.rs#L348-L428)). The earlier
+1,214-directory count was *durable-record absence*, not 1,214 keys using the
+unknown-key grace. Most still have memo attribution. The seven-day constant is
+`ROOT_GRACE_MS = 7 * 24 * 60 * 60 * 1000` = **604,800,000 ms**
+([line 18](../../crates/aft/src/storage_retention.rs#L18)); it is a hard-coded
+retention policy, not a user-configurable setting. It remains unchanged.
+`record_bind` records a new durable `last_bound_ms` on every configure, including
+a same-key rebind ([174–191](../../crates/aft/src/storage_retention.rs#L174-L191)).
+
+What *does* reset on daemon replacement is scheduler state: startup warm-up,
+last-run throttle and the directory traversal cursor are in `State`/`states`
+([66–92](../../crates/aft/src/storage_retention.rs#L66-L92)). Resetting the cursor
+can delay discovery/revisiting of a tail directory, particularly with repeated
+short-lived daemons. It does **not** reset the persisted observation once found.
+The fresh five-minute startup delay also remains. No new persistence mechanism,
+retention-policy change, or production logic fix was needed for this hypothesis.
+
+### 2. Missing-root bytes by the clocks that actually exist
+
+Plain-metadata/stat census at **2026-10-08T10:04:12Z**, with age calculations using
+`now_ms = 1791453850706`. This follows the previous samples, so changing directory
+counts are expected. Only top-level V1 `views/<16-hex-key>/derived-*.sqlite` main
+files are counted here; legacy `derived.sqlite`, V2, sidecars, manifests and blobs
+are excluded. Allocated sizes retain the APFS shared-extent caveat above.
+Attribution joins the actual history sources: memo root-scope and artifact keys,
+durable root-file keys and artifact keys, and owner scope/artifact keys. No live
+SQLite was opened and no metadata was written.
+
+| History classification | View dirs | Derived DBs | Logical bytes | Allocated bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Attributed, all roots absent | 1,314 | 290 | 70,562,852,864 | 70,800,789,504 |
+| Attributed, at least one root present | 224 | 114 | 28,501,434,368 | 28,587,876,352 |
+| No history attribution | 83 | 7 | 2,811,408,384 | 2,818,314,240 |
+
+**Missing attributed roots — latest last-bind age, not missing-since age:**
+
+| Age bucket | View dirs | Derived DBs | Logical bytes | Allocated bytes |
+| --- | ---: | ---: | ---: | ---: |
+| [0, 1) days | 359 | 71 | 20,711,718,912 | 20,750,151,680 |
+| [1, 2) days | 222 | 72 | 16,232,099,840 | 16,320,778,240 |
+| [2, 3) days | 237 | 52 | 7,964,172,288 | 8,004,476,928 |
+| [3, 7) days | 496 | 95 | 25,654,861,824 | 25,725,382,656 |
+| [7, 14) days | 0 | 0 | 0 | 0 |
+| [14, 30) days | 0 | 0 | 0 | 0 |
+| >=30 days | 0 | 0 | 0 | 0 |
+
+All **70,562,852,864 logical bytes** in the missing-root category were attributed
+only to worker-worktree paths containing `/cortexkit/alfonso/worktrees/`: 1,300
+view dirs / 290 DBs. The other 14 missing-root dirs had zero generation-DB bytes.
+The worker-only directory counts in the four nonempty buckets were 357, 222,
+237 and 484 respectively; the byte totals were identical to the table. Thus
+**44,907,991,040 bytes** were last bound less than three days ago, and
+**25,654,861,824 bytes** were last bound three to seven days ago. No attributed
+missing root in this sample had passed the seven-day *age* gate. These numbers
+explain a large young-worktree backlog without any restart-reset bug.
+
+**Active unknown-key clocks — persisted first-observation age:**
+
+| Observation age | View dirs | Derived DBs | Logical bytes | Allocated bytes |
+| --- | ---: | ---: | ---: | ---: |
+| [0, 1) days | 75 | 6 | 2,409,709,568 | 2,415,595,520 |
+| [1, 2) days | 0 | 0 | 0 | 0 |
+| [2, 3) days | 0 | 0 | 0 | 0 |
+| [3, 7) days | 0 | 0 | 0 | 0 |
+| >=7 days | 0 | 0 | 0 | 0 |
+| No observation file yet | 8 | 1 | 401,698,816 | 402,718,720 |
+
+The entire `retention/unknown` directory contained **1,792 valid timestamp JSON
+files**, zero malformed files. Its oldest timestamp was `1791405304627`
+(2026-10-07T20:35:04.627Z), newest `1791453389995`
+(2026-10-08T09:56:29.995Z). Many timestamps concern other cache domains or keys
+whose view directory is absent, so 1,792 is not a count of unknown view dirs.
+For example, `retention/unknown/001084a169624dce.json` contained
+`1791446780041`; its key had no binding-history attribution. There was no
+unknown-clock file for the live prefrontal scope `c0c39eea197fcc68`, which has
+memo, durable and owner history.
+
+There is **no persisted first-observed-missing timestamp for attributed roots**.
+The true duration since their folders disappeared cannot be recovered from
+last-bind timestamps or current filesystem metadata. The last-bind and unknown
+observation tables above deliberately do not label either as actual deletion
+age. Unattributed keys also cannot be assigned to worker paths safely.
+
+### 3. Do permanently settled worker worktrees need seven days?
+
+Given the operator's guarantee that settlement permanently deletes a worker
+checkout, it needs **no durability grace for recovering that checkout**. The
+seven days are a conservative cache-retention policy, not a requirement of an
+immutable derived DB or a live reader. The implementation already treats legacy
+worker-path bindings specially: absent-root bindings with no mount identity are
+eligible after the age gate **only** for paths containing
+`/cortexkit/alfonso/worktrees/`; unidentifiable other mounts remain protected
+([259–275](../../crates/aft/src/storage_retention.rs#L259-L275)). It does not give
+workers a shorter age gate, nor store authoritative settlement status.
+
+A future shorter/zero worker-specific grace would still need all existing
+reader/pin, writer-lease, residency, admission and open-connection checks
+([candidate](../../crates/aft/src/storage_retention.rs#L626-L800)); permanent
+folder deletion is not proof that no reader remains. Unknown keys cannot receive
+a worker exemption without reliable attribution. An authoritative settled-worktree
+signal would be stronger than guessing from a missing folder or `.git` pruning.
+No grace value or deletion rule is changed in this follow-up. The measured
+70.56 GB is the byte population for the operator's policy decision, not an
+immediate-purge authorization.
+
+### 4. Actual restart regression and in-memory mutation red
+
+Added
+`storage_retention::storage_retention_tests::storage_retention_unknown_observation_survives_process_restart`.
+It creates throwaway view storage and an old payload, then invokes retention's
+`candidate` in **three fresh OS test processes**, with supplied times:
+first observation, one millisecond before the seven-day boundary, and the exact
+boundary. It requires preservation before grace and actual directory reclamation
+at the boundary, and checks after **every** process that the original timestamp
+file is unchanged. It never rewrites/backdates that observation file. The test
+advances the retention function's existing `now` argument; it does not sleep or
+change the production clock. The fixture has no pointer DB, keeping the test
+focused on root observation grace rather than generation GC.
+
+The already-persisted implementation passed the new test before any runtime
+change (one test passed); there was no failing production case to pretend to fix.
+For non-vacuity, a `NON-VACUITY BREAK` shadowed the file-loaded clock with a
+process-local `OnceLock<Mutex<HashMap<PathBuf, u64>>>` initialized on each
+process's first observation. The timestamp file still existed with its original
+value, so the test could not pass merely by checking that file. Only the named
+restart regression ran and failed at the actual reclamation assertion:
+`removed_roots` was **0**, expected **1**. All child invocations completed
+successfully. The control's diff was 11 inserted lines; it was restored from the
+staged live state with `git checkout -- ... && touch ...`, leaving an empty
+unstaged diff. This is evidence against a genuinely in-memory grace clock, not
+just a timestamp-file existence test.
+
+The follow-up changes only an explanatory comment, regression tests, this report
+and the existing non-ranking descriptor. The accepted drop-order fix remains
+unchanged. No live cleanup, timestamp update or live SQLite probe was performed.
+
+Follow-up verification (Linux rustc/cargo 1.99.0, rustfmt 1.10.0-stable):
+`cargo fmt --all -- --check` passed; `cargo check -p agent-file-tools --tests`
+finished successfully; `cargo test -p agent-file-tools --lib -- storage_retention`
+passed **27 tests**, including the real fresh-process regression. Runs used
+throwaway HOME and XDG directories outside checkouts, `AFT_STORAGE_DIR` unset,
+and the Linux uname guard. Scoped `aft_inspect` was partial while rust-analyzer
+ran its check/build scripts; the package check is authoritative. Windows checking
+remains unavailable in this remote environment because the MinGW compiler was
+missing in the preceding verification; no Windows pass is claimed. The follow-up
+path diff has no ranking-fence matches and retains the non-ranking descriptor.

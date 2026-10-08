@@ -608,6 +608,8 @@ fn eligible(
     let path = storage
         .join("retention/unknown")
         .join(format!("{key}.json"));
+    // The first observation is an on-disk clock, not scheduling state. Reload
+    // it on every pass so daemon replacement cannot restart the root grace.
     let first_seen = match read_json::<u64>(&path) {
         Ok(first_seen) => first_seen,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1220,6 +1222,84 @@ mod storage_retention_tests {
         .unwrap();
         assert_eq!(run_pass(temp.path(), &|| false).removed_roots, 1);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn storage_retention_observation_restart_child() {
+        let Some(storage) = std::env::var_os("AFT_RETENTION_RESTART_STORAGE") else {
+            return;
+        };
+        let storage = PathBuf::from(storage);
+        let now: u64 = std::env::var("AFT_RETENTION_RESTART_NOW")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let key = "0123456789abcdef";
+        let mut report = SweepReport::default();
+        candidate(
+            &storage,
+            &storage.join("views"),
+            key,
+            false,
+            &BTreeMap::new(),
+            now,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            &mut report,
+        )
+        .unwrap();
+        atomic_json(&storage.join(format!("restart-result-{now}.json")), &report).unwrap();
+    }
+
+    #[test]
+    fn storage_retention_unknown_observation_survives_process_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = "0123456789abcdef";
+        let view = cache(temp.path(), "views", key);
+        // An old payload alone must not authorize deletion on first sight.
+        // The synthetic clock advances a week without editing the observation
+        // file or waiting a week; every observation uses a fresh OS process.
+        filetime::set_file_mtime(
+            view.join("payload.bin"),
+            filetime::FileTime::from_unix_time(0, 0),
+        )
+        .unwrap();
+        let first_seen = 1000_u64;
+        let observation = temp.path().join(format!("retention/unknown/{key}.json"));
+        for (now, should_remove) in [
+            (first_seen, false),
+            (first_seen + ROOT_GRACE_MS - 1, false),
+            (first_seen + ROOT_GRACE_MS, true),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "storage_retention::storage_retention_tests::storage_retention_observation_restart_child",
+                ])
+                .env("AFT_RETENTION_RESTART_STORAGE", temp.path())
+                .env("AFT_RETENTION_RESTART_NOW", now.to_string())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "retention child failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                read_json::<u64>(&observation).unwrap(),
+                first_seen,
+                "a restarted pass replaced the first observation"
+            );
+            let result: serde_json::Value =
+                read_json(&temp.path().join(format!("restart-result-{now}.json"))).unwrap();
+            assert_eq!(result["removed_roots"], usize::from(should_remove));
+            assert_eq!(
+                view.exists(),
+                !should_remove,
+                "a fresh process did not honor the original observation grace at {now}"
+            );
+        }
     }
 
     #[test]
