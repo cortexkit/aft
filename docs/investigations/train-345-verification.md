@@ -1,5 +1,7 @@
 # Train 345 assembly and verification
 
+Follow-up: [paired main/train comparison and fixes](train-345-baseline-comparison.md) reruns all 40 reported Rust failures on main `d286c3d30` and the train. It supersedes the unresolved Rust classifications below: no main-pass/train-fail case remains after the follow-up fixes.
+
 Base: `2eea2a8963e71decce17aea9773c58a4cc6e5446` (main, including trains 340, 343 and 344 and their CI fixes).
 
 This is an assembly of accepted deliveries, not a claim that every full suite is green. The parent must run the 93-row search-quality replay and settle the outstanding environment/fixture failures before landing.
