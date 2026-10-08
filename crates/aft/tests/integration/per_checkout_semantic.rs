@@ -477,6 +477,7 @@ fn embed_counts_views_and_sessions_share_identical_content() {
         );
     }
     let (_, novel_chunks) = cold(novel.path(), "model-a", "load");
+    assert_eq!(novel_chunks, 60, "the fixture has four chunks per module");
     let (_, older_chunks) = cold(older.path(), "model-a", "load");
     let c = Checkout::open(storage.path(), "older", older.path(), &plane_two);
     let snapshot_c = c.load();
@@ -484,7 +485,10 @@ fn embed_counts_views_and_sessions_share_identical_content() {
     c.fill(&snapshot_c, &model, "model-a");
     let older_branch = model.texts() - before;
     assert_eq!(
-        older_branch, novel_chunks,
+        // The ten changed modules retain their Record struct chunks from main;
+        // their other three chunks change, and all four chunks in each of the
+        // five added modules are new: 10 * 3 + 5 * 4 = 50 model inputs.
+        older_branch, 50,
         "the older branch re-embedded shared content"
     );
     let folded = c.load();
@@ -507,7 +511,7 @@ fn embed_counts_views_and_sessions_share_identical_content() {
         "semantic embed texts (chunks per checkout = {chunks}):\n\
          two views, one session: per-root builds {legacy_two_views} -> views {two_views}\n\
          second session on the same pool worktrees: per-root builds {legacy_second_session} -> views {two_sessions}\n\
-         older-branch view ({older_chunks} chunks, {novel_chunks} never embedded): per-root build {legacy_older} -> views {older_branch}"
+          older-branch view ({older_chunks} chunks, {novel_chunks} in new or changed files, 50 never embedded): per-root build {legacy_older} -> views {older_branch}"
     );
 }
 

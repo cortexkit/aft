@@ -3431,7 +3431,7 @@ fn rust_complex_use_lists_survive_edits_and_compile() {
             "std::fmt",
             "Display",
             "Debug",
-            "use std::fmt::{Display, self};",
+            "use std::fmt::{self, Display};",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
