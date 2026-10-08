@@ -15,13 +15,14 @@ use serde_json::{Map, Value};
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
     GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, IndexesConfig,
-    InspectCategories, InspectConfig, LspIdleMinutes, OpenCodeHostConfig, RemoteExecConfig, RerankBackendKind,
-    RerankConfig, SandboxConfig, SearchConfig, SemanticBackend, SemanticBackendConfig,
-    UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_BASH_WORKER_WAIT_MAX_MS,
-    DEFAULT_IDLE_ROOT_TTL_MINUTES, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS, MIN_BASH_WORKER_WAIT_MAX_MS,
-    MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    InspectCategories, InspectConfig, LspIdleMinutes, OpenCodeHostConfig, RemoteExecConfig,
+    RerankBackendKind, RerankConfig, SandboxConfig, SearchConfig, SemanticBackend,
+    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_BASH_WATCH_SYNC_MAX_MS,
+    DEFAULT_BASH_WORKER_WAIT_MAX_MS, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_ROOT_TTL_MINUTES,
+    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_BASH_WATCH_SYNC_MAX_MS,
+    MIN_BASH_WORKER_WAIT_MAX_MS, MIN_IDLE_ROOT_TTL_MINUTES, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::feature_config::{self, PolicyPhase};
 use crate::harness::Harness;

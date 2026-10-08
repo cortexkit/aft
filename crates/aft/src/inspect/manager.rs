@@ -71,7 +71,10 @@ macro_rules! checkout_view_ok {
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
-fn inspect_category_is_off(config: &crate::config::InspectConfig, category: InspectCategory) -> bool {
+fn inspect_category_is_off(
+    config: &crate::config::InspectConfig,
+    category: InspectCategory,
+) -> bool {
     // Retired categories still take their existing unsupported-category path.
     category.is_active() && !config.category_enabled(category)
 }
@@ -7037,7 +7040,11 @@ mod guard_tests {
                     | InspectCategory::Cycles
                     | InspectCategory::Complexity
             );
-            assert_eq!(inspect_category_is_off(&config, category), expected, "{category}");
+            assert_eq!(
+                inspect_category_is_off(&config, category),
+                expected,
+                "{category}"
+            );
         }
     }
 
