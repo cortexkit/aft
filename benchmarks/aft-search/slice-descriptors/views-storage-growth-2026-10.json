@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["crates/aft/tests/integration/view_assembly_wiring_test.rs"],
+  "slices": ["views-storage-growth-2026-10"],
+  "note": "Derived against RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py from the base 2b391db0e046c74afcd6dfbe710aa94fbe73fbc5: no changed path matches. This closes the unpublished derived checkpoint keeper before cancellation cleanup and protects live query pins; it does not change search ranking or routing. The investigation reads only filesystem stats and non-SQLite metadata from live storage."
+}

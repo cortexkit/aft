@@ -4,7 +4,9 @@ use std::path::Path;
 use std::process::Command;
 
 use aft::blob_store::{BlobPlane, BlobStore, SemanticKey};
-use aft::views::assembly::{head_tree_fingerprint, publish_checkout, AssemblyRequest};
+use aft::views::assembly::{
+    head_tree_fingerprint, prepare_checkout, publish_checkout, AssemblyRequest,
+};
 use aft::views::{ManifestEntry, RelPath, ViewStore};
 use rusqlite::Connection;
 use tempfile::tempdir;
@@ -281,6 +283,142 @@ fn republishing_an_unchanged_checkout_keeps_the_current_generation() {
     .unwrap();
     assert!(changed.published);
     assert_ne!(changed.generation.as_deref(), Some(generation.as_str()));
+}
+
+#[test]
+fn abandoned_derived_builds_release_keepers_before_cleanup() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    fs::write(project.path().join("lib.rs"), "pub fn base() {}\n").unwrap();
+    commit(project.path(), "base");
+    let family = "abandoned-build-family";
+    let scope = "abandoned-build-view";
+    let initial = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    let view = ViewStore::open(storage.path(), scope).unwrap();
+    fs::write(project.path().join("lib.rs"), "pub fn changed() {}\n").unwrap();
+    commit(project.path(), "change");
+    let changed = request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::from([b"lib.rs".to_vec()]),
+        true,
+    );
+    let assert_removed = |generation: &str| {
+        for name in [
+            format!("derived-{generation}.sqlite"),
+            format!("derived-{generation}.sqlite-wal"),
+            format!("derived-{generation}.sqlite-shm"),
+            format!("manifest-{generation}.json"),
+            format!("trigram-{generation}.bin"),
+        ] {
+            assert!(
+                !view.view_dir().join(&name).exists(),
+                "abandoned file remains: {name}"
+            );
+        }
+    };
+
+    // Cancel after materialization and durable manifest preparation, while the
+    // assembler still owns its checkpoint keeper. No sweep should be needed.
+    let prepared = prepare_checkout(&changed, &mut |_| Ok(())).unwrap();
+    let cancelled = prepared.report().generation.clone().unwrap();
+    assert!(view.derived_path(&cancelled).unwrap().is_file());
+    assert!(view.manifest_path(&cancelled).unwrap().is_file());
+    drop(prepared);
+    assert_removed(&cancelled);
+    assert_eq!(view.current_generation().unwrap(), initial.generation);
+
+    // Two identical builds from the same base get distinct names. A CAS loser
+    // must not leave a second full database even though the winner stays live.
+    let mut winner = prepare_checkout(&changed, &mut |_| Ok(())).unwrap();
+    let mut loser = prepare_checkout(&changed, &mut |_| Ok(())).unwrap();
+    let losing = loser.report().generation.clone().unwrap();
+    let winning = winner.commit().unwrap().generation.unwrap();
+    assert!(loser.commit().is_err());
+    drop(loser);
+    assert_removed(&losing);
+    assert_eq!(
+        view.current_generation().unwrap().as_deref(),
+        Some(winning.as_str())
+    );
+    assert!(view.derived_path(&winning).unwrap().is_file());
+
+    // A callback error at the last off-barrier phase takes the same Drop path.
+    fs::write(project.path().join("lib.rs"), "pub fn next() {}\n").unwrap();
+    commit(project.path(), "next");
+    let next = request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::new(),
+        true,
+    );
+    let mut failed_generation = None;
+    let result = prepare_checkout(&next, &mut |phase| {
+        if phase == "cas" {
+            failed_generation = fs::read_dir(view.view_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .find_map(|name| {
+                    name.strip_prefix("manifest-3-")
+                        .and_then(|_| name.strip_prefix("manifest-"))
+                        .and_then(|name| name.strip_suffix(".json"))
+                        .map(str::to_owned)
+                });
+            return Err(aft::views::ViewError::InvalidManifest(
+                "cancel after preparation".into(),
+            ));
+        }
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert_removed(&failed_generation.expect("callback reached durable generation"));
+    assert_eq!(
+        view.current_generation().unwrap().as_deref(),
+        Some(winning.as_str())
+    );
+}
+
+#[test]
+fn abandoned_derived_build_keeps_a_live_query_pin() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    fs::write(project.path().join("lib.rs"), "pub fn reader() {}\n").unwrap();
+    commit(project.path(), "base");
+    let prepared = prepare_checkout(
+        &request(
+            storage.path(),
+            project.path(),
+            "pinned-build-family",
+            "pinned-build-view",
+            BTreeSet::new(),
+            true,
+        ),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    let generation = prepared.report().generation.clone().unwrap();
+    let view = ViewStore::open(storage.path(), "pinned-build-view").unwrap();
+    let reader = aft::pins::QueryPin::acquire(view.view_dir(), &generation).unwrap();
+    drop(prepared);
+    assert!(view.derived_path(&generation).unwrap().is_file());
+    assert!(view.manifest_path(&generation).unwrap().is_file());
+    drop(reader);
+    assert_eq!(view.sweep_generations().unwrap(), 1);
+    assert!(!view.derived_path(&generation).unwrap().exists());
 }
 
 #[test]

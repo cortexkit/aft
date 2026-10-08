@@ -141,12 +141,24 @@ impl PreparedAssembly {
 
 impl Drop for PreparedAssembly {
     fn drop(&mut self) {
+        // An abandoned build still owns the checkpoint keeper. Close it before
+        // cleanup, otherwise the file-identity guard correctly refuses unlink
+        // and leaves an entire unpublished database behind on every retry.
+        self.derived_checkpoint.take();
         if let Some((view, generation)) = &self.files {
             if view
                 .current_generation()
                 .is_ok_and(|current| current.as_deref() != Some(generation))
             {
-                view.remove_generation_files(generation);
+                // Even an unpublished name can have a query pin. Serialize the
+                // final protection check with pin admission and fail closed if
+                // admission cannot be locked. A later sweep can finish cleanup.
+                if let Ok(_barrier) = crate::storage_retention::pin_barrier(view.view_dir()) {
+                    if !crate::root_cache::protected_read_marker_exists(view.view_dir(), generation)
+                    {
+                        view.remove_generation_files(generation);
+                    }
+                }
             }
         }
         // Keep the pin alive until generation cleanup has finished.
