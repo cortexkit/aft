@@ -1,0 +1,1 @@
+remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe

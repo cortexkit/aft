@@ -1,0 +1,17 @@
+{
+  "tool_name": "bash",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "task_id": "bash-unknown",
+    "status": "fate_unknown",
+    "output": "remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe",
+    "output_preview": "remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"
+  },
+  "ctx": {
+    "agent_args": {
+      "command": "printf done"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

@@ -1,9 +1,10 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { formatForegroundResult } from "../bash-format.js";
 import { type BashCompletedPayload, BinaryBridge } from "../bridge.js";
 import { cachedExecutable } from "./test-utils/cached-executable.js";
 
@@ -57,6 +58,30 @@ process.stdin.on("data", (chunk) => {
 }
 
 describe("bash_completed token-count push frames", () => {
+  for (const outcome of ["remote_job", "remote_no_job", "local"]) {
+    test(`unknown outcome parity: ${outcome}`, async () => {
+      const fixture = join(
+        import.meta.dir,
+        "../../../../crates/aft/tests/fixtures/subc_parity/format",
+        `bash_unknown_${outcome}`,
+      );
+      const input = JSON.parse(readFileSync(join(fixture, "input.json"), "utf8"));
+      const expected = readFileSync(join(fixture, "expected.txt"), "utf8");
+      expect(formatForegroundResult(input.native_response_json)).toBe(expected);
+      const completion = await readPushedCompletion({
+        type: "bash_completed",
+        task_id: "bash-unknown",
+        status: "fate_unknown",
+        exit_code: null,
+        command: "printf done",
+        output_preview: input.native_response_json.output_preview,
+        status_reason: input.native_response_json.output,
+      });
+      expect(completion.output_preview).toBe(expected);
+      expect(completion.status_reason).toBe(expected);
+    });
+  }
+
   test("bash_completed_frame_preserves_incomplete_capture_without_changing_exit", async () => {
     const reason = "PTY output may be incomplete: output drain deadline expired before EOF";
     const completion = await readPushedCompletion({

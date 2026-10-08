@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { astTools } from "../packages/opencode-plugin/src/tools/ast.ts";
+import { createBashStatusTool, createBashTool } from "../packages/opencode-plugin/src/tools/bash.ts";
 import { conflictTools } from "../packages/opencode-plugin/src/tools/conflicts.ts";
 import { createReadTool, hoistedTools } from "../packages/opencode-plugin/src/tools/hoisted.ts";
 import { inspectTools } from "../packages/opencode-plugin/src/tools/inspect.ts";
@@ -38,6 +39,8 @@ const HOME_ROOT_TOKEN = "<HOME>";
 
 type BareToolName =
   | "status"
+  | "bash"
+  | "bash_status"
   | "read"
   | "write"
   | "edit"
@@ -132,6 +135,8 @@ function makeRuntime(): Parameters<ToolDefinition["execute"]>[1] {
   const runtime = {
     directory: PROJECT_ROOT,
     worktree: PROJECT_ROOT,
+    abort: new AbortController().signal,
+    metadata: () => undefined,
     ask: async () => undefined,
   };
   return runtime as unknown as Parameters<ToolDefinition["execute"]>[1];
@@ -292,6 +297,8 @@ function tools(ctx: PluginContext): Record<BareToolName, ToolDefinition | undefi
   const ast = astTools(ctx);
   return {
     status: undefined,
+    bash: createBashTool(ctx),
+    bash_status: createBashStatusTool(ctx),
     read: createReadTool(ctx),
     write: hoisted.write,
     edit: hoisted.edit,
@@ -569,7 +576,29 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "callgraph_trace_data_translate", tool_name: "callgraph", agent_args: { op: "trace_data", filePath: "src/main.ts", symbol: "run", expression: "value", depth: 2 } },
 ];
 
+// These are native output strings, not a second implementation of the remote
+// disposition. Capture the real wrappers to pin how they present each one.
+const BASH_OUTCOMES = [
+  ["remote_job", "remote outcome unknown (job 0192a64a-1234-7000-8000-000000000001); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status 0192a64a-1234-7000-8000-000000000001 first if you need its result"],
+  ["remote_no_job", "remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"],
+  ["local", "the command started locally; AFT lost track of it: injected running-metadata failure after spawn; never rerun"],
+] as const;
+
 const FORMAT_CASES: FormatCase[] = [
+  ...BASH_OUTCOMES.flatMap(([name, output]): FormatCase[] => [
+    {
+      name: `bash_unknown_${name}`,
+      tool_name: "bash",
+      agent_args: { command: "printf done" },
+      native_response_json: { id: "1", success: true, task_id: "bash-unknown", status: "fate_unknown", output, output_preview: output },
+    },
+    {
+      name: `bash_unknown_${name}_status`,
+      tool_name: "bash_status",
+      agent_args: { taskId: "bash-unknown" },
+      native_response_json: { id: "1", success: true, task_id: "bash-unknown", status: "fate_unknown", mode: "pipes", output_preview: output },
+    },
+  ]),
   { name: "status_text", tool_name: "status", agent_args: {}, native_response_json: { id: "1", success: true, text: "indexes ready" } },
   { name: "read_truncated_footer", tool_name: "read", agent_args: { filePath: "README.md" }, native_response_json: { id: "1", success: true, content: "1: hello\n", truncated: true, start_line: 1, end_line: 100, total_lines: 250 } },
   { name: "read_range_no_footer", tool_name: "read", agent_args: { filePath: "README.md", startLine: 1 }, native_response_json: { id: "1", success: true, content: "1: hello\n", truncated: true, start_line: 1, end_line: 100, total_lines: 250 } },

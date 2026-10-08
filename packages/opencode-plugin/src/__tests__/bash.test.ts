@@ -175,6 +175,25 @@ function safeParse(schema: unknown, value: unknown): { success: boolean } {
 }
 
 describe("OpenCode bash adapter", () => {
+  for (const outcome of ["remote_job", "remote_no_job", "local"]) {
+    for (const suffix of ["", "_status"]) {
+      test(`unknown outcome parity: ${outcome}${suffix}`, async () => {
+        const fixture = join(
+          PROJECT_CWD,
+          "crates/aft/tests/fixtures/subc_parity/format",
+          `bash_unknown_${outcome}${suffix}`,
+        );
+        const input = JSON.parse(await readFile(join(fixture, "input.json"), "utf8"));
+        const expected = await readFile(join(fixture, "expected.txt"), "utf8");
+        const { ctx, tool: bash } = createHarness(() => input.native_response_json);
+        const def = suffix === "" ? bash : createBashStatusTool(ctx);
+        expect(bashText(await def.execute(input.ctx.agent_args, createMockSdkContext()))).toBe(
+          expected,
+        );
+      });
+    }
+  }
+
   test("live runon safety switch updates the schema and refuses a stale call", async () => {
     const {
       tool: bash,

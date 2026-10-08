@@ -336,9 +336,15 @@ that task failed and its status includes `remote_refusal` with the same error te
 Successful remote runs begin with `ran remotely on ck-motor`. Only automatic prefix routing
 (without an explicit `runon`) retains local fallback with the advisory
 `ran locally on macOS: remote refused: <reason>` (or the local OS name). A job that started
-remotely is never run again: if AFT loses track of it, the reply says the outcome is unknown
-instead of re-running it. After the
-output, the reply prints what the runner reported about the server's workspace, none of which
+remotely is never automatically resubmitted: if AFT loses track of it, the reply says the
+outcome is unknown instead of re-running it. Remote jobs run on a
+server-side copy of the workspace with no network access, and no files are synced back. The
+reply therefore says `remote outcome unknown (job <id>); the remote job could not affect this
+machine or the network, so rerunning is safe; check exec.status <id> first if you need its
+result`. If AFT has no job ID, it omits `(job <id>)` and the `check exec.status` advice. This
+applies only to remote jobs; local commands, including a remote refusal's local fallback,
+keep their existing unknown-outcome warnings because their side effects may have happened.
+After the output, the reply prints what the runner reported about the server's workspace, none of which
 is copied back: the files the run changed (`These files changed on the server and were NOT
 copied back:`), a changed Git state (HEAD before -> after, the symbolic ref or `detached`,
 whether the index tree changed, and the stash count change), new untracked files (marked when

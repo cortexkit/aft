@@ -1,0 +1,17 @@
+{
+  "tool_name": "bash_status",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "task_id": "bash-unknown",
+    "status": "fate_unknown",
+    "mode": "pipes",
+    "output_preview": "remote outcome unknown (job 0192a64a-1234-7000-8000-000000000001); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status 0192a64a-1234-7000-8000-000000000001 first if you need its result"
+  },
+  "ctx": {
+    "agent_args": {
+      "taskId": "bash-unknown"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

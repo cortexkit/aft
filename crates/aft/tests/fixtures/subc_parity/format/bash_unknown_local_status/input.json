@@ -1,0 +1,17 @@
+{
+  "tool_name": "bash_status",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "task_id": "bash-unknown",
+    "status": "fate_unknown",
+    "mode": "pipes",
+    "output_preview": "the command started locally; AFT lost track of it: injected running-metadata failure after spawn; never rerun"
+  },
+  "ctx": {
+    "agent_args": {
+      "taskId": "bash-unknown"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

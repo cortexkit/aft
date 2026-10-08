@@ -176,6 +176,22 @@ fn subc_format_matches_typescript_golden_fixtures() {
 }
 
 #[test]
+fn bash_unknown_outcome_format_matches_typescript_golden_fixtures() {
+    let failures = [
+        "bash_unknown_remote_job",
+        "bash_unknown_remote_job_status",
+        "bash_unknown_remote_no_job",
+        "bash_unknown_remote_no_job_status",
+        "bash_unknown_local",
+        "bash_unknown_local_status",
+    ]
+    .into_iter()
+    .filter_map(|name| assert_case(&fixtures_root().join(name)))
+    .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
 fn bash_error_renders_as_text_not_raw_json() {
     // The MCP e2e probe caught a denied bash call returning the raw response
     // JSON as its text content because "bash" was missing from the formatted

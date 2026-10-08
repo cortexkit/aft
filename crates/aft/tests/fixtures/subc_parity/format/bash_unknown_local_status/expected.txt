@@ -1,0 +1,2 @@
+Task bash-unknown: fate_unknown
+the command started locally; AFT lost track of it: injected running-metadata failure after spawn; never rerun

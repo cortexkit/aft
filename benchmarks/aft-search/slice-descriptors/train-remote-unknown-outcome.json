@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["remote-unknown-outcome"],
+  "note": "Changed paths do not match RANKING_FENCE_PREFIXES in benchmarks/aft-search/search_quality_lib.py. This changes remote bash unknown-outcome advice and renderer parity fixtures, leaving local warnings, automatic retry policy, search ranking and routing unchanged. The fenced default subc_tool_schemas.json is unchanged."
+}

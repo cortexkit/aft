@@ -142,8 +142,27 @@ fn remote_execution_note(requested_vcpus: Option<u32>) -> String {
     }
 }
 
-/// This machine's operating system, as a reader sees it in the header for a run
-/// that fell back to local execution.
+/// Remote writes stay on the server and the runner has no network access.
+/// This advice applies only while the task is remote, not after local fallback.
+#[cfg(unix)]
+fn remote_unknown_outcome(job_id: Option<Uuid>) -> String {
+    let mut text = "remote outcome unknown".to_owned();
+    if let Some(job_id) = job_id {
+        text.push_str(&format!(" (job {job_id})"));
+    }
+    text.push_str(
+        "; the remote job could not affect this machine or the network, so rerunning is safe",
+    );
+    if let Some(job_id) = job_id {
+        text.push_str(&format!(
+            "; check exec.status {job_id} first if you need its result"
+        ));
+    }
+    text
+}
+
+/// This machine's operating system as a reader names it, for the header of a
+/// run that fell back to it.
 #[cfg(unix)]
 fn local_os_name() -> &'static str {
     match std::env::consts::OS {
@@ -155,7 +174,7 @@ fn local_os_name() -> &'static str {
 }
 
 /// Bound consecutive empty recovery attempts, not silence on an open stream.
-/// Accepted jobs can disappear with a wiped runner state; they must never rerun.
+/// Accepted jobs can disappear with a wiped runner state; AFT must not resubmit them.
 #[cfg(unix)]
 struct ReattachBudget {
     limit: Duration,
@@ -1506,9 +1525,10 @@ impl BgTaskRegistry {
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
         // Known terminals keep their real status. Only unknown outcomes lose
-        // their fate; no non-refusal terminal permits another execution.
+        // their fate; no non-refusal terminal triggers automatic resubmission.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
-        let (status, code, reason) = match verdict {
+        let unknown = matches!(&verdict, Verdict::OutcomeUnknown);
+        let (status, code, mut reason) = match verdict {
             Verdict::Exited { code } => (
                 if code == 0 {
                     BgTaskStatus::Completed
@@ -1539,11 +1559,7 @@ impl BgTaskRegistry {
                 Some("remote history_expired; prior outcome unavailable; command not rerun".into()),
             ),
             Verdict::RunLocally { .. } => (BgTaskStatus::Failed, None, error),
-            _ => (
-                BgTaskStatus::FateUnknown,
-                None,
-                Some(error.unwrap_or_else(|| "remote outcome_unknown; never rerun".into())),
-            ),
+            _ => (BgTaskStatus::FateUnknown, None, error),
         };
         {
             let mut db = DeferredDbWrites::new(self, task);
@@ -1559,6 +1575,25 @@ impl BgTaskRegistry {
                 .as_ref()
                 .map(|remote| remote_execution_note(remote.requested_vcpus))
                 .unwrap_or_else(|| remote_execution_note(None));
+            if unknown {
+                if let Some(remote) = state.metadata.remote.as_ref() {
+                    let job_id = remote
+                        .job_id
+                        .or_else(|| remote.terminal.as_ref().map(|record| record.job_id));
+                    // Keep recovery diagnostics without substituting them for
+                    // the remote-only rerun advice. Local fallback clears remote.
+                    if let Some(detail) = reason.as_deref() {
+                        state
+                            .metadata
+                            .execution_note
+                            .get_or_insert_with(|| remote_note.clone())
+                            .push_str(&format!("\n{detail}"));
+                    }
+                    reason = Some(remote_unknown_outcome(job_id));
+                } else if reason.is_none() {
+                    reason = Some("remote outcome_unknown; never rerun".into());
+                }
+            }
             if refused {
                 state.metadata.execution_note = Some(
                     if state

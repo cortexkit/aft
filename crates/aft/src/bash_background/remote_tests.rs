@@ -465,6 +465,73 @@ async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
 }
 
 #[tokio::test]
+async fn exec_remote_bash_unknown_reply_names_job_and_safe_rerun() {
+    let daemon = daemon(Script::Lost, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task).await;
+    let expected = format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status {} first if you need its result", id(), id());
+    assert_eq!(done.info.status_reason.as_deref(), Some(expected.as_str()));
+    assert!(
+        done.output_preview.contains(&expected),
+        "{}",
+        done.output_preview
+    );
+    assert!(!done.output_preview.contains("never rerun"));
+}
+
+#[test]
+fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    task.state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_mut()
+        .unwrap()
+        .job_id = None;
+    registry.remote_terminal(
+        &task,
+        Verdict::OutcomeUnknown,
+        Some("remote route interrupted before acceptance".into()),
+    );
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    let expected = "remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe";
+    assert_eq!(done.info.status_reason.as_deref(), Some(expected));
+    assert!(
+        done.output_preview.contains(expected),
+        "{}",
+        done.output_preview
+    );
+    assert!(!done.output_preview.contains("exec.status"));
+    assert!(!done.output_preview.contains("(job"));
+    assert!(!done.output_preview.contains("never rerun"));
+    assert!(done
+        .output_preview
+        .contains("remote route interrupted before acceptance"));
+}
+
+#[test]
+fn exec_remote_bash_local_unknown_reply_is_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    task.state.lock().unwrap().metadata.remote = None;
+    let expected = "the command started locally; AFT lost track of it: injected running-metadata failure after spawn; never rerun";
+    registry.remote_terminal(&task, Verdict::OutcomeUnknown, Some(expected.into()));
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    assert_eq!(done.info.status_reason.as_deref(), Some(expected));
+    assert!(done.output_preview.contains(expected));
+    assert!(!done.output_preview.contains("rerunning is safe"));
+}
+
+#[tokio::test]
 async fn exec_remote_bash_unknown_never_reruns() {
     for script in [Script::Lost, Script::FutureOutcome, Script::Expired] {
         let daemon = daemon(script, "exec-remote/v1").await;
@@ -531,8 +598,12 @@ async fn exec_remote_bash_empty_attach_budget_reports_job_without_rerun() {
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
     assert_eq!(
         done.info.status_reason.as_deref(),
-        Some(format!("remote outcome unknown: job {} could not be re-attached for 5 minutes; command not rerun", id()).as_str())
+        Some(format!("remote outcome unknown (job {}); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status {} first if you need its result", id(), id()).as_str())
     );
+    assert!(done.output_preview.contains(&format!(
+        "job {} could not be re-attached for 5 minutes",
+        id()
+    )));
     assert!(!done.output_preview.contains("local-proof"));
     let task = registry.task(&task_id).unwrap();
     let durable = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
@@ -750,7 +821,12 @@ async fn exec_remote_bash_attach_call_and_reconnect_failures_exhaust_budget() {
         .await
         .expect("failed attach calls and reconnects must exhaust the recovery budget");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
-    assert!(done.info.status_reason.unwrap().contains(&format!(
+    assert!(done
+        .info
+        .status_reason
+        .unwrap()
+        .contains("rerunning is safe"));
+    assert!(done.output_preview.contains(&format!(
         "job {} could not be re-attached for 5 minutes; command not rerun",
         id()
     )));
@@ -779,7 +855,12 @@ async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
         .await
         .expect("restarting an accepted job cannot retry connect forever");
     assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
-    assert!(done.info.status_reason.unwrap().contains(&format!(
+    assert!(done
+        .info
+        .status_reason
+        .unwrap()
+        .contains("rerunning is safe"));
+    assert!(done.output_preview.contains(&format!(
         "job {} could not be re-attached for 5 minutes; command not rerun",
         id()
     )));

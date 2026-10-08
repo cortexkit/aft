@@ -1,0 +1,17 @@
+{
+  "tool_name": "bash",
+  "native_response_json": {
+    "id": "1",
+    "success": true,
+    "task_id": "bash-unknown",
+    "status": "fate_unknown",
+    "output": "the command started locally; AFT lost track of it: injected running-metadata failure after spawn; never rerun",
+    "output_preview": "the command started locally; AFT lost track of it: injected running-metadata failure after spawn; never rerun"
+  },
+  "ctx": {
+    "agent_args": {
+      "command": "printf done"
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

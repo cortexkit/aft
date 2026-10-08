@@ -76,6 +76,31 @@ beforeAll(() => {
   projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
 });
 
+for (const outcome of ["remote_job", "remote_no_job", "local"]) {
+  for (const suffix of ["", "_status"]) {
+    test(`unknown outcome parity: ${outcome}${suffix}`, async () => {
+      const fixture = join(
+        import.meta.dir,
+        "../../../../crates/aft/tests/fixtures/subc_parity/format",
+        `bash_unknown_${outcome}${suffix}`,
+      );
+      const input = JSON.parse(await readFile(join(fixture, "input.json"), "utf8"));
+      const expected = await readFile(join(fixture, "expected.txt"), "utf8");
+      const tools = new Map<string, MockToolDef>();
+      const api = makeMockApi(tools);
+      const bridge = { send: async () => input.native_response_json } as unknown as BinaryBridge;
+      const ctx = makeMockContext(bridge);
+      registerBashTool(api, ctx);
+      const def = suffix === "" ? tools.get("bash")! : createBashStatusTool(ctx);
+      const args = suffix === "" ? input.ctx.agent_args : { task_id: input.ctx.agent_args.taskId };
+      const result = await def.execute("test-call", args, undefined, undefined, {
+        cwd: projectRoot,
+      });
+      expect(result.content[0].text).toBe(expected);
+    });
+  }
+}
+
 afterAll(() => {
   rmSync(projectRoot, { recursive: true, force: true });
 });
