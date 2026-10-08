@@ -5,6 +5,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WATCH_CI="$SCRIPT_DIR/watch-ci.sh"
+REAL_JQ="$(command -v jq || true)"
+if [ -z "$REAL_JQ" ]; then
+  echo 'watch-ci.test.sh: jq is required' >&2
+  exit 2
+fi
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/watch-ci-test.XXXXXX")"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
@@ -35,7 +40,27 @@ cat > "$BIN/sleep" <<'SLEEP'
 #!/usr/bin/env bash
 printf '%s\n' "$1" >> "${WATCH_CI_TEST_STATE:?}/sleeps"
 SLEEP
-chmod +x "$BIN/gh" "$BIN/sleep"
+cat > "$BIN/jq" <<'JQ'
+#!/usr/bin/env bash
+case "${WATCH_CI_TEST_FAIL_JQ:-}" in
+  gating)
+    for arg in "$@"; do
+      case "$arg" in
+        *'join("; ")'*) echo 'injected gating jq failure' >&2; exit 42 ;;
+      esac
+    done
+    ;;
+  failed-job)
+    for arg in "$@"; do
+      case "$arg" in
+        *'select(.conclusion == "failure")'*) echo 'injected failed-job jq failure' >&2; exit 42 ;;
+      esac
+    done
+    ;;
+esac
+exec "${WATCH_CI_TEST_REAL_JQ:?}" "$@"
+JQ
+chmod +x "$BIN/gh" "$BIN/sleep" "$BIN/jq"
 
 checks=0
 failures=0
@@ -55,9 +80,10 @@ response() {
 api_error() { printf 'ERROR\n' > "$STATE/responses/$1"; }
 
 run_watch() {
-  local poll_sleep="${1:-1}" max_sleep="${2:-8}"
+  local poll_sleep="${1:-1}" max_sleep="${2:-8}" fail_jq="${3:-}"
   set +e
   (cd "$REPO" && PATH="$BIN:$PATH" WATCH_CI_TEST_STATE="$STATE" \
+    WATCH_CI_TEST_REAL_JQ="$REAL_JQ" WATCH_CI_TEST_FAIL_JQ="$fail_jq" \
     OPERATOR_GH_FALLBACK_PATHS="$BIN/gh" WATCH_CI_POLL_SLEEP="$poll_sleep" \
     WATCH_CI_POLL_MAX_SLEEP="$max_sleep" "$WATCH_CI" 4242) \
     > "$TMP_ROOT/output" 2>&1
@@ -139,6 +165,36 @@ if [ "$WATCH_RC" -eq 0 ] && grep -q 'CI_DONE run=4242 conclusion=cancelled jobs_
   ok 'non-success run retains watcher output while the landing guard stays authoritative'
 else
   fail 'non-success run retains watcher output while the landing guard stays authoritative'
+fi
+
+# An unnamed failure remains a real red job; it must not disappear from the
+# fail-fast query just because the API omitted its display name.
+reset_case
+response 1 '{"status":"completed","conclusion":"cancelled","jobs":[{"name":null,"databaseId":101,"conclusion":"failure"}],"url":""}'
+run_watch
+if [ "$WATCH_RC" -eq 1 ] && grep -q "CI_EARLY_FAIL job='<unnamed>' run=4242" "$TMP_ROOT/output"; then
+  ok 'failed job with a null name remains fail-fast red'
+else
+  fail 'failed job with a null name remains fail-fast red'
+fi
+
+# Failures in either jq extraction are undetermined, never empty success data.
+reset_case
+response 1 '{"status":"completed","conclusion":"cancelled","jobs":[{"name":"Unit","databaseId":101,"conclusion":"cancelled"}],"url":""}'
+run_watch 1 8 gating
+if [ "$WATCH_RC" -eq 3 ] && grep -q 'CI_UNDETERMINED.*could not read job conclusions' "$TMP_ROOT/output"; then
+  ok 'a gating-job jq failure exits 3'
+else
+  fail 'a gating-job jq failure exits 3'
+fi
+
+reset_case
+response 1 '{"status":"completed","conclusion":"success","jobs":[{"name":"Unit","databaseId":101,"conclusion":"success"}],"url":""}'
+run_watch 1 8 failed-job
+if [ "$WATCH_RC" -eq 3 ] && grep -q 'CI_UNDETERMINED.*could not read job conclusions' "$TMP_ROOT/output"; then
+  ok 'a fail-fast-job jq failure exits 3'
+else
+  fail 'a fail-fast-job jq failure exits 3'
 fi
 
 if [ "$failures" -ne 0 ]; then

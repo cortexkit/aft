@@ -247,8 +247,25 @@ while true; do
   # strict=false), but it is a required check on main, so a red there makes
   # the landing refuse; treating it as advisory only hid the failure until
   # the end of the run.
-  FAILED_JOB=$(jq -r '[.jobs[] | select(.conclusion == "failure")][0] | if . == null then "" else (.name // "") + "|" + ((.databaseId // "") | tostring) end' \
-    <<< "$RUN_VIEW" 2>/dev/null || echo "")
+  if ! FAILED_JOB_RESULT=$(jq -er '[.jobs[] | select(.conclusion == "failure")][0] | if . == null then "none=" else "failed=" + ((.name // "<unnamed>") | tostring) + "|" + ((.databaseId // "") | tostring) end' \
+    <<< "$RUN_VIEW" 2>/dev/null); then
+    if [ "$STATUS" = "completed" ]; then
+      undetermined "could not read job conclusions"
+    fi
+    poll_error_wait
+    continue
+  fi
+  case "$FAILED_JOB_RESULT" in
+    none=) FAILED_JOB="" ;;
+    failed=*) FAILED_JOB="${FAILED_JOB_RESULT#failed=}" ;;
+    *)
+      if [ "$STATUS" = "completed" ]; then
+        undetermined "could not read job conclusions"
+      fi
+      poll_error_wait
+      continue
+      ;;
+  esac
 
   if [ -n "$FAILED_JOB" ] && [ "$FAILED_JOB" != "null" ]; then
     NAME="${FAILED_JOB%%|*}"; JID="${FAILED_JOB##*|}"
@@ -288,8 +305,14 @@ while true; do
       echo "CI_DONE run=$RID conclusion=$CONC${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0
     fi
-    GATING_BAD=$(jq -r '[.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | .name] | join("; ")' \
-      <<< "$RUN_VIEW" 2>/dev/null || echo "")
+    if ! GATING_BAD_RESULT=$(jq -er '"bad=" + ([.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | ((.name // "<unnamed>") | tostring)] | join("; "))' \
+      <<< "$RUN_VIEW" 2>/dev/null); then
+      undetermined "could not read job conclusions (conclusion=$CONC)"
+    fi
+    case "$GATING_BAD_RESULT" in
+      bad=*) GATING_BAD="${GATING_BAD_RESULT#bad=}" ;;
+      *) undetermined "could not read job conclusions (conclusion=$CONC)" ;;
+    esac
     if [ -z "$GATING_BAD" ]; then
       echo "CI_DONE run=$RID conclusion=$CONC jobs_all_passed=1${WATCH_ATTEMPT:+ attempt=$WATCH_ATTEMPT}"
       exit 0
