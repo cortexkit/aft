@@ -620,6 +620,23 @@ fn format_import(data: &Value, ctx: &FormatContext) -> String {
         Some("remove") => {
             let module = import_module_name(response, ctx);
             let removed = response.get("removed").and_then(Value::as_bool) != Some(false);
+            // Older producers have no remaining-binding metadata. Preserve their
+            // scope summary instead of inventing a zero remaining-name count.
+            if !response.contains_key("remaining_names") && !response.contains_key("only_name") {
+                let status = if removed { "removed" } else { "not present" };
+                let scope = ctx
+                    .import_remove_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!("name {name}"))
+                    .unwrap_or_else(|| "scope entire import".to_string());
+                return [
+                    format!("{status} {module}"),
+                    format!("file {}", import_file_name(response, ctx)),
+                    scope,
+                ]
+                .join("\n");
+            }
             let status = if !removed {
                 format!("not present {module}")
             } else if let Some(name) = ctx

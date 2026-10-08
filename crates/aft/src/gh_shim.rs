@@ -803,6 +803,38 @@ fn dispatch_r3_with_relay<F>(
 where
     F: FnOnce(&[OsString]) -> i32,
 {
+    dispatch_r3_with_relay_at(
+        args,
+        classification,
+        manifest,
+        paths,
+        rung,
+        agent_binding,
+        now,
+        delegate_to_upstream,
+        relay,
+        &crate::bash_background::storage_dir(None),
+    )
+}
+
+// Relay fixtures need the same dispatch and invalidation path without inheriting
+// the operator's database. Production keeps resolving its ordinary shared root.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_r3_with_relay_at<F>(
+    args: &[OsString],
+    classification: Classification,
+    manifest: &Manifest,
+    paths: &StatePaths,
+    rung: &RungRecord,
+    agent_binding: &AgentBinding,
+    now: u64,
+    delegate_to_upstream: F,
+    relay: &RelayContext,
+    storage_root: &Path,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
     match classification {
         Classification::Mechanical => delegate_to_upstream(args),
         Classification::Admin { tuple } => {
@@ -873,7 +905,11 @@ where
             }
             let mutation = GithubReadMutation::from_governed_request(&request);
             let outcome = route_governed(paths, rung, agent_binding, request, now, manifest, relay);
-            invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
+            invalidate_successful_github_read_mutation_at(
+                storage_root,
+                mutation.as_ref(),
+                &outcome,
+            );
             governed_outcome_status(paths, agent_binding, now, outcome)
         }
         Classification::Unclassified => refuse(
@@ -4641,17 +4677,6 @@ impl GithubReadMutation {
 ///
 /// The shim runs before AFT selects standalone or subc transport, so keeping the
 /// callback here gives both execution modes identical invalidation behavior.
-fn invalidate_successful_github_read_mutation(
-    mutation: Option<&GithubReadMutation>,
-    outcome: &RouteOutcome,
-) {
-    invalidate_successful_github_read_mutation_at(
-        &crate::bash_background::storage_dir(None),
-        mutation,
-        outcome,
-    );
-}
-
 fn invalidate_successful_github_read_mutation_at(
     storage_root: &Path,
     mutation: Option<&GithubReadMutation>,

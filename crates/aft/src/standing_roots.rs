@@ -819,7 +819,9 @@ mod tests {
             .unwrap();
 
         let restarted = StandingRoots::default();
-        restarted.reconcile(&Config::default()).unwrap();
+        restarted
+            .reconcile(&config(storage.path(), Vec::new()))
+            .unwrap();
         restarted.reconcile(&cfg).unwrap();
         let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
         assert!(standing_roots::needs_strict_verify(

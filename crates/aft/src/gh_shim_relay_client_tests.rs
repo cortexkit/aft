@@ -9,7 +9,7 @@ use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTO
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
 
 use super::super::{
-    classify, dispatch_r3_with_relay, AgentBinding, Classification, Manifest, RefusalCode,
+    classify, dispatch_r3_with_relay_at, AgentBinding, Classification, Manifest, RefusalCode,
     RungDetermination, RungRecordProvenance, StatePaths, OUTCOME_UNKNOWN_EXIT_STATUS,
     REFUSAL_EXIT_STATUS,
 };
@@ -637,7 +637,7 @@ fn dispatch_comment(harness: &Harness, ticket: Option<&str>, body: &str) -> (i32
         agent_id: "alfonso-aft".to_string(),
     };
     let mut upstream_reached = false;
-    let status = dispatch_r3_with_relay(
+    let status = dispatch_r3_with_relay_at(
         &args,
         classification,
         &manifest,
@@ -655,6 +655,7 @@ fn dispatch_comment(harness: &Harness, ticket: Option<&str>, body: &str) -> (i32
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
             relay_budget: Duration::from_secs(5),
         },
+        &harness._temp.path().join("storage"),
     );
     (status, upstream_reached)
 }
@@ -704,6 +705,10 @@ fn a_live_ticket_relays_the_governed_envelope_and_prints_the_url() {
     let (status, upstream) = dispatch_comment(&harness, live.value(), "hello");
     assert_eq!(status, 0);
     assert!(!upstream);
+    assert!(
+        harness._temp.path().join("storage/aft.db").is_file(),
+        "successful relay invalidates reads in the fixture storage"
+    );
     let requests = harness.daemon.requests.lock().unwrap().clone();
     // The version check runs first at activation, then the write.
     assert_eq!(requests[0]["op"], BINDINGS_READ_OPERATION);
@@ -1150,7 +1155,7 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
         repo: "cortexkit/aft".to_string(),
         agent_id: "alfonso-aft".to_string(),
     };
-    let status = dispatch_r3_with_relay(
+    let status = dispatch_r3_with_relay_at(
         &args,
         classification,
         &manifest,
@@ -1165,6 +1170,7 @@ fn a_silent_relay_reports_outcome_unknown_after_the_configured_budget() {
             transient_delays: [Duration::from_millis(1); 2],
             relay_budget: Duration::from_millis(400),
         },
+        &harness._temp.path().join("storage"),
     );
     assert_eq!(status, OUTCOME_UNKNOWN_EXIT_STATUS);
     assert_eq!(harness.daemon.bot_requests().len(), 1, "never resent");
@@ -1200,7 +1206,7 @@ fn dispatch_timed(
         agent_id: "alfonso-aft".to_string(),
     };
     let started = std::time::Instant::now();
-    let status = dispatch_r3_with_relay(
+    let status = dispatch_r3_with_relay_at(
         &args,
         classification,
         &manifest,
@@ -1215,6 +1221,7 @@ fn dispatch_timed(
             transient_delays,
             relay_budget,
         },
+        &harness._temp.path().join("storage"),
     );
     (status, started.elapsed())
 }
@@ -1343,7 +1350,7 @@ fn dispatch_pr_create(harness: &Harness, ticket: Option<&str>) -> (i32, bool) {
         agent_id: "alfonso-aft".to_string(),
     };
     let mut upstream_reached = false;
-    let status = dispatch_r3_with_relay(
+    let status = dispatch_r3_with_relay_at(
         &args,
         classification,
         &manifest,
@@ -1361,6 +1368,7 @@ fn dispatch_pr_create(harness: &Harness, ticket: Option<&str>) -> (i32, bool) {
             transient_delays: [Duration::from_millis(1), Duration::from_millis(1)],
             relay_budget: Duration::from_secs(5),
         },
+        &harness._temp.path().join("storage"),
     );
     (status, upstream_reached)
 }
