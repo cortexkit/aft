@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["oc2-host-tool-overlap-notice"],
+  "note": "OpenCode 2 plugin only: a one-time TUI toast when the host's patch or shell tool runs beside AFT's tools. No changed path matches RANKING_FENCE_PREFIXES."
+}
