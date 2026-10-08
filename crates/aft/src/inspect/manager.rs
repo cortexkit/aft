@@ -71,6 +71,11 @@ macro_rules! checkout_view_ok {
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
+fn inspect_category_is_off(config: &crate::config::InspectConfig, category: InspectCategory) -> bool {
+    // Retired categories still take their existing unsupported-category path.
+    category.is_active() && !config.category_enabled(category)
+}
+
 type WaiterTx = Sender<JobOutcome>;
 type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
 
@@ -1316,7 +1321,7 @@ impl InspectManager {
         deadline: Instant,
     ) -> JobOutcome {
         let wait_started = Instant::now();
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return JobOutcome::off();
         }
         let wait_budget = deadline.saturating_duration_since(wait_started);
@@ -1377,7 +1382,7 @@ impl InspectManager {
         caller_scope: JobScope,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> Result<JobKey, String> {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return Err(format!("inspect.categories.{} is off", category.as_str()));
         }
         if !category.is_active() {
@@ -1404,7 +1409,7 @@ impl InspectManager {
         snapshot: InspectSnapshot,
         category: InspectCategory,
     ) -> Result<Option<JobKey>, String> {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return Ok(None);
         }
         if !category.is_active() {
@@ -1486,7 +1491,7 @@ impl InspectManager {
         let mut requested = Vec::new();
 
         for category in categories {
-            if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+            if inspect_category_is_off(&snapshot.config.inspect, category) {
                 continue;
             }
             if !category.is_active() {
@@ -2180,7 +2185,7 @@ impl InspectManager {
         caller_scope: JobScope,
         callgraph_snapshot: Option<Arc<CallgraphSnapshot>>,
     ) -> JobOutcome {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return JobOutcome::off();
         }
         if let Err(outcome) = validate_tier2_read_category(category) {
@@ -2237,7 +2242,7 @@ impl InspectManager {
         scope: JobScope,
         store: Option<Arc<crate::callgraph_store::ReadonlyCallGraphStore>>,
     ) -> JobOutcome {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return JobOutcome::off();
         }
         if let Err(outcome) = validate_tier2_read_category(category) {
@@ -2341,7 +2346,7 @@ impl InspectManager {
         caller_scope: JobScope,
         require_callgraph_snapshot: bool,
     ) -> JobOutcome {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return JobOutcome::off();
         }
         if let Err(outcome) = validate_tier2_read_category(category) {
@@ -2490,7 +2495,7 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return JobOutcome::off();
         }
         if let Err(outcome) = validate_tier2_read_category(category) {
@@ -2514,7 +2519,7 @@ impl InspectManager {
         category: InspectCategory,
         caller_scope: JobScope,
     ) -> JobOutcome {
-        if category.is_active() && !snapshot.config.inspect.category_enabled(category) {
+        if inspect_category_is_off(&snapshot.config.inspect, category) {
             return JobOutcome::off();
         }
         if let Err(outcome) = validate_tier2_read_category(category) {
@@ -2686,7 +2691,7 @@ impl InspectManager {
         permit_slot: Option<Tier2PermitSlot>,
     ) -> InspectResult {
         let started = Instant::now();
-        if job.category.is_active() && !job.config.inspect.category_enabled(job.category) {
+        if inspect_category_is_off(&job.config.inspect, job.category) {
             return InspectResult::success(
                 &job,
                 InspectScanSuccess {
@@ -6996,6 +7001,44 @@ mod guard_tests {
             count >= 1,
             "expected the fixture's TODO markers, got {count}"
         );
+    }
+
+    #[test]
+    fn category_off_helper_preserves_active_and_retired_categories() {
+        let mut config = crate::config::InspectConfig::default();
+        let categories = [
+            InspectCategory::Diagnostics,
+            InspectCategory::Metrics,
+            InspectCategory::Todos,
+            InspectCategory::DeadCode,
+            InspectCategory::UnusedExports,
+            InspectCategory::Duplicates,
+            InspectCategory::Cycles,
+            InspectCategory::Complexity,
+            InspectCategory::CircularDeps,
+            InspectCategory::OutdatedDeps,
+            InspectCategory::Vulnerabilities,
+            InspectCategory::TestCoverageGaps,
+            InspectCategory::ApiSurface,
+        ];
+        for category in categories {
+            assert!(!inspect_category_is_off(&config, category), "{category}");
+        }
+        config.enabled = false;
+        for category in categories {
+            let expected = matches!(
+                category,
+                InspectCategory::Diagnostics
+                    | InspectCategory::Metrics
+                    | InspectCategory::Todos
+                    | InspectCategory::DeadCode
+                    | InspectCategory::UnusedExports
+                    | InspectCategory::Duplicates
+                    | InspectCategory::Cycles
+                    | InspectCategory::Complexity
+            );
+            assert_eq!(inspect_category_is_off(&config, category), expected, "{category}");
+        }
     }
 
     #[test]
