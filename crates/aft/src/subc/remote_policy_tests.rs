@@ -398,12 +398,35 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
-    let daemon = crate::exec_remote::wire_tests::daemon(
-        crate::exec_remote::wire_tests::Script::Utf8,
-        "exec-remote/v1",
-    )
-    .await;
+    exercise_catalog_remote_bash(crate::exec_remote::wire_tests::Script::Utf8, None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runon_subc_executor_refusal_returns_error_without_local_spawn() {
+    use crate::exec_remote::wire_tests::Script;
+    for (script, reason) in [
+        (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
+        (Script::Refused, "future_refusal"),
+    ] {
+        exercise_catalog_remote_bash(script, Some(reason)).await;
+    }
+}
+
+#[cfg(unix)]
+async fn exercise_catalog_remote_bash(
+    script: crate::exec_remote::wire_tests::Script,
+    refusal: Option<&str>,
+) {
+    let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
     let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("must-not-run-locally");
+    let command = if refusal.is_some() {
+        format!("printf local-proof > '{}'", marker.display())
+    } else {
+        "cargo test".into()
+    };
     let storage = tempfile::tempdir().unwrap();
     let bind = identity(root.path(), "one", 7, true);
     let root_id = bind.root.clone();
@@ -447,7 +470,7 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
         1,
         8,
         serde_json::to_vec(
-            &json!({"name":"bash","preset":"worker","arguments":{"command":"cargo test","runon":"linux"}}),
+            &json!({"name":"bash","preset":"worker","arguments":{"command":command,"runon":"linux"}}),
         )
         .unwrap(),
     )
@@ -494,13 +517,26 @@ async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        done.response_for_test().data["output"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("ran remotely on ck-motor\n")),
-        "{:?}",
-        done.response_for_test()
-    );
+    let response = done.response_for_test();
+    if let Some(reason) = refusal {
+        assert!(
+            !marker.exists(),
+            "subc runon spawned locally after {reason}"
+        );
+        assert!(!response.success, "{response:?}");
+        assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+        assert_eq!(response.data["message"], format!(
+            "runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally"
+        ));
+    } else {
+        assert!(response.success, "{response:?}");
+        assert!(
+            response.data["output"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("ran remotely on ck-motor\n")),
+            "{response:?}"
+        );
+    }
     let log = daemon.log.lock().unwrap();
     assert_eq!(
         log.iter()

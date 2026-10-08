@@ -1,4 +1,5 @@
 use super::*;
+use crate::bash_background::persistence::{read_task, write_task};
 use crate::exec_remote::wire_tests::{daemon, id, Script};
 fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
     static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Duration>>> =
@@ -113,6 +114,7 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
     for (script, reason) in [
         (Script::Refused, "future_refusal"),
         (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
     ] {
         let daemon = daemon(script, "exec-remote/v1").await;
         let dir = tempfile::tempdir().unwrap();
@@ -144,6 +146,106 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
             "environment-proof"
         );
         assert_eq!(request.1["params"]["cwd"], dir.path().display().to_string());
+    }
+}
+
+fn refusal_response(snapshot: BgTaskSnapshot) -> crate::protocol::Response {
+    let now = std::time::Instant::now();
+    match crate::commands::bash_orchestrate::decide_bash_step(
+        snapshot, now, true, false, now, "runon",
+    ) {
+        crate::commands::bash_orchestrate::BashStep::Done(response) => response,
+        _ => panic!("a terminal refusal must finish the foreground call"),
+    }
+}
+
+fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
+    assert!(!response.success, "{response:?}");
+    assert_eq!(response.data["code"], "remote_unavailable", "{response:?}");
+    assert_eq!(
+        response.data["message"],
+        format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally"),
+        "{response:?}"
+    );
+}
+
+#[tokio::test]
+async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
+    for (script, reason) in [
+        (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
+        (Script::Refused, "future_refusal"),
+    ] {
+        let daemon = daemon(script, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run-locally");
+        let ctx = restarted_context(dir.path());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": format!("printf local-proof > '{}'", marker.display()),
+                "runon": "linux", "compressed": false
+            }),
+        );
+        assert!(
+            response.success,
+            "the asynchronous launch returns a task: {response:?}"
+        );
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let done = terminal(ctx.bash_background(), task_id).await;
+        assert!(
+            !marker.exists(),
+            "explicit runon spawned locally after {reason}"
+        );
+        assert_eq!(done.child_pid, None);
+        assert_eq!(done.info.status, BgTaskStatus::Failed);
+        let task = ctx.bash_background().task(task_id).unwrap();
+        assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+        assert_runon_refusal(&refusal_response(done), reason);
+        assert_eq!(exec_runs(&daemon).len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
+    for (script, reason) in [
+        (Script::KnownRefused, "unreachable"),
+        (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
+        (Script::Refused, "future_refusal"),
+    ] {
+        let daemon = daemon(script, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("local-fallback");
+        let ctx = restarted_context(dir.path());
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.remote_exec.as_mut().unwrap().legacy_commands =
+            Some(serde_json::json!(["printf"]));
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({
+                "command": format!("printf local-proof > '{}'", marker.display()),
+                "compressed": false
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        assert_eq!(fs::read_to_string(marker).unwrap(), "local-proof");
+        assert_eq!(done.exit_code, Some(0));
+        assert!(
+            done.output_preview.contains(&format!(
+                "ran locally on {}: remote refused: {reason}",
+                local_os_name()
+            )),
+            "{done:?}"
+        );
+        assert!(refusal_response(done).success);
+        assert_eq!(exec_runs(&daemon).len(), 1);
     }
 }
 
@@ -959,6 +1061,60 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
         .unwrap()
         .iter()
         .any(|(_, b)| b["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn runon_restart_executor_refusal_never_restores_local_launch() {
+    // Cover both an attach that learns a refusal and a refusal already saved
+    // before the previous process could decide whether to launch locally.
+    for saved_terminal in [false, true] {
+        let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("must-not-run-after-restart");
+        let command = format!("printf local-proof > '{}'", marker.display());
+        let (original, task_id, paths) =
+            persist_accepted_with_snapshot(dir.path(), daemon.connection.clone(), &command);
+        let mut metadata = read_task(&paths.json).unwrap();
+        let remote = metadata.remote.as_mut().unwrap();
+        remote.explicit_runon = true;
+        if saved_terminal {
+            remote.terminal = Some(TerminalRecord::new(
+                id(),
+                Outcome::RefusedBeforeStart {
+                    reason: RefusalReason::Unknown("future_refusal".into()),
+                },
+                1,
+                0,
+                0,
+            ));
+        }
+        write_task(&paths.json, &metadata).unwrap();
+        drop(original);
+        let ctx = restarted_context(dir.path());
+        let restarted = ctx.bash_background();
+        restarted.replay_session(dir.path(), "session").unwrap();
+        let done = terminal(restarted, &task_id).await;
+        assert!(
+            !marker.exists(),
+            "explicit runon restored a local launch after restart"
+        );
+        assert_eq!(done.child_pid, None);
+        assert!(!read_task(&paths.json).unwrap().local_fallback_started);
+        assert_runon_refusal(&refusal_response(done), "future_refusal");
+        assert!(
+            exec_runs(&daemon).is_empty(),
+            "restart must not resubmit remotely"
+        );
+        // The terminal refusal and its structured error also survive another restart.
+        drop(ctx);
+        let ctx = restarted_context(dir.path());
+        ctx.bash_background()
+            .replay_session(dir.path(), "session")
+            .unwrap();
+        let done = terminal(ctx.bash_background(), &task_id).await;
+        assert_runon_refusal(&refusal_response(done), "future_refusal");
+        assert!(!marker.exists());
+    }
 }
 
 #[tokio::test]

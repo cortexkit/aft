@@ -62,6 +62,7 @@ pub(crate) enum Script {
     Cancel,
     MissingTerminal,
     KnownRefused,
+    WorkspaceSetupRefused,
     FutureOutcome,
     Expired,
     Utf8,
@@ -159,7 +160,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !matches!(script, Script::Refused | Script::KnownRefused) {
+                            if !attaching && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                             }
                             let outcome = if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
@@ -168,6 +169,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                     Script::Lost => Outcome::OutcomeUnknown,
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
                                     Script::KnownRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
+                                    Script::WorkspaceSetupRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
