@@ -146,7 +146,9 @@ impl SemanticProducer {
 
     fn chunk_key(&self, text: &str) -> FamilyKey {
         let mut hash = blake3::Hasher::new();
-        hash.update(b"aft-semantic-chunk-vector-v1\0");
+        // A new cache format gets a new domain: immutable JSON rows must not
+        // prevent compact vectors from being stored under otherwise equal inputs.
+        hash.update(b"aft-semantic-chunk-vector-v2\0");
         let identity = self.chunk_identity();
         hash.update(&(identity.len() as u64).to_le_bytes());
         hash.update(identity.as_bytes());
@@ -155,13 +157,55 @@ impl SemanticProducer {
     }
 }
 
-/// Float bits preserve the vector exactly, including signed zero, independently
-/// of JSON's number formatting. Payload digests are verified by FamilyStore.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ChunkVector {
-    producer: String,
-    text: String,
-    bits: Vec<u32>,
+const CHUNK_VECTOR_FORMAT: u8 = 1;
+
+/// A format byte, two length-prefixed UTF-8 fields, then raw little-endian f32s.
+/// The vector occupies exactly four bytes per dimension, preserving signed zero
+/// and every float bit. FamilyStore verifies the digest before decoding.
+fn encode_chunk_vector(identity: &str, text: &str, vector: &[f32]) -> Result<Vec<u8>, String> {
+    let identity_len = u32::try_from(identity.len())
+        .map_err(|_| "semantic chunk producer identity is too long".to_string())?;
+    let text_len =
+        u32::try_from(text.len()).map_err(|_| "semantic chunk text is too long".to_string())?;
+    let mut payload = Vec::with_capacity(9 + identity.len() + text.len() + vector.len() * 4);
+    payload.push(CHUNK_VECTOR_FORMAT);
+    payload.extend_from_slice(&identity_len.to_le_bytes());
+    payload.extend_from_slice(identity.as_bytes());
+    payload.extend_from_slice(&text_len.to_le_bytes());
+    payload.extend_from_slice(text.as_bytes());
+    for value in vector {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(payload)
+}
+
+fn take_chunk_field<'a>(remaining: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length = u32::from_le_bytes(remaining.get(..4)?.try_into().ok()?) as usize;
+    let tail = remaining.get(4..)?;
+    let field = tail.get(..length)?;
+    *remaining = tail.get(length..)?;
+    Some(field)
+}
+
+fn decode_chunk_vector(payload: &[u8], identity: &str, text: &str) -> Option<Vec<f32>> {
+    let (&format, mut remaining) = payload.split_first()?;
+    if format != CHUNK_VECTOR_FORMAT {
+        return None;
+    }
+    // The hash is an index, not proof of equality or producer compatibility.
+    if take_chunk_field(&mut remaining)? != identity.as_bytes()
+        || take_chunk_field(&mut remaining)? != text.as_bytes()
+        || remaining.is_empty()
+        || remaining.len() % 4 != 0
+    {
+        return None;
+    }
+    Some(
+        remaining
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+            .collect(),
+    )
 }
 
 fn load_chunk(
@@ -173,14 +217,7 @@ fn load_chunk(
     let Some(payload) = store.get(key)? else {
         return Ok(None);
     };
-    let Ok(row) = serde_json::from_slice::<ChunkVector>(&payload) else {
-        return Ok(None);
-    };
-    // The hash is an index, not proof of equality or producer compatibility.
-    if row.producer != identity || row.text != text || row.bits.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(row.bits.into_iter().map(f32::from_bits).collect()))
+    Ok(decode_chunk_vector(&payload, identity, text))
 }
 
 /// Whether the semantic plane has work for `rel_path`.
@@ -929,12 +966,7 @@ impl SemanticPlane {
                 } = &mut result
                 {
                     if embedded_text == text {
-                        let payload = serde_json::to_vec(&ChunkVector {
-                            producer: identity.clone(),
-                            text: text.clone(),
-                            bits: vector.iter().map(|value| value.to_bits()).collect(),
-                        })
-                        .map_err(|error| error.to_string())?;
+                        let payload = encode_chunk_vector(&identity, text, vector)?;
                         match store.put_or_touch(key, &payload) {
                             Ok(_) => {}
                             Err(crate::blob_store::v2::StoreError::ConflictingPayload(_)) => {
@@ -1857,6 +1889,90 @@ mod tests {
     }
 
     #[test]
+    fn chunk_vector_stored_payload_is_compact_and_preserves_bits() {
+        let storage = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let plane = new_plane(storage.path(), "model-a");
+        let checkout = Checkout::open(storage.path(), "scope-a", root.path(), &plane);
+        let store = checkout.owner.open_store(FamilyPlane::Semantic).unwrap();
+        let producer = plane.semantic_producer();
+        let identity = producer.chunk_identity();
+        let text = "file:src/a.rs\nfn compact_vector()";
+        let vector = (0..1024)
+            .map(|i| if i == 0 { -0.0 } else { i as f32 / 1024.0 })
+            .collect::<Vec<_>>();
+        plane
+            .embed_chunks(
+                &plane.arena("family"),
+                &store,
+                vec![text.into()],
+                &mut |_| Ok(vec![vector.clone()]),
+                &mut FillReport::default(),
+            )
+            .unwrap();
+        let key = producer.chunk_key(text);
+        let payload = store.get(&key).unwrap().unwrap();
+        // A format byte and two u32 lengths are the only fixed overhead.
+        let bound = 4 * vector.len() + 9 + identity.len() + text.len();
+        assert!(
+            payload.len() <= bound,
+            "stored chunk payload uses {} bytes; compact bound is {bound}",
+            payload.len()
+        );
+        let reused = load_chunk(&store, &key, &identity, text).unwrap().unwrap();
+        assert_eq!(
+            reused
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            vector
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "1024-dimensional stored chunk payload: {} bytes (bound {bound})",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn chunk_vector_decode_rejects_malformed_old_or_mismatched_payloads() {
+        let identity = "producer";
+        let text = "text";
+        let valid = encode_chunk_vector(identity, text, &[1.0, -0.0]).unwrap();
+        assert!(decode_chunk_vector(&valid, identity, text).is_some());
+        assert!(decode_chunk_vector(&valid, "other producer", text).is_none());
+        assert!(decode_chunk_vector(&valid, identity, "other text").is_none());
+        let header_len = 9 + identity.len() + text.len();
+        let mut malformed = vec![
+            Vec::new(),
+            br#"{"producer":"producer","text":"text","bits":[1065353216,2147483648]}"#.to_vec(),
+            valid[..header_len].to_vec(),
+            valid[..valid.len() - 1].to_vec(),
+        ];
+        // Every incomplete length or string field must be rejected safely.
+        malformed.extend((0..header_len).map(|end| valid[..end].to_vec()));
+        let mut unknown_format = valid.clone();
+        unknown_format[0] = CHUNK_VECTOR_FORMAT + 1;
+        malformed.push(unknown_format);
+        let mut oversized_identity = valid.clone();
+        oversized_identity[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(oversized_identity);
+        let mut oversized_text = valid.clone();
+        let text_length_offset = 5 + identity.len();
+        oversized_text[text_length_offset..text_length_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        malformed.push(oversized_text);
+        let mut partial_float = valid.clone();
+        partial_float.push(0);
+        malformed.push(partial_float);
+        for payload in malformed {
+            assert!(decode_chunk_vector(&payload, identity, text).is_none());
+        }
+    }
+
+    #[test]
     fn chunk_reuse_hash_collision_requires_exact_text() {
         let storage = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1869,11 +1985,11 @@ mod tests {
         store
             .put_or_touch(
                 &key,
-                &serde_json::to_vec(&ChunkVector {
-                    producer: producer.chunk_identity(),
-                    text: "different text at colliding hash".into(),
-                    bits: vec![999f32.to_bits(); 16],
-                })
+                &encode_chunk_vector(
+                    &producer.chunk_identity(),
+                    "different text at colliding hash",
+                    &[999f32; 16],
+                )
                 .unwrap(),
             )
             .unwrap();
