@@ -272,7 +272,10 @@ bounded_probe() (
     # arrive between starting sleep and assigning that variable. Before sleep
     # starts, $! is inherited from the enclosing shell and names the probe, not
     # a child of this watchdog; cancellation then just exits without a timer.
-    trap 'trap "" TERM; if [ "$!" != "$probe_pid" ]; then kill "$!" 2>/dev/null; wait "$!" 2>/dev/null; fi; exit 0' TERM
+    # Use SIGKILL for the timer: TERM can arrive in the forked shell before it
+    # execs sleep and be consumed by that shell's inherited trap instead. Waiting
+    # for that still-live timer would delay a completed probe for ten seconds.
+    trap 'trap "" TERM; if [ "$!" != "$probe_pid" ]; then kill -KILL "$!" 2>/dev/null; wait "$!" 2>/dev/null; fi; exit 0' TERM
     sleep 10 &
     wait "$!"
     kill -KILL "$probe_pid" 2>/dev/null
@@ -3054,8 +3057,32 @@ mod tests {
                     return status;
                 }
                 if Instant::now() >= deadline {
+                    let remaining: Vec<_> = dispatcher_process_snapshot()
+                        .into_iter()
+                        .filter(|(_, pgid, _)| *pgid == child.id())
+                        .map(|(pid, _, line)| {
+                            #[cfg(target_os = "linux")]
+                            {
+                                let status = fs::read_to_string(format!("/proc/{pid}/status"))
+                                    .unwrap_or_default();
+                                let signals: Vec<_> = status
+                                    .lines()
+                                    .filter(|line| line.starts_with("Sig"))
+                                    .collect();
+                                format!("{line}\n{}", signals.join("\n"))
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
+                                let _ = pid;
+                                line
+                            }
+                        })
+                        .collect();
                     crate::bash_background::process::terminate_process(child);
-                    panic!("dispatcher exceeded {allowance:?}");
+                    panic!(
+                        "dispatcher exceeded {allowance:?} (pid ppid pgid sess stat command):\n{}",
+                        remaining.join("\n")
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -3079,10 +3106,19 @@ mod tests {
             "#!/bin/sh\ncase $1 in\nrev-parse) printf '%s\\n' \"$AFT_TEST_REPO\";;\nconfig) printf '%s\\n' \"$AFT_TEST_REPO/missing-hooks\";;\nesac\n",
         );
         let hook = managed_git_hook_contents("post-index-change");
+        // A loaded runner can delay a healthy hook for more than two seconds.
+        // Allow scheduling slack, but stay below the ten-second watchdog so a
+        // stuck fast probe cannot pass merely by waiting for its timer to expire.
+        let fast_probe_allowance = Duration::from_secs(6);
         for _ in 0..200 {
             let mut child = fixture.spawn(&hook);
-            assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
+            assert!(DispatcherProcessFixture::wait(&mut child, fast_probe_allowance).success());
         }
+        // Model scheduler latency without generating CPU load. This delay is
+        // before any probe/watchdog starts, so it cannot mask a leaked timer.
+        let slow_start = hook.replacen("#!/bin/sh", "#!/bin/sh\n/bin/sleep 3", 1);
+        let mut child = fixture.spawn(&slow_start);
+        assert!(DispatcherProcessFixture::wait(&mut child, fast_probe_allowance).success());
         // Force the timer-publication interleaving without synthetic CPU load:
         // a synchronous, test-only delay preserves $!, but gives the parent
         // time to cancel before the watchdog's next command. The production
@@ -3090,8 +3126,30 @@ mod tests {
         let delayed = hook.replace("sleep 10 &", "sleep 10 &\n    /bin/sleep 0.05");
         assert_ne!(hook, delayed, "test delay must reach the real watchdog");
         let mut child = fixture.spawn(&delayed);
-        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(2)).success());
-        fixture.assert_drained(Duration::from_millis(500));
+        assert!(DispatcherProcessFixture::wait(&mut child, fast_probe_allowance).success());
+        // Give exiting children scheduling slack, not enough time for an orphan
+        // sleep 10 from the final publication-window probe to expire naturally.
+        fixture.assert_drained(Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_cancels_a_timer_that_ignores_term() {
+        let mut fixture = DispatcherProcessFixture::new(
+            "#!/bin/sh\nwhile [ ! -f \"$AFT_TEST_REPO/timer-ready\" ]; do /bin/sleep 0.01; done\n",
+        );
+        // TERM sent between fork and exec can be consumed by the timer child's
+        // inherited shell trap. Model an equally unresponsive timer explicitly,
+        // and let the probe finish only after that timer is known to be running.
+        write_executable(
+            &fixture.temp.path().join("sleep"),
+            "#!/bin/sh\ntrap '' TERM\n: > \"$AFT_TEST_REPO/timer-ready\"\nexec /bin/sleep \"$@\"\n",
+        );
+        let hook = managed_git_hook_contents("post-index-change");
+        let bounded = hook.split("\nprobe_value()").next().unwrap();
+        let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
+        assert!(DispatcherProcessFixture::wait(&mut child, Duration::from_secs(6)).success());
+        fixture.assert_drained(Duration::from_secs(2));
     }
 
     #[cfg(unix)]
@@ -3104,10 +3162,10 @@ mod tests {
         let bounded = hook.split("\nprobe_value()").next().unwrap();
         let mut child = fixture.spawn(&format!("{bounded}\nbounded_probe git\nexit \"$?\"\n"));
         assert_eq!(
-            DispatcherProcessFixture::wait(&mut child, Duration::from_secs(12)).code(),
+            DispatcherProcessFixture::wait(&mut child, Duration::from_secs(16)).code(),
             Some(124)
         );
-        fixture.assert_drained(Duration::from_millis(500));
+        fixture.assert_drained(Duration::from_secs(2));
     }
 
     #[cfg(unix)]
@@ -3115,7 +3173,7 @@ mod tests {
     fn dispatcher_sigkilled_hook_descendants_exit_within_deadline() {
         let mut fixture = DispatcherProcessFixture::new("#!/bin/sh\nexec sleep 600\n");
         let mut child = fixture.spawn(&managed_git_hook_contents("post-index-change"));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(6);
         loop {
             if fixture
                 .remaining_processes()
@@ -3131,7 +3189,7 @@ mod tests {
         // that cannot run a shell trap. The surviving watchdog must still end
         // the stalled probe and then exit within its original ten-second bound.
         child.kill().unwrap();
-        assert!(!DispatcherProcessFixture::wait(&mut child, Duration::from_secs(1)).success());
+        assert!(!DispatcherProcessFixture::wait(&mut child, Duration::from_secs(6)).success());
         fixture.assert_drained(Duration::from_secs(12));
     }
 

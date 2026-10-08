@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["git-hook-orphan-test-latency"],
+  "note": "Managed git-hook timer cancellation and process-fixture timing only: kill the timer with SIGKILL so a TERM consumed between fork and exec cannot delay completed probes. Allow loaded-runner scheduling latency while keeping fast-probe waits and post-exit drains below the ten-second watchdog. The process scan remains scoped to the fixture's own session process groups; mutations restoring the old watchdog and TERM-only timer cancellation must still fail their named regressions. No changed path matches RANKING_FENCE_PREFIXES."
+}
