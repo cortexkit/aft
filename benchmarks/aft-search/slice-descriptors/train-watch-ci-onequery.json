@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["ci-watch-one-query"],
+  "note": "Release scripts only: the CI watcher polls status, conclusion, jobs, and URL from one run-view response per tick and backs off after consecutive API errors. No changed path matches RANKING_FENCE_PREFIXES."
+}

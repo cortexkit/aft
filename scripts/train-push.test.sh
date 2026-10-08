@@ -129,12 +129,52 @@ if [ "${1:-}" = "api" ]; then
   exit 0
 fi
 
-# Fault injection: a field listed in fail_json makes every `run view` query
-# for it exit nonzero with no output, the way gh behaves on a network, rate
-# limit or auth error. The verdict path must fail closed on it.
+# Fault injection: a field listed in fail_json makes the combined `run view`
+# response omit that field's usable value, standing in for a completed-run
+# payload whose conclusion or job list could not be read.
 if [ "${1:-}" = "run" ] && [ "${2:-}" = "view" ] && [ -f "$STATE/fail_json" ] &&
   grep -qxF "$json" "$STATE/fail_json"; then
   exit 1
+fi
+
+if [ "$json" = "status,conclusion,jobs,url" ]; then
+  watch_status="$(cat "$STATE/watch_status" 2>/dev/null || echo completed)"
+  printf '%s\n' "$watch_status" > "$STATE/recorded_status"
+  if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
+    cp "$WATCH_CI_HEARTBEAT" "$STATE/heartbeat-snapshot"
+  fi
+  combined_conclusion="$(cat "$STATE/conclusion")"
+  combined_jobs="$(cat "$STATE/failed_job" 2>/dev/null || true)"
+  combined_count="$(cat "$STATE/job_count" 2>/dev/null || echo 3)"
+  fail_conclusion=0
+  fail_jobs=0
+  if [ -f "$STATE/fail_json" ]; then
+    grep -qxF conclusion "$STATE/fail_json" && fail_conclusion=1 || true
+    grep -qxF jobs "$STATE/fail_json" && fail_jobs=1 || true
+  fi
+  python3 - "$watch_status" "$combined_conclusion" "$combined_jobs" "$combined_count" \
+    "$fail_conclusion" "$fail_jobs" "$(cat "$STATE/run_id")" <<'PY'
+import json, sys
+status, conclusion, failed, count, fail_conclusion, fail_jobs, run_id = sys.argv[1:]
+jobs = [
+    {"name": f"Unit {index + 1}", "databaseId": 9100 + index, "conclusion": "success"}
+    for index in range(int(count))
+]
+if failed:
+    name, _, job_id = failed.partition("|")
+    jobs.append({"name": name, "databaseId": int(job_id or 0), "conclusion": "failure"})
+if fail_conclusion == "1":
+    conclusion = None
+if fail_jobs == "1":
+    jobs = []
+print(json.dumps({
+    "status": status,
+    "conclusion": conclusion,
+    "jobs": jobs,
+    "url": f"https://github.com/example/repo/actions/runs/{run_id}",
+}))
+PY
+  exit 0
 fi
 
 case "$json" in
@@ -437,7 +477,21 @@ if args[:2] == ['run', 'list']:
 if args[:2] != ['run', 'view']:
     sys.exit('unexpected fake CI query: ' + repr(args))
 run = next(r for r in runs if str(r['id']) == args[2])
-if field == 'url':
+if '--log-failed' in args:
+    print('FAIL [   0.10s] canned::stack_failure')
+elif field == 'status,conclusion,jobs,url':
+    jobs = [{
+        'name': 'Unit',
+        'databaseId': 9001,
+        'conclusion': 'failure' if run['conclusion'] == 'failure' else 'success',
+    }]
+    print(json.dumps({
+        'status': run['status'],
+        'conclusion': run['conclusion'],
+        'jobs': jobs,
+        'url': 'https://github.com/example/repo/actions/runs/' + str(run['id']),
+    }))
+elif field == 'url':
     print('https://github.com/example/repo/actions/runs/' + str(run['id']))
 elif field == 'status,conclusion':
     print(run['status'] + '\t' + run['conclusion'])
@@ -1768,7 +1822,7 @@ expect_out "landed previously-verified sha $train_sha" "the recovery names the e
 expect_no_out "creating origin/train/existing-green" "recorded green skips creating the train branch"
 expect_no_out "updating origin/train/existing-green" "recorded green skips updating the train branch"
 expect_no_out "watching CI" "recorded green skips the watch"
-if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+if grep -q -- '--json status,conclusion,jobs,url' "$dir/ci-state/gh-calls"; then
   fail "recorded green invoked watch-ci instead of spending the verdict"
 else
   ok "recorded green did not invoke watch-ci"
@@ -1840,7 +1894,7 @@ run_train "$dir" existing-running
 expect_rc 0 "an existing running train is watched and landed"
 expect_out "attaching to CI for existing origin/train/existing-running at $train_sha" \
   "the running recovery attaches to the exact train tip"
-if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+if grep -q -- '--json status,conclusion,jobs,url' "$dir/ci-state/gh-calls"; then
   ok "running recovery invoked watch-ci"
 else
   fail "running recovery landed without attaching watch-ci"
@@ -1942,7 +1996,7 @@ git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-green-mutant"
 TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
 run_train "$dir" existing-green-mutant --land
 TRAIN_PUSH="$TRAIN_PUSH_SAVED"
-if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+if grep -q -- '--json status,conclusion,jobs,url' "$dir/ci-state/gh-calls"; then
   ok "ignoring the recorded verdict wrongly invokes watch-ci (proves the green recovery arm bites)"
 else
   fail "the recorded-verdict mutant did not invoke watch-ci"
