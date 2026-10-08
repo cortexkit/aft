@@ -50,7 +50,24 @@ fn main() {
     }
     if let Some(reference) = git(&manifest_dir, &["symbolic-ref", "-q", "HEAD"]) {
         if let Some(path) = git(&manifest_dir, &["rev-parse", "--git-path", &reference]) {
-            println!("cargo:rerun-if-changed={path}");
+            let path = manifest_dir.join(path);
+            if path.exists() {
+                println!("cargo:rerun-if-changed={}", path.display());
+            } else if let Some(refs) = git(&manifest_dir, &["rev-parse", "--git-path", "refs"]) {
+                // A packed branch has no loose ref. Watching a missing file
+                // makes Cargo rebuild forever; watch its nearest existing ref
+                // directory instead, so the next commit's loose ref is noticed.
+                // Stop at refs rather than watching all of Git's metadata.
+                let refs = manifest_dir.join(refs);
+                if let Some(parent) = path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|parent| parent.starts_with(&refs))
+                    .find(|parent| parent.is_dir())
+                {
+                    println!("cargo:rerun-if-changed={}", parent.display());
+                }
+            }
         }
     }
     if let Some(revision) = git(&manifest_dir, &["rev-parse", "HEAD"]) {

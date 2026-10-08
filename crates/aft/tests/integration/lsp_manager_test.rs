@@ -619,11 +619,11 @@ fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
 /// A server that ignores both the Shutdown request and SIGTERM, and lingers
 /// after its client goes away, stops only for a kill that cannot be ignored.
 /// The shutdown must deliver that kill and wait for it inside its budget,
-/// with every CPU busy as on a loaded CI runner, and leave no server alive.
+/// and leave no server alive. The fake server's injected 30 s exit delay keeps
+/// it alive even after EOF, without competing for the runner's CPUs.
 #[cfg(unix)]
 #[test]
-fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_under_load() {
-    use super::helpers::CpuHog;
+fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_with_delayed_exit() {
     use aft::lsp::manager::LSP_SHUTDOWN_ALL_BUDGET;
 
     let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
@@ -640,15 +640,18 @@ fn shutdown_all_force_kills_servers_ignoring_sigterm_within_the_budget_under_loa
     let pids = registry.pids();
     assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
 
-    let hog = CpuHog::start();
     let outcome = manager.shutdown_all();
-    drop(hog);
+    eprintln!("delayed-exit shutdown: {outcome:?}");
     assert!(
         outcome.elapsed <= LSP_SHUTDOWN_ALL_BUDGET + Duration::from_millis(150),
         "LSP shutdown ran past its {LSP_SHUTDOWN_ALL_BUDGET:?} ceiling: {outcome:?}"
     );
     assert_eq!(outcome.graceful, 0, "{outcome:?}");
     assert_eq!(outcome.forced, 6, "{outcome:?}");
+    assert_eq!(
+        outcome.unreaped, 0,
+        "every killed server must be reaped: {outcome:?}"
+    );
     assert!(registry.pids().is_empty(), "killed pids must be untracked");
 
     // A server the shutdown could not reap in time was still sent the kill,

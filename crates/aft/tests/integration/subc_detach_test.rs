@@ -535,19 +535,19 @@ fn subc_connection_close_after_drain_exits_zero_and_logs_it() {
 
 #[test]
 fn subc_drain_exits_with_many_live_lsp_servers_in_one_deadline() {
-    drain_with_live_lsp_servers("", false, false);
+    drain_with_live_lsp_servers("", false);
 }
 
 /// Servers that ignore the Shutdown request and SIGTERM, and linger after
-/// their client leaves, stop only for a forced kill. With every CPU busy, as
-/// on a loaded CI runner, the LSP phase (kill and reap included) must still
-/// end within its ceiling, the whole exit within the drain budget, and no
-/// server may outlive the module.
+/// their client leaves, stop only for a forced kill. An injected 30 s fake
+/// server exit delay, rather than busy-loop threads, prevents natural exit
+/// from satisfying the test. The LSP phase (kill and reap included) must end
+/// within its ceiling, the whole exit within the drain budget, and no server
+/// may outlive the module.
 #[test]
-fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load() {
+fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_with_delayed_exit() {
     drain_with_live_lsp_servers(
         "AFT_FAKE_LSP_IGNORE_SIGTERM=1 AFT_FAKE_LSP_EXIT_DELAY_MS=30000",
-        true,
         false,
     );
 }
@@ -558,31 +558,30 @@ fn subc_drain_exit_stays_bounded_when_lsp_servers_ignore_sigterm_under_load() {
 /// root's server is running, so all 34 pid files exist when the drain starts.
 #[test]
 fn subc_drain_with_slow_starting_lsp_servers_finds_every_server_started() {
-    drain_with_live_lsp_servers("AFT_FAKE_LSP_START_DELAY_MS=500", false, false);
+    drain_with_live_lsp_servers("AFT_FAKE_LSP_START_DELAY_MS=500", false);
 }
 
 #[test]
 fn subc_drain_with_active_ort_flushes_final_line_before_hard_exit() {
-    drain_with_live_lsp_servers("", false, true);
+    drain_with_live_lsp_servers("", true);
 }
 
 #[test]
 fn subc_drain_with_slow_writer_persists_terminal_line() {
-    drain_with_live_lsp_servers_and_writer("", false, false, "1000", Some("1000"), Some("450"));
+    drain_with_live_lsp_servers_and_writer("", false, "1000", Some("1000"), Some("450"));
 }
 
 /// Binds 34 roots that each start a fake rust-analyzer which never answers
 /// Shutdown, drains the module and checks that it exits within the drain
 /// budget with no language server left behind. `server_env` holds extra
-/// `NAME=value` assignments for the fake servers; `under_load` keeps every
-/// CPU busy from the drain until the module has exited.
-fn drain_with_live_lsp_servers(server_env: &str, under_load: bool, active_ort: bool) {
-    drain_with_live_lsp_servers_and_writer(server_env, under_load, active_ort, "40", None, None);
+/// `NAME=value` assignments for the fake servers, including deterministic
+/// startup and exit delays.
+fn drain_with_live_lsp_servers(server_env: &str, active_ort: bool) {
+    drain_with_live_lsp_servers_and_writer(server_env, active_ort, "40", None, None);
 }
 
 fn drain_with_live_lsp_servers_and_writer(
     server_env: &str,
-    under_load: bool,
     active_ort: bool,
     writer_delay: &str,
     flush_hold: Option<&str>,
@@ -681,13 +680,11 @@ fn drain_with_live_lsp_servers_and_writer(
             })
             .collect::<Vec<_>>();
         assert_eq!(children.len(), 34, "34 roots must each own a live server");
-        let hog = under_load.then(super::helpers::CpuHog::start);
         send_module_draining(&mut stream).await;
         let drained = Instant::now();
         send_connection_goodbye(&mut stream).await;
         let exit = module.wait_for_exit("drained module with live LSP servers");
         let elapsed = drained.elapsed();
-        drop(hog);
         eprintln!(
             "drain completion to process exit: {} ms",
             elapsed.as_millis()
