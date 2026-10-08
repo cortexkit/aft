@@ -6317,6 +6317,21 @@ impl CallGraphStore {
         indexed_file_count(&conn)
     }
 
+    /// Whether this generation indexed a file, including files with no symbols.
+    /// A missing symbol is meaningful only after this keyed inventory lookup.
+    pub fn is_file_indexed(&self, file: &Path) -> Result<bool> {
+        self.refresh_read_marker()?;
+        let abs_path = normalize_file_path(&self.project_root, file)?;
+        let rel_path = relative_path(&self.project_root, &abs_path);
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        self.ensure_ready(&conn)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1)",
+            params![rel_path],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Size and content hash of every stored file, keyed by root-relative
     /// path with `/` separators: the source snapshot the graph describes.
     /// Files over the hash size cap, or whose stored hash does not parse,
@@ -7008,6 +7023,10 @@ impl ReadonlyCallGraphStore {
 
     pub fn indexed_file_count(&self) -> Result<usize> {
         self.inner.indexed_file_count()
+    }
+
+    pub fn is_file_indexed(&self, file: &Path) -> Result<bool> {
+        self.inner.is_file_indexed(file)
     }
 
     /// This reader's stored file identities; see

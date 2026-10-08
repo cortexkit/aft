@@ -133,6 +133,10 @@ const OPERATIONS: [&str; 6] = [
 ];
 
 fn query(ctx: &AppContext, checkout: &Path, operation: &str, caller: &str) -> Response {
+    query_file(ctx, &checkout.join("index.ts"), operation, caller)
+}
+
+fn query_file(ctx: &AppContext, file: &Path, operation: &str, caller: &str) -> Response {
     let symbol = match operation {
         "call_tree" | "trace_to_symbol" | "trace_data" => caller,
         _ => "target",
@@ -140,7 +144,7 @@ fn query(ctx: &AppContext, checkout: &Path, operation: &str, caller: &str) -> Re
     let req = request(json!({
         "id": operation,
         "command": operation,
-        "file": checkout.join("index.ts"),
+        "file": file,
         "symbol": symbol,
         "toSymbol": "target",
         "expression": "value"
@@ -153,6 +157,127 @@ fn query(ctx: &AppContext, checkout: &Path, operation: &str, caller: &str) -> Re
         "trace_to_symbol" => aft::commands::trace_to_symbol::handle_trace_to_symbol(&req, ctx),
         "trace_data" => aft::commands::trace_data::handle_trace_data(&req, ctx),
         _ => unreachable!(),
+    }
+}
+
+#[test]
+fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = linked_checkout(fixture.path());
+    let storage = fixture.path().join("storage");
+    std::fs::write(checkout.join(".gitignore"), ".cortexkit/\n").unwrap();
+    commit(&checkout);
+    let nested = checkout.join(".cortexkit/alfonso/implementation-worktrees/nested");
+    std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    git(
+        &checkout,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            nested.to_str().unwrap(),
+        ],
+    );
+    let file = nested.join("packages/core/src/pool-authority.ts");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, source("recordNativeMigrationExpectations")).unwrap();
+    publish(&checkout, &storage);
+    let ctx = configure(&checkout, &storage, true);
+
+    let outline = aft::commands::outline::handle_outline(
+        &request(json!({
+            "id": "nested-outline", "command": "outline", "file": file
+        })),
+        &ctx,
+    );
+    assert!(outline.success, "{outline:?}");
+    assert!(outline
+        .data
+        .to_string()
+        .contains("recordNativeMigrationExpectations"));
+    let response = aft::commands::callers::handle_callers(
+        &request(json!({
+            "id": "nested-callers", "command": "callers", "file": file,
+            "symbol": "recordNativeMigrationExpectations"
+        })),
+        &ctx,
+    );
+    assert_eq!(response.data["code"], "not_indexed", "{response:?}");
+    for operation in OPERATIONS {
+        let response = query_file(&ctx, &file, operation, "recordNativeMigrationExpectations");
+        assert!(!response.success, "{operation}: {response:?}");
+        assert_eq!(
+            response.data["code"], "not_indexed",
+            "{operation}: {response:?}"
+        );
+        assert_eq!(response.data["reason"], "ignored");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.contains("ignored by the project's ignore rules"),
+            "{message}"
+        );
+        assert!(
+            message.contains("grep or aft_search with pattern"),
+            "{message}"
+        );
+    }
+    let response = aft::commands::trace_to_symbol::handle_trace_to_symbol(
+        &request(json!({
+            "id": "nested-target", "command": "trace_to_symbol", "file": checkout.join("index.ts"),
+            "symbol": "ownerCaller", "toSymbol": "recordNativeMigrationExpectations", "toFile": file
+        })),
+        &ctx,
+    );
+    assert_eq!(response.data["code"], "not_indexed", "{response:?}");
+    assert_eq!(response.data["reason"], "ignored");
+}
+
+#[test]
+fn callgraph_unindexed_path_differs_from_missing_symbol() {
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = linked_checkout(fixture.path());
+    let storage = fixture.path().join("storage");
+    let empty = checkout.join("empty.ts");
+    std::fs::write(&empty, "// An indexed file with no symbols.\n").unwrap();
+    commit(&checkout);
+    publish(&checkout, &storage);
+    let ctx = configure(&checkout, &storage, true);
+    let unindexed = checkout.join("not-yet-indexed.ts");
+    std::fs::write(&unindexed, source("newCaller")).unwrap();
+    for operation in OPERATIONS {
+        let response = query_file(&ctx, &unindexed, operation, "newCaller");
+        assert_eq!(
+            response.data["code"], "not_indexed",
+            "{operation}: {response:?}"
+        );
+        assert_eq!(response.data["reason"], "not_in_generation");
+    }
+    let response = aft::commands::callers::handle_callers(
+        &request(json!({
+            "id": "missing-symbol", "command": "callers", "file": checkout.join("index.ts"),
+            "symbol": "absentSymbol"
+        })),
+        &ctx,
+    );
+    assert_eq!(response.data["code"], "symbol_not_found", "{response:?}");
+    for operation in OPERATIONS {
+        let response = query_file(&ctx, &empty, operation, "absentSymbol");
+        assert_eq!(
+            response.data["code"], "symbol_not_found",
+            "{operation}: {response:?}"
+        );
+        let outside = fixture.path().join("owner/index.ts");
+        let response = query_file(&ctx, &outside, operation, "ownerCaller");
+        assert_eq!(
+            response.data["code"], "path_outside_project_root",
+            "{operation}: {response:?}"
+        );
+        let message = response.data["message"].as_str().unwrap();
+        assert!(
+            message.contains("not indexed") && message.contains("grep or aft_search with pattern"),
+            "{message}"
+        );
     }
 }
 

@@ -98,6 +98,18 @@ fn answer_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         other => return index_refusal_response(&req.id, "trace_to_symbol", ctx, &other),
     };
 
+    for path in std::iter::once(file_path.as_path()).chain(to_file_path.as_deref()) {
+        if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
+            &req.id,
+            "trace_to_symbol",
+            ctx,
+            &store,
+            path,
+        ) {
+            return response;
+        }
+    }
+
     if let Err(error) = ensure_symbol_resolves(&store, &file_path, symbol) {
         return store_error_response(&req.id, "trace_to_symbol", error);
     }
@@ -239,7 +251,7 @@ fn validate_callgraph_path(
                 &req.id,
                 "path_outside_project_root",
                 format!(
-                    "Callgraph operations require paths inside project_root. Got: {} (project_root: {})",
+                    "Callgraph target is not indexed: path is outside project_root. Got: {} (project_root: {}); use grep or aft_search with pattern to find references",
                     file_path.display(),
                     project_root.display(),
                 ),

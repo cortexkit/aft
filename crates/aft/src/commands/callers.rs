@@ -73,7 +73,7 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "path_outside_project_root",
                 format!(
-                    "Callgraph operations require paths inside project_root. Got: {} (project_root: {})",
+                    "Callgraph target is not indexed: path is outside project_root. Got: {} (project_root: {}); use grep or aft_search with pattern to find references",
                     file_path.display(),
                     project_root.display(),
                 ),
@@ -88,6 +88,12 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         other => return index_refusal_response(&req.id, "callers", ctx, &other),
     };
+
+    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
+        &req.id, "callers", ctx, &store, &file_path,
+    ) {
+        return response;
+    }
 
     let started = Instant::now();
     let include_tests = include_tests_param(req);

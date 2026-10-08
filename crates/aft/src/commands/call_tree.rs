@@ -71,7 +71,7 @@ fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "path_outside_project_root",
                 format!(
-                    "Callgraph operations require paths inside project_root. Got: {} (project_root: {})",
+                    "Callgraph target is not indexed: path is outside project_root. Got: {} (project_root: {}); use grep or aft_search with pattern to find references",
                     file_path.display(),
                     project_root.display(),
                 ),
@@ -86,6 +86,16 @@ fn answer_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         other => return index_refusal_response(&req.id, "call_tree", ctx, &other),
     };
+
+    if let Err(response) = super::callgraph_store_adapter::ensure_target_indexed(
+        &req.id,
+        "call_tree",
+        ctx,
+        &store,
+        &file_path,
+    ) {
+        return response;
+    }
 
     match call_tree_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(tree) => {
