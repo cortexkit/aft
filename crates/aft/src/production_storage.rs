@@ -1,5 +1,9 @@
 //! Debug builds may inspect the account's store, but must not change it.
-//! Account directories come from the OS, never HOME/XDG or AFT overrides.
+//! Unix protects the effective account's passwd home, independent of HOME/XDG.
+//! Windows always protects the process token's profile-derived LocalAppData,
+//! independent of HOME/USERPROFILE/LOCALAPPDATA. A successful shell known-folder
+//! lookup adds another root; that lookup can reflect redirected or expanded
+//! environment paths. If neither OS lookup supplies a root, writes fail closed.
 
 use std::ffi::OsString;
 use std::io;
@@ -14,7 +18,9 @@ pub(crate) fn canonicalized_with(
 ) -> PathBuf {
     for ancestor in path.ancestors() {
         if let Some(canonical) = canonicalize(ancestor) {
-            return canonical.join(path.strip_prefix(ancestor).unwrap());
+            if let Ok(tail) = path.strip_prefix(ancestor) {
+                return canonical.join(tail);
+            }
         }
     }
     path.to_path_buf()
@@ -36,12 +42,17 @@ pub(crate) fn comparison_key(path: &Path, windows: bool) -> Vec<OsString> {
 }
 
 pub(crate) fn is_within(path: &Path, parent: &Path) -> bool {
-    fn absolute_normalized(path: &Path) -> PathBuf {
+    fn absolute_normalized(path: &Path) -> io::Result<PathBuf> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir()
-                .expect("storage fence requires a current directory")
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("storage fence current-directory lookup failed: {error}"),
+                    )
+                })?
                 .join(path)
         };
         let mut normalized = PathBuf::new();
@@ -54,16 +65,20 @@ pub(crate) fn is_within(path: &Path, parent: &Path) -> bool {
                 _ => normalized.push(component),
             }
         }
-        normalized
+        Ok(normalized)
     }
     let canonicalize = |path: &Path| path.canonicalize().ok();
-    let path = absolute_normalized(&canonicalized_with(path, &canonicalize));
-    let parent = absolute_normalized(&canonicalized_with(parent, &canonicalize));
+    let Ok(path) = absolute_normalized(&canonicalized_with(path, &canonicalize)) else {
+        return true;
+    };
+    let Ok(parent) = absolute_normalized(&canonicalized_with(parent, &canonicalize)) else {
+        return true;
+    };
     comparison_key(&path, cfg!(windows)).starts_with(&comparison_key(&parent, cfg!(windows)))
 }
 
 #[cfg(unix)]
-pub(crate) fn account_home() -> PathBuf {
+pub(crate) fn account_home() -> io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = vec![0u8; 16384];
     loop {
@@ -80,53 +95,175 @@ pub(crate) fn account_home() -> PathBuf {
             )
         };
         if error == libc::ERANGE {
+            if buffer.len() >= 1024 * 1024 {
+                return Err(io::Error::other(
+                    "getpwuid_r storage fence lookup exceeded its buffer limit",
+                ));
+            }
             buffer.resize(buffer.len() * 2, 0);
             continue;
         }
-        assert!(
-            error == 0 && !result.is_null(),
-            "cannot resolve account home for storage fence"
-        );
+        if error != 0 || result.is_null() {
+            return Err(io::Error::other(format!(
+                "getpwuid_r storage fence lookup failed (status {error}, no entry: {})",
+                result.is_null()
+            )));
+        }
+        // SAFETY: getpwuid_r initialized result on success.
+        if unsafe { (*result).pw_dir.is_null() } {
+            return Err(io::Error::other(
+                "getpwuid_r storage fence lookup returned no home",
+            ));
+        }
         // SAFETY: a successful lookup supplies a NUL-terminated pw_dir in buffer.
         let home = unsafe { std::ffi::CStr::from_ptr((*result).pw_dir) };
-        return PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes()));
+        return valid_account_path(
+            PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes())),
+            "getpwuid_r",
+        );
     }
 }
 
 #[cfg(windows)]
-pub(crate) fn account_folder(folder: u32) -> PathBuf {
+pub(crate) fn account_home() -> io::Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::UI::Shell::{SHGetFolderPathW, SHGFP_TYPE_CURRENT};
-    let mut buffer = [0u16; 260];
-    // SAFETY: SHGetFolderPathW writes at most MAX_PATH UTF-16 code units.
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: this handle belongs to the successful OpenProcessToken call.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle is valid and token is writable.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::other(format!(
+            "OpenProcessToken(TOKEN_QUERY) storage fence lookup failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let token = Token(token);
+    let mut size = 0;
+    // SAFETY: a null buffer queries the required UTF-16 buffer size.
+    unsafe {
+        GetUserProfileDirectoryW(token.0, std::ptr::null_mut(), &mut size);
+    }
+    if size == 0 || size > 32768 {
+        return Err(io::Error::other(format!(
+            "GetUserProfileDirectoryW storage fence size lookup failed (size {size}): {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let mut buffer = vec![0u16; size as usize];
+    // SAFETY: the buffer has the size supplied by the profile API.
+    if unsafe { GetUserProfileDirectoryW(token.0, buffer.as_mut_ptr(), &mut size) } == 0 {
+        return Err(io::Error::other(format!(
+            "GetUserProfileDirectoryW storage fence lookup failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let len = buffer.iter().position(|unit| *unit == 0).ok_or_else(|| {
+        io::Error::other("GetUserProfileDirectoryW returned an unterminated path")
+    })?;
+    valid_account_path(
+        PathBuf::from(OsString::from_wide(&buffer[..len])),
+        "GetUserProfileDirectoryW",
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn known_local_app_data() -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY,
+    };
+    struct FolderPath(*mut u16);
+    impl Drop for FolderPath {
+        fn drop(&mut self) {
+            // SAFETY: shell paths use the COM allocator; freeing null is allowed.
+            unsafe {
+                CoTaskMemFree(self.0.cast());
+            }
+        }
+    }
+    let mut raw = std::ptr::null_mut();
+    // SAFETY: the GUID is valid and raw is writable. Do not require existence:
+    // a harness may redirect the shell's expanded profile to a missing folder.
     let status = unsafe {
-        SHGetFolderPathW(
+        SHGetKnownFolderPath(
+            &FOLDERID_LocalAppData,
+            KF_FLAG_DONT_VERIFY as u32,
             std::ptr::null_mut(),
-            folder as i32,
-            std::ptr::null_mut(),
-            SHGFP_TYPE_CURRENT as u32,
-            buffer.as_mut_ptr(),
+            &mut raw,
         )
     };
-    assert!(
-        status >= 0,
-        "cannot resolve account folder for storage fence"
-    );
-    let len = buffer.iter().position(|unit| *unit == 0).unwrap();
-    PathBuf::from(OsString::from_wide(&buffer[..len]))
+    let path = FolderPath(raw);
+    if status < 0 || path.0.is_null() {
+        return Err(io::Error::other(format!("SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DONT_VERIFY) storage fence lookup failed (HRESULT 0x{:08x})", status as u32)));
+    }
+    let mut len = 0;
+    // SAFETY: a successful shell lookup returns an allocated NUL-terminated path.
+    while unsafe { *path.0.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: the scan above found the end of the allocated path.
+    let units = unsafe { std::slice::from_raw_parts(path.0, len) };
+    valid_account_path(
+        PathBuf::from(OsString::from_wide(units)),
+        "SHGetKnownFolderPath",
+    )
 }
 
-#[cfg(all(windows, test))]
-pub(crate) fn account_home() -> PathBuf {
-    account_folder(windows_sys::Win32::UI::Shell::CSIDL_PROFILE)
+fn valid_account_path(path: PathBuf, lookup: &str) -> io::Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(io::Error::other(format!(
+            "{lookup} storage fence lookup returned an empty or relative path"
+        )));
+    }
+    Ok(path)
 }
 
-fn account_storage_root() -> PathBuf {
+pub(crate) fn account_storage_roots() -> io::Result<Vec<PathBuf>> {
     #[cfg(windows)]
-    let data = account_folder(windows_sys::Win32::UI::Shell::CSIDL_LOCAL_APPDATA);
-    #[cfg(not(windows))]
-    let data = account_home().join(".local/share");
-    data.join("cortexkit/aft")
+    {
+        combine_windows_roots(account_home(), known_local_app_data())
+    }
+    #[cfg(unix)]
+    {
+        Ok(vec![account_home()?.join(".local/share/cortexkit/aft")])
+    }
+}
+
+#[cfg(any(windows, test))]
+fn combine_windows_roots(
+    profile: io::Result<PathBuf>,
+    local_data: io::Result<PathBuf>,
+) -> io::Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    let mut errors = Vec::new();
+    match profile {
+        Ok(profile) => roots.push(profile.join("AppData/Local/cortexkit/aft")),
+        Err(error) => errors.push(error.to_string()),
+    }
+    match local_data {
+        Ok(data) => roots.push(data.join("cortexkit/aft")),
+        Err(error) => errors.push(error.to_string()),
+    }
+    if roots.is_empty() {
+        return Err(io::Error::other(format!(
+            "no protected account storage root resolved: {}",
+            errors.join("; ")
+        )));
+    }
+    Ok(roots)
 }
 
 fn migration_opt_in() -> bool {
@@ -144,26 +281,41 @@ fn migration_opt_in() -> bool {
 }
 
 pub(crate) fn protected(path: &Path) -> bool {
+    protection_status_with(path, account_storage_roots).unwrap_or(true)
+}
+
+fn protection_status_with(
+    path: &Path,
+    roots: impl FnOnce() -> io::Result<Vec<PathBuf>>,
+) -> io::Result<bool> {
     // Tests and development rigs normally run debug builds (including the
     // target/debug/aft children of Bun tests). Release builds must be allowed
     // automatically: packaging cannot depend on remembering extra opt-ins.
     if !cfg!(debug_assertions) {
-        return false;
+        return Ok(false);
     }
     if migration_opt_in() {
-        return false;
+        return Ok(false);
     }
     #[cfg(test)]
     if let Some((root, _)) = TEST_ACCOUNT.with(|slot| slot.borrow().clone()) {
-        return is_within(path, &root);
+        return Ok(is_within(path, &root));
     }
-    is_within(path, &account_storage_root())
+    Ok(roots()?.iter().any(|root| is_within(path, root)))
 }
 
 pub(crate) fn refuse_write(path: &Path) -> io::Result<()> {
-    if protected(path) {
+    refuse_write_for_status(path, protection_status_with(path, account_storage_roots))
+}
+
+fn refuse_write_for_status(path: &Path, status: io::Result<bool>) -> io::Result<()> {
+    if !matches!(status, Ok(false)) {
+        let reason = status
+            .err()
+            .map(|error| format!("; unresolved protected-root lookup: {error}"))
+            .unwrap_or_default();
         Err(io::Error::new(io::ErrorKind::PermissionDenied, format!(
-            "{CODE}: dev/test build refused to migrate production storage or write a versioned record at {}; use a disposable storage root or explicitly set AFT_ALLOW_PRODUCTION_MIGRATION=1", path.display()
+            "{CODE}: dev/test build refused to migrate production storage or write a versioned record at {}{reason}; use a disposable storage root or explicitly set AFT_ALLOW_PRODUCTION_MIGRATION=1", path.display()
         )))
     } else {
         Ok(())
@@ -200,6 +352,154 @@ mod tests {
         conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY); INSERT INTO schema_version VALUES (0);").unwrap();
         drop(conn);
         path
+    }
+
+    #[test]
+    fn windows_root_union_keeps_profile_and_redirected_local_data() {
+        let fixture = tempfile::tempdir().unwrap();
+        let profile = fixture.path().join("profile");
+        let redirected = fixture.path().join("redirected-local");
+        let roots = combine_windows_roots(Ok(profile.clone()), Ok(redirected.clone())).unwrap();
+        assert_eq!(
+            roots,
+            vec![
+                profile.join("AppData/Local/cortexkit/aft"),
+                redirected.join("cortexkit/aft")
+            ]
+        );
+        let fallback = combine_windows_roots(
+            Ok(profile.clone()),
+            Err(io::Error::other("SHGetKnownFolderPath unavailable")),
+        )
+        .unwrap();
+        assert_eq!(fallback, vec![profile.join("AppData/Local/cortexkit/aft")]);
+        let shell_only = combine_windows_roots(
+            Err(io::Error::other("GetUserProfileDirectoryW unavailable")),
+            Ok(redirected.clone()),
+        )
+        .unwrap();
+        assert_eq!(shell_only, vec![redirected.join("cortexkit/aft")]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn unresolved_account_roots_refuse_writes_without_panicking() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("never-created");
+        let roots = combine_windows_roots(
+            Err(io::Error::other("GetUserProfileDirectoryW lookup failed")),
+            Err(io::Error::other("SHGetKnownFolderPath lookup failed")),
+        );
+        let status = protection_status_with(&path, || roots);
+        let error = refuse_write_for_status(&path, status).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let reason = error.to_string();
+        assert!(reason.contains(CODE), "{reason}");
+        assert!(reason.contains("GetUserProfileDirectoryW"), "{reason}");
+        assert!(reason.contains("SHGetKnownFolderPath"), "{reason}");
+        assert!(!path.exists());
+    }
+
+    #[cfg(debug_assertions)]
+    struct RestoreEnvironment(Vec<(&'static str, Option<OsString>)>);
+    #[cfg(debug_assertions)]
+    impl RestoreEnvironment {
+        fn replace(values: &[(&'static str, &Path)]) -> Self {
+            let restore = Self(
+                values
+                    .iter()
+                    .map(|(name, _)| (*name, std::env::var_os(name)))
+                    .collect(),
+            );
+            for (name, path) in values {
+                std::env::set_var(name, path);
+            }
+            restore
+        }
+    }
+    #[cfg(debug_assertions)]
+    impl Drop for RestoreEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.0 {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[cfg(all(windows, debug_assertions))]
+    #[test]
+    fn windows_token_profile_is_protected_with_missing_home_environment() {
+        use windows_sys::Win32::UI::Shell::{
+            SHGetFolderPathW, CSIDL_LOCAL_APPDATA, SHGFP_TYPE_CURRENT,
+        };
+        let _env = crate::test_env::process_env_lock();
+        let profile = account_home().expect("process token supplies the real account profile");
+        let fixture = tempfile::tempdir().unwrap();
+        let missing_home = fixture.path().join("nonexistent-profile");
+        let missing_local = fixture.path().join("nonexistent-local-appdata");
+        let _restore = RestoreEnvironment::replace(&[
+            ("HOME", &missing_home),
+            ("USERPROFILE", &missing_home),
+            ("LOCALAPPDATA", &missing_local),
+        ]);
+        assert_eq!(
+            account_home().unwrap(),
+            profile,
+            "token lookup must ignore substituted environment homes"
+        );
+        let roots = account_storage_roots()
+            .expect("token root must survive failed or redirected shell lookup");
+        let expected = profile.join("AppData/Local/cortexkit/aft");
+        assert!(
+            roots.contains(&expected),
+            "token profile root missing: {roots:?}"
+        );
+        assert!(protected(&expected.join("aft.db")));
+        assert!(refuse_write(&expected.join("aft.db"))
+            .unwrap_err()
+            .to_string()
+            .contains(CODE));
+        assert!(refuse_write(&fixture.path().join("disposable-storage/aft.db")).is_ok());
+        assert!(!missing_home.exists());
+        assert!(!missing_local.exists());
+
+        let mut old_buffer = [0u16; 260];
+        // SAFETY: the legacy API's MAX_PATH-sized buffer is writable. This probe
+        // records its verification failure, never uses it as the fence's root.
+        let old_status = unsafe {
+            SHGetFolderPathW(
+                std::ptr::null_mut(),
+                CSIDL_LOCAL_APPDATA as i32,
+                std::ptr::null_mut(),
+                SHGFP_TYPE_CURRENT as u32,
+                old_buffer.as_mut_ptr(),
+            )
+        };
+        eprintln!("legacy SHGetFolderPathW without DONT_VERIFY: HRESULT=0x{:08x}; token-profile roots={roots:?}", old_status as u32);
+    }
+
+    #[cfg(all(unix, debug_assertions))]
+    #[test]
+    fn unix_account_root_is_protected_with_missing_home_environment() {
+        let _env = crate::test_env::process_env_lock();
+        let home = account_home().expect("passwd supplies the effective account home");
+        let fixture = tempfile::tempdir().unwrap();
+        let missing = fixture.path().join("nonexistent-home");
+        let _restore =
+            RestoreEnvironment::replace(&[("HOME", &missing), ("XDG_DATA_HOME", &missing)]);
+        assert_eq!(account_home().unwrap(), home);
+        let root = home.join(".local/share/cortexkit/aft");
+        assert_eq!(account_storage_roots().unwrap(), vec![root.clone()]);
+        assert!(protected(&root.join("aft.db")));
+        assert!(refuse_write(&root.join("aft.db"))
+            .unwrap_err()
+            .to_string()
+            .contains(CODE));
+        assert!(refuse_write(&fixture.path().join("disposable-storage/aft.db")).is_ok());
+        assert!(!missing.exists());
     }
 
     #[cfg(debug_assertions)]

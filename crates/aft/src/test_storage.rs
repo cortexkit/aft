@@ -3,16 +3,15 @@ use crate::config::Config;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-#[cfg(windows)]
-use crate::production_storage::account_folder;
 use crate::production_storage::{account_home, canonicalized_with, comparison_key, is_within};
 
-fn live_storage_roots() -> [PathBuf; 2] {
-    let home = account_home();
+fn live_storage_roots() -> Vec<PathBuf> {
+    let home = account_home().expect("test storage fence must resolve the account profile");
     #[cfg(windows)]
-    let local_data = Some(account_folder(
-        windows_sys::Win32::UI::Shell::CSIDL_LOCAL_APPDATA,
-    ));
+    let local_data = Some(
+        crate::production_storage::known_local_app_data()
+            .unwrap_or_else(|_| home.join("AppData/Local")),
+    );
     #[cfg(not(windows))]
     let local_data: Option<PathBuf> = None;
     let mut temporary = vec![std::env::temp_dir()];
@@ -27,7 +26,10 @@ fn live_storage_roots() -> [PathBuf; 2] {
     // Keep protecting the account default when a test replaces a real custom
     // XDG home. Environment mutation must not turn off the native-root fence.
     let account = live_storage_root_from(&home, local_data.as_deref(), &[], &|_| None);
-    [current, account]
+    let mut roots = crate::production_storage::account_storage_roots()
+        .expect("test storage fence must resolve a protected root");
+    roots.extend([current, account]);
+    roots
 }
 
 fn live_storage_root_from(
@@ -196,9 +198,9 @@ mod tests {
         // Derive the expected root independently of the guard's resolver. This
         // assertion performs no I/O even if the fence is accidentally removed.
         #[cfg(windows)]
-        let data = account_folder(windows_sys::Win32::UI::Shell::CSIDL_LOCAL_APPDATA);
+        let data = account_home().unwrap().join("AppData/Local");
         #[cfg(not(windows))]
-        let data = account_home().join(".local").join("share");
+        let data = account_home().unwrap().join(".local").join("share");
         with_temporary_xdg(|_| assert_root(&data.join("cortexkit").join("aft")));
     }
 

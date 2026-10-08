@@ -1,11 +1,20 @@
 # Development builds and production storage
 
 AFT's account-owned storage root is `~/.local/share/cortexkit/aft` on Unix
-(including macOS), and the OS LocalAppData directory's `cortexkit/aft` on Windows.
-The production write fence gets these directories from the OS account database
-or Windows known folders. Changing `HOME`, `XDG_*`, `USERPROFILE`, `LOCALAPPDATA`,
-`AFT_CACHE_DIR`, or `AFT_STORAGE_DIR` cannot hide that root. Symlink aliases and
-not-yet-created descendants are checked against the same root.
+(including macOS), resolved from the effective account's passwd entry rather
+than `HOME` or XDG overrides. On Windows the fence always protects
+`<process-token-profile>\AppData\Local\cortexkit\aft`, resolving the profile
+with `GetUserProfileDirectoryW` on the current process token. That lookup is
+independent of substituted `HOME`, `USERPROFILE`, and `LOCALAPPDATA` values.
+
+Windows also protects the LocalAppData root returned by `SHGetKnownFolderPath`
+when it succeeds. The shell lookup can reflect redirected or environment-expanded
+paths, so it is an additional protected root, not the account identity source.
+`KF_FLAG_DONT_VERIFY` permits lookup without requiring the directory to exist.
+If neither account lookup supplies a protected root, debug writes are refused
+with `dev_build_refused_production_migration` and a reason naming the unresolved
+lookup, rather than panicking or permitting the write. Symlink aliases and
+not-yet-created descendants are checked against every protected root.
 
 Debug assertions identify the builds that tests and development rigs normally
 run: plain `cargo test` and the `target/debug/aft` children spawned by Bun tests.
