@@ -1,0 +1,8 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens"],
+  "slices": ["packed-ref-build-freshness", "deterministic-lsp-shutdown"],
+  "note": "Build revision invalidation and shutdown test harness only: watch an existing loose ref or its nearest existing refs directory, and use the fake LSP's injected exit delay instead of all-core busy loops. Class derived from git diff --name-only origin/main...HEAD against RANKING_FENCE_PREFIXES; no changed path matches. Search ranking and routing are unchanged."
+}
