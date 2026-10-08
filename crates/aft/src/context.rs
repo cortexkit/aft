@@ -7496,11 +7496,16 @@ impl AppContext {
                     };
                 }
             }
-            // The detached standalone view publication owns this graph. A query
-            // before installation must disclose loading, not start a legacy
-            // graph on stdin. Daemon and in-process warmers keep their fallback.
-            if self.daemonless_query_mode()
-                && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some())
+            // Borrowers assemble their own view from shared blobs, not the
+            // owner's legacy graph. Until its first generation is pinned, stay
+            // on the view route even before configure maintenance installs the
+            // runtime. Falling through would refuse a missing legacy store
+            // that a views-on owner never needs to build.
+            // Standalone queries also leave publication to their detached worker;
+            // writer-backed daemon and in-process warmers retain their fallback.
+            if self.shared_artifacts_read_only()
+                || (self.daemonless_query_mode()
+                    && (self.git_common_dir().is_some() || self.view_runtime_snapshot().is_some()))
             {
                 return CallgraphStoreAccess::Building;
             }

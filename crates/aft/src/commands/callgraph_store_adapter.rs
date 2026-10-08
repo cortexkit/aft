@@ -2246,7 +2246,24 @@ pub fn index_refusal_response(
         CallgraphStoreAccess::Off => off_response(req_id, operation),
         CallgraphStoreAccess::Building => {
             note_callgraph_building(ctx, operation);
-            building_response(req_id, operation)
+            if ctx.config().views.enabled && ctx.is_worktree_bridge() {
+                let mut response = callgraph_index_refusal(
+                    req_id,
+                    "callgraph_building",
+                    format!("{operation}: call graph for this worktree is assembling or waiting for shared blobs; retry shortly; use grep or aft_search with pattern meanwhile"),
+                    IndexObservation::building(),
+                );
+                // Report the local view's phase and known pending count without
+                // opening a store or enumerating checkout files on the query.
+                let view = ctx.view_runtime_snapshot();
+                response.data["progress"] = serde_json::json!({
+                    "phase": if view.is_some() { "view_assembly" } else { "configure_maintenance" },
+                    "pending_paths": view.as_ref().map(|view| view.pending_paths.len()),
+                });
+                response
+            } else {
+                building_response(req_id, operation)
+            }
         }
         CallgraphStoreAccess::Suspended(suspension) => {
             suspended_response(req_id, operation, suspension)
