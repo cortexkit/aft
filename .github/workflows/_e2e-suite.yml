@@ -507,12 +507,15 @@ jobs:
   e2e-macos:
     name: E2E (macOS native)
     runs-on: macos-26
-    # The 30-minute budget is the suite's. When release.yml folds the
-    # publishable release-profile build into this job, the fat-LTO link of
-    # the workspace crate runs single-threaded for 16 min on a normal runner
-    # and past 30 on a slow one (v0.56.0's retag timed out in exactly that
-    # step with a full cache hit), so the job gets the build class's headroom.
-    timeout-minutes: ${{ inputs.publish_release_artifacts && 60 || 30 }}
+    # The 45-minute budget covers a cold build: when the sccache and rust-cache
+    # entries miss, the debug build of the workspace crate alone takes about
+    # 30 minutes on a hosted macOS runner, and two train runs were cancelled
+    # in that step. When release.yml folds the publishable release-profile
+    # build into this job, the fat-LTO link of the workspace crate runs
+    # single-threaded for 16 min on a normal runner and past 30 on a slow one
+    # (v0.56.0's retag timed out in exactly that step with a full cache hit),
+    # so the job gets the build class's headroom.
+    timeout-minutes: ${{ inputs.publish_release_artifacts && 60 || 45 }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
