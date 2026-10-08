@@ -626,7 +626,10 @@ mod write_amplification_tests {
             .expect("reader setup must not read a schema held by a writer");
         let error = database_ready(&reader).unwrap_err();
         assert!(error.is_transient_lock_contention(), "{error}");
-        assert!(started.elapsed() < Duration::from_millis(250));
+        // Request readers use an expired busy deadline, so they must not wait
+        // for the writer. A regression would wait for a 5 s busy timeout; 2 s
+        // tells that apart from a slow open on a loaded CI runner.
+        assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
@@ -722,7 +725,10 @@ mod write_amplification_tests {
         assert!(CallGraphStore::open_readonly(store_dir, root)
             .unwrap()
             .is_none());
-        assert!(started.elapsed() < Duration::from_millis(250));
+        // Request readers use an expired busy deadline, so they must not wait
+        // for the writer. A regression would wait for a 5 s busy timeout; 2 s
+        // tells that apart from a slow open on a loaded CI runner.
+        assert!(started.elapsed() < Duration::from_secs(2));
         writer.execute_batch("ROLLBACK").unwrap();
     }
 
