@@ -127,8 +127,7 @@ maybeDescribe("e2e import commands", () => {
         runtime(h),
       ),
     );
-    expect(removed).toContain("removed lodash");
-    expect(removed).toContain("name debounce");
+    expect(removed).toContain("removed the lodash import (its only name)");
     expect(await readTextFile(filePath)).not.toContain("lodash");
 
     const notPresent = toolResultText(

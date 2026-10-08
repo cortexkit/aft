@@ -12,7 +12,9 @@ describe("resolvePluginLogPath", () => {
       lookup: lookup({ BUN_TEST: "1", HOME: "/home/dev", TMPDIR: "/tmp/run" }),
       platform: "other",
     });
-    expect(path).toBe(join("/tmp/run", "aft-plugin-test.log"));
+    expect(path).toBe(
+      join("/tmp/run", `aft-plugin-tests-${process.pid}`, "logs", "aft-plugin-test.log"),
+    );
     expect(path.startsWith(join("/home/dev", ".local", "share", "cortexkit"))).toBe(false);
   });
 
@@ -22,7 +24,9 @@ describe("resolvePluginLogPath", () => {
       platform: "other" as const,
     };
     expect(isTestEnvironment(context)).toBe(true);
-    expect(resolvePluginLogPath(context)).toBe(join("/tmp/run", "aft-plugin-test.log"));
+    expect(resolvePluginLogPath(context)).toBe(
+      join("/tmp/run", `aft-plugin-tests-${process.pid}`, "logs", "aft-plugin-test.log"),
+    );
   });
 
   test("outside tests the plugin logs to aft-plugin.log in the storage root", () => {

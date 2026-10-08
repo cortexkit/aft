@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RotatingLogSink, resolveAftLogPath, resolveAftStorageRoot } from "../durable-log.js";
+import { resolvePluginLogPath } from "../storage-paths.js";
 import { withEnv } from "./test-utils/env-guard.js";
 
 const cleanup: string[] = [];
@@ -19,6 +20,21 @@ afterEach(() => {
 });
 
 describe("durable plugin logging", () => {
+  test("test logs repair their private namespace, not the shared temp directory", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-shared-log-parent-"));
+    cleanup.push(root);
+    const shared = join(root, "shared");
+    mkdirSync(shared);
+    if (process.platform !== "win32") chmodSync(shared, 0o755);
+    const before = statSync(shared).mode;
+    const env: Record<string, string> = { BUN_TEST: "1", TMPDIR: shared };
+    const path = resolvePluginLogPath({ lookup: (name) => env[name] });
+    const sink = new RotatingLogSink(path);
+    sink.append("test log\n");
+    await sink.drain();
+    expect(readFileSync(path, "utf8")).toBe("test log\n");
+    expect(statSync(shared).mode).toBe(before);
+  });
   test("AFT_STORAGE_DIR wins over configured and legacy roots", async () => {
     const storage = join(tmpdir(), "aft-storage-resolution");
     await withEnv(

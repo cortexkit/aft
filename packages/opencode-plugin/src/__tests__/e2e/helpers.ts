@@ -34,7 +34,7 @@ import { isolatedAftEnvironment } from "../../../../aft-bridge/src/test-child-en
 import { bridgeLogger } from "../../logger.js";
 
 // Route aft-bridge log calls (including forwarded Rust child stderr lines like
-// "[aft] invalidated 7 files") into $TMPDIR/aft-plugin-test.log instead of
+// "[aft] invalidated 7 files") into the process-private test log namespace instead of
 // console.error. Without this, every "invalidated N files" / "watcher started"
 // line emitted by the Rust child during e2e tests leaks onto test stdout and
 // pollutes the bash background-completion output preview.

@@ -111,14 +111,18 @@ export function isTestEnvironment(context: StoragePathContext = {}): boolean {
 }
 
 /**
- * Path of the plugin's own log. Test runs write `aft-plugin-test.log` under the
- * system temp directory instead of the storage root, which on a developer
- * machine is the live log directory next to the production `aft-plugin.log`
- * and the daemon's logs.
+ * Test logs use a process-private namespace beneath the system temp directory.
+ * A top-level temp log makes the sink treat the filesystem root as storage's
+ * parent and try to tighten system directory permissions.
  */
 export function resolvePluginLogPath(context: StoragePathContext = {}): string {
   if (isTestEnvironment(context)) {
-    return join(environmentValue(context, "TMPDIR") ?? tmpdir(), "aft-plugin-test.log");
+    return join(
+      environmentValue(context, "TMPDIR") ?? tmpdir(),
+      `aft-plugin-tests-${process.pid}`,
+      "logs",
+      "aft-plugin-test.log",
+    );
   }
   return resolveAftLogPath("aft-plugin.log", undefined, context);
 }

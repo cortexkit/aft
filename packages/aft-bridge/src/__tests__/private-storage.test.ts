@@ -1,5 +1,6 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import * as fs from "node:fs";
 import {
   chmodSync,
   lstatSync,
@@ -11,13 +12,40 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { RotatingLogSink } from "../durable-log.js";
 import { deliverMigrationNoticeOnce } from "../migration-notices.js";
 import { __test__ as __onnxTest__ } from "../onnx-runtime.js";
 import { markAnnouncementSeen } from "../paths.js";
 import { openPrivateStorageDir, privateMkdirSync } from "../private-storage.js";
 import { execTarExtractionSync } from "../tar-executable.js";
+
+test.skipIf(process.platform === "win32")(
+  "private storage rejects filesystem roots before any I/O",
+  () => {
+    const scratch = mkdtempSync(join(tmpdir(), "aft-private-root-guard-"));
+    const mkdir = spyOn(fs, "mkdirSync").mockImplementation(() => undefined);
+    const open = spyOn(fs, "openSync").mockReturnValue(123456);
+    const info = spyOn(fs, "fstatSync").mockReturnValue({ mode: 0o700 } as fs.Stats);
+    const close = spyOn(fs, "closeSync").mockImplementation(() => {});
+    try {
+      // Verify interception on a disposable path before passing a system root.
+      openPrivateStorageDir(scratch);
+      expect(open.mock.calls[0]?.[0]).toBe(scratch);
+      const opens = open.mock.calls.length;
+      const creates = mkdir.mock.calls.length;
+      expect(() => openPrivateStorageDir(parse(scratch).root)).toThrow("filesystem root");
+      expect(open.mock.calls.length).toBe(opens);
+      expect(mkdir.mock.calls.length).toBe(creates);
+    } finally {
+      close.mockRestore();
+      info.mockRestore();
+      open.mockRestore();
+      mkdir.mockRestore();
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  },
+);
 
 test.skipIf(process.platform === "win32")(
   "private_storage_bridge_writers_are_owner_only",

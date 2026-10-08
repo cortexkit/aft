@@ -1,5 +1,5 @@
 import { mkdirSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 const DIRECTORIES = [
@@ -16,6 +16,26 @@ const DIRECTORIES = [
 ] as const;
 
 const ROOTS = Symbol.for("cortexkit.aft.created-test-child-roots");
+const TOOLCHAINS = Symbol.for("cortexkit.aft.test-child-toolchain-homes");
+type ToolchainHomes = { RUSTUP_HOME: string; CARGO_HOME: string };
+
+function toolchainHomes(inherited: NodeJS.ProcessEnv): ToolchainHomes {
+  const global = globalThis as typeof globalThis & { [TOOLCHAINS]?: ToolchainHomes };
+  if (!global[TOOLCHAINS]) {
+    // Capture before suite setup replaces HOME. Source and dist imports must
+    // share this snapshot rather than deriving toolchains from a fixture home.
+    const home =
+      process.platform === "win32"
+        ? inherited.USERPROFILE || inherited.HOME || homedir()
+        : inherited.HOME || homedir();
+    global[TOOLCHAINS] = {
+      RUSTUP_HOME: inherited.RUSTUP_HOME || join(home, ".rustup"),
+      CARGO_HOME: inherited.CARGO_HOME || join(home, ".cargo"),
+    };
+  }
+  return global[TOOLCHAINS];
+}
+
 function createdRoots(): Set<string> {
   // Harnesses import source, plugins import dist. Both must recognize the same
   // explicitly created fixture roots, even when os.homedir was cached earlier.
@@ -29,6 +49,9 @@ export function isolatedAftEnvironment(
   inherited: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
   const env = { ...inherited };
+  const toolchains = toolchainHomes(inherited);
+  env.RUSTUP_HOME ||= toolchains.RUSTUP_HOME;
+  env.CARGO_HOME ||= toolchains.CARGO_HOME;
   const names = [
     "home",
     "home",

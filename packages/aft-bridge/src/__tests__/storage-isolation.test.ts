@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync as nativeSpawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "../child-process.js";
@@ -61,6 +62,60 @@ function seedDatabase(path: string, version: number): void {
 }
 
 describe("test storage isolation", () => {
+  test("isolated children retain Rust toolchain homes captured before HOME changes", () =>
+    fixture((root) => {
+      const originalHome = join(root, "original-home");
+      mkdirSync(originalHome);
+      const childRoot = join(root, "children");
+      const modulePath = join(import.meta.dir, "..", "test-child-environment.ts");
+      // A fresh process avoids the suite preload's already-captured environment.
+      const result = nativeSpawnSync(
+        process.execPath,
+        [
+          "-e",
+          `
+        const { isolatedAftEnvironment } = require(process.env.TEST_ENV_MODULE);
+        const original = { ...process.env };
+        const first = isolatedAftEnvironment(process.env.TEST_CHILD_ROOT + '/first', original);
+        Object.assign(process.env, first);
+        const second = isolatedAftEnvironment(process.env.TEST_CHILD_ROOT + '/second', original);
+        process.stdout.write(JSON.stringify({ first, second }));
+      `,
+        ],
+        {
+          env: {
+            ...process.env,
+            HOME: originalHome,
+            USERPROFILE: originalHome,
+            RUSTUP_HOME: undefined,
+            CARGO_HOME: undefined,
+            TEST_ENV_MODULE: modulePath,
+            TEST_CHILD_ROOT: childRoot,
+          },
+          encoding: "utf8",
+        },
+      );
+      expect(result.status).toBe(0);
+      const { first, second } = JSON.parse(result.stdout);
+      for (const child of [first, second]) {
+        expect(child.HOME).not.toBe(originalHome);
+        expect(child.RUSTUP_HOME).toBe(join(originalHome, ".rustup"));
+        expect(child.CARGO_HOME).toBe(join(originalHome, ".cargo"));
+      }
+    }));
+
+  test("isolated children preserve explicitly selected Rust toolchain homes", () =>
+    fixture((root) => {
+      const env = isolatedAftEnvironment(join(root, "children"), {
+        ...process.env,
+        RUSTUP_HOME: join(root, "selected-toolchains"),
+        CARGO_HOME: join(root, "selected-cargo"),
+      });
+      expect(env.RUSTUP_HOME).toBe(join(root, "selected-toolchains"));
+      expect(env.CARGO_HOME).toBe(join(root, "selected-cargo"));
+      expect(env.HOME).toBe(join(root, "children", "home"));
+    }));
+
   test("shared spawns replace operator directories before the child starts", () => {
     const env: NodeJS.ProcessEnv = { ...process.env, AFT_ALLOW_PRODUCTION_MIGRATION: "1" };
     const operatorStorage = dirname(liveAftDatabasePath());

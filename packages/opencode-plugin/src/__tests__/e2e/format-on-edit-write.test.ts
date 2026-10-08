@@ -284,7 +284,9 @@ maybeDescribe("e2e format_on_edit write tools", () => {
 
     const { output, data } = await executeHoistedWrite(h, filePath, FIXTURES.rust_deformatted);
 
-    expect(await readFile(filePath, "utf8")).toBe(RUSTFMT_EXPECTED);
+    expect(await readFile(filePath, "utf8"), JSON.stringify({ output, data })).toBe(
+      RUSTFMT_EXPECTED,
+    );
     expectWriteOutcome(output, data, true);
   }, 30_000);
 

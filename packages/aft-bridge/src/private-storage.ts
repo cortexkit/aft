@@ -10,7 +10,7 @@ import {
   readSync,
   writeSync,
 } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 
 export const PRIVATE_FILE_MODE = 0o600;
 export const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -50,11 +50,14 @@ const warned = new Set<string>();
 
 /** Only the opened storage ancestors are repaired; histories are never walked. */
 export function openPrivateStorageDir(root: string, path = root): void {
+  const base = resolve(root);
+  if (!root || base === parse(base).root) {
+    throw new Error(`refusing filesystem root as private storage: ${base}`);
+  }
+  const rel = relative(base, resolve(path));
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return;
   privateMkdirSync(path);
   if (process.platform === "win32") return;
-  const base = resolve(root);
-  const rel = relative(base, resolve(path));
-  if (rel === ".." || rel.startsWith(`..${sep}`) || rel.startsWith(sep)) return;
   let current = base;
   for (const component of ["", ...rel.split(sep).filter(Boolean)]) {
     current = join(current, component);
