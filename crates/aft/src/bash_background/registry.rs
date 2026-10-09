@@ -2841,6 +2841,8 @@ impl BgTaskRegistry {
                     metadata.notify_on_completion = true;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
+                    self.record_live_delivery_session(&metadata.session_id);
+                    self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
                     let _ = delete_task_bundle(&paths);
                 }
@@ -3088,6 +3090,8 @@ impl BgTaskRegistry {
                     metadata.notify_on_completion = true;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
+                    self.record_live_delivery_session(&metadata.session_id);
+                    self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
                     let _ = delete_task_bundle(&paths);
                 }
@@ -3328,6 +3332,8 @@ impl BgTaskRegistry {
                     metadata.notify_on_completion = true;
                     metadata.mark_terminal(BgTaskStatus::Failed, None, Some(error.clone()));
                     let _ = self.persist_task(&paths, &metadata);
+                    self.record_live_delivery_session(&metadata.session_id);
+                    self.enqueue_completion_if_needed(&metadata, Some(&paths), true);
                 } else {
                     let _ = delete_task_bundle(&paths);
                 }
@@ -10963,6 +10969,74 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].status_reason.as_deref(), Some(reason));
         assert!(completions[0].output_preview.contains(reason));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_spawn_immediately_pushes_completion_to_its_session() {
+        let frames = Arc::new(Mutex::new(Vec::<crate::protocol::PushFrame>::new()));
+        let frames_for_sender = Arc::clone(&frames);
+        let progress_sender: crate::context::SharedProgressSender =
+            Arc::new(Mutex::new(Some(Arc::new(Box::new(move |frame| {
+                frames_for_sender.lock().unwrap().push(frame);
+            })))));
+        let registry = BgTaskRegistry::new(progress_sender);
+        let session_id = "failed-spawn-session";
+        // Completion pushes are routed only while the task's owning session is live.
+        registry.record_live_delivery_session(session_id);
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let missing_workdir = project.path().join("missing-workdir");
+        let receipt = Arc::new(crate::bash_background::SpawnReceipt::new(
+            Instant::now() + Duration::from_secs(5),
+        ));
+
+        let error = crate::bash_background::with_spawn_receipt(receipt, || {
+            registry.spawn_with_shell_in_slot(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "printf should-not-run",
+                crate::bash_background::BashShell::Bash,
+                crate::bash_background::resolve_shell_path(
+                    false,
+                    crate::bash_background::BashShell::Bash,
+                )
+                .unwrap(),
+                session_id.to_string(),
+                missing_workdir,
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                crate::bash_background::TaskSlot::Background { max: 1 },
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+        })
+        .unwrap_err();
+
+        assert!(
+            error.contains("failed to spawn background bash command"),
+            "{error}"
+        );
+        let frames = frames.lock().unwrap();
+        let completion = frames.iter().find_map(|frame| match frame {
+            crate::protocol::PushFrame::BashCompleted(completion)
+                if completion.command == "printf should-not-run" =>
+            {
+                Some(completion)
+            }
+            _ => None,
+        });
+        let completion = completion.expect("spawn failure should push a completion immediately");
+        assert_eq!(completion.session_id, session_id);
+        assert_eq!(completion.status, BgTaskStatus::Failed);
+        assert_eq!(completion.exit_code, None);
+        assert!(completion
+            .status_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No such file or directory"));
+        registry.shutdown();
     }
 
     #[test]
