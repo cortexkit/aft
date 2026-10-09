@@ -120,3 +120,17 @@ The mandatory `bash scripts/rust-test-gate.sh` was attempted on Linux. It checke
 The runner also repeatedly refused jobs with `runner_draining`. The parent authorized bounded local debug/correctness work but explicitly prohibited a Mac release build and Mac timing. **TypeORM release timing is not run**: the machine and both medians are unmeasured, not substituted with debug or loaded-Mac numbers. The real cold release TypeORM run and the TypeORM/soft-serve/Outline corpus footer measurements are also unrun. Their fixture counterparts pass, but that is not a corpus measurement.
 
 No search-ranking or routing fence file is changed. No root package manifest or lockfile is changed; dependency installation was confined to the fetched corpus under this worktree.
+
+### Generated delivery artifacts
+
+The named schema/catalog/governance generators changed exactly:
+
+- `crates/aft/src/subc_tool_schemas.json`
+- `crates/aft/tests/fixtures/tool_provider_catalog.json`
+- `crates/aft/tests/fixtures/tool_provider_catalog_presets.json`
+- `docs/v0.49-agent-prefix-capture.json`
+- `docs/v0.49-agent-surface-manifest.json`
+- `docs/v0.49-release-manifest.json`
+- `docs/v0.49-release-evidence.json`
+
+`node scripts/release-gate-v049.mjs --candidate --evidence docs/v0.49-release-evidence.json` passed after alignment, including the byte-for-byte 24-tool schema check, surface audit and activation evidence. The alignment script produced its standard automatic publication commits; one invocation hit its two-minute command cap after committing the generated files, and the explicit candidate gate then verified them successfully. No release build was requested by this metadata gate.
