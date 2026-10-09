@@ -1697,13 +1697,17 @@ fn format_ast_search(data: &Value) -> String {
                 let rel_file = m.get("file").and_then(Value::as_str).unwrap_or("unknown");
                 let line = m.get("line").and_then(Value::as_u64).unwrap_or(0);
                 output.push_str(&format!("{rel_file}:{line}\n"));
-                if let Some(text) = m.get("text").and_then(Value::as_str) {
-                    output.push_str(&format!("  {}\n", text.trim()));
+                let match_text = m.get("text").and_then(Value::as_str).unwrap_or("");
+                if !match_text.is_empty() {
+                    output.push_str(&format!("  {}\n", match_text.trim()));
                 }
                 if let Some(meta_vars) = m.get("meta_variables").and_then(Value::as_object) {
                     if !meta_vars.is_empty() {
                         for (key, value) in meta_vars {
-                            output.push_str(&format!("  {key}: {}\n", js_template_string(value)));
+                            output.push_str(&format!(
+                                "  {}\n",
+                                format_ast_search_capture(key, value, match_text, line)
+                            ));
                         }
                     }
                 }
@@ -1722,6 +1726,128 @@ fn format_ast_search(data: &Value) -> String {
         output = append_ast_skipped_files(output, data.get("skipped_files"));
     }
     output
+}
+
+const AST_CAPTURE_INLINE_CHAR_LIMIT: usize = 80;
+
+fn format_ast_search_capture(
+    key: &str,
+    value: &Value,
+    match_text: &str,
+    match_line: u64,
+) -> String {
+    let rendered = js_template_string(value);
+    let multiline = rendered.contains('\n') || rendered.contains('\r');
+    if !multiline && rendered.chars().count() <= AST_CAPTURE_INLINE_CHAR_LIMIT {
+        return format!("{key}: {rendered}");
+    }
+
+    let first_line = rendered.lines().next().unwrap_or("").trim_start();
+    let preview: String = first_line
+        .chars()
+        .take(AST_CAPTURE_INLINE_CHAR_LIMIT)
+        .collect();
+    let location = ast_capture_line_range(match_text, value, match_line)
+        .map(|(start, end)| {
+            if start == end {
+                format!("line {start}")
+            } else {
+                format!("lines {start}-{end}")
+            }
+        })
+        .unwrap_or_else(|| "in matched excerpt".to_string());
+
+    format!("{key}: {location} — {preview}…")
+}
+
+fn ast_capture_line_range(match_text: &str, value: &Value, match_line: u64) -> Option<(u64, u64)> {
+    let excerpt = match_text.trim();
+    let captures: Vec<&str> = match value {
+        Value::String(capture) => vec![capture],
+        Value::Array(captures) => captures.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    if captures.is_empty() {
+        return None;
+    }
+
+    let mut cursor = 0;
+    let mut range: Option<(u64, u64)> = None;
+    for capture in captures {
+        let needle = capture.trim();
+        if needle.is_empty() {
+            continue;
+        }
+        let found = excerpt
+            .get(cursor..)
+            .and_then(|remaining| remaining.find(needle).map(|offset| cursor + offset))
+            .or_else(|| excerpt.find(needle))?;
+        let end = found + needle.len();
+        cursor = end;
+        let start_line = match_line
+            + excerpt[..found]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u64;
+        let end_line =
+            match_line + excerpt[..end].bytes().filter(|byte| *byte == b'\n').count() as u64;
+        range = Some(match range {
+            Some((start, previous_end)) => (start.min(start_line), previous_end.max(end_line)),
+            None => (start_line, end_line),
+        });
+    }
+    range
+}
+
+#[cfg(test)]
+mod ast_search_format_tests {
+    use super::{format_response_with_context, FormatContext};
+    use crate::protocol::Response;
+    use serde_json::json;
+
+    #[test]
+    fn ast_search_multiline_capture_is_rendered_as_excerpt_reference() {
+        let body = "async () => {\n  expect(true).toBe(true);\n}";
+        let response = Response::success(
+            "ast-search",
+            json!({
+                "matches": [{
+                    "file": "src/test.ts",
+                    "line": 12,
+                    "text": format!("test('name', {body})"),
+                    "meta_variables": {"$BODY": body},
+                }],
+                "total_matches": 1,
+                "files_with_matches": 1,
+                "files_searched": 1,
+            }),
+        );
+        let structured_payload = response.data.clone();
+
+        let rendered =
+            format_response_with_context("ast_search", &response, &FormatContext::default());
+
+        assert!(rendered.contains("$BODY: lines 12-14 — async () => {…"));
+        assert_eq!(rendered.matches("expect(true).toBe(true);").count(), 1);
+        assert_eq!(response.data, structured_payload);
+    }
+
+    #[test]
+    fn ast_search_short_capture_stays_inline() {
+        let rendered = super::format_ast_search(&json!({
+            "matches": [{
+                "file": "src/test.ts",
+                "line": 1,
+                "text": "test('name', $NAME)",
+                "meta_variables": {"$NAME": "foo"},
+            }],
+            "total_matches": 1,
+            "files_with_matches": 1,
+            "files_searched": 1,
+        }));
+
+        assert!(rendered.contains("$NAME: foo"));
+    }
 }
 
 fn format_ast_replace(data: &Value, dry_run: bool) -> String {
