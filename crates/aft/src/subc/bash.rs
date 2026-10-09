@@ -71,6 +71,9 @@ enum BashSpawnControl {
         storage_dir: PathBuf,
         deadline: Instant,
         block_to_completion: bool,
+        /// Held-call diagnostics retain the requested blocking mode even if
+        /// a deadline returns a still-running task to the caller.
+        blocking_intent: bool,
         timeout: Option<u64>,
         wait_window_ms: u64,
         detach_on_user_message: bool,
@@ -856,6 +859,7 @@ pub(super) fn submit_deferred_bash(
                             // A capped blocking wait detaches at its deadline.
                             block_to_completion: (settings.block_to_completion || settings.wait)
                                 && worker_cap_ms.is_none(),
+                            blocking_intent: settings.block_to_completion || settings.wait,
                             timeout: settings.timeout,
                             wait_window_ms,
                             detach_on_user_message,
@@ -986,6 +990,7 @@ pub(super) fn submit_deferred_bash(
                 storage_dir,
                 deadline,
                 block_to_completion,
+                blocking_intent,
                 timeout,
                 wait_window_ms,
                 detach_on_user_message,
@@ -995,7 +1000,7 @@ pub(super) fn submit_deferred_bash(
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
-                } else if block_to_completion {
+                } else if blocking_intent {
                     drain::BashHoldPhase::Block
                 } else {
                     drain::BashHoldPhase::Foreground

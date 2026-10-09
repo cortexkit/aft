@@ -11002,7 +11002,7 @@ mod tests {
                 )
                 .unwrap(),
                 session_id.to_string(),
-                missing_workdir,
+                missing_workdir.clone(),
                 HashMap::new(),
                 crate::bash_background::HardKill::After(Duration::from_secs(30)),
                 storage.path().to_path_buf(),
@@ -11018,6 +11018,13 @@ mod tests {
             error.contains("failed to spawn background bash command"),
             "{error}"
         );
+        assert!(
+            error.contains(&format!(
+                "working directory does not exist: {}",
+                missing_workdir.display()
+            )),
+            "{error}"
+        );
         let frames = frames.lock().unwrap();
         let completion = frames.iter().find_map(|frame| match frame {
             crate::protocol::PushFrame::BashCompleted(completion)
@@ -11031,6 +11038,20 @@ mod tests {
         assert_eq!(completion.session_id, session_id);
         assert_eq!(completion.status, BgTaskStatus::Failed);
         assert_eq!(completion.exit_code, None);
+        assert_eq!(completion.status_reason.as_deref(), Some(error.as_str()));
+        assert!(completion
+            .output_preview
+            .contains("working directory does not exist"));
+        let snapshot = registry
+            .status(
+                &completion.task_id,
+                session_id,
+                Some(project.path()),
+                Some(storage.path()),
+                8192,
+            )
+            .unwrap();
+        assert_eq!(snapshot.info.status_reason.as_deref(), Some(error.as_str()));
         assert!(completion
             .status_reason
             .as_deref()

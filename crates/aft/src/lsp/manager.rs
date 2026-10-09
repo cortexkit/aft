@@ -6067,32 +6067,35 @@ impl PreparedSpawn {
     /// manager state, so it runs without the manager lock.
     fn run(self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
         let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
-        let completed_rust_check = (self.kind == ServerKind::Rust)
-            .then(|| {
-                let runtime = super::completed_rust_check::Runtime {
-                    binary: self.binary.clone(),
-                    args: self.args.clone(),
-                    env: self.env.clone(),
-                    options: self.initialization_options.clone(),
-                    launch_env: None,
-                    #[cfg(test)]
-                    validation_delay: Duration::ZERO,
-                };
-                super::completed_rust_check::CompletedRustCheck::new(
+        // Loose Rust roots have no Cargo check to certify; keep their analyzer
+        // diagnostics instead of replacing an indexing gap with a Cargo failure.
+        let completed_rust_check = (self.kind == ServerKind::Rust
+            && self.root.join("Cargo.toml").is_file())
+        .then(|| {
+            let runtime = super::completed_rust_check::Runtime {
+                binary: self.binary.clone(),
+                args: self.args.clone(),
+                env: self.env.clone(),
+                options: self.initialization_options.clone(),
+                launch_env: None,
+                #[cfg(test)]
+                validation_delay: Duration::ZERO,
+            };
+            super::completed_rust_check::CompletedRustCheck::new(
+                &self.root,
+                &self.reclaim_root,
+                &self.storage_root,
+                runtime.clone(),
+            )
+            .or_else(|| {
+                super::completed_rust_check::CompletedRustCheck::in_memory(
                     &self.root,
                     &self.reclaim_root,
-                    &self.storage_root,
-                    runtime.clone(),
+                    runtime,
                 )
-                .or_else(|| {
-                    super::completed_rust_check::CompletedRustCheck::in_memory(
-                        &self.root,
-                        &self.reclaim_root,
-                        runtime,
-                    )
-                })
             })
-            .flatten();
+        })
+        .flatten();
         let mut client = match LspClient::spawn_with_reclaim_root(
             self.kind.clone(),
             self.root.clone(),

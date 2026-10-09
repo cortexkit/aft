@@ -1049,12 +1049,29 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
     assert!(aft.shutdown().success());
 }
 
-#[test]
-fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
+fn warming_rust_inspect_response(cargo_owned: bool) -> (Value, Duration) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     fs::create_dir_all(project.join("crates")).unwrap();
-    fs::write(project.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let root_marker = if cargo_owned {
+        "Cargo.toml"
+    } else {
+        "fake.toml"
+    };
+    if cargo_owned {
+        fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"partial-inspect\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"crates/lib.rs\"\n",
+    )
+    .unwrap();
+        fs::write(
+            project.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"partial-inspect\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+    } else {
+        fs::write(project.join("fake.toml"), "").unwrap();
+    }
     fs::write(
         project.join("crates/lib.rs"),
         "// TODO: check indexing\npub fn value() {}\n",
@@ -1073,7 +1090,7 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
                 "inspect": {"diagnostics_timeout_ms": 10000},
                 "lsp": {"servers": {
-                    "rust": {"binary": binary, "args": []},
+                    "rust": {"binary": binary, "args": [], "root_markers": [root_marker]},
                     "typescript": {"binary": binary, "args": []}
                 }}
             }))
@@ -1093,6 +1110,15 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
         "partial inspect elapsed={:?} response={response:#}",
         started.elapsed()
     );
+    let elapsed = started.elapsed();
+    assert!(aft.shutdown().success());
+    (response, elapsed)
+}
+
+#[test]
+fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
+    // Without Cargo.toml, an analyzer still indexing cannot confirm complete diagnostics.
+    let (response, elapsed) = warming_rust_inspect_response(false);
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], false);
     assert!(
@@ -1108,8 +1134,25 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
         response["text"].as_str().unwrap().contains("E? W?"),
         "{response:#}"
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
-    assert!(aft.shutdown().success());
+    assert!(elapsed < Duration::from_secs(5));
+}
+
+#[test]
+fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming() {
+    // A completed explicit Cargo check supplies diagnostics while the analyzer is still warming.
+    let (response, elapsed) = warming_rust_inspect_response(true);
+    assert_eq!(response["success"], true, "{response:#}");
+    assert_eq!(response["complete"], true, "{response:#}");
+
+    assert_eq!(
+        response["summary"]["diagnostics"]["errors"], 0,
+        "{response:#}"
+    );
+    let text = response["text"].as_str().unwrap();
+    assert!(text.starts_with("FRESH"), "{text}");
+    assert!(text.contains("workspace analysis is warming"), "{text}");
+    assert!(text.contains("from the last completed check"), "{text}");
+    assert!(elapsed < Duration::from_secs(5));
 }
 
 /// A search against an already-ready index is answered as soon as its worker

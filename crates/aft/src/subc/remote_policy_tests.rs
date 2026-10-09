@@ -523,9 +523,7 @@ async fn exercise_catalog_remote_bash(
 ) {
     let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
     let root = tempfile::tempdir().unwrap();
-    if refusal.is_none() {
-        init_remote_git_fixture(root.path());
-    }
+    init_remote_git_fixture(root.path());
     let marker = root.path().join("must-not-run-locally");
     let command = if refusal.is_some() {
         format!("printf local-proof > '{}'", marker.display())

@@ -120,6 +120,7 @@ async fn exec_remote_bash_background_slots_are_shared_with_local_tasks() {
     use crate::bash_background::{HardKill, TaskSlot};
 
     let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
     let registry = registry();
     let local = registry
         .spawn_with_shell(
@@ -346,6 +347,7 @@ async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
 async fn runon_refusal_detail_is_rendered_and_sanitized() {
     let daemon = daemon(Script::RefusedWithDetail, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(&std::fs::canonicalize(dir.path()).unwrap(), 100);
     let marker = dir.path().join("must-not-run-locally");
     let ctx = restarted_context(dir.path());
     let response = handle_with_policy(
@@ -363,8 +365,14 @@ async fn runon_refusal_detail_is_rendered_and_sanitized() {
     let task_id = response.data["task_id"].as_str().unwrap();
     let done = terminal(ctx.bash_background(), task_id).await;
     assert!(!marker.exists(), "explicit runon must not start locally");
-    let expected = "runon refused: remote refused: runner_draining (runner says: maintenance window); command was not run; retry, or omit runon to run locally";
-    assert_eq!(refusal_response(done).data["message"], expected);
+    let response = refusal_response(done);
+    let message = response.data["message"].as_str().unwrap();
+    assert!(message.starts_with("runon refused: remote refused: runner_draining (runner says: maintenance window) after retrying for "), "{message}");
+    assert!(
+        message.ends_with("; command was not run; retry, or omit runon to run locally"),
+        "{message}"
+    );
+    assert!(!message.contains(['\n', '\t']), "{message}");
 }
 
 #[tokio::test]
@@ -3695,4 +3703,48 @@ async fn head_blocking_runon_uses_configured_cap_while_queued() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let project = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(project.path());
+    // The runner may place TMPDIR inside a checkout. Use the system's other
+    // Unix temporary root so this workdir cannot inherit that repository.
+    let workdir = tempfile::Builder::new()
+        .prefix("aft-runon-non-git-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    assert!(worktree_root_containing(workdir.path()).unwrap().is_none());
+    let marker = workdir.path().join("must-not-run-locally");
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("printf local-proof > '{}'", marker.display()),
+            "runon": "linux",
+            "workdir": workdir.path(),
+            "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    for expected in [
+        "runon refused before remote dispatch; command did not run",
+        "runon refused: remote execution is unavailable; command did not run",
+        "cwd resolves outside the workspace key",
+    ] {
+        assert!(done.output_preview.contains(expected), "{done:?}");
+    }
+    assert!(!marker.exists(), "a refused runon must never spawn locally");
+    assert!(
+        exec_runs(&daemon).is_empty(),
+        "a non-git cwd must never dispatch"
+    );
 }
