@@ -759,13 +759,14 @@ pub(crate) fn detach_wait_mode_bash(
 ///
 /// The OpenCode and Pi plugins size their transport deadline
 /// (`orchestratedTransportTimeoutMs`) as this same budget plus a margin: the
-/// `timeout`, or 30 minutes without one, capped by the worker wait limit for
-/// a delegated worker. This never exceeds the 30-minute wait cap either.
-pub(crate) fn remote_block_handback_ms(timeout: Option<u64>, worker_cap_ms: Option<u64>) -> u64 {
+/// `timeout`, or 30 minutes without one, capped by the configured blocking
+/// wait limit for both head and worker sessions. Transports may wait longer,
+/// but the remote hand-back never exceeds 30 minutes.
+pub(crate) fn remote_block_handback_ms(timeout: Option<u64>, blocking_cap_ms: Option<u64>) -> u64 {
     let budget = timeout
         .unwrap_or(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS)
         .min(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS);
-    worker_cap_ms.map_or(budget, |cap| budget.min(cap))
+    blocking_cap_ms.map_or(budget, |cap| budget.min(cap))
 }
 
 /// The reply to a blocking call whose remote command did not finish within
@@ -1288,6 +1289,20 @@ mod tests {
     fn blocking_wait_cap_applies_to_every_blocking_call() {
         assert_eq!(blocking_wait_cap_ms(true, 90_000), Some(90_000));
         assert_eq!(blocking_wait_cap_ms(false, 90_000), None);
+    }
+
+    #[test]
+    fn remote_handback_budget_obeys_configured_all_session_cap() {
+        let cap = blocking_wait_cap_ms(true, 250);
+        assert_eq!(remote_block_handback_ms(Some(5_000), cap), 250);
+        assert_eq!(remote_block_handback_ms(None, cap), 250);
+        assert_eq!(remote_block_handback_ms(Some(100), cap), 100);
+        assert_eq!(remote_block_handback_ms(Some(5_000), None), 5_000);
+        assert_eq!(remote_block_handback_ms(None, None), 1_800_000);
+        assert_eq!(
+            remote_block_handback_ms(Some(9_000_000), Some(7_200_000)),
+            1_800_000
+        );
     }
 
     #[test]

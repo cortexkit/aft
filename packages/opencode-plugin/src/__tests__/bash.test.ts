@@ -2708,6 +2708,36 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(worker.calls[0].options?.transportTimeoutMs).toBe(1_800_000 + 10_000);
   });
 
+  test("head and worker runon transport budgets cover a short configured blocking cap", async () => {
+    const config = {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+      bash: { runon_enabled: true, worker_wait_max_ms: 250 },
+    } as PluginContext["config"];
+    for (const worker of [false, true]) {
+      for (const timeout of [100, 5_000]) {
+        _resetSubagentCacheForTest();
+        const response = () => ({
+          success: true,
+          status: "running",
+          task_id: "bash-runon",
+          output: "queued",
+        });
+        const harness = worker
+          ? createSubagentHarness(response, undefined, config)
+          : createHarness(response, undefined, false, config);
+        await harness.tool.execute(
+          { command: "uname -s", runon: "linux", wait: true, timeout },
+          createMockSdkContext({
+            sessionID: worker ? "ses_subagent_runon_cap" : "ses_primary_runon_cap",
+          }),
+        );
+        expect(harness.calls[0].params.timeout).toBe(timeout);
+        expect(harness.calls[0].options?.transportTimeoutMs).toBe(Math.min(timeout, 250) + 10_000);
+      }
+    }
+  });
+
   test("primary session + background: true still works (regression check)", async () => {
     _resetSubagentCacheForTest();
     // No client.session.get → resolveIsSubagent returns false → primary path.

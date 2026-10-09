@@ -2140,9 +2140,16 @@ mod grant_path_tests {
 
     /// Runs the bash handler with a remote policy pointing at the fake runner.
     #[cfg(unix)]
-    fn remote_runon_stub(req: RawRequest, ctx: &AppContext) -> Response {
+    fn remote_runon_stub(mut req: RawRequest, ctx: &AppContext) -> Response {
+        req.params
+            .as_object_mut()
+            .unwrap()
+            .entry("workdir")
+            .or_insert_with(|| json!(ctx.config().project_root));
         let launch = crate::bash_background::RemoteLaunch {
             explicit_runon: false,
+            requested_vcpus: None,
+            requested_network: false,
             connection_file: REMOTE_RUNON_CONNECTION.lock().unwrap().clone(),
             harness: "broca".into(),
             session: "session".into(),
@@ -2176,6 +2183,15 @@ mod grant_path_tests {
         .await;
         *REMOTE_RUNON_CONNECTION.lock().unwrap() = Some(daemon.connection.clone());
         let (dir, root) = super::super::test_support::test_root("remote-handback");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(dir.path())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .status()
+            .unwrap()
+            .success());
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());

@@ -502,6 +502,39 @@ describe("bash tool adapter", () => {
     expect(await transportFor(false, 3_600_000)).toBe(1_800_000 + 10_000);
   });
 
+  test("head and worker runon transport budgets cover a short configured blocking cap", async () => {
+    for (const hasUI of [true, false]) {
+      for (const timeout of [100, 5_000]) {
+        const tools = new Map<string, MockToolDef>();
+        const { bridge, calls } = makeTrackableMockBridge({
+          status: "running",
+          task_id: "bash-runon",
+          output: "queued",
+        });
+        registerBashTool(
+          makeMockApi(tools),
+          makeMockContext(bridge, {
+            subc: { connection_file: "/run/subc-connection.json" },
+            remote_exec: { enabled: true },
+            bash: { runon_enabled: true, worker_wait_max_ms: 250 },
+          } as PluginContext["config"]),
+        );
+        await tools
+          .get("bash")!
+          .execute(
+            "test-call",
+            { command: "uname -s", runon: "linux", wait: true, timeout },
+            undefined,
+            undefined,
+            { cwd: projectRoot, hasUI },
+          );
+        const call = calls[0] as [string, Record<string, unknown>, { transportTimeoutMs?: number }];
+        expect(call[1].timeout).toBe(timeout);
+        expect(call[2]?.transportTimeoutMs).toBe(Math.min(timeout, 250) + 10_000);
+      }
+    }
+  });
+
   test("PowerShell registration routes through the unified bash command family", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);

@@ -291,10 +291,10 @@ pub(crate) struct RemoteTask {
     /// reported once and never updated, so it can only fall afterwards.
     #[serde(default)]
     pub queue_position: Option<u32>,
-    /// The job's stream has shown that the command started on the runner.
-    /// Set when the first output record arrives; see [`RemotePhase::of`].
+    /// Output proves execution started even when an older runner sends no
+    /// `Started` record.
     #[serde(default)]
-    pub started: bool,
+    pub output_received: bool,
 }
 
 /// Where a remote job is, as far as its own stream has shown. Used to tell a
@@ -313,14 +313,10 @@ pub(crate) enum RemotePhase {
 impl RemotePhase {
     /// The one place that decides a remote job's phase.
     ///
-    /// exec-remote-types 0.2.x streams carry no record that marks a queued
-    /// job taking runner capacity; only output proves the command started.
-    /// A running command that has printed nothing therefore still reads as
-    /// queued. When the locked crate gains a `StreamRecord::Started` record,
-    /// set `RemoteTask::started` when the stream delivers it (in `TaskSink`)
-    /// and this mapping needs no change.
+    /// New runners explicitly report `Started`; output remains evidence of
+    /// execution for older runners that do not send that record.
     pub(crate) fn of(remote: &RemoteTask) -> Self {
-        if remote.started {
+        if remote.started.is_some() || remote.output_received {
             Self::Running
         } else if let (Some(_), Some(position)) = (remote.job_id, remote.queue_position) {
             Self::Queued { position }
@@ -348,7 +344,7 @@ impl RemotePhase {
             Self::Queued { position } => format!(
                 "queued at position {position} on ck-motor (the position when the job was accepted; no output yet)"
             ),
-            Self::Running => "running on ck-motor (output received)".to_string(),
+            Self::Running => "running on ck-motor (execution started)".to_string(),
         }
     }
 }
@@ -530,7 +526,7 @@ impl OutputSink for TaskSink {
             }
             r.last_seq = Some(seq);
             // Output proves the command started on the runner.
-            r.started = true;
+            r.output_received = true;
         })?;
         let _ = self.registry.inner.wake_tx.try_send(());
         Ok(())
@@ -761,7 +757,7 @@ impl BgTaskRegistry {
             fallback_digest: None,
             env_not_forwarded: None,
             queue_position: None,
-            started: false,
+            output_received: false,
             retry: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)

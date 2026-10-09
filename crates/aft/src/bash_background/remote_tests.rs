@@ -1266,7 +1266,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
-        started: false,
+        output_received: false,
         retry: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
@@ -1583,7 +1583,7 @@ fn persist_accepted_with_snapshot(
         fallback_digest: Some(digest),
         env_not_forwarded: None,
         queue_position: None,
-        started: false,
+        output_received: false,
         retry: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
@@ -1603,6 +1603,7 @@ fn restarted_context(dir: &Path) -> crate::context::AppContext {
 }
 
 fn restarted_context_with_runon(dir: &Path, enabled: bool) -> crate::context::AppContext {
+    ensure_git_fixture(dir);
     // A fresh configuration would choose ordinary unsandboxed inheritance;
     // the saved Host plan must still clear ambient HOME before its command.
     crate::context::AppContext::new(
@@ -2133,8 +2134,13 @@ async fn exec_remote_bash_fallback_marker_before_cancel_uses_local_kill() {
 fn handle_with_policy(
     ctx: &crate::context::AppContext,
     policy: Option<crate::bash_background::RemoteLaunch>,
-    params: serde_json::Value,
+    mut params: serde_json::Value,
 ) -> crate::protocol::Response {
+    params
+        .as_object_mut()
+        .unwrap()
+        .entry("workdir")
+        .or_insert_with(|| serde_json::json!(ctx.config().project_root));
     let request = crate::protocol::RawRequest {
         id: "runon".into(),
         command: "bash".into(),
@@ -2937,8 +2943,15 @@ fn orchestrated_request(params: serde_json::Value) -> crate::protocol::RawReques
 async fn orchestrated_reply(
     ctx: &crate::context::AppContext,
     daemon: &crate::exec_remote::wire_tests::Daemon,
-    params: serde_json::Value,
+    mut params: serde_json::Value,
 ) -> (crate::protocol::Response, Duration) {
+    // The handler resolves an omitted cwd against the process, not this
+    // disposable test project. Keep the remote request inside its own root.
+    params
+        .as_object_mut()
+        .unwrap()
+        .entry("workdir")
+        .or_insert_with(|| serde_json::json!(ctx.config().project_root));
     let request = orchestrated_request(params);
     let received = std::time::Instant::now();
     let spawned =
@@ -3174,14 +3187,21 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
 }
 
 #[test]
-fn remote_phase_comes_from_acceptance_and_output_only() {
+fn remote_phase_comes_from_acceptance_started_or_output() {
     let mut remote = RemoteTask {
         connection_file: None,
         explicit_runon: true,
         harness: "broca".into(),
         session: "session".into(),
+        requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: false,
+        started: None,
         job_id: None,
         last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
@@ -3190,7 +3210,7 @@ fn remote_phase_comes_from_acceptance_and_output_only() {
         fallback_digest: None,
         env_not_forwarded: None,
         queue_position: None,
-        started: false,
+        output_received: false,
         retry: None,
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::WaitingOnRunner);
@@ -3205,7 +3225,10 @@ fn remote_phase_comes_from_acceptance_and_output_only() {
         RemotePhase::of(&remote),
         RemotePhase::Queued { position: 4 }
     );
-    remote.started = true;
+    remote.started = Some(Started::new(0, 123, 1));
+    assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
+    remote.started = None;
+    remote.output_received = true;
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
 }
 
@@ -3220,6 +3243,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     )
     .await;
     let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
     let registry = registry();
     let mut policy = launch(daemon.connection.clone());
     policy.explicit_runon = true;
@@ -3234,7 +3258,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
             HashMap::new(),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.path().into(),
-            10,
+            crate::bash_background::TaskSlot::Background { max: 10 },
             true,
             false,
             Some(dir.path().into()),
@@ -3253,9 +3277,7 @@ async fn runon_draining_twice_then_accepts_and_discloses_wait() {
     assert!(!done.output_preview.contains("local-proof"));
     let requests = exec_runs(&daemon);
     assert_eq!(requests.len(), 3);
-    assert!(requests
-        .windows(2)
-        .all(|pair| pair[0]["params"] == pair[1]["params"]));
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 fn draining_budgets() -> &'static Mutex<HashMap<PathBuf, u64>> {
@@ -3281,6 +3303,7 @@ pub(super) fn stop_draining_worker(root: &Path) -> bool {
 }
 
 fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
+    ensure_git_fixture(dir);
     let mut policy = launch(connection);
     policy.explicit_runon = true;
     registry
@@ -3297,7 +3320,7 @@ fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf)
             )]),
             crate::bash_background::HardKill::After(Duration::from_secs(30)),
             dir.into(),
-            10,
+            crate::bash_background::TaskSlot::Background { max: 10 },
             true,
             false,
             Some(dir.into()),
@@ -3505,7 +3528,7 @@ async fn runon_draining_restart_resubmits_and_accepts() {
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     let requests = exec_runs(&daemon);
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["params"], requests[1]["params"]);
+    assert_eq!(requests[0], requests[1]);
 }
 
 #[test]
@@ -3586,4 +3609,90 @@ async fn runon_draining_restart_does_not_resubmit_ambiguous_dispatch() {
         1,
         "missing acceptance must never authorize resubmission"
     );
+}
+
+#[tokio::test]
+async fn runon_draining_network_retry_preserves_outbound_and_vcpu_request() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(50),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "printf remote-proof",
+            "runon": "linux,4c,net",
+            "wait": true,
+            "timeout": 5_000,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["status"], "completed", "{reply:?}");
+    assert_eq!(reply.data["exit_code"], 0, "{reply:?}");
+    let requests = exec_runs(&daemon);
+    assert_eq!(
+        requests.len(),
+        2,
+        "a never-started draining refusal must retry"
+    );
+    assert_eq!(requests[0], requests[1]);
+    for request in requests {
+        let request: RunRequest = serde_json::from_value(request).unwrap();
+        assert_eq!(request.network, Some(Network::Outbound));
+        assert_eq!(request.weight_hint, Some(4));
+    }
+}
+
+#[tokio::test]
+async fn head_blocking_runon_uses_configured_cap_while_queued() {
+    let daemon = daemon(
+        Script::Staged {
+            position: 9,
+            queue: Duration::from_secs(30),
+            run: Duration::ZERO,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    ctx.update_config(|config| config.bash.worker_wait_max_ms = 250);
+    let (reply, waited) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "uname -s",
+            "runon": "linux",
+            "wait": true,
+            "timeout": 5_000,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    assert!(waited < plugin_transport_deadline(250), "{waited:?}");
+    assert_eq!(reply.data["status"], "running", "{reply:?}");
+    assert_eq!(reply.data["remote_phase"], "queued", "{reply:?}");
+    assert_eq!(reply.data["queue_position"], 9, "{reply:?}");
+    assert_eq!(reply.data["remote_job_id"], id().to_string(), "{reply:?}");
+    assert_eq!(runner_cancels(&daemon), 0);
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    let registry = ctx.bash_background().clone();
+    let task_id = reply.data["task_id"].as_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || registry.kill(&task_id, "session"))
+        .await
+        .unwrap()
+        .unwrap();
 }
