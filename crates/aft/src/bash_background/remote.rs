@@ -40,6 +40,33 @@ fn runon_refusal_message(reason: &str, detail: Option<&str>) -> String {
     format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally")
 }
 
+fn retry_refusal_message(reason: &str, detail: Option<&str>, waited_ms: Option<u64>) -> String {
+    let Some(waited_ms) = waited_ms else {
+        return runon_refusal_message(reason, detail);
+    };
+    let reason = rendered_refusal_reason(reason, detail);
+    let waited = format!(" after retrying for {}", retry_duration(waited_ms));
+    format!("runon refused: remote refused: {reason}{waited}; command was not run; retry, or omit runon to run locally")
+}
+
+fn retry_duration(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let seconds = ms / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds % 60 == 0 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
+fn retry_waited_ms(remote: &RemoteTask) -> Option<u64> {
+    remote.retry.as_ref()?.waited_ms
+}
+
 /// Derive the error from persisted remote proof, never from command output.
 /// Keeping it in snapshots lets foreground and restarted/background readers
 /// report the same named refusal without changing older task records.
@@ -58,12 +85,49 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
     let reason = serde_json::to_value(reason).ok()?;
     Some(super::RemoteRefusal {
         code: "remote_unavailable",
-        message: runon_refusal_message(reason.as_str()?, refusal_detail.as_deref()),
+        message: retry_refusal_message(
+            reason.as_str()?,
+            refusal_detail.as_deref(),
+            retry_waited_ms(remote),
+        ),
     })
 }
 
 #[cfg(unix)]
 const REMOTE_REATTACH_BUDGET: Duration = Duration::from_secs(5 * 60);
+
+#[cfg(unix)]
+const DRAINING_RETRY_BUDGET_MS: u64 = 10 * 60 * 1000;
+
+#[cfg(unix)]
+fn retries_draining(remote: &RemoteTask, verdict: &Verdict) -> bool {
+    remote.explicit_runon
+        && matches!(
+            verdict,
+            Verdict::RunLocally {
+                reason: RefusalReason::RunnerDraining,
+                ..
+            }
+        )
+}
+
+#[cfg(unix)]
+fn draining_delay_ms(attempt: u32, retry_after_ms: Option<u64>) -> u64 {
+    retry_after_ms.unwrap_or_else(|| {
+        5000_u64
+            .saturating_mul(1_u64 << attempt.saturating_sub(1).min(4))
+            .min(60000)
+    })
+}
+
+#[cfg(unix)]
+fn draining_budget_ms(_root: &Path) -> u64 {
+    #[cfg(test)]
+    if let Some(ms) = tests::draining_budget_ms(_root) {
+        return ms;
+    }
+    DRAINING_RETRY_BUDGET_MS
+}
 
 /// The remote runner AFT dispatches to; named in every remote reply header.
 #[cfg(unix)]
@@ -136,6 +200,15 @@ impl ReattachBudget {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DrainingRetry {
+    request_digest: String,
+    attempts: u32,
+    first_refusal_at_ms: Option<u64>,
+    next_retry_at_ms: Option<u64>,
+    waited_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
     pub connection_file: Option<PathBuf>,
     #[serde(default)]
@@ -158,6 +231,8 @@ pub(crate) struct RemoteTask {
     pub fallback_digest: Option<String>,
     #[serde(default)]
     pub env_not_forwarded: Option<Vec<String>>,
+    #[serde(default)]
+    pub retry: Option<DrainingRetry>,
     /// The queue position the runner reported when it accepted the job. It is
     /// reported once and never updated, so it can only fall afterwards.
     #[serde(default)]
@@ -425,11 +500,22 @@ impl OutputSink for TaskSink {
             r.unknown_len = remote.unknown_len + bytes.len() as u64;
         })
     }
-    fn terminal(&mut self, record: &TerminalRecord, _verdict: &Verdict) -> io::Result<()> {
+    fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
         self.commit(|r| {
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
             r.gap_recovery = None;
+            if retries_draining(r, verdict) {
+                if let Some(retry) = r.retry.as_mut() {
+                    let now = unix_millis();
+                    retry.first_refusal_at_ms.get_or_insert(now);
+                    retry.next_retry_at_ms =
+                        Some(now.saturating_add(draining_delay_ms(
+                            retry.attempts,
+                            record.retry_after_ms,
+                        )));
+                }
+            }
         })
     }
 }
@@ -469,6 +555,46 @@ impl TaskSink {
         }
         result
     }
+}
+
+#[cfg(unix)]
+fn save_retry_request(task: &BgTask, request: &RunRequest) -> Result<String, String> {
+    let layout =
+        resolve_task_layout(&task.paths.session_dir, &task.task_id).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+    // Environment values stay in a private control file, not mirrored task metadata.
+    let file = crate::bash_background::persistence::create_control_file(
+        &layout.dirs,
+        "remote-retry-request",
+        &bytes,
+    )
+    .map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    Ok(retry_request_digest(task, &bytes))
+}
+
+#[cfg(unix)]
+fn retry_request_digest(task: &BgTask, bytes: &[u8]) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(task.task_id.as_bytes());
+    hash.update(bytes);
+    hash.finalize().to_hex().to_string()
+}
+
+#[cfg(unix)]
+fn restore_retry_request(task: &BgTask, expected: &str) -> Result<RunRequest, String> {
+    use std::io::Read;
+    let layout =
+        resolve_task_layout(&task.paths.session_dir, &task.task_id).map_err(|e| e.to_string())?;
+    let mut file =
+        crate::bash_background::persistence::open_control_file(&layout, "remote-retry-request")
+            .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if retry_request_digest(task, &bytes) != expected {
+        return Err("remote retry request digest mismatch; command not resubmitted".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
 #[derive(Clone)]
@@ -552,6 +678,7 @@ impl BgTaskRegistry {
             env_not_forwarded: None,
             queue_position: None,
             started: false,
+            retry: None,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -739,26 +866,35 @@ impl BgTaskRegistry {
             .unwrap_or_else(|| PathBuf::from("/"));
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
         let mut recovery = ReattachBudget::new(&root);
+        let mut retry_request = None;
         if let Some(record) = remote.terminal.as_ref() {
-            if let Verdict::RunLocally {
-                reason,
-                refusal_detail,
-            } = exec::grade(record)
-            {
-                let reason = serde_json::to_value(reason)
-                    .unwrap()
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_owned();
-                return self.restored_remote_fallback(
-                    &task,
-                    &remote,
-                    &reason,
-                    refusal_detail.as_deref(),
-                );
+            let verdict = exec::grade(record);
+            if retries_draining(&remote, &verdict) && remote.retry.is_some() {
+                retry_request = self.wait_draining_retry(&task, &root).await?;
+                if retry_request.is_none() {
+                    return Ok(());
+                }
+            } else {
+                if let Verdict::RunLocally {
+                    reason,
+                    refusal_detail,
+                } = verdict
+                {
+                    let reason = serde_json::to_value(reason)
+                        .unwrap()
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned();
+                    return self.restored_remote_fallback(
+                        &task,
+                        &remote,
+                        &reason,
+                        refusal_detail.as_deref(),
+                    );
+                }
+                self.remote_terminal(&task, exec::grade(record), None);
+                return Ok(());
             }
-            self.remote_terminal(&task, exec::grade(record), None);
-            return Ok(());
         }
         let connection = remote
             .connection_file
@@ -780,7 +916,7 @@ impl BgTaskRegistry {
                     Err(error) => Err(error.clone()),
                 }
             };
-            let result = if initial.is_none() {
+            let result = if initial.is_none() && retry_request.is_none() {
                 if let Some(point) = remote.point() {
                     recovery.wait(point.job_id, connect).await?
                 } else {
@@ -792,6 +928,9 @@ impl BgTaskRegistry {
             match result {
                 Ok(c) => break c,
                 Err(error) => {
+                    if retry_request.is_some() {
+                        return self.refuse_remote_before_dispatch(&task, &error);
+                    }
                     if let Some((_, fallback)) = initial.take() {
                         return if remote.explicit_runon {
                             self.refuse_remote_before_dispatch(&task, &error)
@@ -811,7 +950,12 @@ impl BgTaskRegistry {
             }
         };
         let mut fallback = None;
-        let mut stream = if let Some((request, local)) = initial.take() {
+        let mut stream = if retry_request.is_some() {
+            let Some(stream) = self.submit_draining_retry(&client, &task, &root).await? else {
+                return Ok(());
+            };
+            stream
+        } else if let Some((request, local)) = initial.take() {
             let request = match request {
                 Ok(r) => r,
                 Err(error) => {
@@ -823,6 +967,19 @@ impl BgTaskRegistry {
                 }
             };
             fallback = Some(local);
+            if remote.explicit_runon {
+                let request_digest = save_retry_request(&task, &request)?;
+                sink.commit(|r| {
+                    r.retry = Some(DrainingRetry {
+                        request_digest,
+                        attempts: 1,
+                        first_refusal_at_ms: None,
+                        next_retry_at_ms: None,
+                        waited_ms: None,
+                    })
+                })
+                .map_err(|e| e.to_string())?;
+            }
             match client.run(&request).await {
                 Ok(stream) => stream,
                 Err(error) if proves_no_start(&error) => {
@@ -879,6 +1036,23 @@ impl BgTaskRegistry {
                     reason,
                     refusal_detail,
                 })) => {
+                    let verdict = Verdict::RunLocally {
+                        reason: reason.clone(),
+                        refusal_detail: refusal_detail.clone(),
+                    };
+                    if retries_draining(&remote, &verdict) {
+                        if self.wait_draining_retry(&task, &root).await?.is_some() {
+                            let Some(next) =
+                                self.submit_draining_retry(&client, &task, &root).await?
+                            else {
+                                return Ok(());
+                            };
+                            stream = next;
+                            recovery.reset();
+                            continue;
+                        }
+                        return Ok(());
+                    }
                     let reason = serde_json::to_value(reason)
                         .unwrap()
                         .as_str()
@@ -924,6 +1098,129 @@ impl BgTaskRegistry {
                         .await?;
                 }
             }
+        }
+    }
+
+    async fn wait_draining_retry(
+        &self,
+        task: &Arc<BgTask>,
+        root: &Path,
+    ) -> Result<Option<RunRequest>, String> {
+        let budget = draining_budget_ms(root);
+        loop {
+            let (remote, now) = {
+                let mut db = DeferredDbWrites::new(self, task);
+                let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+                let remote = state
+                    .metadata
+                    .remote
+                    .clone()
+                    .ok_or("remote record absent")?;
+                let retry = remote
+                    .retry
+                    .as_ref()
+                    .ok_or("draining retry request absent; command not resubmitted")?;
+                let first = retry
+                    .first_refusal_at_ms
+                    .ok_or("draining retry start absent; command not resubmitted")?;
+                let now = unix_millis();
+                state.metadata.execution_note = Some(format!(
+                    "build server is draining for maintenance; retrying (attempt {}, {} of {} used)",
+                    retry.attempts.saturating_add(1), retry_duration(now.saturating_sub(first).min(budget)), retry_duration(budget)
+                ));
+                self.persist_task_locked(task, &state.metadata, &mut db)
+                    .map_err(|e| e.to_string())?;
+                (remote, now)
+            };
+            if remote.cancel_requested {
+                self.remote_terminal(task, Verdict::Cancelled, None);
+                return Ok(None);
+            }
+            #[cfg(test)]
+            if tests::stop_draining_worker(root) {
+                return Ok(None);
+            }
+            let retry = remote.retry.as_ref().unwrap();
+            let first = retry.first_refusal_at_ms.unwrap();
+            let elapsed = now.saturating_sub(first);
+            if elapsed >= budget {
+                let sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
+                sink.commit(|r| r.retry.as_mut().unwrap().waited_ms = Some(elapsed))
+                    .map_err(|e| e.to_string())?;
+                let Verdict::RunLocally { refusal_detail, .. } =
+                    exec::grade(remote.terminal.as_ref().ok_or("draining refusal absent")?)
+                else {
+                    return Err("draining refusal absent".into());
+                };
+                return self
+                    .refuse_remote_executor(task, "runner_draining", refusal_detail.as_deref())
+                    .map(|_| None);
+            }
+            if now >= retry.next_retry_at_ms.unwrap_or(now) {
+                return restore_retry_request(task, &retry.request_digest).map(Some);
+            }
+            // A durable cancellation intent plus Notify covers both live kills
+            // and kills recorded before the worker/restarted daemon began waiting.
+            let delay = retry
+                .next_retry_at_ms
+                .unwrap()
+                .saturating_sub(now)
+                .min(budget - elapsed)
+                .min(1000);
+            tokio::select! {
+                _ = task.remote_cancel_notify.notified() => {},
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {},
+            }
+        }
+    }
+
+    async fn submit_draining_retry(
+        &self,
+        client: &ExecRemoteClient,
+        task: &Arc<BgTask>,
+        root: &Path,
+    ) -> Result<Option<exec::RemoteStream>, String> {
+        // Recheck after connecting: reconnect time also consumes the retry budget.
+        let Some(request) = self.wait_draining_retry(task, root).await? else {
+            return Ok(None);
+        };
+        {
+            let mut db = DeferredDbWrites::new(self, task);
+            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
+            let remote = state
+                .metadata
+                .remote
+                .as_mut()
+                .ok_or("remote record absent")?;
+            if remote.cancel_requested {
+                drop(state);
+                self.remote_terminal(task, Verdict::Cancelled, None);
+                return Ok(None);
+            }
+            // Clear the no-start proof before dispatch. A crash after this write
+            // is ambiguous and must recover by attach, never another exec.run.
+            remote.terminal = None;
+            remote.job_id = None;
+            remote.last_seq = None;
+            let retry = remote
+                .retry
+                .as_mut()
+                .ok_or("draining retry request absent")?;
+            retry.attempts = retry.attempts.saturating_add(1);
+            retry.next_retry_at_ms = None;
+            state.metadata.execution_note = Some(format!(
+                "remote execution requested on {RUNNER_ID} after maintenance wait"
+            ));
+            self.persist_task_locked(task, &state.metadata, &mut db)
+                .map_err(|e| e.to_string())?;
+        }
+        match client.run(&request).await {
+            Ok(stream) => Ok(Some(stream)),
+            Err(error) if proves_no_start(&error) => {
+                self.refuse_remote_before_dispatch(task, &error.to_string())?;
+                Ok(None)
+            }
+            Err(error) => Err(format!("remote outcome unknown; not resubmitted: {error}")),
         }
     }
 
@@ -1161,7 +1458,17 @@ impl BgTaskRegistry {
                 reason: RefusalReason::Unknown(reason.into()),
                 refusal_detail: refusal_detail.map(str::to_owned),
             },
-            Some(runon_refusal_message(reason, refusal_detail)),
+            Some({
+                let remote = task
+                    .state
+                    .lock()
+                    .map_err(|_| "task lock poisoned")?
+                    .metadata
+                    .remote
+                    .clone()
+                    .unwrap();
+                retry_refusal_message(reason, refusal_detail, retry_waited_ms(&remote))
+            }),
         );
         Ok(())
     }
@@ -1310,6 +1617,7 @@ impl BgTaskRegistry {
                     .map_err(|e| e.to_string())?;
             }
         }
+        task.remote_cancel_notify.notify_one();
         Ok(true)
     }
 

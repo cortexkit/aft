@@ -708,6 +708,8 @@ pub(crate) struct BgTask {
     /// `BgTaskState::kill_in_flight`. Readers that must answer with a settled
     /// status wait on it instead of holding `state` across the kill.
     kill_settled: std::sync::Condvar,
+    #[cfg(unix)]
+    remote_cancel_notify: tokio::sync::Notify,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
     /// the route that started it (or of the row it was replayed from). The
     /// root context is shared by routes from several harnesses, so this can
@@ -2875,6 +2877,8 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
+            #[cfg(unix)]
+            remote_cancel_notify: tokio::sync::Notify::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -3121,6 +3125,8 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
+            #[cfg(unix)]
+            remote_cancel_notify: tokio::sync::Notify::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Pty(Some(runtime)),
@@ -3355,6 +3361,8 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
+            #[cfg(unix)]
+            remote_cancel_notify: tokio::sync::Notify::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: TaskRuntime::Piped(Some(child)),
@@ -6565,6 +6573,8 @@ impl BgTaskRegistry {
             #[cfg(unix)]
             adopted_exit: Mutex::new(Default::default()),
             kill_settled: std::sync::Condvar::new(),
+            #[cfg(unix)]
+            remote_cancel_notify: tokio::sync::Notify::new(),
             state: Mutex::new(BgTaskState {
                 metadata,
                 runtime: if mode == BgMode::Pty {

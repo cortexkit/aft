@@ -1150,6 +1150,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         env_not_forwarded: None,
         queue_position: None,
         started: false,
+        retry: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -1461,6 +1462,7 @@ fn persist_accepted_with_snapshot(
         env_not_forwarded: None,
         queue_position: None,
         started: false,
+        retry: None,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -2779,6 +2781,7 @@ fn remote_phase_comes_from_acceptance_and_output_only() {
         env_not_forwarded: None,
         queue_position: None,
         started: false,
+        retry: None,
     };
     assert_eq!(RemotePhase::of(&remote), RemotePhase::WaitingOnRunner);
     remote.job_id = Some(id());
@@ -2794,4 +2797,383 @@ fn remote_phase_comes_from_acceptance_and_output_only() {
     );
     remote.started = true;
     assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
+}
+
+#[tokio::test]
+async fn runon_draining_twice_then_accepts_and_discloses_wait() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 2,
+            retry_after_ms: Some(150),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let mut policy = launch(daemon.connection.clone());
+    policy.explicit_runon = true;
+    let task_id = registry
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            "printf local-proof",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.path().into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.path().into(),
+            10,
+            true,
+            false,
+            Some(dir.path().into()),
+        )
+        .unwrap();
+    let waiting = draining_phase(&registry, &task_id).await;
+    assert_eq!(waiting.info.status, BgTaskStatus::Running, "{waiting:?}");
+    assert!(
+        waiting
+            .output_preview
+            .contains("draining for maintenance; retrying (attempt 2"),
+        "{waiting:?}"
+    );
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    assert!(!done.output_preview.contains("local-proof"));
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 3);
+    assert!(requests
+        .windows(2)
+        .all(|pair| pair[0]["params"] == pair[1]["params"]));
+}
+
+fn draining_budgets() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, u64>>> = std::sync::OnceLock::new();
+    BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn draining_budget_ms(root: &Path) -> Option<u64> {
+    draining_budgets().lock().unwrap().get(root).copied()
+}
+
+fn shorten_draining_budget(root: &Path, ms: u64) {
+    draining_budgets().lock().unwrap().insert(root.into(), ms);
+}
+
+fn stopped_draining_roots() -> &'static Mutex<HashSet<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(super) fn stop_draining_worker(root: &Path) -> bool {
+    stopped_draining_roots().lock().unwrap().remove(root)
+}
+
+fn start_runon_retry(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
+    let mut policy = launch(connection);
+    policy.explicit_runon = true;
+    registry
+        .spawn_remote(
+            policy,
+            SpawnPlan::Unsandboxed,
+            "printf local-proof",
+            resolve_posix_shell(),
+            "session".into(),
+            dir.into(),
+            HashMap::from([(
+                "REMOTE_REQUEST_PRIVATE_VALUE".into(),
+                "private-value-proof".into(),
+            )]),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            dir.into(),
+            10,
+            true,
+            false,
+            Some(dir.into()),
+        )
+        .unwrap()
+}
+
+async fn draining_phase(registry: &BgTaskRegistry, task: &str) -> BgTaskSnapshot {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = registry.observed_status(task, "session", 8192).unwrap();
+            if snapshot
+                .output_preview
+                .contains("draining for maintenance; retrying")
+            {
+                return snapshot;
+            }
+            assert!(!snapshot.info.status.is_terminal(), "{snapshot:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("retry phase must be observable")
+}
+
+#[tokio::test]
+async fn runon_draining_budget_caps_retry_after() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(60_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(dir.path(), 250);
+    let registry = registry();
+    let started = Instant::now();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let done = tokio::time::timeout(Duration::from_millis(650), terminal(&registry, &task))
+        .await
+        .expect("retry_after must be capped by the total budget");
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    let refusal = done.remote_refusal.unwrap();
+    assert!(
+        refusal
+            .message
+            .contains("runner_draining (maintenance) after retrying for "),
+        "{refusal:?}"
+    );
+    assert!(refusal.message.contains("ms; command was not run"));
+    assert_eq!(retry_duration(DRAINING_RETRY_BUDGET_MS), "10m");
+}
+
+#[tokio::test]
+async fn runon_draining_retry_after_is_honoured() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(300),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let started = Instant::now();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    draining_phase(&registry, &task).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(exec_runs(&daemon).len(), 1, "must not resubmit early");
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.exit_code, Some(0));
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(exec_runs(&daemon).len(), 2);
+}
+
+#[tokio::test]
+async fn runon_draining_retry_only_draining() {
+    let daemon = daemon(
+        Script::DiskFull {
+            refusals: 2,
+            retry_after_ms: Some(20),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(dir.path(), 300);
+    let registry = registry();
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
+    assert_runon_refusal(&refusal_response(done), "runner_disk_full (maintenance)");
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn runon_draining_kill_stops_retries() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(500),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(dir.path(), 1000);
+    let registry = registry();
+    let task_id = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    draining_phase(&registry, &task_id).await;
+    let killing = registry.clone();
+    let killed_id = task_id.clone();
+    let killed = tokio::time::timeout(
+        Duration::from_millis(200),
+        tokio::task::spawn_blocking(move || killing.kill(&killed_id, "session")),
+    )
+    .await
+    .expect("kill must interrupt retry sleep immediately")
+    .unwrap()
+    .unwrap();
+    assert_eq!(killed.info.status, BgTaskStatus::Killed);
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "kill must veto any new exec.run"
+    );
+}
+
+#[tokio::test]
+async fn runon_draining_restart_preserves_remaining_budget_and_request() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_draining_budget(dir.path(), 600);
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
+    draining_phase(&original, &task_id).await;
+    let task = original.task(&task_id).unwrap();
+    let saved = read_task(&task.paths.json).unwrap();
+    let retry = saved.remote.as_ref().unwrap().retry.as_ref().unwrap();
+    assert_eq!(retry.attempts, 1);
+    let first = retry.first_refusal_at_ms.unwrap();
+    assert!(!serde_json::to_string(&saved)
+        .unwrap()
+        .contains("private-value-proof"));
+    let request = restore_retry_request(&task, &retry.request_digest).unwrap();
+    assert_eq!(
+        serde_json::to_value(request).unwrap()["env"]["REMOTE_REQUEST_PRIVATE_VALUE"],
+        "private-value-proof"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = tokio::time::timeout(Duration::from_millis(400), terminal(&restarted, &task_id))
+        .await
+        .expect("restart must use remaining budget, not another full budget");
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    let restored = read_task(&task.paths.json).unwrap();
+    let retry = restored.remote.unwrap().retry.unwrap();
+    assert_eq!(retry.first_refusal_at_ms, Some(first));
+    assert_eq!(retry.attempts, 1);
+    assert!(retry.waited_ms.unwrap() >= 600);
+}
+
+#[tokio::test]
+async fn runon_draining_restart_resubmits_and_accepts() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(200),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let task = start_runon_retry(&original, dir.path(), daemon.connection.clone());
+    draining_phase(&original, &task).await;
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{done:?}");
+    let requests = exec_runs(&daemon);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["params"], requests[1]["params"]);
+}
+
+#[test]
+fn draining_default_backoff_is_bounded() {
+    for (attempt, expected) in [
+        (1, 5000),
+        (2, 10000),
+        (3, 20000),
+        (4, 40000),
+        (5, 60000),
+        (100, 60000),
+    ] {
+        assert_eq!(draining_delay_ms(attempt, None), expected);
+    }
+    assert_eq!(draining_delay_ms(100, Some(17)), 17);
+    assert_eq!(draining_delay_ms(1, Some(0)), 0);
+}
+
+#[tokio::test]
+async fn runon_draining_restart_obeys_persisted_cancel() {
+    let daemon = daemon(
+        Script::Draining {
+            refusals: u32::MAX,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
+    draining_phase(&original, &task_id).await;
+    let task = original.task(&task_id).unwrap();
+    original.record_remote_cancel(&task).unwrap();
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed, "{done:?}");
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn runon_draining_restart_does_not_resubmit_ambiguous_dispatch() {
+    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+        Script::Draining {
+            refusals: 1,
+            retry_after_ms: Some(10_000),
+        },
+        "exec-remote/v1",
+        2,
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    stopped_draining_roots()
+        .lock()
+        .unwrap()
+        .insert(dir.path().into());
+    let original = registry();
+    let task_id = start_runon_retry(&original, dir.path(), daemon.connection.clone());
+    draining_phase(&original, &task_id).await;
+    let task = original.task(&task_id).unwrap();
+    let mut saved = read_task(&task.paths.json).unwrap();
+    let remote = saved.remote.as_mut().unwrap();
+    remote.terminal = None;
+    remote.job_id = None;
+    remote.retry.as_mut().unwrap().attempts = 2;
+    write_task(&task.paths.json, &saved).unwrap();
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::FateUnknown, "{done:?}");
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "missing acceptance must never authorize resubmission"
+    );
 }

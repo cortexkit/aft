@@ -64,6 +64,14 @@ pub(crate) enum Script {
     KnownRefused,
     WorkspaceSetupRefused,
     RefusedWithDetail,
+    Draining {
+        refusals: u32,
+        retry_after_ms: Option<u64>,
+    },
+    DiskFull {
+        refusals: u32,
+        retry_after_ms: Option<u64>,
+    },
     FutureOutcome,
     Expired,
     Utf8,
@@ -121,6 +129,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
     let server_key = key.clone();
     let claim = claim.to_string();
     let server = tokio::spawn(async move {
+        let mut runs = 0;
         for _ in 0..clients {
             let (mut socket, _) = listener.accept().await.unwrap();
             subc_transport::authenticate_server(
@@ -168,17 +177,20 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                     match body["method"].as_str().unwrap() {
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
+                            if !attaching { runs += 1; }
+                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } if runs <= refusals);
                             if attaching && matches!(script, Script::AttachDisconnected) {
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 }))).unwrap()));
-                            
+
                             }
                              let outcome = if matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { Outcome::Exit { code: 7 } }
                                  else if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
-                                else if attaching && cancelled { Outcome::Signal { signal: 15 } }
+                                else if draining { Outcome::RefusedBeforeStart { reason: if matches!(script, Script::DiskFull { .. }) { RefusalReason::RunnerDiskFull } else { RefusalReason::RunnerDraining } } }
+                                 else if attaching && cancelled { Outcome::Signal { signal: 15 } }
                                 else { match script {
                                     Script::Lost => Outcome::OutcomeUnknown,
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
@@ -221,6 +233,12 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                         let mut value = serde_json::to_value(&terminal).unwrap();
                                         value["refusal_detail"] = json!("runner says:\nmaintenance\twindow");
                                         terminal = serde_json::from_value(value).unwrap();
+                                    }
+                                    if draining {
+                                        if let Script::Draining { retry_after_ms, .. } | Script::DiskFull { retry_after_ms, .. } = script {
+                                            terminal.retry_after_ms = retry_after_ms;
+                                            terminal.refusal_detail = Some("maintenance".into());
+                                        }
                                     }
                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
