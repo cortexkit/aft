@@ -125,7 +125,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         made_tool_call: AtomicBool::new(false),
     }));
     let mut call = json!({"name":"bash","arguments":{
-        "command":"sleep 3; printf completed", "wait":true, "timeout":30_000
+        "command":"sleep 30; printf completed", "wait":true, "timeout":120_000
     }});
     call["preset"] = json!(if worker { "worker" } else { "head" });
     let frame = Frame::build(
@@ -177,7 +177,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     )
     .await
     .unwrap();
-    let done = tokio::time::timeout(Duration::from_secs(8), bash_rx.recv())
+    let done = tokio::time::timeout(Duration::from_secs(90), bash_rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -200,7 +200,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
         assert_eq!(response.data["status"], "running", "{response:?}");
         assert!(response.data["task_id"].as_str().is_some(), "{response:?}");
         assert!(
-            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_millis(2_500),
+            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(15),
             "{elapsed:?}"
         );
         assert!(

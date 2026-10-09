@@ -1693,6 +1693,7 @@ impl ToolProviderSubject for Subject {
             Capability::Cancellation,
             Capability::CallKey,
             Capability::SchemaPin,
+            Capability::SystemText,
         ])
     }
     fn plain_stamp(&self) -> RouteStamp {
@@ -1709,6 +1710,13 @@ impl ToolProviderSubject for Subject {
             Some(preset) => json!({ "preset": preset }),
             None => json!({}),
         }
+    }
+    fn system_text_catalog_arguments(&self) -> Option<Value> {
+        let preset = self.preset.unwrap_or("head");
+        Some(json!({
+            "preset": preset,
+            "system_text": {"preset": preset, "params": {}}
+        }))
     }
     fn quick_call(&self) -> CallSpec {
         // The quick call's tool must be in the catalog under test, and the

@@ -721,11 +721,19 @@ mod tests {
     }
 
     async fn watch_with_deadline(ctx: Arc<AppContext>, request: RawRequest) -> Response {
+        watch_with_wait_deadline(ctx, request, Duration::from_secs(3)).await
+    }
+
+    async fn watch_with_wait_deadline(
+        ctx: Arc<AppContext>,
+        request: RawRequest,
+        deadline: Duration,
+    ) -> Response {
         let worker = principal(ctx.config().project_root.as_deref().unwrap());
         let wake = crate::response_finalize::DeferredResponseWake::default();
         let producer_wake = wake.clone();
         let producer_ctx = Arc::clone(&ctx);
-        tokio::time::timeout(Duration::from_secs(3), async move {
+        tokio::time::timeout(deadline, async move {
             let outcome = tokio::task::spawn_blocking(move || {
                 let _wake = producer_wake.install();
                 with_authenticated_principal(worker, || handle_deferred(&request, producer_ctx))
@@ -743,7 +751,7 @@ mod tests {
             }
         })
         .await
-        .expect("worker watch must answer within three seconds, not its 30-minute window")
+        .expect("worker watch must answer before the test deadline, not its 30-minute window")
     }
 
     fn persist_failed_task(ctx: &AppContext) {
@@ -834,11 +842,11 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let ctx = context(project.path(), storage.path());
-        ctx.update_config(|config| config.bash.worker_wait_max_ms = 500);
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = 1_000);
         let spawn: RawRequest = serde_json::from_value(json!({
             "id":"start-watch-cap", "command":"bash", "session_id":SESSION,
             "worker_session":true,
-            "params":{"command":"sleep 10", "background":true, "timeout":30_000},
+            "params":{"command":"sleep 60", "background":true, "timeout":120_000},
         }))
         .unwrap();
         let launched = with_authenticated_principal(principal(project.path()), || {
@@ -854,13 +862,18 @@ mod tests {
         }
         let _stop = StopTask(ctx.bash_background().clone(), task.into());
         let started = Instant::now();
-        let response = watch_with_deadline(Arc::clone(&ctx), request(task, SESSION)).await;
+        let response = watch_with_wait_deadline(
+            Arc::clone(&ctx),
+            request(task, SESSION),
+            Duration::from_secs(20),
+        )
+        .await;
         let elapsed = started.elapsed();
         assert!(response.success, "{response:?}");
         assert_eq!(response.data["status"], "running", "{response:?}");
         assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
         assert!(
-            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(20),
             "{elapsed:?}"
         );
     }

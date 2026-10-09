@@ -1853,6 +1853,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn worker_shell_calls_with_old_semantics_pins_are_refused() {
+        for name in ["bash", "bash_watch"] {
+            let tool = tools_for_session(CatalogPreset::Worker, &[], true, false)
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap();
+            let arguments = if name == "bash" {
+                json!({"command":"echo"})
+            } else {
+                json!({"taskId":"bash-0123456789abcdef"})
+            };
+            let mut request = call(name, arguments);
+            request.preset = Some("worker".into());
+            request.schema_pin = Some(
+                SchemaPin::new(name, &tool.schema_digest, 1)
+                    .encode()
+                    .unwrap(),
+            );
+            let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
+            assert_eq!(refusal.code, "tool_semantics_changed");
+            assert_eq!(
+                refusal.detail.unwrap(),
+                json!({"tool":name,"expected":1,"current":2})
+            );
+            request.schema_pin = Some(
+                SchemaPin::new(name, &tool.schema_digest, 2)
+                    .encode()
+                    .unwrap(),
+            );
+            assert_eq!(
+                admit(&request, false, &[], true, "session", true).unwrap(),
+                CallerRole::Worker
+            );
+            request.schema_pin = None;
+            assert_eq!(
+                admit(&request, false, &[], true, "session", true).unwrap(),
+                CallerRole::Worker
+            );
+        }
+    }
+
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
 
     /// The catalog goldens: the `head` file AFT pinned before presets existed,
