@@ -7517,7 +7517,7 @@ impl BgTaskRegistry {
             output_preview = format!("{note}\n{output_preview}");
         }
         append_remote_report(&mut output_preview, metadata);
-        if metadata.status == BgTaskStatus::FateUnknown {
+        if metadata.status == BgTaskStatus::Failed || metadata.status == BgTaskStatus::FateUnknown {
             if let Some(reason) = metadata.status_reason.as_deref() {
                 output_preview = if output_preview.is_empty() {
                     reason.to_string()
@@ -10928,6 +10928,41 @@ mod tests {
         let preview = &completions[0].output_preview;
         assert!(preview.contains("HEAD-SIGNAL"), "preview was {preview:?}");
         assert!(preview.contains("TAIL-SIGNAL"), "preview was {preview:?}");
+    }
+
+    #[test]
+    fn failed_spawn_completion_includes_the_spawn_reason() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = random_slug();
+        let paths = task_paths(dir.path(), "session", &task_id).unwrap();
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(&paths.stdout, "").unwrap();
+        fs::write(&paths.stderr, "").unwrap();
+        let reason = "failed to spawn background bash command: No such file or directory";
+        let mut metadata = PersistedTask::starting(
+            task_id.clone(),
+            "session".to_string(),
+            "git status --short".to_string(),
+            dir.path().to_path_buf(),
+            Some(dir.path().to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.mark_terminal(BgTaskStatus::Failed, None, Some(reason.to_string()));
+        write_task(&paths.json, &metadata).unwrap();
+        registry
+            .insert_rehydrated_task(metadata, paths, true)
+            .expect("insert failed task");
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+
+        registry.post_terminal_transition(&task, true).unwrap();
+        let completions = registry.drain_completions_for_session(Some("session"));
+
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].status_reason.as_deref(), Some(reason));
+        assert!(completions[0].output_preview.contains(reason));
     }
 
     #[test]

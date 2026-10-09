@@ -275,6 +275,7 @@ mod tests {
     const RUNNING_TASK: &str = "bash-0000000000000002";
     const COMPLETED_TASK: &str = "bash-0000000000000003";
     const DELIVERED_TASK: &str = "bash-0000000000000004";
+    const FAILED_TASK: &str = "bash-0000000000000005";
     const SESSION: &str = "restore-session";
     const FUTURE_VERSION: u64 = crate::bash_background::persistence::SCHEMA_VERSION as u64 + 1;
 
@@ -344,12 +345,30 @@ mod tests {
             let running = normal(RUNNING_TASK, false, false);
             normal(COMPLETED_TASK, true, false);
             let delivered = normal(DELIVERED_TASK, true, true);
+            let failed = create_task_layout(&task_storage, SESSION, FAILED_TASK).unwrap();
+            let mut failed_metadata = PersistedTask::starting(
+                FAILED_TASK.into(),
+                SESSION.into(),
+                "git status --short".into(),
+                project.clone(),
+                Some(project.clone()),
+                None,
+                true,
+                false,
+            );
+            failed_metadata.harness = Some(harness.storage_segment());
+            failed_metadata.mark_terminal(
+                BgTaskStatus::Failed,
+                None,
+                Some("failed to spawn background bash command: No such file or directory".into()),
+            );
+            write_task_at(&failed, &failed_metadata).unwrap();
             // Bypass the GC grace period, using real artifacts rather than a
             // mocked reader, so the future record is first in the task sweep.
             let old = filetime::FileTime::from_system_time(
                 SystemTime::now() - Duration::from_secs(2 * 24 * 60 * 60),
             );
-            for paths in [&future.paths, &running, &delivered] {
+            for paths in [&future.paths, &running, &delivered, &failed.paths] {
                 filetime::set_file_mtime(&paths.json, old).unwrap();
             }
             Self {
@@ -563,6 +582,20 @@ mod tests {
             let health = fixture.ctx.build_status_snapshot();
             assert!(health["storage_refusals"].as_array().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn bash_status_returns_failed_task_reason_in_structured_data() {
+        let fixture = RestoreFixture::new(Harness::Pi);
+
+        let response = fixture.status(FAILED_TASK, SESSION);
+
+        assert!(response.success, "{:?}", response.data);
+        assert_eq!(response.data["status"], "failed");
+        assert_eq!(
+            response.data["status_reason"],
+            "failed to spawn background bash command: No such file or directory"
+        );
     }
 
     #[test]

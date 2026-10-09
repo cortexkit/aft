@@ -902,7 +902,7 @@ async function formatBashStatusText(
   if (typeof data.live_descendants_summary === "string") {
     text += ` · ${data.live_descendants_summary}`;
   }
-  if (data.output_incomplete === true) {
+  if (data.output_incomplete === true || (status === "failed" && data.status_reason)) {
     const reason =
       typeof data.status_reason === "string" && data.status_reason
         ? data.status_reason

@@ -1411,6 +1411,20 @@ describe("bash_status tool", () => {
     }
   });
 
+  test("failed bash_status includes a task's spawn reason", async () => {
+    const reason = "failed to spawn background bash command: No such file or directory";
+    const { statusTool } = makeCtx(() => ({
+      success: true,
+      status: "failed",
+      exit_code: null,
+      status_reason: reason,
+    }));
+
+    const text = await statusTool.execute({ taskId: "bash-failed-spawn" }, createMockSdkContext());
+
+    expect(text).toContain(reason);
+  });
+
   test("default sync cap rejects 120001 with the config knob in the error", async () => {
     const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
 

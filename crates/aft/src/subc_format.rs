@@ -1060,12 +1060,14 @@ fn format_bash_status(
     if let Some(summary) = data.get("live_descendants_summary").and_then(Value::as_str) {
         text.push_str(&format!(" · {summary}"));
     }
-    if data.get("output_incomplete").and_then(Value::as_bool) == Some(true) {
-        let reason = data
-            .get("status_reason")
-            .and_then(Value::as_str)
-            .filter(|reason| !reason.is_empty())
-            .unwrap_or("PTY output may be incomplete");
+    let status_reason = data
+        .get("status_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty());
+    if data.get("output_incomplete").and_then(Value::as_bool) == Some(true)
+        || (status == "failed" && status_reason.is_some())
+    {
+        let reason = status_reason.unwrap_or("PTY output may be incomplete");
         text.push_str(&format!("\n[{reason}]"));
     }
     let running = status == "running";
@@ -4471,6 +4473,22 @@ mod bash_companion_format_tests {
                 assert!(text.contains(reason), "status text: {text}");
             }
         }
+    }
+
+    #[test]
+    fn failed_bash_status_renders_its_reason_without_incomplete_output() {
+        let reason = "failed to spawn background bash command: No such file or directory";
+        let text = status_text(
+            json!({
+                "task_id": "bash-1",
+                "status": "failed",
+                "mode": "pipes",
+                "status_reason": reason,
+            }),
+            None,
+        );
+
+        assert_eq!(text, format!("Task bash-1: failed\n[{reason}]"));
     }
 
     #[test]

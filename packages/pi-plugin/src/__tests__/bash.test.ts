@@ -1585,6 +1585,26 @@ describe("bash tool adapter", () => {
     }
   });
 
+  test("bash_status text includes a failed task's spawn reason", async () => {
+    const reason = "failed to spawn background bash command: No such file or directory";
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({
+      status: "failed",
+      exit_code: null,
+      status_reason: reason,
+    });
+    registerBashTool(api, makeMockContext(bridge));
+
+    const result = await tools
+      .get("bash_status")!
+      .execute("call", { task_id: "bash-failed-spawn" }, undefined, undefined, {
+        cwd: projectRoot,
+      });
+
+    expect(toolText(result)).toContain(reason);
+  });
+
   test("bash_watch pattern substring returns waited matched details", async () => {
     const outputPath = await spill("alpha ready beta\n");
     try {

@@ -1811,7 +1811,7 @@ async function formatBashStatus(
   if (details.live_descendants_summary) {
     text += ` · ${details.live_descendants_summary}`;
   }
-  if (details.output_incomplete) {
+  if (details.output_incomplete || (details.status === "failed" && details.status_reason)) {
     text += `\n[${details.status_reason || "PTY output may be incomplete"}]`;
   }
   if (details.waited)
