@@ -3,7 +3,9 @@
 //! reaching the fill through both the watcher and AFT's own writes.
 
 use super::*;
-use crate::semantic_index::{EmbedTextCaps, SemanticIndex, SemanticResult};
+use crate::semantic_index::{
+    EmbedTextCaps, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex, SemanticResult,
+};
 use std::sync::atomic::AtomicUsize;
 
 const FILES: &[(&str, &str)] = &[
@@ -1422,6 +1424,71 @@ fn live_view_fill_progress_is_visible_before_each_model_call() {
             .iter()
             .any(|job| job.root == root.path().to_string_lossy())
     );
+}
+
+struct DelayedLocalProvider {
+    delay: Duration,
+}
+
+impl LocalEmbeddingProvider for DelayedLocalProvider {
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        std::thread::sleep(self.delay);
+        Ok(texts.iter().map(|text| vector(text)).collect())
+    }
+}
+
+#[test]
+fn semantic_view_fill_summary_reports_backend_embedding_timing() {
+    let storage = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    write_tree(root.path(), FILES);
+    let (slot, epoch, _wake, runtime) = served_lane(storage.path(), root.path());
+    let schedule = fast_schedule(root.path());
+    let delay = Duration::from_millis(30);
+    let mut model = SemanticEmbeddingModel::from_local_provider_for_test(
+        Box::new(DelayedLocalProvider { delay }),
+        root.path().to_path_buf(),
+    );
+    let mut calls = 0;
+
+    let (outcome, lines) = crate::logging::capture_log_lines(|| {
+        catch_up(
+            &Arc::downgrade(&slot),
+            epoch,
+            &runtime,
+            &schedule,
+            FillBudget {
+                max_files: 1,
+                max_batch: 1,
+                ..FillBudget::default()
+            },
+            &mut |texts| {
+                calls += 1;
+                model.embed(texts)
+            },
+        )
+    });
+
+    assert!(matches!(outcome, FillOutcome::Settled));
+    assert!(calls > 0, "{lines:?}");
+    let summary = lines
+        .iter()
+        .find(|line| line.contains("INFO semantic view fill"))
+        .unwrap_or_else(|| panic!("missing view fill summary in {lines:?}"));
+    for field in ["elapsed_ms=", "embed_ms=", "embed_max_ms="] {
+        assert!(summary.contains(field), "{summary}");
+    }
+    let field = |name: &str| -> u128 {
+        summary
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("missing {name} in {summary}"))
+            .parse()
+            .unwrap()
+    };
+    assert!(field("embed_ms") >= delay.as_millis(), "{summary}");
+    assert!(field("embed_max_ms") >= delay.as_millis(), "{summary}");
+    assert!(field("elapsed_ms") >= field("embed_ms"), "{summary}");
 }
 
 /// A lane whose checkout is loaded and served, as the worker leaves it.

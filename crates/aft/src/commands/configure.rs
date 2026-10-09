@@ -1278,6 +1278,8 @@ fn spawn_semantic_refresh_worker(
                         )
                     })
                 };
+                let refresh_started = Instant::now();
+                let embedding_timing_scope = crate::semantic_index::EmbeddingTimingScope::new();
                 let refresh_result = index.refresh_invalidated_files_with_blob_reuse(
                     &project_root,
                     &paths,
@@ -1287,6 +1289,9 @@ fn spawn_semantic_refresh_worker(
                     &mut progress,
                     &mut reuse_blob,
                 );
+                let elapsed_ms = refresh_started.elapsed().as_millis();
+                let embedding_timing = embedding_timing_scope.snapshot();
+                drop(embedding_timing_scope);
                 index_memory.update(&index);
                 if embed_batches > 0 {
                     let files = refresh_result
@@ -1294,23 +1299,29 @@ fn spawn_semantic_refresh_worker(
                         .map(|update| update.summary.changed.saturating_add(update.summary.added))
                         .unwrap_or(paths.len());
                     slog_info!(
-                        "semantic embedder refresh: root=\"{}\" reason=\"watcher batch\" files={} chunks={} batches={} backend={}",
+                        "semantic embedder refresh: root=\"{}\" reason=\"watcher batch\" files={} chunks={} batches={} backend={} elapsed_ms={} embed_ms={} embed_max_ms={}",
                         project_root.display(),
                         files,
                         embedded_chunks,
                         embed_batches,
                         backend,
+                        elapsed_ms,
+                        embedding_timing.total_ms(),
+                        embedding_timing.max_ms(),
                     );
                 }
                 match refresh_result {
                     Ok(update) => {
                         if !update.summary.is_noop() {
                             slog_info!(
-                                "semantic refresh: {} changed, {} new, {} deleted, {} total processed",
+                                "semantic refresh: {} changed, {} new, {} deleted, {} total processed elapsed_ms={} embed_ms={} embed_max_ms={}",
                                 update.summary.changed,
                                 update.summary.added,
                                 update.summary.deleted,
                                 update.summary.total_processed,
+                                elapsed_ms,
+                                embedding_timing.total_ms(),
+                                embedding_timing.max_ms(),
                             );
                         }
                         if event_tx

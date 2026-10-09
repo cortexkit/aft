@@ -23,6 +23,7 @@ use std::fmt::Display;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
@@ -46,6 +47,189 @@ const BUILD_BACKEND_RETRY_SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
 // so the grace must cover a whole attempt; a loop that exits clears the
 // status explicitly, so the grace only ever bounds a loop that died.
 const BUILD_BACKEND_STATUS_EXPIRY_GRACE_MS: u64 = 5 * 60 * 1_000;
+const SLOW_EMBED_WARNING_THRESHOLD: Duration = Duration::from_secs(5);
+const SLOW_EMBED_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct EmbeddingTiming {
+    total: Duration,
+    max: Duration,
+}
+
+impl EmbeddingTiming {
+    pub(crate) fn total_ms(self) -> u128 {
+        self.total.as_millis()
+    }
+
+    pub(crate) fn max_ms(self) -> u128 {
+        self.max.as_millis()
+    }
+
+    fn record(&mut self, elapsed: Duration) {
+        self.total = self.total.saturating_add(elapsed);
+        self.max = self.max.max(elapsed);
+    }
+}
+
+thread_local! {
+    static ACTIVE_EMBEDDING_TIMINGS: RefCell<Vec<Rc<RefCell<EmbeddingTiming>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Collects backend-call durations made synchronously inside one fill or refresh.
+pub(crate) struct EmbeddingTimingScope {
+    timing: Rc<RefCell<EmbeddingTiming>>,
+}
+
+impl EmbeddingTimingScope {
+    pub(crate) fn new() -> Self {
+        let timing = Rc::new(RefCell::new(EmbeddingTiming::default()));
+        ACTIVE_EMBEDDING_TIMINGS.with(|active| active.borrow_mut().push(Rc::clone(&timing)));
+        Self { timing }
+    }
+
+    pub(crate) fn snapshot(&self) -> EmbeddingTiming {
+        *self.timing.borrow()
+    }
+}
+
+impl Drop for EmbeddingTimingScope {
+    fn drop(&mut self) {
+        ACTIVE_EMBEDDING_TIMINGS.with(|active| {
+            let removed = active.borrow_mut().pop();
+            debug_assert!(removed.is_some_and(|timing| Rc::ptr_eq(&timing, &self.timing)));
+        });
+    }
+}
+
+#[derive(Default)]
+struct SlowEmbeddingWarningState {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+#[derive(Default)]
+struct SlowEmbeddingWarningLimiter {
+    by_backend: Mutex<HashMap<&'static str, SlowEmbeddingWarningState>>,
+}
+
+impl SlowEmbeddingWarningLimiter {
+    fn permit(&self, backend: &'static str, now: Instant) -> Option<u64> {
+        let mut by_backend = self
+            .by_backend
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = by_backend.entry(backend).or_default();
+        if state
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < SLOW_EMBED_WARNING_INTERVAL)
+        {
+            state.suppressed = state.suppressed.saturating_add(1);
+            return None;
+        }
+
+        state.last_warning = Some(now);
+        Some(std::mem::take(&mut state.suppressed))
+    }
+}
+
+static SLOW_EMBED_WARNING_LIMITER: OnceLock<SlowEmbeddingWarningLimiter> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SLOW_EMBED_WARNING_LIMITER: RefCell<Option<Rc<SlowEmbeddingWarningLimiter>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn with_slow_embedding_warning_limiter_for_test<R>(
+    limiter: Rc<SlowEmbeddingWarningLimiter>,
+    action: impl FnOnce() -> R,
+) -> R {
+    let previous = TEST_SLOW_EMBED_WARNING_LIMITER.with(|slot| slot.replace(Some(limiter)));
+    struct Restore(Option<Rc<SlowEmbeddingWarningLimiter>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_SLOW_EMBED_WARNING_LIMITER.with(|slot| {
+                slot.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(previous);
+    action()
+}
+
+fn log_slow_embedding_warning(
+    limiter: &SlowEmbeddingWarningLimiter,
+    backend: SemanticBackend,
+    model: &str,
+    text_count: usize,
+    elapsed: Duration,
+    now: Instant,
+) {
+    if elapsed < SLOW_EMBED_WARNING_THRESHOLD {
+        return;
+    }
+    if let Some(suppressed) = limiter.permit(backend.as_str(), now) {
+        slog_warn!(
+            "slow semantic embedding backend={} model={} texts={} elapsed_ms={} suppressed={}",
+            backend.as_str(),
+            model,
+            text_count,
+            elapsed.as_millis(),
+            suppressed
+        );
+    }
+}
+
+fn record_embedding_call(
+    backend: SemanticBackend,
+    model: &str,
+    text_count: usize,
+    elapsed: Duration,
+    query: bool,
+) {
+    ACTIVE_EMBEDDING_TIMINGS.with(|active| {
+        for timing in active.borrow().iter() {
+            timing.borrow_mut().record(elapsed);
+        }
+    });
+
+    if elapsed >= SLOW_EMBED_WARNING_THRESHOLD {
+        let now = Instant::now();
+        #[cfg(test)]
+        if let Some(limiter) = TEST_SLOW_EMBED_WARNING_LIMITER.with(|slot| slot.borrow().clone()) {
+            log_slow_embedding_warning(&limiter, backend, model, text_count, elapsed, now);
+        } else {
+            log_slow_embedding_warning(
+                SLOW_EMBED_WARNING_LIMITER.get_or_init(SlowEmbeddingWarningLimiter::default),
+                backend,
+                model,
+                text_count,
+                elapsed,
+                now,
+            );
+        }
+        #[cfg(not(test))]
+        log_slow_embedding_warning(
+            SLOW_EMBED_WARNING_LIMITER.get_or_init(SlowEmbeddingWarningLimiter::default),
+            backend,
+            model,
+            text_count,
+            elapsed,
+            now,
+        );
+    }
+
+    if query && log::log_enabled!(target: "aft::semantic_index", log::Level::Debug) {
+        log::debug!(
+            target: "aft::semantic_index",
+            "semantic query embedding backend={} model={} texts={} elapsed_ms={}",
+            backend.as_str(),
+            model,
+            text_count,
+            elapsed.as_millis()
+        );
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct EmbeddingBackendBuildHealth {
@@ -491,6 +675,7 @@ fn finish_semantic_index_build(
     scope: &crate::logging::IndexBuildScope,
     failure_guard: &mut crate::logging::IndexBuildFailureGuard,
     result: &Result<SemanticIndex, String>,
+    embedding_timing: EmbeddingTiming,
 ) {
     match result {
         Ok(index) => {
@@ -503,7 +688,9 @@ fn finish_semantic_index_build(
                 .field("elapsed_ms", scope.elapsed_ms())
                 .field("files", index.file_mtimes.len())
                 .field("chunks", index.entries.len())
-                .field("skipped_rows", index.skipped_rows),
+                .field("skipped_rows", index.skipped_rows)
+                .field("embed_ms", embedding_timing.total_ms())
+                .field("embed_max_ms", embedding_timing.max_ms()),
             );
             failure_guard.disarm();
         }
@@ -2690,6 +2877,8 @@ impl SemanticEmbeddingModel {
         } else {
             0
         };
+        let text_count = texts.len();
+        let backend_started = Instant::now();
         let local_query_result = if cached_vectors.is_none() {
             match policy {
                 EmbeddingRequestPolicy::Query(budget)
@@ -2726,10 +2915,17 @@ impl SemanticEmbeddingModel {
             return Ok(vectors);
         }
         if let Some(result) = local_query_result {
+            record_embedding_call(
+                self.backend,
+                &self.model,
+                text_count,
+                backend_started.elapsed(),
+                matches!(policy, EmbeddingRequestPolicy::Query(_)),
+            );
             return result;
         }
 
-        let result = match &mut self.engine {
+        let result = (|| match &mut self.engine {
             SemanticEmbeddingEngine::Local(engine) => engine
                 .model
                 .lock()
@@ -2891,7 +3087,15 @@ impl SemanticEmbeddingModel {
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
-        };
+        })();
+
+        record_embedding_call(
+            self.backend,
+            &self.model,
+            text_count,
+            backend_started.elapsed(),
+            matches!(policy, EmbeddingRequestPolicy::Query(_)),
+        );
 
         if let (Some(query), Ok(vectors)) = (query_cache_key, &result) {
             if let Some(vector) = vectors.first() {
@@ -5259,6 +5463,8 @@ impl SemanticIndex {
         max_batch_size: usize,
         mut progress: Option<&mut P>,
         should_continue: &mut C,
+        elapsed_started: Instant,
+        embedding_timing: &EmbeddingTimingScope,
     ) -> Result<Self, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -5401,17 +5607,21 @@ impl SemanticIndex {
             }
         }
 
-        let embed_ms = embed_started.elapsed().as_millis();
+        let embed_phase_ms = embed_started.elapsed().as_millis();
         let rate = (total_chunks as u128 * 1000)
-            .checked_div(embed_ms)
+            .checked_div(embed_phase_ms)
             .unwrap_or(0) as u64;
+        let embedding_timing = embedding_timing.snapshot();
         slog_info!(
-            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_rows={}",
+            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_rows={} elapsed_ms={} embed_ms={} embed_max_ms={}",
             total_chunks,
             batch_count,
-            embed_ms,
+            embed_phase_ms,
             rate,
             skipped_rows,
+            elapsed_started.elapsed().as_millis(),
+            embedding_timing.total_ms(),
+            embedding_timing.max_ms(),
         );
 
         let dimension = entries
@@ -5480,6 +5690,8 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        let elapsed_started = Instant::now();
+        let embedding_timing = EmbeddingTimingScope::new();
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
         let _progress = crate::cold_build_limiter::progress::start(
             project_root,
@@ -5498,8 +5710,15 @@ impl SemanticIndex {
             max_batch_size,
             Option::<&mut fn(usize, usize)>::None,
             &mut should_continue,
+            elapsed_started,
+            &embedding_timing,
         );
-        finish_semantic_index_build(&scope, &mut failure_guard, &result);
+        finish_semantic_index_build(
+            &scope,
+            &mut failure_guard,
+            &result,
+            embedding_timing.snapshot(),
+        );
         result
     }
 
@@ -5515,6 +5734,8 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        let elapsed_started = Instant::now();
+        let embedding_timing = EmbeddingTimingScope::new();
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
         let _progress = crate::cold_build_limiter::progress::start(
             project_root,
@@ -5536,8 +5757,15 @@ impl SemanticIndex {
             max_batch_size,
             Some(progress),
             &mut should_continue,
+            elapsed_started,
+            &embedding_timing,
         );
-        finish_semantic_index_build(&scope, &mut failure_guard, &result);
+        finish_semantic_index_build(
+            &scope,
+            &mut failure_guard,
+            &result,
+            embedding_timing.snapshot(),
+        );
         result
     }
 
@@ -5582,6 +5810,8 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         C: FnMut() -> bool,
     {
+        let elapsed_started = Instant::now();
+        let embedding_timing = EmbeddingTimingScope::new();
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
         let _progress = crate::cold_build_limiter::progress::start(
             project_root,
@@ -5601,8 +5831,15 @@ impl SemanticIndex {
             max_batch_size,
             Some(progress),
             should_continue,
+            elapsed_started,
+            &embedding_timing,
         );
-        finish_semantic_index_build(&scope, &mut failure_guard, &result);
+        finish_semantic_index_build(
+            &scope,
+            &mut failure_guard,
+            &result,
+            embedding_timing.snapshot(),
+        );
         result
     }
 
@@ -9727,6 +9964,17 @@ mod tests {
         }
     }
 
+    struct SleepingLocalProvider {
+        delay: Duration,
+    }
+
+    impl LocalEmbeddingProvider for SleepingLocalProvider {
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            thread::sleep(self.delay);
+            Ok(vec![vec![0.25, 0.5, 0.75]; texts.len()])
+        }
+    }
+
     #[test]
     fn local_build_embeddings_stay_on_the_build_caller_and_run_once() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9756,6 +10004,99 @@ mod tests {
                 .as_slice(),
             &[caller]
         );
+    }
+
+    #[test]
+    fn semantic_embedding_timing_is_reported_and_slow_calls_are_rate_limited() {
+        let project = tempfile::tempdir().unwrap();
+        let source = project.path().join("lib.rs");
+        fs::write(&source, "pub fn measured_embedding() -> u32 { 1 }\n").unwrap();
+        let delay = Duration::from_secs(5);
+        let mut model = SemanticEmbeddingModel::from_local_provider_for_test(
+            Box::new(SleepingLocalProvider { delay }),
+            project.path().to_path_buf(),
+        );
+
+        let limiter = Rc::new(SlowEmbeddingWarningLimiter::default());
+        let (index, lines) = with_slow_embedding_warning_limiter_for_test(limiter, || {
+            crate::logging::capture_log_lines(|| {
+                let index = SemanticIndex::build(
+                    project.path(),
+                    std::slice::from_ref(&source),
+                    &mut |texts| model.embed(texts),
+                    64,
+                )
+                .unwrap();
+                model
+                    .embed(vec!["second delayed call".to_string()])
+                    .unwrap();
+                index
+            })
+        });
+
+        assert!(!index.entries.is_empty());
+        let summary = lines
+            .iter()
+            .find(|line| line.contains("semantic embed:"))
+            .expect("legacy build summary");
+        let field = |name: &str| -> u128 {
+            summary
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("missing {name} in {summary}"))
+                .parse()
+                .unwrap()
+        };
+        assert!(summary.contains("elapsed_ms="));
+        assert!(field("embed_ms") >= delay.as_millis(), "{summary}");
+        assert!(field("embed_max_ms") >= delay.as_millis(), "{summary}");
+        assert!(field("elapsed_ms") >= field("embed_ms"), "{summary}");
+
+        let warnings = lines
+            .iter()
+            .filter(|line| line.starts_with("WARN slow semantic embedding"))
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        assert!(warnings[0].contains("backend=fastembed"));
+        assert!(warnings[0].contains("model=test-local"));
+        assert!(warnings[0].contains("texts=1"));
+        let warning_elapsed_ms = warnings[0]
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix("elapsed_ms="))
+            .unwrap()
+            .parse::<u128>()
+            .unwrap();
+        assert!(warning_elapsed_ms >= delay.as_millis());
+    }
+
+    #[test]
+    fn slow_embedding_warning_reports_suppressed_calls_after_the_interval() {
+        let limiter = SlowEmbeddingWarningLimiter::default();
+        let first = Instant::now();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            for offset in [0, 1, 2] {
+                log_slow_embedding_warning(
+                    &limiter,
+                    SemanticBackend::Fastembed,
+                    "test-model",
+                    3,
+                    Duration::from_secs(5),
+                    first + Duration::from_secs(offset),
+                );
+            }
+            log_slow_embedding_warning(
+                &limiter,
+                SemanticBackend::Fastembed,
+                "test-model",
+                3,
+                Duration::from_secs(5),
+                first + SLOW_EMBED_WARNING_INTERVAL,
+            );
+        });
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("suppressed=0"));
+        assert!(lines[1].contains("suppressed=2"));
     }
 
     #[cfg(unix)]
@@ -14601,6 +14942,8 @@ public class Greeter {
             .collect();
         let mut embed = |texts: Vec<String>| model.embed(texts);
         let mut should_continue = || true;
+        let elapsed_started = Instant::now();
+        let embedding_timing = EmbeddingTimingScope::new();
         SemanticIndex::build_from_chunks(
             root,
             chunks,
@@ -14609,6 +14952,8 @@ public class Greeter {
             64,
             Option::<&mut fn(usize, usize)>::None,
             &mut should_continue,
+            elapsed_started,
+            &embedding_timing,
         )
     }
 
@@ -14643,7 +14988,12 @@ public class Greeter {
         let (result, events) = crate::logging::capture_index_events(|| {
             let (_guard, scope, mut failure_guard) = begin_semantic_index_build(root.path());
             let result = build_chunks_with_model(root.path(), chunks, &mut model);
-            finish_semantic_index_build(&scope, &mut failure_guard, &result);
+            finish_semantic_index_build(
+                &scope,
+                &mut failure_guard,
+                &result,
+                EmbeddingTiming::default(),
+            );
             result
         });
         let index = result.unwrap();
@@ -14725,7 +15075,12 @@ public class Greeter {
             let (_guard, scope, mut failure_guard) = begin_semantic_index_build(root.path());
             let result =
                 build_chunks_with_model(root.path(), vec![normal, unshrinkable], &mut model);
-            finish_semantic_index_build(&scope, &mut failure_guard, &result);
+            finish_semantic_index_build(
+                &scope,
+                &mut failure_guard,
+                &result,
+                EmbeddingTiming::default(),
+            );
             result
         });
         let index = result.unwrap();

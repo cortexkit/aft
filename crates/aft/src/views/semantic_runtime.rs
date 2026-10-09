@@ -1209,7 +1209,13 @@ where
             ));
             crate::cold_build_limiter::progress::phase("embedding", None);
         }
-        match runtime.refresh(budget, embed) {
+        let elapsed_started = Instant::now();
+        let embedding_timing_scope = crate::semantic_index::EmbeddingTimingScope::new();
+        let refresh = runtime.refresh(budget, embed);
+        let embedding_timing = embedding_timing_scope.snapshot();
+        drop(embedding_timing_scope);
+        let elapsed_ms = elapsed_started.elapsed().as_millis();
+        match refresh {
             Ok(report) => {
                 if report.model_calls > 0
                     || report.installed > 0
@@ -1217,7 +1223,7 @@ where
                     || !report.store_errors.is_empty()
                 {
                     crate::slog_info!(
-                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={}",
+                        "semantic view fill root={} queued={} deferred={} embedded_keys={} chunks={} chunk_reused={} texts={} calls={} stored_hits={} resident_hits={} installed={} failed={} errors={} store_errors={} elapsed_ms={} embed_ms={} embed_max_ms={}",
                         schedule.root.display(),
                         report.queued,
                         report.deferred,
@@ -1231,7 +1237,10 @@ where
                         report.installed,
                         report.failed,
                         report.errors.len(),
-                        report.store_errors.len()
+                        report.store_errors.len(),
+                        elapsed_ms,
+                        embedding_timing.total_ms(),
+                        embedding_timing.max_ms()
                     );
                 }
                 let advanced = report.installed > 0 || report.failed > 0;
