@@ -384,18 +384,26 @@ describe("Pi bash_watch caller role", () => {
 });
 
 describe("Pi bash wait:true caller role", () => {
-  async function waitCall(params: Record<string, unknown>, hasUI: boolean) {
+  async function waitCall(
+    params: Record<string, unknown>,
+    hasUI: boolean,
+    config: Record<string, unknown> = {},
+  ) {
     const calls: Array<[Record<string, unknown>, Record<string, unknown> | undefined]> = [];
-    const tool = registeredTool("bash", (_command, sent, options) => {
-      calls.push([sent, options]);
-      return {
-        success: true,
-        status: "completed",
-        task_id: "task-wait",
-        exit_code: 0,
-        output: "ok",
-      };
-    });
+    const tool = registeredTool(
+      "bash",
+      (_command, sent, options) => {
+        calls.push([sent, options]);
+        return {
+          success: true,
+          status: "completed",
+          task_id: "task-wait",
+          exit_code: 0,
+          output: "ok",
+        };
+      },
+      config,
+    );
     await tool.execute("call", { command: "long-build", ...params }, undefined, undefined, {
       cwd: process.cwd(),
       hasUI,
@@ -423,6 +431,20 @@ describe("Pi bash wait:true caller role", () => {
     const [params, options] = await waitCall({ wait: true }, true);
     expect(params).not.toHaveProperty("worker_session");
     expect(options?.transportTimeoutMs).toBe(30 * 60 * 1000 + 10_000);
+  });
+
+  test("a primary's blocking transport budget follows worker_wait_max_ms without extending command timeout", async () => {
+    for (const [timeout, expected] of [
+      [undefined, 7_200_000],
+      [9_000_000, 7_200_000],
+      [45_000, 45_000],
+    ] as const) {
+      const [params, options] = await waitCall({ wait: true, timeout }, true, {
+        bash: { worker_wait_max_ms: 7_200_000 },
+      });
+      expect(params.timeout).toBe(timeout);
+      expect(options?.transportTimeoutMs).toBe(expected + 10_000);
+    }
   });
 
   test("a worker's requests carry its role and the engine's hand-off text gets the bash_watch note", async () => {

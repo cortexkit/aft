@@ -2621,6 +2621,28 @@ describe("OpenCode bash adapter — subagent gating", () => {
     expect(calls[0].options?.transportTimeoutMs).toBe(30 * 60 * 1000 + 10_000);
   });
 
+  test("primary blocking transport budget follows worker_wait_max_ms without extending command timeout", async () => {
+    _resetSubagentCacheForTest();
+    for (const [timeout, expected] of [
+      [undefined, 7_200_000],
+      [9_000_000, 7_200_000],
+      [45_000, 45_000],
+    ] as const) {
+      const { calls, tool: bash } = createHarness(
+        () => ({ success: true, status: "completed", exit_code: 0 }),
+        undefined,
+        false,
+        { bash: { worker_wait_max_ms: 7_200_000 } } as PluginContext["config"],
+      );
+      await bash.execute(
+        { command: "long-build", wait: true, timeout },
+        createMockSdkContext({ sessionID: "ses_primary_cap" }),
+      );
+      expect(calls[0].params.timeout).toBe(timeout);
+      expect(calls[0].options?.transportTimeoutMs).toBe(expected + 10_000);
+    }
+  });
+
   test("primary session + background: true still works (regression check)", async () => {
     _resetSubagentCacheForTest();
     // No client.session.get → resolveIsSubagent returns false → primary path.

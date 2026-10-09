@@ -629,6 +629,100 @@ fn bash_watch_sync_max_default_and_clamp_match_consumer_contract() {
 /// Worker wait limit for the hand-back test, short enough to wait out.
 const SHORT_WORKER_WAIT_MS: &str = "1500";
 
+#[test]
+fn subc_head_wait_hands_back_at_the_configured_wait_limit() {
+    assert_subc_head_blocking_wait_detaches(true);
+}
+
+#[test]
+fn subc_head_implicit_blocking_call_hands_back_at_the_configured_wait_limit() {
+    assert_subc_head_blocking_wait_detaches(false);
+}
+
+fn assert_subc_head_blocking_wait_detaches(wait: bool) {
+    run_subc_with_role(
+        &[("AFT_TEST_WORKER_WAIT_MAX_MS", SHORT_WORKER_WAIT_MS)],
+        true,
+        move |mut harness| async move {
+            let started = Instant::now();
+            send_tool_call_with_preset(
+                &mut harness.stream,
+                90,
+                "bash",
+                json!({ "command": "echo started; sleep 30", "wait": wait, "compressed": false }),
+                Some("head"),
+            )
+            .await;
+            let reply = read_tool_response(&mut harness.stream, 90, Duration::from_secs(20)).await;
+            let elapsed = started.elapsed();
+            assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
+            assert!(
+                elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
+                "{elapsed:?}"
+            );
+            let structured = tool_response_json(&reply);
+            assert_eq!(structured["status"], "running", "{}", frame_body(&reply));
+            let task = extract_task_id(&reply);
+            let text = tool_response_text(&reply);
+            assert!(text.contains("still running after 1.5s"), "{text}");
+            assert!(text.contains("it was not killed"), "{text}");
+            assert!(text.contains("AFT kills this task at "), "{text}");
+            assert!(text.contains("Recent output:\nstarted"), "{text}");
+            assert!(
+                !text.contains("bash_watch"),
+                "the head catalog does not serve bash_watch: {text}"
+            );
+            send_tool_call(
+                &mut harness.stream,
+                91,
+                "bash_status",
+                json!({ "taskId": task }),
+            )
+            .await;
+            let status = read_tool_response(&mut harness.stream, 91, HANG_CATCH).await;
+            assert_eq!(
+                tool_response_json(&status)["status"],
+                "running",
+                "{}",
+                frame_body(&status)
+            );
+            send_tool_call(
+                &mut harness.stream,
+                92,
+                "bash_kill",
+                json!({ "taskId": task }),
+            )
+            .await;
+            let _ = read_tool_response(&mut harness.stream, 92, HANG_CATCH).await;
+            harness
+        },
+    );
+}
+
+#[test]
+fn subc_head_wait_completes_inline_before_the_limit() {
+    run_subc_with_role(
+        &[("AFT_TEST_WORKER_WAIT_MAX_MS", SHORT_WORKER_WAIT_MS)],
+        true,
+        |mut harness| async move {
+            send_tool_call(
+                &mut harness.stream,
+                93,
+                "bash",
+                json!({ "command": "echo head-done", "wait": true }),
+            )
+            .await;
+            let reply = read_tool_response(&mut harness.stream, 93, HANG_CATCH).await;
+            assert!(!tool_result_is_error(&reply), "{}", frame_body(&reply));
+            let structured = tool_response_json(&reply);
+            assert_eq!(structured["status"], "completed", "{}", frame_body(&reply));
+            assert_eq!(structured["exit_code"], 0, "{}", frame_body(&reply));
+            assert!(tool_response_text(&reply).contains("head-done"));
+            harness
+        },
+    );
+}
+
 async fn launch_worker_background(stream: &mut TcpStream, corr: u64, command: &str) -> String {
     send_tool_call_with_preset(
         stream,
@@ -910,6 +1004,14 @@ where
     F: FnOnce(SubcHarness) -> Fut,
     Fut: std::future::Future<Output = SubcHarness>,
 {
+    run_subc_with_role(env, false, body);
+}
+
+fn run_subc_with_role<F, Fut>(env: &[(&str, &str)], v1: bool, body: F)
+where
+    F: FnOnce(SubcHarness) -> Fut,
+    Fut: std::future::Future<Output = SubcHarness>,
+{
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -929,7 +1031,7 @@ where
             env,
         );
         let mut stream = accept_module(&listener).await;
-        bind_route(&mut stream, project.path()).await;
+        bind_route(&mut stream, project.path(), v1).await;
 
         let mut harness = body(SubcHarness {
             stream,
@@ -1105,7 +1207,7 @@ async fn accept_module(listener: &TcpListener) -> TcpStream {
     stream
 }
 
-async fn bind_route(stream: &mut TcpStream, root: &Path) {
+async fn bind_route(stream: &mut TcpStream, root: &Path, v1: bool) {
     let project_cfg = root.join(".cortexkit").join("aft.jsonc");
     std::fs::create_dir_all(project_cfg.parent().expect("project config parent"))
         .expect("create project config dir");
@@ -1133,7 +1235,8 @@ async fn bind_route(stream: &mut TcpStream, root: &Path) {
         consumer_capabilities: None,
         admission_facts: Default::default(),
         scope: None,
-        role_versions: None,
+        role_versions: v1
+            .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
     };
     send_frame(
         stream,

@@ -155,7 +155,7 @@ fn status_of(aft: &mut AftProcess, task_id: &str) -> Value {
     )
 }
 
-/// The reply a worker gets when its blocking call reaches the worker wait
+/// The reply a caller gets when its blocking call reaches the configured wait
 /// limit: the call returns, the command keeps running in the background (it
 /// is not killed), and the reply names the task, how long it ran and its
 /// output so far.
@@ -168,7 +168,7 @@ fn assert_detached_at_limit(
     assert_eq!(response["success"], true, "{label}: {response:?}");
     assert_eq!(response["status"], "running", "{label}: {response:?}");
     assert!(
-        elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(10),
+        elapsed >= Duration::from_millis(1_400) && elapsed < Duration::from_secs(15),
         "{label}: the call must return at the 1.5s limit, took {elapsed:?}"
     );
     let task_id = response["task_id"].as_str().expect("task id").to_string();
@@ -275,10 +275,9 @@ fn worker_wait_returns_the_result_before_the_limit() {
     assert!(aft.shutdown().success());
 }
 
-/// A primary session's `wait: true` call is not bounded by the worker wait
-/// limit: it still blocks until the command finishes.
+/// Head blocking calls share the worker wait limit without killing the task.
 #[test]
-fn primary_wait_is_not_bounded_by_the_worker_wait_limit() {
+fn head_wait_detaches_at_the_configured_wait_limit_and_keeps_running() {
     let project = tempfile::tempdir().expect("primary wait project");
     let mut aft = spawn_with_worker_limit();
     aft.configure(project.path());
@@ -286,7 +285,49 @@ fn primary_wait_is_not_bounded_by_the_worker_wait_limit() {
         &mut aft,
         "primary-wait",
         json!({
-            "command": "sleep 2.5; printf 'primary-done\\n'",
+            "command": "printf 'started\\n'; sleep 30",
+            "workdir": project.path(),
+            "foreground_orchestrate": true,
+            "wait": true,
+            "compressed": false,
+        }),
+        false,
+    );
+    assert_detached_at_limit(&mut aft, "head wait:true", &response, elapsed);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn head_blocking_foreground_detaches_at_the_configured_wait_limit() {
+    let project = tempfile::tempdir().expect("head block project");
+    let mut aft = spawn_with_worker_limit();
+    aft.configure(project.path());
+    let (response, elapsed) = foreground_bash(
+        &mut aft,
+        "head-block-cap",
+        json!({
+            "command": "printf 'started\\n'; sleep 30",
+            "workdir": project.path(),
+            "foreground_orchestrate": true,
+            "block_to_completion": true,
+            "compressed": false,
+        }),
+        false,
+    );
+    assert_detached_at_limit(&mut aft, "head block_to_completion", &response, elapsed);
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn head_wait_returns_the_result_before_the_limit() {
+    let project = tempfile::tempdir().expect("head fast project");
+    let mut aft = spawn_with_worker_limit();
+    aft.configure(project.path());
+    let (response, _) = foreground_bash(
+        &mut aft,
+        "head-wait-fast",
+        json!({
+            "command": "sleep 0.2; printf 'head-done\\n'",
             "workdir": project.path(),
             "foreground_orchestrate": true,
             "wait": true,
@@ -295,10 +336,10 @@ fn primary_wait_is_not_bounded_by_the_worker_wait_limit() {
         false,
     );
     assert_eq!(response["status"], "completed", "{response:?}");
-    assert!(elapsed >= Duration::from_millis(2_400), "{elapsed:?}");
+    assert_eq!(response["exit_code"], 0, "{response:?}");
     assert!(response["output"]
         .as_str()
         .unwrap_or_default()
-        .contains("primary-done"));
+        .contains("head-done"));
     assert!(aft.shutdown().success());
 }

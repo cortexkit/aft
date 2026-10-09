@@ -90,7 +90,7 @@ fn worker_reply_deadlines_track_resolved_config_only() {
     let mut previous = None;
     for (cap, expected) in [(60_000, 90_000), (300_000, 330_000)] {
         ctx.update_config(|config| config.bash.worker_wait_max_ms = cap);
-        for preset in ["head", "worker", "reader"] {
+        for preset in ["worker", "reader"] {
             let answer = catalog(json!({"preset":preset}), &route, &ctx).unwrap();
             for tool in answer["tools"].as_array().unwrap() {
                 if preset == "worker"
@@ -111,6 +111,55 @@ fn worker_reply_deadlines_track_resolved_config_only() {
                 assert_eq!(digest_only["catalog_digest"], digest);
             }
         }
+    }
+}
+
+#[test]
+fn head_reply_deadline_tracks_resolved_config_only() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "head-reply-deadline", 7, false);
+    let mut previous = None;
+    for (cap, expected) in [(60_000, 90_000), (300_000, 330_000)] {
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = cap);
+        let answer = catalog(json!({"preset":"head"}), &route, &ctx).unwrap();
+        for tool in answer["tools"].as_array().unwrap() {
+            if tool["name"] == "bash" {
+                assert_eq!(tool["reply"], json!({"max_ms":expected}), "{tool}");
+            } else {
+                assert!(tool.get("reply").is_none(), "{tool}");
+            }
+        }
+        assert!(!answer["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "bash_watch"));
+        let digest = answer["catalog_digest"].clone();
+        if let Some(previous) = previous.replace(digest.clone()) {
+            assert_ne!(previous, digest);
+        }
+        let digest_only =
+            catalog(json!({"preset":"head","digest_only":true}), &route, &ctx).unwrap();
+        assert_eq!(digest_only["catalog_digest"], digest);
+    }
+}
+
+#[test]
+fn oversized_head_cap_serves_catalog_without_reply_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "head-reply-oversized", 7, false);
+    for cap in [86_400_000, u64::MAX] {
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = cap);
+        let answer = catalog(json!({"preset":"head"}), &route, &ctx).unwrap();
+        assert!(answer["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t.get("reply").is_none()));
     }
 }
 

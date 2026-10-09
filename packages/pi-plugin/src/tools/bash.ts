@@ -129,9 +129,8 @@ function orchestratedTransportTimeoutMs(
 ): number {
   const blocking = blockToCompletion || wait;
   let waitBudget = blocking ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
-  // The engine hands a delegated worker's blocking call back at the worker
-  // wait limit (the command moves to the background), even when the worker's
-  // waits keep its hard kill further away than the default.
+  // AFT returns every blocking call at bash.worker_wait_max_ms, even if
+  // renewing the default kill deadline lets the command run longer.
   if (blocking && workerWaitMaxMs !== undefined) {
     waitBudget = Math.min(effectiveTimeout ?? workerWaitMaxMs, workerWaitMaxMs);
   }
@@ -193,7 +192,7 @@ const BashWaitParam = {
   wait: Type.Optional(
     Type.Boolean({
       description:
-        "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); any new message detaches by default, while `bash.detach_on_user_message: false` keeps it blocking unless the message contains the literal `&detach`. The token is stripped before delivery; the rest of the message is preserved, and a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
+        "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); any new message detaches by default, while `bash.detach_on_user_message: false` keeps it blocking unless the message contains the literal `&detach`. The token is stripped before delivery; the rest of the message is preserved, and a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
     }),
   ),
 };
@@ -719,7 +718,7 @@ export function registerBashTool(
     ? "Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`."
     : "Because `bash.detach_on_user_message` is false, a new message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`.";
   const tasksSentence = bashCfg.background
-    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, \`bash.worker_wait_max_ms\`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
+    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting (it blocks up to \`bash.worker_wait_max_ms\`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   const remoteRuns = () => !isPowerShell && remoteRunsOffered(ctx.config);
   pi.registerTool<typeof BashParams, BashDetails>({
@@ -818,12 +817,10 @@ export function registerBashTool(
       const blockToCompletion = backgroundDisabled || requestedWait || workerForcedForeground;
       const effectiveBackground = !blockToCompletion && (rawRequestedBackground || requestedPty);
       const isWorker = isPiWorkerSession(extCtx);
-      // A worker's blocking call (wait:true, or every foreground call when
-      // subagent background is off) is handed back by the engine at the
-      // worker wait limit, with the command moved to the background (the
-      // engine knows the role from the `worker_session` field callBridge adds
-      // to every request). The transport timeout must not undercut it.
-      const workerWaitMaxMs = isWorker ? bashCfg.worker_wait_max_ms : undefined;
+      // AFT hands every blocking call back at bash.worker_wait_max_ms with
+      // the command still running. The bridge's reply timeout must allow
+      // that wait so it does not lose the handoff reply.
+      const workerWaitMaxMs = bashCfg.worker_wait_max_ms;
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {

@@ -62,9 +62,8 @@ function orchestratedTransportTimeoutMs(
 ): number {
   const blocking = blockToCompletion || wait;
   let waitBudget = blocking ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
-  // The engine hands a delegated worker's blocking call back at the worker
-  // wait limit (the command moves to the background), even when the worker's
-  // waits keep its hard kill further away than the default.
+  // AFT returns every blocking call at bash.worker_wait_max_ms, even if
+  // renewing the default kill deadline lets the command run longer.
   if (blocking && workerWaitMaxMs !== undefined) {
     waitBudget = Math.min(effectiveTimeout ?? workerWaitMaxMs, workerWaitMaxMs);
   }
@@ -283,7 +282,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   const outputRules = backgroundOn
     ? " Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report."
@@ -435,7 +434,7 @@ export function bashTimeoutDescription(
   const promoted =
     role === "worker"
       ? "moves to the background as a task that won't wake you, so wait on it with bash_watch; wait:true disables promotion and remains inline until completion, the timeout, or the worker wait limit"
-      : "is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion or timeout";
+      : "is promoted to background and gets a completion reminder when it exits; wait:true disables promotion and remains inline until completion, timeout, or bash.worker_wait_max_ms";
   return `Hard kill cap in milliseconds (positive integer). In the default foreground mode when wait is false, a command that exceeds the configured wait window ${promoted}. A background task with no timeout is killed after 30 minutes; pass a longer timeout for long jobs.`;
 }
 
@@ -463,7 +462,7 @@ export function createBashTool(
           .boolean()
           .optional()
           .describe(
-            `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (in a delegated session at most the worker wait limit, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
+            `When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); ${userMessageDetachDescription(initialBashCfg.detach_on_user_message)} Use only when you know the result is required before doing anything else.`,
           ),
       }
     : {};
@@ -646,12 +645,10 @@ export function createBashTool(
       // and the call answers with the timed-out result. Omitting it lets the
       // engine apply its 30-minute default.
       const rawTimeout = coerceOptionalInt(args.timeout, "timeout", 1, Number.MAX_SAFE_INTEGER);
-      // A subagent's blocking call (wait:true, or every foreground call when
-      // subagent background is off) is handed back by the engine at the
-      // worker wait limit, with the command moved to the background (the
-      // engine knows the role from the `worker_session` field callBridge adds
-      // to every request). The transport timeout must not undercut it.
-      const workerWaitMaxMs = isSubagent ? bashCfg.worker_wait_max_ms : undefined;
+      // AFT hands every blocking call back at bash.worker_wait_max_ms with
+      // the command still running. The bridge's reply timeout must allow
+      // that wait so it does not lose the handoff reply.
+      const workerWaitMaxMs = bashCfg.worker_wait_max_ms;
       const ptyRows = coerceOptionalInt(args.ptyRows, "ptyRows", 1, 60);
       const ptyCols = coerceOptionalInt(args.ptyCols, "ptyCols", 1, 140);
       const compressed = coerceBoolean(args.compressed, true);

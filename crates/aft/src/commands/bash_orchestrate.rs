@@ -191,17 +191,17 @@ pub(crate) fn kill_deadline_note(
     )
 }
 
-/// Reply to a delegated worker whose blocking call (`wait: true`, or
-/// `block_to_completion`) reached the worker wait limit
+/// Reply to a caller whose blocking call (`wait: true`, or
+/// `block_to_completion`) reached the configured wait limit
 /// (`bash.worker_wait_max_ms`). The command was moved to the background,
-/// not killed: a worker must get control back so it can notice a stuck
+/// not killed: the caller must get control back so it can notice a stuck
 /// command, but a long build it still wants must keep running. This names
 /// `bash_watch` only when the caller's catalog includes it; otherwise it points
 /// the caller at `bash_status` to inspect the task. The host plugins append any
 /// additional guidance they provide.
 ///
 /// `ran_ms` is how long the command has run and `tail` its most recent
-/// output, so the worker can judge whether it is stuck.
+/// output, so the caller can judge whether it is stuck.
 pub fn format_worker_wait_limit_message(
     task_id: &str,
     limit_ms: u64,
@@ -455,8 +455,7 @@ pub fn build_bash_outcome(
         ctx.bash_background()
             .begin_wait_mode_session(&session_id, &task_id);
     }
-    let worker_cap_ms = worker_wait_cap_ms(
-        worker_session,
+    let worker_cap_ms = blocking_wait_cap_ms(
         params.block_to_completion || params.wait,
         worker_wait_max_ms(ctx),
     );
@@ -468,7 +467,7 @@ pub fn build_bash_outcome(
         )
     });
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
-    // A capped worker wait detaches at its deadline instead of blocking on.
+    // A capped blocking wait detaches at its deadline instead of blocking on.
     let block_to_completion =
         (params.block_to_completion || params.wait) && worker_cap_ms.is_none();
     let timeout = params.timeout;
@@ -480,7 +479,7 @@ pub fn build_bash_outcome(
     let session_id_for_cleanup = session_id.clone();
 
     let mut poll: PendingResponsePoll = Box::new(move |ctx| {
-        // A worker blocked on its command is waiting on it: keep its default
+        // A caller blocked on its command is waiting on it: keep its default
         // hard kill at least one wait limit away, so the kill cannot fire
         // before the cap hands control back.
         if let Some(cap_ms) = worker_cap_ms {
@@ -625,9 +624,9 @@ pub(crate) fn decide_bash_step(
 }
 
 /// Moves a foreground command to the background at the end of its wait.
-/// `capped_worker_wait` marks a delegated worker's blocking call that hit the
-/// worker wait limit (`wait_window_ms` is then that limit): it gets its
-/// own reply, and its hard kill is pushed one more limit away so the worker
+/// `capped_worker_wait` marks a blocking call that hit the configured
+/// wait limit (`wait_window_ms` is then that limit): it gets its
+/// own reply, and its hard kill is pushed one more limit away so the caller
 /// has time to wait again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn promote_bash(
@@ -940,23 +939,12 @@ pub(crate) fn worker_wait_max_ms(ctx: &AppContext) -> u64 {
         .unwrap_or_else(|| ctx.config().bash.worker_wait_max_ms)
 }
 
-/// How long a foreground bash call may block before it detaches, when the
-/// worker wait limit bounds it: any delegated worker call that would block
-/// until its command finishes, i.e. `wait: true` or `block_to_completion`
-/// (which the plugins send for every worker foreground call when
-/// `bash.subagent_background` is false, so those are never auto-promoted).
-/// `None` for every other call: a primary session's blocking call still
-/// blocks until the command finishes or its hard kill fires, and a
-/// non-blocking foreground call is promoted after the much shorter foreground
-/// wait window anyway. A worker's explicit `timeout` shorter than the limit
-/// simply ends the call first; a longer one no longer holds the worker past
-/// the limit, though the command keeps that timeout as its hard kill.
-pub(crate) fn worker_wait_cap_ms(
-    worker_session: bool,
-    blocking: bool,
-    limit_ms: u64,
-) -> Option<u64> {
-    (worker_session && blocking).then_some(limit_ms)
+/// Every session's blocking bash call (`wait: true` or `block_to_completion`)
+/// is bounded by `bash.worker_wait_max_ms`. Ordinary foreground calls use the
+/// shorter foreground window. The cap returns control without changing an
+/// explicit command timeout, which still governs the process's lifetime.
+pub(crate) fn blocking_wait_cap_ms(blocking: bool, limit_ms: u64) -> Option<u64> {
+    blocking.then_some(limit_ms)
 }
 
 pub(crate) fn select_foreground_wait_window_ms(
@@ -1170,14 +1158,12 @@ mod tests {
         );
     }
 
-    /// Every blocking call from a delegated worker is capped by the worker
-    /// wait limit; a primary's blocking call and a worker's non-blocking call
-    /// (promoted after the foreground window) are not.
+    /// Blocking calls are capped independently of role; ordinary foreground
+    /// calls still use the shorter promotion window.
     #[test]
-    fn worker_wait_cap_applies_only_to_a_worker_blocking_call() {
-        assert_eq!(worker_wait_cap_ms(true, true, 90_000), Some(90_000));
-        assert_eq!(worker_wait_cap_ms(false, true, 90_000), None);
-        assert_eq!(worker_wait_cap_ms(true, false, 90_000), None);
+    fn blocking_wait_cap_applies_to_every_blocking_call() {
+        assert_eq!(blocking_wait_cap_ms(true, 90_000), Some(90_000));
+        assert_eq!(blocking_wait_cap_ms(false, 90_000), None);
     }
 
     #[test]

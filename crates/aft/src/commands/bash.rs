@@ -77,9 +77,9 @@ struct BashParams {
 }
 
 /// The hard kill for a bash request: the caller's explicit `timeout`, or the
-/// registry's default. A delegated worker's `wait: true` call gets the default
+/// registry's default. Every session's blocking call gets the default
 /// like every other call; its wait is capped by `bash.worker_wait_max_ms`
-/// instead (see `bash_orchestrate::worker_wait_cap_ms`), and its waits extend
+/// instead (see `bash_orchestrate::blocking_wait_cap_ms`), and its waits extend
 /// the default kill while it keeps waiting.
 fn hard_kill_for(params: &BashParams) -> crate::bash_background::HardKill {
     crate::bash_background::HardKill::from_timeout_ms(params.timeout)

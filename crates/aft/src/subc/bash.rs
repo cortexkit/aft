@@ -75,8 +75,8 @@ enum BashSpawnControl {
         wait_window_ms: u64,
         detach_on_user_message: bool,
         worker_session: bool,
-        /// The worker wait limit bounding this wait, when it is a delegated
-        /// worker's blocking call (`wait: true` or `block_to_completion`).
+        /// The configured wait limit bounding a blocking call in any session
+        /// (`wait: true` or `block_to_completion`).
         worker_cap_ms: Option<u64>,
     },
 }
@@ -132,10 +132,10 @@ struct DeferredWaitObservation {
 /// stops the frame loop, so no route's frames are read or written until the
 /// lock frees. Here the frame loop only awaits.
 ///
-/// `renew_window` is set for a delegated worker's capped wait: the worker is
+/// `renew_window` is set for a capped blocking wait: the caller is
 /// waiting on its command, so each wake keeps the task's default hard kill at
 /// least that far away, and the kill cannot fire before the cap hands control
-/// back to the worker.
+/// back to the caller.
 async fn observe_deferred_bash_wait(
     registry: crate::bash_background::BgTaskRegistry,
     task_id: String,
@@ -797,12 +797,11 @@ pub(super) fn submit_deferred_bash(
                         );
                     }
 
-                    // The worker wait cap limits the caller's reply wait,
+                    // The blocking wait cap limits every caller's reply wait,
                     // regardless of the route's cancellation policy. Reaching
                     // that cap hands back a task id without killing the command;
                     // the command's own timeout still governs its lifetime.
-                    let worker_cap_ms = crate::commands::bash_orchestrate::worker_wait_cap_ms(
-                        worker_session,
+                    let worker_cap_ms = crate::commands::bash_orchestrate::blocking_wait_cap_ms(
                         settings.block_to_completion || settings.wait,
                         crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
                     );
@@ -839,7 +838,7 @@ pub(super) fn submit_deferred_bash(
                             project_root,
                             storage_dir,
                             deadline,
-                            // A capped worker wait detaches at its deadline.
+                            // A capped blocking wait detaches at its deadline.
                             block_to_completion: (settings.block_to_completion || settings.wait)
                                 && worker_cap_ms.is_none(),
                             timeout: settings.timeout,

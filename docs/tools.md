@@ -464,13 +464,16 @@ delegated (subagent) session, which cannot be woken once its turn ends, a sync w
 `timeoutMs` waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default),
 then reports the command is still running with how long it has run and its latest output; the
 worker watches again to keep waiting or kills it. An explicit `timeoutMs` can shorten that wait,
-but never extends it beyond the configured worker limit. A delegated session's blocking `bash`
+but never extends it beyond the configured worker limit. Every session's blocking `bash`
 call (`wait: true`, or any foreground call when
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
 background, not killed, and the reply gives its task id, including on the tool-provider/v1 route.
-The worker preset declares a reply deadline for `bash` and `bash_watch` equal to the resolved
-worker limit plus 30 seconds for spawn, terminal handoff and reply delivery; head and reader
-presets declare no deadline. If that sum exceeds the role contract's 24-hour maximum, the catalog
+The head preset declares a reply deadline for `bash`; the worker preset declares it for `bash`
+and `bash_watch`. Both use the resolved `bash.worker_wait_max_ms` plus 30 seconds for spawn,
+terminal handoff and reply delivery. A watch does not spawn a command, but retains the same
+margin for admission, observing terminal state, and delivering its reply under load. Head
+catalogs do not serve `bash_watch` (heads receive completion wakes); reader catalogs serve neither
+shell tool and declare no deadline. If the sum exceeds the role contract's 24-hour maximum, the catalog
 still serves the tools but omits their reply metadata, leaving callers' fallback in force.
 The wait limit is not the task's kill
 deadline: every reply that hands a task back (launch, promotion, detach) and every `bash_watch`

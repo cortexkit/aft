@@ -946,6 +946,25 @@ mod tests {
     }
 
     #[test]
+    fn head_watch_defaults_and_background_requests_stay_within_sync_cap() {
+        for cap in [1_000, 120_000, 1_800_000] {
+            for background in [false, true] {
+                let defaults = params(json!({"background":background}));
+                assert_eq!(
+                    effective_wait_ms(&defaults, false, 3_600_000, cap),
+                    Ok(30_000.min(cap))
+                );
+                let explicit = params(json!({"background":background,"timeout_ms":cap}));
+                assert_eq!(effective_wait_ms(&explicit, false, 3_600_000, cap), Ok(cap));
+                let too_long = params(json!({"background":background,"timeout_ms":cap+1}));
+                assert!(effective_wait_ms(&too_long, false, 3_600_000, cap)
+                    .unwrap_err()
+                    .contains("bash.watch_sync_max_ms"));
+            }
+        }
+    }
+
+    #[test]
     fn worker_watch_at_cap_waits_for_a_nearby_kill_terminal() {
         assert_eq!(
             wait_limit_outcome(true, false, true, Some(Duration::from_secs(4)),),

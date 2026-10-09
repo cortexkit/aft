@@ -191,37 +191,29 @@ async fn v1_bash_wait_limit_case(worker: bool) {
             .unwrap();
         let status = snapshot.info.status;
         let _ = ctx.bash_background().kill(task_id, "wait-limit-test");
-        if worker {
-            assert_eq!(status, crate::bash_background::BgTaskStatus::Running);
-        }
+        assert_eq!(status, crate::bash_background::BgTaskStatus::Running);
     }
     assert!(response.success, "{response:?}");
-    if worker {
-        assert_eq!(response.data["status"], "running", "{response:?}");
-        assert!(response.data["task_id"].as_str().is_some(), "{response:?}");
-        assert!(
-            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(15),
-            "{elapsed:?}"
-        );
-        assert!(
-            response.data["output"]
-                .as_str()
-                .unwrap()
-                .contains("was not killed"),
-            "{response:?}"
-        );
-        assert!(
-            response.data["output"]
-                .as_str()
-                .unwrap()
-                .contains("timeout"),
-            "{response:?}"
-        );
-    } else {
-        assert_eq!(response.data["exit_code"], 0, "{response:?}");
-        assert_eq!(response.data["output"], "completed", "{response:?}");
-        assert!(elapsed >= Duration::from_millis(2_800), "{elapsed:?}");
-    }
+    assert_eq!(response.data["status"], "running", "{response:?}");
+    assert!(response.data["task_id"].as_str().is_some(), "{response:?}");
+    assert!(
+        elapsed >= Duration::from_millis(800) && elapsed < Duration::from_secs(15),
+        "{elapsed:?}"
+    );
+    assert!(
+        response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("was not killed"),
+        "{response:?}"
+    );
+    assert!(
+        response.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("timeout"),
+        "{response:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -232,6 +224,6 @@ async fn tool_provider_v1_worker_bash_hands_off_at_configured_cap() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn tool_provider_v1_head_bash_wait_is_not_worker_capped() {
+async fn tool_provider_v1_head_bash_hands_off_at_configured_cap() {
     v1_bash_wait_limit_case(false).await;
 }

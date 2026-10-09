@@ -293,8 +293,8 @@ fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)>
                     .remove("description");
                 let digest =
                     schema_digest(&schema).expect("embedded schema has a structural digest");
-                let semantics = if preset == CatalogPreset::Worker
-                    && matches!(name.as_str(), "bash" | "bash_watch")
+                let semantics = if name == "bash"
+                    || (preset == CatalogPreset::Worker && name == "bash_watch")
                 {
                     2
                 } else {
@@ -348,15 +348,14 @@ fn code_tool_lines(text: &mut String, has: impl Fn(&str) -> bool) {
     }
 }
 
-/// The `head` preset's system text: the text AFT served before presets
-/// existed, unchanged. `worker` is the legacy `broca` item's own parameter,
-/// which adds one line and nothing else.
+/// System instructions for the primary (`head`) session. The legacy `broca`
+/// text request can set `worker` to append a reminder to stay in scope.
 pub(super) fn broca_text(names: &[&str], worker: bool) -> String {
     let has = |name: &str| names.contains(&name);
     let mut text = String::from("# Agent File Tools\n\n");
     code_tool_lines(&mut text, has);
     if has("bash") {
-        text.push_str("Use bash with wait: true for long commands. The provider waits for completion or the command deadline; no completion subscriber is required.\n");
+        text.push_str("Use bash with wait: true for long commands. The provider waits for completion, the command deadline, or bash.worker_wait_max_ms (30 minutes by default), then hands back a still-running task; no completion subscriber is required.\n");
     }
     if worker {
         text.push_str(WORKER_SCOPE_LINE);
@@ -410,14 +409,17 @@ pub(super) fn catalog(
 }
 
 // A reply deadline starts at receipt, not at the command's first poll. Reserve
-// 30 seconds beyond the resolved worker cap: up to 20 seconds for spawn
-// admission, the 5-second near-kill terminal handoff margin, and 5 seconds for
+// 30 seconds beyond the resolved blocking cap: up to 20 seconds for spawn
+// admission, up to 5 seconds to observe a command timeout instead of handing
+// back a task just before it dies, and 5 seconds for
 // finalization, writer queueing and relay egress. The margin extends the reply
 // deadline, not the command timeout, and no model argument controls it.
+// Watches do not spawn, but use the same conservative margin for admission,
+// terminal-state observation and delivering the reply under load.
 const WORKER_REPLY_MARGIN_MS: u64 = 30_000;
 const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
 
-/// Render from session policy and its resolved worker wait limit. Only a
+/// Render from session policy and its resolved blocking wait limit. Only a
 /// session that may run commands remotely sees bash's `runon` argument.
 pub(super) fn catalog_for_session(
     body: Value,
@@ -441,7 +443,7 @@ pub(super) fn catalog_for_session(
         powershell_available,
         runon,
     ));
-    if preset == CatalogPreset::Worker {
+    if matches!(preset, CatalogPreset::Head | CatalogPreset::Worker) {
         match worker_wait_max_ms.checked_add(WORKER_REPLY_MARGIN_MS)
             .filter(|max_ms| *max_ms <= MAX_DECLARED_REPLY_MS)
         {
@@ -453,7 +455,7 @@ pub(super) fn catalog_for_session(
                 }
             }
             None => log::info!(
-                "worker catalog: bash.worker_wait_max_ms={worker_wait_max_ms}; reply omitted because the cap plus {WORKER_REPLY_MARGIN_MS}ms margin exceeds the 24-hour tool-provider deadline maximum"
+                "{} catalog: bash.worker_wait_max_ms={worker_wait_max_ms}; reply omitted because the cap plus {WORKER_REPLY_MARGIN_MS}ms margin exceeds the 24-hour tool-provider deadline maximum", preset.name()
             ),
         }
     }
@@ -1819,7 +1821,7 @@ mod tests {
             assert_eq!(inventory.len(), if available { 24 } else { 23 });
             for tool in &inventory {
                 assert!(expected.contains(tool.name.as_str()));
-                assert_eq!(tool.semantics, 1);
+                assert_eq!(tool.semantics, if tool.name == "bash" { 2 } else { 1 });
                 assert_eq!(tool.capabilities.is_empty(), tool.name == "status");
                 assert_eq!(
                     tool.result_ops,
@@ -1851,6 +1853,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn head_bash_calls_with_old_semantics_pins_are_refused() {
+        let tool = tools_for_session(CatalogPreset::Head, &[], true, false)
+            .into_iter()
+            .find(|tool| tool.name == "bash")
+            .unwrap();
+        let mut request = call("bash", json!({"command":"echo"}));
+        request.preset = Some("head".into());
+        request.schema_pin = Some(
+            SchemaPin::new("bash", &tool.schema_digest, 1)
+                .encode()
+                .unwrap(),
+        );
+        let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
+        assert_eq!(refusal.code, "tool_semantics_changed");
+        assert_eq!(
+            refusal.detail.unwrap(),
+            json!({"tool":"bash","expected":1,"current":2})
+        );
+        request.schema_pin = Some(
+            SchemaPin::new("bash", &tool.schema_digest, 2)
+                .encode()
+                .unwrap(),
+        );
+        assert_eq!(
+            admit(&request, false, &[], true, "session", true).unwrap(),
+            CallerRole::Head
+        );
+        request.schema_pin = None;
+        assert_eq!(
+            admit(&request, false, &[], true, "session", true).unwrap(),
+            CallerRole::Head
+        );
     }
 
     #[test]
@@ -2583,8 +2620,8 @@ mod tests {
         for role in [CallerRole::Head, CallerRole::Worker] {
             let worker = role.is_worker();
             assert_eq!(
-                orchestrate::worker_wait_cap_ms(worker, true, 1_800_000),
-                worker.then_some(1_800_000),
+                orchestrate::blocking_wait_cap_ms(true, 1_800_000),
+                Some(1_800_000),
                 "{role:?} wait cap"
             );
             let promotion = orchestrate::format_promotion_message(
@@ -2842,7 +2879,7 @@ mod tests {
             .find(|tool| tool.name == "bash")
             .unwrap();
         for (digest, semantics, expected) in [
-            (schema.schema_digest.as_str(), 1, None),
+            (schema.schema_digest.as_str(), 2, None),
             (
                 "0000000000000000000000000000000000000000000000000000000000000000",
                 2,
@@ -2850,7 +2887,7 @@ mod tests {
             ),
             (
                 schema.schema_digest.as_str(),
-                2,
+                1,
                 Some("tool_semantics_changed"),
             ),
         ] {
