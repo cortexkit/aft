@@ -454,28 +454,25 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
         collect_json_entry_strings(bin, &mut bin_entries);
     }
 
-    for entry in public_entries {
-        if published {
-            if !entry.contains('*') && !entry.contains("://") && !entry.starts_with("node:") {
-                let base = source_root.join(entry.trim_start_matches("./"));
-                if let Some(path) = candidate_paths(&base)
-                    .into_iter()
-                    .find(|path| path.is_file())
-                {
-                    insert_resolved_entry_point(entry_points, &path, EntryPointKind::PublicApi);
+    for (entries, kind) in [
+        (public_entries, EntryPointKind::PublicApi),
+        (bin_entries, EntryPointKind::LivenessRoot),
+    ] {
+        for entry in entries {
+            if published {
+                if !entry.contains('*') && !entry.contains("://") && !entry.starts_with("node:") {
+                    let base = source_root.join(entry.trim_start_matches("./"));
+                    if let Some(path) = candidate_paths(&base)
+                        .into_iter()
+                        .find(|path| path.is_file())
+                    {
+                        insert_resolved_entry_point(entry_points, &path, kind);
+                    }
                 }
+            } else {
+                insert_package_entry(package_dir, &entry, entry_points, kind);
             }
-        } else {
-            insert_package_entry(package_dir, &entry, entry_points, EntryPointKind::PublicApi);
         }
-    }
-    for entry in bin_entries {
-        insert_package_entry(
-            package_dir,
-            &entry,
-            entry_points,
-            EntryPointKind::LivenessRoot,
-        );
     }
 
     if let Some(scripts) = value.get("scripts").and_then(Value::as_object) {
@@ -1248,6 +1245,25 @@ mod tests {
         fs::write(root.join("index.ts"), "export const own = 1;").unwrap();
         fs::write(root.join("package.json"), r#"{"publishConfig":{"directory":"build/package"},"main":"./index.js","scripts":{"start":"bun main.ts"}}"#).unwrap();
         assert!(resolve_entry_points(root).is_public_api_file(&root.join("index.ts")));
+    }
+
+    #[test]
+    fn ts_liveness_published_bin_uses_declared_source_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("source")).unwrap();
+        fs::write(root.join("source/command.ts"), "export function run() {};").unwrap();
+        fs::write(root.join("source/index.ts"), "export const own = 1;").unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"rootDir":"source"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("package.json"), r#"{"publishConfig":{"directory":"build/package"},"main":"./index.js","bin":"./command.js"}"#).unwrap();
+        let entries = resolve_entry_points(root);
+        assert!(entries.is_liveness_root_file(&root.join("source/command.ts")));
+        assert!(!entries.is_public_api_file(&root.join("source/command.ts")));
+        assert!(entries.is_public_api_file(&root.join("source/index.ts")));
     }
 
     #[test]
