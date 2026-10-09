@@ -146,6 +146,13 @@ fn published_outcomes_have_explicit_grades() {
             _ => panic!("ungraded published case: {name}"),
         };
         assert_eq!(grade(terminal), expected, "{name}");
+        let encoded_terminal = serde_json::to_value(terminal).unwrap();
+        let mut original_terminal = value["stream"].as_array().unwrap().last().unwrap().clone();
+        original_terminal.as_object_mut().unwrap().remove("type");
+        assert_eq!(
+            encoded_terminal, original_terminal,
+            "published vector {name} changed when round-tripped"
+        );
         // The two output/record future-tag goldens are attach excerpts: seq 7
         // without an accepted record. Resume from the prior retained cursor.
         let mut consumer = if matches!(
