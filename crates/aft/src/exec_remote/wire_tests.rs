@@ -63,6 +63,7 @@ pub(crate) enum Script {
     MissingTerminal,
     KnownRefused,
     WorkspaceSetupRefused,
+    RefusedWithDetail,
     FutureOutcome,
     Expired,
     Utf8,
@@ -171,8 +172,9 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused) {
+                            if !attaching && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 }))).unwrap()));
+                            
                             }
                              let outcome = if matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { Outcome::Exit { code: 7 } }
                                  else if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
@@ -182,6 +184,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
                                     Script::KnownRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
                                     Script::WorkspaceSetupRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed },
+                                    Script::RefusedWithDetail => Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerDraining },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
@@ -214,7 +217,12 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                  }
                                  if !matches!(script, Script::MissingTerminal) && !(attaching && matches!(script, Script::TerminalGapOnce)) && (!matches!(script, Script::Restart | Script::AttachRefused | Script::GappedAttach(_) | Script::AttachDisconnected) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
-                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
+                                    if matches!(script, Script::RefusedWithDetail) {
+                                        let mut value = serde_json::to_value(&terminal).unwrap();
+                                        value["refusal_detail"] = json!("runner says:\nmaintenance\twindow");
+                                        terminal = serde_json::from_value(value).unwrap();
+                                    }
+                                    if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
                                     if matches!(script, Script::Reported) { terminal = report_vector("all"); }
                                     if matches!(script, Script::Utf8) {
@@ -459,6 +467,7 @@ async fn daemon_route_uses_hyphenated_capability_and_dotted_operations() {
             Script::Refused,
             Verdict::RunLocally {
                 reason: RefusalReason::Unknown("future_refusal".into()),
+                refusal_detail: None,
             },
         ),
     ] {

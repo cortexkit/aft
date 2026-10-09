@@ -265,6 +265,31 @@ fn assert_runon_refusal(response: &crate::protocol::Response, reason: &str) {
     );
 }
 
+#[test]
+fn refusal_detail_is_sanitized_and_truncated_at_utf8_boundary() {
+    let detail = format!("first\nsecond\t{}", "é".repeat(510));
+    let rendered = rendered_refusal_reason("runner_draining", Some(&detail));
+    assert_eq!(
+        rendered,
+        format!("runner_draining (first second {})", "é".repeat(505))
+    );
+    let rendered_detail = rendered
+        .strip_prefix("runner_draining (")
+        .unwrap()
+        .strip_suffix(')')
+        .unwrap();
+    assert_eq!(rendered_detail.len(), 1023);
+    assert!(!rendered_detail.chars().any(char::is_control));
+}
+
+#[test]
+fn absent_refusal_detail_keeps_the_existing_message_exactly() {
+    assert_eq!(
+        runon_refusal_message("unreachable", None),
+        "runon refused: remote refused: unreachable; command was not run; retry, or omit runon to run locally"
+    );
+}
+
 #[tokio::test]
 async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
     for (script, reason) in [
@@ -313,6 +338,65 @@ async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
         assert_eq!(status.data["remote_refusal"]["code"], "remote_unavailable");
         assert_eq!(exec_runs(&daemon).len(), 1);
     }
+}
+
+#[tokio::test]
+async fn runon_refusal_detail_is_rendered_and_sanitized() {
+    let daemon = daemon(Script::RefusedWithDetail, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("must-not-run-locally");
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("printf local-proof > '{}'", marker.display()),
+            "runon": "linux", "compressed": false
+        }),
+    );
+    assert!(
+        response.success,
+        "the asynchronous launch returns a task: {response:?}"
+    );
+    let task_id = response.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert!(!marker.exists(), "explicit runon must not start locally");
+    let expected = "runon refused: remote refused: runner_draining (runner says: maintenance window); command was not run; retry, or omit runon to run locally";
+    assert_eq!(refusal_response(done).data["message"], expected);
+}
+
+#[tokio::test]
+async fn local_fallback_refusal_detail_is_rendered_and_sanitized() {
+    let daemon = daemon(Script::RefusedWithDetail, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("local-fallback");
+    let ctx = restarted_context(dir.path());
+    let mut policy = launch(daemon.connection.clone());
+    policy.params.remote_exec.as_mut().unwrap().legacy_commands =
+        Some(serde_json::json!(["touch"]));
+    let response = handle_with_policy(
+        &ctx,
+        Some(policy),
+        serde_json::json!({
+            "command": format!("touch '{}'", marker.display()),
+            "compressed": false
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    assert!(marker.exists(), "implicit routing still runs locally");
+    assert!(
+        done.output_preview.contains(&format!(
+            "ran locally on {}: remote refused: runner_draining (runner says: maintenance window)",
+            local_os_name()
+        )),
+        "{}",
+        done.output_preview
+    );
 }
 
 #[tokio::test]
@@ -1870,7 +1954,7 @@ async fn exec_remote_bash_durable_cancel_before_refusal_suppresses_fallback() {
         .unwrap()
         .cancel_requested = false;
     stale
-        .restored_remote_fallback(&task, &remote, "future_refusal")
+        .restored_remote_fallback(&task, &remote, "future_refusal", None)
         .unwrap();
     assert!(fs::read(&paths.stdout).unwrap().is_empty());
     assert!(!task.state.lock().unwrap().metadata.local_fallback_started);

@@ -60,6 +60,7 @@ pub enum Verdict {
     /// sandbox and must tell the user; neither this client nor ck-motor does it.
     RunLocally {
         reason: types::RefusalReason,
+        refusal_detail: Option<String>,
     },
     Exited {
         code: i32,
@@ -89,7 +90,8 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
         Outcome::RefusedBeforeStart { reason } => {
             return Verdict::RunLocally {
                 reason: reason.clone(),
-            }
+                refusal_detail: terminal.refusal_detail().map(str::to_owned),
+            };
         }
         Outcome::OutcomeUnknown | Outcome::Unknown { .. } => return Verdict::OutcomeUnknown,
         Outcome::HistoryExpired => return Verdict::HistoryExpired,

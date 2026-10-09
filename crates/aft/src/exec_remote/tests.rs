@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.2"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.3"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.2"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.3"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -101,36 +101,47 @@ fn published_outcomes_have_explicit_grades() {
             "history_expired" => Verdict::HistoryExpired,
             "bundle_rejected" => Verdict::RunLocally {
                 reason: RefusalReason::BundleRejected,
+                refusal_detail: None,
             },
             "queue_wait_exceeded" => Verdict::RunLocally {
                 reason: RefusalReason::QueueWaitExceeded,
+                refusal_detail: None,
             },
             "runner_full" => Verdict::RunLocally {
                 reason: RefusalReason::RunnerFull,
+                refusal_detail: None,
             },
             "runner_version_mismatch" => Verdict::RunLocally {
                 reason: RefusalReason::RunnerVersionMismatch,
+                refusal_detail: None,
             },
             "snapshot_failed" => Verdict::RunLocally {
                 reason: RefusalReason::SnapshotFailed,
+                refusal_detail: None,
             },
             "transfer_interrupted" => Verdict::RunLocally {
                 reason: RefusalReason::TransferInterrupted,
+                refusal_detail: None,
             },
             "tree_hash_mismatch" => Verdict::RunLocally {
                 reason: RefusalReason::TreeHashMismatch,
+                refusal_detail: None,
             },
             "unreachable" => Verdict::RunLocally {
                 reason: RefusalReason::Unreachable,
+                refusal_detail: None,
             },
             "workspace_key_rejected" => Verdict::RunLocally {
                 reason: RefusalReason::WorkspaceKeyRejected,
+                refusal_detail: None,
             },
             "workspace_setup_failed" => Verdict::RunLocally {
                 reason: RefusalReason::WorkspaceSetupFailed,
+                refusal_detail: None,
             },
             "crate-local-unknown-refusal" => Verdict::RunLocally {
                 reason: RefusalReason::Unknown("future_refusal".into()),
+                refusal_detail: None,
             },
             _ => panic!("ungraded published case: {name}"),
         };
@@ -179,6 +190,51 @@ fn published_outcomes_have_explicit_grades() {
             );
             assert_eq!(sink.unknown, [(7, vec![0xe2])]);
         }
+    }
+}
+
+#[test]
+fn refusal_detail_is_preserved_when_grading_a_terminal() {
+    let mut value = serde_json::to_value(TerminalRecord::new(
+        job_id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining,
+        },
+        1,
+        0,
+        0,
+    ))
+    .unwrap();
+    value["refusal_detail"] = serde_json::json!("runner maintenance window");
+    let terminal: TerminalRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        grade(&terminal),
+        Verdict::RunLocally {
+            reason: RefusalReason::RunnerDraining,
+            refusal_detail: Some("runner maintenance window".into()),
+        }
+    );
+}
+
+#[test]
+fn new_runner_refusal_reasons_still_prove_never_started() {
+    for reason in [RefusalReason::RunnerDraining, RefusalReason::RunnerDiskFull] {
+        let terminal = TerminalRecord::new(
+            job_id(),
+            Outcome::RefusedBeforeStart {
+                reason: reason.clone(),
+            },
+            1,
+            0,
+            0,
+        );
+        assert_eq!(
+            grade(&terminal),
+            Verdict::RunLocally {
+                reason,
+                refusal_detail: None,
+            }
+        );
     }
 }
 

@@ -13,7 +13,30 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-fn runon_refusal_message(reason: &str) -> String {
+fn rendered_refusal_reason(reason: &str, detail: Option<&str>) -> String {
+    let Some(detail) = detail else {
+        return reason.to_owned();
+    };
+    // The runner detail is caller-visible text, so keep it bounded and single-line.
+    let mut end = detail.len().min(1024);
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let detail = detail[..end]
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    format!("{reason} ({detail})")
+}
+
+fn runon_refusal_message(reason: &str, detail: Option<&str>) -> String {
+    let reason = rendered_refusal_reason(reason, detail);
     format!("runon refused: remote refused: {reason}; command was not run; retry, or omit runon to run locally")
 }
 
@@ -25,15 +48,17 @@ pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::R
         return None;
     }
     let remote = metadata.remote.as_ref().filter(|r| r.explicit_runon)?;
-    let crate::exec_remote::Verdict::RunLocally { reason } =
-        crate::exec_remote::grade(remote.terminal.as_ref()?)
+    let crate::exec_remote::Verdict::RunLocally {
+        reason,
+        refusal_detail,
+    } = crate::exec_remote::grade(remote.terminal.as_ref()?)
     else {
         return None;
     };
     let reason = serde_json::to_value(reason).ok()?;
     Some(super::RemoteRefusal {
         code: "remote_unavailable",
-        message: runon_refusal_message(reason.as_str()?),
+        message: runon_refusal_message(reason.as_str()?, refusal_detail.as_deref()),
     })
 }
 
@@ -715,15 +740,21 @@ impl BgTaskRegistry {
         let mut sink = TaskSink::new(self, task.clone()).map_err(|e| e.to_string())?;
         let mut recovery = ReattachBudget::new(&root);
         if let Some(record) = remote.terminal.as_ref() {
-            if let Verdict::RunLocally { reason } = exec::grade(record) {
+            if let Verdict::RunLocally {
+                reason,
+                refusal_detail,
+            } = exec::grade(record)
+            {
+                let reason = serde_json::to_value(reason)
+                    .unwrap()
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_owned();
                 return self.restored_remote_fallback(
                     &task,
                     &remote,
-                    &serde_json::to_value(reason)
-                        .unwrap()
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_owned(),
+                    &reason,
+                    refusal_detail.as_deref(),
                 );
             }
             self.remote_terminal(&task, exec::grade(record), None);
@@ -765,7 +796,7 @@ impl BgTaskRegistry {
                         return if remote.explicit_runon {
                             self.refuse_remote_before_dispatch(&task, &error)
                         } else {
-                            self.remote_fallback(&task, fallback, &error)
+                            self.remote_fallback(&task, fallback, &error, None)
                         };
                     }
                     if let Some(point) = remote.point().filter(|_| remote.connection_file.is_some())
@@ -787,7 +818,7 @@ impl BgTaskRegistry {
                     return if remote.explicit_runon {
                         self.refuse_remote_before_dispatch(&task, &error.to_string())
                     } else {
-                        self.remote_fallback(&task, local, &error.to_string())
+                        self.remote_fallback(&task, local, &error.to_string(), None)
                     }
                 }
             };
@@ -798,7 +829,12 @@ impl BgTaskRegistry {
                     return if remote.explicit_runon {
                         self.refuse_remote_before_dispatch(&task, &error.to_string())
                     } else {
-                        self.remote_fallback(&task, fallback.take().unwrap(), &error.to_string())
+                        self.remote_fallback(
+                            &task,
+                            fallback.take().unwrap(),
+                            &error.to_string(),
+                            None,
+                        )
                     }
                 }
                 Err(error) => {
@@ -839,28 +875,30 @@ impl BgTaskRegistry {
             };
             match result {
                 Ok(StreamProgress::Record) => recovery.reset(),
-                Ok(StreamProgress::Complete(Verdict::RunLocally { reason })) => {
+                Ok(StreamProgress::Complete(Verdict::RunLocally {
+                    reason,
+                    refusal_detail,
+                })) => {
+                    let reason = serde_json::to_value(reason)
+                        .unwrap()
+                        .as_str()
+                        .unwrap_or("unknown")
+                        .to_owned();
                     if let Some(fallback) = fallback.take() {
                         // A live refusal uses the launch plan captured before
                         // dispatch. The private disk snapshot is for restarts.
                         return self.remote_fallback(
                             &task,
                             fallback,
-                            &serde_json::to_value(reason)
-                                .unwrap()
-                                .as_str()
-                                .unwrap_or("unknown")
-                                .to_owned(),
+                            &reason,
+                            refusal_detail.as_deref(),
                         );
                     }
                     return self.restored_remote_fallback(
                         &task,
                         &remote,
-                        &serde_json::to_value(reason)
-                            .unwrap()
-                            .as_str()
-                            .unwrap_or("unknown")
-                            .to_owned(),
+                        &reason,
+                        refusal_detail.as_deref(),
                     );
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
@@ -942,6 +980,7 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         local: LocalFallback,
         reason: &str,
+        refusal_detail: Option<&str>,
     ) -> Result<(), String> {
         let mut db = DeferredDbWrites::new(self, task);
         let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
@@ -951,7 +990,7 @@ impl BgTaskRegistry {
         if metadata.remote.as_ref().is_some_and(|r| r.explicit_runon) {
             drop(state);
             drop(db);
-            return self.refuse_remote_executor(task, reason);
+            return self.refuse_remote_executor(task, reason, refusal_detail);
         }
         let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
             .map_err(|e| e.to_string())?;
@@ -962,7 +1001,14 @@ impl BgTaskRegistry {
             }
             drop(state);
             drop(db);
-            self.remote_terminal(task,Verdict::RunLocally { reason:RefusalReason::Unknown(reason.into()) },Some("remote refused before start; local fallback skipped because cancellation was requested".into()));
+            self.remote_terminal(
+                task,
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unknown(reason.into()),
+                    refusal_detail: refusal_detail.map(str::to_owned),
+                },
+                Some("remote refused before start; local fallback skipped because cancellation was requested".into()),
+            );
             return Ok(());
         }
         // Commit the switch to local before spawning. A crash before the PID
@@ -970,7 +1016,7 @@ impl BgTaskRegistry {
         state.metadata.remote = None;
         state.metadata.local_fallback_started = true;
         state.metadata.started_at = unix_millis();
-        let reason = reason.replace(['\n', '\r'], " ");
+        let reason = rendered_refusal_reason(reason, refusal_detail).replace(['\n', '\r'], " ");
         state.metadata.execution_note = Some(format!(
             "ran locally on {}: remote refused: {reason}",
             local_os_name()
@@ -1043,11 +1089,12 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         remote: &RemoteTask,
         reason: &str,
+        refusal_detail: Option<&str>,
     ) -> Result<(), String> {
         // Decide before even restoring a local launch plan: this also covers
         // a refusal persisted just before the previous AFT process stopped.
         if remote.explicit_runon {
-            return self.refuse_remote_executor(task, reason);
+            return self.refuse_remote_executor(task, reason, refusal_detail);
         }
         let restore = (|| {
             let layout = resolve_task_layout(&task.paths.session_dir, &task.task_id)
@@ -1086,21 +1133,35 @@ impl BgTaskRegistry {
                     linux_scope,
                 },
                 reason,
+                refusal_detail,
             )
         })();
         if let Err(error) = restore {
-            self.remote_terminal(task,Verdict::RunLocally { reason:RefusalReason::Unknown(reason.into()) },Some(format!("remote refused before start; the local fallback could not be restored after restart, so the command did not run: {error}")));
+            self.remote_terminal(
+                task,
+                Verdict::RunLocally {
+                    reason: RefusalReason::Unknown(reason.into()),
+                    refusal_detail: refusal_detail.map(str::to_owned),
+                },
+                Some(format!("remote refused before start; the local fallback could not be restored after restart, so the command did not run: {error}")),
+            );
         }
         Ok(())
     }
 
-    fn refuse_remote_executor(&self, task: &Arc<BgTask>, reason: &str) -> Result<(), String> {
+    fn refuse_remote_executor(
+        &self,
+        task: &Arc<BgTask>,
+        reason: &str,
+        refusal_detail: Option<&str>,
+    ) -> Result<(), String> {
         self.remote_terminal(
             task,
             Verdict::RunLocally {
                 reason: RefusalReason::Unknown(reason.into()),
+                refusal_detail: refusal_detail.map(str::to_owned),
             },
-            Some(runon_refusal_message(reason)),
+            Some(runon_refusal_message(reason, refusal_detail)),
         );
         Ok(())
     }
@@ -1113,6 +1174,7 @@ impl BgTaskRegistry {
             task,
             Verdict::RunLocally {
                 reason: RefusalReason::Unreachable,
+                refusal_detail: None,
             },
             Some(format!(
                 "runon refused: remote execution is unavailable; command did not run: {error}"
