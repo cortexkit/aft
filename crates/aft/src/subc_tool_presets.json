@@ -134,7 +134,7 @@
           "type": "boolean"
         },
         "timeoutMs": {
-          "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+          "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.",
           "type": "integer",
           "minimum": 1,
           "maximum": 1800000
@@ -147,7 +147,7 @@
       "required": [
         "taskId"
       ],
-      "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait."
+      "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait."
     },
     "powershell": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

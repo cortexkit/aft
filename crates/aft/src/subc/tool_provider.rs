@@ -9,7 +9,7 @@ use cortexkit_role_tool_provider::{
     call::{check_call, SchemaPin},
     catalog::{
         composition_digest, schema_digest, system_text_digest, CatalogAnswer, CatalogRequest,
-        CatalogTool, SystemTextAnswer,
+        CatalogTool, Reply, SystemTextAnswer,
     },
     describe::{Major, RoleDescribe},
     errors,
@@ -293,7 +293,14 @@ fn build_tools(preset: CatalogPreset) -> Vec<(CatalogTool, Option<CatalogTool>)>
                     .remove("description");
                 let digest =
                     schema_digest(&schema).expect("embedded schema has a structural digest");
-                let mut entry = CatalogTool::new(name.clone(), digest, 1, schema);
+                let semantics = if preset == CatalogPreset::Worker
+                    && matches!(name.as_str(), "bash" | "bash_watch")
+                {
+                    2
+                } else {
+                    1
+                };
+                let mut entry = CatalogTool::new(name.clone(), digest, semantics, schema);
                 if !tag.is_empty() {
                     entry.capabilities.push((*tag).into());
                 }
@@ -387,21 +394,37 @@ pub(super) fn reader_text(names: &[&str]) -> String {
     text
 }
 
+#[cfg(test)]
 pub(super) fn catalog(
     body: Value,
     disabled: &[String],
     powershell_available: bool,
 ) -> Result<Value, ErrorBody> {
-    catalog_for_session(body, disabled, powershell_available, false)
+    catalog_for_session(
+        body,
+        disabled,
+        powershell_available,
+        false,
+        crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+    )
 }
 
-/// [`catalog`] for a session that may (`runon`) or may not run commands on
-/// the remote runner; only the first sees bash's `runon` argument.
+// A reply deadline starts at receipt, not at the command's first poll. Reserve
+// 30 seconds beyond the resolved worker cap: up to 20 seconds for spawn
+// admission, the 5-second near-kill terminal handoff margin, and 5 seconds for
+// finalization, writer queueing and relay egress. The margin extends the reply
+// deadline, not the command timeout, and no model argument controls it.
+const WORKER_REPLY_MARGIN_MS: u64 = 30_000;
+const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
+
+/// Render from session policy and its resolved worker wait limit. Only a
+/// session that may run commands remotely sees bash's `runon` argument.
 pub(super) fn catalog_for_session(
     body: Value,
     disabled: &[String],
     powershell_available: bool,
     runon: bool,
+    worker_wait_max_ms: u64,
 ) -> Result<Value, ErrorBody> {
     let request: CatalogRequest = serde_json::from_value(body)
         .map_err(|e| errors::invalid_request("arguments", e.to_string()))?;
@@ -418,6 +441,22 @@ pub(super) fn catalog_for_session(
         powershell_available,
         runon,
     ));
+    if preset == CatalogPreset::Worker {
+        match worker_wait_max_ms.checked_add(WORKER_REPLY_MARGIN_MS)
+            .filter(|max_ms| *max_ms <= MAX_DECLARED_REPLY_MS)
+        {
+            Some(max_ms) => {
+                for tool in &mut answer.tools {
+                    if matches!(tool.name.as_str(), "bash" | "bash_watch") {
+                        tool.reply = Some(Reply::new(max_ms));
+                    }
+                }
+            }
+            None => log::info!(
+                "worker catalog: bash.worker_wait_max_ms={worker_wait_max_ms}; reply omitted because the cap plus {WORKER_REPLY_MARGIN_MS}ms margin exceeds the 24-hour tool-provider deadline maximum"
+            ),
+        }
+    }
     let composition = request.composition.as_ref().map(|composition| {
         composition_digest(&Value::Object(composition.clone())).expect("composition is JSON")
     });
@@ -1377,6 +1416,17 @@ fn admit_as(
     // A bash call is checked against the schema with `runon`: whether the
     // session may run remotely is decided when the call runs, by name.
     let tool = served.with_runon.as_ref().unwrap_or(&served.catalog);
+    // Shared argument validation accepts both shell schemas. Check the behavior
+    // version against the caller's preset so a worker wait change does not
+    // invalidate calls pinned to the head's unchanged bash behavior.
+    let semantics = if role.is_worker() {
+        tool.semantics
+    } else {
+        served_tools(CatalogPreset::Head)
+            .iter()
+            .find(|entry| entry.catalog.name == call.name)
+            .map_or(tool.semantics, |entry| entry.catalog.semantics)
+    };
     if let Some(encoded) = &call.schema_pin {
         let pin = SchemaPin::parse(encoded)
             .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
@@ -1385,8 +1435,13 @@ fn admit_as(
         {
             return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
         }
-        if pin.semantics != tool.semantics {
-            return Err(ErrorBody::new(errors::TOOL_SEMANTICS_CHANGED, "semantics pin is stale").with_detail(json!({"tool": call.name, "expected": pin.semantics, "current": tool.semantics})));
+        if pin.semantics != semantics {
+            return Err(
+                ErrorBody::new(errors::TOOL_SEMANTICS_CHANGED, "semantics pin is stale")
+                    .with_detail(
+                        json!({"tool": call.name, "expected": pin.semantics, "current": semantics}),
+                    ),
+            );
         }
     }
     let arguments = call
@@ -1829,6 +1884,7 @@ mod tests {
                     &disabled,
                     fixture["powershell_available"].as_bool().unwrap(),
                     remote_runs(fixture),
+                    crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
                 )
                 .unwrap();
             }
@@ -1874,7 +1930,13 @@ mod tests {
         let available = fixture["powershell_available"].as_bool().unwrap();
         let runon = remote_runs(fixture);
         let catalog = |request: Value, disabled: &[String], available: bool| {
-            catalog_for_session(request, disabled, available, runon)
+            catalog_for_session(
+                request,
+                disabled,
+                available,
+                runon,
+                crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS,
+            )
         };
         let request = fixture["request"].clone();
         let actual = catalog(request.clone(), &disabled, available).unwrap();

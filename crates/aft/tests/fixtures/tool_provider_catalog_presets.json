@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1db58523ac3ea575cf8be651315ed0a9767458de133c51bc27502d6973b20c11",
-      "catalog_digest": "1db58523ac3ea575cf8be651315ed0a9767458de133c51bc27502d6973b20c11",
+      "generation": "a50ed7844c9c6267b0112f16ddb3ec2a772927e6d48f7f12c1729198118b1733",
+      "catalog_digest": "a50ed7844c9c6267b0112f16ddb3ec2a772927e6d48f7f12c1729198118b1733",
       "tools": [
         {
           "name": "status",
@@ -28,7 +28,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 1,
+          "semantics": 2,
           "result_ops": [
             "prepend",
             "append"
@@ -37,6 +37,9 @@
             "shell.exec/v1"
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -978,11 +981,14 @@
         {
           "name": "bash_watch",
           "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
-          "semantics": 1,
+          "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1015,7 +1021,7 @@
                 "type": "boolean"
               },
               "timeoutMs": {
-                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
@@ -1150,8 +1156,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "1d9e07ceca8e6cf4b2004e76c2337c4fc62923a19635013a6df4e759342f2de9",
-      "catalog_digest": "1d9e07ceca8e6cf4b2004e76c2337c4fc62923a19635013a6df4e759342f2de9",
+      "generation": "9390be45cdb1fb6afad7dda81b08193d294b4bc69a11518d2788b76bf38142f0",
+      "catalog_digest": "9390be45cdb1fb6afad7dda81b08193d294b4bc69a11518d2788b76bf38142f0",
       "tools": [
         {
           "name": "status",
@@ -1168,7 +1174,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 1,
+          "semantics": 2,
           "result_ops": [
             "prepend",
             "append"
@@ -1177,6 +1183,9 @@
             "shell.exec/v1"
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2187,11 +2196,14 @@
         {
           "name": "bash_watch",
           "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
-          "semantics": 1,
+          "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2224,7 +2236,7 @@
                 "type": "boolean"
               },
               "timeoutMs": {
-                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
@@ -3213,8 +3225,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "ee2ade3bd5f5faec2cd29a4b676417338ac11c7d8b32b7402a75b02334304c17",
-      "catalog_digest": "ee2ade3bd5f5faec2cd29a4b676417338ac11c7d8b32b7402a75b02334304c17",
+      "generation": "4dfd4d805ce4901c6e3e433680bdba3346055757b699b52a3462ac824f8946bc",
+      "catalog_digest": "4dfd4d805ce4901c6e3e433680bdba3346055757b699b52a3462ac824f8946bc",
       "tools": [
         {
           "name": "status",
@@ -3231,7 +3243,7 @@
         {
           "name": "bash",
           "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
-          "semantics": 1,
+          "semantics": 2,
           "result_ops": [
             "prepend",
             "append"
@@ -3240,6 +3252,9 @@
             "shell.exec/v1"
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4185,11 +4200,14 @@
         {
           "name": "bash_watch",
           "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
-          "semantics": 1,
+          "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4222,7 +4240,7 @@
                 "type": "boolean"
               },
               "timeoutMs": {
-                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000
@@ -4358,8 +4376,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "37381a30cc5bfec01ad2e288b3c8e032806a51f9c059c93bfae591bf7fefb176",
-      "catalog_digest": "37381a30cc5bfec01ad2e288b3c8e032806a51f9c059c93bfae591bf7fefb176",
+      "generation": "de185082d3e9e508112857f6be257dc5789f11c956bc3c72c16670628061a618",
+      "catalog_digest": "de185082d3e9e508112857f6be257dc5789f11c956bc3c72c16670628061a618",
       "tools": [
         {
           "name": "status",
@@ -4376,7 +4394,7 @@
         {
           "name": "bash",
           "schema_digest": "029ddfaa46f2b46b773e15231b41cf5c86acd1ed1668068236039c1edb978aca",
-          "semantics": 1,
+          "semantics": 2,
           "result_ops": [
             "prepend",
             "append"
@@ -4385,6 +4403,9 @@
             "shell.exec/v1"
           ],
           "description": "Execute shell commands. Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks. Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (in a delegated session it blocks up to the worker wait limit, bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use it when you need the result before doing anything else; keep it off otherwise so a long command moves to the background while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then wait on it with bash_watch before you report a result: a background task never wakes you, and a watch without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. Never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one); never loop bash_status to wait. A `nohup … &` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: \"screen\" }) plus bash_write. Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report. `timeout` starts after spawn and kills the Unix process group (exit 124; Windows uses taskkill /T /F); processes that leave the group survive. When remote runs are available, put `runon: \"linux\"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the grep tool, read, aft_outline, or aft_zoom instead. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5399,11 +5420,14 @@
         {
           "name": "bash_watch",
           "schema_digest": "1f3fb25a580902d58c7e391df1c2da3d065079f62c9ba1a3363f6eb880955a35",
-          "semantics": 1,
+          "semantics": 2,
           "capabilities": [
             "shell.exec/v1"
           ],
-          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "description": "Watch a background bash task and wait until it exits or prints a pattern. Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit. A background task never wakes you, so wait on it before you report a result. Call bash_watch again to keep waiting; don't report a result until the command finishes. Never loop bash_status to wait.",
+          "reply": {
+            "max_ms": 1830000
+          },
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5436,7 +5460,7 @@
                 "type": "boolean"
               },
               "timeoutMs": {
-                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.",
+                "description": "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 1800000

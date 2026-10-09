@@ -171,8 +171,8 @@ fn with_id(mut response: Response, id: &str) -> Response {
 /// The wait this call gets, in milliseconds, or the refusal of its timeout.
 ///
 /// A delegated worker cannot be woken once its turn ends, so without a timeout
-/// it waits up to the worker wait limit (`bash.worker_wait_max_ms`), and a
-/// timeout it passes is used as given up to the schema maximum. A primary
+/// it waits up to the worker wait limit (`bash.worker_wait_max_ms`), and an
+/// explicit timeout cannot extend that wait beyond the configured limit. A primary
 /// keeps the short default and the `bash.watch_sync_max_ms` cap. A worker's
 /// `background: true` keeps the async request's meaning ("tell me when it's
 /// done") as a wait up to the worker limit, exactly like the plugins when
@@ -220,7 +220,7 @@ fn effective_wait_ms(
     Ok(if worker && background {
         worker_limit_ms
     } else if worker {
-        requested.unwrap_or(worker_limit_ms)
+        requested.unwrap_or(worker_limit_ms).min(worker_limit_ms)
     } else {
         requested
             .unwrap_or(DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
@@ -826,6 +826,43 @@ mod tests {
 
     fn params(value: Value) -> BashWatchParams {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worker_watch_explicit_timeout_is_clamped_to_configured_cap() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = context(project.path(), storage.path());
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = 500);
+        let spawn: RawRequest = serde_json::from_value(json!({
+            "id":"start-watch-cap", "command":"bash", "session_id":SESSION,
+            "worker_session":true,
+            "params":{"command":"sleep 10", "background":true, "timeout":30_000},
+        }))
+        .unwrap();
+        let launched = with_authenticated_principal(principal(project.path()), || {
+            crate::commands::bash::handle(&spawn, &ctx)
+        });
+        assert!(launched.success, "{launched:?}");
+        let task = launched.data["task_id"].as_str().unwrap();
+        struct StopTask(crate::bash_background::BgTaskRegistry, String);
+        impl Drop for StopTask {
+            fn drop(&mut self) {
+                let _ = self.0.kill(&self.1, SESSION);
+            }
+        }
+        let _stop = StopTask(ctx.bash_background().clone(), task.into());
+        let started = Instant::now();
+        let response = watch_with_deadline(Arc::clone(&ctx), request(task, SESSION)).await;
+        let elapsed = started.elapsed();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        assert_eq!(response.data["waited"]["reason"], "timeout", "{response:?}");
+        assert!(
+            elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
     }
 
     #[cfg(unix)]

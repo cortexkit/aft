@@ -797,10 +797,12 @@ pub(super) fn submit_deferred_bash(
                         );
                     }
 
-                    // A server-owned call is killed rather than detached when it
-                    // ends, so the worker wait limit (which detaches) leaves it be.
+                    // The worker wait cap limits the caller's reply wait,
+                    // regardless of the route's cancellation policy. Reaching
+                    // that cap hands back a task id without killing the command;
+                    // the command's own timeout still governs its lifetime.
                     let worker_cap_ms = crate::commands::bash_orchestrate::worker_wait_cap_ms(
-                        worker_session && !server_completion,
+                        worker_session,
                         settings.block_to_completion || settings.wait,
                         crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
                     );

@@ -54,14 +54,14 @@ export const WORKER_WAIT_LIMIT_PHRASE =
  * has to state both roles' real behaviour.
  */
 export const WATCH_SYNC_DEFAULTS_DESCRIPTION =
-  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting";
+  "Sync waits default to 30s in a main session (max `bash.watch_sync_max_ms`, 120s by default); in a delegated session a sync wait without a timeout waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), then reports it is still running; watch again to keep waiting. An explicit timeout never exceeds that worker limit";
 
 /**
  * Description of the bash_watch timeout parameter. Every caller sees the same
  * schema, so it has to be true for both roles.
  */
 export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
-  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is used as given.";
+  "Sync-only timeout in milliseconds. In a main session: default 30000, max `bash.watch_sync_max_ms` (120000 by default). In a delegated session: omit it to wait up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default), after which the watch reports the command is still running; a value you pass is clamped to that worker limit.";
 
 /**
  * Effective sync bash_watch deadline in milliseconds.
@@ -72,7 +72,7 @@ export const WATCH_TIMEOUT_PARAM_DESCRIPTION =
  * therefore waits up to the worker wait limit (`workerWaitMaxMs`,
  * `bash.worker_wait_max_ms`) by default: long enough that re-watching is
  * rare, short enough that a stuck command cannot hold it forever. A timeout
- * it passes is honoured as given rather than clamped to the primary cap. A
+ * it passes is clamped to the worker limit, not to the primary cap. A
  * primary keeps the short default and the cap because it can do other work
  * or end its turn and be woken by the completion reminder.
  */
@@ -82,7 +82,7 @@ export function resolveWatchTimeoutMs(
   capMs: number,
   workerWaitMaxMs: number,
 ): number {
-  if (role === "worker") return requestedMs ?? workerWaitMaxMs;
+  if (role === "worker") return Math.min(requestedMs ?? workerWaitMaxMs, workerWaitMaxMs);
   return Math.min(requestedMs ?? DEFAULT_PRIMARY_WATCH_TIMEOUT_MS, capMs);
 }
 

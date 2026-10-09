@@ -463,10 +463,16 @@ reminder wake you, or use `bash({wait:true})` when the result is needed before a
 delegated (subagent) session, which cannot be woken once its turn ends, a sync wait without
 `timeoutMs` waits up to the worker wait limit (`bash.worker_wait_max_ms`, 30 minutes by default),
 then reports the command is still running with how long it has run and its latest output; the
-worker watches again to keep waiting or kills it. An explicit `timeoutMs` is used as given rather
-than capped. A delegated session's blocking `bash` call (`wait: true`, or any foreground call when
+worker watches again to keep waiting or kills it. An explicit `timeoutMs` can shorten that wait,
+but never extends it beyond the configured worker limit. A delegated session's blocking `bash`
+call (`wait: true`, or any foreground call when
 `bash.subagent_background` is false) is bounded the same way: at the limit the command moves to the
-background, not killed, and the reply gives its task id. The wait limit is not the task's kill
+background, not killed, and the reply gives its task id, including on the tool-provider/v1 route.
+The worker preset declares a reply deadline for `bash` and `bash_watch` equal to the resolved
+worker limit plus 30 seconds for spawn, terminal handoff and reply delivery; head and reader
+presets declare no deadline. If that sum exceeds the role contract's 24-hour maximum, the catalog
+still serves the tools but omits their reply metadata, leaving callers' fallback in force.
+The wait limit is not the task's kill
 deadline: every reply that hands a task back (launch, promotion, detach) and every `bash_watch`
 result also names the task's own deadline (for example, "AFT kills this task at 2026-09-10 10:30:00Z, when it has run 30 minutes (its default background limit); about 12 minutes remain", or the `timeout` you passed), and a task killed by it is reported by
 name ("killed by AFT's default background limit of 30 minutes (exit 124)") rather than as a bare

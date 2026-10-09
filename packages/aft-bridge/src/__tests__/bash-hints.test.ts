@@ -60,6 +60,11 @@ describe("resolveWatchTimeoutMs", () => {
     expect(resolveWatchTimeoutMs(600_000, "primary", 120_000, 1_800_000)).toBe(120_000);
     expect(resolveWatchTimeoutMs(undefined, "primary", 10_000, 1_800_000)).toBe(10_000);
   });
+
+  test("a worker explicit timeout never exceeds its configured wait cap", () => {
+    expect(resolveWatchTimeoutMs(600_000, "worker", 120_000, 300_000)).toBe(300_000);
+    expect(resolveWatchTimeoutMs(5_000, "worker", 120_000, 300_000)).toBe(5_000);
+  });
 });
 
 describe("taskKillDeadlineText", () => {

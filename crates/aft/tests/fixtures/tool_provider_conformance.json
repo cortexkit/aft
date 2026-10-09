@@ -2,19 +2,19 @@
   "registry_artifacts": [
     {
       "name": "cortexkit-role-tool-provider",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "1bfc99885fd0368fcc698ab7e2d2730798c3896db601ff223dd4bfff56df74c9",
+      "checksum": "0d3a631807c4f69a1f055e7e1eed592c7b4b28a47157b1d1ecbd65dfe15cc175",
       "dependency_kind": "normal",
-      "release_tag": "cortexkit-role-tool-provider-v0.5.1"
+      "release_tag": "cortexkit-role-tool-provider-v0.5.2"
     },
     {
       "name": "cortexkit-role-tool-provider-conformance",
-      "version": "0.5.0",
+      "version": "0.5.2",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "checksum": "8455bb4bd0da2770ed67d10c3bbdc94394c880d17d86bb41e67ed5c42d367907",
+      "checksum": "8b0ba5ed4b08f304c91d4b6f3542dd1eb228bfd90143e39b76d9346a71553e0e",
       "dependency_kind": "dev",
-      "release_tag": "cortexkit-role-tool-provider-conformance-v0.5.0"
+      "release_tag": "cortexkit-role-tool-provider-conformance-v0.5.2"
     },
     {
       "name": "cortexkit-role-harness",
@@ -45,6 +45,7 @@
       "role_describe_shape",
       "role_describe_cacheable",
       "catalog_schemas_flat",
+      "catalog_reply_valid",
       "catalog_schema_digest_stable",
       "catalog_digest_only",
       "catalog_unknown_preset_refused",
@@ -59,6 +60,8 @@
       "schema_pin_malformed_refused"
     ],
     "skipped_cases": [
+      "system_text_digests_match_text",
+      "system_text_preflight_digest_stable",
       "withdraw_unknown_call",
       "withdraw_answer_identical_on_repeat_and_owner",
       "withdraw_owner_as_carrier_needs_no_carrier",
@@ -104,6 +107,7 @@
       "role_describe_shape",
       "role_describe_cacheable",
       "catalog_schemas_flat",
+      "catalog_reply_valid",
       "catalog_schema_digest_stable",
       "catalog_digest_only",
       "catalog_unknown_preset_refused",
@@ -131,7 +135,10 @@
       "crash_after_prepared_not_started",
       "crash_after_authorized_not_started"
     ],
-    "skipped_cases": [],
+    "skipped_cases": [
+      "system_text_digests_match_text",
+      "system_text_preflight_digest_stable"
+    ],
     "capabilities": [
       "disable_tool",
       "cancellation",

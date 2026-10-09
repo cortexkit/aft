@@ -26,8 +26,8 @@ pub const DEFAULT_BASH_WATCH_SYNC_MAX_MS: u64 = 120_000;
 pub const MIN_BASH_WATCH_SYNC_MAX_MS: u64 = 1_000;
 pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
 /// How long a delegated worker's wait on one command blocks before control
-/// returns to the worker (`bash.worker_wait_max_ms`): a `bash_watch` without a
-/// timeout, or a blocking `bash` call (`wait: true`, or every foreground call
+/// returns to the worker (`bash.worker_wait_max_ms`): any `bash_watch` wait,
+/// or a blocking `bash` call (`wait: true`, or every foreground call
 /// when `bash.subagent_background` is false), which then moves to the
 /// background instead of being killed. The worker then
 /// decides whether to wait again or kill the command, so a stuck command can

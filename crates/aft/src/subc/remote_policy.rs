@@ -69,7 +69,14 @@ pub(super) fn catalog(
         }
     }
     let powershell = crate::bash_background::powershell_available();
-    let answer = tool_provider::catalog(body.clone(), &identity.disabled_tools, powershell)?;
+    let worker_wait_max_ms = ctx.config().bash.worker_wait_max_ms;
+    let answer = tool_provider::catalog_for_session(
+        body.clone(),
+        &identity.disabled_tools,
+        powershell,
+        false,
+        worker_wait_max_ms,
+    )?;
     if let Some(key) = key(identity, Some(&preset)) {
         if original.contains_key("remote_exec") || original.contains_key("siblings") {
             let policy = match crate::exec_remote::FrozenParams::decode(&original) {
@@ -129,7 +136,13 @@ pub(super) fn catalog(
                 .is_some_and(|policy| policy.enabled)
         });
     if offered {
-        tool_provider::catalog_for_session(body, &identity.disabled_tools, powershell, true)
+        tool_provider::catalog_for_session(
+            body,
+            &identity.disabled_tools,
+            powershell,
+            true,
+            worker_wait_max_ms,
+        )
     } else {
         Ok(answer)
     }

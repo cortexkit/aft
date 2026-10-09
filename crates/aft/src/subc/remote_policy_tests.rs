@@ -81,6 +81,59 @@ fn fetch(plan: &Value) -> Value {
     json!({"op":"tool.catalog","preset":"worker","params":plan["tool_items"][0]["params"],"composition":plan["composition"]})
 }
 
+#[test]
+fn worker_reply_deadlines_track_resolved_config_only() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    let route = identity(root.path(), "reply-deadline", 7, false);
+    let mut previous = None;
+    for (cap, expected) in [(60_000, 90_000), (300_000, 330_000)] {
+        ctx.update_config(|config| config.bash.worker_wait_max_ms = cap);
+        for preset in ["head", "worker", "reader"] {
+            let answer = catalog(json!({"preset":preset}), &route, &ctx).unwrap();
+            for tool in answer["tools"].as_array().unwrap() {
+                if preset == "worker"
+                    && matches!(tool["name"].as_str(), Some("bash" | "bash_watch"))
+                {
+                    assert_eq!(tool["reply"], json!({"max_ms":expected}), "{tool}");
+                } else {
+                    assert!(tool.get("reply").is_none(), "{preset}: {tool}");
+                }
+            }
+            if preset == "worker" {
+                let digest = answer["catalog_digest"].clone();
+                if let Some(previous) = previous.replace(digest.clone()) {
+                    assert_ne!(previous, digest);
+                }
+                let digest_only =
+                    catalog(json!({"preset":preset,"digest_only":true}), &route, &ctx).unwrap();
+                assert_eq!(digest_only["catalog_digest"], digest);
+            }
+        }
+    }
+}
+
+#[test]
+fn oversized_worker_cap_serves_catalog_without_reply_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = context(root.path(), storage.path(), None);
+    ctx.update_config(|config| config.bash.worker_wait_max_ms = 86_400_000);
+    let route = identity(root.path(), "reply-oversized", 7, false);
+    let answer = catalog(json!({"preset":"worker"}), &route, &ctx).unwrap();
+    assert!(answer["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == "bash_watch"));
+    assert!(answer["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|t| t.get("reply").is_none()));
+}
+
 #[cfg(unix)]
 fn bash_catalog_entry(reply: &Value) -> &Value {
     reply["tools"]

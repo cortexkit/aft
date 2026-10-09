@@ -198,7 +198,7 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-role-tool-provider = "=0.5.1"
+cortexkit-role-tool-provider = "=0.5.2"
 jsonschema = { version = "0.33", default-features = false }
 subc-protocol = "=0.29.0"
 subc-transport = "=0.10.0"
@@ -233,7 +233,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 graphql-parser = "0.4.1"
-cortexkit-role-tool-provider-conformance = "=0.5.0"
+cortexkit-role-tool-provider-conformance = "=0.5.2"
 cortexkit-role-harness = "=0.1.0"
 async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }
