@@ -666,6 +666,7 @@ pub(crate) struct RegistryInner {
     /// bind/unbind transitions; standalone replay relies on its binding-session
     /// exception instead.
     live_delivery_sessions: Mutex<HashSet<String>>,
+    live_delivery_lock_diagnostics: Arc<crate::lock_diagnostics::LockDiagnostics>,
     wait_detach_sessions: Mutex<HashSet<String>>,
     active_wait_sessions: Mutex<HashMap<String, usize>>,
     wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
@@ -991,6 +992,9 @@ impl BgTaskRegistry {
                 watch_registry: Mutex::new(WatchRegistry::default()),
                 persisted_watch_cursors: Mutex::new(HashMap::new()),
                 live_delivery_sessions: Mutex::new(HashSet::new()),
+                live_delivery_lock_diagnostics: crate::lock_diagnostics::LockDiagnostics::new(
+                    file!(),
+                ),
                 wait_detach_sessions: Mutex::new(HashSet::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),
                 wait_registered_tasks: Mutex::new(HashMap::new()),
@@ -1171,21 +1175,32 @@ impl BgTaskRegistry {
 
     pub(crate) fn record_live_delivery_session(&self, session_id: &str) {
         if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
+            let _hold = self.inner.live_delivery_lock_diagnostics.hold();
             live_sessions.insert(session_id.to_string());
         }
     }
 
     pub(crate) fn replace_live_delivery_sessions(&self, sessions: HashSet<String>) {
         if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
+            let _hold = self.inner.live_delivery_lock_diagnostics.hold();
             *live_sessions = sessions;
         }
+    }
+
+    pub(crate) fn live_delivery_lock_diagnostics(
+        &self,
+    ) -> Arc<crate::lock_diagnostics::LockDiagnostics> {
+        Arc::clone(&self.inner.live_delivery_lock_diagnostics)
     }
 
     fn originating_session_has_live_route(&self, session_id: &str) -> bool {
         self.inner
             .live_delivery_sessions
             .lock()
-            .map(|sessions| sessions.contains(session_id))
+            .map(|sessions| {
+                let _hold = self.inner.live_delivery_lock_diagnostics.hold();
+                sessions.contains(session_id)
+            })
             .unwrap_or(true)
     }
 

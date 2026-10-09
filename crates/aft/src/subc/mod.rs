@@ -2424,7 +2424,7 @@ fn purge_deleted_root_residents(
         false
     });
     bg_sub_by_session.retain(|(root, _), _| root != root_id);
-    sync_bg_live_delivery_sessions(executor, routes, Some(root_id));
+    sync_bg_live_delivery_sessions(executor, routes, Some(root_id), None);
 
     log::info!(
         "subc attach: fully forgot deleted root {}; cause=absence_reclaim; ended {} held request(s)",
@@ -3107,6 +3107,7 @@ fn sync_bg_live_delivery_sessions(
     executor: &Executor,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     additional_root: Option<&ProjectRootId>,
+    metrics: Option<&DispatchPathMetrics>,
 ) {
     // The loop-owned installed-route table is the lifecycle source of truth:
     // an originating session is live exactly while the daemon has an installed,
@@ -3122,7 +3123,21 @@ fn sync_bg_live_delivery_sessions(
         .collect::<HashSet<_>>();
     roots.extend(additional_root.cloned());
     for root in roots {
+        if let Some(metrics) = metrics {
+            metrics.mark_frame_loop_wait_for_root(
+                "executor.scheduler/actor_context",
+                &root,
+                executor.scheduler_lock_diagnostics(),
+            );
+        }
         if let Some(ctx) = executor.actor_context(&root) {
+            if let Some(metrics) = metrics {
+                metrics.mark_frame_loop_wait_for_root(
+                    "bash.live_delivery_sessions",
+                    &root,
+                    ctx.bash_background().live_delivery_lock_diagnostics(),
+                );
+            }
             ctx.bash_background()
                 .replace_live_delivery_sessions(sessions.clone());
         }
@@ -3358,7 +3373,7 @@ async fn teardown_installed_route(
     // cannot run before the route is removed and a completion is recorded for replay.
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
-        sync_bg_live_delivery_sessions(executor, routes, Some(&identity.root));
+        sync_bg_live_delivery_sessions(executor, routes, Some(&identity.root), Some(metrics));
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);
         }
@@ -4719,6 +4734,7 @@ where
 
                 match frame.header.ty {
                     FrameType::Ping if frame.header.channel == 0 => {
+                        dispatch_path_metrics.mark_frame_loop_wait("writer_queue/Pong", None);
                         let pong = match Frame::build_with_version(
                             frame.header.ver,
                             FrameType::Pong,
@@ -5604,9 +5620,10 @@ fn spawn_stall_watchdog(
     config_override: Option<stall_watchdog::StallWatchdogConfig>,
 ) -> Option<stall_watchdog::StallWatchdog> {
     let markers: Vec<Box<dyn stall_watchdog::LivenessMarker>> = vec![
-        Box::new(stall_watchdog::FrameLoopMarker(Arc::clone(
-            dispatch_path_metrics,
-        ))),
+        Box::new(stall_watchdog::FrameLoopMarker(
+            Arc::clone(dispatch_path_metrics),
+            executor.scheduler_lock_diagnostics(),
+        )),
         Box::new(stall_watchdog::DispatchLoopMarker(
             executor.dispatch_loop_liveness(),
         )),
@@ -6078,7 +6095,12 @@ async fn handle_route_bind_completion(
     let replay_key = push::ReplayKey::from_identity(&completion.identity);
     let bind_trust = completion.identity.trust;
     insert_route_channel(routes, root_channels, route_id, completion.identity);
-    sync_bg_live_delivery_sessions(executor, routes, Some(&completion.bind_root_id));
+    sync_bg_live_delivery_sessions(
+        executor,
+        routes,
+        Some(&completion.bind_root_id),
+        Some(metrics),
+    );
     let restore_watcher = live_roots
         .get(&completion.bind_root_id)
         .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
@@ -6498,7 +6520,10 @@ async fn handle_control_request(
             }
             let bind_root_id = match bind_root_id {
                 Some(root_id) => root_id,
-                None => match ProjectRootId::from_path(&identity.project_root) {
+                None => match {
+                    metrics.mark_frame_loop_wait("disk/canonicalize_root", None);
+                    ProjectRootId::from_path(&identity.project_root)
+                } {
                     Ok(root_id) => root_id,
                     Err(error) => {
                         return send_route_bind_error(
@@ -6540,6 +6565,7 @@ async fn handle_control_request(
             // wire-relayed tiers are ignored so a front cannot inject settings.
             // The resolver selects only this bind's harness override before it
             // applies the unchanged user/project trust boundary.
+            metrics.mark_frame_loop_wait("disk/local_config", None);
             let local_tiers = crate::subc_config::read_local_cortexkit_config_tiers(
                 user_config_path,
                 Path::new(&bind_project_root),
@@ -6603,6 +6629,10 @@ async fn handle_control_request(
             }));
             let configure_session = route_identity.session.clone();
             let root_was_live = live_roots.contains_key(&bind_root_id);
+            metrics.mark_frame_loop_wait(
+                "executor.scheduler/register_actor",
+                Some(executor.scheduler_lock_diagnostics()),
+            );
             let inserted_new_actor = register_actor_for_bind(
                 shared_app,
                 executor,
@@ -6612,7 +6642,7 @@ async fn handle_control_request(
                 root_was_live,
             );
 
-            sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id));
+            sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id), Some(metrics));
             let configure_request_id = configure_req.id.clone();
             installed_route_epochs.insert(route_channel, epoch);
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
@@ -6622,6 +6652,10 @@ async fn handle_control_request(
             // Repeatable: the executor may start the bind beside a running
             // maintenance job and run it again as an exclusive writer when the
             // configure must change the root, so the job re-reads the request.
+            metrics.mark_frame_loop_wait(
+                "executor.scheduler/submit_bind",
+                Some(executor.scheduler_lock_diagnostics()),
+            );
             let (configure_rx, configure_cancellation) = executor.submit_bind_cancellable_async(
                 bind_root_id.clone(),
                 configure_request_id.clone(),
@@ -6706,6 +6740,7 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
+            metrics.mark_frame_loop_wait("cached_health/writer_queue", None);
             send_cached_health_response(
                 tx,
                 frame,

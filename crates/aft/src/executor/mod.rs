@@ -21,6 +21,7 @@ use crossbeam_channel::{Receiver, RecvError, RecvTimeoutError, Sender};
 use parking_lot::{Condvar, Mutex, RwLock};
 use tokio::sync::oneshot;
 
+use crate::lock_diagnostics::{LockDiagnostics, TrackedMutex};
 use crate::{context::AppContext, path_identity::ProjectRootId, protocol::Response};
 
 pub use single_flight::SingleFlight;
@@ -1042,7 +1043,10 @@ impl Executor {
 
     pub fn with_config(config: ExecutorConfig) -> Self {
         let effective = config.effective();
-        let state = Arc::new(Mutex::new(SchedulerState::new(effective.clone())));
+        let state = Arc::new(TrackedMutex::new(
+            SchedulerState::new(effective.clone()),
+            file!(),
+        ));
         let heavy = Arc::new(HeavySemaphore::new(effective.heavy_permits));
         let nonrunnable_dispatches = Arc::new(AtomicUsize::new(0));
         let completed_interactive = Arc::new(AtomicU64::new(0));
@@ -1326,6 +1330,10 @@ impl Executor {
             .actors
             .get(root_id)
             .map(|actor| Arc::clone(&actor.ctx))
+    }
+
+    pub(crate) fn scheduler_lock_diagnostics(&self) -> Arc<LockDiagnostics> {
+        self.inner.state.diagnostics()
     }
 
     /// [`Self::actor_context`] waiting at most [`SCHEDULER_PROBE_WAIT`] for
@@ -2065,7 +2073,7 @@ impl Default for Executor {
 }
 
 struct ExecutorInner {
-    state: Arc<Mutex<SchedulerState>>,
+    state: Arc<TrackedMutex<SchedulerState>>,
     event_tx: Sender<SchedulerEvent>,
     scheduler_handle: Mutex<Option<JoinHandle<()>>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -3133,7 +3141,7 @@ enum SchedulerEvent {
 }
 
 fn scheduler_loop(
-    state: Arc<Mutex<SchedulerState>>,
+    state: Arc<TrackedMutex<SchedulerState>>,
     heavy: Arc<HeavySemaphore>,
     run_tx: Sender<RunJob>,
     event_tx: Sender<SchedulerEvent>,

@@ -503,6 +503,17 @@ impl BindAckLatencies {
     }
 }
 
+#[derive(Default)]
+struct FrameOperation {
+    corr: u64,
+    op: String,
+    root: String,
+    session: String,
+    awaited: &'static str,
+    awaited_root: String,
+    holder: Option<Arc<crate::lock_diagnostics::LockDiagnostics>>,
+}
+
 pub(super) struct DispatchPathMetrics {
     unanswered_tools: StdMutex<HashMap<(super::RouteChannel, u64), UnansweredTool>>,
     pub(super) origin: Instant,
@@ -516,6 +527,9 @@ pub(super) struct DispatchPathMetrics {
     /// Best-effort header context; no locks are taken by the watchdog reader.
     frame_loop_frame_header: AtomicU64,
     frame_loop_frame_corr: AtomicU64,
+    /// Kept separate from scheduler and bash-registry locks. Publishers and the
+    /// watchdog use try_lock so evidence collection cannot block either thread.
+    frame_operation: StdMutex<FrameOperation>,
     /// Stall counts published by the stall watchdog thread.
     pub(super) stall_stats: Arc<super::stall_watchdog::StallStats>,
     pub(super) writer_queued: AtomicUsize,
@@ -560,6 +574,7 @@ impl DispatchPathMetrics {
             frame_loop_phase: AtomicUsize::new(0),
             frame_loop_frame_header: AtomicU64::new(0),
             frame_loop_frame_corr: AtomicU64::new(0),
+            frame_operation: StdMutex::new(FrameOperation::default()),
             stall_stats: Arc::default(),
             writer_queued: AtomicUsize::new(0),
             writer_active: AtomicBool::new(false),
@@ -761,7 +776,55 @@ impl DispatchPathMetrics {
         );
         self.frame_loop_frame_corr
             .store(frame.header.corr, Ordering::Relaxed);
+        if let Ok(mut operation) = self.frame_operation.try_lock() {
+            *operation = FrameOperation {
+                corr: frame.header.corr,
+                op: format!("{:?}", frame.header.ty).to_lowercase(),
+                awaited: "none",
+                ..FrameOperation::default()
+            };
+            if frame.header.channel == 0 && frame.header.ty == super::FrameType::Request {
+                match serde_json::from_slice::<super::ModuleControlRequest>(&frame.body) {
+                    Ok(super::ModuleControlRequest::RouteBind { identity, .. }) => {
+                        operation.op = "route_bind".to_string();
+                        operation.root = identity.project_root.to_string_lossy().into_owned();
+                        operation.session = identity.session;
+                        operation.awaited = "control_validation";
+                    }
+                    Ok(super::ModuleControlRequest::HealthCheck {}) => {
+                        operation.op = "health_check".to_string();
+                        operation.awaited = "cached_health";
+                    }
+                    Err(_) => operation.op = "invalid_control_request".to_string(),
+                }
+            }
+        }
         self.frame_loop_phase.store(2, Ordering::Release);
+    }
+
+    pub(super) fn mark_frame_loop_wait(
+        &self,
+        awaited: &'static str,
+        holder: Option<Arc<crate::lock_diagnostics::LockDiagnostics>>,
+    ) {
+        if let Ok(mut operation) = self.frame_operation.try_lock() {
+            operation.awaited = awaited;
+            operation.awaited_root.clear();
+            operation.holder = holder;
+        }
+    }
+
+    pub(super) fn mark_frame_loop_wait_for_root(
+        &self,
+        awaited: &'static str,
+        root: &ProjectRootId,
+        holder: Arc<crate::lock_diagnostics::LockDiagnostics>,
+    ) {
+        if let Ok(mut operation) = self.frame_operation.try_lock() {
+            operation.awaited = awaited;
+            operation.awaited_root = root.as_path().to_string_lossy().into_owned();
+            operation.holder = Some(holder);
+        }
     }
 
     pub(super) fn frame_loop_context(&self) -> String {
@@ -770,12 +833,35 @@ impl DispatchPathMetrics {
             1 => "phase=select_wait frame=none".to_string(),
             _ => {
                 let header = self.frame_loop_frame_header.load(Ordering::Relaxed);
+                let corr = self.frame_loop_frame_corr.load(Ordering::Relaxed);
+                let operation = self
+                    .frame_operation
+                    .try_lock()
+                    .ok()
+                    .filter(|op| op.corr == corr);
+                let detail = operation.map_or_else(
+                    || "op=unavailable awaited=diagnostic_snapshot_busy".to_string(),
+                    |op| {
+                        format!(
+                            "op={} root={:?} session={:?} awaited={} {} awaited_root={:?}",
+                            op.op,
+                            op.root,
+                            op.session,
+                            op.awaited,
+                            op.holder.as_ref().map_or_else(
+                                || "holder=unknown".to_string(),
+                                |holder| holder.snapshot()
+                            ),
+                            op.awaited_root,
+                        )
+                    },
+                );
                 format!(
-                    "phase=handle_frame frame_type={} channel={} epoch={} corr={}",
+                    "phase=handle_frame frame_type={} channel={} epoch={} corr={} {detail}",
                     header & 0xff,
                     (header >> 8) & 0xffff,
                     header >> 24,
-                    self.frame_loop_frame_corr.load(Ordering::Relaxed),
+                    corr,
                 )
             }
         }

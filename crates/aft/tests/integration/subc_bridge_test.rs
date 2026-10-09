@@ -5520,6 +5520,74 @@ async fn drive_rebind_beside_held_read_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+#[test]
+fn subc_bridge_back_to_back_binds_beside_held_mutating_job() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "subc_bridge_back_to_back_binds_beside_held_mutating_job",
+        Duration::from_secs(30),
+        drive_back_to_back_binds_beside_held_mutating_job,
+        |_, _, _| {},
+        bridge_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        },
+    );
+}
+
+async fn drive_back_to_back_binds_beside_held_mutating_job(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root = ProjectRootId::from_path(&root1).unwrap();
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let held = executor.submit(
+        root,
+        Lane::Mutating,
+        "held-mutating".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).unwrap();
+            // Bound the hold even if the transport regression fails.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            Response::success("held-mutating", json!({}))
+        }),
+    );
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    send_route_bind(&mut stream, 2, 20, &root1).await;
+    send_route_bind(&mut stream, 3, 30, &root1).await;
+    send_control_request(&mut stream, 40, ModuleControlRequest::HealthCheck {}).await;
+    // Receiving health confirms that the loop accepted both earlier binds
+    // while the writer is still held, not merely that the daemon wrote them.
+    let health = read_frame_within(
+        &mut stream,
+        Duration::from_secs(2),
+        "health behind two binds beside a held Mutating job",
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    held.recv_timeout(Duration::from_secs(5)).unwrap();
+    let health = health.expect("the frame loop must service health while the writer is held");
+    assert_eq!((health.header.channel, health.header.corr), (0, 40));
+    let mut acks = HashSet::new();
+    while acks.len() < 2 {
+        let ack = read_frame_timeout(&mut stream, "deferred bind ack").await;
+        assert_eq!(ack.header.channel, 0);
+        let response: ModuleControlResponse = serde_json::from_slice(&ack.body).unwrap();
+        assert_eq!(response, ModuleControlResponse::RouteBindAck {});
+        acks.insert(ack.header.corr);
+    }
+    assert_eq!(acks, HashSet::from([20, 30]));
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_configure_warning_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..

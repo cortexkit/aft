@@ -114,6 +114,7 @@ pub(crate) mod lifecycle_census;
 pub mod list_envelope;
 pub mod list_surfaces;
 pub mod local_embed;
+pub(crate) mod lock_diagnostics;
 pub mod log_ctx;
 pub mod log_redact;
 pub mod logging;

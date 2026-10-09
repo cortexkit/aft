@@ -3,10 +3,11 @@
 //! A stall is a loop that owes work but has stopped taking turns: the whole
 //! daemon goes quiet while the subc daemon waits on route binds that nobody
 //! answers. The watchdog runs on its own OS thread and reads only atomics the
-//! watched loops publish, so it keeps running when those loops are wedged on a
+//! watched loops publish and nonblocking diagnostic snapshots, so it keeps running when those loops are wedged on a
 //! lock or descheduled, and it can capture evidence while the stall is live.
 
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -96,6 +97,7 @@ impl StallCapture for PlatformCapture {
     #[cfg(target_os = "macos")]
     fn capture(&self, pid: u32, path: &Path) -> io::Result<CaptureStarted> {
         crate::private_storage::create(path)?;
+        let stderr = crate::private_storage::create(&path.with_extension("stderr"))?;
         // `-mayDie` keeps `sample` from failing if the daemon exits mid-sample.
         std::process::Command::new("/usr/bin/sample")
             .arg(pid.to_string())
@@ -105,7 +107,7 @@ impl StallCapture for PlatformCapture {
             .arg(path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr)
             .spawn()
             .map(CaptureStarted::Spawned)
     }
@@ -290,15 +292,33 @@ fn run_watchdog(
     let mut expected_wake = Instant::now() + config.tick;
     let mut last_capture_at: Option<Instant> = None;
     let mut last_capture = "none".to_string();
-    let mut capture_children: Vec<Child> = Vec::new();
+    let mut capture_children: Vec<CaptureChild> = Vec::new();
     loop {
         match stop_rx.recv_timeout(config.tick) {
             Err(RecvTimeoutError::Timeout) => {}
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                for mut capture in capture_children.drain(..) {
+                    let _ = capture.child.kill();
+                    match capture.child.wait() {
+                        Ok(status) => finish_capture(
+                            &config,
+                            &capture.path,
+                            &capture.output_path,
+                            &status.to_string(),
+                            status.success(),
+                        ),
+                        Err(error) => (config.log)(&format!(
+                            "stall watchdog: capture wait failed path={} error={error}",
+                            capture.path.display()
+                        )),
+                    }
+                }
+                return;
+            }
         }
         let now = Instant::now();
         // Reap finished profiler children so they do not linger as zombies.
-        capture_children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        reap_capture_children(&config, &mut capture_children);
         // If the watchdog itself woke far later than it asked to, the whole
         // process (not one loop) was not running; the log lines carry this so
         // a stall can be told apart from process-wide descheduling.
@@ -322,13 +342,15 @@ fn run_watchdog(
                     } else {
                         last_capture_at = Some(now);
                         stats.captures.fetch_add(1, Ordering::Relaxed);
-                        last_capture = start_capture(&config, &mut capture_children);
+                        last_capture =
+                            start_capture(&config, &mut capture_children, &marker.context());
                         last_capture.clone()
                     };
                     (config.log)(&format!(
-                        "stall watchdog: stall detected marker={} stalled_for_ms={} watchdog_wake_late_ms={} capture={capture}",
+                        "stall watchdog: stall detected marker={} stalled_for_ms={} {} watchdog_wake_late_ms={} capture={capture}",
                         marker.name(),
                         stalled_for.as_millis(),
+                        marker.context(),
                         wake_late.as_millis(),
                     ));
                 }
@@ -371,7 +393,11 @@ fn run_watchdog(
 }
 
 /// Starts one capture and describes the outcome for the log line.
-fn start_capture(config: &StallWatchdogConfig, children: &mut Vec<Child>) -> String {
+fn start_capture(
+    config: &StallWatchdogConfig,
+    children: &mut Vec<CaptureChild>,
+    context: &str,
+) -> String {
     let path = config
         .diagnostics_dir
         .join(capture_file_name(SystemTime::now(), config.pid));
@@ -383,15 +409,127 @@ fn start_capture(config: &StallWatchdogConfig, children: &mut Vec<Child>) -> Str
         &config.diagnostics_dir,
         config.keep_captures.saturating_sub(1),
     );
-    match config.capture.capture(config.pid, &path) {
+    // This in-process snapshot needs no permission to attach an external
+    // profiler. Store it separately from macOS `sample` output, which may be
+    // empty if that command fails.
+    if let Err(error) = crate::private_storage::write(
+        &path,
+        format!(
+            "AFT in-process stall snapshot pid={}\n{context}\n",
+            config.pid
+        ),
+    ) {
+        return format!("failed ({}: {error})", path.display());
+    }
+    let output_path = path.with_extension("profiler");
+    match config.capture.capture(config.pid, &output_path) {
         Ok(CaptureStarted::Spawned(child)) => {
-            children.push(child);
+            children.push(CaptureChild {
+                child,
+                path: path.clone(),
+                output_path,
+            });
             path.display().to_string()
         }
-        Ok(CaptureStarted::Written) => path.display().to_string(),
-        Ok(CaptureStarted::Unsupported) => "unsupported on this platform".to_string(),
-        Err(error) => format!("failed ({}: {error})", path.display()),
+        Ok(CaptureStarted::Written) => {
+            finish_capture(config, &path, &output_path, "written", true);
+            path.display().to_string()
+        }
+        Ok(CaptureStarted::Unsupported) => {
+            (config.log)(&format!(
+                "stall watchdog: profiler unsupported snapshot={}",
+                path.display()
+            ));
+            path.display().to_string()
+        }
+        Err(error) => {
+            (config.log)(&format!(
+                "stall watchdog: capture failed snapshot={} spawn_error={error}",
+                path.display()
+            ));
+            finish_capture(
+                config,
+                &path,
+                &output_path,
+                &format!("spawn_error={error}"),
+                false,
+            );
+            path.display().to_string()
+        }
     }
+}
+
+struct CaptureChild {
+    child: Child,
+    path: PathBuf,
+    output_path: PathBuf,
+}
+
+fn reap_capture_children(config: &StallWatchdogConfig, children: &mut Vec<CaptureChild>) {
+    children.retain_mut(|capture| match capture.child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            finish_capture(
+                config,
+                &capture.path,
+                &capture.output_path,
+                &status.to_string(),
+                status.success(),
+            );
+            false
+        }
+        Err(error) => {
+            (config.log)(&format!(
+                "stall watchdog: capture wait failed path={} error={error}",
+                capture.path.display()
+            ));
+            true
+        }
+    });
+}
+
+fn finish_capture(
+    config: &StallWatchdogConfig,
+    path: &Path,
+    output_path: &Path,
+    status: &str,
+    success: bool,
+) {
+    let output = std::fs::read(output_path).unwrap_or_default();
+    let stderr_path = output_path.with_extension("stderr");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let outcome = if success && !output.is_empty() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let evidence = format!(
+        "profiler {outcome}: status={status} bytes={} stderr={stderr:?}\n",
+        output.len()
+    );
+    if let Err(error) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| {
+            file.write_all(evidence.as_bytes())?;
+            if success {
+                file.write_all(&output)?;
+            }
+            Ok(())
+        })
+    {
+        (config.log)(&format!(
+            "stall watchdog: capture append failed path={} error={error}",
+            path.display()
+        ));
+    }
+    (config.log)(&format!(
+        "stall watchdog: capture {outcome} path={} status={status} bytes={} stderr={stderr:?}",
+        path.display(),
+        output.len()
+    ));
+    let _ = std::fs::remove_file(output_path);
+    let _ = std::fs::remove_file(stderr_path);
 }
 
 /// `stall-<UTC yyyymmddThhmmssZ>-<pid>.txt`. The timestamp leads so names sort
@@ -455,7 +593,10 @@ pub(super) trait LivenessMarker: Send + Sync {
 /// The subc module (frame) loop. It shares a current-thread runtime with the
 /// frame reader and writer tasks, so when this loop stops taking turns the
 /// socket stops being read and nothing is answered.
-pub(super) struct FrameLoopMarker(pub(super) Arc<DispatchPathMetrics>);
+pub(super) struct FrameLoopMarker(
+    pub(super) Arc<DispatchPathMetrics>,
+    pub(super) Arc<crate::lock_diagnostics::LockDiagnostics>,
+);
 
 impl LivenessMarker for FrameLoopMarker {
     fn name(&self) -> &'static str {
@@ -476,7 +617,11 @@ impl LivenessMarker for FrameLoopMarker {
     }
 
     fn context(&self) -> String {
-        self.0.frame_loop_context()
+        format!(
+            "{} scheduler_{}",
+            self.0.frame_loop_context(),
+            self.1.snapshot()
+        )
     }
 }
 
@@ -638,6 +783,131 @@ mod tests {
 
     const TEST_PID: u32 = 4242;
 
+    #[test]
+    fn frame_loop_context_names_control_operation_root_and_session() {
+        use super::super::*;
+        let metrics = DispatchPathMetrics::new();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            133,
+            serde_json::to_vec(&ModuleControlRequest::RouteBind {
+                route_channel: 125,
+                epoch: 1,
+                target: subc_protocol::RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity::new(
+                    PathBuf::from("/isolated/root"),
+                    "runner".to_string(),
+                    "sidekick-session".to_string(),
+                ),
+                principal: None,
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+                scope: None,
+                role_versions: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        let diagnostics = crate::lock_diagnostics::LockDiagnostics::new("executor_holder.rs");
+        let _held = diagnostics.hold();
+        metrics.mark_frame_loop_wait(
+            "executor.scheduler/actor_context",
+            Some(diagnostics.clone()),
+        );
+        let context = metrics.frame_loop_context();
+        assert!(context.contains("op=route_bind"), "{context}");
+        assert!(context.contains("root=\"/isolated/root\""), "{context}");
+        assert!(
+            context.contains("session=\"sidekick-session\""),
+            "{context}"
+        );
+        assert!(
+            context.contains("awaited=executor.scheduler/actor_context holder=executor_holder.rs:"),
+            "{context}"
+        );
+        assert!(context.contains("held_for_ms="), "{context}");
+    }
+
+    #[test]
+    fn scheduler_wait_context_names_live_holder_without_taking_scheduler_lock() {
+        use super::super::*;
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let frame = Frame::build(FrameType::Ping, control_flags(), 0, 0, 99, Vec::new()).unwrap();
+        metrics.mark_frame_loop_frame(&frame);
+        metrics.mark_frame_loop_wait(
+            "executor.scheduler",
+            Some(executor.scheduler_lock_diagnostics()),
+        );
+        executor.hold_state_lock_for_test(|| {
+            let context = metrics.frame_loop_context();
+            assert!(
+                context.contains("holder=crates/aft/src/executor/mod.rs:"),
+                "{context}"
+            );
+            assert!(context.contains("held_for_ms="), "{context}");
+        });
+        assert!(metrics.frame_loop_context().contains("holder=none"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_profiler_records_status_stderr_and_preserves_in_process_snapshot() {
+        struct FailedProfiler;
+        impl StallCapture for FailedProfiler {
+            fn capture(&self, _pid: u32, path: &Path) -> io::Result<CaptureStarted> {
+                crate::private_storage::create(path)?;
+                let stderr = crate::private_storage::create(&path.with_extension("stderr"))?;
+                std::process::Command::new("sh")
+                    .args(["-c", "printf 'task_for_pid denied' >&2; exit 7"])
+                    .stderr(stderr)
+                    .spawn()
+                    .map(CaptureStarted::Spawned)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = RecordedLog::default();
+        let mut config = test_config(&log, &Arc::new(RecordingCapture::default()), dir.path());
+        config.capture = Arc::new(FailedProfiler);
+        let mut children = Vec::new();
+        let snapshot = start_capture(
+            &config,
+            &mut children,
+            "op=route_bind root=isolated session=sidekick awaited=executor.scheduler",
+        );
+        assert_eq!(children.len(), 1);
+        let status = children[0].child.wait().unwrap();
+        assert_eq!(status.code(), Some(7));
+        reap_capture_children(&config, &mut children);
+        assert!(children.is_empty());
+        let evidence = std::fs::read_to_string(&snapshot).unwrap();
+        assert!(evidence.contains("op=route_bind"), "{evidence}");
+        assert!(
+            evidence.contains(
+                "profiler failed: status=exit status: 7 bytes=0 stderr=\"task_for_pid denied\""
+            ),
+            "{evidence}"
+        );
+        let lines = log.lines();
+        assert!(
+            lines.iter().any(|line| line.contains("capture failed")
+                && line.contains("status=exit status: 7")
+                && line.contains("task_for_pid denied")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "only the nonempty snapshot remains"
+        );
+    }
+
     fn test_config(
         log: &RecordedLog,
         capture: &Arc<RecordingCapture>,
@@ -663,7 +933,10 @@ mod tests {
         executor: &crate::executor::Executor,
     ) -> Vec<Box<dyn LivenessMarker>> {
         vec![
-            Box::new(FrameLoopMarker(Arc::clone(metrics))),
+            Box::new(FrameLoopMarker(
+                Arc::clone(metrics),
+                executor.scheduler_lock_diagnostics(),
+            )),
             Box::new(DispatchLoopMarker(executor.dispatch_loop_liveness())),
         ]
     }
@@ -687,6 +960,8 @@ mod tests {
         stderr: RecordedLog,
         exits: Arc<Mutex<Vec<(i32, Vec<String>)>>>,
         capture: Arc<RecordingCapture>,
+        executor: Arc<crate::executor::Executor>,
+        log: RecordedLog,
         _storage: tempfile::TempDir,
     }
 
@@ -699,8 +974,8 @@ mod tests {
             let stderr = RecordedLog::default();
             let capture = Arc::new(RecordingCapture::default());
             let exits = Arc::new(Mutex::new(Vec::new()));
-            let mut config =
-                test_config(&RecordedLog::default(), &capture, &path.join("diagnostics"));
+            let log = RecordedLog::default();
+            let mut config = test_config(&log, &capture, &path.join("diagnostics"));
             config.stderr = stderr.sink();
             let recorded_exits = Arc::clone(&exits);
             let exit_stderr = stderr.clone();
@@ -716,6 +991,8 @@ mod tests {
                 before_frame,
             };
             let (mut daemon, module_stream) = tokio::io::duplex(64 * 1024);
+            let executor = Arc::new(crate::executor::Executor::new());
+            let module_executor = Arc::clone(&executor);
             let module = thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -727,7 +1004,7 @@ mod tests {
                     write,
                     &path.join("absent-connection.json"),
                     crate::context::App::default_shared(),
-                    Arc::new(crate::executor::Executor::new()),
+                    module_executor,
                     |request, _| Response::success(request.id, json!({})),
                     Some(path.join("absent-user-config.json")),
                     false,
@@ -761,6 +1038,8 @@ mod tests {
                 stderr,
                 exits,
                 capture,
+                executor,
+                log,
                 _storage: storage,
             }
         }
@@ -790,6 +1069,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocked_route_bind_capture_names_operation_resource_and_scheduler_holder() {
+        use super::super::*;
+        let mut fixture = FrameLoopFixture::start(Arc::new(|| {})).await;
+        fixture.ping(90).await;
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let executor = Arc::clone(&fixture.executor);
+        let holder = thread::spawn(move || {
+            executor.hold_state_lock_for_test(|| {
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            })
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let root = fixture._storage.path().to_path_buf();
+        let request = ModuleControlRequest::RouteBind {
+            route_channel: 125,
+            epoch: 1,
+            target: subc_protocol::RouteTarget::ToolProvider {
+                module_id: "aft".to_string(),
+            },
+            identity: subc_protocol::BindIdentity::new(
+                root.clone(),
+                "runner".to_string(),
+                "sidekick-session".to_string(),
+            ),
+            principal: None,
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+            scope: None,
+            role_versions: None,
+        };
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            133,
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        write_frame(&mut fixture.daemon, &frame).await.unwrap();
+        tokio::time::sleep(TEST_THRESHOLD * 5).await;
+        let lines = fixture.log.lines();
+        let terminal = fixture.stderr.lines();
+        let capture = fixture
+            .capture
+            .calls()
+            .first()
+            .map(|(_, path)| std::fs::read_to_string(path.with_extension("txt")).unwrap());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        fixture.finish();
+        let detected = lines
+            .iter()
+            .find(|line| line.contains("stall detected"))
+            .expect("detected stall");
+        assert_eq!(terminal.len(), 1, "{terminal:?}");
+        for line in [
+            detected,
+            &terminal[0],
+            &capture.expect("in-process snapshot"),
+        ] {
+            assert!(line.contains("op=route_bind"), "{line}");
+            assert!(
+                line.contains(&format!("root={:?}", root.to_string_lossy())),
+                "{line}"
+            );
+            assert!(line.contains("session=\"sidekick-session\""), "{line}");
+            assert!(
+                line.contains("awaited=executor.scheduler/register_actor"),
+                "{line}"
+            );
+            assert!(
+                line.contains("holder=crates/aft/src/executor/mod.rs:"),
+                "{line}"
+            );
+            assert!(line.contains("held_for_ms="), "{line}");
+        }
+    }
+
+    #[tokio::test]
     async fn frame_loop_restart_parked_frame_exits_nonzero_after_stderr_with_capture() {
         let (parked_tx, parked_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -808,7 +1169,12 @@ mod tests {
         tokio::time::sleep(TEST_THRESHOLD * 5).await;
         let exits = fixture.exits.lock().unwrap().clone();
         let stderr = fixture.stderr.lines();
-        let calls = fixture.capture.calls();
+        let calls = fixture
+            .capture
+            .calls()
+            .into_iter()
+            .map(|(pid, path)| (pid, path.with_extension("txt")))
+            .collect::<Vec<_>>();
         let capture_written = calls.first().is_some_and(|(_, path)| path.is_file());
         release_tx.send(()).unwrap();
         fixture.finish();
@@ -970,7 +1336,11 @@ mod tests {
         });
         watchdog.stop_and_join();
 
-        let calls = capture.calls();
+        let calls = capture
+            .calls()
+            .into_iter()
+            .map(|(pid, path)| (pid, path.with_extension("txt")))
+            .collect::<Vec<_>>();
         assert_eq!(calls.len(), 1, "exactly one capture attempted: {calls:?}");
         let (pid, path) = &calls[0];
         assert_eq!(*pid, TEST_PID);
