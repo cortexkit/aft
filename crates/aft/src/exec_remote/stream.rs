@@ -8,7 +8,24 @@ use types::{Accepted, AttachRequest, Output, OutputStream, StreamRecord, Uuid};
 pub struct ResumePoint {
     pub job_id: Uuid,
     pub last_seq: Option<u64>,
+    pub gap_recovery: Option<GapRecovery>,
 }
+
+/// An executor terminal received while output has a gap. Persist its outcome,
+/// buffered later records and retries without contiguous cursor progress. Keep
+/// it separate from a committed terminal until output is drained, recovering
+/// missing records for up to three attaches before declaring only output lost.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GapRecovery {
+    pub from_seq: u64,
+    pub reattaches: u8,
+    pub terminal: TerminalRecord,
+    pending: BTreeMap<u64, Pending>,
+}
+
+// The original terminal starts recovery; three attaches without cursor progress
+// are enough to establish missing output without discarding a transient gap.
+const MAX_GAP_REATTACHES: u8 = 3;
 
 impl ResumePoint {
     pub fn attach_request(&self) -> Result<AttachRequest, super::Error> {
@@ -29,6 +46,15 @@ pub trait OutputSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()>;
     fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> io::Result<()>;
     fn truncated(&mut self, before_seq: u64) -> io::Result<()>;
+    /// Commit terminal proof and the retry count before dropping a gapped stream.
+    fn gap_recovery(&mut self, _recovery: &GapRecovery) -> io::Result<()> {
+        Ok(())
+    }
+    /// Output absent after repeated recovery is lost, even when the executor
+    /// did not advertise a retained-history truncation cursor.
+    fn undelivered(&mut self, before_seq: u64) -> io::Result<()> {
+        self.truncated(before_seq)
+    }
     /// A future stream record or output descriptor is not attributed to stdout
     /// or stderr. Preserve its sequence (and raw bytes, when available) durably
     /// so reattach does not replay it forever or silently mislabel output.
@@ -42,8 +68,10 @@ pub struct StreamConsumer {
     accepted: bool,
     pending: BTreeMap<u64, Pending>,
     terminal: Option<Verdict>,
+    recovering_gap: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Pending {
     Output(Output),
     Unknown,
@@ -54,7 +82,16 @@ impl StreamConsumer {
         Self::default()
     }
     pub fn resume(point: ResumePoint) -> Self {
+        let mut pending = point
+            .gap_recovery
+            .as_ref()
+            .map_or_else(BTreeMap::new, |gap| gap.pending.clone());
+        if let Some(last) = point.last_seq {
+            pending.retain(|seq, _| *seq > last);
+        }
         Self {
+            recovering_gap: point.gap_recovery.is_some(),
+            pending,
             point: Some(point),
             ..Self::default()
         }
@@ -108,6 +145,7 @@ impl StreamConsumer {
                 self.point = Some(ResumePoint {
                     job_id: accepted.job_id,
                     last_seq: None,
+                    gap_recovery: None,
                 });
                 self.accepted = true;
                 Ok(())
@@ -131,7 +169,28 @@ impl StreamConsumer {
             StreamRecord::Terminal(record) => {
                 self.check_job(record.job_id)?;
                 if !self.pending.is_empty() {
-                    return Err(self.recovery("output sequence gap before terminal"));
+                    let from_seq = self.next_seq()?;
+                    let previous = self.point.as_ref().and_then(|p| p.gap_recovery.as_ref());
+                    let reattaches = previous
+                        .filter(|gap| gap.from_seq == from_seq)
+                        .map_or(0, |gap| {
+                            gap.reattaches.saturating_add(u8::from(self.recovering_gap))
+                        });
+                    let recovery = GapRecovery {
+                        from_seq,
+                        reattaches,
+                        terminal: previous
+                            .map_or_else(|| record.clone(), |gap| gap.terminal.clone()),
+                        pending: self.pending.clone(),
+                    };
+                    sink.gap_recovery(&recovery)?;
+                    self.point.as_mut().unwrap().gap_recovery = Some(recovery);
+                    if reattaches < MAX_GAP_REATTACHES {
+                        return Err(self.recovery("output sequence gap before terminal"));
+                    }
+                    // Only output is uncertain: the executor already supplied
+                    // the outcome. Skip each hole, preserving later seq order.
+                    self.lose_pending(sink)?;
                 }
                 if self.point.is_none() {
                     // The executor can refuse before acceptance. Lost/expired
@@ -139,10 +198,17 @@ impl StreamConsumer {
                     self.point = Some(ResumePoint {
                         job_id: record.job_id,
                         last_seq: None,
+                        gap_recovery: None,
                     });
                 }
+                let record = self
+                    .point
+                    .as_ref()
+                    .and_then(|p| p.gap_recovery.as_ref())
+                    .map_or(record, |gap| gap.terminal.clone());
                 let verdict = grade(&record);
                 sink.terminal(&record, &verdict)?;
+                self.point.as_mut().unwrap().gap_recovery = None;
                 self.terminal = Some(verdict);
                 Ok(())
             }
@@ -193,6 +259,10 @@ impl StreamConsumer {
             return Ok(());
         }
         self.pending.entry(seq).or_insert(record);
+        self.drain(sink)
+    }
+
+    fn drain<S: OutputSink>(&mut self, sink: &mut S) -> Result<(), Error> {
         loop {
             let next = self.next_seq()?;
             let Some(record) = self.pending.get(&next) else {
@@ -213,6 +283,47 @@ impl StreamConsumer {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn finish_recovery<S: OutputSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<Verdict, Error> {
+        if self.terminal.is_none() {
+            if let Some(gap) = self.point.as_ref().and_then(|p| p.gap_recovery.clone()) {
+                // An attach need not repeat terminal proof. Its end still
+                // demonstrates that this attempt did not recover the saved gap.
+                self.consume(StreamRecord::Terminal(gap.terminal), sink)?;
+            }
+        }
+        self.finish()
+    }
+
+    fn lose_pending<S: OutputSink>(&mut self, sink: &mut S) -> Result<(), Error> {
+        self.drain(sink)?;
+        while let Some((&before, _)) = self.pending.first_key_value() {
+            sink.undelivered(before)?;
+            self.point.as_mut().unwrap().last_seq = before.checked_sub(1);
+            self.drain(sink)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn finish_lost_output<S: OutputSink>(
+        &mut self,
+        sink: &mut S,
+    ) -> Result<Verdict, Error> {
+        let terminal = self
+            .point
+            .as_ref()
+            .and_then(|p| p.gap_recovery.as_ref())
+            .ok_or_else(|| self.recovery("no terminal proof for output recovery"))?
+            .terminal
+            .clone();
+        self.lose_pending(sink)?;
+        self.consume(StreamRecord::Terminal(terminal), sink)?;
+        self.finish()
     }
 
     pub(crate) fn recovery(&self, reason: impl Into<String>) -> Error {

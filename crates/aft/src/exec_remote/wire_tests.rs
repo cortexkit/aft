@@ -69,6 +69,9 @@ pub(crate) enum Script {
     Deadline,
     AttachRefused,
     RetainedGap,
+    PersistentTerminalGap,
+    TransientTerminalGap,
+    TerminalGapOnce,
     Continuous,
     GappedAttach(Duration),
     GappedCancel(Duration),
@@ -163,7 +166,8 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                             if !attaching && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                             }
-                            let outcome = if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
+                             let outcome = if matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { Outcome::Exit { code: 7 } }
+                                 else if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
                                 else if attaching && cancelled { Outcome::Signal { signal: 15 } }
                                 else { match script {
                                     Script::Lost => Outcome::OutcomeUnknown,
@@ -189,13 +193,20 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                         replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(Output::new(seq,stream,BytePayload(bytes)))).unwrap()));
                                     }
                                 }
-                                if matches!(script,Script::RetainedGap) {
+                                 if matches!(script,Script::RetainedGap) {
                                     let output=Output::new(3,OutputStream::Stdout,BytePayload(b"D".to_vec())).with_truncated_before_seq(3);
                                     replies.push(reply(FrameType::StreamData,serde_json::to_value(StreamRecord::Output(output)).unwrap()));
-                                }
-                                if !matches!(script, Script::MissingTerminal) && (!matches!(script, Script::Restart | Script::AttachRefused | Script::GappedAttach(_) | Script::AttachDisconnected) || attaching) {
+                                 }
+                                 if matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) && !(attaching && matches!(script, Script::TerminalGapOnce)) {
+                                     let from = if attaching { body["params"]["from_seq"].as_u64().unwrap() } else { 0 };
+                                     let first = if attaching && matches!(script, Script::TransientTerminalGap) { from } else { from.max(1) };
+                                     for seq in (first..3).rev() {
+                                         replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(vec![b'A' + seq as u8])))).unwrap()));
+                                     }
+                                 }
+                                 if !matches!(script, Script::MissingTerminal) && !(attaching && matches!(script, Script::TerminalGapOnce)) && (!matches!(script, Script::Restart | Script::AttachRefused | Script::GappedAttach(_) | Script::AttachDisconnected) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
-                                    if cancelled { terminal = terminal.with_killed(Killed::Cancel); }
+                                     if cancelled && !matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { terminal = terminal.with_killed(Killed::Cancel); }
                                     if matches!(script, Script::Deadline) { terminal = terminal.with_killed(Killed::Deadline); }
                                     if matches!(script, Script::Reported) { terminal = report_vector("all"); }
                                     if matches!(script, Script::Utf8) {
@@ -490,6 +501,87 @@ async fn interrupted_call_reattaches_with_next_durable_seq_without_resubmission(
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn persistent_terminal_gap_completes_after_three_attaches() {
+    let daemon = daemon(Script::PersistentTerminalGap, client::CAPABILITY).await;
+    let client = client(&daemon).await;
+    let mut sink = MemorySink::default();
+    let mut stream = client
+        .run(&RunRequest::new(
+            "/workspace/task",
+            "/src/repo",
+            "/workspace/task",
+            "cargo test",
+        ))
+        .await
+        .unwrap();
+    let verdict = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match drain(&mut stream, &mut sink).await {
+                Ok(verdict) => return verdict,
+                Err(Error::RecoveryRequired {
+                    resume: Some(point),
+                    ..
+                }) => {
+                    stream = client.attach(point).await.unwrap();
+                }
+                other => panic!("unexpected gap recovery: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a repeated terminal gap must not reattach forever");
+    assert_eq!(verdict, Verdict::Exited { code: 7 });
+    assert_eq!(sink.stdout, b"BC");
+    assert_eq!(sink.seqs, [1, 2]);
+    assert_eq!(sink.truncations, [1]);
+    let log = daemon.log.lock().unwrap();
+    let from: Vec<_> = log
+        .iter()
+        .filter(|(_, b)| b["method"] == "exec.attach")
+        .map(|(_, b)| b["params"]["from_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(from, [0, 0, 0]);
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn transient_terminal_gap_fills_on_next_attach_without_truncation() {
+    let daemon = daemon(Script::TransientTerminalGap, client::CAPABILITY).await;
+    let client = client(&daemon).await;
+    let mut sink = MemorySink::default();
+    let mut stream = client
+        .run(&RunRequest::new(
+            "/workspace/task",
+            "/src/repo",
+            "/workspace/task",
+            "cargo test",
+        ))
+        .await
+        .unwrap();
+    let Err(Error::RecoveryRequired {
+        resume: Some(point),
+        ..
+    }) = drain(&mut stream, &mut sink).await
+    else {
+        panic!("the first stream must have a gap");
+    };
+    assert!(sink.stdout.is_empty());
+    let mut resumed = client.attach(point).await.unwrap();
+    assert_eq!(
+        drain(&mut resumed, &mut sink).await.unwrap(),
+        Verdict::Exited { code: 7 }
+    );
+    assert_eq!(sink.stdout, b"ABC");
+    assert_eq!(sink.seqs, [0, 1, 2]);
+    assert!(sink.truncations.is_empty());
 }
 
 #[tokio::test]

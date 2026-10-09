@@ -525,6 +525,70 @@ async fn exec_remote_bash_gapped_attach_records_reset_budget_and_complete() {
 }
 
 #[tokio::test]
+async fn exec_remote_bash_persistent_terminal_gap_is_bounded() {
+    let daemon = daemon(Script::PersistentTerminalGap, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(done.exit_code, Some(7));
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"BC");
+    let durable = read_task(&task.paths.json).unwrap();
+    assert_eq!(durable.incomplete_output, [(0, 0)]);
+    assert!(durable
+        .execution_note
+        .unwrap()
+        .contains("output lost between seq 0 and 0: the executor never delivered it"));
+    let log = daemon.log.lock().unwrap();
+    let from: Vec<_> = log
+        .iter()
+        .filter(|(_, b)| b["method"] == "exec.attach")
+        .map(|(_, b)| b["params"]["from_seq"].as_u64().unwrap())
+        .collect();
+    assert_eq!(from, [0, 0, 0]);
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn exec_remote_bash_transient_terminal_gap_recovers_without_loss() {
+    let daemon = daemon(Script::TransientTerminalGap, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(done.exit_code, Some(7));
+    let task = registry.task(&task_id).unwrap();
+    assert_eq!(fs::read(&task.paths.stdout).unwrap(), b"ABC");
+    let durable = read_task(&task.paths.json).unwrap();
+    assert!(durable.incomplete_output.is_empty());
+    assert!(!durable
+        .execution_note
+        .unwrap_or_default()
+        .contains("output lost"));
+    let log = daemon.log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.attach")
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.run")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn exec_remote_bash_reattach_budget_cancel_observes_real_terminal() {
     let daemon = daemon(
         Script::GappedCancel(Duration::from_millis(500)),
@@ -989,6 +1053,8 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         session: "session".into(),
         job_id: None,
         last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
@@ -1085,6 +1151,161 @@ async fn exec_remote_bash_retained_output_gap_survives_terminal_and_restart() {
         .any(|(_, b)| b["method"] == "exec.run"));
 }
 
+#[tokio::test]
+async fn exec_remote_bash_terminal_gap_budget_and_outcome_survive_restart() {
+    let daemon = daemon(Script::TerminalGapOnce, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task.clone()).unwrap();
+    let mut consumer = exec::StreamConsumer::resume(
+        task.state
+            .lock()
+            .unwrap()
+            .metadata
+            .remote
+            .as_ref()
+            .unwrap()
+            .point()
+            .unwrap(),
+    );
+    for attempt in 0..3 {
+        for seq in [2, 1] {
+            consumer
+                .consume(
+                    StreamRecord::Output(Output::new(
+                        seq,
+                        OutputStream::Stdout,
+                        BytePayload(vec![b'A' + seq as u8]),
+                    )),
+                    &mut sink,
+                )
+                .unwrap();
+        }
+        let Err(exec::Error::RecoveryRequired {
+            resume: Some(point),
+            ..
+        }) = consumer.consume(
+            StreamRecord::Terminal(TerminalRecord::new(
+                id(),
+                Outcome::Exit { code: 7 },
+                1,
+                0,
+                0,
+            )),
+            &mut sink,
+        )
+        else {
+            panic!("recovery should still be possible before the bound");
+        };
+        assert_eq!(point.gap_recovery.as_ref().unwrap().reattaches, attempt);
+        consumer = exec::StreamConsumer::resume(point);
+    }
+    let durable = read_task(&paths.json).unwrap();
+    let remote = durable.remote.unwrap();
+    assert_eq!(remote.gap_recovery.as_ref().unwrap().reattaches, 2);
+    assert!(
+        remote.terminal.is_none(),
+        "output must be recovered before finalization"
+    );
+    drop(sink);
+    drop(task);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(done.exit_code, Some(7));
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"BC");
+    let durable = read_task(&paths.json).unwrap();
+    assert_eq!(durable.incomplete_output, [(0, 0)]);
+    assert!(durable
+        .execution_note
+        .unwrap()
+        .contains("output lost between seq 0 and 0: the executor never delivered it"));
+    assert!(durable.remote.unwrap().gap_recovery.is_none());
+    let log = daemon.log.lock().unwrap();
+    assert_eq!(
+        log.iter()
+            .filter(|(_, b)| b["method"] == "exec.attach")
+            .count(),
+        1
+    );
+    assert!(!log.iter().any(|(_, b)| b["method"] == "exec.run"));
+}
+
+#[tokio::test]
+async fn exec_remote_bash_terminal_gap_keeps_outcome_when_attach_is_unavailable() {
+    let daemon = daemon(Script::AttachDisconnected, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    shorten_reattach_budget(dir.path());
+    let (original, task_id, paths) = persist_accepted_with_snapshot(
+        dir.path(),
+        daemon.connection.clone(),
+        "printf must-not-run",
+    );
+    let task = original.task(&task_id).unwrap();
+    let mut sink = TaskSink::new(&original, task.clone()).unwrap();
+    let point = task
+        .state
+        .lock()
+        .unwrap()
+        .metadata
+        .remote
+        .as_ref()
+        .unwrap()
+        .point()
+        .unwrap();
+    let mut consumer = exec::StreamConsumer::resume(point);
+    for seq in [2, 1] {
+        consumer
+            .consume(
+                StreamRecord::Output(Output::new(
+                    seq,
+                    OutputStream::Stdout,
+                    BytePayload(vec![b'A' + seq as u8]),
+                )),
+                &mut sink,
+            )
+            .unwrap();
+    }
+    assert!(matches!(
+        consumer.consume(
+            StreamRecord::Terminal(TerminalRecord::new(
+                id(),
+                Outcome::Exit { code: 7 },
+                1,
+                0,
+                0,
+            )),
+            &mut sink
+        ),
+        Err(exec::Error::RecoveryRequired { .. })
+    ));
+    drop(sink);
+    drop(task);
+    drop(original);
+    let restarted = registry();
+    restarted.replay_session(dir.path(), "session").unwrap();
+    let done = terminal(&restarted, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Failed);
+    assert_eq!(done.exit_code, Some(7));
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"BC");
+    let durable = read_task(&paths.json).unwrap();
+    assert_eq!(durable.incomplete_output, [(0, 0)]);
+    assert!(durable.remote.unwrap().terminal.is_some());
+    assert!(!daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, b)| b["method"] == "exec.run"));
+}
+
 fn persist_accepted_with_snapshot(
     dir: &Path,
     connection: PathBuf,
@@ -1141,6 +1362,8 @@ fn persist_accepted_with_snapshot(
         session: "session".into(),
         job_id: None,
         last_seq: None,
+        gap_recovery: None,
+        undelivered_output: Vec::new(),
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
@@ -1529,7 +1752,8 @@ fn exec_remote_bash_only_not_sent_errors_prove_local_fallback_safe() {
     assert!(!proves_no_start(&exec::Error::RecoveryRequired {
         resume: Some(ResumePoint {
             job_id: id(),
-            last_seq: Some(3)
+            last_seq: Some(3),
+            gap_recovery: None,
         }),
         reason: "lost".into()
     }));

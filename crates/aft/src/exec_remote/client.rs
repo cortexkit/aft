@@ -173,8 +173,11 @@ impl RemoteStream {
         self.received_frame
     }
 
-    /// Read one record into a durable sink. Only a known terminal followed by a
-    /// clean StreamEnd completes a run; loss/decode errors require status/attach.
+    /// Read one record into a durable sink. Outside output-gap recovery, a known
+    /// terminal followed by clean StreamEnd is required to complete a run;
+    /// loss/decode errors require status/attach. During output-gap recovery, the
+    /// saved executor terminal still supplies the outcome even if a later attach
+    /// closes with an error or does not repeat that terminal.
     /// There is no response deadline here: request timeout bounds remote run
     /// time only, and the executor owns queue waiting and reconnects to runner.
     pub async fn next<S: OutputSink>(&mut self, sink: &mut S) -> Result<StreamProgress, Error> {
@@ -189,9 +192,21 @@ impl RemoteStream {
             return Ok(StreamProgress::Record);
         }
         if let Err(error) = self.subscription.closed().await {
+            if self
+                .consumer
+                .resume_point()
+                .is_some_and(|p| p.gap_recovery.is_some())
+            {
+                return self
+                    .consumer
+                    .finish_recovery(sink)
+                    .map(StreamProgress::Complete);
+            }
             return Err(self.consumer.recovery(error.to_string()));
         }
         self.finished = true;
-        self.consumer.finish().map(StreamProgress::Complete)
+        self.consumer
+            .finish_recovery(sink)
+            .map(StreamProgress::Complete)
     }
 }

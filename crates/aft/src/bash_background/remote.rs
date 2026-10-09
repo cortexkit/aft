@@ -119,6 +119,10 @@ pub(crate) struct RemoteTask {
     pub session: String,
     pub job_id: Option<Uuid>,
     pub last_seq: Option<u64>,
+    #[serde(default)]
+    pub gap_recovery: Option<crate::exec_remote::GapRecovery>,
+    #[serde(default)]
+    pub undelivered_output: Vec<(u64, u64)>,
     pub stdout_len: u64,
     pub stderr_len: u64,
     #[serde(default)]
@@ -137,6 +141,7 @@ impl RemoteTask {
         Some(ResumePoint {
             job_id: self.job_id?,
             last_seq: self.last_seq,
+            gap_recovery: self.gap_recovery.clone(),
         })
     }
 }
@@ -270,34 +275,13 @@ impl OutputSink for TaskSink {
         Ok(())
     }
     fn truncated(&mut self, before_seq: u64) -> io::Result<()> {
-        let mut db = DeferredDbWrites::new(&self.registry, &self.task);
-        let mut state = self
-            .task
-            .state
-            .lock()
-            .map_err(|_| io::Error::other("task lock poisoned"))?;
-        let previous = state.metadata.clone();
-        let remote = state
-            .metadata
-            .remote
-            .as_mut()
-            .ok_or_else(|| io::Error::other("remote record absent"))?;
-        let first = remote.last_seq.map_or(0, |seq| seq.saturating_add(1));
-        remote.last_seq = before_seq.checked_sub(1);
-        if first < before_seq {
-            state
-                .metadata
-                .incomplete_output
-                .push((first, before_seq - 1));
-        }
-        append_output_loss(&mut state.metadata);
-        let result = self
-            .registry
-            .persist_task_locked(&self.task, &state.metadata, &mut db);
-        if result.is_err() {
-            state.metadata = previous;
-        }
-        result
+        self.truncate_output(before_seq, false)
+    }
+    fn undelivered(&mut self, before_seq: u64) -> io::Result<()> {
+        self.truncate_output(before_seq, true)
+    }
+    fn gap_recovery(&mut self, recovery: &exec::GapRecovery) -> io::Result<()> {
+        self.commit(|r| r.gap_recovery = Some(recovery.clone()))
     }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
         let remote = self
@@ -337,7 +321,45 @@ impl OutputSink for TaskSink {
         self.commit(|r| {
             r.job_id = Some(record.job_id);
             r.terminal = Some(record.clone());
+            r.gap_recovery = None;
         })
+    }
+}
+
+#[cfg(unix)]
+impl TaskSink {
+    fn truncate_output(&mut self, before_seq: u64, undelivered: bool) -> io::Result<()> {
+        let mut db = DeferredDbWrites::new(&self.registry, &self.task);
+        let mut state = self
+            .task
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("task lock poisoned"))?;
+        let previous = state.metadata.clone();
+        let remote = state
+            .metadata
+            .remote
+            .as_mut()
+            .ok_or_else(|| io::Error::other("remote record absent"))?;
+        let first = remote.last_seq.map_or(0, |seq| seq.saturating_add(1));
+        remote.last_seq = before_seq.checked_sub(1);
+        if first < before_seq {
+            if undelivered {
+                remote.undelivered_output.push((first, before_seq - 1));
+            }
+            state
+                .metadata
+                .incomplete_output
+                .push((first, before_seq - 1));
+        }
+        append_output_loss(&mut state.metadata);
+        let result = self
+            .registry
+            .persist_task_locked(&self.task, &state.metadata, &mut db);
+        if result.is_err() {
+            state.metadata = previous;
+        }
+        result
     }
 }
 
@@ -411,6 +433,8 @@ impl BgTaskRegistry {
             session: launch.session,
             job_id: None,
             last_seq: None,
+            gap_recovery: None,
+            undelivered_output: Vec::new(),
             stdout_len: 0,
             stderr_len: 0,
             unknown_len: 0,
@@ -555,7 +579,28 @@ impl BgTaskRegistry {
                     .map_err(|e| e.to_string())
                     .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial)));
                 if let Err(error) = result {
-                    registry.remote_terminal(&task, Verdict::OutcomeUnknown, Some(error));
+                    let point = task
+                        .state
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.metadata.remote.as_ref()?.point())
+                        .filter(|point| point.gap_recovery.is_some());
+                    let verdict = point
+                        .map(|point| {
+                            // Exhausted attach/connect recovery cannot invalidate a
+                            // terminal already received. Preserve buffered output
+                            // and mark only its missing sequences as lost.
+                            let known = exec::grade(&point.gap_recovery.as_ref().unwrap().terminal);
+                            let mut consumer = exec::StreamConsumer::resume(point.clone());
+                            match TaskSink::new(&registry, task.clone()) {
+                                Ok(mut sink) => {
+                                    consumer.finish_lost_output(&mut sink).unwrap_or(known)
+                                }
+                                Err(_) => known,
+                            }
+                        })
+                        .unwrap_or(Verdict::OutcomeUnknown);
+                    registry.remote_terminal(&task, verdict, Some(error));
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -1161,9 +1206,16 @@ fn append_output_loss(metadata: &mut PersistedTask) {
     append_environment_disclosure(metadata);
     append_executor_environment_disclosure(metadata);
     for (first, last) in &metadata.incomplete_output {
-        let warning = format!(
-            "output lost between seq {first} and {last}: the executor no longer retained it"
-        );
+        let reason = if metadata
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.undelivered_output.contains(&(*first, *last)))
+        {
+            "never delivered it"
+        } else {
+            "no longer retained it"
+        };
+        let warning = format!("output lost between seq {first} and {last}: the executor {reason}");
         let note = metadata
             .execution_note
             .get_or_insert_with(|| format!("remote execution on {RUNNER_ID}"));

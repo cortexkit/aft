@@ -144,6 +144,7 @@ fn published_outcomes_have_explicit_grades() {
             StreamConsumer::resume(ResumePoint {
                 job_id: terminal.job_id,
                 last_seq: Some(6),
+                gap_recovery: None,
             })
         } else {
             StreamConsumer::new()
@@ -213,9 +214,9 @@ fn control_known_history_expired_never_reruns() {
 pub(super) struct MemorySink {
     pub(super) stdout: Vec<u8>,
     pub(super) stderr: Vec<u8>,
-    seqs: Vec<u64>,
+    pub(super) seqs: Vec<u64>,
     terminals: Vec<Verdict>,
-    truncations: Vec<u64>,
+    pub(super) truncations: Vec<u64>,
     unknown: Vec<(u64, Vec<u8>)>,
 }
 
@@ -646,6 +647,7 @@ fn retained_history_truncation_is_explicit_and_replay_continues() {
     let mut consumer = StreamConsumer::resume(ResumePoint {
         job_id: job_id(),
         last_seq: Some(0),
+        gap_recovery: None,
     });
     let mut sink = MemorySink::default();
     consumer
@@ -814,6 +816,7 @@ fn unknown_records_without_a_terminal_require_recovery() {
     let mut consumer = StreamConsumer::resume(ResumePoint {
         job_id: job_id(),
         last_seq: None,
+        gap_recovery: None,
     });
     let mut sink = MemorySink::default();
     consumer
@@ -829,4 +832,101 @@ fn unknown_records_without_a_terminal_require_recovery() {
             ..
         })
     ));
+}
+
+#[test]
+fn terminal_gap_progress_resets_the_bound_for_a_new_cursor() {
+    let mut sink = MemorySink::default();
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    for attempt in 0..3 {
+        consumer
+            .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+            .unwrap();
+        assert!(matches!(
+            consumer.consume(terminal(Outcome::Exit { code: 7 }), &mut sink),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let point = consumer.resume_point().unwrap();
+        assert_eq!(point.gap_recovery.as_ref().unwrap().reattaches, attempt);
+        consumer = StreamConsumer::resume(point);
+    }
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"A"), &mut sink)
+        .unwrap();
+    consumer
+        .consume(output(3, OutputStream::Stdout, b"D"), &mut sink)
+        .unwrap();
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::OutcomeUnknown), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    let point = consumer.resume_point().unwrap();
+    let gap = point.gap_recovery.as_ref().unwrap();
+    assert_eq!(gap.from_seq, 2);
+    assert_eq!(gap.reattaches, 0);
+    assert_eq!(sink.stdout, b"AB");
+    assert!(sink.truncations.is_empty());
+    consumer = StreamConsumer::resume(point);
+    consumer
+        .consume(output(2, OutputStream::Stdout, b"C"), &mut sink)
+        .unwrap();
+    assert_eq!(
+        consumer.finish_recovery(&mut sink).unwrap(),
+        Verdict::Exited { code: 7 }
+    );
+    assert_eq!(sink.stdout, b"ABCD");
+    assert!(sink.truncations.is_empty());
+}
+
+#[test]
+fn output_gaps_without_terminal_proof_remain_recoverable() {
+    let mut sink = MemorySink::default();
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    for _ in 0..6 {
+        consumer
+            .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+            .unwrap();
+        assert!(matches!(
+            consumer.finish_recovery(&mut sink),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let point = consumer.resume_point().unwrap();
+        assert!(point.gap_recovery.is_none());
+        assert_eq!(point.last_seq, None);
+        consumer = StreamConsumer::resume(point);
+    }
+    assert!(sink.stdout.is_empty());
+    assert!(sink.truncations.is_empty());
+    assert!(sink.terminals.is_empty());
+}
+
+#[test]
+fn terminal_gap_loses_each_missing_range_but_drains_later_records_in_order() {
+    let mut sink = MemorySink::default();
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(4, OutputStream::Stdout, b"E"), &mut sink)
+        .unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+        .unwrap();
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 7 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    for attempt in 1..=3 {
+        consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+        let result = consumer.finish_recovery(&mut sink);
+        if attempt < 3 {
+            assert!(matches!(result, Err(Error::RecoveryRequired { .. })));
+        } else {
+            assert_eq!(result.unwrap(), Verdict::Exited { code: 7 });
+        }
+    }
+    assert_eq!(sink.stdout, b"BE");
+    assert_eq!(sink.seqs, [1, 4]);
+    assert_eq!(sink.truncations, [1, 4]);
 }
