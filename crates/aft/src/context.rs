@@ -517,6 +517,8 @@ pub struct StatusBarCountValues {
     pub duplicates: Option<usize>,
     pub todos: Option<usize>,
     pub tier2_stale: bool,
+    pub diagnostics: Option<&'static str>,
+    pub diagnostics_gaps: Vec<serde_json::Value>,
 }
 
 impl StatusBarCountValues {
@@ -3976,6 +3978,8 @@ impl AppContext {
                     todos: tier2.todos,
                     tier2_stale: tier2.stale,
                     disabled_categories: Vec::new(),
+                    diagnostics: None,
+                    diagnostics_gaps: Vec::new(),
                 }
             })
             .mask_disabled(&self.config().inspect)
@@ -3992,15 +3996,20 @@ impl AppContext {
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
         let lsp = self.lsp_manager.try_lock()?;
         let diagnostics_generation = lsp.diagnostics_generation();
-        let root = self
-            .canonical_cache_root_opt()
-            .map(|root| crate::inspect::job::normalize_path(&root));
-        let failed = lsp.has_failed_diagnostic_producers(root.as_deref());
+        let (authoritative, producer_gaps) = lsp.project_diagnostics_authority();
         let mask_failed = |mut counts: StatusBarCountValues| {
-            if failed {
+            if !authoritative {
                 counts.errors = None;
                 counts.warnings = None;
             }
+            counts.diagnostics = if !producer_gaps.is_empty() {
+                Some("producer_missing")
+            } else if !authoritative {
+                Some("pending")
+            } else {
+                None
+            };
+            counts.diagnostics_gaps = producer_gaps.clone();
             counts.mask_disabled(&self.config().inspect)
         };
 
@@ -4062,6 +4071,8 @@ impl AppContext {
             todos: tier2.todos,
             tier2_stale: tier2.stale,
             disabled_categories: Vec::new(),
+            diagnostics: None,
+            diagnostics_gaps: Vec::new(),
         };
 
         *self
@@ -4501,6 +4512,18 @@ impl AppContext {
             tier2.stale,
         );
         if current != previous {
+            tier2.generation = tier2.generation.wrapping_add(1);
+        }
+    }
+
+    /// A completed scan with no supported-language files invalidates any older
+    /// dead-code count; unlike a pending rebuild, it cannot confirm that number.
+    pub(crate) fn clear_status_bar_dead_code_count(&self) {
+        let mut tier2 = self
+            .status_bar_tier2
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tier2.dead_code.take().is_some() {
             tier2.generation = tier2.generation.wrapping_add(1);
         }
     }
@@ -6111,6 +6134,14 @@ impl AppContext {
         // Configure publishes this way, and it runs inside a pinned request:
         // it must see its own publication for the rest of that request.
         self.publish_config(|_| Some(config), true);
+        let config = self.config();
+        if let Some(root) = config.project_root.as_deref() {
+            if let Ok(walk) = crate::lsp::manager::walk_applicable_area(root, None, &config, None) {
+                let mut lsp = self.lsp();
+                let snapshot = lsp.classify_applicable_servers(walk, &config);
+                lsp.store_project_applicability(snapshot);
+            }
+        }
     }
 
     /// Publish `config` only if the published snapshot is still `expected`.
@@ -14554,6 +14585,7 @@ mod status_emitter_tests {
             },
         ));
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.lsp().store_project_applicability(Default::default());
         ctx.lsp().diagnostics_store_mut_for_test().publish(
             crate::lsp::roots::ServerKey {
                 kind: crate::lsp::registry::ServerKind::Rust,
@@ -14974,7 +15006,38 @@ mod status_bar_tests {
     use crate::parser::TreeSitterProvider;
 
     fn ctx() -> AppContext {
-        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        // These count-cache fixtures inject reports without filesystem or server
+        // discovery; their project-wide applicability set is explicitly empty.
+        ctx.lsp().store_project_applicability(Default::default());
+        ctx
+    }
+
+    #[test]
+    fn diagnostics_counts_are_unknown_until_project_applicability_exists() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.lsp()
+            .diagnostics_store_mut_for_test()
+            .publish_with_kind(
+                crate::lsp::registry::ServerKind::Rust,
+                PathBuf::from("/fixture/main.rs"),
+                Vec::new(),
+            );
+        assert_eq!(
+            (
+                ctx.status_bar_count_values().errors,
+                ctx.status_bar_count_values().warnings
+            ),
+            (None, None)
+        );
+        ctx.lsp().store_project_applicability(Default::default());
+        assert_eq!(
+            (
+                ctx.status_bar_count_values().errors,
+                ctx.status_bar_count_values().warnings
+            ),
+            (Some(0), Some(0))
+        );
     }
 
     #[test]

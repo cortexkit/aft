@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1db58523ac3ea575cf8be651315ed0a9767458de133c51bc27502d6973b20c11",
-      "catalog_digest": "1db58523ac3ea575cf8be651315ed0a9767458de133c51bc27502d6973b20c11",
+      "generation": "32fe09b325075fe8b824f84438c961aee8d884c2c1bc61ea687c90c29dbeaa0f",
+      "catalog_digest": "32fe09b325075fe8b824f84438c961aee8d884c2c1bc61ea687c90c29dbeaa0f",
       "tools": [
         {
           "name": "status",
@@ -506,18 +506,18 @@
         },
         {
           "name": "inspect",
-          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "sections": {
-                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -531,7 +531,7 @@
                 ]
               },
               "scope": {
-                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -543,6 +543,12 @@
                     }
                   }
                 ]
+              },
+              "offset": {
+                "description": "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "topK": {
                 "description": "Max drill-down items per category. Default 20, max 100.",
@@ -1150,8 +1156,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "1d9e07ceca8e6cf4b2004e76c2337c4fc62923a19635013a6df4e759342f2de9",
-      "catalog_digest": "1d9e07ceca8e6cf4b2004e76c2337c4fc62923a19635013a6df4e759342f2de9",
+      "generation": "3b3219b5a750a58b0241452b211dc28c05cbf5dfb94399c92bdeea34c0f6d931",
+      "catalog_digest": "3b3219b5a750a58b0241452b211dc28c05cbf5dfb94399c92bdeea34c0f6d931",
       "tools": [
         {
           "name": "status",
@@ -1715,18 +1721,18 @@
         },
         {
           "name": "inspect",
-          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "sections": {
-                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -1740,7 +1746,7 @@
                 ]
               },
               "scope": {
-                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -1752,6 +1758,12 @@
                     }
                   }
                 ]
+              },
+              "offset": {
+                "description": "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "topK": {
                 "description": "Max drill-down items per category. Default 20, max 100.",
@@ -2360,8 +2372,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "2cf739042e2d4a1df0bdd6a2fe93a36dfb236053d616aa37e3b5bc5f40b9c6f3",
-      "catalog_digest": "2cf739042e2d4a1df0bdd6a2fe93a36dfb236053d616aa37e3b5bc5f40b9c6f3",
+      "generation": "f8129c6d1ee5251c6c6d1d229c20c837e280fb0e2672ef3f98613f2a3ab39b7a",
+      "catalog_digest": "f8129c6d1ee5251c6c6d1d229c20c837e280fb0e2672ef3f98613f2a3ab39b7a",
       "tools": [
         {
           "name": "read",
@@ -2644,18 +2656,18 @@
         },
         {
           "name": "inspect",
-          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "sections": {
-                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -2669,7 +2681,7 @@
                 ]
               },
               "scope": {
-                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -2681,6 +2693,12 @@
                     }
                   }
                 ]
+              },
+              "offset": {
+                "description": "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "topK": {
                 "description": "Max drill-down items per category. Default 20, max 100.",
@@ -2786,8 +2804,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "2cf739042e2d4a1df0bdd6a2fe93a36dfb236053d616aa37e3b5bc5f40b9c6f3",
-      "catalog_digest": "2cf739042e2d4a1df0bdd6a2fe93a36dfb236053d616aa37e3b5bc5f40b9c6f3",
+      "generation": "f8129c6d1ee5251c6c6d1d229c20c837e280fb0e2672ef3f98613f2a3ab39b7a",
+      "catalog_digest": "f8129c6d1ee5251c6c6d1d229c20c837e280fb0e2672ef3f98613f2a3ab39b7a",
       "tools": [
         {
           "name": "read",
@@ -3070,18 +3088,18 @@
         },
         {
           "name": "inspect",
-          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "sections": {
-                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -3095,7 +3113,7 @@
                 ]
               },
               "scope": {
-                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -3107,6 +3125,12 @@
                     }
                   }
                 ]
+              },
+              "offset": {
+                "description": "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "topK": {
                 "description": "Max drill-down items per category. Default 20, max 100.",
@@ -3213,8 +3237,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "ee2ade3bd5f5faec2cd29a4b676417338ac11c7d8b32b7402a75b02334304c17",
-      "catalog_digest": "ee2ade3bd5f5faec2cd29a4b676417338ac11c7d8b32b7402a75b02334304c17",
+      "generation": "aa711d29de2549ec6dd64cf580e43f597b8a6901576ca9b1c433b281d9566599",
+      "catalog_digest": "aa711d29de2549ec6dd64cf580e43f597b8a6901576ca9b1c433b281d9566599",
       "tools": [
         {
           "name": "status",
@@ -3713,18 +3737,18 @@
         },
         {
           "name": "inspect",
-          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "sections": {
-                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -3738,7 +3762,7 @@
                 ]
               },
               "scope": {
-                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -3750,6 +3774,12 @@
                     }
                   }
                 ]
+              },
+              "offset": {
+                "description": "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "topK": {
                 "description": "Max drill-down items per category. Default 20, max 100.",
@@ -4358,8 +4388,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "37381a30cc5bfec01ad2e288b3c8e032806a51f9c059c93bfae591bf7fefb176",
-      "catalog_digest": "37381a30cc5bfec01ad2e288b3c8e032806a51f9c059c93bfae591bf7fefb176",
+      "generation": "441b2d01a66c18c9ae1414be586dd028c43743dfd37288211268c84bb789165b",
+      "catalog_digest": "441b2d01a66c18c9ae1414be586dd028c43743dfd37288211268c84bb789165b",
       "tools": [
         {
           "name": "status",
@@ -4927,18 +4957,18 @@
         },
         {
           "name": "inspect",
-          "schema_digest": "ad782f4406aa4bbfd85e80db3438cb9ca332bb4cc75e159bd75251e52ec0a3f4",
+          "schema_digest": "4e189e7662dd08cec4e8696bc215b3742a0ca5a5dd037de744f523c3707596aa",
           "semantics": 1,
           "capabilities": [
             "code.diagnostics/v1"
           ],
-          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+          "description": "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\nUse `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\nUse when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\nTreat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
               "sections": {
-                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+                "description": "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -4952,7 +4982,7 @@
                 ]
               },
               "scope": {
-                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+                "description": "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
                 "anyOf": [
                   {
                     "type": "string"
@@ -4964,6 +4994,12 @@
                     }
                   }
                 ]
+              },
+              "offset": {
+                "description": "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
               },
               "topK": {
                 "description": "Max drill-down items per category. Default 20, max 100.",

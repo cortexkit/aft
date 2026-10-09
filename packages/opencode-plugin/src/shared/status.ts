@@ -64,11 +64,12 @@ export interface StatusBar {
   todos?: number;
   tier2_stale?: boolean;
   /**
-   * `"no_language_server"` when no language server is running, so errors and
-   * warnings will not arrive until one starts. Absent while the counts are
-   * present or a running server has not reported yet.
+   * `no_language_server` means no server is running. `producer_missing`
+   * masks both counts when an expected project producer has failed, even if
+   * another server supplied counts; diagnostics_gaps identifies the failures.
    */
-  diagnostics?: "no_language_server";
+  diagnostics?: "no_language_server" | "producer_missing";
+  diagnostics_gaps?: Array<{ language: string; producer: string; root: string }>;
 }
 
 export interface AftStatusSnapshot {
@@ -225,6 +226,22 @@ function readStatusBar(value: unknown): StatusBar | undefined {
   const duplicates = readOptionalNumber(bar.duplicates);
   const todos = readOptionalNumber(bar.todos);
   const noLanguageServer = bar.diagnostics === "no_language_server";
+  const producerMissing = bar.diagnostics === "producer_missing";
+  const diagnosticsGaps = Array.isArray(bar.diagnostics_gaps)
+    ? bar.diagnostics_gaps
+        .map(asRecord)
+        .filter(
+          (gap) =>
+            typeof gap.language === "string" &&
+            typeof gap.producer === "string" &&
+            typeof gap.root === "string",
+        )
+        .map((gap) => ({
+          language: gap.language as string,
+          producer: gap.producer as string,
+          root: gap.root as string,
+        }))
+    : [];
   if (
     errors === null &&
     warnings === null &&
@@ -233,6 +250,7 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     duplicates === null &&
     todos === null &&
     !noLanguageServer &&
+    !producerMissing &&
     disabled.length === 0
   ) {
     return undefined;
@@ -247,6 +265,9 @@ function readStatusBar(value: unknown): StatusBar | undefined {
     ...(todos !== null ? { todos } : {}),
     ...(bar.tier2_stale === true ? { tier2_stale: true } : {}),
     ...(noLanguageServer ? { diagnostics: "no_language_server" as const } : {}),
+    ...(producerMissing
+      ? { diagnostics: "producer_missing" as const, diagnostics_gaps: diagnosticsGaps }
+      : {}),
   };
 }
 

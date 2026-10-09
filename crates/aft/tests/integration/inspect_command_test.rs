@@ -3842,6 +3842,7 @@ fn scoped_blocking_inspect_starts_only_the_owning_rust_workspace() {
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
             "id": "inspect-scoped-owning-workspace",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": "crates/aft",
         })),
@@ -3960,7 +3961,7 @@ fn tool_call_aft_inspect_text_is_the_rendered_inspect_text() {
             "id": "tool-call-inspect-text",
             "command": "tool_call",
             "name": "aft_inspect",
-            "arguments": {"scope": "src", "sections": "todos"}
+            "arguments": {"scope": "src", "sections": ["todos", "diagnostics"]}
         })),
         &ctx,
         &|_, _| panic!("inspect tool calls use the inspect dispatcher"),
@@ -4008,6 +4009,7 @@ fn scoped_rust_inspect_does_not_start_typescript_for_js_outside_the_scope() {
         &ctx,
         json!({
             "id": "inspect-scoped-rust-with-outside-js",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": "src/lib.rs",
         }),
@@ -4530,6 +4532,7 @@ fn package_json_without_typescript_files_never_starts_typescript() {
         &ctx,
         json!({
             "id": "inspect-scoped-rust-wrangler",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": "src/lib.rs",
         }),
@@ -4555,6 +4558,7 @@ fn a_typescript_file_still_starts_typescript() {
         &ctx,
         json!({
             "id": "inspect-scoped-typescript",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": "worker/index.ts",
         }),
@@ -5151,6 +5155,320 @@ fn scoped_diagnostics_open_no_documents_and_close_none() {
 }
 
 #[test]
+fn scoped_inspect_without_diagnostics_does_no_producer_work() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "Cargo.toml", "[package]\nname = \"diag-no-work\"\n");
+    let pre_opened = write_file(&root, "src/a.rs", "fn a() {}\n");
+    let never_opened = [
+        write_file(&root, "src/b.rs", "fn b() {}\n"),
+        write_file(&root, "src/c.rs", "fn c() {}\n"),
+    ];
+    write_file(&root, "src/cold.ts", "export const cold = 1;\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    ctx.lsp()
+        .ensure_file_open(&pre_opened, &ctx.config())
+        .unwrap();
+    collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
+    ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
+
+    for sections in [Some(json!(["dead_code"])), None] {
+        let mut params =
+            json!({"id": "inspect-no-diagnostics", "command": "inspect", "scope": "src"});
+        if let Some(sections) = sections {
+            params["sections"] = sections;
+        }
+        let response = handle_inspect_tool_call(&request(params), &ctx);
+        assert!(response.success, "{response:?}");
+        // Check whether inspect opened or analyzed documents before checking
+        // its response: discarded diagnostics must not conceal document analysis.
+        for file in &never_opened {
+            assert!(!ctx.lsp().document_is_open_for_test(file));
+            assert!(
+                !ctx.lsp().has_diagnostic_report_for_file(file),
+                "cold file was analyzed: {file:?}"
+            );
+        }
+        let leftover = ctx.lsp().drain_events().events;
+        assert!(
+            leftover.iter().all(|event| !matches!(event,
+                LspEvent::Notification { method, .. }
+                if method == "custom/documentOpened" || method == "custom/documentClosed"
+            )),
+            "unexpected document notifications: {leftover:?}"
+        );
+        assert_eq!(
+            response.data["summary"]["diagnostics"],
+            json!({"status": "not_requested"})
+        );
+        assert!(response.data["details"].get("diagnostics").is_none());
+        assert!(!response.data["text"]
+            .as_str()
+            .unwrap()
+            .contains("diagnostics:"));
+        assert_eq!(
+            ctx.lsp().active_client_count(),
+            1,
+            "scoped request started a cold producer"
+        );
+        assert!(response.data["wait_stamp"]["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|phase| !matches!(phase["id"].as_str(), Some("lsp_start" | "lsp_quiescence"))));
+        let bar = ctx.status_bar_count_values();
+        assert_eq!(
+            (bar.dead_code, bar.unused_exports, bar.duplicates, bar.todos),
+            (Some(11), Some(12), Some(13), Some(14))
+        );
+    }
+}
+
+#[test]
+fn inspect_offset_pages_all_150_unused_exports() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "package.json",
+        "{\"name\":\"paging-app\",\"private\":true}",
+    );
+    write_file(&root, "src/main.ts", "console.log('entry');\n");
+    let source = (0..150)
+        .map(|i| format!("export function spare{i:03}() {{ return {i}; }}\n"))
+        .collect::<String>();
+    write_file(&root, "src/spares.ts", &source);
+    let ctx = configured_context(&root);
+    let page = |offset| {
+        inspect(
+            &ctx,
+            json!({
+                "id": format!("page-{offset}"), "command": "inspect", "sections": ["unused_exports"],
+                "topK": 100, "offset": offset,
+            }),
+        )
+    };
+    let first = page(0);
+    assert_eq!(first["success"], true, "{first:#}");
+    let bar = ctx.status_bar_count_values();
+    for (category, count) in [
+        ("dead_code", bar.dead_code),
+        ("unused_exports", bar.unused_exports),
+        ("duplicates", bar.duplicates),
+        ("todos", bar.todos),
+    ] {
+        assert_eq!(
+            count,
+            first["summary"][category]["count"]
+                .as_u64()
+                .map(|n| n as usize)
+        );
+    }
+    assert!(first["text"]
+        .as_str()
+        .unwrap()
+        .contains("Unused exports: 150"));
+    let details = &first["details"];
+    assert_eq!(
+        details["unused_exports_list_envelope"]["total"]["value"],
+        150
+    );
+    assert_eq!(details["unused_exports_list_envelope"]["next_offset"], 100);
+    assert_eq!(details["unused_exports"].as_array().unwrap().len(), 100);
+    assert_eq!(first["details"], page(0)["details"]);
+    let second = page(100);
+    let second_details = &second["details"];
+    assert_eq!(
+        second_details["unused_exports"].as_array().unwrap().len(),
+        50
+    );
+    assert_eq!(
+        second_details["unused_exports_list_envelope"]["offset"],
+        100
+    );
+    assert_eq!(
+        second_details["unused_exports_list_envelope"]["next_offset"],
+        Value::Null
+    );
+    assert_eq!(
+        second_details["unused_exports_list_envelope"]["reasons"],
+        json!([])
+    );
+    let rows = details["unused_exports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second_details["unused_exports"].as_array().unwrap())
+        .map(|row| {
+            (
+                row["file"].to_string(),
+                row["symbol"].to_string(),
+                row["line"].to_string(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(rows.len(), 150);
+    let exhausted = page(150);
+    assert_eq!(exhausted["details"]["unused_exports"], json!([]));
+    assert_eq!(
+        exhausted["details"]["unused_exports_list_envelope"]["total"]["value"],
+        150
+    );
+    assert_eq!(
+        exhausted["details"]["unused_exports_list_envelope"]["next_offset"],
+        Value::Null
+    );
+    let scoped = inspect(
+        &ctx,
+        json!({
+            "id": "scoped-page-100", "command": "inspect", "sections": ["unused_exports"],
+            "scope": "src/spares.ts", "topK": 100, "offset": 100,
+        }),
+    );
+    assert_eq!(
+        scoped["details"]["unused_exports"],
+        second_details["unused_exports"]
+    );
+    assert_eq!(ctx.status_bar_count_values().unused_exports, Some(150));
+}
+
+#[test]
+fn inspect_python_gap_is_unknown_without_supported_files_and_counted_when_mixed() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "service.py", "def spare():\n    return 1\n");
+    write_file(&root, "README.md", "documentation\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ctx.update_status_bar_tier2(Some(99), Some(0), Some(0), Some(0), false);
+    let response = inspect(
+        &ctx,
+        json!({"id":"python-only", "command":"inspect", "sections":["dead_code"]}),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    let summary = &response["summary"]["dead_code"];
+    assert_eq!(summary["count"], Value::Null, "{summary:#}");
+    assert_eq!(summary["complete"], false);
+    assert!(summary["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|gap| gap["kind"] == "language_unsupported"
+            && gap["language"] == "python"
+            && gap["files"] == 1));
+    assert_eq!(ctx.status_bar_count_values().dead_code, None);
+
+    write_file(&root, "main.ts", "console.log('supported');\n");
+    let response = serde_json::to_value(handle_inspect_tool_call(
+        &request(json!({"id":"python-mixed", "command":"inspect", "sections":["dead_code"]})),
+        &ctx,
+    ))
+    .unwrap();
+    let summary = &response["summary"]["dead_code"];
+    assert!(summary["count"].is_u64(), "{response:#}");
+    assert_eq!(summary["complete"], false);
+    assert_eq!(
+        ctx.status_bar_count_values().dead_code,
+        summary["count"].as_u64().map(|count| count as usize)
+    );
+    assert!(response["text"].as_str().unwrap().contains("python"));
+}
+
+#[test]
+fn scoped_diagnostics_discovery_preserves_project_bar_counts() {
+    let (_temp_dir, root, _lib) = single_crate_fixture("project-bar");
+    let pre_opened = write_file(&root, "src/old.rs", "pub fn old() {}\n");
+    let cold = write_file(&root, "src/cold.rs", "pub fn cold() {}\n");
+    let ctx = configured_context(&root);
+    configure_fake_rust_lsp(&ctx);
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
+    open_with_lsp(&ctx, &pre_opened, "pub fn old() {}\n");
+    ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
+    let before = ctx.status_bar_count_values();
+    assert!(before.errors.is_some());
+    assert!(!ctx.lsp().has_diagnostic_report_for_file(&cold));
+    let response = handle_inspect_tool_call(
+        &request(json!({
+            "id": "scoped-discovery", "command": "inspect", "sections": ["diagnostics"], "scope": cold,
+        })),
+        &ctx,
+    );
+    assert!(response.success, "{response:?}");
+    let after = ctx.status_bar_count_values();
+    assert_eq!(
+        (
+            after.dead_code,
+            after.unused_exports,
+            after.duplicates,
+            after.todos
+        ),
+        (
+            before.dead_code,
+            before.unused_exports,
+            before.duplicates,
+            before.todos
+        )
+    );
+    assert_eq!(after.diagnostics, before.diagnostics);
+    assert_eq!(after.diagnostics_gaps, before.diagnostics_gaps);
+    assert!(
+        after.errors.unwrap() > before.errors.unwrap(),
+        "{before:?} -> {after:?}"
+    );
+    assert_eq!(
+        after.errors.unwrap(),
+        ctx.lsp().warm_error_warning_counts().0
+    );
+    assert!(
+        after.errors.unwrap()
+            > response.data["summary"]["diagnostics"]["errors"]
+                .as_u64()
+                .unwrap() as usize
+    );
+}
+
+#[test]
+fn scoped_typescript_inspect_preserves_missing_gopls_mask() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "package.json", "{}");
+    let ts = write_file(&root, "src/main.ts", "console.log('ts');\n");
+    write_file(&root, "go.mod", "module example.test/app\n");
+    write_file(&root, "main.go", "package main\nfunc main() {}\n");
+    let ctx = configured_context(&root);
+    ctx.update_config(|config| {
+        config.disabled_lsp.insert("biome".into());
+        config.disabled_lsp.insert("oxlint".into());
+    });
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::Go, root.join("missing-gopls"));
+    // Configure takes the project-wide applicability snapshot after the test's
+    // deterministic binary overrides, so host-installed gopls is irrelevant.
+    ctx.set_config(ctx.config().as_ref().clone());
+    open_with_lsp(&ctx, &ts, "console.log('ts');\n");
+    let before = ctx.status_bar_count_values();
+    assert_eq!(before.diagnostics, Some("producer_missing"));
+    assert!(before
+        .diagnostics_gaps
+        .iter()
+        .any(|gap| gap["producer"] == "gopls"));
+    let response = handle_inspect_tool_call(
+        &request(json!({
+            "id": "ts-missing-go", "command": "inspect", "sections": ["diagnostics"], "scope": ts,
+        })),
+        &ctx,
+    );
+    assert!(response.success, "{response:?}");
+    let after = ctx.status_bar_count_values();
+    assert_eq!(
+        (after.errors, after.warnings, after.diagnostics),
+        (None, None, Some("producer_missing"))
+    );
+    assert_eq!(after.diagnostics_gaps, before.diagnostics_gaps);
+}
+
+#[test]
 fn inspect_command_diagnostics_missing_server_is_a_named_partial_gap() {
     let (_temp_dir, root) = fixture_project();
     write_file(&root, "Cargo.toml", "[package]\nname = \"diag-missing\"\n");
@@ -5362,6 +5680,7 @@ fn inspect_failed_producer_reason_names_exit_code_and_first_stderr_line() {
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
             "id": "inspect-producer-exit",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": "src/lib.rs",
         })),
@@ -5440,6 +5759,7 @@ fn scoped_files_without_diagnostics_roll_up_to_one_cause_and_top_k_paths() {
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
             "id": "inspect-uncovered-rollup",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": "web",
             "topK": 3,
@@ -5546,11 +5866,17 @@ fn inspect_reports_one_failed_lsp_producer_without_hiding_other_results() {
     );
 
     let before_failure = ctx.status_bar_count_values();
-    assert!(before_failure.errors.is_some_and(|errors| errors > 0));
+    // TypeScript's report alone cannot certify project totals while the
+    // expected Rust producer has not supplied authoritative diagnostics.
+    assert_eq!(
+        (before_failure.errors, before_failure.warnings),
+        (None, None)
+    );
 
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
             "id": "inspect-producer-gap",
+            "sections": ["diagnostics"],
             "command": "inspect",
             "scope": ["src/lib.rs", "web/src/app.ts"],
         })),
@@ -6709,7 +7035,7 @@ fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     wait_for_lsp_report_state(&ctx, &file, true);
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
-            "id": "inspect-partial-published", "command": "inspect", "scope": "src/main.rs"
+            "id": "inspect-partial-published", "command": "inspect", "scope": "src/main.rs", "sections": ["diagnostics"]
         })),
         &ctx,
     ))

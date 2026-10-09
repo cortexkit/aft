@@ -857,6 +857,7 @@ mod tests {
             todos: None,
             tier2_stale: true,
             disabled_categories: Vec::new(),
+            ..Default::default()
         };
         assert_eq!(agent_status_bar(&values), "[AFT E? W? | ~D21 U0 C13 | T?]");
     }

@@ -438,11 +438,15 @@ fn attach_inspect_envelope_mutates_details_when_capped() {
     assert!(attached.is_some());
     assert!(details.contains_key("dead_code_list_envelope"));
 
-    // When uncapped, does not insert
+    // Final pages retain structured pagination metadata, never a text trailer.
     let mut details_uncapped = Map::new();
-    let not_attached = attach_inspect_envelope(&mut details_uncapped, "dead_code", 5, 5);
-    assert!(not_attached.is_none());
-    assert!(!details_uncapped.contains_key("dead_code_list_envelope"));
+    let attached = attach_inspect_envelope(&mut details_uncapped, "dead_code", 5, 5);
+    assert!(attached.is_some());
+    assert_eq!(
+        details_uncapped["dead_code_list_envelope"]["next_offset"],
+        Value::Null
+    );
+    assert_eq!(trailer_from_details(&details_uncapped, "dead_code"), None);
 }
 
 #[test]

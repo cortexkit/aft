@@ -877,6 +877,9 @@ pub struct LspManager {
     latest_pull_for_rust: HashMap<(ServerKey, PathBuf), Vec<StoredDiagnostic>>,
     /// Times the retry window of transient start failures in `failed_spawns`.
     retry_clock: RetryClock,
+    /// Project-wide diagnostic producer expectations survive walks limited to
+    /// part of the project: those walks cannot prove an outside producer vanished.
+    project_applicability: Option<ApplicableServerSnapshot>,
 }
 #[cfg(test)]
 thread_local! {
@@ -1044,6 +1047,7 @@ impl LspManager {
             latest_push_for_pull_servers: HashMap::new(),
             latest_pull_for_rust: HashMap::new(),
             retry_clock: RetryClock::system(),
+            project_applicability: None,
         }
     }
 
@@ -1304,6 +1308,60 @@ impl LspManager {
             candidates,
             producer_failures,
         }
+    }
+
+    pub(crate) fn store_project_applicability(&mut self, snapshot: ApplicableServerSnapshot) {
+        self.project_applicability = Some(snapshot);
+    }
+
+    /// A failed diagnostics producer differs from one still starting. Either
+    /// prevents project totals, but only actual failures report producer_missing.
+    pub(crate) fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {
+        let Some(snapshot) = &self.project_applicability else {
+            return (false, Vec::new());
+        };
+        let mut gaps = Vec::new();
+        for key in &snapshot.server_keys {
+            let failed = self.producer_failure(key).is_some()
+                || self.failed_spawns.contains_key(key)
+                || (!self.has_client(key)
+                    && snapshot
+                        .producer_failures
+                        .iter()
+                        .any(|failure| failure.server_key == *key));
+            if failed {
+                let producer = snapshot
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.key == *key)
+                    .map(|candidate| candidate.definition.binary.as_str())
+                    .or_else(|| {
+                        snapshot
+                            .producer_failures
+                            .iter()
+                            .find(|failure| failure.server_key == *key)
+                            .and_then(|failure| match &failure.result {
+                                ServerAttemptResult::BinaryNotInstalled { binary }
+                                | ServerAttemptResult::SpawnFailed { binary, .. } => {
+                                    Some(binary.as_str())
+                                }
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or_else(|| key.kind.id_str());
+                gaps.push(serde_json::json!({
+                    "language": key.kind.id_str(), "producer": producer,
+                    "root": key.root.to_string_lossy(),
+                }));
+            }
+        }
+        let authoritative = gaps.is_empty()
+            && snapshot.server_keys.iter().all(|key| {
+                self.has_client(key)
+                    && !self.server_is_warming(key)
+                    && self.has_authoritative_report_for_server(key)
+            });
+        (authoritative, gaps)
     }
 
     /// Start exactly the servers selected by a prior applicability snapshot.
@@ -4353,14 +4411,6 @@ impl LspManager {
         self.diagnostics.authoritative_reports()
     }
 
-    /// Failed starts leave the project-wide diagnostic total unknown even when
-    /// another server has published a clean report.
-    pub(crate) fn has_failed_diagnostic_producers(&self, root: Option<&Path>) -> bool {
-        self.failed_spawns.keys().any(|key| {
-            root.is_none_or(|root| key.root.starts_with(root) || root.starts_with(&key.root))
-        })
-    }
-
     pub fn get_all_diagnostics(&self) -> Vec<&StoredDiagnostic> {
         self.diagnostics.all()
     }
@@ -6929,6 +6979,112 @@ mod env_binary_override_tests {
             env_binary_override_from(&kind, |_| Some(std::ffi::OsString::from("/bin/lsp"))),
             Some(PathBuf::from("/bin/lsp"))
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod project_applicability_tests {
+    use super::*;
+
+    fn fixture(yaml_enabled: bool, go: bool) -> (tempfile::TempDir, LspManager, Config, ServerKey) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_for_lsp(dir.path()).unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::write(root.join("main.ts"), "const x = 1;\n").unwrap();
+        std::fs::write(root.join("settings.yaml"), "key: value\n").unwrap();
+        if go {
+            std::fs::write(root.join("go.mod"), "module example.test/app\n").unwrap();
+            std::fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();
+        }
+        let mut config = Config {
+            project_root: Some(root.clone()),
+            ..Config::default()
+        };
+        config.disabled_lsp.insert("biome".into());
+        config.disabled_lsp.insert("oxlint".into());
+        if !yaml_enabled {
+            config.disabled_lsp.insert("yaml".into());
+        }
+        let mut manager = LspManager::new();
+        manager.override_binary(ServerKind::TypeScript, PathBuf::from("/bin/sh"));
+        manager.override_binary(ServerKind::Yaml, root.join("missing-yaml"));
+        manager.override_binary(ServerKind::Go, root.join("missing-gopls"));
+        let snapshot = manager
+            .resolve_applicable_servers_for_root(&root, &config)
+            .unwrap();
+        let ts = snapshot
+            .server_keys
+            .iter()
+            .find(|key| key.kind == ServerKind::TypeScript)
+            .unwrap()
+            .clone();
+        manager.store_project_applicability(snapshot);
+        // A live transport plus a stored empty report models an authoritative
+        // producer without involving a real language server or SDK discovery.
+        let client = LspClient::spawn(
+            ServerKind::TypeScript,
+            ts.root.clone(),
+            Path::new("/bin/sh"),
+            &["-c".into(), "while read line; do :; done".into()],
+            &HashMap::new(),
+            manager.event_tx.clone(),
+            LspChildRegistry::new(),
+        )
+        .unwrap();
+        manager.insert_client_for_test(client);
+        manager
+            .diagnostics
+            .publish(ts.clone(), root.join("main.ts"), Vec::new());
+        (dir, manager, config, ts)
+    }
+
+    #[test]
+    fn project_authority_ignores_disabled_and_undefined_producers() {
+        let (_dir, manager, _config, _) = fixture(false, false);
+        let (authoritative, gaps) = manager.project_diagnostics_authority();
+        assert!(authoritative, "{gaps:?}");
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn project_authority_masks_typescript_sdk_unavailable() {
+        let (_dir, mut manager, _config, ts) = fixture(false, false);
+        manager
+            .clients
+            .get_mut(&ts)
+            .unwrap()
+            .set_diagnostic_failure(Some("TypeScript SDK unavailable: no tsserver.js".into()));
+        let (authoritative, gaps) = manager.project_diagnostics_authority();
+        assert!(!authoritative);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["language"], "typescript");
+        assert_eq!(gaps[0]["root"], ts.root.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn project_authority_masks_missing_yaml_binary() {
+        let (_dir, manager, _config, _) = fixture(true, false);
+        let (authoritative, gaps) = manager.project_diagnostics_authority();
+        assert!(!authoritative);
+        assert!(gaps.iter().any(|gap| gap["language"] == "yaml"));
+    }
+
+    #[test]
+    fn scoped_walk_does_not_replace_project_missing_gopls() {
+        let (dir, manager, config, _) = fixture(false, true);
+        let before = manager.project_diagnostics_authority();
+        assert!(!before.0);
+        assert!(before.1.iter().any(|gap| gap["producer"] == "gopls"));
+        let root = canonicalize_for_lsp(dir.path()).unwrap();
+        let scoped = manager.classify_applicable_servers(
+            walk_applicable_area(&root, Some(&[root.join("main.ts")]), &config, None).unwrap(),
+            &config,
+        );
+        assert!(scoped
+            .server_keys
+            .iter()
+            .all(|key| key.kind == ServerKind::TypeScript));
+        assert_eq!(manager.project_diagnostics_authority(), before);
     }
 }
 

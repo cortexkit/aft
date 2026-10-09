@@ -386,7 +386,12 @@ fn resolve_inspect_applicability(
         config,
         Some(deadline),
     )?;
-    Ok(ctx.lsp().classify_applicable_servers(walk, config))
+    let mut lsp = ctx.lsp();
+    let snapshot = lsp.classify_applicable_servers(walk, config);
+    if scoped_roots.is_none() {
+        lsp.store_project_applicability(snapshot.clone());
+    }
+    Ok(snapshot)
 }
 
 /// Test-only warm-path entry that preserves nonblocking diagnostics semantics
@@ -442,13 +447,17 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     let scope = parse_scope(req, ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = resolve_inspect_applicability(
-        ctx,
-        &snapshot.project_root,
-        scoped_roots,
-        &snapshot.config,
-        deadline.work_at(),
-    );
+    let applicability = if scoped_roots.is_some() && !diagnostics_selected(req) {
+        Ok(ApplicableServerSnapshot::default())
+    } else {
+        resolve_inspect_applicability(
+            ctx,
+            &snapshot.project_root,
+            scoped_roots,
+            &snapshot.config,
+            deadline.work_at(),
+        )
+    };
     let response = match applicability {
         Ok(applicability) => {
             run_blocking_inspect_body(req, ctx, applicability, phase_log, deadline)
@@ -490,6 +499,10 @@ fn handle_inspect_payload(
         Ok(top_k) => top_k,
         Err(message) => return invalid_request(&req.id, message),
     };
+    let offset = match parse_offset(&req.params) {
+        Ok(offset) => offset,
+        Err(message) => return invalid_request(&req.id, message),
+    };
     let sections = match parse_sections(req.params.get("sections")) {
         Ok(sections) => sections,
         Err(message) => return invalid_request(&req.id, message),
@@ -507,6 +520,8 @@ fn handle_inspect_payload(
     let scope_was_provided = scope_was_provided && !parsed_scope.roots.is_empty();
     let scope_roots = scope_was_provided.then_some(parsed_scope.roots.as_slice());
     let scope = parsed_scope.job;
+    let diagnostics_requested =
+        !scope_was_provided || sections.includes(InspectCategory::Diagnostics);
 
     if inspect_cancellation_requested() {
         return inspect_interrupted_response(&req.id);
@@ -671,7 +686,11 @@ fn handle_inspect_payload(
         if inspect_cancellation_requested() {
             return inspect_interrupted_response(&req.id);
         }
-        let outcome = if *category == InspectCategory::Diagnostics {
+        let outcome = if *category == InspectCategory::Diagnostics && !diagnostics_requested {
+            JobOutcome::Fresh {
+                payload: serde_json::json!({"status": "not_requested"}),
+            }
+        } else if *category == InspectCategory::Diagnostics {
             // Read the warm LSP store with named gaps for producers whose wait
             // expired. A blocking scoped request first has its started servers
             // analyze the scoped files, within half the remaining budget.
@@ -719,11 +738,33 @@ fn handle_inspect_payload(
         outcomes.insert(*category, outcome);
     }
 
+    if let Some(JobOutcome::Fresh { payload }) = outcomes.get_mut(&InspectCategory::DeadCode) {
+        if payload["status"] != "pending" && payload["off"] != true {
+            let files = observed_stats
+                .map(|stats| {
+                    stats
+                        .0
+                        .iter()
+                        .map(|(path, _, _)| path.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| {
+                    crate::callgraph::walk_project_files(&snapshot.project_root).collect()
+                });
+            let files = files
+                .into_iter()
+                .filter(|file| scope.contains(file))
+                .collect::<Vec<_>>();
+            crate::inspect::job::attach_dead_code_language_coverage(payload, &files);
+        }
+    }
     // Truthful fleet-status values update from whatever this collection proved,
     // even when the freshness gate below refuses the payload: a verified count
     // stays verified, and pending or failed categories remain absent rather
     // than reading as zero.
-    refresh_status_bar_counts(ctx, &outcomes);
+    if !scope_was_provided {
+        refresh_status_bar_counts(ctx, &outcomes);
+    }
 
     // A cache-only scoped request deliberately skips missing or unverified
     // Tier-2 results. A view scan that actually ran, or an incomplete result
@@ -793,8 +834,15 @@ fn handle_inspect_payload(
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
     };
 
-    let mut payload =
-        build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
+    let mut payload = build_inspect_payload_with_offset(
+        &snapshot,
+        &payloads,
+        &sections,
+        top_k,
+        offset,
+        ctx,
+        scope_roots,
+    );
     // A scoped answer carries only the notes of servers for its own files; a
     // TypeScript SDK note from a server started for another request does not
     // belong in an answer about Rust files.
@@ -946,13 +994,17 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     let scope = parse_scope(req, &ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
     let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
-    let applicability = resolve_inspect_applicability(
-        &ctx,
-        &snapshot.project_root,
-        scoped_roots,
-        &snapshot.config,
-        deadline.work_at(),
-    );
+    let applicability = if scoped_roots.is_some() && !diagnostics_selected(req) {
+        Ok(ApplicableServerSnapshot::default())
+    } else {
+        resolve_inspect_applicability(
+            &ctx,
+            &snapshot.project_root,
+            scoped_roots,
+            &snapshot.config,
+            deadline.work_at(),
+        )
+    };
     let applicability = match applicability {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -1038,6 +1090,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
 
 fn inspect_preflight(req: &RawRequest, ctx: &AppContext) -> Result<InspectSnapshot, Response> {
     parse_top_k(&req.params).map_err(|message| invalid_request(&req.id, message))?;
+    parse_offset(&req.params).map_err(|message| invalid_request(&req.id, message))?;
     parse_sections(req.params.get("sections"))
         .map_err(|message| invalid_request(&req.id, message))?;
     let snapshot = build_snapshot(ctx).map_err(|response| response.with_id(&req.id))?;
@@ -1078,6 +1131,13 @@ fn inspect_shutdown_terminal(
 /// supplies a category count; pending or failed categories remain absent in the
 /// truthful values state instead of being replaced with zero.
 fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCategory, JobOutcome>) {
+    if outcomes
+        .get(&InspectCategory::DeadCode)
+        .and_then(JobOutcome::payload)
+        .is_some_and(|payload| payload["supported_language_files"] == 0)
+    {
+        ctx.clear_status_bar_dead_code_count();
+    }
     // `JobOutcome::payload()` exposes only Fresh data or a stat-verified stale
     // cache, so an unavailable category cannot overwrite a proven value.
     let count_of = |category: InspectCategory| -> Option<usize> {
@@ -1093,7 +1153,10 @@ fn refresh_status_bar_counts(ctx: &AppContext, outcomes: &BTreeMap<InspectCatego
     ]
     .iter()
     .any(|category| match outcomes.get(category) {
-        Some(JobOutcome::Fresh { payload }) => category_is_incomplete(payload),
+        Some(JobOutcome::Fresh { payload }) => {
+            category_is_incomplete(payload)
+                && available_count_from_payload(*category, payload).is_none()
+        }
         Some(JobOutcome::Stale { .. } | JobOutcome::Pending { .. } | JobOutcome::Failed { .. }) => {
             true
         }
@@ -1302,8 +1365,12 @@ fn run_blocking_inspect_body(
     // it here.
     let scoped_request =
         scope_was_provided(req.params.get("scope")) && !reload_scope_roots.is_empty();
-    let wait_outcome =
-        wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request);
+    let diagnostics_requested = !scoped_request || diagnostics_selected(req);
+    let wait_outcome = if diagnostics_requested {
+        wait_for_root_quiescence(ctx, &start_outcomes.successful, deadline, !scoped_request)
+    } else {
+        Ok((Vec::new(), false, Vec::new()))
+    };
     if inspect_cancellation_requested() {
         for phase in quiescence {
             phase.fail("inspect request cancelled");
@@ -1406,7 +1473,7 @@ fn run_blocking_inspect_body(
         }
         return build_inspect_terminal(&req.id, &phase_log, terminal);
     }
-    if let Some(inspect_snapshot) = &inspect_snapshot {
+    if let Some(inspect_snapshot) = inspect_snapshot.as_ref().filter(|_| diagnostics_requested) {
         record_blocking_inspect_observations(ctx, req, inspect_snapshot, accepted_snapshots);
     }
     if inspect_cancellation_requested() {
@@ -2294,7 +2361,11 @@ fn finish_tier2_phases(
                 }
             }
             if let Some(tier2_phase) = tier2_phase {
-                tier2_phase.complete();
+                if payload["status"] == "pending" {
+                    tier2_phase.fail("callgraph_building; retry aft_inspect");
+                } else {
+                    tier2_phase.complete();
+                }
             }
         }
         JobOutcome::Failed { message } => {
@@ -2331,6 +2402,13 @@ fn receive_tier2_completion_until(
         }
         let now = std::time::Instant::now();
         if now >= deadline {
+            if category == InspectCategory::DeadCode && manager.dead_code_build_is_pending() {
+                return Some(JobOutcome::Fresh {
+                    payload: serde_json::json!({
+                        "status": "pending", "reason": "callgraph_building", "complete": false,
+                    }),
+                });
+            }
             if request_deadline.is_some_and(|request| now >= request.work_at()) {
                 return Some(JobOutcome::Failed {
                     message: request_deadline
@@ -2422,6 +2500,16 @@ fn parse_top_k(params: &Value) -> Result<usize, String> {
     Ok((top_k as usize).min(MAX_TOP_K))
 }
 
+fn parse_offset(params: &Value) -> Result<usize, String> {
+    match params.get("offset") {
+        None | Some(Value::Null) => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| "offset must be a non-negative integer".to_string()),
+    }
+}
+
 fn parse_sections(value: Option<&Value>) -> Result<Sections, String> {
     let Some(value) = value else {
         return Ok(Sections::summary_only());
@@ -2454,6 +2542,11 @@ fn parse_sections(value: Option<&Value>) -> Result<Sections, String> {
             detail_categories: categories,
         })
     }
+}
+
+fn diagnostics_selected(req: &RawRequest) -> bool {
+    parse_sections(req.params.get("sections"))
+        .is_ok_and(|sections| sections.includes(InspectCategory::Diagnostics))
 }
 
 fn scope_was_provided(value: Option<&Value>) -> bool {
@@ -2617,11 +2710,24 @@ fn scope_root_display(project_root: &Path, root: &Path) -> String {
         .join("/")
 }
 
+#[cfg(test)]
 fn build_inspect_payload(
     snapshot: &InspectSnapshot,
     payloads: &BTreeMap<InspectCategory, Value>,
     sections: &Sections,
     top_k: usize,
+    ctx: &AppContext,
+    scope_roots: Option<&[PathBuf]>,
+) -> Value {
+    build_inspect_payload_with_offset(snapshot, payloads, sections, top_k, 0, ctx, scope_roots)
+}
+
+fn build_inspect_payload_with_offset(
+    snapshot: &InspectSnapshot,
+    payloads: &BTreeMap<InspectCategory, Value>,
+    sections: &Sections,
+    top_k: usize,
+    offset: usize,
     ctx: &AppContext,
     scope_roots: Option<&[PathBuf]>,
 ) -> Value {
@@ -2657,12 +2763,23 @@ fn build_inspect_payload(
             );
             continue;
         }
-        // `fresh_payloads` established this invariant before this emitter runs.
-        // Keeping the fresh payload separate from JobOutcome prevents accidental
-        // reintroduction of a stale or pending branch into a successful response.
+        // Each payload describes the current outcome, never unverified cached
+        // findings. A cold build still in progress has an explicit count-free
+        // pending payload rather than stale rows presented as current results.
         let payload = payloads
             .get(category)
             .expect("all active categories have a fresh inspect payload");
+        if payload["status"] == "not_requested" {
+            summary.insert(
+                category.as_str().to_string(),
+                serde_json::json!({"status": "not_requested"}),
+            );
+            continue;
+        }
+        if payload["status"] == "pending" {
+            summary.insert(category.as_str().to_string(), payload.clone());
+            continue;
+        }
         if payload.get("not_computed").and_then(Value::as_bool) == Some(true) {
             let mut category_summary = serde_json::json!({
                 "not_computed": true, "complete": true,
@@ -2693,7 +2810,7 @@ fn build_inspect_payload(
             summary.insert(
                 category.as_str().to_string(),
                 serde_json::json!({
-                    "unavailable": true, "complete": false, "gaps": category_gaps,
+                    "status": "unavailable", "unavailable": true, "complete": false, "gaps": category_gaps,
                 }),
             );
             for key in ["building", "last_complete"] {
@@ -2743,7 +2860,13 @@ fn build_inspect_payload(
             }
         }
         if *category == InspectCategory::Diagnostics {
-            attach_uncovered_file_rollup(&mut category_summary, &mut details, payload, top_k);
+            attach_uncovered_file_rollup(
+                &mut category_summary,
+                &mut details,
+                payload,
+                top_k,
+                offset,
+            );
         }
         summary.insert(category.as_str().to_string(), category_summary);
         if dead_code_unavailable {
@@ -2755,7 +2878,7 @@ fn build_inspect_payload(
             continue;
         }
         if sections.includes(*category) {
-            let detail = details_for(*category, payload, top_k);
+            let detail = details_for(*category, payload, top_k, offset);
             let total_count = payload
                 .get("items")
                 .or_else(|| payload.get("groups"))
@@ -2764,31 +2887,33 @@ fn build_inspect_payload(
             let shown = detail.as_array().map_or(0, |a| a.len());
             details.insert(category.as_str().to_string(), detail);
             if *category != InspectCategory::Metrics {
-                crate::list_surfaces::inspect::attach_inspect_envelope(
+                crate::list_surfaces::inspect::attach_inspect_page_envelope(
                     &mut details,
                     category.as_str(),
                     shown,
                     total_count,
+                    offset,
                 );
             }
             if matches!(
                 *category,
                 InspectCategory::DeadCode | InspectCategory::UnusedExports
             ) {
-                let test_only_detail = test_only_details_for(payload, top_k);
+                let test_only_detail = test_only_details_for(payload, top_k, offset);
                 let test_only_total = payload
                     .get("test_only_items")
                     .and_then(Value::as_array)
                     .map_or(0, |a| a.len());
                 let test_only_shown = test_only_detail.as_array().map_or(0, |a| a.len());
-                if test_only_shown > 0 || (top_k == 0 && test_only_total > 0) {
+                if test_only_total > 0 {
                     let key = format!("{}_test_only", category.as_str());
                     details.insert(key.clone(), test_only_detail);
-                    crate::list_surfaces::inspect::attach_inspect_envelope(
+                    crate::list_surfaces::inspect::attach_inspect_page_envelope(
                         &mut details,
                         &key,
                         test_only_shown,
                         test_only_total,
+                        offset,
                     );
                 }
             }
@@ -2798,39 +2923,41 @@ fn build_inspect_payload(
                     | InspectCategory::UnusedExports
                     | InspectCategory::Duplicates
             ) {
-                let generated_detail = generated_details_for(payload, top_k);
+                let generated_detail = generated_details_for(payload, top_k, offset);
                 let generated_total = payload
                     .get("generated_items")
                     .and_then(Value::as_array)
                     .map_or(0, |a| a.len());
                 let generated_shown = generated_detail.as_array().map_or(0, |a| a.len());
-                if generated_shown > 0 || (top_k == 0 && generated_total > 0) {
+                if generated_total > 0 {
                     let key = format!("{}_generated", category.as_str());
                     details.insert(key.clone(), generated_detail);
-                    crate::list_surfaces::inspect::attach_inspect_envelope(
+                    crate::list_surfaces::inspect::attach_inspect_page_envelope(
                         &mut details,
                         &key,
                         generated_shown,
                         generated_total,
+                        offset,
                     );
                 }
             }
         } else if *category == InspectCategory::Diagnostics {
             // Diagnostics detail is actionable even without an explicit section.
             // `top_k` limits rows only; summaries are always computed in full.
-            let detail = details_for(*category, payload, top_k);
+            let detail = details_for(*category, payload, top_k, offset);
             let diag_total = payload
                 .get("items")
                 .and_then(Value::as_array)
                 .map_or(0, |a| a.len());
             let diag_shown = detail.as_array().map_or(0, |a| a.len());
-            if diag_shown > 0 || (top_k == 0 && diag_total > 0) {
+            if diag_total > 0 {
                 details.insert(category.as_str().to_string(), detail);
-                crate::list_surfaces::inspect::attach_inspect_envelope(
+                crate::list_surfaces::inspect::attach_inspect_page_envelope(
                     &mut details,
                     category.as_str(),
                     diag_shown,
                     diag_total,
+                    offset,
                 );
             }
         }
@@ -2867,6 +2994,16 @@ fn build_inspect_payload(
         if no_files_matched_scope {
             payload["no_files_matched_scope"] = Value::Bool(true);
         }
+    }
+    let pending = payload["summary"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, value)| value["status"] == "pending")
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    if !pending.is_empty() {
+        payload["scanner_state"]["pending_categories"] = serde_json::json!(pending);
     }
     if !details.is_empty() {
         payload["details"] = Value::Object(details);
@@ -2955,6 +3092,7 @@ fn render_inspect_text(
             value.get("unavailable").and_then(Value::as_bool) != Some(true)
                 && value["not_computed"] != true
                 && value["off"] != true
+                && value["status"] != "not_requested"
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<Map<String, Value>>();
@@ -3370,6 +3508,10 @@ fn render_symbol_category(
         } else {
             lines.push(format!("{label}: {status}"));
         }
+        return;
+    }
+    if key == "dead_code" && section["count"].is_null() {
+        lines.push("Dead code: unknown (no supported-language files scanned)".to_string());
         return;
     }
     let count = section.get("count").and_then(Value::as_u64).unwrap_or(0);
@@ -4111,7 +4253,8 @@ fn computed_summary_for(category: InspectCategory, payload: &Value) -> Value {
             })
         }
         InspectCategory::DeadCode => serde_json::json!({
-            "count": count_from_payload(Some(payload)),
+            "count": payload.get("count").cloned().unwrap_or_else(|| serde_json::json!(0)),
+            "supported_language_files": payload.get("supported_language_files"),
             "generated_count": generated_count_from_payload(Some(payload)),
             "total_count": total_count_from_payload(Some(payload)),
             "test_only_count": test_only_count_from_payload(Some(payload)),
@@ -4308,6 +4451,7 @@ fn attach_uncovered_file_rollup(
     details: &mut Map<String, Value>,
     payload: &Value,
     top_k: usize,
+    offset: usize,
 ) {
     let Some(gaps) = payload.get("gaps").and_then(Value::as_array) else {
         return;
@@ -4329,31 +4473,35 @@ fn attach_uncovered_file_rollup(
             })
             .collect(),
     );
-    let (listed, total) = uncovered_files_details_for(&groups, top_k);
+    let (listed, total) = uncovered_files_details_for(&groups, top_k, offset);
     let shown = listed.len();
     let key = format!("{}_uncovered_files", InspectCategory::Diagnostics.as_str());
     details.insert(
         key.clone(),
         Value::Array(listed.into_iter().map(Value::from).collect()),
     );
-    crate::list_surfaces::inspect::attach_inspect_envelope(details, &key, shown, total);
+    crate::list_surfaces::inspect::attach_inspect_page_envelope(
+        details, &key, shown, total, offset,
+    );
 }
 
 /// The first `top_k` uncovered paths in group order, and the total count.
 fn uncovered_files_details_for<'a>(
     groups: &[UncoveredFileGroup<'a>],
     top_k: usize,
+    offset: usize,
 ) -> (Vec<&'a str>, usize) {
     let total = groups.iter().map(|group| group.files.len()).sum();
     let listed = groups
         .iter()
         .flat_map(|group| group.files.iter().copied())
+        .skip(offset)
         .take(top_k)
         .collect();
     (listed, total)
 }
 
-fn details_for(category: InspectCategory, payload: &Value, top_k: usize) -> Value {
+fn details_for(category: InspectCategory, payload: &Value, top_k: usize, offset: usize) -> Value {
     if category == InspectCategory::Metrics {
         return computed_summary_for(category, payload);
     }
@@ -4362,27 +4510,39 @@ fn details_for(category: InspectCategory, payload: &Value, top_k: usize) -> Valu
         .or_else(|| payload.get("groups"))
         .and_then(Value::as_array);
     match items {
-        Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
+        Some(items) => Value::Array(items.iter().skip(offset).take(top_k).cloned().collect()),
         None => serde_json::json!([]),
     }
 }
 
-fn test_only_details_for(payload: &Value, top_k: usize) -> Value {
+fn test_only_details_for(payload: &Value, top_k: usize, offset: usize) -> Value {
     match payload.get("test_only_items").and_then(Value::as_array) {
-        Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
+        Some(items) => Value::Array(items.iter().skip(offset).take(top_k).cloned().collect()),
         None => serde_json::json!([]),
     }
 }
 
-fn generated_details_for(payload: &Value, top_k: usize) -> Value {
+fn generated_details_for(payload: &Value, top_k: usize, offset: usize) -> Value {
     match payload.get("generated_items").and_then(Value::as_array) {
-        Some(items) => Value::Array(items.iter().take(top_k).cloned().collect()),
+        Some(items) => Value::Array(items.iter().skip(offset).take(top_k).cloned().collect()),
         None => serde_json::json!([]),
     }
 }
 
 fn available_count_from_payload(_category: InspectCategory, payload: &Value) -> Option<usize> {
-    if category_is_incomplete(payload) {
+    let incomplete_files = ["parse_errors", "skipped_files"].iter().any(|key| {
+        payload[*key]
+            .as_array()
+            .is_some_and(|files| !files.is_empty())
+    }) || payload["skipped_files_count"]
+        .as_u64()
+        .is_some_and(|count| count > 0);
+    if category_is_incomplete(payload)
+        && (incomplete_files
+            || payload["gaps"]
+                .as_array()
+                .is_none_or(|gaps| gaps.iter().any(|gap| gap["kind"] != "language_unsupported")))
+    {
         return None;
     }
     payload
@@ -4518,6 +4678,25 @@ mod status_bar_refresh_tests {
 
     fn ctx() -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+    }
+
+    #[test]
+    fn unsupported_language_gap_does_not_hide_failed_supported_files() {
+        let ctx = ctx();
+        ctx.update_status_bar_tier2(Some(5), Some(0), Some(0), Some(0), false);
+        let outcome = JobOutcome::Fresh {
+            payload: serde_json::json!({
+                "count": 8, "complete": false, "supported_language_files": 1,
+                "gaps": [{"kind": "language_unsupported", "language": "python", "files": 1}],
+                "parse_errors": [{"file": "broken.ts", "message": "syntax error"}],
+            }),
+        };
+        refresh_status_bar_counts(
+            &ctx,
+            &[(InspectCategory::DeadCode, outcome)].into_iter().collect(),
+        );
+        assert_eq!(ctx.status_bar_count_values().dead_code, Some(5));
+        assert!(ctx.status_bar_count_values().tier2_stale);
     }
 
     fn outcomes(
@@ -5654,12 +5833,28 @@ mod fresh_payload_tests {
         assert_header(&response, "PARTIAL — file freshness unverified: file freshness verification exceeded the request budget; retry aft_inspect.", false);
     }
 
-    fn assert_no_banned_field(value: &Value) {
+    pub(super) fn assert_no_banned_field(value: &Value) {
+        if let Some(summary) = value["summary"].as_object() {
+            let pending = summary
+                .iter()
+                .filter(|(_, payload)| payload["status"] == "pending")
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>();
+            let categories = value["scanner_state"].get("pending_categories");
+            if pending.is_empty() {
+                assert!(
+                    categories.is_none(),
+                    "non-pending response has pending_categories"
+                );
+            } else {
+                assert_eq!(pending, vec!["dead_code"]);
+                assert_eq!(categories, Some(&serde_json::json!(pending)));
+            }
+        }
         // These sentinels must never substitute for explicit completion and gaps.
         const BANNED_KEYS: &[&str] = &[
             "provisional",
             "provisional_counts",
-            "pending_categories",
             "stale_categories",
             "incomplete_categories",
             "scope_truncated",
@@ -5690,8 +5885,16 @@ mod fresh_payload_tests {
                         );
                     }
                     if key == "status" {
+                        if value == "pending" {
+                            assert_eq!(
+                                fields.get("reason"),
+                                Some(&serde_json::json!("callgraph_building"))
+                            );
+                            assert_eq!(fields.get("complete"), Some(&Value::Bool(false)));
+                            assert!(!fields.contains_key("count"));
+                        }
                         assert!(
-                            !matches!(value.as_str(), Some("pending" | "stale" | "failed")),
+                            !matches!(value.as_str(), Some("stale" | "failed")),
                             "partial category status leaked into payload: {value}"
                         );
                     }
@@ -5739,6 +5942,75 @@ mod fresh_payload_tests {
         );
         assert!(payload.get("topK").is_none());
         assert!(payload.get("top_k").is_none());
+    }
+
+    #[test]
+    fn payload_contract_only_allows_pending_categories_for_pending_outcomes() {
+        let mut value = serde_json::json!({
+            "summary": {"dead_code": {"count": 0, "complete": true}}, "scanner_state": {},
+        });
+        assert_no_banned_field(&value);
+        value["scanner_state"]["pending_categories"] = serde_json::json!(["dead_code"]);
+        assert!(std::panic::catch_unwind(|| assert_no_banned_field(&value)).is_err());
+        value["summary"]["dead_code"] = serde_json::json!({
+            "status": "pending", "reason": "callgraph_building", "complete": false,
+        });
+        assert_no_banned_field(&value);
+        value["scanner_state"]["pending_categories"] = serde_json::json!(["unused_exports"]);
+        assert!(std::panic::catch_unwind(|| assert_no_banned_field(&value)).is_err());
+    }
+
+    #[test]
+    fn offset_applies_independently_to_all_detail_lists() {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        );
+        let rows = (0..4).map(|i| serde_json::json!({"file": format!("src/f{i}.ts"), "symbol": format!("f{i}"), "line": i+1}))
+            .collect::<Vec<_>>();
+        let payloads = InspectCategory::active()
+            .iter()
+            .map(|category| {
+                (
+                    *category,
+                    serde_json::json!({
+                        "count": 4, "items": rows, "generated_items": rows, "generated_count": 4,
+                        "test_only_items": rows, "test_only_count": 4,
+                    }),
+                )
+            })
+            .collect();
+        let page = build_inspect_payload_with_offset(
+            &snapshot(),
+            &payloads,
+            &Sections::all(),
+            2,
+            2,
+            &ctx,
+            None,
+        );
+        let details = page["details"].as_object().unwrap();
+        let mut lists = 0;
+        for (key, value) in details
+            .iter()
+            .filter(|(key, _)| key.ends_with("_list_envelope"))
+        {
+            let list_key = key.strip_suffix("_list_envelope").unwrap();
+            assert_eq!(details[list_key], serde_json::json!(rows[2..]));
+            assert_eq!(value["offset"], 2);
+            assert_eq!(value["next_offset"], Value::Null);
+            assert_eq!(value["total"]["value"], 4);
+            assert_eq!(value["reasons"], serde_json::json!([]));
+            lists += 1;
+        }
+        assert!(lists >= 9, "only {lists} independent lists checked");
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("2"),
+        ] {
+            assert!(parse_offset(&serde_json::json!({"offset": invalid})).is_err());
+        }
     }
 
     #[test]
@@ -6463,13 +6735,14 @@ mod fresh_payload_tests {
             text.ends_with("  tools/lint_3.ts") || text.contains("  tools/lint_3.ts\n"),
             "{text}"
         );
-        assert!(payload["details"]
-            .get("diagnostics_uncovered_files_list_envelope")
-            .is_none());
+        assert_eq!(
+            payload["details"]["diagnostics_uncovered_files_list_envelope"]["next_offset"],
+            Value::Null
+        );
     }
 
     #[test]
-    fn build_inspect_payload_uncapped_renders_no_trailers_and_serializes_no_envelope() {
+    fn build_inspect_payload_uncapped_renders_no_trailers_and_serializes_final_envelopes() {
         let ctx = AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
@@ -6506,10 +6779,11 @@ mod fresh_payload_tests {
             .keys()
             .filter(|k| k.ends_with("_list_envelope"))
             .collect();
-        assert!(
-            envelope_keys.is_empty(),
-            "uncapped must have no envelopes: {envelope_keys:?}"
-        );
+        assert_eq!(envelope_keys.len(), 2);
+        for key in envelope_keys {
+            assert_eq!(details[key]["next_offset"], Value::Null);
+            assert_eq!(details[key]["reasons"], serde_json::json!([]));
+        }
 
         let text = payload["text"].as_str().expect("text");
         assert!(
@@ -6928,7 +7202,7 @@ mod deferred_terminal_tests {
     }
 
     #[test]
-    fn inspect_builder_state_refusal_includes_start_timestamp() {
+    fn inspect_builder_timeout_is_pending_while_building() {
         let (_tx, rx) = std::sync::mpsc::channel();
         let manager = crate::inspect::InspectManager::new();
         manager.set_tier2_in_flight_for_test(InspectCategory::DeadCode, true);
@@ -6940,13 +7214,123 @@ mod deferred_terminal_tests {
             None,
         )
         .expect("deadline produces an honest failure");
-        assert!(matches!(
-            outcome,
-            JobOutcome::Failed { message }
-                if message.contains("inspect_phase_timeout")
-                    && message.contains("builder_state=building since ")
-                    && message.contains("age_s=")
-        ));
+        assert!(matches!(outcome, JobOutcome::Fresh { payload }
+            if payload == serde_json::json!({"status": "pending", "reason": "callgraph_building", "complete": false})));
+    }
+
+    #[test]
+    fn inspect_cold_build_limiter_timeout_is_pending_then_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::inspect::job::canonicalize_normalized(dir.path());
+        std::fs::write(
+            root.join("main.ts"),
+            "export function spare() { return 1; }\n",
+        )
+        .unwrap();
+        let ctx = deferred_test_context(&root);
+        let mut config = ctx.config().as_ref().clone();
+        config.views.enabled = false;
+        config.indexes.callgraph = true;
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-cache/inspect"),
+            Arc::new(config),
+            ctx.symbol_cache(),
+        );
+        let project_key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &project_key, false);
+        let manager = ctx.inspect_manager();
+        let limiter = crate::cold_build_limiter::test_limiter(1);
+        manager.set_cold_build_limiter(limiter.clone());
+        let request = crate::cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "held-test-slot",
+            crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let permit =
+            crate::cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
+                .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker_snapshot = snapshot.clone();
+        std::thread::spawn(move || {
+            let outcome = worker_manager.tier2_run_with_reuse_blocking_fresh(
+                worker_snapshot.clone(),
+                InspectCategory::DeadCode,
+                JobScope::for_project(worker_snapshot.project_root),
+            );
+            let _ = tx.send(outcome.clone());
+            let _ = done_tx.send(outcome);
+        });
+        let admission_deadline = Instant::now() + Duration::from_secs(10);
+        while !manager.dead_code_build_is_pending() {
+            assert!(
+                Instant::now() < admission_deadline,
+                "builder was never admitted"
+            );
+            std::thread::yield_now();
+        }
+        let outcome = receive_tier2_completion_until(
+            rx,
+            &manager,
+            InspectCategory::DeadCode,
+            Instant::now() + Duration::from_millis(100),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome
+                .payload()
+                .and_then(|payload| payload["status"].as_str()),
+            Some("pending"),
+            "{outcome:?}"
+        );
+        ctx.update_status_bar_tier2(Some(41), Some(0), Some(0), Some(0), false);
+        refresh_status_bar_counts(
+            &ctx,
+            &[(InspectCategory::DeadCode, outcome.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(ctx.status_bar_count_values().dead_code, Some(41));
+        assert!(ctx.status_bar_count_values().tier2_stale);
+        let mut payloads = InspectCategory::active()
+            .iter()
+            .map(|category| (*category, serde_json::json!({"count": 0})))
+            .collect::<BTreeMap<_, _>>();
+        payloads.insert(
+            InspectCategory::DeadCode,
+            outcome.payload().unwrap().clone(),
+        );
+        let payload =
+            build_inspect_payload(&snapshot, &payloads, &Sections::all(), 100, &ctx, None);
+        super::fresh_payload_tests::assert_no_banned_field(&payload);
+        assert_eq!(
+            payload["summary"]["dead_code"],
+            serde_json::json!({
+            "status": "pending", "reason": "callgraph_building", "complete": false})
+        );
+        assert_eq!(
+            payload["scanner_state"]["pending_categories"],
+            serde_json::json!(["dead_code"])
+        );
+        assert!(payload["details"].get("dead_code").is_none());
+        assert!(
+            done_rx.try_recv().is_err(),
+            "held cold-build slot did not block the builder"
+        );
+        drop(permit);
+        let completed = done_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(
+            completed.payload().unwrap()["count"].is_u64(),
+            "{completed:?}"
+        );
+        let later = manager.tier2_run_with_reuse_blocking(
+            snapshot.clone(),
+            InspectCategory::DeadCode,
+            JobScope::for_project(root),
+        );
+        assert!(later.payload().unwrap()["count"].is_u64(), "{later:?}");
     }
 
     #[test]

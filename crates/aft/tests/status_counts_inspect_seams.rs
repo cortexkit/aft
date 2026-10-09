@@ -11,6 +11,7 @@ fn truthful_count_shape_keeps_proven_values_and_omits_unproven_categories() {
         todos: None,
         tier2_stale: true,
         disabled_categories: Default::default(),
+        ..Default::default()
     };
 
     assert_eq!(values.dead_code, Some(7));
