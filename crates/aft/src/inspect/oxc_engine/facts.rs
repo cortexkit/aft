@@ -499,6 +499,16 @@ impl<'a> Visit<'a> for Extractor {
         walk::walk_computed_member_expression(self, member);
     }
 
+    fn visit_jsx_member_expression(&mut self, member: &JSXMemberExpression<'a>) {
+        if let JSXMemberExpressionObject::IdentifierReference(identifier) = &member.object {
+            self.namespace_members.insert(
+                identifier.span.start,
+                Some(member.property.name.to_string()),
+            );
+        }
+        walk::walk_jsx_member_expression(self, member);
+    }
+
     fn visit_ts_qualified_name(&mut self, name: &TSQualifiedName<'a>) {
         if let TSTypeName::IdentifierReference(identifier) = &name.left {
             self.namespace_members

@@ -7035,14 +7035,14 @@ throughBarrel();
                 .and_then(|item| item["used_by"].as_array())
                 .and_then(|items| items.first())
                 .and_then(serde_json::Value::as_str),
-            Some("api.test.ts")
+            Some("src/api.test.ts")
         );
         assert_eq!(
             aggregate_test_only_item(&aggregate, "src/barrel-target.ts", "throughBarrel")
                 .and_then(|item| item["used_by"].as_array())
                 .and_then(|items| items.first())
                 .and_then(serde_json::Value::as_str),
-            Some("barrel.test.ts")
+            Some("src/barrel.test.ts")
         );
     }
 

@@ -1923,3 +1923,20 @@ fn ts_liveness_public_named_reexport_chain_exposes_only_selected_names() {
         assert_verdict(&result, "src/other.ts", symbol, LivenessVerdict::Unused);
     }
 }
+
+#[test]
+fn ts_liveness_namespace_jsx_member_only() {
+    let (_temp, root, paths) = fixture_project(&[
+        (
+            "src/m.tsx",
+            "export function Foo() { return null; } export function Bar() { return null; }",
+        ),
+        (
+            "src/consumer.tsx",
+            "import * as T from './m'; const view = <T.Foo />;",
+        ),
+    ]);
+    let result = analyze(&root, &paths);
+    assert_verdict(&result, "src/m.tsx", "Foo", LivenessVerdict::Used);
+    assert_verdict(&result, "src/m.tsx", "Bar", LivenessVerdict::Unused);
+}
