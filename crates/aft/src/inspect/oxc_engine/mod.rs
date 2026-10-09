@@ -22,13 +22,13 @@ use facts::parse_file_facts;
 use graph::compute_verdicts;
 use resolver::{normalize_path, ModuleResolver};
 pub use types::{
-    DecoratorFact, DynamicImportFact, ExportFact, ExportName, FileFacts, FileId, ImportFact,
-    ImportKind, LivenessVerdict, OxcEngineError, OxcEngineResult, OxcEngineStats, OxcExportVerdict,
-    OxcFileVerdicts, OxcReExportContext, OxcResolvedEdge, ReExportFact, ReExportKind,
-    ResolverConfigInput, OXC_PROVENANCE,
+    DecoratorFact, DynamicImportFact, ExportFact, ExportName, ExportUsage, FileFacts, FileId,
+    ImportFact, ImportKind, LivenessVerdict, OxcEngineError, OxcEngineResult, OxcEngineStats,
+    OxcExportVerdict, OxcFileVerdicts, OxcReExportContext, OxcResolvedEdge, ReExportFact,
+    ReExportKind, ResolverConfigInput, OXC_PROVENANCE,
 };
 
-pub(crate) const FACTS_FORMAT_VERSION: u32 = 4;
+pub(crate) const FACTS_FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {

@@ -88,6 +88,7 @@ impl EntryPointSet {
 struct ManifestPaths {
     cargo_tomls: Vec<PathBuf>,
     package_jsons: Vec<PathBuf>,
+    go_mods: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,6 +131,7 @@ pub(crate) fn collect_entry_point_manifests(project_root: &Path) -> Vec<PathBuf>
 
     let mut paths = manifests.cargo_tomls;
     paths.extend(manifests.package_jsons);
+    paths.extend(manifests.go_mods);
     paths.sort();
     paths.dedup();
     paths
@@ -140,6 +142,7 @@ fn collect_manifests(project_root: &Path, manifests: &mut ManifestPaths) {
         match path.file_name().and_then(|name| name.to_str()) {
             Some("Cargo.toml") => manifests.cargo_tomls.push(path),
             Some("package.json") => manifests.package_jsons.push(path),
+            Some("go.mod") => manifests.go_mods.push(path),
             _ => {}
         }
     }
@@ -424,13 +427,47 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
         collect_json_entry_strings(exports, &mut public_entries);
     }
 
+    for field in ["types", "typings"] {
+        if let Some(entry) = value.get(field).and_then(Value::as_str) {
+            public_entries.insert(entry.to_string());
+        }
+    }
+    let published = value
+        .pointer("/publishConfig/directory")
+        .and_then(Value::as_str)
+        .is_some();
+    let source_root = package_source_root(package_dir);
+    if value
+        .get("exports")
+        .and_then(Value::as_object)
+        .is_some_and(|exports| exports.contains_key("./*"))
+    {
+        for path in entry_point_walk_files(&source_root) {
+            if has_js_module_extension(&path, JS_MODULE_EXTENSIONS) {
+                insert_resolved_entry_point(entry_points, &path, EntryPointKind::PublicApi);
+            }
+        }
+    }
+
     let mut bin_entries = BTreeSet::new();
     if let Some(bin) = value.get("bin") {
         collect_json_entry_strings(bin, &mut bin_entries);
     }
 
     for entry in public_entries {
-        insert_package_entry(package_dir, &entry, entry_points, EntryPointKind::PublicApi);
+        if published {
+            if !entry.contains('*') && !entry.contains("://") && !entry.starts_with("node:") {
+                let base = source_root.join(entry.trim_start_matches("./"));
+                if let Some(path) = candidate_paths(&base)
+                    .into_iter()
+                    .find(|path| path.is_file())
+                {
+                    insert_resolved_entry_point(entry_points, &path, EntryPointKind::PublicApi);
+                }
+            }
+        } else {
+            insert_package_entry(package_dir, &entry, entry_points, EntryPointKind::PublicApi);
+        }
     }
     for entry in bin_entries {
         insert_package_entry(
@@ -450,6 +487,25 @@ fn collect_package_manifest_entry_points(manifest: &Path, entry_points: &mut Ent
     collect_package_tool_config_entry_points(package_dir, &value, entry_points);
 
     collect_framework_route_entry_points(package_dir, &value, entry_points);
+}
+
+fn package_source_root(package_dir: &Path) -> PathBuf {
+    let root_dir = fs::read_to_string(package_dir.join("tsconfig.json"))
+        .ok()
+        .and_then(|source| serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(&source)).ok())
+        .and_then(|config| {
+            config
+                .pointer("/compilerOptions/rootDir")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    if let Some(root_dir) = root_dir {
+        package_dir.join(root_dir)
+    } else if package_dir.join("src").is_dir() {
+        package_dir.join("src")
+    } else {
+        package_dir.to_path_buf()
+    }
 }
 
 fn collect_package_tool_config_entry_points(
@@ -737,17 +793,17 @@ fn resolve_package_entry(package_dir: &Path, entry: &str) -> Option<PathBuf> {
 
 /// Map a built entry path (`dist/index.js`) to its likely source location
 /// (`src/index.js`, which `candidate_paths` then remaps to `src/index.ts`).
-/// Returns `None` when the path is not under a recognized build-output dir, in
-/// which case the caller uses the literal path. `lib` is intentionally excluded
+/// Bare output filenames also probe `src/`; paths under unrelated directories
+/// use only their literal location. `lib` is intentionally excluded
 /// — it is as commonly a source dir as a build dir, so remapping it risks
 /// pointing at an unrelated `src/` file.
-fn remap_build_output_to_src(rel: &str) -> Option<String> {
+pub(super) fn remap_build_output_to_src(rel: &str) -> Option<String> {
     const BUILD_DIRS: &[&str] = &["dist", "build", "out", "output", "esm", "cjs"];
     const BUILD_FLAVOR_DIRS: &[&str] = &["esm", "cjs"];
     let mut components = rel.split('/');
     let first = components.next()?;
     if !BUILD_DIRS.contains(&first) {
-        return None;
+        return (!rel.contains('/')).then(|| format!("src/{rel}"));
     }
     let mut rest: Vec<&str> = components.collect();
     if rest.len() > 1 && BUILD_FLAVOR_DIRS.contains(&rest[0]) {
@@ -1075,6 +1131,134 @@ pub(crate) fn top_preview_symbols(items: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn published_api_fixture(wildcard: bool, index: &str, default_live: bool) {
+        use crate::inspect::oxc_engine::{
+            analyze_files_with_cache, AnalyzeOptions, LivenessVerdict, OxcFactsCache,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("package.json"), serde_json::json!({
+            "publishConfig": {"directory": "build/package"}, "scripts": {"start": "bun src/main.ts"},
+            "exports": if wildcard { serde_json::json!({".": "./index.js", "./*": "./*"}) } else { serde_json::json!({".": "./index.js"}) }
+        }).to_string()).unwrap();
+        fs::write(root.join("src/main.ts"), "console.log(1);").unwrap();
+        fs::write(root.join("src/index.ts"), index).unwrap();
+        fs::write(
+            root.join("src/other.ts"),
+            "export const spare = 1; export default function hidden() {}\n",
+        )
+        .unwrap();
+        let entries = resolve_entry_points(root);
+        assert!(entries.is_public_api_file(&root.join("src/index.ts")));
+        let mut cache = OxcFactsCache::new();
+        let result = analyze_files_with_cache(
+            root,
+            &[root.join("src/index.ts"), root.join("src/other.ts")],
+            AnalyzeOptions {
+                public_api_files: entries.public_api_files(),
+                entry_reachability: true,
+                ..Default::default()
+            },
+            &mut cache,
+        )
+        .unwrap();
+        let status = |file: &str, symbol: &str| {
+            result
+                .files
+                .iter()
+                .find(|f| f.relative_file == file)
+                .unwrap()
+                .exports
+                .iter()
+                .find(|e| e.symbol == symbol)
+                .unwrap()
+                .verdict
+        };
+        assert_eq!(
+            status("src/other.ts", "spare"),
+            if wildcard || index.contains("export *") {
+                LivenessVerdict::Used
+            } else {
+                LivenessVerdict::Unused
+            }
+        );
+        assert_eq!(
+            status("src/other.ts", "default"),
+            if default_live {
+                LivenessVerdict::Used
+            } else {
+                LivenessVerdict::Unused
+            }
+        );
+        if index.contains("own") {
+            assert_eq!(status("src/index.ts", "own"), LivenessVerdict::Used);
+        }
+    }
+
+    #[test]
+    fn ts_liveness_published_source_root() {
+        published_api_fixture(false, "export const own = 1;", false);
+    }
+
+    #[test]
+    fn ts_liveness_published_wildcard() {
+        published_api_fixture(true, "export const own = 1;", true);
+    }
+
+    #[test]
+    fn ts_liveness_public_star_excludes_default() {
+        published_api_fixture(false, "export * from './other';", false);
+    }
+
+    #[test]
+    fn ts_liveness_public_explicit_default() {
+        published_api_fixture(
+            false,
+            "export * from './other'; export {default} from './other';",
+            true,
+        );
+    }
+
+    #[test]
+    fn ts_liveness_prefixless_entry_and_source_root_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("source")).unwrap();
+        fs::write(root.join("source/index.ts"), "export const own = 1;").unwrap();
+        fs::write(root.join("main.ts"), "console.log(1);").unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"rootDir":"source"}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("package.json"), r#"{"publishConfig":{"directory":"build/package"},"types":"./index.js","scripts":{"start":"bun main.ts"}}"#).unwrap();
+        assert!(resolve_entry_points(root).is_public_api_file(&root.join("source/index.ts")));
+        fs::remove_file(root.join("tsconfig.json")).unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/index.ts"), "export const own = 1;").unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"main":"./index.js","scripts":{"start":"bun main.ts"}}"#,
+        )
+        .unwrap();
+        assert!(resolve_entry_points(root).is_public_api_file(&root.join("src/index.ts")));
+        fs::remove_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("index.ts"), "export const own = 1;").unwrap();
+        fs::write(root.join("package.json"), r#"{"publishConfig":{"directory":"build/package"},"main":"./index.js","scripts":{"start":"bun main.ts"}}"#).unwrap();
+        assert!(resolve_entry_points(root).is_public_api_file(&root.join("index.ts")));
+    }
+
+    #[test]
+    fn ts_liveness_manifest_hash_includes_go_mod() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("go.mod"), "module example.test/app\n").unwrap();
+        assert_eq!(
+            collect_entry_point_manifests(temp.path()),
+            vec![snapshot_path(&temp.path().join("go.mod"))]
+        );
+    }
 
     #[test]
     fn package_scripts_seed_source_files_as_liveness_roots() {

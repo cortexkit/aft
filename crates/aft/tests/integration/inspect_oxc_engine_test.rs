@@ -268,7 +268,7 @@ throughBarrel();
 
     let test_only = verdict(&result, "src/api.ts", "testOnly");
     assert_eq!(test_only.verdict, LivenessVerdict::Used);
-    assert_eq!(test_only.test_only_reference_files, vec!["api.test.ts"]);
+    assert_eq!(test_only.test_only_reference_files, vec!["src/api.test.ts"]);
     assert!(test_only.has_references);
 
     let product_used = verdict(&result, "src/api.ts", "productUsed");
@@ -285,7 +285,7 @@ throughBarrel();
     assert_eq!(through_barrel.verdict, LivenessVerdict::Used);
     assert_eq!(
         through_barrel.test_only_reference_files,
-        vec!["barrel.test.ts"]
+        vec!["src/barrel.test.ts"]
     );
     assert!(through_barrel.has_references);
 }
@@ -888,7 +888,7 @@ fn oxc_engine_star_reexport_cycle_resolves_names_without_hanging() {
 }
 
 #[test]
-fn oxc_engine_namespace_import_marks_target_exports_uncertain_without_member_precision() {
+fn oxc_engine_namespace_import_marks_only_accessed_member_used() {
     let (_temp, root, paths) = fixture_project(&[
         (
             "src/feature/storage.ts",
@@ -906,18 +906,16 @@ fn oxc_engine_namespace_import_marks_target_exports_uncertain_without_member_pre
         &result,
         "src/feature/storage.ts",
         "enforceProjectCap",
-        LivenessVerdict::Uncertain,
+        LivenessVerdict::Used,
     );
     assert_verdict(
         &result,
         "src/feature/storage.ts",
         "deadOne",
-        LivenessVerdict::Uncertain,
+        LivenessVerdict::Unused,
     );
-    assert_eq!(
-        verdict(&result, "src/feature/storage.ts", "deadOne").reason,
-        "namespace_import"
-    );
+    assert!(verdict(&result, "src/feature/storage.ts", "enforceProjectCap").has_references);
+    assert!(!verdict(&result, "src/feature/storage.ts", "deadOne").has_references);
 }
 
 #[test]
@@ -1197,38 +1195,218 @@ fn oxc_engine_computed_dynamic_import_does_not_demote_unrelated_exports() {
     );
 }
 
-#[test]
-fn oxc_engine_dynamic_imports_demote_to_uncertain_never_dead() {
+fn dynamic_usage_fixture(use_site: &str, expected: [LivenessVerdict; 3]) {
     let (_temp, root, paths) = fixture_project(&[
+        ("src/m.ts", "export default function page() {}\nexport function run() {}\nexport const other = 1;\n"),
+        ("src/hook.ts", use_site),
+    ]);
+    let unreachable = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_reachability: true,
+            ..Default::default()
+        },
+    );
+    for (symbol, expected) in ["default", "run", "other"].into_iter().zip(expected) {
+        assert_eq!(
+            verdict(&unreachable, "src/m.ts", symbol).has_references,
+            expected != LivenessVerdict::Unused
+        );
+        if expected == LivenessVerdict::Unused {
+            assert_verdict(&unreachable, "src/m.ts", symbol, LivenessVerdict::Unused);
+        }
+    }
+    for entry_reachability in [false, true] {
+        let result = analyze_with_options(
+            &root,
+            &paths,
+            AnalyzeOptions {
+                entry_reachability,
+                entry_points: if entry_reachability {
+                    vec![root.join("src/hook.ts")]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            },
+        );
+        for (symbol, expected) in ["default", "run", "other"].into_iter().zip(expected) {
+            assert_verdict(&result, "src/m.ts", symbol, expected);
+            assert_eq!(
+                verdict(&result, "src/m.ts", symbol).has_references,
+                expected != LivenessVerdict::Unused
+            );
+        }
+    }
+}
+
+#[test]
+fn ts_liveness_dynamic_statement_default_only() {
+    dynamic_usage_fixture(
+        "import('./m');",
+        [
+            LivenessVerdict::Used,
+            LivenessVerdict::Unused,
+            LivenessVerdict::Unused,
+        ],
+    );
+}
+
+#[test]
+fn ts_liveness_dynamic_discarded_await_default_only() {
+    dynamic_usage_fixture(
+        "await import('./m');",
+        [
+            LivenessVerdict::Used,
+            LivenessVerdict::Unused,
+            LivenessVerdict::Unused,
+        ],
+    );
+}
+
+#[test]
+fn ts_liveness_dynamic_lazy_default_only() {
+    dynamic_usage_fixture(
+        "lazy(() => import('./m'));",
+        [
+            LivenessVerdict::Used,
+            LivenessVerdict::Unused,
+            LivenessVerdict::Unused,
+        ],
+    );
+}
+
+#[test]
+fn ts_liveness_dynamic_await_member_only() {
+    for use_site in [
+        "(await import('./m')).run();",
+        "(await import('./m'))['run']();",
+    ] {
+        dynamic_usage_fixture(
+            use_site,
+            [
+                LivenessVerdict::Unused,
+                LivenessVerdict::Used,
+                LivenessVerdict::Unused,
+            ],
+        );
+    }
+}
+
+#[test]
+fn ts_liveness_dynamic_then_all_exports() {
+    for use_site in [
+        "import('./m').then(m => m.run());",
+        "import('./m').catch(handle);",
+        "import('./m').finally(cleanup);",
+    ] {
+        dynamic_usage_fixture(use_site, [LivenessVerdict::Uncertain; 3]);
+    }
+}
+
+#[test]
+fn ts_liveness_dynamic_computed_key_all_exports() {
+    dynamic_usage_fixture(
+        "(await import('./m'))[key];",
+        [LivenessVerdict::Uncertain; 3],
+    );
+}
+
+#[test]
+fn ts_liveness_dynamic_assigned_result_all_exports() {
+    dynamic_usage_fixture(
+        "const m = await import('./m');",
+        [LivenessVerdict::Uncertain; 3],
+    );
+}
+
+#[test]
+fn ts_liveness_dynamic_target_stays_enqueued() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/main.ts", "import('./m');"),
         (
-            "src/plugin.ts",
-            "export function plugin() {}\nexport function other() {}\n",
+            "src/m.ts",
+            "import {live} from './dep'; live(); export const spare = 1;",
         ),
-        ("src/literal.ts", "await import('./plugin');\n"),
         (
-            "src/computed.ts",
-            "const name = './anything';\nawait import(name);\n",
+            "src/dep.ts",
+            "export function live() {} export function dead() {}",
         ),
     ]);
-
-    let result = analyze(&root, &paths);
-
-    assert_verdict(
-        &result,
-        "src/plugin.ts",
-        "plugin",
-        LivenessVerdict::Uncertain,
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![root.join("src/main.ts")],
+            entry_reachability: true,
+            ..Default::default()
+        },
     );
-    assert_verdict(
-        &result,
-        "src/plugin.ts",
-        "other",
-        LivenessVerdict::Uncertain,
+    assert_verdict(&result, "src/dep.ts", "live", LivenessVerdict::Used);
+    assert_verdict(&result, "src/dep.ts", "dead", LivenessVerdict::Unused);
+    assert_verdict(&result, "src/m.ts", "spare", LivenessVerdict::Unused);
+}
+
+#[test]
+fn ts_liveness_namespace_type_positions() {
+    for consumer in [
+        "import * as T from './m'; type X = Ctx<T.Foo>;",
+        "import * as T from './m'; type X = T.Foo;",
+        "import * as T from './m'; console.log(T.Foo);",
+        "import * as T from './m'; console.log(T['Foo']);",
+    ] {
+        let (_temp, root, paths) = fixture_project(&[
+            ("src/m.ts", "export class Foo {} export class Bar {}"),
+            ("src/consumer.ts", consumer),
+        ]);
+        let result = analyze(&root, &paths);
+        assert_verdict(&result, "src/m.ts", "Foo", LivenessVerdict::Used);
+        assert_verdict(&result, "src/m.ts", "Bar", LivenessVerdict::Unused);
+        assert!(verdict(&result, "src/m.ts", "Foo").has_references);
+        let result = analyze_with_options(
+            &root,
+            &paths,
+            AnalyzeOptions {
+                entry_reachability: true,
+                ..Default::default()
+            },
+        );
+        assert!(verdict(&result, "src/m.ts", "Foo").has_references);
+        assert!(!verdict(&result, "src/m.ts", "Bar").has_references);
+        let result = analyze_with_options(
+            &root,
+            &paths,
+            AnalyzeOptions {
+                entry_points: vec![root.join("src/consumer.ts")],
+                entry_reachability: true,
+                ..Default::default()
+            },
+        );
+        assert_verdict(&result, "src/m.ts", "Foo", LivenessVerdict::Used);
+        assert_verdict(&result, "src/m.ts", "Bar", LivenessVerdict::Unused);
+    }
+}
+
+#[test]
+fn ts_liveness_namespace_bare_value_all_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/m.ts", "export const Foo = 1; export const Bar = 2;"),
+        ("src/main.ts", "import * as T from './m'; consume(T);"),
+    ]);
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            entry_points: vec![root.join("src/main.ts")],
+            entry_reachability: true,
+            ..Default::default()
+        },
     );
-    assert!(matches!(
-        verdict(&result, "src/plugin.ts", "plugin").reason.as_str(),
-        "dynamic_import" | "dynamic_import_nonliteral"
-    ));
+    for symbol in ["Foo", "Bar"] {
+        assert_verdict(&result, "src/m.ts", symbol, LivenessVerdict::Uncertain);
+        assert!(verdict(&result, "src/m.ts", symbol).has_references);
+    }
 }
 
 #[test]
@@ -1674,4 +1852,74 @@ fn oxc_engine_warm_facts_cache_resolves_3k_file_corpus_under_perf_gate() {
         "warm oxc resolution over {FILE_COUNT} files took {elapsed:?}; stats={:#?}",
         warm.stats
     );
+}
+
+#[test]
+fn ts_liveness_namespace_shadowed_binding_does_not_reference_exports() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/m.ts", "export const Foo = 1; export const Bar = 2;"),
+        (
+            "src/consumer.ts",
+            "import * as T from './m'; function use(T: any) { return T.Foo; }",
+        ),
+    ]);
+    let result = analyze(&root, &paths);
+    for symbol in ["Foo", "Bar"] {
+        assert_verdict(&result, "src/m.ts", symbol, LivenessVerdict::Unused);
+        assert!(!verdict(&result, "src/m.ts", symbol).has_references);
+    }
+}
+
+#[test]
+fn ts_liveness_dynamic_non_argument_arrow_uses_all_exports() {
+    dynamic_usage_fixture(
+        "const load = () => import('./m');",
+        [LivenessVerdict::Uncertain; 3],
+    );
+}
+
+#[test]
+fn ts_liveness_test_tree_references_are_project_relative() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/m.ts", "export const Foo = 1; export const Bar = 2;"),
+        (
+            "test/fixtures/consumer.ts",
+            "import * as T from '../../src/m'; console.log(T.Foo);",
+        ),
+        (
+            "test/fixtures/hook.ts",
+            "(await import('../../src/m')).Bar;",
+        ),
+    ]);
+    let result = analyze(&root, &paths);
+    assert_eq!(
+        verdict(&result, "src/m.ts", "Foo").test_only_reference_files,
+        vec!["test/fixtures/consumer.ts"]
+    );
+    assert_eq!(
+        verdict(&result, "src/m.ts", "Bar").test_only_reference_files,
+        vec!["test/fixtures/hook.ts"]
+    );
+}
+
+#[test]
+fn ts_liveness_public_named_reexport_chain_exposes_only_selected_names() {
+    let (_temp, root, paths) = fixture_project(&[
+        ("src/index.ts", "export { shown } from './barrel';"),
+        ("src/barrel.ts", "export { wanted as shown } from './other'; export * from './other';"),
+        ("src/other.ts", "export const wanted = 1; export const spare = 2; export default 3; export declare const declared: number;"),
+    ]);
+    let result = analyze_with_options(
+        &root,
+        &paths,
+        AnalyzeOptions {
+            public_api_files: vec![root.join("src/index.ts")],
+            entry_reachability: true,
+            ..Default::default()
+        },
+    );
+    assert_verdict(&result, "src/other.ts", "wanted", LivenessVerdict::Used);
+    for symbol in ["spare", "default", "declared"] {
+        assert_verdict(&result, "src/other.ts", symbol, LivenessVerdict::Unused);
+    }
 }

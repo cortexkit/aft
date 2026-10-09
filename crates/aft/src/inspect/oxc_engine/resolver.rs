@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::inspect::entry_points::remap_build_output_to_src;
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 use rustc_hash::FxHashMap;
 use serde_json::Value;
@@ -13,7 +14,6 @@ use super::types::{
 use crate::inspect::frameworks::{detected_route_frameworks, Framework};
 
 const JS_MODULE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"];
-const BUILD_OUTPUT_DIRS: &[&str] = &["dist", "build", "out", "output", "esm", "cjs"];
 
 #[derive(Debug, Clone)]
 pub struct ResolvedImport {
@@ -618,23 +618,6 @@ fn package_entry_bases(package_dir: &Path, entry: &str) -> Vec<PathBuf> {
     }
     bases.push(package_dir.join(rel));
     bases
-}
-
-fn remap_build_output_to_src(rel: &str) -> Option<String> {
-    const BUILD_FLAVOR_DIRS: &[&str] = &["esm", "cjs"];
-    let mut components = rel.split('/');
-    let first = components.next()?;
-    if !BUILD_OUTPUT_DIRS.contains(&first) {
-        return None;
-    }
-    let mut rest = components.collect::<Vec<_>>();
-    if rest.len() > 1 && BUILD_FLAVOR_DIRS.contains(&rest[0]) {
-        rest.remove(0);
-    }
-    if rest.is_empty() {
-        return None;
-    }
-    Some(format!("src/{}", rest.join("/")))
 }
 
 #[cfg(windows)]

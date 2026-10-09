@@ -6,12 +6,12 @@ use serde_json::Value;
 
 use super::resolver::{normalize_path, ResolvedImport, ResolvedModule};
 use super::types::{
-    ExportFact, FileId, ImportKind, LivenessVerdict, OxcExportVerdict, OxcFileVerdicts,
-    OxcReExportContext, ReExportKind, OXC_PROVENANCE,
+    ExportFact, ExportUsage, FileId, ImportKind, LivenessVerdict, OxcExportVerdict,
+    OxcFileVerdicts, OxcReExportContext, ReExportKind, OXC_PROVENANCE,
 };
 use crate::inspect::entry_points::EXECUTABLE_ROOT_ALL_EXPORTS;
 use crate::inspect::frameworks::{detected_decorator_frameworks, Framework};
-use crate::inspect::job::is_test_file;
+use crate::inspect::scanners::dead_code::is_test_code_file;
 
 #[derive(Debug, Clone)]
 struct ExportState {
@@ -39,8 +39,8 @@ struct ReferenceOrigins {
 impl ReferenceOrigins {
     fn record(&mut self, origin: &ReferenceOrigin) {
         match origin {
-            ReferenceOrigin::Test { basename } => {
-                self.test_files.insert(basename.clone());
+            ReferenceOrigin::Test { file } => {
+                self.test_files.insert(file.clone());
             }
             ReferenceOrigin::NonTest => {
                 self.has_non_test = true;
@@ -63,7 +63,7 @@ impl ReferenceOrigins {
 
 #[derive(Debug, Clone)]
 enum ReferenceOrigin {
-    Test { basename: String },
+    Test { file: String },
     NonTest,
 }
 
@@ -424,9 +424,62 @@ impl<'a> GraphBuilder<'a> {
                             &mut visited,
                         );
                     }
-                    ImportKind::Namespace | ImportKind::SideEffect => {}
+                    ImportKind::Namespace => {
+                        self.record_usage_reference(target, &import.fact.usage, &origin);
+                    }
+                    ImportKind::SideEffect => {}
                 }
             }
+            for dynamic in &module.dynamic_imports {
+                if let Some(target) = dynamic.target {
+                    self.record_usage_reference(target, &dynamic.fact.usage, &origin);
+                }
+            }
+        }
+    }
+
+    fn record_usage_reference(
+        &mut self,
+        target: FileId,
+        usage: &ExportUsage,
+        origin: &ReferenceOrigin,
+    ) {
+        if usage.all {
+            let visible = self.visible_export_resolutions(target, true, &mut BTreeSet::new());
+            for resolution in visible.values() {
+                self.record_resolution_reference_origin(resolution.clone(), origin);
+            }
+        }
+        for name in &usage.names {
+            self.record_imported_name_reference(target, name, origin, &mut BTreeSet::new());
+        }
+    }
+
+    fn apply_usage(
+        &mut self,
+        target: FileId,
+        usage: &ExportUsage,
+        reason: &str,
+        origin: &ReferenceOrigin,
+        newly_live_modules: &mut BTreeSet<usize>,
+    ) {
+        if usage.all {
+            self.mark_all_uncertain_collect(
+                target,
+                reason,
+                &mut BTreeSet::new(),
+                newly_live_modules,
+            );
+        }
+        for name in &usage.names {
+            self.mark_imported_name_collect(
+                target,
+                name,
+                reason,
+                origin,
+                &mut BTreeSet::new(),
+                newly_live_modules,
+            );
         }
     }
 
@@ -446,9 +499,21 @@ impl<'a> GraphBuilder<'a> {
         resolution: ResolutionSet,
         origin: &ReferenceOrigin,
     ) {
-        for canonical in resolution.canonical {
-            if let Some(export) = self.export_state_mut(&canonical) {
-                export.reference_origins.record(origin);
+        let mut pending = vec![resolution];
+        let mut namespaces = BTreeSet::new();
+        while let Some(resolution) = pending.pop() {
+            for canonical in resolution.canonical {
+                if let Some(export) = self.export_state_mut(&canonical) {
+                    export.reference_origins.record(origin);
+                }
+            }
+            for target in resolution.namespace_targets {
+                if namespaces.insert(target) {
+                    pending.extend(
+                        self.visible_export_resolutions(target, true, &mut BTreeSet::new())
+                            .into_values(),
+                    );
+                }
             }
         }
     }
@@ -637,11 +702,11 @@ impl<'a> GraphBuilder<'a> {
                         );
                     }
                     ImportKind::Namespace => {
-                        let mut visited = BTreeSet::new();
-                        self.mark_all_uncertain_collect(
+                        self.apply_usage(
                             target,
+                            &import.fact.usage,
                             "namespace_import",
-                            &mut visited,
+                            &origin,
                             &mut newly_live_modules,
                         );
                     }
@@ -654,12 +719,12 @@ impl<'a> GraphBuilder<'a> {
             for dynamic in &module.dynamic_imports {
                 if dynamic.fact.is_literal {
                     if let Some(target) = dynamic.target {
-                        let mut visited = BTreeSet::new();
                         let mut newly_live_modules = BTreeSet::new();
-                        self.mark_all_uncertain_collect(
+                        self.apply_usage(
                             target,
+                            &dynamic.fact.usage,
                             "dynamic_import",
-                            &mut visited,
+                            &origin,
                             &mut newly_live_modules,
                         );
                         enqueue_module(target, &mut live_modules, &mut queue);
@@ -696,8 +761,13 @@ impl<'a> GraphBuilder<'a> {
                         self.mark_imported_name(target, "default", "import", &origin, &mut visited);
                     }
                     ImportKind::Namespace => {
-                        let mut visited = BTreeSet::new();
-                        self.mark_all_uncertain(target, "namespace_import", &mut visited);
+                        self.apply_usage(
+                            target,
+                            &import.fact.usage,
+                            "namespace_import",
+                            &origin,
+                            &mut BTreeSet::new(),
+                        );
                     }
                     ImportKind::SideEffect => {}
                 }
@@ -706,19 +776,19 @@ impl<'a> GraphBuilder<'a> {
     }
 
     fn apply_dynamic_imports(&mut self) {
-        let mut literal_targets = Vec::new();
-        for module in self.modules {
+        for (idx, module) in self.modules.iter().enumerate() {
+            let origin = self.reference_origin_for_module(idx);
             for dynamic in &module.dynamic_imports {
-                if dynamic.fact.is_literal {
-                    if let Some(target) = dynamic.target {
-                        literal_targets.push(target);
-                    }
+                if let Some(target) = dynamic.target {
+                    self.apply_usage(
+                        target,
+                        &dynamic.fact.usage,
+                        "dynamic_import",
+                        &origin,
+                        &mut BTreeSet::new(),
+                    );
                 }
             }
-        }
-        for target in literal_targets {
-            let mut visited = BTreeSet::new();
-            self.mark_all_uncertain(target, "dynamic_import", &mut visited);
         }
     }
 
@@ -752,11 +822,6 @@ impl<'a> GraphBuilder<'a> {
     ) {
         let resolution = self.resolve_export_name(target, name, visited);
         self.mark_resolution_used_or_uncertain(resolution, reason, origin, newly_live_modules);
-    }
-
-    fn mark_all_uncertain(&mut self, target: FileId, reason: &str, visited: &mut BTreeSet<usize>) {
-        let mut newly_live_modules = BTreeSet::new();
-        self.mark_all_uncertain_collect(target, reason, visited, &mut newly_live_modules);
     }
 
     fn mark_all_uncertain_collect(
@@ -1266,12 +1331,8 @@ fn mark_uncertain(export: &mut ExportState, reason: &str) -> bool {
 
 fn reference_origin_for_path(project_root: &Path, path: &Path) -> ReferenceOrigin {
     let relative = relative_string(project_root, path);
-    if is_test_file(&relative) {
-        let basename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or(relative);
-        ReferenceOrigin::Test { basename }
+    if is_test_code_file(&relative, &BTreeSet::new()) {
+        ReferenceOrigin::Test { file: relative }
     } else {
         ReferenceOrigin::NonTest
     }

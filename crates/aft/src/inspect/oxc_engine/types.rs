@@ -79,6 +79,7 @@ pub struct ExportFact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportFact {
+    pub usage: ExportUsage,
     pub source: String,
     pub kind: ImportKind,
     pub imported_name: Option<String>,
@@ -97,10 +98,19 @@ pub struct ReExportFact {
     pub line: u32,
 }
 
+/// Export references selected by a namespace access or dynamic import result.
+/// `all` is conservative whole-namespace use; named accesses remain precise.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExportUsage {
+    pub names: BTreeSet<String>,
+    pub all: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DynamicImportFact {
     pub source: Option<String>,
     pub is_literal: bool,
+    pub usage: ExportUsage,
     pub line: u32,
 }
 
