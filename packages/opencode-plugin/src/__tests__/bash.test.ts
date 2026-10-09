@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import {
   BASH_HOST_FALLBACK_BANNER,
   BASH_RUNON_DESCRIPTION,
+  BASH_RUNON_GUIDANCE,
   type BridgePool,
   type BridgeRequestOptions,
   BridgeTransportUnavailableError,
@@ -280,7 +281,7 @@ describe("OpenCode bash adapter", () => {
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit)",
       );
       expect(bash.description).toContain(
-        "or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.",
+        "or runs binaries built on this machine: a remote build leaves no binaries or target/ output in the local worktree.",
       );
     },
   );
@@ -334,6 +335,7 @@ describe("OpenCode bash adapter", () => {
         description?: string;
       };
       expect(jsonSchema.description).toBe(BASH_RUNON_DESCRIPTION);
+      expect(bash.description).toContain(BASH_RUNON_GUIDANCE);
     },
   );
 

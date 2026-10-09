@@ -68,6 +68,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         connection_file: Some(connection),
         harness: "broca".into(),
         session: "session".into(),
+        requested_vcpus: None,
         params: exec::FrozenParams {
             remote_exec: Some(exec::policy::RemoteExecPolicy {
                 enabled: true,
@@ -1137,6 +1138,7 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         connection_file: Some(daemon.connection.clone()),
         harness: "broca".into(),
         session: "session".into(),
+        requested_vcpus: None,
         job_id: None,
         last_seq: None,
         gap_recovery: None,
@@ -1449,6 +1451,7 @@ fn persist_accepted_with_snapshot(
         connection_file: Some(connection),
         harness: "runner".into(),
         session: "session".into(),
+        requested_vcpus: None,
         job_id: None,
         last_seq: None,
         gap_recovery: None,
@@ -2055,6 +2058,7 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     let runs = exec_runs(&daemon);
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(runs[0]["command"], line);
+    assert!(runs[0].get("weight_hint").is_none(), "{runs:?}");
     assert_eq!(
         Path::new(runs[0]["cwd"].as_str().unwrap()),
         dir.path(),
@@ -2076,6 +2080,78 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
         ),
         "{rendered}"
     );
+}
+
+#[tokio::test]
+async fn runon_vcpu_count_is_sent_as_weight_hint_on_the_wire() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({"command": "printf vcpu", "runon": "linux,4c", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["weight_hint"], 4);
+    let rendered = crate::commands::bash_orchestrate::format_foreground_result(&done);
+    assert_eq!(
+        rendered.lines().next(),
+        Some("ran remotely on ck-motor (4 vCPUs requested)"),
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
+async fn runon_uses_vcpu_count_from_plan_default_demand() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let mut policy = launch(daemon.connection.clone());
+    policy.params.remote_exec.as_mut().unwrap().default_demand = Some("linux,4c".into());
+    let response = handle_with_policy(
+        &ctx,
+        Some(policy),
+        serde_json::json!({"command": "printf default", "runon": "", "compressed": false}),
+    );
+    assert!(response.success, "{response:?}");
+    let task_id = response.data["task_id"].as_str().unwrap().to_string();
+    let _done = terminal(ctx.bash_background(), &task_id).await;
+    let runs = exec_runs(&daemon);
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["weight_hint"], 4);
+}
+
+#[tokio::test]
+async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
+    let daemon = daemon(Script::Plain, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran-locally");
+    let command = format!("printf x > '{}'", marker.display());
+    for runon in [
+        "linux,0c",
+        "linux,4",
+        "linux,4cores",
+        "linux,c",
+        "linux,4c,2c",
+        "windows,4c",
+    ] {
+        let response = handle_with_policy(
+            &restarted_context(dir.path()),
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({"command": command.clone(), "runon": runon}),
+        );
+        assert!(!response.success, "{runon}: {response:?}");
+        let message = response.data["message"].as_str().unwrap_or_default();
+        assert!(message.contains(runon), "{runon}: {response:?}");
+        assert!(message.contains("not valid"), "{runon}: {response:?}");
+    }
+    assert!(exec_runs(&daemon).is_empty());
+    assert!(!marker.exists());
 }
 
 #[tokio::test]

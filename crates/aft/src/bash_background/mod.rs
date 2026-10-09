@@ -296,6 +296,7 @@ pub(crate) struct RemoteLaunch {
     pub harness: String,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub session: String,
+    pub requested_vcpus: Option<u32>,
 }
 
 /// Decide where a bash call that set `runon` runs, before anything is spawned.
@@ -333,8 +334,8 @@ pub(crate) fn remote_for_runon(
     }
     // An unknown demand is named before anything else is decided about it.
     let requested = runon.trim();
-    if !requested.is_empty() && !crate::exec_remote::policy::KNOWN_DEMANDS.contains(&requested) {
-        return Err(crate::exec_remote::policy::unknown_demand(requested));
+    if !requested.is_empty() {
+        crate::exec_remote::policy::parse_demand(requested)?;
     }
     if config.remote_exec.project_off {
         return Err("remote runs are off for this project".into());
@@ -349,7 +350,7 @@ pub(crate) fn remote_for_runon(
                 .is_some_and(|policy| policy.enabled)
         })
         .ok_or_else(|| "this session has no remote runner".to_string())?;
-    crate::exec_remote::policy::resolve_demand(
+    let resolved = crate::exec_remote::policy::resolve_demand(
         runon,
         launch
             .params
@@ -357,6 +358,7 @@ pub(crate) fn remote_for_runon(
             .as_ref()
             .and_then(|policy| policy.default_demand.as_deref()),
     )?;
+    launch.requested_vcpus = resolved.weight_hint;
     launch.explicit_runon = true;
     Ok(launch)
 }

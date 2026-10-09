@@ -355,7 +355,7 @@ describe("bash tool adapter", () => {
         "Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit)",
       );
       expect(bash.description).toContain(
-        "or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.",
+        "or runs binaries built on this machine: a remote build leaves no binaries or target/ output in the local worktree.",
       );
     },
   );

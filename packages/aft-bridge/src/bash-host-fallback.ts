@@ -18,11 +18,11 @@ export const BASH_HOST_FALLBACK_REFUSAL =
  * the rest. Shared by the OpenCode and Pi tools and the module catalog.
  */
 export const BASH_RUNON_DESCRIPTION =
-  'Run this command on the remote Linux build server instead of this machine; the only value is "linux".';
+  "Run on the remote Linux build server: `linux`, optionally with an exact vCPU count such as `linux,4c`.";
 
 /** Guidance served only beside an available remote-run parameter. */
 export const BASH_RUNON_GUIDANCE =
-  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.';
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); the job sees exactly N CPUs, so ask for what the command uses: 2c for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.';
 
 export interface BashHostFallbackOptions {
   command: string;

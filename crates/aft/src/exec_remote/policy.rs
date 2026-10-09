@@ -3,7 +3,7 @@
 //! gates explicit runon only, never that legacy route.
 use serde::{Deserialize, Serialize};
 
-/// The runner demands `runon` accepts today.
+/// Runner platforms whose demands `runon` accepts; vCPU counts are parsed separately.
 pub const KNOWN_DEMANDS: &[&str] = &["linux"];
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -80,10 +80,16 @@ fn valid_prefix(prefix: &str) -> bool {
         })
 }
 
+/// The vCPU sizing hint parsed from a runner demand.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResolvedDemand {
+    pub weight_hint: Option<u32>,
+}
+
 /// Resolve the demand a `runon` call asks for. An empty value takes the
-/// session's default demand; any other value must be a known demand, and an
-/// unknown one is refused by name rather than guessed.
-pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<String, String> {
+/// session's default demand; otherwise, AFT accepts a known runner with an
+/// optional vCPU count, and refuses malformed or unknown demands by name.
+pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<ResolvedDemand, String> {
     let requested = runon.trim();
     let demand = if requested.is_empty() {
         default_demand
@@ -91,18 +97,40 @@ pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<Strin
             .filter(|d| !d.is_empty())
             .ok_or_else(|| {
                 format!(
-                "runon needs a runner demand and this session sets no default; use runon: \"{}\"",
-                KNOWN_DEMANDS[0]
-            )
+                    "runon needs a runner demand and this session sets no default; use runon: {:?}",
+                    KNOWN_DEMANDS[0]
+                )
             })?
     } else {
         requested
     };
+    parse_demand(demand)
+}
+
+/// Parse a runner name and optional vCPU count, rejecting malformed requests
+/// before the remote command can be dispatched.
+pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
+    if let Some((platform, count)) = demand.split_once(',') {
+        let digits = count.strip_suffix('c').filter(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+        });
+        let count = digits
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .filter(|count| *count > 0);
+        if platform != "linux" || count.is_none() {
+            return Err(invalid_vcpu_demand(demand));
+        }
+        return Ok(ResolvedDemand { weight_hint: count });
+    }
     if KNOWN_DEMANDS.contains(&demand) {
-        Ok(demand.to_owned())
+        Ok(ResolvedDemand::default())
     } else {
         Err(unknown_demand(demand))
     }
+}
+
+fn invalid_vcpu_demand(demand: &str) -> String {
+    format!("runon {demand:?} is not valid: give the vCPU count as Nc, for example \"linux,4c\"")
 }
 
 /// The refusal for a demand no runner serves.
@@ -208,9 +236,42 @@ mod tests {
     }
 
     #[test]
+    fn demand_resolution_accepts_vcpu_counts_and_names_malformed_suffixes() {
+        assert_eq!(resolve_demand("linux", None).unwrap().weight_hint, None);
+        assert_eq!(resolve_demand(" linux ", None).unwrap().weight_hint, None);
+        assert_eq!(
+            resolve_demand("linux,1c", None).unwrap().weight_hint,
+            Some(1)
+        );
+        assert_eq!(
+            resolve_demand(" linux,4c ", None).unwrap().weight_hint,
+            Some(4)
+        );
+        assert_eq!(
+            resolve_demand("", Some("linux,8c")).unwrap().weight_hint,
+            Some(8)
+        );
+        assert!(resolve_demand("", Some("linux,4"))
+            .unwrap_err()
+            .contains("not valid"));
+        for demand in [
+            "linux,0c",
+            "linux,4",
+            "linux,4cores",
+            "linux,c",
+            "linux,4c,2c",
+            "windows,4c",
+        ] {
+            let error = resolve_demand(demand, None).unwrap_err();
+            assert!(error.contains(demand), "{demand:?}: {error}");
+            assert!(error.contains("not valid"), "{demand:?}: {error}");
+        }
+    }
+
+    #[test]
     fn demand_resolution_names_unknown_demands_and_uses_the_default_only_when_unspecified() {
-        assert_eq!(resolve_demand("linux", None).unwrap(), "linux");
-        assert_eq!(resolve_demand("", Some("linux")).unwrap(), "linux");
+        assert!(resolve_demand("linux", None).is_ok());
+        assert!(resolve_demand("", Some("linux")).is_ok());
         assert!(resolve_demand("", None)
             .unwrap_err()
             .contains("runon needs a runner demand"));

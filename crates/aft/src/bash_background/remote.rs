@@ -133,8 +133,17 @@ fn draining_budget_ms(_root: &Path) -> u64 {
 #[cfg(unix)]
 const RUNNER_ID: &str = "ck-motor";
 
-/// This machine's operating system as a reader names it, for the header of a
-/// run that fell back to it.
+#[cfg(unix)]
+fn remote_execution_note(requested_vcpus: Option<u32>) -> String {
+    match requested_vcpus {
+        Some(1) => format!("ran remotely on {RUNNER_ID} (1 vCPU requested)"),
+        Some(count) => format!("ran remotely on {RUNNER_ID} ({count} vCPUs requested)"),
+        None => format!("ran remotely on {RUNNER_ID}"),
+    }
+}
+
+/// This machine's operating system, as a reader sees it in the header for a run
+/// that fell back to local execution.
 #[cfg(unix)]
 fn local_os_name() -> &'static str {
     match std::env::consts::OS {
@@ -215,6 +224,8 @@ pub(crate) struct RemoteTask {
     pub explicit_runon: bool,
     pub harness: String,
     pub session: String,
+    #[serde(default)]
+    pub requested_vcpus: Option<u32>,
     pub job_id: Option<Uuid>,
     pub last_seq: Option<u64>,
     #[serde(default)]
@@ -646,6 +657,7 @@ impl BgTaskRegistry {
             plan = plan.with_prepared_task(prepared);
         }
         let task_id = layout.paths.task_id.clone();
+        let requested_vcpus = launch.requested_vcpus;
         let mut metadata = PersistedTask::starting(
             task_id.clone(),
             session_id,
@@ -665,6 +677,7 @@ impl BgTaskRegistry {
             explicit_runon: launch.explicit_runon,
             harness: launch.harness,
             session: launch.session,
+            requested_vcpus,
             job_id: None,
             last_seq: None,
             gap_recovery: None,
@@ -780,6 +793,7 @@ impl BgTaskRegistry {
                 ),
                 &exec::PresetParams {
                     siblings: launch.params.siblings,
+                    weight_hint: requested_vcpus,
                     ..Default::default()
                 },
             )
@@ -1539,6 +1553,12 @@ impl BgTaskRegistry {
             if state.metadata.is_terminal() {
                 return;
             }
+            let remote_note = state
+                .metadata
+                .remote
+                .as_ref()
+                .map(|remote| remote_execution_note(remote.requested_vcpus))
+                .unwrap_or_else(|| remote_execution_note(None));
             if refused {
                 state.metadata.execution_note = Some(
                     if state
@@ -1560,7 +1580,7 @@ impl BgTaskRegistry {
                     | BgTaskStatus::Killed
                     | BgTaskStatus::TimedOut
             ) {
-                state.metadata.execution_note = Some(format!("ran remotely on {RUNNER_ID}"));
+                state.metadata.execution_note = Some(remote_note.clone());
             }
             if let Some(terminal) = state
                 .metadata
@@ -1592,7 +1612,7 @@ impl BgTaskRegistry {
                 let note = state
                     .metadata
                     .execution_note
-                    .get_or_insert_with(|| format!("ran remotely on {RUNNER_ID}"));
+                    .get_or_insert_with(|| remote_note.clone());
                 note.push_str(&format!("\n{reason}"));
             }
             task.mark_terminal_now();

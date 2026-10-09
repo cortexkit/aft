@@ -738,6 +738,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                     connection_file: Some(daemon.connection.clone()),
                     harness: "runner".into(),
                     session: "session".into(),
+                    requested_vcpus: None,
                 },
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 "cargo test",
@@ -907,7 +908,7 @@ fn new_plan_shape_decodes_and_its_default_demand_reaches_the_session() {
     let ctx = context(root.path(), storage.path(), None);
     let bind = identity(root.path(), "new-shape", 7, true);
     let answer = catalog(
-        json!({"op":"tool.catalog","preset":"worker","params":{"remote_exec":{"enabled":true,"default_demand":"linux"}}}),
+        json!({"op":"tool.catalog","preset":"worker","params":{"remote_exec":{"enabled":true,"default_demand":"linux,4c"}}}),
         &bind,
         &ctx,
     )
@@ -924,7 +925,7 @@ fn new_plan_shape_decodes_and_its_default_demand_reaches_the_session() {
         .remote_exec
         .unwrap();
     assert!(policy.enabled);
-    assert_eq!(policy.default_demand.as_deref(), Some("linux"));
+    assert_eq!(policy.default_demand.as_deref(), Some("linux,4c"));
 }
 
 #[test]
