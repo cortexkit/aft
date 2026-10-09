@@ -134,10 +134,10 @@ function orchestratedTransportTimeoutMs(
   if (blocking && workerWaitMaxMs !== undefined) {
     waitBudget = Math.min(effectiveTimeout ?? workerWaitMaxMs, workerWaitMaxMs);
   }
-  // A blocking `runon` call needs no more: a remote command's `timeout` only
-  // starts once the runner runs it, so the engine hands a remote task back
-  // at this same budget (capped at 30 minutes) even while its job is still
-  // queued, and the margin covers that reply.
+  // A blocking `runon` call needs this same budget and no more: the engine
+  // hands a remote task back at it (never later than 30 minutes) even while
+  // the job is still queued on the runner, because a remote command's
+  // `timeout` only starts once the runner runs it. The margin covers that reply.
   // A configured limit can exceed what a JavaScript timer accepts.
   return Math.min(waitBudget + BASH_TRANSPORT_MARGIN_MS, LONGEST_TIMER_DELAY_MS);
 }

@@ -78,8 +78,9 @@ enum BashSpawnControl {
         /// The configured wait limit bounding a blocking call in any session
         /// (`wait: true` or `block_to_completion`).
         worker_cap_ms: Option<u64>,
-        /// When a blocking wait hands a remote task back, and how long that
-        /// is after the call arrived; see `remote_block_handback_ms`.
+        /// For a blocking call: the instant its wait hands a remote task back
+        /// to the background, and that wait in milliseconds from when the
+        /// call arrived (see `remote_block_handback_ms`).
         remote_handback: Option<(Instant, u64)>,
     },
 }
@@ -2191,7 +2192,8 @@ mod grant_path_tests {
             remote_runon_stub,
             json!({"command":"uname -s", "runon":"linux", "wait":true, "timeout":timeout_ms, "foreground_orchestrate":true}),
         );
-        // The plugins give up on this call 10 s after its `timeout`.
+        // The OpenCode and Pi plugins stop waiting for this call 10 s after
+        // its `timeout`.
         let transport_deadline = Duration::from_millis(timeout_ms + 10_000);
         let done = tokio::time::timeout(transport_deadline, rx.recv())
             .await
@@ -2217,7 +2219,8 @@ mod grant_path_tests {
                 .count()
         };
         assert_eq!(cancels(), 0, "the queued job must not be cancelled");
-        // The job leaves the queue and completes in the background.
+        // The queued runon job still leaves the queue and completes in the
+        // background after the call returned.
         let task_id = response.data["task_id"].as_str().unwrap().to_string();
         let finished = tokio::time::timeout(Duration::from_secs(10), async {
             loop {

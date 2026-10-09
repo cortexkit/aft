@@ -790,8 +790,9 @@ pub(crate) fn format_remote_handback_message(
     )
 }
 
-/// Moves a blocking call's remote task to the background at the end of its
-/// wait (see [`remote_block_handback_ms`]) and replies with its job and phase.
+/// Moves a blocking call's remote task to the background once the call has
+/// waited as long as it may (the budget from [`remote_block_handback_ms`]),
+/// and replies with the task's job id and phase.
 pub(crate) fn handback_remote_bash(
     ctx: &AppContext,
     task_id: &str,

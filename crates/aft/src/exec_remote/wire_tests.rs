@@ -82,9 +82,9 @@ pub(crate) enum Script {
     /// Accepted, then exited 0 with a terminal record that reports nothing
     /// about the workspace (no changed-file list).
     Plain,
-    /// Accepted at `position`, then held in the queue for `queue` with no
-    /// records, then one output record, then `run` later exit 0: a runner
-    /// with a long queue.
+    /// A runner with a long queue: accepted at `position`, then queued for
+    /// `queue` with no records, then one output record (it started), then
+    /// after a further `run` it exits 0.
     Staged {
         position: u32,
         queue: Duration,
