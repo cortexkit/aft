@@ -526,7 +526,7 @@ pub fn builtin_servers() -> Vec<ServerDef> {
             &["Cargo.toml", "Cargo.lock"],
             // Lock metadata resolution and build-script discovery/flycheck so a
             // stale Cargo.lock fails analysis instead of being rewritten by Cargo.
-            serde_json::json!({ "cargo": {
+            serde_json::json!({ "checkOnSave": false, "cargo": {
                 "extraArgs": ["--locked"],
                 "metadataExtraArgs": ["--locked"]
             } }),
@@ -1121,6 +1121,8 @@ fn marker_signals_language(marker: &str, server: &ServerDef) -> bool {
 /// default value (empty array, empty string, empty map, None) are inherited
 /// from the built-in so users only have to specify what they actually want
 /// to override.
+/// Initialization options instead merge JSON objects recursively, with explicit
+/// arrays and scalars replacing built-in values, including empty arrays.
 ///
 /// User-defined servers whose `id` does not match any built-in are appended
 /// as `ServerKind::Custom(id)` with no merging — they're standalone.
@@ -1173,10 +1175,16 @@ fn resolved_servers(config: &Config) -> Vec<ServerDef> {
                 } else {
                     user.env.clone()
                 },
-                initialization_options: user
-                    .initialization_options
-                    .clone()
-                    .or_else(|| builtin.initialization_options.clone()),
+                initialization_options: match (
+                    builtin.initialization_options.clone(),
+                    user.initialization_options.clone(),
+                ) {
+                    (Some(mut base), Some(overrides)) => {
+                        super::manager::merge_json_override(&mut base, overrides);
+                        Some(base)
+                    }
+                    (base, overrides) => overrides.or(base),
+                },
             };
             servers[position] = merged;
         } else if let Some(def) = custom_server(user) {
@@ -2047,6 +2055,82 @@ mod tests {
             ids.len(),
             unique.len(),
             "duplicate server IDs in registry: {ids:?}",
+        );
+    }
+
+    #[test]
+    fn rust_initialization_disables_checks_and_locks_cargo() {
+        let rust = super::resolved_servers(&Config::default())
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Rust)
+            .unwrap();
+        let options = rust.initialization_options.unwrap();
+        assert_eq!(options["checkOnSave"], false);
+        assert_eq!(
+            options["cargo"]["extraArgs"],
+            serde_json::json!(["--locked"])
+        );
+        assert_eq!(
+            options["cargo"]["metadataExtraArgs"],
+            serde_json::json!(["--locked"])
+        );
+    }
+
+    #[test]
+    fn rust_initialization_override_keeps_builtin_cargo_options() {
+        let config = Config {
+            lsp_servers: vec![UserServerDef {
+                id: "rust".into(),
+                initialization_options: Some(serde_json::json!({"checkOnSave": true})),
+                ..UserServerDef::default()
+            }],
+            ..Config::default()
+        };
+        let rust = super::resolved_servers(&config)
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Rust)
+            .unwrap();
+        assert_eq!(
+            rust.initialization_options.unwrap(),
+            serde_json::json!({"checkOnSave": true, "cargo": {
+                "extraArgs": ["--locked"], "metadataExtraArgs": ["--locked"]
+            }})
+        );
+    }
+
+    #[test]
+    fn initialization_override_merges_objects_and_replaces_arrays_and_scalars() {
+        let config = Config {
+            lsp_servers: vec![
+                UserServerDef {
+                    id: "rust".into(),
+                    initialization_options: Some(serde_json::json!({"cargo": {
+                        "extraArgs": [], "newOption": 42
+                    }})),
+                    ..UserServerDef::default()
+                },
+                UserServerDef {
+                    id: "go".into(),
+                    initialization_options: Some(serde_json::json!({
+                        "pullDiagnostics": false, "newOption": "value"
+                    })),
+                    ..UserServerDef::default()
+                },
+            ],
+            ..Config::default()
+        };
+        let servers = super::resolved_servers(&config);
+        let rust = servers.iter().find(|s| s.kind == ServerKind::Rust).unwrap();
+        assert_eq!(
+            rust.initialization_options.as_ref().unwrap(),
+            &serde_json::json!({"checkOnSave": false, "cargo": {
+                "extraArgs": [], "metadataExtraArgs": ["--locked"], "newOption": 42
+            }})
+        );
+        let go = servers.iter().find(|s| s.kind == ServerKind::Go).unwrap();
+        assert_eq!(
+            go.initialization_options.as_ref().unwrap(),
+            &serde_json::json!({"pullDiagnostics": false, "newOption": "value"})
         );
     }
 

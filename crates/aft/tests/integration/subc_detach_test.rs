@@ -636,7 +636,7 @@ fn drain_with_live_lsp_servers_and_writer(
         std::fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}'\n",
+                "#!/bin/sh\nAFT_FAKE_LSP_IGNORE_SHUTDOWN=1 {server_env} AFT_FAKE_LSP_PID_DIR='{}' exec '{}' \"$@\"\n",
                 pids.path().display(),
                 fake.display()
             ),

@@ -685,9 +685,7 @@ fn handle_inspect_payload(
                 not_applicable,
                 expected_producers,
                 indexing_gaps,
-                request_deadline
-                    .filter(|_| scope_was_provided)
-                    .map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP)),
+                request_deadline.map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP)),
             )
         } else if category.is_tier2() {
             if let Some((rx, deadline, callgraph_phase, tier2_phase)) =

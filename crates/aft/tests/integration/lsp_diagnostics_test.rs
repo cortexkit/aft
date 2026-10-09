@@ -2788,6 +2788,16 @@ fn configured_rust_context(root: &std::path::Path) -> AppContext {
     configured_rust_context_with_lsp(root, serde_json::json!({}))
 }
 
+fn enable_automatic_rust_checks(ctx: &AppContext) {
+    ctx.update_config(|config| {
+        config.lsp_servers.push(aft::config::UserServerDef {
+            id: "rust".into(),
+            initialization_options: Some(serde_json::json!({"checkOnSave": true})),
+            ..Default::default()
+        });
+    });
+}
+
 fn configured_rust_context_with_lsp(root: &std::path::Path, lsp: serde_json::Value) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
@@ -2998,6 +3008,7 @@ fn lsp_diagnostics_reports_cargo_check_after_an_aft_write_with_real_rust_analyze
         .expect("cargo is required for Rust integration tests");
     assert!(generated.status.success(), "{generated:?}");
     let ctx = configured_rust_context(&root);
+    enable_automatic_rust_checks(&ctx);
 
     let clean = poll_lsp_diagnostics(&ctx, &user, Duration::from_secs(60), |response| {
         response["complete"] == true
@@ -3530,6 +3541,7 @@ fn main() {
             .unwrap();
         assert!(generated.status.success(), "{generated:?}");
         let ctx = configured_rust_context_with_lsp(&root, lsp);
+        enable_automatic_rust_checks(&ctx);
         let clean = poll_lsp_diagnostics(&ctx, &source, Duration::from_secs(90), |r| {
             r["complete"] == true
         });

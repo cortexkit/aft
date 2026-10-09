@@ -4843,6 +4843,7 @@ impl AppContext {
     }
 
     pub(crate) fn mark_subc_bound(&self) {
+        self.lsp().resume();
         self.subc_lifecycle.mark_bound();
         self.inspect_manager.resume_root_work();
         // A views-on semantic lane pauses its fills while the root is unbound

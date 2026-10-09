@@ -92,6 +92,8 @@ fn server_key_sort(left: &ServerKey, right: &ServerKey) -> std::cmp::Ordering {
 /// server".
 #[derive(Debug, Clone)]
 pub enum ServerAttemptResult {
+    /// The root has no live route; reopening it permits a lazy start again.
+    ProjectClosed,
     /// Server is running and ready to serve requests for this file.
     Ok { server_key: ServerKey },
     /// No workspace root was found by walking up from the file looking for
@@ -222,6 +224,7 @@ pub struct ApplicableServerStartOutcomes {
 impl ServerAttemptResult {
     pub fn failure_reason(&self) -> String {
         match self {
+            Self::ProjectClosed => "project closed; reopen the project and retry".into(),
             Self::BinaryNotInstalled { binary } => format!("{binary} is unavailable"),
             Self::SpawnFailed { reason, .. } => {
                 // Files outside every TypeScript project are a coverage gap,
@@ -769,8 +772,13 @@ pub struct LspShutdownAllOutcome {
 }
 
 pub struct LspManager {
+    quiesced: std::sync::atomic::AtomicBool,
     /// Active server instances, keyed by (ServerKind, workspace_root).
     clients: HashMap<ServerKey, LspClient>,
+    inspect_rust_checks: HashMap<
+        ServerKey,
+        Arc<parking_lot::Mutex<super::completed_rust_check::CompletedRustCheck>>,
+    >,
     /// Binary names for active server instances. Kept separate from
     /// `LspClient` so crash handling can report the installable binary name
     /// after a post-initialize process exit.
@@ -1016,7 +1024,9 @@ impl LspManager {
     pub fn new() -> Self {
         let (event_tx, event_rx) = unbounded();
         Self {
+            quiesced: std::sync::atomic::AtomicBool::new(false),
             clients: HashMap::new(),
+            inspect_rust_checks: HashMap::new(),
             server_binaries: HashMap::new(),
             documents: HashMap::new(),
             diagnostics: DiagnosticsStore::new(),
@@ -1063,6 +1073,11 @@ impl LspManager {
         result: ServerAttemptResult,
         durability: FailureDurability,
     ) -> ServerAttemptResult {
+        // Closing a route is not a failed executable. Reopening the project
+        // must permit an immediate start rather than replay a retry backoff.
+        if matches!(result, ServerAttemptResult::ProjectClosed) {
+            return result;
+        }
         let now = self.retry_clock.now();
         let retry_at = match durability {
             FailureDurability::Permanent => {
@@ -1390,6 +1405,13 @@ impl LspManager {
         outcomes: &mut ApplicableServerStartOutcomes,
     ) -> Option<StartNext> {
         let key = &candidate.key;
+        if self.is_quiesced() {
+            outcomes.failures.push(ApplicableServerFailure {
+                server_key: key.clone(),
+                result: ServerAttemptResult::ProjectClosed,
+            });
+            return None;
+        }
         if self.clients.contains_key(key) {
             outcomes.successful.push(key.clone());
             return None;
@@ -1539,6 +1561,9 @@ impl LspManager {
         file_path: &Path,
         config: &Config,
     ) -> FileServerStart {
+        if self.is_quiesced() {
+            return FileServerStart::Failed(ServerAttemptResult::ProjectClosed);
+        }
         if self.clients.contains_key(key) {
             return FileServerStart::Running;
         }
@@ -2824,7 +2849,8 @@ impl LspManager {
         &self,
         deadline: Instant,
     ) -> HashMap<ServerKey, super::completed_rust_check::SavedCheck> {
-        self.clients
+        let mut saved: HashMap<_, _> = self
+            .clients
             .iter()
             .filter_map(|(key, client)| {
                 if key.kind != ServerKind::Rust
@@ -2836,10 +2862,55 @@ impl LspManager {
                 let saved = client.completed_rust_check.as_ref()?.validated(deadline)?;
                 Some((key.clone(), saved))
             })
+            .collect();
+        for (key, check) in &self.inspect_rust_checks {
+            if let Some(record) = check.try_lock().and_then(|check| check.validated(deadline)) {
+                saved.insert(key.clone(), record);
+            }
+        }
+        saved
+    }
+
+    /// Transfer completed-check records from clients with automatic checks off
+    /// to explicit inspect requests. Their shared mutex permits only one Cargo
+    /// check at a time without holding the manager lock while Cargo runs.
+    pub(crate) fn inspect_rust_check_work(
+        &mut self,
+        producers: &[ServerKey],
+    ) -> Vec<(
+        ServerKey,
+        Arc<parking_lot::Mutex<super::completed_rust_check::CompletedRustCheck>>,
+    )> {
+        for key in producers {
+            if self.inspect_rust_checks.contains_key(key) {
+                continue;
+            }
+            if let Some(client) = self.clients.get_mut(key) {
+                if client
+                    .completed_rust_check
+                    .as_ref()
+                    .is_some_and(|cache| cache.automatic_checks_disabled() && !cache.running())
+                {
+                    let cache = client.completed_rust_check.take().unwrap();
+                    self.inspect_rust_checks
+                        .insert(key.clone(), Arc::new(parking_lot::Mutex::new(cache)));
+                }
+            }
+        }
+        producers
+            .iter()
+            .filter_map(|key| {
+                self.inspect_rust_checks
+                    .get(key)
+                    .map(|work| (key.clone(), work.clone()))
+            })
             .collect()
     }
 
     pub(crate) fn rust_check_running_reason(&self, key: &ServerKey) -> String {
+        if self.rust_automatic_checks_disabled(key) {
+            return "cargo check required for aft_inspect; retry aft_inspect".into();
+        }
         self.clients
             .get(key)
             .and_then(|c| c.completed_rust_check.as_ref())
@@ -2847,6 +2918,15 @@ impl LspManager {
             .unwrap_or_else(|| {
                 crate::inspect::diagnostics_category::RUST_CHECK_RUNNING_REASON.to_string()
             })
+    }
+
+    pub(crate) fn rust_automatic_checks_disabled(&self, key: &ServerKey) -> bool {
+        self.inspect_rust_checks.contains_key(key)
+            || self
+                .clients
+                .get(key)
+                .and_then(|client| client.completed_rust_check.as_ref())
+                .is_some_and(|cache| cache.automatic_checks_disabled())
     }
 
     /// Ask rust-analyzer again for a check that was expected and did not
@@ -4082,10 +4162,26 @@ impl LspManager {
     pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
         let clients: Vec<_> = self.clients.drain().collect();
         self.clients_generation = self.clients_generation.wrapping_add(1);
+        self.inspect_rust_checks.clear();
         self.server_binaries.clear();
         self.documents.clear();
         self.diagnostics = DiagnosticsStore::new();
         clients
+    }
+
+    pub(crate) fn quiesce(&mut self) -> Vec<(ServerKey, LspClient)> {
+        self.quiesced
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.take_all_clients()
+    }
+
+    pub(crate) fn resume(&self) {
+        self.quiesced
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_quiesced(&self) -> bool {
+        self.quiesced.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Shut down every server concurrently within one shared grace period.
@@ -4100,20 +4196,33 @@ impl LspManager {
         clients: Vec<(ServerKey, LspClient)>,
         child_registry: LspChildRegistry,
     ) -> LspShutdownAllOutcome {
-        Self::shutdown_all_clients(clients, child_registry, LSP_SHUTDOWN_ALL_BUDGET)
+        Self::shutdown_all_clients(clients, child_registry, LSP_SHUTDOWN_ALL_BUDGET, false)
+    }
+
+    /// Process exit must also reap clients already detached by route quiescence.
+    /// Their shutdown threads cannot be relied on after the daemon exits.
+    pub(crate) fn shutdown_at_process_exit(
+        clients: Vec<(ServerKey, LspClient)>,
+        registry: LspChildRegistry,
+    ) -> LspShutdownAllOutcome {
+        Self::shutdown_all_clients(clients, registry, LSP_SHUTDOWN_ALL_BUDGET, true)
     }
 
     fn shutdown_all_clients(
         clients: Vec<(ServerKey, LspClient)>,
         child_registry: LspChildRegistry,
         budget: Duration,
+        include_registered: bool,
     ) -> LspShutdownAllOutcome {
         let started = Instant::now();
-        let servers = clients.len();
         let mut pending_pids = clients
             .iter()
             .map(|(_, client)| client.child_pid())
             .collect::<HashSet<_>>();
+        if include_registered {
+            pending_pids.extend(child_registry.pids());
+        }
+        let servers = pending_pids.len();
         let (result_tx, result_rx) = unbounded();
 
         for (key, mut client) in clients {
@@ -4139,8 +4248,20 @@ impl LspManager {
         let force_at = deadline - LSP_FORCED_TERMINATION_RESERVE.min(budget / 2);
         let mut outcome = LspShutdownAllOutcome::default();
         while !pending_pids.is_empty() {
+            if include_registered {
+                let live = child_registry.pids();
+                pending_pids.retain(|pid| live.contains(pid));
+                if pending_pids.is_empty() {
+                    break;
+                }
+            }
             let remaining = force_at.saturating_duration_since(Instant::now());
-            match result_rx.recv_timeout(remaining) {
+            let wait = if include_registered {
+                remaining.min(Duration::from_millis(20))
+            } else {
+                remaining
+            };
+            match result_rx.recv_timeout(wait) {
                 Ok((key, pid, result)) => {
                     if !pending_pids.remove(&pid) {
                         continue;
@@ -4153,7 +4274,12 @@ impl LspManager {
                         }
                     }
                 }
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                    if !include_registered || Instant::now() >= force_at {
+                        break;
+                    }
+                    std::thread::sleep(wait);
+                }
             }
         }
 
@@ -4168,14 +4294,31 @@ impl LspManager {
             child_registry.force_kill_pids(&pids);
             let mut unreaped = pids.into_iter().collect::<HashSet<_>>();
             while !unreaped.is_empty() {
+                if include_registered {
+                    let live = child_registry.pids();
+                    unreaped.retain(|pid| live.contains(pid));
+                    if unreaped.is_empty() {
+                        break;
+                    }
+                }
                 // A zero timeout still takes a report that is already queued,
                 // so a late wake-up counts every server reaped in the meantime.
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                match result_rx.recv_timeout(remaining) {
+                let wait = if include_registered {
+                    remaining.min(Duration::from_millis(20))
+                } else {
+                    remaining
+                };
+                match result_rx.recv_timeout(wait) {
                     Ok((_, pid, _)) => {
                         unreaped.remove(&pid);
                     }
-                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                        if !include_registered || Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(wait);
+                    }
                 }
             }
             // Waiting longer would break the ceiling. Each of these was sent a
@@ -5099,6 +5242,11 @@ impl LspManager {
         source_file: &Path,
         config: &Config,
     ) -> Result<PreparedSpawn, LspError> {
+        // Configure can start a server while holding the root lifecycle mutex.
+        // Read only this atomic here; locking that mutex again would deadlock.
+        if self.is_quiesced() {
+            return Err(LspError::ProjectClosed);
+        }
         let mut resolution_config = config.clone();
         if let Some(paths) = &self.pushed_search_paths {
             resolution_config.lsp_paths_extra.clone_from(paths);
@@ -5552,7 +5700,7 @@ fn find_project_typescript_sdk(source_file: &Path, project_root: &Path) -> Optio
     }
 }
 
-fn merge_json_override(base: &mut serde_json::Value, override_value: serde_json::Value) {
+pub(super) fn merge_json_override(base: &mut serde_json::Value, override_value: serde_json::Value) {
     match (base, override_value) {
         (serde_json::Value::Object(base), serde_json::Value::Object(override_fields)) => {
             for (key, value) in override_fields {
@@ -5579,6 +5727,7 @@ fn recoverable_pull_rejection(err: &LspError) -> bool {
 
 fn server_attempt_result_reason(result: &ServerAttemptResult) -> String {
     match result {
+        ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
         ServerAttemptResult::SpawnFailed { binary, reason } => {
             format!("spawn_failed: {binary} ({reason})")
         }
@@ -5920,20 +6069,28 @@ impl PreparedSpawn {
         let initialize_timeout = initialize_timeout.or_else(|| self.test_initialize_timeout());
         let completed_rust_check = (self.kind == ServerKind::Rust)
             .then(|| {
+                let runtime = super::completed_rust_check::Runtime {
+                    binary: self.binary.clone(),
+                    args: self.args.clone(),
+                    env: self.env.clone(),
+                    options: self.initialization_options.clone(),
+                    launch_env: None,
+                    #[cfg(test)]
+                    validation_delay: Duration::ZERO,
+                };
                 super::completed_rust_check::CompletedRustCheck::new(
                     &self.root,
                     &self.reclaim_root,
                     &self.storage_root,
-                    super::completed_rust_check::Runtime {
-                        binary: self.binary.clone(),
-                        args: self.args.clone(),
-                        env: self.env.clone(),
-                        options: self.initialization_options.clone(),
-                        launch_env: None,
-                        #[cfg(test)]
-                        validation_delay: Duration::ZERO,
-                    },
+                    runtime.clone(),
                 )
+                .or_else(|| {
+                    super::completed_rust_check::CompletedRustCheck::in_memory(
+                        &self.root,
+                        &self.reclaim_root,
+                        runtime,
+                    )
+                })
             })
             .flatten();
         let mut client = match LspClient::spawn_with_reclaim_root(
@@ -6822,6 +6979,7 @@ fn delay_applicability_walk_for_test() {
 ///   (permissions, missing runtime, server crashed during initialize, etc.).
 fn classify_spawn_error(binary: &str, err: &LspError) -> ServerAttemptResult {
     match err {
+        LspError::ProjectClosed => ServerAttemptResult::ProjectClosed,
         // resolve_binary returns NotFound for both missing override paths and
         // missing PATH binaries. The "override missing" case is rare in
         // practice (only set in tests / env vars); we report all NotFound as

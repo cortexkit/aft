@@ -3336,7 +3336,20 @@ fn inspect_command_tier2_last_run_updates_on_hash_match_reuse() {
     );
 }
 
+fn enable_automatic_rust_checks(ctx: &AppContext) {
+    // These fixtures exercise automatic analyzer checks. Opt in explicitly so
+    // changing the production default does not change their flycheck contract.
+    ctx.update_config(|config| {
+        config.lsp_servers.push(aft::config::UserServerDef {
+            id: "rust".into(),
+            initialization_options: Some(json!({"checkOnSave": true})),
+            ..Default::default()
+        });
+    });
+}
+
 fn configure_fake_rust_lsp(ctx: &AppContext) {
+    enable_automatic_rust_checks(ctx);
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
 }
@@ -4074,6 +4087,197 @@ fn scoped_diagnostics_inspect(ctx: &AppContext, id: &str, scope: &str) -> Value 
             "topK": 20,
         }),
     )
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    if !std::process::Command::new(&cargo)
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        eprintln!("skipping rust_inspect_runs_cargo_with_checks_off_and_reuses_saved_record: cargo unavailable");
+        return;
+    }
+    let (_temp_dir, root, lib) = single_crate_fixture("inspect-explicit-check");
+    std::fs::write(
+        &lib,
+        "pub fn f() { let s = String::new(); let moved = s; println!(\"{}\", s); drop(moved); }\n",
+    )
+    .unwrap();
+    assert!(std::process::Command::new(&cargo)
+        .current_dir(&root)
+        .args(["generate-lockfile", "--offline"])
+        .status()
+        .unwrap()
+        .success());
+    let storage = tempfile::tempdir().unwrap();
+    let trace = storage.path().join("cargo-runs");
+    let wrapper = storage.path().join("cargo-wrapper");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\n[ \"$GIT_OPTIONAL_LOCKS\" = 0 ] || exit 7\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+        trace.display(), Path::new(&cargo).display()
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let make_context = || {
+        let ctx = configured_context(&root);
+        ctx.update_config(|config| config.storage_dir = Some(storage.path().to_path_buf()));
+        ctx.lsp()
+            .override_binary(ServerKind::Rust, fake_server_path());
+        ctx.lsp().set_extra_env("CARGO", wrapper.to_str().unwrap());
+        ctx
+    };
+    let ctx = make_context();
+    open_with_lsp(&ctx, &lib, &std::fs::read_to_string(&lib).unwrap());
+    let native_only = inspect_warm_event_driven(
+        &ctx,
+        json!({
+            "id": "inspect-native-only", "command": "inspect", "scope": "src", "sections": "diagnostics"
+        }),
+    );
+    assert_eq!(
+        native_only["complete"], false,
+        "native diagnostics alone must stay partial: {native_only:#}"
+    );
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-explicit-cargo", "src");
+    let messages = diagnostic_messages_for(&response, "src/lib.rs");
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("borrow of moved value")),
+        "real borrow-check diagnostic missing: {response:#}"
+    );
+    assert!(
+        uncovered_files(&response).is_empty(),
+        "response: {response:#}"
+    );
+    assert!(!response
+        .to_string()
+        .contains("rust-analyzer: cargo check still running"));
+    let runs = || {
+        std::fs::read_to_string(&trace)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("check "))
+            .count()
+    };
+    assert_eq!(runs(), 1);
+    let command = std::fs::read_to_string(&trace).unwrap();
+    assert!(command.contains("check --workspace --message-format=json --locked --target-dir"));
+    assert!(
+        command.contains("rust-analyzer"),
+        "must share analyzer target directory: {command}"
+    );
+
+    let second = scoped_diagnostics_inspect(&ctx, "inspect-explicit-cargo-again", "src");
+    assert!(
+        diagnostic_messages_for(&second, "src/lib.rs")
+            .iter()
+            .any(|message| message.contains("borrow of moved value")),
+        "saved report missing: {second:#}"
+    );
+    assert_eq!(runs(), 1, "warm inspect must not run cargo twice");
+    ctx.lsp().shutdown_all();
+    drop(ctx);
+
+    let ctx = make_context();
+    let restarted = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-explicit-cargo-restart", "command": "inspect", "sections": "diagnostics"
+        }),
+    );
+    assert!(
+        diagnostic_messages_for(&restarted, "src/lib.rs")
+            .iter()
+            .any(|message| message.contains("borrow of moved value")),
+        "persisted report missing: {restarted:#}"
+    );
+    assert_eq!(runs(), 1, "cold manager must reuse the persisted check");
+    std::fs::write(&lib, "include!(concat!(\"\", \"borrow.rs\"));\n").unwrap();
+    std::fs::write(
+        root.join("src/borrow.rs"),
+        "pub fn f() { let s = String::new(); let moved = s; println!(\"{}\", s); drop(moved); }\n",
+    )
+    .unwrap();
+    let uncertified = scoped_diagnostics_inspect(&ctx, "inspect-dynamic-include", "src");
+    assert_eq!(
+        runs(),
+        2,
+        "unsupported fingerprints must not prevent the explicit compiler check"
+    );
+    assert_eq!(
+        uncertified["complete"], false,
+        "uncertifiable inputs must not be cached as clean: {uncertified:#}"
+    );
+    assert!(
+        diagnostic_messages_for(&uncertified, "src/borrow.rs")
+            .iter()
+            .any(|message| message.contains("borrow of moved value")),
+        "provisional compiler diagnostics must remain visible: {uncertified:#}"
+    );
+    ctx.lsp().shutdown_all();
+}
+
+#[cfg(unix)]
+#[test]
+fn rust_inspect_explicit_cargo_deadline_is_partial_and_kills_the_check() {
+    use std::os::unix::fs::PermissionsExt;
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    if !std::process::Command::new(&cargo)
+        .arg("--version")
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return;
+    }
+    let (_temp_dir, root, _lib) = single_crate_fixture("inspect-check-deadline");
+    assert!(std::process::Command::new(&cargo)
+        .current_dir(&root)
+        .args(["generate-lockfile", "--offline"])
+        .status()
+        .unwrap()
+        .success());
+    let storage = tempfile::tempdir().unwrap();
+    let wrapper = storage.path().join("cargo-wrapper");
+    let pid_file = storage.path().join("check-pid");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\nif [ \"$1\" = check ]; then echo $$ > '{}'; exec sleep 30; fi\nexec '{}' \"$@\"\n",
+        pid_file.display(), Path::new(&cargo).display()
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ctx = configured_context_with_diagnostics_timeout(&root, 3000);
+    ctx.update_config(|config| config.storage_dir = Some(storage.path().to_path_buf()));
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    ctx.lsp().set_extra_env("CARGO", wrapper.to_str().unwrap());
+    let response = scoped_diagnostics_inspect(&ctx, "inspect-cargo-deadline", "src");
+    assert!(
+        response
+            .to_string()
+            .contains("cargo check running for aft_inspect; retry"),
+        "must name the actual check owner: {response:#}"
+    );
+    assert!(!response
+        .to_string()
+        .contains("rust-analyzer: cargo check still running"));
+    assert_eq!(
+        response["summary"]["diagnostics"]["complete"], false,
+        "response: {response:#}"
+    );
+    let pid: u32 = std::fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !aft::bash_background::process::is_process_alive(pid),
+        "timed-out check must be terminated"
+    );
+    ctx.lsp().shutdown_all();
 }
 
 /// Language servers publish diagnostics only for files they were told about.
@@ -5886,6 +6090,7 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_aft_edit_with_real_rust_
     }
     let (_temp_dir, root, s) = field_removal_crate();
     let ctx = configured_context(&root);
+    enable_automatic_rust_checks(&ctx);
     let warm = scoped_diagnostics_inspect(&ctx, "field-removal-warm", "src");
     assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
 
@@ -5934,6 +6139,7 @@ fn scoped_rust_inspect_reports_a_removed_field_after_an_outside_edit_with_real_r
     }
     let (_temp_dir, root, s) = field_removal_crate();
     let ctx = configured_context(&root);
+    enable_automatic_rust_checks(&ctx);
     let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
     *ctx.watcher_rx().lock() = Some(watcher_rx);
     // Only the use site is examined first, so AFT has no diagnostics for
@@ -5978,6 +6184,7 @@ fn scoped_rust_inspect_drops_a_fixed_compiler_error_with_real_rust_analyzer() {
         "pub mod moves;\npub mod s;\npub mod user;\n",
     );
     let ctx = configured_context(&root);
+    enable_automatic_rust_checks(&ctx);
     let moved_value = |response: &Value| {
         diagnostic_sources_for(response, "src/moves.rs")
             .iter()
@@ -6097,6 +6304,7 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
             .set_extra_env("AFT_FAKE_LSP_PROXY", "rust-analyzer");
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_PROXY_CHECK_DELAY_MS", "45000");
+        enable_automatic_rust_checks(&ctx);
         ctx
     };
     let ctx = new_context();
@@ -6315,6 +6523,7 @@ fn scoped_rust_inspect_waits_for_a_late_first_cargo_check_with_real_rust_analyze
         "pub mod moves;\npub mod s;\npub mod user;\n",
     );
     let ctx = configured_context(&root);
+    enable_automatic_rust_checks(&ctx);
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
     ctx.lsp()

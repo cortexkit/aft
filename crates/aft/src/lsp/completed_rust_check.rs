@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::diagnostics::StoredDiagnostic;
+use super::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 
 pub(crate) const BUDGET: Duration = Duration::from_secs(2);
 // The first completed check has no trusted hash ledger yet. Parsing literal
@@ -1152,6 +1152,7 @@ pub(crate) struct CompletedRustCheck {
     root: PathBuf,
     checkout: PathBuf,
     path: PathBuf,
+    persistence_enabled: bool,
     runtime: Runtime,
     saved: Option<Arc<SavedCheck>>,
     validation: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<Option<SavedCheck>>>>,
@@ -1165,6 +1166,199 @@ pub(crate) struct CompletedRustCheck {
 }
 
 impl CompletedRustCheck {
+    pub(crate) fn in_memory(root: &Path, checkout: &Path, mut runtime: Runtime) -> Option<Self> {
+        let root = canonical(root)?;
+        let checkout = canonical(checkout)?;
+        runtime.launch_env = Some(runtime.effective_env()?);
+        #[cfg(not(unix))]
+        let pre_spawn = runtime.capture(&root, None, Instant::now() + INITIAL_CAPTURE_BUDGET, None);
+        Some(Self {
+            root,
+            checkout,
+            runtime,
+            // No disk operation uses the empty path while persistence is disabled.
+            path: PathBuf::new(),
+            persistence_enabled: false,
+            saved: None,
+            validation: parking_lot::Mutex::new(None),
+            pending: None,
+            reports: BTreeMap::new(),
+            started: None,
+            began: None,
+            finished: false,
+            #[cfg(not(unix))]
+            pre_spawn,
+        })
+    }
+
+    pub(crate) fn automatic_checks_disabled(&self) -> bool {
+        super::client::rust_check_triggers(self.runtime.options.as_ref()) == (false, false)
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        self.started.is_some()
+    }
+
+    /// Compile only for an explicit inspect request. Native analyzer diagnostics
+    /// cannot prove borrow checking succeeded, so an idle server is insufficient.
+    pub(crate) fn run_for_inspect(
+        &mut self,
+        deadline: Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<SavedCheck, String> {
+        if let Some(saved) = self.validated(deadline.min(Instant::now() + BUDGET)) {
+            return Ok(saved);
+        }
+        let running = "cargo check running for aft_inspect; retry";
+        if cancelled() || Instant::now() >= deadline {
+            return Err(running.into());
+        }
+        // Capture before spawning, not after receiving a progress event. This
+        // also works on platforms without inode change timestamps.
+        self.reports.clear();
+        let before = self.runtime.capture(
+            &self.root,
+            self.saved.as_ref().map(|saved| &saved.fingerprint),
+            deadline,
+            None,
+        );
+        let mut args = vec![
+            "check".to_string(),
+            "--workspace".into(),
+            "--message-format=json".into(),
+            "--locked".into(),
+        ];
+        if let Some(target) = self.inspect_target_dir(deadline, &cancelled)? {
+            args.push("--target-dir".into());
+            args.push(target.to_string_lossy().into_owned());
+        }
+        self.started = Some(Instant::now());
+        self.began = Some(SystemTime::now());
+        let result = self.cargo(&args, deadline, &cancelled);
+        let output = match result {
+            Ok(output) => output,
+            Err(reason) => {
+                self.abort();
+                return Err(reason);
+            }
+        };
+        let (reports, finished) = cargo_reports(&self.root, &output.stdout)?;
+        let has_error = reports
+            .values()
+            .flatten()
+            .any(|row| row.severity == DiagnosticSeverity::Error);
+        if !finished || output.truncated || (!output.status.success() && !has_error) {
+            self.abort();
+            return Err(format!(
+                "aft_inspect: cargo check did not produce a complete diagnostic report: {}",
+                output.stderr.trim()
+            ));
+        }
+        self.reports = reports;
+        let Some(before) = before else {
+            self.abort();
+            return Err("aft_inspect: cargo check completed, but Rust inputs cannot be fingerprinted; diagnostics are provisional".into());
+        };
+        let after = self
+            .runtime
+            .capture(&self.root, Some(&before), deadline, None)
+            .ok_or_else(|| {
+                "aft_inspect: cannot validate Rust inputs after cargo check; retry".to_string()
+            })?;
+        if cancelled() || before.files != after.files || before.digest != after.digest {
+            self.abort();
+            return Err("aft_inspect: Rust inputs changed during cargo check; retry".into());
+        }
+        self.pending = Some(before);
+        self.finished = true;
+        self.complete_until(deadline, true);
+        self.validated(deadline)
+            .ok_or_else(|| "aft_inspect: cannot certify completed cargo check; retry".into())
+    }
+
+    fn cargo(
+        &self,
+        args: &[String],
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<crate::format::SubprocessOutcome, String> {
+        if cancelled() || Instant::now() >= deadline {
+            return Err("cargo check running for aft_inspect; retry".into());
+        }
+        let binary = self
+            .runtime
+            .env
+            .get("CARGO")
+            .map(String::as_str)
+            .unwrap_or("cargo");
+        let mut command = crate::effective_path::new_command(binary);
+        command
+            .args(args)
+            .current_dir(&self.root)
+            .envs(&self.runtime.env)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::format::isolate_in_process_group(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("aft_inspect: cargo check could not start: {error}"))?;
+        crate::format::wait_with_deadline(child, "cargo check", deadline, cancelled).map_err(
+            |error| match error {
+                crate::format::FormatError::Timeout { .. } => {
+                    "cargo check running for aft_inspect; retry".into()
+                }
+                _ => format!("aft_inspect: cargo check failed: {error}"),
+            },
+        )
+    }
+
+    fn inspect_target_dir(
+        &self,
+        deadline: Instant,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<Option<PathBuf>, String> {
+        match self
+            .runtime
+            .options
+            .as_ref()
+            .and_then(|o| o.pointer("/cargo/targetDir"))
+        {
+            Some(serde_json::Value::String(path)) => Ok(Some(self.root.join(path))),
+            Some(serde_json::Value::Bool(true)) => {
+                // Metadata resolves Cargo's environment/config target directory.
+                // Rust-analyzer's cargo.targetDir=true setting uses its
+                // rust-analyzer child directory rather than the build directory.
+                let output = self.cargo(
+                    &[
+                        "metadata".into(),
+                        "--no-deps".into(),
+                        "--format-version=1".into(),
+                        "--locked".into(),
+                    ],
+                    deadline,
+                    cancelled,
+                )?;
+                let metadata: serde_json::Value =
+                    serde_json::from_str(&output.stdout).map_err(|_| {
+                        "aft_inspect: cannot resolve Cargo target directory".to_string()
+                    })?;
+                if !output.status.success() || output.truncated {
+                    return Err("aft_inspect: cannot resolve Cargo target directory".into());
+                }
+                let path = metadata
+                    .get("target_directory")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        "aft_inspect: Cargo metadata has no target directory".to_string()
+                    })?;
+                Ok(Some(PathBuf::from(path).join("rust-analyzer")))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn new(
         root: &Path,
         checkout: &Path,
@@ -1230,6 +1424,7 @@ impl CompletedRustCheck {
             root,
             checkout,
             path,
+            persistence_enabled: true,
             runtime,
             saved,
             validation: parking_lot::Mutex::new(None),
@@ -1276,6 +1471,10 @@ impl CompletedRustCheck {
     }
 
     pub(crate) fn complete(&mut self) {
+        self.complete_until(Instant::now() + BUDGET, false);
+    }
+
+    fn complete_until(&mut self, deadline: Instant, captured_before_spawn: bool) {
         if !self.finished {
             return;
         }
@@ -1284,7 +1483,6 @@ impl CompletedRustCheck {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        let deadline = Instant::now() + BUDGET;
         let Some(mut current) = self
             .runtime
             .capture(&self.root, Some(&pending), deadline, None)
@@ -1299,16 +1497,54 @@ impl CompletedRustCheck {
         else {
             return;
         };
+        if captured_before_spawn {
+            // Newly discovered build-script inputs were not in the pre-spawn
+            // snapshot. They must predate the run, rather than certify bytes
+            // changed after the compiler might already have read them.
+            let Some(cutoff) = self
+                .began
+                .and_then(|begin| begin.checked_sub(CHECK_BEGIN_TIMESTAMP_MARGIN))
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|time| time.as_nanos())
+            else {
+                return;
+            };
+            for input in &build_inputs {
+                let Some(input) = canonical(input) else {
+                    return;
+                };
+                if pending.files.contains_key(&input) {
+                    continue;
+                }
+                let Some(metadata) = fs::metadata(input).ok().and_then(|meta| stamp(&meta)) else {
+                    return;
+                };
+                if metadata.modified >= cutoff {
+                    return;
+                }
+                if metadata.changed.is_none_or(|(s, ns)| {
+                    s < 0 || (s as u128 * 1_000_000_000 + ns as u128) >= cutoff
+                }) {
+                    return;
+                }
+            }
+        }
         current.extra_inputs.extend(build_inputs);
         current.extra_env_keys.extend(env_keys);
         current.extra_env_keys.sort();
         current.extra_env_keys.dedup();
         current.extra_inputs.sort();
         current.extra_inputs.dedup();
-        let Some(current) = self
-            .runtime
-            .capture(&self.root, Some(&current), deadline, self.began)
-        else {
+        let Some(current) = self.runtime.capture(
+            &self.root,
+            Some(&current),
+            deadline,
+            if captured_before_spawn {
+                None
+            } else {
+                self.began
+            },
+        ) else {
             return;
         };
         #[cfg(not(unix))]
@@ -1328,6 +1564,10 @@ impl CompletedRustCheck {
             duration_seconds: started.map_or(0, |start| start.elapsed().as_secs()),
         };
         let path = self.path.clone();
+        if !self.persistence_enabled {
+            self.saved = Some(Arc::new(record));
+            return;
+        }
         let persisted = record.clone();
         if let Ok(worker) = std::thread::Builder::new()
             .name("aft-rust-check-save".into())
@@ -1368,6 +1608,7 @@ impl CompletedRustCheck {
         let runtime = self.runtime.clone();
         let root = self.root.clone();
         let path = self.path.clone();
+        let persistence_enabled = self.persistence_enabled;
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         *active = Some(rx);
         if std::thread::Builder::new()
@@ -1378,7 +1619,7 @@ impl CompletedRustCheck {
                 let result = runtime
                     .capture(&root, Some(&saved.fingerprint), deadline, None)
                     .and_then(|current| accept_saved(&saved, current));
-                if result.is_some() && expired(deadline).is_some() {
+                if persistence_enabled && result.is_some() && expired(deadline).is_some() {
                     mark_validated(&path);
                 }
                 let _ = tx.send(result);
@@ -1432,6 +1673,48 @@ impl CompletedRustCheck {
         let last = self.saved.as_ref()?;
         Some(format!("rust-analyzer: cargo check running for {elapsed} s; the last full check here took {}; retry", duration(last.duration_seconds)))
     }
+}
+
+fn cargo_reports(
+    root: &Path,
+    stdout: &str,
+) -> Result<(BTreeMap<PathBuf, Vec<StoredDiagnostic>>, bool), String> {
+    let mut finished = false;
+    for line in stdout.lines() {
+        let message: serde_json::Value = serde_json::from_str(line)
+            .map_err(|_| "aft_inspect: invalid Cargo JSON diagnostic stream".to_string())?;
+        if message.get("reason").and_then(serde_json::Value::as_str) == Some("build-finished") {
+            finished = true;
+        }
+    }
+    let mut reports = BTreeMap::<PathBuf, Vec<StoredDiagnostic>>::new();
+    for error in crate::format::parse_cargo_messages(stdout) {
+        let Some(file) = canonical(&root.join(&error.file)) else {
+            continue;
+        };
+        if !file.starts_with(root) {
+            continue;
+        }
+        reports
+            .entry(file.clone())
+            .or_default()
+            .push(StoredDiagnostic {
+                file,
+                line: error.line,
+                column: error.column,
+                end_line: error.line,
+                end_column: error.column,
+                severity: if error.severity == "warning" {
+                    DiagnosticSeverity::Warning
+                } else {
+                    DiagnosticSeverity::Error
+                },
+                message: error.message,
+                code: None,
+                source: Some("cargo check (aft_inspect)".into()),
+            });
+    }
+    Ok((reports, finished))
 }
 
 fn accept_saved(saved: &SavedCheck, current: Fingerprint) -> Option<SavedCheck> {
@@ -2037,6 +2320,58 @@ mod tests {
         );
         assert!(valid(&cache).is_none());
     }
+    #[test]
+    #[cfg(unix)]
+    fn inspect_refuses_build_inputs_changed_before_their_discovery() {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        if !Command::new(&cargo)
+            .arg("--version")
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!("skipping inspect_refuses_build_inputs_changed_before_their_discovery: cargo unavailable");
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("checkout");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='inspect-build-input'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        fs::write(root.join("input.txt"), "original").unwrap();
+        fs::write(root.join("build.rs"), "fn main() { let _ = std::fs::read_to_string(\"input.txt\").unwrap(); std::fs::write(\"input.txt\", \"changed\").unwrap(); println!(\"cargo:rerun-if-changed=input.txt\"); }\n").unwrap();
+        assert!(Command::new(&cargo)
+            .current_dir(&root)
+            .args(["generate-lockfile", "--offline"])
+            .status()
+            .unwrap()
+            .success());
+        let runtime = Runtime {
+            binary: crate::fake_lsp_test_helper::fake_server_binary(),
+            args: vec![],
+            env: HashMap::new(),
+            options: Some(serde_json::json!({"checkOnSave": false, "cargo": {"targetDir": true}})),
+            launch_env: None,
+            validation_delay: Duration::ZERO,
+        };
+        let mut check =
+            CompletedRustCheck::new(&root, &root, &temp.path().join("storage"), runtime).unwrap();
+        let result = check.run_for_inspect(Instant::now() + Duration::from_secs(30), || false);
+        assert_eq!(
+            fs::read_to_string(root.join("input.txt")).unwrap(),
+            "changed",
+            "control: the build script must run"
+        );
+        assert!(
+            result.is_err(),
+            "an input changed after being read must not certify a clean check"
+        );
+        assert!(check.saved.is_none());
+    }
+
     #[test]
     fn saved_duration_is_in_running_wording() {
         let (_temp, mut cache) = fixture();

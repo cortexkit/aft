@@ -214,6 +214,7 @@ fn classify_binary_source(
 
 fn spawn_status(result: &ServerAttemptResult) -> String {
     match result {
+        ServerAttemptResult::ProjectClosed => "project closed; reopen the project and retry".into(),
         ServerAttemptResult::Ok { .. } => "ok".to_string(),
         ServerAttemptResult::NoRootMarker { .. } => "no_root_marker".to_string(),
         ServerAttemptResult::BinaryNotInstalled { .. } => "binary_not_installed".to_string(),

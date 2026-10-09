@@ -25,6 +25,7 @@ pub enum LspError {
     Timeout(String),
     ServerError { code: i32, message: String },
     NotFound(String),
+    ProjectClosed,
 }
 
 impl std::fmt::Display for LspError {
@@ -38,6 +39,7 @@ impl std::fmt::Display for LspError {
                 write!(f, "server error {code}: {message}")
             }
             Self::NotFound(message) => write!(f, "not found: {message}"),
+            Self::ProjectClosed => write!(f, "project closed; reopen the project and retry"),
         }
     }
 }

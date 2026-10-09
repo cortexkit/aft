@@ -840,8 +840,23 @@ configuration above shows registering `tinymist` for Typst files. Required field
 | `args` | no | Args passed to the server (default: `[]`) |
 | `root_markers` | no | Filenames whose presence anchors the workspace root (default: `[".git"]`) |
 | `env` | no | Extra environment variables for the spawned process |
-| `initialization_options` | no | Passed to the server's LSP `initialize` request |
+| `initialization_options` | no | Passed to the server's LSP `initialize` request; recursively merged over built-in options. Objects merge, while explicit arrays and scalars replace built-in values (including an empty array). |
 | `disabled` | no | Skip this server even though it's registered |
+
+Rust-analyzer's automatic diagnostic checks (flycheck) no longer run `cargo check`
+on save or workspace reload by default.
+Its in-memory analysis remains enabled; `aft_inspect` runs an explicit compiler
+check when needed and reuses a saved result while the checkout inputs are unchanged.
+To restore automatic checks, set the following in your **user** config:
+
+```jsonc
+{ "lsp": { "servers": { "rust": {
+  "initialization_options": { "checkOnSave": true }
+} } } }
+```
+
+This keeps the built-in Cargo `--locked` arguments. To override those arguments,
+set `cargo.extraArgs` or `cargo.metadataExtraArgs` explicitly, for example to `[]`.
 
 **Missing-tool warnings:** on startup, AFT detects configured-but-missing formatters, type
 checkers, and LSP binaries (for languages your project actually uses) and surfaces a one-time

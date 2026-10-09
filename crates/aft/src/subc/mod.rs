@@ -1632,6 +1632,10 @@ fn quiesce_unbound_root(
         // ConfigureTail cannot release gates, install a watcher, or reserve a
         // callgraph build after this transition becomes visible.
         ctx.mark_subc_unbound();
+        // Detach under the root's manager lock before allowing a rebind. The
+        // reaper owns only the old clients, never servers a new route starts.
+        let clients = ctx.lsp().quiesce();
+        crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
         ctx.bash_background()
             .replace_live_delivery_sessions(HashSet::new());
     }
@@ -3630,7 +3634,7 @@ fn run_subc_mode_inner(
     );
     record_exit_phase_event("lsp_shutdown", "start");
     if let Some(registry) = registry {
-        crate::lsp::manager::LspManager::shutdown_taken_clients(clients, registry);
+        crate::lsp::manager::LspManager::shutdown_at_process_exit(clients, registry);
     }
     record_exit_phase_event("lsp_shutdown", "end");
     log::info!(
@@ -13615,6 +13619,99 @@ mod tests {
         assert_eq!(outcome.forgotten_deleted_roots, vec![root.clone()]);
         assert!(!executor.actor_registered(&root));
         assert!(!live_roots.contains_key(&root));
+    }
+
+    #[test]
+    fn quiesced_root_refuses_preserved_inspect_spawn_and_rebind_is_safe() {
+        use crate::lsp::manager::ServerAttemptResult;
+        use crate::lsp::registry::ServerKind;
+
+        let (_root_dir, root) = test_root("quiesced-root-lsp");
+        std::fs::write(
+            root.as_path().join("Cargo.toml"),
+            "[package]\nname='quiesce'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let file = root.as_path().join("lib.rs");
+        std::fs::write(&file, "pub fn f() {}\n").unwrap();
+        let ctx = test_ctx();
+        ctx.mark_subc_bound();
+        ctx.update_config(|config| config.project_root = Some(root.as_path().to_path_buf()));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let config = ctx.config().as_ref().clone();
+        ctx.lsp().override_binary(
+            ServerKind::Rust,
+            crate::fake_lsp_test_helper::fake_server_binary(),
+        );
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
+        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        assert_eq!(ctx.lsp().active_client_count(), 1);
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        quiesce_unbound_root(&root, &mut roots, &executor);
+        assert_eq!(ctx.lsp().active_client_count(), 0);
+
+        // An inspect job can retain this context across route teardown. Its
+        // late start must be a coverage gap, not a new orphaned server.
+        let snapshot = ctx
+            .lsp()
+            .resolve_applicable_servers_for_root(root.as_path(), &config)
+            .unwrap();
+        let denied = ctx.lsp_start_applicable_server_until(
+            &snapshot,
+            &snapshot.server_keys[0],
+            &config,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(denied.successful.is_empty());
+        assert!(denied
+            .failures
+            .iter()
+            .any(|failure| matches!(failure.result, ServerAttemptResult::ProjectClosed)));
+        assert_eq!(ctx.lsp().active_client_count(), 0);
+
+        let file_denied = ctx.lsp().ensure_server_for_file_detailed(&file, &config);
+        assert!(file_denied
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::ProjectClosed)));
+        assert_eq!(ctx.lsp().active_client_count(), 0);
+
+        let inspect = serde_json::from_value::<crate::protocol::RawRequest>(serde_json::json!({
+            "id": "inspect-closed-root", "command": "inspect", "scope": file,
+            "sections": "diagnostics"
+        }))
+        .unwrap();
+        let partial = serde_json::to_value(crate::commands::inspect::handle_inspect_tool_call(
+            &inspect, &ctx,
+        ))
+        .unwrap();
+        assert_eq!(
+            partial["complete"], false,
+            "closed project must not be reported clean: {partial:#}"
+        );
+        assert!(
+            partial.to_string().contains("project closed"),
+            "closed project must name its coverage gap: {partial:#}"
+        );
+
+        // The old server ignores shutdown, so the detached reaper overlaps
+        // rebind. It must never kill the replacement from the new route.
+        ctx.mark_subc_bound();
+        ctx.lsp()
+            .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "0".into());
+        assert_eq!(ctx.lsp().ensure_server_for_file(&file, &config).len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ctx.lsp_child_registry().health_snapshot().children_total > 1 {
+            assert!(Instant::now() < deadline, "old client must be reaped");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        ctx.lsp().drain_events();
+        assert_eq!(ctx.lsp().active_client_count(), 1);
+        assert_eq!(ctx.lsp_child_registry().health_snapshot().children_total, 1);
+        ctx.lsp().shutdown_all();
     }
 
     #[test]

@@ -78,6 +78,9 @@ impl CoverageCause {
 
 #[derive(Default)]
 struct DiagnosticsCollection {
+    // Completed Cargo output can remain useful even when its input fingerprint
+    // cannot be certified. Keep these rows separate from stale native publishes.
+    uncertified_compiler_reports: Vec<CollectedDiagnostic>,
     diagnostics: Vec<CollectedDiagnostic>,
     producer_reports: Vec<(String, PathBuf, Vec<CollectedDiagnostic>)>,
     server_ran: bool,
@@ -169,6 +172,29 @@ pub(crate) fn run_diagnostics_category(
             .collect::<HashSet<_>>();
         (candidates, producer_keys)
     });
+    let mut explicit_check_reasons = HashMap::new();
+    let mut explicit_reports = Vec::new();
+    if let Some(deadline) = sweep_deadline {
+        let work = ctx.lsp().inspect_rust_check_work(expected_producers);
+        for (key, check) in work {
+            let result = check
+                .try_lock_until(deadline)
+                .ok_or_else(|| "cargo check running for aft_inspect; retry".to_string())
+                .and_then(|mut check| {
+                    let result = check.run_for_inspect(deadline, || {
+                        crate::executor::current_job_cancellation()
+                            .is_some_and(|token| token.cancel_requested_before_commit())
+                    });
+                    if result.is_err() {
+                        explicit_reports.extend(check.reports.values().flatten().cloned());
+                    }
+                    result
+                });
+            if let Err(reason) = result {
+                explicit_check_reasons.insert(key, reason);
+            }
+        }
+    }
     let saved = ctx.lsp().saved_rust_checks(
         sweep_deadline
             .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
@@ -304,6 +330,25 @@ pub(crate) fn run_diagnostics_category(
         }
     }
 
+    for (key, reason) in explicit_check_reasons {
+        let producer = (server_id(&key), key.root.clone());
+        collection.servers_pending.remove(&producer);
+        collection.indexing_gaps.remove(&producer);
+        collection.checking_producers.insert(producer.clone());
+        collection.checking_reasons.insert(producer, reason);
+    }
+    collection
+        .uncertified_compiler_reports
+        .extend(
+            explicit_reports
+                .into_iter()
+                .map(|diagnostic| CollectedDiagnostic {
+                    diagnostic,
+                    provisional: true,
+                }),
+        );
+    collection.sort_and_dedup();
+
     if let Some((candidates, _)) = &scoped {
         collection.apply_scope(scope);
         collection.record_scope_coverage_gaps(ctx, snapshot, candidates, sweep.as_ref());
@@ -367,9 +412,9 @@ fn collect_warm_working_set(
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     {
         let mut lsp = ctx.lsp();
-        // The only diagnostics collection path, for scoped and unscoped
-        // requests alike: drain already queued LSP events, then read only the
-        // warm diagnostics store. It does not open files or spawn servers.
+        // Live language-server diagnostics come from queued events and the
+        // warm store. Completed compiler-check snapshots are applied separately
+        // below; this read does not open files or spawn servers.
         lsp.drain_events();
         collection.server_ran = lsp.has_any_diagnostic_reports();
         collection.producer_reports = lsp
@@ -418,13 +463,26 @@ fn collect_warm_working_set(
                     .insert(server.clone(), reason.to_string());
             }
             let key = (server_id(server), server.root.clone());
+            if scope_producers.is_some()
+                && server.kind == ServerKind::Rust
+                && lsp.rust_automatic_checks_disabled(server)
+                && lsp.producer_failure(server).is_none()
+            {
+                // Native per-file reports cannot certify a compiler check.
+                // A validated completed-check snapshot settles this gap below.
+                collection.checking_producers.insert(key.clone());
+                collection
+                    .checking_reasons
+                    .insert(key.clone(), lsp.rust_check_running_reason(server));
+            }
             if scope_producers.is_none()
                 && lsp.producer_failure(server).is_none()
                 && !lsp.server_is_warming(server)
             {
                 let reported = lsp.has_authoritative_report_for_server(server);
                 if server.kind == ServerKind::Rust {
-                    if lsp.rust_check_state(server) != RustCheckState::Current
+                    if lsp.rust_automatic_checks_disabled(server)
+                        || lsp.rust_check_state(server) != RustCheckState::Current
                         || (!reported && !lsp.rust_check_completed_current(server))
                     {
                         collection.checking_producers.insert(key.clone());
@@ -670,6 +728,8 @@ impl DiagnosticsCollection {
     /// are included only after a bounded wait expires, labeled incomplete and
     /// excluded from authoritative counts.
     fn apply_scope(&mut self, scope: &JobScope) {
+        self.uncertified_compiler_reports
+            .retain(|row| scope.contains(&row.diagnostic.file));
         self.producer_reports
             .retain(|(_, file, _)| scope.contains(file));
         self.diagnostics.retain(|diagnostic| {
@@ -880,6 +940,8 @@ impl DiagnosticsCollection {
         // what the producer has published so far, but cannot certify totals.
         self.diagnostics
             .retain(|diagnostic| !diagnostic.provisional || !self.indexing_gaps.is_empty());
+        self.diagnostics
+            .append(&mut self.uncertified_compiler_reports);
         self.sort_and_dedup();
         let (errors, warnings, info, hints) = severity_counts(&self.diagnostics);
         let items = self

@@ -368,4 +368,7 @@ mod tests {
 #[cfg(all(test, target_os = "macos"))]
 mod disk_write_hunt;
 
+#[cfg(test)]
+#[path = "../tests/helpers/fake_lsp.rs"]
+pub(crate) mod fake_lsp_test_helper;
 pub(crate) mod persistence_gate;

@@ -812,6 +812,9 @@ struct ServerStatusEntry {
 impl ServerStatusEntry {
     fn from_attempt(attempt: &crate::lsp::manager::ServerAttempt, scope: ServerScope) -> Self {
         let status = match &attempt.result {
+            ServerAttemptResult::ProjectClosed => {
+                "project closed; reopen the project and retry".into()
+            }
             ServerAttemptResult::Ok { .. } => "ok".to_string(),
             ServerAttemptResult::NoRootMarker { looked_for } => {
                 format!("no_root_marker (looked for: {})", looked_for.join(", "))

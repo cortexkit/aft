@@ -153,7 +153,7 @@ fn is_rust_check_begin(params: Option<&Value>) -> bool {
 /// unless `false`). Measured with rust-analyzer 1.98: with `checkOnSave`
 /// off neither runs, and with `check.workspace` off only the on-save check
 /// does. Both also need the server to accept save notifications.
-fn rust_check_triggers(initialization_options: Option<&Value>) -> (bool, bool) {
+pub(crate) fn rust_check_triggers(initialization_options: Option<&Value>) -> (bool, bool) {
     let disabled = |value: Option<&Value>| match value {
         Some(Value::Bool(enabled)) => !enabled,
         // Older rust-analyzer configurations spell it as an object:

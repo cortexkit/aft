@@ -23,11 +23,11 @@ pub struct ExternalToolResult {
     pub truncated: bool,
 }
 
-struct SubprocessOutcome {
-    stdout: String,
-    stderr: String,
-    status: ExitStatus,
-    truncated: bool,
+pub(crate) struct SubprocessOutcome {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) status: ExitStatus,
+    pub(crate) truncated: bool,
 }
 
 /// Errors from external tool execution.
@@ -101,7 +101,7 @@ impl std::fmt::Display for FormatError {
 /// holding stdout/stderr pipes open, and the reader threads block
 /// until `sleep` terminates — turning a 2s timeout into a 60s hang.
 #[cfg(unix)]
-fn isolate_in_process_group(cmd: &mut Command) {
+pub(crate) fn isolate_in_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: setsid is async-signal-safe.
     unsafe {
@@ -115,7 +115,7 @@ fn isolate_in_process_group(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn isolate_in_process_group(_cmd: &mut Command) {
+pub(crate) fn isolate_in_process_group(_cmd: &mut Command) {
     // Best-effort no-op outside Unix. Windows timeout cleanup uses taskkill /T
     // in kill_process_tree so .cmd wrappers and grandchildren are terminated.
 }
@@ -227,10 +227,29 @@ pub fn run_external_tool(
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 fn wait_with_timeout(
-    mut child: Child,
+    child: Child,
     command: &str,
     timeout_secs: u32,
 ) -> Result<SubprocessOutcome, FormatError> {
+    wait_with_deadline(
+        child,
+        command,
+        Instant::now() + Duration::from_secs(timeout_secs as u64),
+        || false,
+    )
+}
+
+/// Share output capture and process-tree cleanup with deadline-bound inspect checks.
+pub(crate) fn wait_with_deadline(
+    mut child: Child,
+    command: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> Result<SubprocessOutcome, FormatError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timeout_secs = remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0)) as u32;
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
     // Each reader reports when its pipe reaches end of file. A tool closes
@@ -249,7 +268,6 @@ fn wait_with_timeout(
         let _ = closed_tx.send(());
         output
     });
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs as u64);
     let mut open_pipes = 2u8;
     // Once both pipes are closed the tool is exiting; its exit status can lag
     // the close by a moment, so poll with a short, growing interval.
@@ -269,7 +287,7 @@ fn wait_with_timeout(
             }
             Ok(None) => {
                 let now = Instant::now();
-                if now >= deadline {
+                if now >= deadline || cancelled() {
                     kill_process_tree(&mut child);
                     let _ = child.wait();
                     // Do NOT block joining the reader threads — orphaned
@@ -286,7 +304,7 @@ fn wait_with_timeout(
                     // Wait for a pipe to close, or for the deadline. Joining
                     // the readers after exit already waits for the pipes, so
                     // waiting for them here first delays nothing.
-                    match closed_rx.recv_timeout(remaining) {
+                    match closed_rx.recv_timeout(remaining.min(EXIT_POLL_MAX)) {
                         Ok(()) => open_pipes -= 1,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => open_pipes = 0,
@@ -2380,9 +2398,19 @@ fn parse_pyright_output(stdout: &str, file: &Path) -> Vec<ValidationError> {
 
 /// Parse cargo check JSON output, filtering to errors in the target file.
 fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
     let file_str = file.to_string_lossy();
+    parse_cargo_messages(stdout)
+        .into_iter()
+        .filter(|error| {
+            file_str.ends_with(&error.file)
+                || error.file.ends_with(&*file_str)
+                || error.file == file_str
+        })
+        .collect()
+}
 
+pub(crate) fn parse_cargo_messages(stdout: &str) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
     for line in stdout.lines() {
         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {
             if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
@@ -2419,14 +2447,6 @@ fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<Validatio
                         .unwrap_or(false);
 
                     if !is_primary {
-                        continue;
-                    }
-
-                    // Filter to our file
-                    if !file_str.ends_with(span_file)
-                        && !span_file.ends_with(&*file_str)
-                        && span_file != &*file_str
-                    {
                         continue;
                     }
 
@@ -2966,6 +2986,27 @@ mod tests {
             }
             other => panic!("expected NotFound, got: {:?}", other),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn deadline_runner_cancellation_kills_the_process_group() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_in_process_group(&mut command);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        let result = wait_with_deadline(
+            child,
+            "cancelled check",
+            Instant::now() + Duration::from_secs(30),
+            || true,
+        );
+        assert!(matches!(result, Err(FormatError::Timeout { .. })));
+        assert!(!crate::bash_background::process::is_process_alive(pid));
     }
 
     #[test]
