@@ -615,9 +615,8 @@ impl BgTaskRegistry {
                 .map_err(|e| e.to_string())?;
         }
         let request = environment.and_then(|environment| {
-            exec::build_request(
+            build_remote_request(
                 request_root,
-                &repository_root(request_root),
                 &workdir,
                 command,
                 environment,
@@ -1271,6 +1270,62 @@ impl BgTaskRegistry {
         drop(state);
         Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
     }
+}
+
+#[cfg(unix)]
+fn build_remote_request(
+    session_root: &Path,
+    cwd: &Path,
+    command: &str,
+    environment: BTreeMap<String, String>,
+    timeout: Option<u64>,
+    preset: &exec::PresetParams,
+) -> Result<RunRequest, exec::Error> {
+    let session_root = session_root
+        .canonicalize()
+        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+    let session_worktree = worktree_root_containing(&session_root)?.unwrap_or(session_root);
+    let Some(worktree_root) = worktree_root_containing(cwd)? else {
+        return Err(workdir_outside_session_repository());
+    };
+    if repository_root(&worktree_root) != repository_root(&session_worktree) {
+        return Err(workdir_outside_session_repository());
+    }
+
+    // The runner snapshots this key, so it must name the checkout containing cwd.
+    exec::build_request(
+        &worktree_root,
+        &repository_root(&worktree_root),
+        cwd,
+        command,
+        environment,
+        timeout,
+        preset,
+    )
+}
+
+#[cfg(unix)]
+fn worktree_root_containing(path: &Path) -> Result<Option<PathBuf>, exec::Error> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| exec::Error::Protocol(error.to_string()))?;
+    for ancestor in path.ancestors() {
+        let git_marker = ancestor.join(".git");
+        if git_marker.is_file() || git_marker.is_dir() {
+            return ancestor
+                .canonicalize()
+                .map(Some)
+                .map_err(|error| exec::Error::Protocol(error.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+fn workdir_outside_session_repository() -> exec::Error {
+    exec::Error::Protocol(
+        "cwd resolves outside the workspace key: workdir is not inside this session's repository or one of its linked worktrees".into(),
+    )
 }
 
 #[cfg(unix)]

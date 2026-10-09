@@ -79,6 +79,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
 }
 
 fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
+    ensure_git_fixture(dir);
     registry
         .spawn_remote(
             launch(connection),
@@ -274,7 +275,7 @@ async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
         let daemon = daemon(script, "exec-remote/v1").await;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("must-not-run-locally");
-        let ctx = restarted_context(dir.path());
+        let ctx = remote_test_context(dir.path());
         let response = handle_with_policy(
             &ctx,
             Some(launch(daemon.connection.clone())),
@@ -324,7 +325,7 @@ async fn prefix_routing_executor_refusal_still_spawns_locally_with_advisory() {
         let daemon = daemon(script, "exec-remote/v1").await;
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("local-fallback");
-        let ctx = restarted_context(dir.path());
+        let ctx = remote_test_context(dir.path());
         let mut policy = launch(daemon.connection.clone());
         policy.params.remote_exec.as_mut().unwrap().legacy_commands =
             Some(serde_json::json!(["touch"]));
@@ -736,6 +737,7 @@ async fn exec_remote_bash_raw_utf8_pipeline_and_workspace_changes() {
 async fn exec_remote_bash_discloses_only_names_aft_stripped() {
     let daemon = daemon(Script::Utf8, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
+    ensure_git_fixture(dir.path());
     let registry = registry();
     let env = HashMap::from([
         ("BUILD_LABEL".into(), "ordinary-build".into()),
@@ -1952,7 +1954,7 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
 async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
-    let ctx = restarted_context(dir.path());
+    let ctx = remote_test_context(dir.path());
     // Pipes, an environment prefix, a list and a command the old prefix
     // matcher would never have sent anywhere: all of it goes as one line.
     let line = "BUILD_FLAVOR=ci git status | tr a-z A-Z && printf '%s' \"$HOME\" ; ls | wc -l";
@@ -1997,7 +1999,7 @@ async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works
             crate::exec_remote::wire_tests::daemon_with_clients(Script::Plain, "exec-remote/v1", 2)
                 .await;
         let dir = tempfile::tempdir().unwrap();
-        let ctx = restarted_context_with_runon(dir.path(), enabled);
+        let ctx = remote_test_context_with_runon(dir.path(), enabled);
         let mut old = launch(daemon.connection.clone());
         old.params.remote_exec.as_mut().unwrap().legacy_commands =
             Some(serde_json::json!(["cd", "cargo test"]));
@@ -2171,6 +2173,179 @@ async fn runon_is_refused_by_name_whenever_it_cannot_run_remotely() {
     assert!(!marker.exists());
 }
 
+#[cfg(unix)]
+fn hermetic_git(cwd: &Path, args: &[&str]) {
+    let mut command = std::process::Command::new("git");
+    let output = crate::test_env::apply_hermetic_git_env(command.current_dir(cwd))
+        .args(args)
+        .output()
+        .expect("run git fixture command");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn git_fixture(root: &Path) {
+    std::fs::create_dir_all(root).unwrap();
+    hermetic_git(root, &["init", "--quiet"]);
+    hermetic_git(root, &["config", "user.name", "AFT Test"]);
+    hermetic_git(root, &["config", "user.email", "aft-test@example.invalid"]);
+    std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
+    hermetic_git(root, &["add", "tracked.txt"]);
+    hermetic_git(root, &["commit", "--quiet", "-m", "fixture"]);
+}
+
+#[cfg(unix)]
+fn ensure_git_fixture(root: &Path) {
+    if !root.join(".git").exists() {
+        git_fixture(root);
+    }
+}
+
+#[cfg(unix)]
+fn remote_test_context(root: &Path) -> crate::context::AppContext {
+    ensure_git_fixture(root);
+    restarted_context(root)
+}
+
+#[cfg(unix)]
+fn remote_test_context_with_runon(root: &Path, enabled: bool) -> crate::context::AppContext {
+    ensure_git_fixture(root);
+    restarted_context_with_runon(root, enabled)
+}
+
+#[cfg(unix)]
+fn add_git_worktree(repository: &Path, path: &Path, branch: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let path = path.to_str().unwrap();
+    hermetic_git(
+        repository,
+        &["worktree", "add", "--quiet", "-b", branch, path, "HEAD"],
+    );
+}
+
+#[cfg(unix)]
+fn assert_remote_request_paths(
+    request: RunRequest,
+    workspace_key: &Path,
+    repository_root: &Path,
+    cwd: &Path,
+) {
+    let wire = serde_json::to_value(request).unwrap();
+    assert_eq!(wire["workspace_key"], workspace_key.to_str().unwrap());
+    assert_eq!(wire["repository_root"], repository_root.to_str().unwrap());
+    assert_eq!(wire["cwd"], cwd.to_str().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_worktree_remote_requests_use_the_linked_worktree_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git_fixture(&main);
+    let main = main.canonicalize().unwrap();
+    let linked = temp.path().join("linked");
+    add_git_worktree(&main, &linked, "linked-sibling");
+    let linked = linked.canonicalize().unwrap();
+    let subdir = linked.join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+
+    for cwd in [&linked, &subdir] {
+        let request = build_remote_request(
+            &main,
+            cwd,
+            "true",
+            BTreeMap::new(),
+            None,
+            &exec::PresetParams::default(),
+        )
+        .expect("linked worktree cwd should be accepted");
+        assert_remote_request_paths(request, &linked, &main, cwd);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_request_for_main_worktree_keeps_the_main_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git_fixture(&main);
+    let main = main.canonicalize().unwrap();
+    let cwd = main.join("subdir");
+    std::fs::create_dir(&cwd).unwrap();
+
+    let request = build_remote_request(
+        &main,
+        &cwd,
+        "true",
+        BTreeMap::new(),
+        None,
+        &exec::PresetParams::default(),
+    )
+    .unwrap();
+    assert_remote_request_paths(request, &main, &main, &cwd);
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_linked_worktree_remote_request_uses_the_nested_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    git_fixture(&main);
+    let main = main.canonicalize().unwrap();
+    let nested = main.join(".cortexkit/worktrees/nested");
+    add_git_worktree(&main, &nested, "linked-nested");
+    let nested = nested.canonicalize().unwrap();
+    let cwd = nested.join("subdir");
+    std::fs::create_dir(&cwd).unwrap();
+
+    let request = build_remote_request(
+        &main,
+        &cwd,
+        "true",
+        BTreeMap::new(),
+        None,
+        &exec::PresetParams::default(),
+    )
+    .unwrap();
+    assert_remote_request_paths(request, &nested, &main, &cwd);
+}
+
+#[cfg(unix)]
+#[test]
+fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let main = temp.path().join("main");
+    let unrelated = temp.path().join("unrelated");
+    git_fixture(&main);
+    git_fixture(&unrelated);
+    let main = main.canonicalize().unwrap();
+    let unrelated = unrelated.canonicalize().unwrap();
+    let outside = temp.path().join("plain-outside");
+    std::fs::create_dir(&outside).unwrap();
+
+    for cwd in [&unrelated, &outside] {
+        let error = build_remote_request(
+            &main,
+            cwd,
+            "true",
+            BTreeMap::new(),
+            None,
+            &exec::PresetParams::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "workdir is not inside this session's repository or one of its linked worktrees"
+            ),
+            "unexpected refusal reason: {error}"
+        );
+    }
+}
+
 #[test]
 fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_is_absent() {
     use crate::exec_remote::wire_tests::report_vector;
@@ -2222,7 +2397,7 @@ fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_
 async fn a_reporting_runner_report_is_printed_after_the_output() {
     let daemon = daemon(Script::Reported, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
-    let ctx = restarted_context(dir.path());
+    let ctx = remote_test_context(dir.path());
     let response = handle_with_policy(
         &ctx,
         Some(launch(daemon.connection.clone())),

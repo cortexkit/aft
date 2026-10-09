@@ -523,6 +523,9 @@ async fn exercise_catalog_remote_bash(
 ) {
     let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
     let root = tempfile::tempdir().unwrap();
+    if refusal.is_none() {
+        init_remote_git_fixture(root.path());
+    }
     let marker = root.path().join("must-not-run-locally");
     let command = if refusal.is_some() {
         format!("printf local-proof > '{}'", marker.display())
@@ -724,6 +727,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         )
         .await;
         let dir = tempfile::tempdir().unwrap();
+        init_remote_git_fixture(dir.path());
         let ctx = context(dir.path(), dir.path(), Some(daemon.connection.clone()));
         let registry = ctx.bash_background().clone();
         let task = registry
@@ -798,6 +802,29 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 .unwrap();
         }
     }
+}
+
+#[cfg(unix)]
+fn init_remote_git_fixture(root: &Path) {
+    std::fs::create_dir_all(root).unwrap();
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        let output = crate::test_env::apply_hermetic_git_env(command.current_dir(root))
+            .args(args)
+            .output()
+            .expect("run git fixture command");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--quiet"]);
+    git(&["config", "user.name", "AFT Test"]);
+    git(&["config", "user.email", "aft-test@example.invalid"]);
+    std::fs::write(root.join("tracked.txt"), "fixture\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "--quiet", "-m", "fixture"]);
 }
 
 fn bash_properties(answer: &Value, tool: &str) -> Vec<String> {
