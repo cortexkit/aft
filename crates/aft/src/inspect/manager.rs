@@ -1085,6 +1085,22 @@ impl InspectManager {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
     }
 
+    pub(crate) fn dead_code_build_is_pending(&self) -> bool {
+        self.builder_states.lock().ok().is_some_and(|states| {
+            states
+                .get(&JobKey::for_project_category(InspectCategory::DeadCode))
+                .is_some_and(|entry| {
+                    matches!(
+                        entry.state,
+                        Some(
+                            InspectBuilderState::Building
+                                | InspectBuilderState::QueuedBehindColdBuilds
+                        )
+                    )
+                })
+        })
+    }
+
     /// The automatic-retry pause on `category`, if its last build failed and
     /// the pause has not elapsed. An explicit `aft_inspect` is not subject to
     /// it; only automatic (watcher, idle and maintenance) refreshes are.
@@ -2546,10 +2562,7 @@ impl InspectManager {
                 } else {
                     let full =
                         roll_up_tier2_contributions_with_limit(&job, &success.contributions, None);
-                    cap_payload_drill_down(
-                        filter_payload_for_scope(full, &scope),
-                        MAX_DRILL_DOWN_ITEMS,
-                    )
+                    filter_payload_for_scope(full, &scope)
                 },
             },
             Err(message) => JobOutcome::Failed { message },
@@ -3724,18 +3737,19 @@ impl InspectManager {
             let previous = allow_incremental
                 .then(|| self.previous_dead_code_rollup_state(&job.project_root))
                 .flatten();
-            let (aggregate, state, mut verdict) =
+            let (mut aggregate, state, mut verdict) =
                 super::scanners::dead_code::aggregate_dead_code_contributions_incremental(
                     &job.project_root,
                     snapshot,
                     &contributions,
                     &public_api_files,
                     &roles,
-                    Some(MAX_DRILL_DOWN_ITEMS),
+                    None,
                     Some(&contribution_set_hash),
                     previous.as_deref(),
                     &changed_files,
                 );
+            super::job::attach_dead_code_language_coverage(&mut aggregate, &job.scope_files);
             if verdict.kind == super::scanners::dead_code::RollupKind::Full {
                 verdict.reason = phases
                     .projection
@@ -5400,7 +5414,7 @@ fn contribution_from_record(
 fn run_tier2_scan(job: &InspectJob, oxc_result: Option<&OxcEngineResult>) -> InspectResult {
     use super::scanners;
 
-    match job.category {
+    let mut result = match job.category {
         InspectCategory::DeadCode => {
             scanners::dead_code::run_dead_code_scan_with_oxc(job, oxc_result)
         }
@@ -5415,11 +5429,20 @@ fn run_tier2_scan(job: &InspectJob, oxc_result: Option<&OxcEngineResult>) -> Ins
             format!("inspect category '{other}' is not an active Tier 2 scanner"),
             Duration::from_secs(0),
         ),
+    };
+    if job.category == InspectCategory::DeadCode {
+        if let Ok(success) = &mut result.outcome {
+            super::job::attach_dead_code_language_coverage(
+                &mut success.aggregate,
+                &job.scope_files,
+            );
+        }
     }
+    result
 }
 
 fn roll_up_tier2_contributions(job: &InspectJob, contributions: &[FileContribution]) -> Value {
-    roll_up_tier2_contributions_with_limit(job, contributions, Some(MAX_DRILL_DOWN_ITEMS))
+    roll_up_tier2_contributions_with_limit(job, contributions, None)
 }
 
 fn roll_up_tier2_contributions_with_limit(
@@ -5427,7 +5450,7 @@ fn roll_up_tier2_contributions_with_limit(
     contributions: &[FileContribution],
     drill_down_limit: Option<usize>,
 ) -> Value {
-    match job.category {
+    let mut payload = match job.category {
         InspectCategory::DeadCode => {
             roll_up_dead_code_contributions(job, contributions, drill_down_limit)
         }
@@ -5448,7 +5471,11 @@ fn roll_up_tier2_contributions_with_limit(
             "items": [],
             "scanned_files": contributions.len(),
         }),
+    };
+    if job.category == InspectCategory::DeadCode {
+        super::job::attach_dead_code_language_coverage(&mut payload, &job.scope_files);
     }
+    payload
 }
 
 fn scoped_tier2_payload_from_contributions(
@@ -5467,7 +5494,7 @@ fn scoped_tier2_payload_from_contributions(
     let contributions = load_contributions(cache, &rollup_job)?;
     let full_payload = roll_up_tier2_contributions_with_limit(&rollup_job, &contributions, None);
     let scoped_payload = filter_payload_for_scope(full_payload, scope);
-    Ok(cap_payload_drill_down(scoped_payload, MAX_DRILL_DOWN_ITEMS))
+    Ok(scoped_payload)
 }
 
 fn scoped_tier2_rollup_job(
@@ -5693,9 +5720,6 @@ fn roll_up_unused_exports_contributions(
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
-        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
-        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
         "uncertain_count": uncertain_count,
@@ -5955,9 +5979,6 @@ fn roll_up_unused_exports_oxc_contributions(
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
-        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
-        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
         "scanned_files": parsed.len(),
         "languages_skipped": skipped_languages(&job.scope_files, LanguageSkipMode::UnusedExports),
         "uncertain_count": uncertain_count,
@@ -6046,22 +6067,7 @@ fn roll_up_complexity_contributions(
     )
 }
 
-fn cap_payload_drill_down(mut payload: Value, limit: usize) -> Value {
-    let mut capped = false;
-    if let Some(items) = payload.get_mut("items").and_then(Value::as_array_mut) {
-        capped |= items.len() > limit;
-        items.truncate(limit);
-    }
-    if let Some(groups) = payload.get_mut("groups").and_then(Value::as_array_mut) {
-        capped |= groups.len() > limit;
-        groups.truncate(limit);
-    }
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("drill_down_capped".to_string(), json!(capped));
-    }
-    payload
-}
-
+#[cfg(test)]
 const MAX_DRILL_DOWN_ITEMS: usize = 100;
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1,0 +1,58 @@
+{
+  "after_outputs": {},
+  "entries": [],
+  "status": "blocked",
+  "reason": "The baseline and prior judgment-origin raw rows were kept under worker target/ directories and deleted after delivery. No rows or scores are reconstructed from the earlier Markdown tables.",
+  "missing_origins": {
+    "baseline": {"revision": "13dd9cb71", "path": "target/inspect-truth-corpus/_results/<repo>/13dd9cb71", "repos": ["outline", "typeorm", "ripgrep", "axum", "soft-serve", "fastapi"]},
+    "harness": {"revision": "52f09206136a11e1cd18ebf8348d58200bae6e55", "path": "target/inspect-truth-corpus/_results/<repo>/52f09206136a11e1cd18ebf8348d58200bae6e55", "repos": ["outline", "typeorm", "ripgrep", "axum", "soft-serve", "fastapi", "aft"]},
+    "scanner_ts_go": {"revision": "715f01b05062908be3f9cd147f0e4399c40274ec", "path": "target/inspect-truth-corpus/_results/<repo>/715f01b05062908be3f9cd147f0e4399c40274ec", "repos": ["outline", "typeorm", "soft-serve"]},
+    "scanner_rust": {"revision": "7306b6953ace4ad20e8b3108486e6b0d831d8af5", "path": "target/inspect-truth-corpus/_results/<repo>/7306b6953ace4ad20e8b3108486e6b0d831d8af5", "repos": ["ripgrep", "axum", "aft"]}
+  },
+  "blocked_cells": [
+    {"repo":"outline","language":"typescript","category":"unused_exports","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"outline","language":"typescript","category":"dead_code","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"outline","language":"typescript","category":"todos","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"outline","language":"typescript","category":"diagnostics","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"typeorm","language":"typescript","category":"unused_exports","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"typeorm","language":"typescript","category":"dead_code","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"typeorm","language":"typescript","category":"todos","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"typeorm","language":"typescript","category":"diagnostics","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"ripgrep","language":"rust","category":"dead_code","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_rust"]},
+    {"repo":"ripgrep","language":"rust","category":"todos","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_rust"]},
+    {"repo":"ripgrep","language":"rust","category":"diagnostics","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_rust"]},
+    {"repo":"axum","language":"rust","category":"dead_code","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_rust"]},
+    {"repo":"axum","language":"rust","category":"todos","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_rust"]},
+    {"repo":"axum","language":"rust","category":"diagnostics","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_rust"]},
+    {"repo":"soft-serve","language":"go","category":"dead_code","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"soft-serve","language":"go","category":"dead_code (functions)","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"soft-serve","language":"go","category":"todos","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"soft-serve","language":"go","category":"diagnostics","metrics":["precision","recall"],"missing_origins":["baseline","harness","scanner_ts_go"]},
+    {"repo":"fastapi","language":"python","category":"dead_code","metrics":["precision","recall"],"missing_origins":["baseline","harness"]},
+    {"repo":"fastapi","language":"python","category":"todos","metrics":["precision","recall"],"missing_origins":["baseline","harness"]},
+    {"repo":"fastapi","language":"python","category":"diagnostics","metrics":["precision","recall"],"missing_origins":["baseline","harness"]},
+    {"repo":"aft","language":"rust","category":"dead_code","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]},
+    {"repo":"aft","language":"rust","category":"todos","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]},
+    {"repo":"aft","language":"rust","category":"diagnostics","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]},
+    {"repo":"aft","language":"typescript","category":"unused_exports","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]},
+    {"repo":"aft","language":"typescript","category":"dead_code","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]},
+    {"repo":"aft","language":"typescript","category":"todos","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]},
+    {"repo":"aft","language":"typescript","category":"diagnostics","metrics":["precision","recall"],"baseline":"new, no baseline","missing_origins":["harness","scanner_rust"]}
+  ],
+  "passed_acceptance": {
+    "outline_paging": {"pin":"d410db1b24594d71b766212282804d79ca18e5c1","profile":"debug","total":228,"offsets":[0,100,200],"shown":[100,100,28],"next_offsets":[100,200,null],"distinct_rows":228,"repeat_order_stable":true,"exhausted_offset":238,"exhausted_rows":0},
+    "synthetic_paging": {"total":150,"shown":[100,50],"scoped_second_page":50},
+    "inspect_integration": {"passed":112,"ignored":4,"failed":0},
+    "list_envelopes": {"passed":175,"failed":0},
+    "affected_rust_modules": {"inspect_passed":332,"inspect_ignored":4,"inspect_unit_passed":79,"status_seam_passed":4,"status_bar_passed":10,"applicability_passed":4,"failed":0},
+    "plugin_units": {"opencode_passed":1640,"opencode_skipped":3,"pi_passed":842,"pi_skipped":1,"failed":0},
+    "mutation_controls": {"rust_reddened":11,"footer_reddened":1,"unexpected_other_failures":0},
+    "no_work_red_baseline": {"revision":"52f09206136a11e1cd18ebf8348d58200bae6e55","test":"inspect_command_test::scoped_inspect_without_diagnostics_does_no_producer_work","failure":"cold file was analyzed: src/b.rs"}
+  },
+  "not_run": [
+    {"check":"remaining full Rust gate phases","reason":"Linux TLS prerequisite could not run its trust assertion: https://localhost:<port>/v1/embeddings failed DNS lookup (Temporary failure in name resolution)."},
+    {"check":"TypeORM release timing, cold release run and corpus E/W checks","reason":"Linux runner repeatedly refused jobs with runner_draining; Mac release/timing was explicitly disallowed. No medians or corpus footer numbers are claimed."},
+    {"check":"tool-slice before/after score and diagnostics pass on every corpus repository","reason":"Baseline and judgment-origin raw rows were deleted with worker target/ directories; the parent directed recording the blocked gate without reconstructing scores."}
+  ],
+  "finding": "Scoring provenance must be committed or preserved outside regenerable target/ directories. Keeping every baseline and judgment-origin raw result only under target/ makes dependent slices unable to validate judgments or prove the cell rule."
+}

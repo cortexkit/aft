@@ -63,18 +63,44 @@ pub fn build_inspect_envelope(shown: usize, total: usize) -> Option<ListEnvelope
     ))
 }
 
-/// Attach an inspect truncation envelope to `details` if truncated.
-///
-/// If `shown < total`, serializes the envelope under `format!("{list_key}_list_envelope")`.
-/// If the list is complete, no envelope field is added.
+/// Attach first-page counts and pagination metadata beside the findings array.
+/// Complete pages have no cap reason, so their metadata produces no text trailer.
 pub fn attach_inspect_envelope(
     details: &mut Map<String, Value>,
     list_key: &str,
     shown: usize,
     total: usize,
 ) -> Option<ListEnvelope> {
-    let envelope = build_inspect_envelope(shown, total)?;
+    attach_inspect_page_envelope(details, list_key, shown, total, 0)
+}
+
+/// Always attach pagination metadata, including on exhausted and empty pages.
+/// Only a page with more rows ahead is a capped enumeration.
+pub fn attach_inspect_page_envelope(
+    details: &mut Map<String, Value>,
+    list_key: &str,
+    shown: usize,
+    total: usize,
+    offset: usize,
+) -> Option<ListEnvelope> {
+    let end = offset.saturating_add(shown);
+    let next_offset = (end < total && shown > 0).then_some(end);
+    let envelope = ListEnvelope::new(
+        shown,
+        Total::Exact(total),
+        UNIT,
+        if end < total {
+            vec![Reason::Cap]
+        } else {
+            vec![]
+        },
+        NARROW,
+    );
     if let Ok(val) = serde_json::to_value(&envelope) {
+        let mut val = val;
+        val["offset"] = serde_json::json!(offset);
+        val["next_offset"] = serde_json::json!(next_offset);
+        val["reasons"] = serde_json::json!(envelope.causes);
         details.insert(derive_inspect_wire_key(list_key), val);
     }
     Some(envelope)

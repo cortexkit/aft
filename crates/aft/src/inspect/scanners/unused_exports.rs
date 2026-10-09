@@ -191,30 +191,20 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
     }
 
     let roles = crate::inspect::entry_points::resolve_project_roles(&project_root);
-    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
-        headline_items,
-        &roles,
-        Some(DRILL_DOWN_LIMIT),
-    );
-    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
-        generated_items,
-        &roles,
-        Some(DRILL_DOWN_LIMIT),
-    );
+    let headline_items =
+        crate::inspect::entry_points::rank_and_truncate_items(headline_items, &roles, None);
+    let generated_items =
+        crate::inspect::entry_points::rank_and_truncate_items(generated_items, &roles, None);
     let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
     let mut items = headline_items;
     items.extend(generated_items.iter().cloned());
-    items.truncate(DRILL_DOWN_LIMIT);
     let generated_top = generated_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
         .cloned()
         .collect::<Vec<_>>();
-    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
-        test_only_items,
-        &roles,
-        Some(DRILL_DOWN_LIMIT),
-    );
+    let test_only_items =
+        crate::inspect::entry_points::rank_and_truncate_items(test_only_items, &roles, None);
     let test_only_top = test_only_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
@@ -239,9 +229,6 @@ fn run_unused_exports_legacy_scan(job: &InspectJob, started: Instant) -> Inspect
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": count + generated_count > DRILL_DOWN_LIMIT,
-        "generated_drill_down_capped": generated_count > DRILL_DOWN_LIMIT,
-        "test_only_drill_down_capped": test_only_count > DRILL_DOWN_LIMIT,
         "scanned_files": per_file.len(),
         "languages_skipped": languages_skipped,
         "uncertain_count": uncertain_count,
@@ -461,30 +448,20 @@ fn run_unused_exports_oxc_scan(
         .collect::<Vec<_>>();
     contributions.extend(non_js_scans.into_iter().map(|scan| scan.contribution));
 
-    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
-        headline_items,
-        &roles,
-        Some(DRILL_DOWN_LIMIT),
-    );
-    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
-        generated_items,
-        &roles,
-        Some(DRILL_DOWN_LIMIT),
-    );
+    let headline_items =
+        crate::inspect::entry_points::rank_and_truncate_items(headline_items, &roles, None);
+    let generated_items =
+        crate::inspect::entry_points::rank_and_truncate_items(generated_items, &roles, None);
     let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
     let mut items = headline_items;
     items.extend(generated_items.iter().cloned());
-    items.truncate(DRILL_DOWN_LIMIT);
     let generated_top = generated_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
         .cloned()
         .collect::<Vec<_>>();
-    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
-        test_only_items,
-        &roles,
-        Some(DRILL_DOWN_LIMIT),
-    );
+    let test_only_items =
+        crate::inspect::entry_points::rank_and_truncate_items(test_only_items, &roles, None);
     let test_only_top = test_only_items
         .iter()
         .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
@@ -501,9 +478,6 @@ fn run_unused_exports_oxc_scan(
         "test_only_count": test_only_count,
         "test_only_items": test_only_items,
         "test_only_top": test_only_top,
-        "drill_down_capped": count + generated_count > DRILL_DOWN_LIMIT,
-        "generated_drill_down_capped": generated_count > DRILL_DOWN_LIMIT,
-        "test_only_drill_down_capped": test_only_count > DRILL_DOWN_LIMIT,
         "scanned_files": contributions.len(),
         "languages_skipped": languages_skipped,
         "uncertain_count": uncertain_count,

@@ -461,7 +461,9 @@ impl AppContext {
         // reads as "still loading" forever. `diagnostics` says which case it is:
         // `no_language_server` when nothing can produce the counts, null while
         // a running server has not reported yet or the counts are present.
-        let diagnostics_state = if status_bar_values.errors.is_none()
+        let diagnostics_state = if let Some(state) = status_bar_values.diagnostics {
+            serde_json::json!(state)
+        } else if status_bar_values.errors.is_none()
             && status_bar_values.warnings.is_none()
             && self.lsp_server_count_if_available() == Some(0)
         {
@@ -469,11 +471,13 @@ impl AppContext {
         } else {
             serde_json::Value::Null
         };
+        let diagnostics_gaps = status_bar_values.diagnostics_gaps.clone();
         let disabled_categories = status_bar_values.disabled_categories.clone();
         let mut status_bar_values = serde_json::json!({
             "errors": status_bar_values.errors,
             "warnings": status_bar_values.warnings,
             "diagnostics": diagnostics_state,
+            "diagnostics_gaps": diagnostics_gaps,
             "dead_code": status_bar_values.dead_code,
             "unused_exports": status_bar_values.unused_exports,
             "duplicates": status_bar_values.duplicates,

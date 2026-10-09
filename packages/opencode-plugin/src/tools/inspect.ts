@@ -344,8 +344,8 @@ export function createInspectTier2IdleScheduler(options: InspectTier2IdleSchedul
 export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const inspectTool: ToolDefinition = {
     description:
-      "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail, not the categories verified. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\n" +
-      "Use `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\n" +
+      "Codebase health inspection that waits for current analysis. FRESH means the reported analysis is current. PARTIAL means some diagnostics are unknown; the header names the analyzer, reason, and retry guidance. INTERRUPTED means the request stopped without a fresh snapshot; retry aft_inspect. PHASE-FAILED means inspection could not finish; address the reported reason and retry, or narrow the scope. `sections` selects drill-down detail. Scoped requests skip diagnostics unless sections includes 'diagnostics' or 'all'; unscoped requests keep warm diagnostics. Categories switched off in `inspect.categories` are not computed or refreshed, render as off, and never make the header PARTIAL.\n\n" +
+      "Use `scope=` to narrow all findings, counts, and examples to those paths. Cross-boundary duplicates are labeled as groups touching the scope. Scope also limits Rust analyzer startup to the Cargo workspaces owning those paths when diagnostics are requested. Files without an authoritative diagnostic report remain named gaps (complete: false), not a clean result.\n\n" +
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.\n\n" +
       "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
@@ -355,7 +355,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. `sections` changes detail, not the categories verified.",
+            "Categories to include in detailed drill-down (e.g. 'todos' or ['todos', 'dead_code', 'cycles']). Use 'all' for every active category. Omit for summary-only mode. With scope, diagnostics run only when sections includes 'diagnostics' or 'all'; other categories are verified regardless of sections.",
           ),
       ),
       scope: arg(
@@ -363,7 +363,17 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
           .union([z.string(), z.array(z.string())])
           .optional()
           .describe(
-            "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+            "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results. Scoped requests do no diagnostics work unless sections includes 'diagnostics' or 'all'; when requested, diagnostics collect scoped files and report coverage gaps.",
+          ),
+      ),
+      offset: arg(
+        z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe(
+            "Rows to skip independently in each drill-down list. Default 0; follow next_offset in each list envelope.",
           ),
       ),
       topK: arg(
@@ -384,6 +394,7 @@ export function inspectTools(ctx: PluginContext): Record<string, ToolDefinition>
       if (sections !== undefined) rawArgs.sections = sections;
       if (scoped.scope !== undefined) rawArgs.scope = scoped.scope;
       if (args.topK !== undefined && args.topK !== null) rawArgs.topK = args.topK;
+      if (args.offset !== undefined && args.offset !== null) rawArgs.offset = args.offset;
       const response = await callToolCall(ctx, context, "inspect", rawArgs, {
         transportTimeoutMs:
           resolveInspectDiagnosticsTimeoutMs(ctx.config) + INSPECT_TRANSPORT_HEADROOM_MS,

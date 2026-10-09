@@ -12,6 +12,7 @@ function count(value: number | undefined, off = false): string {
  */
 function diagnosticsPart(bar: StatusBar): string {
   if (bar.disabled_categories?.includes("diagnostics")) return "E○ W○";
+  if (bar.diagnostics === "producer_missing") return "E? W?";
   if (
     bar.errors === undefined &&
     bar.warnings === undefined &&

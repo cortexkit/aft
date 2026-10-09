@@ -368,6 +368,61 @@ pub(crate) fn dead_code_skipped_language(file: &Path) -> Option<&'static str> {
     (!dead_code_supports_language(language)).then(|| language_name(language))
 }
 
+/// A skipped programming language is a coverage gap, not evidence of zero
+/// findings. Data and documentation files do not imply dead-code support.
+pub(crate) fn attach_dead_code_language_coverage(
+    payload: &mut serde_json::Value,
+    files: &[PathBuf],
+) {
+    let mut supported = 0usize;
+    let mut unsupported = std::collections::BTreeMap::new();
+    for file in files {
+        let Some(language) = crate::parser::detect_language(file) else {
+            continue;
+        };
+        if dead_code_supports_language(language) {
+            supported += 1;
+        } else if !crate::calls::call_node_kinds(language).is_empty() {
+            *unsupported.entry(language_name(language)).or_insert(0usize) += 1;
+        }
+    }
+    payload["supported_language_files"] = serde_json::json!(supported);
+    let mut gaps = payload["gaps"].as_array().cloned().unwrap_or_default();
+    gaps.retain(|gap| gap["kind"] != "language_unsupported");
+    let unsupported_only = supported == 0 && !unsupported.is_empty();
+    if unsupported_only {
+        if let Some(object) = payload.as_object_mut() {
+            for key in [
+                "unavailable",
+                "callgraph_available",
+                "callgraph_unavailable_reason",
+                "not_computed",
+            ] {
+                object.remove(key);
+            }
+        }
+        gaps.retain(|gap| {
+            !matches!(
+                gap["kind"].as_str(),
+                Some("tier2_unavailable" | "analysis_incomplete")
+            )
+        });
+    }
+    for (language, files) in unsupported {
+        gaps.push(
+            serde_json::json!({"kind": "language_unsupported", "language": language, "files": files,
+            "reason": format!("{language} dead-code analysis is not supported ({files} files)")}),
+        );
+    }
+    if !gaps.is_empty() {
+        payload["complete"] = serde_json::json!(false);
+        payload["gaps"] = serde_json::json!(gaps);
+    }
+    if supported == 0 {
+        payload["count"] = serde_json::Value::Null;
+    }
+}
+
 fn callgraph_store_dead_code_supports_language(language: LangId) -> bool {
     // Dead-code reachability needs real call edges, not just outline symbols.
     // Keep this narrower than every language with a tree-sitter grammar: the
