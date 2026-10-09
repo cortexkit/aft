@@ -1,0 +1,3076 @@
+{
+  "after_outputs": {
+    "outline": ".inspect-truth-ts-liveness/corpus/_results/outline/9f382ddf1",
+    "typeorm": ".inspect-truth-ts-liveness/corpus/_results/typeorm/9f382ddf1",
+    "aft": ".inspect-truth-ts-liveness/corpus/_results/aft/9f382ddf1"
+  },
+  "provenance": {
+    "binary_commit": "9f382ddf1",
+    "baseline_commit": "13dd9cb71a7bbf9076377ac1ba1717dabf15e586",
+    "baseline_recollected": true,
+    "reason": "Dependency snapshots lived under target/ and were deleted after worker delivery. Parent authorized exact-pin fresh baseline/oracles; these replacement snapshots live outside target/ and are retained for reuse.",
+    "corpus_pins": {
+      "outline": "d410db1b24594d71b766212282804d79ca18e5c1",
+      "typeorm": "17e858da8d2becab1ca47826f670a4660da70142",
+      "aft": "9f382ddf1"
+    },
+    "measurement_excludes": [
+      "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace-type-only.input.ts",
+      "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace-type-only.output.ts",
+      "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace.input.ts",
+      "packages/codemod/test/transforms/v1/fixtures/column-readonly/column-readonly-metadata-args-namespace.output.ts",
+      "benchmarks/src/exercise.ts"
+    ],
+    "exclude_reason": "Parent authorized these exact five out-of-domain syntax-invalid fixtures, identically excluded on before and after sides using temporary .aftignore files. Original default captures are retained as aft.original-default.json. No parser tolerance or source fixture was changed.",
+    "extra_unscoped_dead_code_waits": 3,
+    "oracle_tools": {
+      "fallow": "2.88.3",
+      "knip": "5.85.0",
+      "typescript": "5.9.3"
+    }
+  },
+  "entries": [
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/CacheClearCommand.ts",
+      "symbol": "CacheClearCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/MigrationRevertCommand.ts",
+      "symbol": "MigrationRevertCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/MigrationRunCommand.ts",
+      "symbol": "MigrationRunCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/MigrationShowCommand.ts",
+      "symbol": "MigrationShowCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/QueryCommand.ts",
+      "symbol": "QueryCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SchemaDropCommand.ts",
+      "symbol": "SchemaDropCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SchemaLogCommand.ts",
+      "symbol": "SchemaLogCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SchemaSyncCommand.ts",
+      "symbol": "SchemaSyncCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/common/NonNever.ts",
+      "symbol": "NonNever",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/common/RelationType.ts",
+      "symbol": "Relation",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/decorator/listeners/AfterInsert.ts",
+      "symbol": "AfterInsert",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/decorator/listeners/BeforeRemove.ts",
+      "symbol": "BeforeRemove",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/decorator/options/TransactionOptions.ts",
+      "symbol": "TransactionOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AggregationCursorOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AutoEncryptionExtraOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Callback",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientEncryption",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientEncryptionRewrapManyDataKeyResult",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientEncryptionSocketOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "IdPServerResponse",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoAWSError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoAzureError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoBatchReExecutionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoBulkWriteError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoChangeStreamError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientBulkWriteCursorError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientBulkWriteError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientBulkWriteExecutionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientClosedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCompatibilityError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptAzureKMSRequestError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptCreateDataKeyError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptCreateEncryptedCollectionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptInvalidArgumentError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptKMSRequestNetworkTimeoutError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCursorExhaustedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCursorInUseError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoDecompressionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoExpiredSessionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoGCPError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoGridFSChunkError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoGridFSStreamError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoInvalidArgumentError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoKerberosError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoMissingCredentialsError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoMissingDependencyError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoNetworkTimeoutError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoNotConnectedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoOperationTimeoutError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoParseError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoServerClosedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoServerSelectionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoStalePrimaryError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoTailableCursorError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoTopologyClosedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoTransactionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoUnexpectedServerResponseError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoWriteConcernError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MonitorEvents",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MonitorOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "SchemaMember",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "SelectServerOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Stream",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "StreamDescription",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "StrictFilter",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "StrictUpdateFilter",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/types/GeoJsonTypes.ts",
+      "symbol": "GeoJSON",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/CannotReflectMethodParameterTypeError.ts",
+      "symbol": "CannotReflectMethodParameterTypeError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/ConnectionNotFoundError.ts",
+      "symbol": "ConnectionNotFoundError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/MetadataAlreadyExistsError.ts",
+      "symbol": "MetadataAlreadyExistsError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/MetadataWithSuchNameAlreadyExistsError.ts",
+      "symbol": "MetadataWithSuchNameAlreadyExistsError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/MissingJoinColumnError.ts",
+      "symbol": "MissingJoinColumnError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/MissingJoinTableError.ts",
+      "symbol": "MissingJoinTableError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/PersistedEntityNotFoundError.ts",
+      "symbol": "PersistedEntityNotFoundError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/RepositoryNotTreeError.ts",
+      "symbol": "RepositoryNotTreeError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/UsingJoinColumnIsNotAllowedError.ts",
+      "symbol": "UsingJoinColumnIsNotAllowedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/UsingJoinColumnOnlyOnOneSideAllowedError.ts",
+      "symbol": "UsingJoinColumnOnlyOnOneSideAllowedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/UsingJoinTableIsNotAllowedError.ts",
+      "symbol": "UsingJoinTableIsNotAllowedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/error/UsingJoinTableOnlyOnOneSideAllowedError.ts",
+      "symbol": "UsingJoinTableOnlyOnOneSideAllowedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/query-builder/JoinOptions.ts",
+      "symbol": "JoinOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/query-builder/QueryPartialEntity.ts",
+      "symbol": "QueryPartialEntity",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "packages/typeorm/src/repository/EntityId.ts",
+      "symbol": "EntityId",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/CacheClearCommand.ts",
+      "symbol": "CacheClearCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/EntityCreateCommand.ts",
+      "symbol": "EntityCreateCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/InitCommand.ts",
+      "symbol": "InitCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/MigrationRevertCommand.ts",
+      "symbol": "MigrationRevertCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/MigrationRunCommand.ts",
+      "symbol": "MigrationRunCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/MigrationShowCommand.ts",
+      "symbol": "MigrationShowCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/QueryCommand.ts",
+      "symbol": "QueryCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SchemaDropCommand.ts",
+      "symbol": "SchemaDropCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SchemaLogCommand.ts",
+      "symbol": "SchemaLogCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SchemaSyncCommand.ts",
+      "symbol": "SchemaSyncCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/SubscriberCreateCommand.ts",
+      "symbol": "SubscriberCreateCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/commands/VersionCommand.ts",
+      "symbol": "VersionCommand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "setInternalBufferSize",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "serializeWithBufferAndIndex",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "calculateObjectSize",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "deserializeStream",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "UUIDExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BinaryExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BinaryExtendedLegacy",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BinarySequence",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "CodeExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "DBRefLike",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "Decimal128Extended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "DoubleExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "EJSONOptions",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "EJSONOptionsBase",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "EJSONSerializeOptions",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "EJSONParseOptions",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "Int32Extended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "LongExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "MaxKeyExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "MinKeyExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "ObjectIdExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "ObjectIdLike",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONRegExpExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONRegExpExtendedLegacy",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONSymbolExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "LongWithoutOverrides",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "TimestampExtended",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "TimestampOverrides",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "LongWithoutOverridesClass",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "SerializeOptions",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "DeserializeOptions",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "NumberUtils",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "ByteUtils",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONValue",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "bsonType",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONTypeTag",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONError",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONVersionError",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONRuntimeError",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONOffsetError",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "EJSON",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "onDemand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "OnDemand",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "CalculateObjectSizeOptions",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSON",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "BSON",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Binary",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "BSONRegExp",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "BSONSymbol",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "BSONType",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Code",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "DBRef",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Decimal128",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "deserialize",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Double",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Int32",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Long",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MaxKey",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MinKey",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "serialize",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Timestamp",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "UUID",
+      "verdict": "public_api",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/codemod/src/transforms/ast-helpers.ts",
+      "symbol": "TYPEORM_FIND_OPTIONS_METHODS",
+      "verdict": "aft_correct",
+      "note": "Export used only within ast-helpers.ts (references at :697, :945-946, :1120-1123); exact-name search across codemod/src found no other file importing these constants. The helper is live but its export modifier is unnecessary; the codemod CLI bin is not a public library API."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/codemod/src/transforms/ast-helpers.ts",
+      "symbol": "TYPEORM_REPOSITORY_TYPES",
+      "verdict": "aft_correct",
+      "note": "Export used only within ast-helpers.ts (references at :697, :945-946, :1120-1123); exact-name search across codemod/src found no other file importing these constants. The helper is live but its export modifier is unnecessary; the codemod CLI bin is not a public library API."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/codemod/src/transforms/ast-helpers.ts",
+      "symbol": "TYPEORM_DATASOURCE_TYPES",
+      "verdict": "aft_correct",
+      "note": "Export used only within ast-helpers.ts (references at :697, :945-946, :1120-1123); exact-name search across codemod/src found no other file importing these constants. The helper is live but its export modifier is unnecessary; the codemod CLI bin is not a public library API."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/common/NonNever.ts",
+      "symbol": "NonNever",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/decorator/options/TransactionOptions.ts",
+      "symbol": "TransactionOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONOffsetError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONRuntimeError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "bsonType",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONValue",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSONVersionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "calculateObjectSize",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "deserializeStream",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "EJSON",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "LongWithoutOverridesClass",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "onDemand",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "serializeWithBufferAndIndex",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "setInternalBufferSize",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/bson.typings.ts",
+      "symbol": "BSON",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AbstractCursor",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Admin",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AggregationCursorOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AuthMechanism",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AutoEncryptionExtraOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "AutoEncryptionLoggerLevel",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Batch",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "BatchType",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "BulkOperationBase",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Callback",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientEncryption",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientEncryptionRewrapManyDataKeyResult",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientEncryptionSocketOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ClientSession",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "CommandFailedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "CommandStartedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "CommandSucceededEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Compressor",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionCheckedInEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionCheckedOutEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionCheckOutFailedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionCheckOutStartedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionClosedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionCreatedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionPoolClearedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionPoolClosedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionPoolCreatedEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionPoolMonitoringEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionPoolReadyEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectionReadyEvent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ConnectOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "CURSOR_FLAGS",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "CursorTimeoutMode",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "Db",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ExplainableCursor",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ExplainVerbosity",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "FindOperators",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "GridFSBucket",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "GridFSBucketReadStream",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "GridFSBucketWriteStream",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "GSSAPICanonicalizationValue",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "HostAddress",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "IdPServerResponse",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "LEGAL_TCP_SOCKET_OPTIONS",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "LEGAL_TLS_SOCKET_OPTIONS",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ListCollectionsCursor",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "ListSearchIndexesCursor",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MONGO_CLIENT_EVENTS",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoAPIError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoAWSError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoAzureError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoBatchReExecutionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoBulkWriteError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoChangeStreamError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientBulkWriteCursorError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientBulkWriteError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientBulkWriteExecutionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoClientClosedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCompatibilityError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCredentials",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptAzureKMSRequestError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptCreateDataKeyError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptCreateEncryptedCollectionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptInvalidArgumentError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCryptKMSRequestNetworkTimeoutError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCursorExhaustedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoCursorInUseError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoDBCollectionNamespace",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoDBNamespace",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoDecompressionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoDriverError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoErrorLabel",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoExpiredSessionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoGCPError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoGridFSChunkError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoGridFSStreamError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoInvalidArgumentError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoKerberosError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoLoggableComponent",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoMissingCredentialsError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoMissingDependencyError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoNetworkError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoNetworkTimeoutError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoNotConnectedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoOIDCError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoOperationTimeoutError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoParseError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoRuntimeError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoServerClosedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoServerError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoServerSelectionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoStalePrimaryError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoSystemError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoTailableCursorError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoTopologyClosedError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoTransactionError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoUnexpectedServerResponseError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/driver/mongodb/typings.ts",
+      "symbol": "MongoWriteConcernError",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/query-builder/JoinOptions.ts",
+      "symbol": "JoinOptions",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "typeorm",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "packages/typeorm/src/repository/EntityId.ts",
+      "symbol": "EntityId",
+      "verdict": "aft_false_positive",
+      "note": "Public package subpath under packages/typeorm/src/: package.json:19-45 exposes the literal ./* key, publishConfig.directory is build/package at :213-215, and tsconfig.json has no rootDir, so src/ is the published source root. Library exports need no in-package consumer; export declare in a .ts file is not the reason for suppression."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuInternalLink",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuInternalLink is rendered in app/components/primitives/Menu/index.tsx:344-360 and app/components/Menu/transformer.tsx:57-67,192-203."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuInternalLink",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuInternalLink is rendered in app/components/primitives/Menu/index.tsx:344-360 and app/components/Menu/transformer.tsx:57-67,192-203."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuInternalLink",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. Components.MenuInternalLink is rendered in app/components/primitives/Menu/index.tsx:344-360 and app/components/Menu/transformer.tsx:57-67,192-203."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuExternalLink",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuExternalLink is rendered in app/components/primitives/Menu/index.tsx:379-399 and app/components/Menu/transformer.tsx:69-82,205-219."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuExternalLink",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuExternalLink is rendered in app/components/primitives/Menu/index.tsx:379-399 and app/components/Menu/transformer.tsx:69-82,205-219."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuExternalLink",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. Components.MenuExternalLink is rendered in app/components/primitives/Menu/index.tsx:379-399 and app/components/Menu/transformer.tsx:69-82,205-219."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuSubTrigger",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuSubTrigger is rendered by production submenu triggers at app/components/primitives/Menu/index.tsx:131-148."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuSubTrigger",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuSubTrigger is rendered by production submenu triggers at app/components/primitives/Menu/index.tsx:131-148."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuSubTrigger",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. Components.MenuSubTrigger is rendered by production submenu triggers at app/components/primitives/Menu/index.tsx:131-148."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "SelectedIconWrapper",
+      "verdict": "oracle_wrong",
+      "note": "Components.SelectedIconWrapper wraps selected production menu items at app/components/primitives/Menu/index.tsx:311-315 and app/components/Menu/transformer.tsx:184-188."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "SelectedIconWrapper",
+      "verdict": "oracle_wrong",
+      "note": "Components.SelectedIconWrapper wraps selected production menu items at app/components/primitives/Menu/index.tsx:311-315 and app/components/Menu/transformer.tsx:184-188."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "SelectedIconWrapper",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. Components.SelectedIconWrapper wraps selected production menu items at app/components/primitives/Menu/index.tsx:311-315 and app/components/Menu/transformer.tsx:184-188."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuShortcut",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuShortcut renders shortcut keys at app/components/primitives/Menu/index.tsx:243-263."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuShortcut",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuShortcut renders shortcut keys at app/components/primitives/Menu/index.tsx:243-263."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuShortcut",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. Components.MenuShortcut renders shortcut keys at app/components/primitives/Menu/index.tsx:243-263."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuContent",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuContent renders production content at app/components/primitives/Menu/index.tsx:114-116."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuContent",
+      "verdict": "oracle_wrong",
+      "note": "Components.MenuContent renders production content at app/components/primitives/Menu/index.tsx:114-116."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/primitives/components/Menu.tsx",
+      "symbol": "MenuContent",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. Components.MenuContent renders production content at app/components/primitives/Menu/index.tsx:114-116."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/converters/CsvConverter.ts",
+      "symbol": "CsvConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:265-267 selects CsvConverter from an awaited literal import; production conversion uses it at :222-224,235-237."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/converters/CsvConverter.ts",
+      "symbol": "CsvConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:265-267 selects CsvConverter from an awaited literal import; production conversion uses it at :222-224,235-237."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/converters/CsvConverter.ts",
+      "symbol": "CsvConverter",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. DocumentConverter.ts:265-267 selects CsvConverter from an awaited literal import; production conversion uses it at :222-224,235-237."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/converters/DocxConverter.ts",
+      "symbol": "DocxConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:257-259 selects DocxConverter from an awaited literal import; production conversion uses it at :163-164,190-192."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/converters/DocxConverter.ts",
+      "symbol": "DocxConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:257-259 selects DocxConverter from an awaited literal import; production conversion uses it at :163-164,190-192."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/converters/DocxConverter.ts",
+      "symbol": "DocxConverter",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. DocumentConverter.ts:257-259 selects DocxConverter from an awaited literal import; production conversion uses it at :163-164,190-192."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/converters/MimeArchiveConverter.ts",
+      "symbol": "MimeArchiveConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:261-263 selects MimeArchiveConverter from an awaited literal import; production conversion uses it at :161-162,168-179,192-196."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/converters/MimeArchiveConverter.ts",
+      "symbol": "MimeArchiveConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:261-263 selects MimeArchiveConverter from an awaited literal import; production conversion uses it at :161-162,168-179,192-196."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/converters/MimeArchiveConverter.ts",
+      "symbol": "MimeArchiveConverter",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. DocumentConverter.ts:261-263 selects MimeArchiveConverter from an awaited literal import; production conversion uses it at :161-162,168-179,192-196."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/converters/TextPackConverter.ts",
+      "symbol": "TextPackConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:269-271 selects TextPackConverter from an awaited literal import; production conversion uses it at :238-239."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/converters/TextPackConverter.ts",
+      "symbol": "TextPackConverter",
+      "verdict": "oracle_wrong",
+      "note": "DocumentConverter.ts:269-271 selects TextPackConverter from an awaited literal import; production conversion uses it at :238-239."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/converters/TextPackConverter.ts",
+      "symbol": "TextPackConverter",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. DocumentConverter.ts:269-271 selects TextPackConverter from an awaited literal import; production conversion uses it at :238-239."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/services/admin.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/services/admin.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/services/admin.ts",
+      "symbol": "default",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/services/collaboration.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/services/collaboration.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/services/collaboration.ts",
+      "symbol": "default",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/services/cron.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/services/cron.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/services/cron.ts",
+      "symbol": "default",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/services/websockets.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/services/websockets.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/services/websockets.ts",
+      "symbol": "default",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "oracle",
+      "path": "server/services/worker.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "oracle",
+      "path": "server/services/worker.ts",
+      "symbol": "default",
+      "verdict": "oracle_wrong",
+      "note": "server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/services/worker.ts",
+      "symbol": "default",
+      "verdict": "aft_false_positive",
+      "note": "Baseline missed a production namespace/dynamic-import reference. server/services/index.ts:7-14 registers this literal dynamic-import loader; server/main.ts:110-118 awaits the selected loader and invokes its default init. The stored arrow result is a whole-namespace use, not an unused default."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/components/Tabs/Tabs.tsx",
+      "symbol": "Separator",
+      "verdict": "aft_correct",
+      "note": "Only its definition (Tabs.tsx:56-61) and unused re-export (Tabs/index.ts:2) occur; production Tabs consumers use Tabs/Tab, not this Separator. Other Separator names belong to different modules."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "app/types.ts",
+      "symbol": "Pagination",
+      "verdict": "aft_correct",
+      "note": "Client type at app/types.ts:245-249 has no import/reference. Pagination imports use the distinct @shared/constants value or server/types.ts type; production Store.ts:19,28 imports those other definitions."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "server/middlewares/feature.ts",
+      "symbol": "feature",
+      "verdict": "aft_correct",
+      "note": "Only definition found by exact feature( search. comments/comments.ts:8,26-32 imports and calls commentingEnabled, not this separate function (feature.ts:12-19)."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "shared/editor/queries/table.ts",
+      "symbol": "isColSelection",
+      "verdict": "aft_correct",
+      "note": "Exact-name search finds only the wrapper definition at :23 and the unrelated selection-class methods. Production query imports use other helpers (app/editor/menus/tableRow.tsx:15-20)."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "shared/editor/queries/table.ts",
+      "symbol": "isRowSelection",
+      "verdict": "aft_correct",
+      "note": "Exact-name search finds only the wrapper definition at :35 and the unrelated selection-class methods. Production query imports use other helpers (app/editor/menus/tableRow.tsx:15-20)."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "shared/utils/keyboard.ts",
+      "symbol": "meta",
+      "verdict": "aft_correct",
+      "note": "Production keyboard imports and shortcuts use metaDisplay, not the meta export (keyboard.ts:23-37; Header.tsx:11-14; KeyboardShortcut.tsx:37-45)."
+    },
+    {
+      "repo": "outline",
+      "category": "dead_code",
+      "side": "aft",
+      "path": "shared/utils/markdown.ts",
+      "symbol": "escape",
+      "verdict": "aft_correct",
+      "note": "Production imports from this module consume replaceMarkdownLinks (MarkdownAPIImportTask.ts:6), not escape. Other escape imports use es-toolkit/compat, not this definition (markdown.ts:26-30)."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "app/components/Tabs/Tabs.tsx",
+      "symbol": "Separator",
+      "verdict": "aft_correct",
+      "note": "Only its definition (Tabs.tsx:56-61) and unused re-export (Tabs/index.ts:2) occur; production Tabs consumers use Tabs/Tab, not this Separator. Other Separator names belong to different modules."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "app/types.ts",
+      "symbol": "Pagination",
+      "verdict": "aft_correct",
+      "note": "Client type at app/types.ts:245-249 has no import/reference. Pagination imports use the distinct @shared/constants value or server/types.ts type; production Store.ts:19,28 imports those other definitions."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "server/middlewares/feature.ts",
+      "symbol": "feature",
+      "verdict": "aft_correct",
+      "note": "Only definition found by exact feature( search. comments/comments.ts:8,26-32 imports and calls commentingEnabled, not this separate function (feature.ts:12-19)."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "shared/editor/lib/prosemirror-recreate-transform/recreateTransform.ts",
+      "symbol": "RecreateTransform",
+      "verdict": "aft_correct",
+      "note": "Class is instantiated only inside its own recreateTransform wrapper (:302-309). Production callers in multiplayer.ts:77-99, ChangesetHelper.ts:319-326 and PasteHandler.tsx:353-360 import recreateTransform, not the class. Internal class use is live but exporting the class is unnecessary."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "shared/editor/queries/table.ts",
+      "symbol": "isColSelection",
+      "verdict": "aft_correct",
+      "note": "Exact-name search finds only the wrapper definition at :23 and the unrelated selection-class methods. Production query imports use other helpers (app/editor/menus/tableRow.tsx:15-20)."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "shared/editor/queries/table.ts",
+      "symbol": "isRowSelection",
+      "verdict": "aft_correct",
+      "note": "Exact-name search finds only the wrapper definition at :35 and the unrelated selection-class methods. Production query imports use other helpers (app/editor/menus/tableRow.tsx:15-20)."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "shared/utils/keyboard.ts",
+      "symbol": "meta",
+      "verdict": "aft_correct",
+      "note": "Production keyboard imports and shortcuts use metaDisplay, not the meta export (keyboard.ts:23-37; Header.tsx:11-14; KeyboardShortcut.tsx:37-45)."
+    },
+    {
+      "repo": "outline",
+      "category": "unused_exports",
+      "side": "aft",
+      "path": "shared/utils/markdown.ts",
+      "symbol": "escape",
+      "verdict": "aft_correct",
+      "note": "Production imports from this module consume replaceMarkdownLinks (MarkdownAPIImportTask.ts:6), not escape. Other escape imports use es-toolkit/compat, not this definition (markdown.ts:26-30)."
+    }
+  ]
+}
