@@ -157,6 +157,16 @@ fn try_spawn_pty(
         workdir,
         env,
     )?;
+    let spawn_program = command
+        .get_argv()
+        .first()
+        .cloned()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let spawn_workdir = command
+        .get_cwd()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workdir.to_path_buf());
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -170,15 +180,24 @@ fn try_spawn_pty(
     let child = if crate::privacy_spawn::requested(env) {
         crate::privacy_spawn::spawn_pty(command, pair.master.as_ref())?
     } else {
-        pair.slave
-            .spawn_command(command)
-            .map_err(|error| format!("spawn PTY command failed: {error}"))?
+        pair.slave.spawn_command(command).map_err(|error| {
+            crate::bash_background::format_spawn_failure(
+                "spawn PTY command failed",
+                &spawn_program,
+                &spawn_workdir,
+                error,
+            )
+        })?
     };
     #[cfg(not(target_os = "macos"))]
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| format!("spawn PTY command failed: {error}"))?;
+    let child = pair.slave.spawn_command(command).map_err(|error| {
+        crate::bash_background::format_spawn_failure(
+            "spawn PTY command failed",
+            &spawn_program,
+            &spawn_workdir,
+            error,
+        )
+    })?;
     if crate::privacy_spawn::requested(env) {
         crate::privacy_spawn::note_session(session_id);
     }

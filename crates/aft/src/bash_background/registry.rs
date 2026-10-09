@@ -9952,9 +9952,14 @@ fn spawn_detached_child(
         crate::agent_child_env::apply_to_command(&mut child_command, env);
         crate::sandbox_spawn::apply_sandbox_environment(spawn_plan, &mut child_command, env);
         crate::sandbox_spawn::disclaim_command_for_plan(spawn_plan, &mut child_command, env)?;
-        let child = child_command
-            .spawn()
-            .map_err(|e| format!("failed to spawn background bash command: {e}"));
+        let child = child_command.spawn().map_err(|error| {
+            super::format_spawn_failure(
+                "failed to spawn background bash command",
+                Path::new(child_command.get_program()),
+                child_command.get_current_dir().unwrap_or(workdir),
+                error,
+            )
+        });
         drop((payload, exit, failure, profile_handle));
         child
     }
@@ -10001,6 +10006,7 @@ fn spawn_detached_child(
             FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP | FLAG_CREATE_BREAKAWAY_FROM_JOB;
         let without_breakaway = FLAG_CREATE_NO_WINDOW | FLAG_CREATE_NEW_PROCESS_GROUP;
         let mut last_error: Option<String> = None;
+        let mut last_program: Option<PathBuf> = None;
         for (idx, shell) in candidates.iter().enumerate() {
             // Per-shell, try with breakaway first. If the process is in a
             // restrictive job, the breakaway flag triggers Access Denied
@@ -10044,6 +10050,7 @@ fn spawn_detached_child(
                         crate::slog_warn!("background bash spawn: {} returned NotFound at runtime — trying next candidate",
                         shell.binary());
                         last_error = Some(format!("{}: {e}", shell.binary()));
+                        last_program = Some(PathBuf::from(shell.binary().into_owned()));
                         // Skip the without-breakaway retry for NotFound — the
                         // binary itself is missing, breakaway flag is irrelevant.
                         break;
@@ -10056,23 +10063,37 @@ fn spawn_detached_child(
                             shell.binary()
                         );
                         last_error = Some(format!("{}: {e}", shell.binary()));
+                        last_program = Some(PathBuf::from(shell.binary().into_owned()));
                         continue;
                     }
                     Err(e) => {
-                        return Err(format!(
-                            "failed to spawn background bash command via {}: {e}",
-                            shell.binary()
+                        return Err(super::format_spawn_failure(
+                            &format!(
+                                "failed to spawn background bash command via {}",
+                                shell.binary()
+                            ),
+                            Path::new(cmd.get_program()),
+                            cmd.get_current_dir().unwrap_or(workdir),
+                            e,
                         ));
                     }
                 }
             }
         }
-        Err(format!(
+        let candidates = candidates
+            .iter()
+            .map(|shell| shell.binary())
+            .collect::<Vec<_>>();
+        let context = format!(
             "failed to spawn background bash command: no Windows shell could be spawned. \
-             Last error: {}. PATH-probed candidates: {:?}",
-            last_error.unwrap_or_else(|| "no candidates were attempted".to_string()),
-            candidates.iter().map(|s| s.binary()).collect::<Vec<_>>()
-        ))
+             PATH-probed candidates: {candidates:?}"
+        );
+        match (last_program, last_error) {
+            (Some(program), Some(error)) => Err(super::format_spawn_failure(
+                &context, &program, workdir, error,
+            )),
+            _ => Err(format!("{context}: no candidates were attempted")),
+        }
     }
 }
 
@@ -10170,6 +10191,43 @@ mod tests {
     const QUICK_SUCCESS_COMMAND: &str = "true";
     #[cfg(windows)]
     const QUICK_SUCCESS_COMMAND: &str = "cmd /c exit 0";
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_background_spawn_error_names_missing_workdir() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let missing_workdir = project.path().join("does-not-exist");
+        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+
+        let error = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                "true",
+                "bash-background-spawn-error-workdir".to_string(),
+                missing_workdir.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap_err();
+
+        assert!(
+            error.contains(&format!(
+                "working directory does not exist: {}",
+                missing_workdir.display()
+            )),
+            "spawn error did not identify the missing workdir: {error}"
+        );
+        assert!(
+            error.ends_with("(os error 2)"),
+            "OS error must remain last: {error}"
+        );
+    }
 
     /// Upper bound for "a trivial child terminates". This asserts liveness, not
     /// speed: under a parallel libtest run on a contended Windows CI runner a

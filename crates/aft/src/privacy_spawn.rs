@@ -125,10 +125,22 @@ pub(crate) fn spawn_pty(
         });
     }
     macos::install(&mut command, true, true)?;
+    let spawn_program = std::path::Path::new(command.get_program()).to_path_buf();
+    let spawn_workdir = command
+        .get_current_dir()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
     command
         .spawn()
         .map(|child| Box::new(child) as Box<dyn portable_pty::Child + Send + Sync>)
-        .map_err(|error| format!("privacy disclaim unavailable: PTY spawn failed: {error}"))
+        .map_err(|error| {
+            crate::bash_background::format_spawn_failure(
+                "privacy disclaim unavailable: PTY spawn failed",
+                &spawn_program,
+                &spawn_workdir,
+                error,
+            )
+        })
 }
 
 #[cfg(target_os = "macos")]
