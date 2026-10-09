@@ -1542,6 +1542,22 @@ impl BgTaskRegistry {
             .is_some_and(|t| t.state.lock().is_ok_and(|s| s.metadata.remote.is_some()))
     }
 
+    /// A remote task's job ID and phase; `None` for a local task.
+    pub(crate) fn remote_progress(
+        &self,
+        task_id: &str,
+        session: &str,
+    ) -> Option<remote::RemoteProgress> {
+        self.task_for_session(task_id, session)?
+            .state
+            .lock()
+            .ok()?
+            .metadata
+            .remote
+            .as_ref()
+            .map(remote::RemoteProgress::of)
+    }
+
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
         #[cfg(test)]
         {

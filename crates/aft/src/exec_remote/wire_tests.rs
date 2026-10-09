@@ -82,6 +82,14 @@ pub(crate) enum Script {
     /// Accepted, then exited 0 with a terminal record that reports nothing
     /// about the workspace (no changed-file list).
     Plain,
+    /// Accepted at `position`, then held in the queue for `queue` with no
+    /// records, then one output record, then `run` later exit 0: a runner
+    /// with a long queue.
+    Staged {
+        position: u32,
+        queue: Duration,
+        run: Duration,
+    },
 }
 
 pub(crate) struct Daemon {
@@ -164,7 +172,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                 return;
                             }
                             if !attaching && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused) {
-                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 }))).unwrap()));
                             }
                              let outcome = if matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { Outcome::Exit { code: 7 } }
                                  else if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
@@ -178,7 +186,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_)) && !attaching { /* accepted, still running */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. }) && !attaching { /* accepted, still running */ }
                             else if attaching && matches!(script, Script::GappedAttach(_) | Script::GappedCancel(_)) { /* delayed producer below */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -294,6 +302,60 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                 subc_transport::write_frame(&mut *writer.lock().await, &end).await;
                         }));
                     }
+                }
+                if let (Script::Staged { queue, run, .. }, "exec.run") =
+                    (script, body["method"].as_str().unwrap_or_default())
+                {
+                    let writer = writer.clone();
+                    producers.push(tokio::spawn(async move {
+                        let data = |record| {
+                            Frame::build_with_version(
+                                header.ver,
+                                FrameType::StreamData,
+                                header.flags,
+                                header.channel,
+                                header.epoch,
+                                header.corr,
+                                serde_json::to_vec(&record).unwrap(),
+                            )
+                            .unwrap()
+                        };
+                        tokio::time::sleep(queue).await;
+                        let output = data(StreamRecord::Output(Output::new(
+                            0,
+                            OutputStream::Stdout,
+                            BytePayload(b"started\n".to_vec()),
+                        )));
+                        if subc_transport::write_frame(&mut *writer.lock().await, &output)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(run).await;
+                        let terminal =
+                            TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
+                        let end = Frame::build_with_version(
+                            header.ver,
+                            FrameType::StreamEnd,
+                            header.flags,
+                            header.channel,
+                            header.epoch,
+                            header.corr,
+                            vec![],
+                        )
+                        .unwrap();
+                        let mut writer = writer.lock().await;
+                        if subc_transport::write_frame(
+                            &mut *writer,
+                            &data(StreamRecord::Terminal(terminal)),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            let _ = subc_transport::write_frame(&mut *writer, &end).await;
+                        }
+                    }));
                 }
                 if matches!(script, Script::Continuous) && body["method"] == "exec.run" {
                     let writer = writer.clone();

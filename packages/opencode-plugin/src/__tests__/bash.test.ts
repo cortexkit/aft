@@ -2643,6 +2643,46 @@ describe("OpenCode bash adapter — subagent gating", () => {
     }
   });
 
+  test("blocking runon transport outlasts the engine's remote hand-back at the timeout or wait cap", async () => {
+    // The engine hands a blocking runon call back after its `timeout` (or the
+    // worker wait limit, at most 30 minutes) even while the job is still
+    // queued on the runner, so the transport must wait that long plus its
+    // margin, exactly as for a local command.
+    const remoteConfig = {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+      bash: { runon_enabled: true },
+    } as PluginContext["config"];
+    _resetSubagentCacheForTest();
+    const primary = createHarness(
+      () => ({ success: true, status: "running", task_id: "bash-runon", output: "queued" }),
+      undefined,
+      false,
+      remoteConfig,
+    );
+    await primary.tool.execute(
+      { command: "uname -s", runon: "linux", wait: true, timeout: 180_000 },
+      createMockSdkContext({ sessionID: "ses_primary_runon" }),
+    );
+    expect(primary.calls[0].params).toMatchObject({ runon: "linux", wait: true, timeout: 180_000 });
+    expect(primary.calls[0].options?.transportTimeoutMs).toBe(180_000 + 10_000);
+
+    _resetSubagentCacheForTest();
+    const worker = createSubagentHarness(
+      () => ({ success: true, status: "running", task_id: "bash-runon-w", output: "queued" }),
+      undefined,
+      remoteConfig,
+    );
+    await worker.tool.execute(
+      { command: "cargo test", runon: "linux", wait: true, timeout: 3_600_000 },
+      createMockSdkContext({ sessionID: "ses_subagent_runon" }),
+    );
+    expect(worker.calls[0].params).toMatchObject({ runon: "linux", wait: true });
+    // A worker's call is handed back at the worker wait limit (30 minutes by
+    // default) when its timeout is longer.
+    expect(worker.calls[0].options?.transportTimeoutMs).toBe(1_800_000 + 10_000);
+  });
+
   test("primary session + background: true still works (regression check)", async () => {
     _resetSubagentCacheForTest();
     // No client.session.get → resolveIsSubagent returns false → primary path.

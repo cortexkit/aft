@@ -4,6 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::bash_background::registry::remote::{RemotePhase, RemoteProgress};
 use crate::bash_background::registry::{BgTaskSnapshot, HardKillDeadline, HardKillSource};
 use crate::bash_background::BgTaskStatus;
 use crate::context::AppContext;
@@ -467,6 +468,12 @@ pub fn build_bash_outcome(
         )
     });
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
+    // A blocking wait on a remote task ends here even while its job waits in
+    // the runner's queue; see `remote_block_handback_ms`.
+    let remote_handback = (params.block_to_completion || params.wait).then(|| {
+        let waited_ms = remote_block_handback_ms(params.timeout, worker_cap_ms);
+        (Instant::now() + Duration::from_millis(waited_ms), waited_ms)
+    });
     // A capped blocking wait detaches at its deadline instead of blocking on.
     let block_to_completion =
         (params.block_to_completion || params.wait) && worker_cap_ms.is_none();
@@ -511,6 +518,23 @@ pub fn build_bash_outcome(
                     &task_id_for_poll,
                     &session_id_for_poll,
                     &request_id_for_poll,
+                    worker_session,
+                    bash_watch_available,
+                ))
+            } else if let Some(waited_ms) = remote_handback
+                .filter(|(at, _)| Instant::now() >= *at)
+                .map(|(_, waited_ms)| waited_ms)
+                .filter(|_| {
+                    ctx.bash_background()
+                        .is_remote_task(&task_id_for_poll, &session_id_for_poll)
+                })
+            {
+                Some(handback_remote_bash(
+                    ctx,
+                    &task_id_for_poll,
+                    &session_id_for_poll,
+                    &request_id_for_poll,
+                    waited_ms,
                     worker_session,
                     bash_watch_available,
                 ))
@@ -715,6 +739,104 @@ pub(crate) fn detach_wait_mode_bash(
             bash_watch_available,
             &kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
         ),
+        Err(message) if message.contains("not found") => Response::error(
+            request_id,
+            "task_not_found",
+            crate::commands::bash_status::format_unknown_task_message(task_id),
+        ),
+        Err(message) => Response::error(request_id, "execution_failed", message),
+    }
+}
+
+/// How long a blocking call (`wait: true` or `block_to_completion`) on a
+/// remote task waits before it hands the task back.
+///
+/// A local command's `timeout` starts when it spawns, so its hard kill ends a
+/// blocking wait in time. A remote command's `timeout` starts only when the
+/// runner starts running it, and AFT keeps no kill clock of its own for it.
+/// While the job waits in the runner's queue nothing would end the wait, and
+/// the plugin would give up on the call with no reply at all.
+///
+/// The OpenCode and Pi plugins size their transport deadline
+/// (`orchestratedTransportTimeoutMs`) as this same budget plus a margin: the
+/// `timeout`, or 30 minutes without one, capped by the worker wait limit for
+/// a delegated worker. This never exceeds the 30-minute wait cap either.
+pub(crate) fn remote_block_handback_ms(timeout: Option<u64>, worker_cap_ms: Option<u64>) -> u64 {
+    let budget = timeout
+        .unwrap_or(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS)
+        .min(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS);
+    worker_cap_ms.map_or(budget, |cap| budget.min(cap))
+}
+
+/// The reply to a blocking call whose remote command did not finish within
+/// [`remote_block_handback_ms`]: the task id, the runner's job id and where
+/// the job is. The job keeps going; only the call ends.
+pub(crate) fn format_remote_handback_message(
+    task_id: &str,
+    waited_ms: u64,
+    progress: Option<&RemoteProgress>,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
+    let job = progress
+        .and_then(|progress| progress.job_id)
+        .map_or_else(|| "not assigned yet".to_string(), |id| id.to_string());
+    let phase = progress.map_or(RemotePhase::WaitingOnRunner, |progress| progress.phase);
+    format!(
+        "The remote command did not finish within {}, the longest this call waits, so it now runs in the background as {}\nIt was not killed. Remote job: {job}. Phase: {}. Its `timeout` counts from when it starts running on ck-motor; a job that waits too long in ck-motor's queue is refused without running.",
+        format_wait_limit(waited_ms),
+        format_background_handoff_tail(task_id, worker_session, bash_watch_available),
+        phase.describe(),
+    )
+}
+
+/// Moves a blocking call's remote task to the background at the end of its
+/// wait (see [`remote_block_handback_ms`]) and replies with its job and phase.
+pub(crate) fn handback_remote_bash(
+    ctx: &AppContext,
+    task_id: &str,
+    session_id: &str,
+    request_id: &str,
+    waited_ms: u64,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> Response {
+    match ctx.bash_background().promote(task_id, session_id) {
+        Ok(_) => {
+            let progress = ctx.bash_background().remote_progress(task_id, session_id);
+            let output = format!(
+                "{}{}",
+                format_remote_handback_message(
+                    task_id,
+                    waited_ms,
+                    progress.as_ref(),
+                    worker_session,
+                    bash_watch_available,
+                ),
+                kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
+            );
+            let phase = progress
+                .as_ref()
+                .map_or(RemotePhase::WaitingOnRunner, |progress| progress.phase);
+            let queue_position = match phase {
+                RemotePhase::Queued { position } => Some(position),
+                _ => None,
+            };
+            Response::success(
+                request_id,
+                json!({
+                    "output": output,
+                    "task_id": task_id,
+                    "status": "running",
+                    "remote_job_id": progress
+                        .as_ref()
+                        .and_then(|progress| progress.job_id)
+                        .map(|id| id.to_string()),
+                    "remote_phase": phase.tag(),
+                    "queue_position": queue_position,
+                }),
+            )
+        }
         Err(message) if message.contains("not found") => Response::error(
             request_id,
             "task_not_found",

@@ -78,6 +78,9 @@ enum BashSpawnControl {
         /// The configured wait limit bounding a blocking call in any session
         /// (`wait: true` or `block_to_completion`).
         worker_cap_ms: Option<u64>,
+        /// When a blocking wait hands a remote task back, and how long that
+        /// is after the call arrived; see `remote_block_handback_ms`.
+        remote_handback: Option<(Instant, u64)>,
     },
 }
 
@@ -819,6 +822,17 @@ pub(super) fn submit_deferred_bash(
                             wait_window_ms.min(20_000)
                         };
                     let deadline = received_at + Duration::from_millis(wait_window_ms);
+                    // A server-owned call is killed rather than handed back.
+                    let remote_handback = ((settings.block_to_completion || settings.wait)
+                        && !server_completion)
+                        .then(|| {
+                            let waited_ms =
+                                crate::commands::bash_orchestrate::remote_block_handback_ms(
+                                    settings.timeout,
+                                    worker_cap_ms,
+                                );
+                            (received_at + Duration::from_millis(waited_ms), waited_ms)
+                        });
                     let project_root = ctx.config().project_root.clone();
                     // Register the session as detachable exactly like the
                     // standalone path (bash_orchestrate) does: without this, a
@@ -846,6 +860,7 @@ pub(super) fn submit_deferred_bash(
                             detach_on_user_message,
                             worker_session,
                             worker_cap_ms,
+                            remote_handback,
                         });
                     }
                     response
@@ -975,6 +990,7 @@ pub(super) fn submit_deferred_bash(
                 detach_on_user_message,
                 worker_session,
                 worker_cap_ms,
+                remote_handback,
             }) => {
                 let phase = if detach_on_user_message {
                     drain::BashHoldPhase::Wait
@@ -1019,6 +1035,7 @@ pub(super) fn submit_deferred_bash(
                     detach_on_user_message,
                     worker_session,
                     worker_cap_ms,
+                    remote_handback,
                     format_context,
                     cancel,
                     claim.clone(),
@@ -1186,6 +1203,7 @@ async fn run_deferred_bash_wait(
     detach_on_user_message: bool,
     worker_session: bool,
     worker_cap_ms: Option<u64>,
+    remote_handback: Option<(Instant, u64)>,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
     claim: Arc<drain::BashCallClaim>,
@@ -1296,13 +1314,21 @@ async fn run_deferred_bash_wait(
             } => {
                 let DeferredWaitObservation { target_finished, detach_pending } = observation;
                 let promotion_due = !block_to_completion && Instant::now() >= deadline;
+                let remote_handback_due = remote_handback
+                    .is_some_and(|(at, _)| Instant::now() >= at)
+                    && registry.is_remote_task(&task_id, &session_id);
                 // While the module drains, every foreground wait (wait:true,
                 // block_to_completion, or a plain wait window) is detached into
                 // a background task so its request can answer before the drain
                 // deadline. The command keeps running and its completion is
                 // delivered like any promoted task's.
                 let drain_detach_due = cancel.drain.is_active() && !server_completion;
-                if !target_finished && !detach_pending && !promotion_due && !drain_detach_due {
+                if !target_finished
+                    && !detach_pending
+                    && !promotion_due
+                    && !drain_detach_due
+                    && !remote_handback_due
+                {
                     continue;
                 }
                 let (poll_control_tx, poll_control_rx) = oneshot::channel::<BashPollControl>();
@@ -1424,6 +1450,43 @@ async fn run_deferred_bash_wait(
                                     &session_for_poll,
                                     &task_id_for_poll,
                                 );
+                                return finish_bash_poll_done(
+                                    response,
+                                    ctx,
+                                    &session_for_poll,
+                                    &format_context_for_poll,
+                                    &mut poll_text_tx,
+                                    &mut poll_control_tx,
+                                    false,
+                                    &mut repeat_for_poll,
+                                );
+                            }
+                            if remote_handback_due && !snapshot.info.status.is_terminal() {
+                                if !claim_for_poll.claim_for_wait_task() {
+                                    return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
+                                }
+                                let response = crate::commands::bash_orchestrate::handback_remote_bash(
+                                    ctx,
+                                    &task_id_for_poll,
+                                    &session_for_poll,
+                                    &request_id_for_poll,
+                                    remote_handback.map_or(0, |(_, waited_ms)| waited_ms),
+                                    worker_session,
+                                    format_context_for_poll
+                                        .bash_watch_available
+                                        .unwrap_or(worker_session),
+                                );
+                                if detach_on_user_message {
+                                    ctx.bash_background().end_wait_mode_session(
+                                        &session_for_poll,
+                                        &task_id_for_poll,
+                                    );
+                                } else {
+                                    ctx.bash_background().unregister_foreground_task(
+                                        &session_for_poll,
+                                        &task_id_for_poll,
+                                    );
+                                }
                                 return finish_bash_poll_done(
                                     response,
                                     ctx,
@@ -2066,6 +2129,115 @@ mod grant_path_tests {
             .expect("time spent in the reader queue is part of startup's reply budget")
             .unwrap();
         assert_eq!(done.response_for_test().data["code"], "bash_start_deadline");
+    }
+
+    /// The fake runner's connection file for [`remote_runon_stub`]; a dispatch
+    /// function is a plain `fn`, so it cannot capture one.
+    #[cfg(unix)]
+    static REMOTE_RUNON_CONNECTION: std::sync::Mutex<Option<std::path::PathBuf>> =
+        std::sync::Mutex::new(None);
+
+    /// Runs the bash handler with a remote policy pointing at the fake runner.
+    #[cfg(unix)]
+    fn remote_runon_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let launch = crate::bash_background::RemoteLaunch {
+            explicit_runon: false,
+            connection_file: REMOTE_RUNON_CONNECTION.lock().unwrap().clone(),
+            harness: "broca".into(),
+            session: "session".into(),
+            params: crate::exec_remote::FrozenParams {
+                remote_exec: Some(crate::exec_remote::policy::RemoteExecPolicy {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        crate::bash_background::with_remote_policy(Some(launch), || {
+            crate::commands::bash::handle(&req, ctx)
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn subc_blocking_runon_queued_past_its_timeout_answers_with_job_and_phase() {
+        use crate::exec_remote::wire_tests::{daemon, id, Script};
+        // The runner accepts the job at queue position 7 and keeps it queued
+        // well past the call's `timeout`.
+        let daemon = daemon(
+            Script::Staged {
+                position: 7,
+                queue: Duration::from_secs(4),
+                run: Duration::ZERO,
+            },
+            "exec-remote/v1",
+        )
+        .await;
+        *REMOTE_RUNON_CONNECTION.lock().unwrap() = Some(daemon.connection.clone());
+        let (dir, root) = super::super::test_support::test_root("remote-handback");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.bash.runon_enabled = true;
+            config.sandbox.enabled = false;
+        });
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let timeout_ms = 1_500;
+        let received = Instant::now();
+        let mut rx = deadline_test_call(
+            &executor,
+            &root,
+            remote_runon_stub,
+            json!({"command":"uname -s", "runon":"linux", "wait":true, "timeout":timeout_ms, "foreground_orchestrate":true}),
+        );
+        // The plugins give up on this call 10 s after its `timeout`.
+        let transport_deadline = Duration::from_millis(timeout_ms + 10_000);
+        let done = tokio::time::timeout(transport_deadline, rx.recv())
+            .await
+            .expect("a blocking runon call must answer before the transport deadline")
+            .unwrap();
+        let waited = received.elapsed();
+        assert!(waited >= Duration::from_millis(timeout_ms), "{waited:?}");
+        let response = done.response_for_test();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["status"], "running", "{response:?}");
+        assert_eq!(response.data["remote_phase"], "queued", "{response:?}");
+        assert_eq!(response.data["queue_position"], 7, "{response:?}");
+        assert_eq!(response.data["remote_job_id"], id().to_string());
+        let cancels = || {
+            daemon
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(header, body)| {
+                    body["method"] == "exec.cancel" || header.ty == subc_protocol::FrameType::Cancel
+                })
+                .count()
+        };
+        assert_eq!(cancels(), 0, "the queued job must not be cancelled");
+        // The job leaves the queue and completes in the background.
+        let task_id = response.data["task_id"].as_str().unwrap().to_string();
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = ctx
+                    .bash_background()
+                    .observed_status(&task_id, "deadline-session", 0)
+                    .unwrap();
+                if snapshot.info.status.is_terminal() {
+                    return snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            finished.info.status,
+            crate::bash_background::BgTaskStatus::Completed
+        );
+        assert_eq!(cancels(), 0);
     }
 
     #[tokio::test]

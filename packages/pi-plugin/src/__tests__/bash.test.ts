@@ -441,6 +441,46 @@ describe("bash tool adapter", () => {
     expect(call[1]).toMatchObject({ command: "FOO=1 make | tail -1", runon: "linux" });
   });
 
+  test("blocking runon transport outlasts the engine's remote hand-back at the timeout or wait cap", async () => {
+    // The engine hands a blocking runon call back after its `timeout` (or the
+    // worker wait limit, at most 30 minutes) even while the job is still
+    // queued on the runner, so the transport must wait that long plus its
+    // margin, exactly as for a local command.
+    const transportFor = async (hasUI: boolean, timeout: number) => {
+      const tools = new Map<string, MockToolDef>();
+      const { bridge, calls } = makeTrackableMockBridge({
+        status: "running",
+        task_id: "bash-runon",
+        output: "queued",
+      });
+      registerBashTool(
+        makeMockApi(tools),
+        makeMockContext(bridge, {
+          subc: { connection_file: "/run/subc-connection.json" },
+          remote_exec: { enabled: true },
+          bash: { runon_enabled: true },
+        } as PluginContext["config"]),
+      );
+      await tools
+        .get("bash")!
+        .execute(
+          "test-call",
+          { command: "uname -s", runon: "linux", wait: true, timeout },
+          undefined,
+          undefined,
+          { cwd: projectRoot, hasUI },
+        );
+      const call = calls[0] as [string, Record<string, unknown>, { transportTimeoutMs?: number }];
+      expect(call[1]).toMatchObject({ runon: "linux", wait: true });
+      return call[2]?.transportTimeoutMs;
+    };
+    // A primary session: the call's own timeout plus the margin.
+    expect(await transportFor(true, 180_000)).toBe(180_000 + 10_000);
+    // A worker whose timeout is longer than the worker wait limit (30 minutes
+    // by default) is handed back at the limit.
+    expect(await transportFor(false, 3_600_000)).toBe(1_800_000 + 10_000);
+  });
+
   test("PowerShell registration routes through the unified bash command family", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);

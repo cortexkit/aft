@@ -133,6 +133,86 @@ pub(crate) struct RemoteTask {
     pub fallback_digest: Option<String>,
     #[serde(default)]
     pub env_not_forwarded: Option<Vec<String>>,
+    /// The queue position the runner reported when it accepted the job. It is
+    /// reported once and never updated, so it can only fall afterwards.
+    #[serde(default)]
+    pub queue_position: Option<u32>,
+    /// The job's stream has shown that the command started on the runner.
+    /// Set when the first output record arrives; see [`RemotePhase::of`].
+    #[serde(default)]
+    pub started: bool,
+}
+
+/// Where a remote job is, as far as its own stream has shown. Used to tell a
+/// caller whose blocking wait ended what the job is doing now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemotePhase {
+    /// The runner has not accepted the job yet (it is still being submitted
+    /// or uploaded), or AFT restarted without learning its queue position.
+    WaitingOnRunner,
+    /// Accepted at this queue position, and nothing has shown it started.
+    Queued { position: u32 },
+    /// The command has started on the runner.
+    Running,
+}
+
+impl RemotePhase {
+    /// The one place that decides a remote job's phase.
+    ///
+    /// exec-remote-types 0.2.x streams carry no record that marks a queued
+    /// job taking runner capacity; only output proves the command started.
+    /// A running command that has printed nothing therefore still reads as
+    /// queued. When the locked crate gains a `StreamRecord::Started` record,
+    /// set `RemoteTask::started` when the stream delivers it (in `TaskSink`)
+    /// and this mapping needs no change.
+    pub(crate) fn of(remote: &RemoteTask) -> Self {
+        if remote.started {
+            Self::Running
+        } else if let (Some(_), Some(position)) = (remote.job_id, remote.queue_position) {
+            Self::Queued { position }
+        } else {
+            Self::WaitingOnRunner
+        }
+    }
+
+    /// A stable machine-readable name for replies.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::WaitingOnRunner => "waiting_on_runner",
+            Self::Queued { .. } => "queued",
+            Self::Running => "running",
+        }
+    }
+
+    /// The phase in words, naming the runner.
+    pub(crate) fn describe(self) -> String {
+        match self {
+            Self::WaitingOnRunner => {
+                "waiting on the runner (ck-motor has not reported a queue position or any output yet)"
+                    .to_string()
+            }
+            Self::Queued { position } => format!(
+                "queued at position {position} on ck-motor (the position when the job was accepted; no output yet)"
+            ),
+            Self::Running => "running on ck-motor (output received)".to_string(),
+        }
+    }
+}
+
+/// A remote task's job ID, once the runner assigned one, and its phase.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteProgress {
+    pub job_id: Option<Uuid>,
+    pub phase: RemotePhase,
+}
+
+impl RemoteProgress {
+    pub(crate) fn of(remote: &RemoteTask) -> Self {
+        Self {
+            job_id: remote.job_id,
+            phase: RemotePhase::of(remote),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -229,6 +309,7 @@ impl OutputSink for TaskSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()> {
         self.commit(|r| {
             r.job_id = Some(accepted.job_id);
+            r.queue_position = Some(accepted.queue_position);
             if accepted.env_not_forwarded.is_some() {
                 r.env_not_forwarded = accepted.env_not_forwarded.clone();
             }
@@ -270,6 +351,8 @@ impl OutputSink for TaskSink {
                 r.stderr_len = offset + bytes.len() as u64;
             }
             r.last_seq = Some(seq);
+            // Output proves the command started on the runner.
+            r.started = true;
         })?;
         let _ = self.registry.inner.wake_tx.try_send(());
         Ok(())
@@ -442,6 +525,8 @@ impl BgTaskRegistry {
             terminal: None,
             fallback_digest: None,
             env_not_forwarded: None,
+            queue_position: None,
+            started: false,
         });
         metadata.pipeline_segments = single_top_level_pipeline(command)
             .map(|p| p.segments.into_iter().map(|s| s.label).collect())
@@ -1056,9 +1141,11 @@ impl BgTaskRegistry {
                 128_i32.checked_add(signal),
                 Some(format!("remote signal {signal}")),
             ),
+            // The runner already killed the command at its `timeout`, counted
+            // from when it started running; report it like a local timeout.
             Verdict::DeadlineKilled => (
                 BgTaskStatus::TimedOut,
-                None,
+                Some(124),
                 Some("remote deadline kill".into()),
             ),
             Verdict::Cancelled | Verdict::CancelKilled => {

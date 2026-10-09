@@ -1062,6 +1062,8 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         terminal: None,
         fallback_digest: None,
         env_not_forwarded: None,
+        queue_position: None,
+        started: false,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -1371,6 +1373,8 @@ fn persist_accepted_with_snapshot(
         terminal: None,
         fallback_digest: Some(digest),
         env_not_forwarded: None,
+        queue_position: None,
+        started: false,
     });
     let handles = TaskIoHandles::create(&layout, BgMode::Pipes, true).unwrap();
     write_task_at(&layout, &metadata).unwrap();
@@ -2243,4 +2247,292 @@ async fn a_reporting_runner_report_is_printed_after_the_output() {
         !rendered.contains("not reported by the runner"),
         "{rendered}"
     );
+}
+
+/// The bash call the OpenCode and Pi plugins send for a model's `runon` call.
+fn orchestrated_request(params: serde_json::Value) -> crate::protocol::RawRequest {
+    crate::protocol::RawRequest {
+        id: "runon".into(),
+        command: "bash".into(),
+        session_id: Some("session".into()),
+        lsp_hints: None,
+        params,
+    }
+}
+
+/// Spawn `params` through the bash handler and drive its foreground wait the
+/// way the standalone request loop does, until the call answers. Returns the
+/// reply and how long after the call arrived it came.
+async fn orchestrated_reply(
+    ctx: &crate::context::AppContext,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
+    params: serde_json::Value,
+) -> (crate::protocol::Response, Duration) {
+    let request = orchestrated_request(params);
+    let received = std::time::Instant::now();
+    let spawned =
+        crate::bash_background::with_remote_policy(Some(launch(daemon.connection.clone())), || {
+            crate::commands::bash::handle(&request, ctx)
+        });
+    assert!(spawned.success, "{spawned:?}");
+    match crate::commands::bash_orchestrate::build_bash_outcome(&request, ctx, spawned) {
+        crate::response_finalize::DispatchOutcome::Immediate(response) => {
+            (response, received.elapsed())
+        }
+        crate::response_finalize::DispatchOutcome::Deferred(mut pending) => {
+            let response = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if let Some(response) = (pending.poll)(ctx) {
+                        return response;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("a blocking call must always answer");
+            (response, received.elapsed())
+        }
+    }
+}
+
+/// Every cancellation AFT sent the runner: `exec.cancel`, or a Cancel frame
+/// (sent when a held-open run stream is dropped).
+fn runner_cancels(daemon: &crate::exec_remote::wire_tests::Daemon) -> usize {
+    daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(header, body)| {
+            body["method"] == "exec.cancel" || header.ty == subc_protocol::FrameType::Cancel
+        })
+        .count()
+}
+
+/// The plugins' transport deadline for a blocking call with this `timeout`
+/// (`orchestratedTransportTimeoutMs`: the timeout plus a 10-second margin).
+fn plugin_transport_deadline(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms + 10_000)
+}
+
+#[tokio::test]
+async fn blocking_runon_queued_past_its_timeout_answers_with_task_job_and_queue_position() {
+    // The runner accepts the job at queue position 11 and holds it queued well
+    // past the call's `timeout` before running it.
+    let daemon = daemon(
+        Script::Staged {
+            position: 11,
+            queue: Duration::from_secs(4),
+            run: Duration::ZERO,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let timeout_ms = 1_500;
+    let (reply, waited) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "uname -s; date -u",
+            "runon": "linux",
+            "wait": true,
+            "timeout": timeout_ms,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert!(
+        waited >= Duration::from_millis(timeout_ms),
+        "answered after {waited:?}, before its wait was over"
+    );
+    assert!(
+        waited < plugin_transport_deadline(timeout_ms),
+        "answered after {waited:?}, when the plugin had already given up"
+    );
+    let task_id = reply.data["task_id"].as_str().unwrap().to_string();
+    assert_eq!(reply.data["status"], "running", "{reply:?}");
+    assert_eq!(reply.data["remote_phase"], "queued", "{reply:?}");
+    assert_eq!(reply.data["queue_position"], 11, "{reply:?}");
+    assert_eq!(reply.data["remote_job_id"], id().to_string(), "{reply:?}");
+    let output = reply.data["output"].as_str().unwrap();
+    for expected in [
+        task_id.as_str(),
+        &id().to_string(),
+        "queued at position 11",
+        "It was not killed",
+    ] {
+        assert!(output.contains(expected), "missing {expected:?}: {output}");
+    }
+    assert_eq!(
+        runner_cancels(&daemon),
+        0,
+        "handing the call back must not cancel the queued job"
+    );
+    // The job runs once it leaves the queue: AFT did not count its timeout
+    // from submission, and nothing cancelled it.
+    let done = terminal(ctx.bash_background(), &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+    assert!(
+        crate::commands::bash_orchestrate::format_foreground_result(&done).contains("started"),
+        "{done:?}"
+    );
+    assert_eq!(runner_cancels(&daemon), 0);
+    assert_eq!(
+        exec_runs(&daemon).len(),
+        1,
+        "the job must not be resubmitted"
+    );
+}
+
+#[tokio::test]
+async fn blocking_runon_still_running_at_its_wait_limit_answers_with_running_phase() {
+    let daemon = daemon(
+        Script::Staged {
+            position: 1,
+            queue: Duration::ZERO,
+            run: Duration::from_secs(4),
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let timeout_ms = 1_500;
+    let (reply, waited) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "cargo test",
+            "runon": "linux",
+            "wait": true,
+            "timeout": timeout_ms,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert!(waited < plugin_transport_deadline(timeout_ms), "{waited:?}");
+    assert_eq!(reply.data["remote_phase"], "running", "{reply:?}");
+    assert_eq!(reply.data["queue_position"], serde_json::Value::Null);
+    assert!(
+        reply.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("running on ck-motor"),
+        "{reply:?}"
+    );
+    assert_eq!(runner_cancels(&daemon), 0);
+    let task_id = reply.data["task_id"].as_str().unwrap();
+    let done = terminal(ctx.bash_background(), task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Completed, "{done:?}");
+}
+
+#[tokio::test]
+async fn blocking_runon_killed_at_its_runner_deadline_reports_exit_124() {
+    let daemon = daemon(Script::Deadline, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let (reply, _) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "sleep 600",
+            "runon": "linux",
+            "wait": true,
+            "timeout": 5_000,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert_eq!(reply.data["timed_out"], true, "{reply:?}");
+    assert_eq!(reply.data["exit_code"], 124, "{reply:?}");
+    let output = reply.data["output"].as_str().unwrap();
+    assert!(output.contains("[command timed out]"), "{output}");
+    assert!(output.contains("[exit code: 124]"), "{output}");
+    // The runner killed the job itself; AFT has nothing to cancel.
+    assert_eq!(runner_cancels(&daemon), 0);
+}
+
+#[tokio::test]
+async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
+    let daemon = daemon(
+        Script::Staged {
+            position: 3,
+            queue: Duration::from_secs(6),
+            run: Duration::ZERO,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    ctx.update_config(|config| config.foreground_wait_window_ms = 2_500);
+    let (reply, waited) = orchestrated_reply(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "uname -s",
+            "runon": "linux",
+            "timeout": 500,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    // A non-blocking call ends at the foreground wait window, as before; the
+    // blocking-call hand-back (at its 500 ms `timeout`) does not apply to it.
+    assert!(waited >= Duration::from_millis(2_500), "{waited:?}");
+    assert_eq!(reply.data["status"], "running", "{reply:?}");
+    assert!(reply.data.get("remote_phase").is_none(), "{reply:?}");
+    assert!(
+        reply.data["output"]
+            .as_str()
+            .unwrap()
+            .starts_with("Foreground bash didn't finish within"),
+        "{reply:?}"
+    );
+    assert_eq!(runner_cancels(&daemon), 0);
+}
+
+#[test]
+fn remote_phase_comes_from_acceptance_and_output_only() {
+    let mut remote = RemoteTask {
+        connection_file: None,
+        explicit_runon: true,
+        harness: "broca".into(),
+        session: "session".into(),
+        job_id: None,
+        last_seq: None,
+        stdout_len: 0,
+        stderr_len: 0,
+        unknown_len: 0,
+        cancel_requested: false,
+        terminal: None,
+        fallback_digest: None,
+        env_not_forwarded: None,
+        queue_position: None,
+        started: false,
+    };
+    assert_eq!(RemotePhase::of(&remote), RemotePhase::WaitingOnRunner);
+    remote.job_id = Some(id());
+    assert_eq!(
+        RemotePhase::of(&remote),
+        RemotePhase::WaitingOnRunner,
+        "a job id restored without its queue position does not claim a position"
+    );
+    remote.queue_position = Some(4);
+    assert_eq!(
+        RemotePhase::of(&remote),
+        RemotePhase::Queued { position: 4 }
+    );
+    remote.started = true;
+    assert_eq!(RemotePhase::of(&remote), RemotePhase::Running);
 }
