@@ -134,25 +134,41 @@ fn draining_budget_ms(_root: &Path) -> u64 {
 const RUNNER_ID: &str = "ck-motor";
 
 #[cfg(unix)]
-fn remote_execution_note(requested_vcpus: Option<u32>) -> String {
-    match requested_vcpus {
+fn remote_execution_note(remote: &RemoteTask) -> String {
+    let mut note = match remote.requested_vcpus {
         Some(1) => format!("ran remotely on {RUNNER_ID} (1 vCPU requested)"),
         Some(count) => format!("ran remotely on {RUNNER_ID} ({count} vCPUs requested)"),
         None => format!("ran remotely on {RUNNER_ID}"),
+    };
+    if remote.requested_network {
+        if remote.requested_vcpus.is_some() {
+            note.pop();
+            note.push_str(", network)");
+        } else {
+            note.push_str(" (network)");
+        }
+        if remote.accepted && !remote.granted_network {
+            note.push_str("\nOFFLINE: the runner did not grant the requested network access");
+        }
     }
+    note
 }
 
-/// Remote writes stay on the server and the runner has no network access.
-/// This advice applies only while the task is remote, not after local fallback.
+/// Only an offline remote job is safe to repeat without checking outside effects.
+/// Local fallback has its own warnings and never uses this advice.
 #[cfg(unix)]
-fn remote_unknown_outcome(job_id: Option<Uuid>) -> String {
+fn remote_unknown_outcome(job_id: Option<Uuid>, granted_network: bool) -> String {
     let mut text = "remote outcome unknown".to_owned();
     if let Some(job_id) = job_id {
         text.push_str(&format!(" (job {job_id})"));
     }
-    text.push_str(
-        "; the remote job could not affect this machine or the network, so rerunning is safe",
-    );
+    if granted_network {
+        text.push_str("; the job may have had outside effects through outbound network access, so check before rerunning");
+    } else {
+        text.push_str(
+            "; the remote job could not affect this machine or the network, so rerunning is safe",
+        );
+    }
     if let Some(job_id) = job_id {
         text.push_str(&format!(
             "; check exec.status {job_id} first if you need its result"
@@ -245,6 +261,14 @@ pub(crate) struct RemoteTask {
     pub session: String,
     #[serde(default)]
     pub requested_vcpus: Option<u32>,
+    #[serde(default)]
+    pub requested_network: bool,
+    #[serde(default)]
+    pub granted_network: bool,
+    #[serde(default)]
+    pub accepted: bool,
+    #[serde(default)]
+    pub started: Option<Started>,
     pub job_id: Option<Uuid>,
     pub last_seq: Option<u64>,
     #[serde(default)]
@@ -440,6 +464,8 @@ impl OutputSink for TaskSink {
         self.commit(|r| {
             r.job_id = Some(accepted.job_id);
             r.queue_position = Some(accepted.queue_position);
+            r.accepted = true;
+            r.granted_network = accepted.network == Some(Network::Outbound);
             if accepted.env_not_forwarded.is_some() {
                 r.env_not_forwarded = accepted.env_not_forwarded.clone();
             }
@@ -451,8 +477,30 @@ impl OutputSink for TaskSink {
             .lock()
             .map_err(|_| io::Error::other("task lock poisoned"))?;
         append_executor_environment_disclosure(&mut state.metadata);
+        if let Some(remote) = &state.metadata.remote {
+            let note = remote_execution_note(remote);
+            let existing = state
+                .metadata
+                .execution_note
+                .get_or_insert_with(String::new);
+            // Preserve environment disclosures already attached to the request header.
+            let suffix = existing
+                .find('\n')
+                .map(|index| existing[index..].to_owned())
+                .unwrap_or_default();
+            *existing = note + &suffix;
+        }
         self.registry
             .persist_task_locked(&self.task, &state.metadata, &mut db)
+    }
+    fn started(&mut self, started: &Started) -> io::Result<()> {
+        // Runner wall-clock time is display data, not a local watchdog deadline.
+        self.commit(|r| {
+            r.started = Some(started.clone());
+            r.last_seq = Some(started.seq);
+        })?;
+        let _ = self.registry.inner.wake_tx.try_send(());
+        Ok(())
     }
     fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> io::Result<()> {
         let remote = self
@@ -697,6 +745,10 @@ impl BgTaskRegistry {
             harness: launch.harness,
             session: launch.session,
             requested_vcpus,
+            requested_network: launch.requested_network,
+            granted_network: false,
+            accepted: false,
+            started: None,
             job_id: None,
             last_seq: None,
             gap_recovery: None,
@@ -813,6 +865,7 @@ impl BgTaskRegistry {
                 &exec::PresetParams {
                     siblings: launch.params.siblings,
                     weight_hint: requested_vcpus,
+                    network: launch.requested_network.then_some(Network::Outbound),
                     ..Default::default()
                 },
             )
@@ -1524,8 +1577,8 @@ impl BgTaskRegistry {
     }
 
     fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
-        // Known terminals keep their real status. Only unknown outcomes lose
-        // their fate; no non-refusal terminal triggers automatic resubmission.
+        // Known terminal outcomes keep their status. An unknown outcome is reported
+        // as uncertain, never automatically resubmitted.
         let refused = matches!(&verdict, Verdict::RunLocally { .. });
         let unknown = matches!(&verdict, Verdict::OutcomeUnknown);
         let (status, code, mut reason) = match verdict {
@@ -1573,15 +1626,18 @@ impl BgTaskRegistry {
                 .metadata
                 .remote
                 .as_ref()
-                .map(|remote| remote_execution_note(remote.requested_vcpus))
-                .unwrap_or_else(|| remote_execution_note(None));
+                .map(remote_execution_note)
+                .unwrap_or_else(|| format!("ran remotely on {RUNNER_ID}"));
             if unknown {
                 if let Some(remote) = state.metadata.remote.as_ref() {
                     let job_id = remote
                         .job_id
                         .or_else(|| remote.terminal.as_ref().map(|record| record.job_id));
-                    // Keep recovery diagnostics without substituting them for
-                    // the remote-only rerun advice. Local fallback clears remote.
+                    // A lost acceptance cannot prove that a requested network mode was denied.
+                    let network_risk =
+                        remote.granted_network || (remote.requested_network && !remote.accepted);
+                    // Retain recovery diagnostics alongside advice based on the
+                    // runner's network grant. Local fallback removes remote metadata.
                     if let Some(detail) = reason.as_deref() {
                         state
                             .metadata
@@ -1589,7 +1645,7 @@ impl BgTaskRegistry {
                             .get_or_insert_with(|| remote_note.clone())
                             .push_str(&format!("\n{detail}"));
                     }
-                    reason = Some(remote_unknown_outcome(job_id));
+                    reason = Some(remote_unknown_outcome(job_id, network_risk));
                 } else if reason.is_none() {
                     reason = Some("remote outcome_unknown; never rerun".into());
                 }

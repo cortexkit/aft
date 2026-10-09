@@ -1122,6 +1122,7 @@ mod tests {
             sandbox_native: false,
             sandbox_unavailable: false,
             remote_refusal: None,
+            phase: None,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,
             live_descendants_summary: None,

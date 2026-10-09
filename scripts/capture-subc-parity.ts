@@ -576,8 +576,8 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "callgraph_trace_data_translate", tool_name: "callgraph", agent_args: { op: "trace_data", filePath: "src/main.ts", symbol: "run", expression: "value", depth: 2 } },
 ];
 
-// These are native output strings, not a second implementation of the remote
-// disposition. Capture the real wrappers to pin how they present each one.
+// These strings capture native output rather than reimplementing how remote
+// outcomes are classified. Capture the real wrappers to pin their presentation.
 const BASH_OUTCOMES = [
   ["remote_job", "remote outcome unknown (job 0192a64a-1234-7000-8000-000000000001); the remote job could not affect this machine or the network, so rerunning is safe; check exec.status 0192a64a-1234-7000-8000-000000000001 first if you need its result"],
   ["remote_no_job", "remote outcome unknown; the remote job could not affect this machine or the network, so rerunning is safe"],

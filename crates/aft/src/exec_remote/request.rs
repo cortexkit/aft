@@ -8,6 +8,7 @@ pub struct PresetParams {
     pub siblings: Vec<String>,
     pub weight_hint: Option<u32>,
     pub queue_wait_limit_s: Option<u64>,
+    pub network: Option<super::types::Network>,
 }
 
 /// Only the routing fields of a frozen catalog plan; never tool arguments.
@@ -135,6 +136,9 @@ pub fn build_request(
         .with_siblings(preset.siblings.clone());
     if let Some(weight) = preset.weight_hint {
         request = request.with_weight_hint(weight);
+    }
+    if let Some(network) = &preset.network {
+        request = request.with_network(network.clone());
     }
     if let Some(seconds) = timeout {
         request = request.with_timeout(seconds);

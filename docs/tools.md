@@ -289,12 +289,18 @@ Returns combined stdout/stderr plus `exit_code`, `duration_ms`, truncation statu
 
 **Running on the remote build server (`runon`)** — `runon: "linux"` sends the whole command
 line, exactly as written (pipes, lists, environment prefixes and all), to the remote Linux
-build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). It runs
-there under `bash -c` in the same working directory, with the same timeout and the same
-environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips before any
-off-host request (the reply names them). New plans require `runon` to send a line away. Deployed
-worker plans with an enabled `commands` prefix list retain their existing automatic routing:
-every literal command must match an allowed prefix, and unsupported syntax stays local.
+build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). `runon:
+"linux,4c"` requests exactly four vCPUs; the runner refuses counts it cannot serve before the
+command starts. Without a count, AFT leaves the runner's existing default sizing behavior
+unchanged. Add `,net` for outbound internet: `linux,net`, `linux,4c,net` and `linux,net,4c`
+are accepted; remote jobs are offline by default. A plan's `default_demand` may include these
+options too. Duplicate options, unknown tokens and non-Linux platforms are refused by name
+before dispatch. It runs there under `bash -c` in the same working directory, with the same timeout
+and the same environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips
+before any off-host request (the reply names them). New plans require `runon` to send a line
+away. Deployed worker plans with an enabled `commands` prefix list retain their existing
+automatic routing: every literal command must match an allowed prefix, and unsupported syntax
+stays local.
 Explicit whole-line `runon` also requires the user-only live safety switch
 `bash.runon_enabled: true` (default false); projects cannot enable it. Turning that switch off
 hides and refuses `runon` without disabling legacy prefix routing.
@@ -320,9 +326,11 @@ setting says.
 A call that sets `runon` is refused by name, and runs nowhere, when it cannot run remotely:
 the project turned remote runs off (`remote runs are off for this project`), the session has no
 remote runner (`this session has no remote runner`), the demand is not one AFT knows
-(`unknown runner demand`), or the call also sets `pty: true`, a PowerShell shell, or
-`sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch needs AFT on macOS or
-Linux. If no `exec-remote/v1` provider answers, or daemon discovery fails before dispatch,
+(`unknown runner demand`; the server only runs Linux), an option is malformed (for example,
+`runon "linux,4" is not valid: options are net and a vCPU count as Nc, for example "linux,4c,net"`),
+or the call also sets `pty: true`, a
+PowerShell shell, or `sandbox: "host"`. On Windows `runon` is refused by name: remote dispatch
+needs AFT on macOS or Linux. If no `exec-remote/v1` provider answers, or daemon discovery fails before dispatch,
 the task is refused by name and the command is not run locally. `background: true` works as
 for local commands, and a background remote task re-attaches after a restart.
 
@@ -332,16 +340,27 @@ omit runon to run locally`. The refusal reason is preserved, including reasons f
 runners. This also applies to pending tasks recovered after a restart. No local process is
 spawned. A deliberately backgrounded call still returns its task ID; a later refusal marks
 that task failed and its status includes `remote_refusal` with the same error text.
+`network_unsupported` means the runner cannot grant the requested network mode; it is a
+non-transient refusal before start, not a local fallback, and includes the runner's detail
+when present. If the runner accepts a `net` job but does not acknowledge outbound access
+(including older runners), the header plainly says `OFFLINE: the runner did not grant the
+requested network access`.
 
-Successful remote runs begin with `ran remotely on ck-motor`. Only automatic prefix routing
-(without an explicit `runon`) retains local fallback with the advisory
+Successful remote runs begin with `ran remotely on ck-motor`; when a vCPU count was requested,
+the header includes it, for example `ran remotely on ck-motor (4 vCPUs requested, network)`
+when `net` was also requested. A runner's `Started` record publishes phase `running`; its
+wall-clock start time is not an AFT timeout. Only
+automatic prefix routing (without an explicit `runon`) retains local fallback with the advisory
 `ran locally on macOS: remote refused: <reason>` (or the local OS name). A job that started
 remotely is never automatically resubmitted: if AFT loses track of it, the reply says the
 outcome is unknown instead of re-running it. Remote jobs run on a
-server-side copy of the workspace with no network access, and no files are synced back. The
-reply therefore says `remote outcome unknown (job <id>); the remote job could not affect this
+server-side copy of the workspace, and no files are synced back. For offline jobs the
+reply says `remote outcome unknown (job <id>); the remote job could not affect this
 machine or the network, so rerunning is safe; check exec.status <id> first if you need its
-result`. If AFT has no job ID, it omits `(job <id>)` and the `check exec.status` advice. This
+result`. For jobs granted outbound access, the reply instead warns that the job may have had
+outside effects through outbound network access, so check before rerunning, and names the
+remote job ID. It never says such a rerun is safe. If AFT has no job ID, it omits `(job <id>)`
+and the `check exec.status` advice. This
 applies only to remote jobs; local commands, including a remote refusal's local fallback,
 keep their existing unknown-outcome warnings because their side effects may have happened.
 After the output, the reply prints what the runner reported about the server's workspace, none of which

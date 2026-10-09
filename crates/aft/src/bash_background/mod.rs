@@ -297,6 +297,7 @@ pub(crate) struct RemoteLaunch {
     #[cfg_attr(not(unix), allow(dead_code))]
     pub session: String,
     pub requested_vcpus: Option<u32>,
+    pub requested_network: bool,
 }
 
 /// Decide where a bash call that set `runon` runs, before anything is spawned.
@@ -359,6 +360,7 @@ pub(crate) fn remote_for_runon(
             .and_then(|policy| policy.default_demand.as_deref()),
     )?;
     launch.requested_vcpus = resolved.weight_hint;
+    launch.requested_network = resolved.network;
     launch.explicit_runon = true;
     Ok(launch)
 }

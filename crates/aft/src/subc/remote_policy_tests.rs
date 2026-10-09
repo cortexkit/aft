@@ -739,6 +739,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                     harness: "runner".into(),
                     session: "session".into(),
                     requested_vcpus: None,
+                    requested_network: false,
                 },
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 "cargo test",

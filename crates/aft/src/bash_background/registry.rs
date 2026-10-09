@@ -406,6 +406,9 @@ pub struct BgTaskSnapshot {
     /// An explicit remote demand was refused before the command started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_refusal: Option<RemoteRefusal>,
+    /// The runner confirmed execution began; older runners omit this phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<&'static str>,
     pub live_descendants: Option<Vec<LiveDescendant>>,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub live_descendants_omitted: usize,
@@ -9463,6 +9466,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
         remote_refusal,
+        phase: None,
         live_descendants: metadata.live_descendants.clone(),
         live_descendants_omitted: metadata.live_descendants_omitted,
         live_descendants_summary,
@@ -9547,6 +9551,12 @@ impl BgTask {
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
             remote_refusal: remote::remote_refusal(metadata),
+            phase: metadata
+                .remote
+                .as_ref()
+                .filter(|remote| remote.started.is_some())
+                .filter(|_| !metadata.is_terminal())
+                .map(|_| "running"),
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
             live_descendants_summary: live_descendants_summary(metadata),

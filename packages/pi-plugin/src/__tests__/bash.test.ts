@@ -450,20 +450,16 @@ describe("bash tool adapter", () => {
         bash: { runon_enabled: true },
       } as PluginContext["config"]),
     );
-    await tools
-      .get("bash")!
-      .execute(
-        "test-call",
-        { command: "FOO=1 make | tail -1", runon: "linux" },
-        undefined,
-        undefined,
-        {
+    for (const runon of ["linux", "linux,net", "linux,4c,net", "linux,net,4c"]) {
+      await tools
+        .get("bash")!
+        .execute("test-call", { command: "FOO=1 make | tail -1", runon }, undefined, undefined, {
           cwd: projectRoot,
           hasUI: false,
-        },
-      );
-    const call = calls[0] as [string, Record<string, unknown>];
-    expect(call[1]).toMatchObject({ command: "FOO=1 make | tail -1", runon: "linux" });
+        });
+      const call = calls.at(-1) as [string, Record<string, unknown>];
+      expect(call[1]).toMatchObject({ command: "FOO=1 make | tail -1", runon });
+    }
   });
 
   test("blocking runon transport outlasts the engine's remote hand-back at the timeout or wait cap", async () => {

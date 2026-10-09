@@ -3,7 +3,7 @@
 //! gates explicit runon only, never that legacy route.
 use serde::{Deserialize, Serialize};
 
-/// Runner platforms whose demands `runon` accepts; vCPU counts are parsed separately.
+/// Runner platforms whose demands `runon` accepts; options are parsed separately.
 pub const KNOWN_DEMANDS: &[&str] = &["linux"];
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -80,15 +80,16 @@ fn valid_prefix(prefix: &str) -> bool {
         })
 }
 
-/// The vCPU sizing hint parsed from a runner demand.
+/// The sizing and outbound-network options parsed from a runner demand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedDemand {
     pub weight_hint: Option<u32>,
+    pub network: bool,
 }
 
 /// Resolve the demand a `runon` call asks for. An empty value takes the
 /// session's default demand; otherwise, AFT accepts a known runner with an
-/// optional vCPU count, and refuses malformed or unknown demands by name.
+/// optional vCPU count and outbound access, and refuses invalid demands by name.
 pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<ResolvedDemand, String> {
     let requested = runon.trim();
     let demand = if requested.is_empty() {
@@ -107,36 +108,51 @@ pub fn resolve_demand(runon: &str, default_demand: Option<&str>) -> Result<Resol
     parse_demand(demand)
 }
 
-/// Parse a runner name and optional vCPU count, rejecting malformed requests
+/// Parse a runner name and its options, rejecting malformed requests
 /// before the remote command can be dispatched.
 pub fn parse_demand(demand: &str) -> Result<ResolvedDemand, String> {
-    if let Some((platform, count)) = demand.split_once(',') {
-        let digits = count.strip_suffix('c').filter(|digits| {
+    let mut tokens = demand.split(',');
+    if !KNOWN_DEMANDS.contains(&tokens.next().unwrap_or_default()) {
+        return Err(unknown_demand(demand));
+    }
+    let mut resolved = ResolvedDemand::default();
+    for token in tokens {
+        if token == "net" {
+            if resolved.network {
+                return Err(format!(
+                    "runon {demand:?} is not valid: duplicate net option"
+                ));
+            }
+            resolved.network = true;
+            continue;
+        }
+        let digits = token.strip_suffix('c').filter(|digits| {
             !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
         });
         let count = digits
             .and_then(|digits| digits.parse::<u32>().ok())
             .filter(|count| *count > 0);
-        if platform != "linux" || count.is_none() {
+        if count.is_none() {
             return Err(invalid_vcpu_demand(demand));
         }
-        return Ok(ResolvedDemand { weight_hint: count });
+        if resolved.weight_hint.is_some() {
+            return Err(format!(
+                "runon {demand:?} is not valid: duplicate vCPU count"
+            ));
+        }
+        resolved.weight_hint = count;
     }
-    if KNOWN_DEMANDS.contains(&demand) {
-        Ok(ResolvedDemand::default())
-    } else {
-        Err(unknown_demand(demand))
-    }
+    Ok(resolved)
 }
 
 fn invalid_vcpu_demand(demand: &str) -> String {
-    format!("runon {demand:?} is not valid: give the vCPU count as Nc, for example \"linux,4c\"")
+    format!("runon {demand:?} is not valid: options are net and a vCPU count as Nc, for example \"linux,4c,net\"")
 }
 
 /// The refusal for a demand no runner serves.
 pub fn unknown_demand(demand: &str) -> String {
     format!(
-        "unknown runner demand {demand:?}; runon accepts {}",
+        "unknown runner demand {demand:?}; the server only runs Linux; runon accepts {}",
         KNOWN_DEMANDS
             .iter()
             .map(|d| format!("{d:?}"))
@@ -148,6 +164,33 @@ pub fn unknown_demand(demand: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_demand_options_parse_in_any_order_and_refuse_duplicates_by_name() {
+        for demand in ["linux,net", "linux,4c,net", "linux,net,4c"] {
+            let resolved = resolve_demand(demand, None).unwrap();
+            assert!(resolved.network, "{demand}");
+            assert_eq!(
+                resolved.weight_hint,
+                if demand.contains("4c") { Some(4) } else { None }
+            );
+        }
+        assert!(resolve_demand("", Some("linux,net,4c")).unwrap().network);
+        for demand in ["linux", "linux,4c"] {
+            assert!(!resolve_demand(demand, None).unwrap().network);
+        }
+        for demand in ["linux,net,net", "linux,4c,8c", "linux,other"] {
+            let error = resolve_demand(demand, None).unwrap_err();
+            assert!(error.contains(demand), "{error}");
+            assert!(error.contains("not valid"), "{error}");
+        }
+        for demand in ["windows", "windows,4c", "windows,net,4c"] {
+            let error = resolve_demand(demand, None).unwrap_err();
+            assert!(error.contains(demand), "{error}");
+            assert!(error.contains("unknown runner demand"), "{error}");
+            assert!(error.contains("only runs Linux"), "{error}");
+        }
+    }
 
     #[test]
     fn deployed_legacy_policy_vectors_match_and_verify_digests() {
@@ -260,7 +303,6 @@ mod tests {
             "linux,4cores",
             "linux,c",
             "linux,4c,2c",
-            "windows,4c",
         ] {
             let error = resolve_demand(demand, None).unwrap_err();
             assert!(error.contains(demand), "{demand:?}: {error}");

@@ -41,6 +41,10 @@ describe("subc tool schemas artifact", () => {
     const worker = buildSubcToolPresets(true).worker;
     for (const bash of [head.bash, worker.bash]) {
       expect((bash.properties as Record<string, unknown>).runon).toMatchObject({ type: "string" });
+      expect((bash.properties as Record<string, unknown>).runon).toMatchObject({
+        description:
+          'Run on the remote Linux build server: `linux`, optionally with an exact vCPU count such as `linux,4c`; add ",net" for outbound internet (offline by default).',
+      });
       expect((bash.description as string).split(REMOTE_GUIDANCE)).toHaveLength(2);
     }
     for (const schemas of [head, worker]) {

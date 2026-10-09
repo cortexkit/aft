@@ -69,6 +69,7 @@ pub(crate) fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunc
         harness: "broca".into(),
         session: "session".into(),
         requested_vcpus: None,
+        requested_network: false,
         params: exec::FrozenParams {
             remote_exec: Some(exec::policy::RemoteExecPolicy {
                 enabled: true,
@@ -514,6 +515,35 @@ fn exec_remote_bash_unknown_reply_without_job_omits_status_hint() {
     assert!(done
         .output_preview
         .contains("remote route interrupted before acceptance"));
+}
+
+#[test]
+fn runon_network_lost_acceptance_does_not_claim_rerun_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, _) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf unused");
+    let task = registry.task(&task_id).unwrap();
+    {
+        let mut state = task.state.lock().unwrap();
+        let remote = state.metadata.remote.as_mut().unwrap();
+        remote.job_id = None;
+        remote.requested_network = true;
+        remote.accepted = false;
+    }
+    registry.remote_terminal(
+        &task,
+        Verdict::OutcomeUnknown,
+        Some("remote acceptance lost".into()),
+    );
+    let done = registry.observed_status(&task_id, "session", 8192).unwrap();
+    assert!(
+        done.output_preview.contains("check before rerunning"),
+        "{done:?}"
+    );
+    assert!(
+        !done.output_preview.contains("rerunning is safe"),
+        "{done:?}"
+    );
 }
 
 #[test]
@@ -1220,6 +1250,10 @@ async fn exec_remote_bash_restart_uses_persisted_seq_without_duplicates_or_gaps(
         harness: "broca".into(),
         session: "session".into(),
         requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: true,
+        started: None,
         job_id: None,
         last_seq: None,
         gap_recovery: None,
@@ -1533,6 +1567,10 @@ fn persist_accepted_with_snapshot(
         harness: "runner".into(),
         session: "session".into(),
         requested_vcpus: None,
+        requested_network: false,
+        granted_network: false,
+        accepted: true,
+        started: None,
         job_id: None,
         last_seq: None,
         gap_recovery: None,
@@ -2121,6 +2159,214 @@ fn exec_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json:
 }
 
 #[tokio::test]
+async fn runon_network_is_present_on_wire_only_when_requested() {
+    for (runon, network, cpus) in [
+        ("linux", None, None),
+        ("linux,4c", None, Some(4)),
+        ("linux,net", Some("outbound"), None),
+        ("linux,4c,net", Some("outbound"), Some(4)),
+        ("linux,net,4c", Some("outbound"), Some(4)),
+        ("", Some("outbound"), Some(4)),
+    ] {
+        let daemon = daemon(Script::NetworkGranted, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let mut policy = launch(daemon.connection.clone());
+        policy.params.remote_exec.as_mut().unwrap().default_demand = Some("linux,net,4c".into());
+        let response = handle_with_policy(
+            &ctx,
+            Some(policy),
+            serde_json::json!({
+                "command": "printf network", "runon": runon, "compressed": false
+            }),
+        );
+        assert!(response.success, "{runon}: {response:?}");
+        let done = terminal(
+            ctx.bash_background(),
+            response.data["task_id"].as_str().unwrap(),
+        )
+        .await;
+        let runs = exec_runs(&daemon);
+        assert_eq!(runs.len(), 1);
+        let captured: RunRequest = serde_json::from_value(runs[0].clone()).unwrap();
+        assert_eq!(
+            captured.network,
+            network.map(|_| Network::Outbound),
+            "{runon}: {runs:?}"
+        );
+        assert_eq!(
+            runs[0].get("network").and_then(serde_json::Value::as_str),
+            network,
+            "{runon}: {runs:?}"
+        );
+        assert_eq!(captured.weight_hint, cpus, "{runon}: {runs:?}");
+        if network.is_some() {
+            let expected = if cpus.is_some() {
+                "ran remotely on ck-motor (4 vCPUs requested, network)"
+            } else {
+                "ran remotely on ck-motor (network)"
+            };
+            assert_eq!(done.output_preview.lines().next(), Some(expected));
+            assert!(!done.output_preview.contains("OFFLINE"), "{done:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn runon_network_not_granted_is_plainly_offline_in_reply_and_persistence() {
+    for script in [Script::Plain, Script::NetworkUnknown] {
+        let daemon = daemon(script, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": "printf offline", "runon": "linux,net", "compressed": false
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let done = terminal(ctx.bash_background(), task_id).await;
+        assert_eq!(done.info.status, BgTaskStatus::Completed);
+        let expected = "OFFLINE: the runner did not grant the requested network access";
+        assert!(done.output_preview.contains(expected), "{done:?}");
+        assert!(
+            crate::commands::bash_orchestrate::format_foreground_result(&done).contains(expected)
+        );
+        let task = ctx.bash_background().task(task_id).unwrap();
+        let persisted = read_task(&task.paths.json).unwrap();
+        assert!(persisted.execution_note.unwrap().contains(expected));
+        let remote = persisted.remote.unwrap();
+        assert!(remote.requested_network);
+        assert!(!remote.granted_network);
+    }
+}
+
+#[tokio::test]
+async fn runon_network_unsupported_refuses_by_name_without_local_spawn() {
+    let daemon = daemon(Script::NetworkUnsupported, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    let marker = dir.path().join("must-not-run");
+    let response = handle_with_policy(
+        &ctx,
+        Some(launch(daemon.connection.clone())),
+        serde_json::json!({
+            "command": format!("touch '{}'", marker.display()), "runon": "linux,net"
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    let done = terminal(
+        ctx.bash_background(),
+        response.data["task_id"].as_str().unwrap(),
+    )
+    .await;
+    let refusal = refusal_response(done);
+    assert_runon_refusal(
+        &refusal,
+        "network_unsupported (outbound access disabled by runner policy)",
+    );
+    assert!(
+        refusal.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("outbound access disabled by runner policy"),
+        "{refusal:?}"
+    );
+    assert!(!marker.exists());
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
+async fn runon_network_unknown_outcome_warns_only_for_granted_outbound() {
+    for (script, runon, granted) in [
+        (Script::NetworkLost, "linux,net", true),
+        (Script::Lost, "linux,net", false),
+        (Script::Lost, "linux", false),
+    ] {
+        let daemon = daemon(script, "exec-remote/v1").await;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = restarted_context(dir.path());
+        let response = handle_with_policy(
+            &ctx,
+            Some(launch(daemon.connection.clone())),
+            serde_json::json!({
+                "command": "printf uncertain", "runon": runon, "compressed": false
+            }),
+        );
+        assert!(response.success, "{response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        let done = terminal(ctx.bash_background(), task_id).await;
+        assert_eq!(done.info.status, BgTaskStatus::FateUnknown);
+        let text = crate::commands::bash_orchestrate::format_foreground_result(&done);
+        assert!(
+            text.contains(&format!("remote outcome unknown (job {})", id())),
+            "{text}"
+        );
+        assert_eq!(text.contains("rerunning is safe"), !granted, "{text}");
+        assert_eq!(
+            text.contains("may have had outside effects"),
+            granted,
+            "{text}"
+        );
+        assert_eq!(text.contains("check before rerunning"), granted, "{text}");
+        assert_eq!(
+            exec_runs(&daemon).len(),
+            1,
+            "unknown outcomes must never be resubmitted"
+        );
+        let task = ctx.bash_background().task(task_id).unwrap();
+        let persisted = read_task(&task.paths.json).unwrap();
+        assert_eq!(persisted.remote.unwrap().granted_network, granted);
+        assert_eq!(persisted.status_reason, done.info.status_reason);
+    }
+}
+
+#[tokio::test]
+async fn exec_remote_started_sets_running_phase_without_aft_timeout() {
+    let daemon = daemon(Script::Started, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry();
+    let task_id = start(&registry, dir.path(), daemon.connection.clone());
+    let running = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = registry.observed_status(&task_id, "session", 8192).unwrap();
+            if snapshot.phase == Some("running") {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Started must publish the running phase");
+    assert_eq!(running.info.status, BgTaskStatus::Running);
+    assert_eq!(serde_json::to_value(&running).unwrap()["phase"], "running");
+    assert!(running.hard_kill.is_none());
+    let task = registry.task(&task_id).unwrap();
+    let persisted = read_task(&task.paths.json).unwrap();
+    let started = persisted.remote.as_ref().unwrap().started.as_ref().unwrap();
+    assert_eq!(
+        (started.seq, started.queue_wait_ms, started.started_at_ms),
+        (0, 123, 1)
+    );
+    assert_eq!(persisted.remote.as_ref().unwrap().last_seq, Some(0));
+    assert!(
+        persisted.started_at > 1,
+        "runner time must not reset the local start or timeout"
+    );
+    assert!(running.info.status_reason.is_none());
+    let killing = registry.clone();
+    tokio::task::spawn_blocking(move || killing.kill_remote_task(&task).unwrap())
+        .await
+        .unwrap();
+    let done = terminal(&registry, &task_id).await;
+    assert_eq!(done.info.status, BgTaskStatus::Killed);
+    assert!(done.phase.is_none());
+    assert_eq!(exec_runs(&daemon).len(), 1);
+}
+
+#[tokio::test]
 async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     let daemon = daemon(Script::Plain, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
@@ -2219,6 +2465,8 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         "linux,4cores",
         "linux,c",
         "linux,4c,2c",
+        "linux,net,net",
+        "linux,unknown",
         "windows,4c",
     ] {
         let response = handle_with_policy(
@@ -2229,7 +2477,12 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
         assert!(!response.success, "{runon}: {response:?}");
         let message = response.data["message"].as_str().unwrap_or_default();
         assert!(message.contains(runon), "{runon}: {response:?}");
-        assert!(message.contains("not valid"), "{runon}: {response:?}");
+        let reason = if runon.starts_with("windows") {
+            "only runs Linux"
+        } else {
+            "not valid"
+        };
+        assert!(message.contains(reason), "{runon}: {response:?}");
     }
     assert!(exec_runs(&daemon).is_empty());
     assert!(!marker.exists());

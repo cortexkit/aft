@@ -99,6 +99,11 @@ pub(crate) enum Script {
         queue: Duration,
         run: Duration,
     },
+    NetworkGranted,
+    NetworkUnknown,
+    NetworkLost,
+    NetworkUnsupported,
+    Started,
 }
 
 pub(crate) struct Daemon {
@@ -183,16 +188,25 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail) {
-                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 }))).unwrap()));
-
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported) {
+                                let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 });
+                                if matches!(script, Script::NetworkGranted | Script::NetworkLost) {
+                                    accepted = accepted.with_network(Network::Outbound);
+                                } else if matches!(script, Script::NetworkUnknown) {
+                                    accepted = accepted.with_network(Network::Unknown("future_network".into()));
+                                }
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(accepted)).unwrap()));
+                                if matches!(script, Script::Started) {
+                                    replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Started(Started::new(0, 123, 1))).unwrap()));
+                                }
                             }
                              let outcome = if matches!(script, Script::PersistentTerminalGap | Script::TransientTerminalGap | Script::TerminalGapOnce) { Outcome::Exit { code: 7 } }
                                  else if attaching && matches!(script,Script::AttachRefused) { Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) } }
                                 else if draining { Outcome::RefusedBeforeStart { reason: if matches!(script, Script::DiskFull { .. }) { RefusalReason::RunnerDiskFull } else { RefusalReason::RunnerDraining } } }
                                  else if attaching && cancelled { Outcome::Signal { signal: 15 } }
                                 else { match script {
-                                    Script::Lost => Outcome::OutcomeUnknown,
+                                    Script::Lost | Script::NetworkLost => Outcome::OutcomeUnknown,
+                                    Script::NetworkUnsupported => Outcome::RefusedBeforeStart { reason: RefusalReason::NetworkUnsupported },
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
                                     Script::KnownRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
                                     Script::WorkspaceSetupRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed },
@@ -201,7 +215,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. }) && !attaching { /* accepted, still running */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started) && !attaching { /* accepted, still running */ }
                             else if attaching && matches!(script, Script::GappedAttach(_) | Script::GappedCancel(_)) { /* delayed producer below */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -233,6 +247,9 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                         let mut value = serde_json::to_value(&terminal).unwrap();
                                         value["refusal_detail"] = json!("runner says:\nmaintenance\twindow");
                                         terminal = serde_json::from_value(value).unwrap();
+                                    }
+                                    if matches!(script, Script::NetworkUnsupported) {
+                                        terminal.refusal_detail = Some("outbound access disabled by runner policy".into());
                                     }
                                     if draining {
                                         if let Script::Draining { retry_after_ms, .. } | Script::DiskFull { retry_after_ms, .. } = script {

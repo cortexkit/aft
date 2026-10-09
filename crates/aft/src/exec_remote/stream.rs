@@ -1,6 +1,6 @@
 use super::*;
 use std::{collections::BTreeMap, io};
-use types::{Accepted, AttachRequest, Output, OutputStream, StreamRecord, Uuid};
+use types::{Accepted, AttachRequest, Output, OutputStream, Started, StreamRecord, Uuid};
 
 /// Durable resume cursor. `last_seq` is the last contiguous record committed
 /// by the sink, not the largest sequence observed on the connection.
@@ -44,6 +44,9 @@ impl ResumePoint {
 /// number atomically before returning, so a restart can reconstruct ResumePoint.
 pub trait OutputSink {
     fn accepted(&mut self, accepted: &Accepted) -> io::Result<()>;
+    fn started(&mut self, started: &Started) -> io::Result<()> {
+        self.unknown_output(started.seq, &[])
+    }
     fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> io::Result<()>;
     fn truncated(&mut self, before_seq: u64) -> io::Result<()>;
     /// Commit terminal proof and the retry count before dropping a gapped stream.
@@ -74,6 +77,7 @@ pub struct StreamConsumer {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Pending {
     Output(Output),
+    Started(Started),
     Unknown,
 }
 
@@ -113,9 +117,10 @@ impl StreamConsumer {
         let record: StreamRecord =
             serde_json::from_value(value).map_err(|e| Error::Protocol(e.to_string()))?;
         match record {
-            StreamRecord::Accepted(_) | StreamRecord::Output(_) | StreamRecord::Terminal(_) => {
-                self.consume(record, sink)
-            }
+            StreamRecord::Accepted(_)
+            | StreamRecord::Started(_)
+            | StreamRecord::Output(_)
+            | StreamRecord::Terminal(_) => self.consume(record, sink),
             _ => self.consume_unknown(seq, sink),
         }
     }
@@ -149,6 +154,9 @@ impl StreamConsumer {
                 });
                 self.accepted = true;
                 Ok(())
+            }
+            StreamRecord::Started(started) => {
+                self.enqueue(started.seq, Pending::Started(started), sink)
             }
             StreamRecord::Output(output) => {
                 if let Some(before) = output.truncated_before_seq {
@@ -276,6 +284,7 @@ impl StreamConsumer {
                     _ => sink.unknown_output(next, &output.bytes.0)?,
                 },
                 Pending::Unknown => sink.unknown_output(next, &[])?,
+                Pending::Started(started) => sink.started(started)?,
             }
             self.pending.remove(&next);
             if let Some(point) = self.point.as_mut() {

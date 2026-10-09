@@ -354,6 +354,9 @@ describe("OpenCode bash adapter", () => {
         description?: string;
       };
       expect(jsonSchema.description).toBe(BASH_RUNON_DESCRIPTION);
+      expect(jsonSchema.description).toContain(
+        'add ",net" for outbound internet (offline by default)',
+      );
       expect(bash.description).toContain(BASH_RUNON_GUIDANCE);
     },
   );
@@ -369,14 +372,13 @@ describe("OpenCode bash adapter", () => {
         bash: { runon_enabled: true },
       } as PluginContext["config"],
     );
-    await bash.execute(
-      { command: "FOO=1 cargo test | tail -1", runon: "linux" },
-      createMockSdkContext({}),
-    );
-    expect(calls[0].params).toMatchObject({
-      command: "FOO=1 cargo test | tail -1",
-      runon: "linux",
-    });
+    for (const runon of ["linux", "linux,net", "linux,4c,net", "linux,net,4c"]) {
+      await bash.execute(
+        { command: "FOO=1 cargo test | tail -1", runon },
+        createMockSdkContext({}),
+      );
+      expect(calls.at(-1)?.params).toMatchObject({ command: "FOO=1 cargo test | tail -1", runon });
+    }
 
     const dead = createHarness(
       () => {
@@ -390,9 +392,11 @@ describe("OpenCode bash adapter", () => {
         remote_exec: { enabled: true },
       } as PluginContext["config"],
     );
-    await expect(
-      dead.tool.execute({ command: "printf no", runon: "linux" }, createMockSdkContext({})),
-    ).rejects.toThrow("runon is unsupported, and the command was not run locally");
+    for (const runon of ["linux", "linux,net"]) {
+      await expect(
+        dead.tool.execute({ command: "printf no", runon }, createMockSdkContext({})),
+      ).rejects.toThrow("runon is unsupported, and the command was not run locally");
+    }
   });
 
   test("schema omits wait, background and PTY args when bash.background is disabled", () => {

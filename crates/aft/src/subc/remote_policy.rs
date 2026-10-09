@@ -206,6 +206,7 @@ pub(super) fn lookup(
                     harness: harness.clone(),
                     session: session.clone(),
                     requested_vcpus: None,
+                    requested_network: false,
                 })
         }
         RemoteSource::Worker(key) => {
@@ -225,6 +226,7 @@ pub(super) fn lookup(
                 harness: key.harness.clone(),
                 session: key.session.clone(),
                 requested_vcpus: None,
+                requested_network: false,
             })
         }
     }

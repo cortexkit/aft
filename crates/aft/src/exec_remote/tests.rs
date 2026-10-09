@@ -33,7 +33,7 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.3"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.5"));
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +54,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.3"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.5"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/exec-remote/published-v0.2.0.json"
     ))
@@ -225,7 +225,11 @@ fn refusal_detail_is_preserved_when_grading_a_terminal() {
 
 #[test]
 fn new_runner_refusal_reasons_still_prove_never_started() {
-    for reason in [RefusalReason::RunnerDraining, RefusalReason::RunnerDiskFull] {
+    for reason in [
+        RefusalReason::RunnerDraining,
+        RefusalReason::RunnerDiskFull,
+        RefusalReason::NetworkUnsupported,
+    ] {
         let terminal = TerminalRecord::new(
             job_id(),
             Outcome::RefusedBeforeStart {
@@ -281,9 +285,15 @@ pub(super) struct MemorySink {
     terminals: Vec<Verdict>,
     pub(super) truncations: Vec<u64>,
     unknown: Vec<(u64, Vec<u8>)>,
+    started: Vec<Started>,
 }
 
 impl OutputSink for MemorySink {
+    fn started(&mut self, started: &Started) -> std::io::Result<()> {
+        self.seqs.push(started.seq);
+        self.started.push(started.clone());
+        Ok(())
+    }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> std::io::Result<()> {
         self.seqs.push(seq);
         self.unknown.push((seq, bytes.to_vec()));
@@ -313,6 +323,29 @@ impl OutputSink for MemorySink {
 
 fn accepted() -> StreamRecord {
     StreamRecord::Accepted(Accepted::new(job_id(), 1))
+}
+
+#[test]
+fn started_records_are_sequenced_deduplicated_and_replayed_without_unknown_output() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"after-start"), &mut sink)
+        .unwrap();
+    let record = StreamRecord::Started(Started::new(0, 123, 1));
+    let bytes = serde_json::to_vec(&record).unwrap();
+    consumer.consume_bytes(&bytes, &mut sink).unwrap();
+    consumer.consume(record.clone(), &mut sink).unwrap();
+    assert_eq!(sink.seqs, [0, 1]);
+    assert_eq!(sink.started, [Started::new(0, 123, 1)]);
+    assert_eq!(sink.stdout, b"after-start");
+    assert!(sink.unknown.is_empty());
+    let point = consumer.resume_point().unwrap();
+    assert_eq!(point.last_seq, Some(1));
+    let mut replay = StreamConsumer::resume(point);
+    replay.consume(record, &mut sink).unwrap();
+    assert_eq!(sink.started.len(), 1);
 }
 fn output(seq: u64, stream: OutputStream, bytes: &[u8]) -> StreamRecord {
     StreamRecord::Output(Output::new(seq, stream, BytePayload(bytes.to_vec())))
@@ -489,6 +522,7 @@ fn request_copies_shell_inputs_without_executor_metadata() {
         siblings: vec![worktree.to_str().unwrap().into()],
         weight_hint: Some(16),
         queue_wait_limit_s: Some(0),
+        network: None,
     };
     let request = build_request(
         &worktree,
