@@ -2090,6 +2090,14 @@ mod grant_path_tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, rx) = mpsc::channel(8);
         let (touch_tx, _) = mpsc::channel(8);
+        let repeat = crate::run_tool_call::RepeatObservation::for_agent_call(
+            "deadline-session",
+            "bash",
+            &arguments,
+            false,
+            false,
+            false,
+        );
         submit_deferred_bash(
             executor,
             &tx,
@@ -2119,7 +2127,7 @@ mod grant_path_tests {
             None,
             None,
             None,
-            None,
+            repeat,
             false,
             false,
             server_completion,
@@ -2968,6 +2976,96 @@ mod grant_path_tests {
             ),
             "only one terminal reply"
         );
+    }
+
+    #[tokio::test]
+    async fn bash_deadline_handoff_observes_repeat_while_task_lock_is_held() {
+        let (dir, root) = super::super::test_support::test_root("bash-repeat-deadline");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.foreground_wait_window_ms = 2000;
+            config.project_root = Some(root.as_path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.sandbox.enabled = false;
+        });
+        let arguments = json!({"command":"sleep 60", "timeout":60000});
+        let key = crate::response_finalize::repeat_breaker::semantic_key("bash", &arguments);
+        // Seed prior calls with injected times instead of spending thirty
+        // seconds waiting for the breaker's minimum observation span.
+        let now = Instant::now();
+        for (age, output) in [(32, "first task"), (16, "second task")] {
+            assert!(ctx
+                .repeat_breaker()
+                .observe_at(
+                    "deadline-session",
+                    "bash",
+                    key.clone(),
+                    crate::response_finalize::repeat_breaker::output_hash(output),
+                    now - Duration::from_secs(age),
+                )
+                .is_none());
+        }
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(root.clone(), ctx.clone());
+        let mut rx = deadline_test_call(&executor, &root, running_bash_stub, arguments);
+        let started_by = Instant::now() + Duration::from_millis(1500);
+        let task = loop {
+            if let Some(snapshot) = ctx.bash_background().list(0).first() {
+                break ctx
+                    .bash_background()
+                    .task_for_test(&snapshot.info.task_id)
+                    .unwrap();
+            }
+            assert!(
+                Instant::now() < started_by,
+                "task must start before the reply deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = executor.submit_async(
+            root,
+            Lane::Mutating,
+            "held-writer".into(),
+            Box::new(move |_| {
+                let _state = task.state.lock().unwrap();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                Response::success("held-writer", json!({}))
+            }),
+        );
+        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let done = tokio::time::timeout(Duration::from_millis(2300), rx.recv()).await;
+        release_tx.send(()).unwrap();
+        holder.await.unwrap();
+        let done = done
+            .expect("handoff must bypass the held writer and task lock")
+            .unwrap();
+        let result = done.result.expect("handoff response");
+        let task_id = result.response.data["task_id"]
+            .as_str()
+            .expect("handoff task id");
+        let _ = ctx.bash_background().kill(task_id, "deadline-session");
+        assert!(
+            result
+                .text
+                .contains("This is the 3rd call with the same arguments"),
+            "deadline handoff must steer: {}",
+            result.text
+        );
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv()).await,
+                Ok(Some(_))
+            ),
+            "only one terminal reply"
+        );
+        let next = ctx
+            .repeat_breaker()
+            .observe_at("deadline-session", "bash", key, 0, Instant::now())
+            .expect("fourth call");
+        assert_eq!(next.count, 4, "the deadline path observes exactly once");
     }
 
     impl Drop for DeferredWaitReleaseGuard {
