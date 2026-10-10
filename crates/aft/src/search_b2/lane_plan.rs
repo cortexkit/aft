@@ -54,6 +54,15 @@ pub fn plan<'a>(
 /// ruling R1b selects symbol lookup for natural-language queries only when the
 /// classifier found an identifier-shaped token, leaving ordinary prose
 /// unchanged. Regex remains on its pinned owner.
+///
+/// `query` is prose: `pattern` carries exact names, text, regexes and
+/// literals, so every shape the router gives `query` keeps the semantic lane.
+/// A code-looking query (an identifier, a quoted literal, a log line, a path)
+/// adds the exact, lexical and lookup lanes its shape calls for, and those
+/// lanes plus the plan table's lexical weight keep exact-name hits strong;
+/// the shape never drops the semantic lane. Regex is the one exception: a
+/// query the router reads as a regex is searched as a regex on the grep
+/// route, with no prose to embed.
 pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind> {
     let mut lanes = match shape {
         SearchShape::Identifier => vec![
@@ -61,6 +70,7 @@ pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind
             SearchLaneKind::Exact,
             SearchLaneKind::Lexical,
             SearchLaneKind::Variants,
+            SearchLaneKind::Semantic,
         ],
         SearchShape::Short => vec![
             SearchLaneKind::Symbol,
@@ -69,7 +79,11 @@ pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind
             SearchLaneKind::Variants,
             SearchLaneKind::Semantic,
         ],
-        SearchShape::CodeLiteral => vec![SearchLaneKind::Exact, SearchLaneKind::Lexical],
+        SearchShape::CodeLiteral => vec![
+            SearchLaneKind::Exact,
+            SearchLaneKind::Lexical,
+            SearchLaneKind::Semantic,
+        ],
         SearchShape::NaturalLanguage => vec![
             SearchLaneKind::Exact,
             SearchLaneKind::Lexical,
@@ -79,11 +93,13 @@ pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind
             SearchLaneKind::Exact,
             SearchLaneKind::Anchored,
             SearchLaneKind::Lexical,
+            SearchLaneKind::Semantic,
         ],
         SearchShape::Path => vec![
             SearchLaneKind::PathLookup,
             SearchLaneKind::Exact,
             SearchLaneKind::Lexical,
+            SearchLaneKind::Semantic,
         ],
         SearchShape::Regex => vec![SearchLaneKind::FallbackWalk],
     };

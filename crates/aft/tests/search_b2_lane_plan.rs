@@ -185,14 +185,28 @@ fn independent_eighty_row_matrix_matches_installed_runtime_hooks() {
     }
 }
 
+/// `query` is prose (exact names and regexes go in `pattern`), so a
+/// code-looking query keeps the semantic lane whenever the semantic index is
+/// ready, and a degraded index only ever removes the lanes it serves.
 #[test]
-fn deterministic_degradation_never_adds_semantic_to_identifiers_or_literals() {
-    for query in ["parse_header", "\"exceeds the cap\"", "\"ab\""] {
+fn code_looking_queries_keep_the_semantic_lane_when_it_is_ready() {
+    for query in [
+        "parse_header",
+        "\"exceeds the cap\"",
+        "\"ab\"",
+        "src/main.rs",
+        "2026-09-08 ERROR open /tmp/a.rs failed",
+    ] {
         let raw_query = RawQuery::new(query);
         let (shape, facts) = install_defaults().classify(&raw_query);
+        assert_ne!(shape, SearchShape::NaturalLanguage, "{query}");
         for bits in ["111", "110", "101", "100", "011", "010", "001", "000"] {
             let plan = install_defaults().plan(&shape, &facts, &readiness(bits));
-            assert!(!plan.contains(SearchLaneKind::Semantic), "{query} {bits}");
+            assert_eq!(
+                plan.contains(SearchLaneKind::Semantic),
+                bits.starts_with('1'),
+                "{query} {bits}"
+            );
             assert_ne!(plan.selected_lanes, Vec::<SearchLaneKind>::new());
         }
     }

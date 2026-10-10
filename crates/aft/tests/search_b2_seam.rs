@@ -166,6 +166,7 @@ fn readiness_disclosure_is_a_callback_but_never_a_retrieval_lane() {
             SearchLaneKind::Exact,
             SearchLaneKind::Lexical,
             SearchLaneKind::Variants,
+            SearchLaneKind::Semantic,
         ]
     );
     assert_eq!(
@@ -174,6 +175,7 @@ fn readiness_disclosure_is_a_callback_but_never_a_retrieval_lane() {
             SearchLaneKind::Exact,
             SearchLaneKind::Lexical,
             SearchLaneKind::Variants,
+            SearchLaneKind::Semantic,
             SearchLaneKind::ReadinessDisclosure
         ]
     );
@@ -223,11 +225,11 @@ fn public_log_and_path_requests_focus_anchored_and_path_lookup_callbacks() {
     for (index, (query, expected)) in [
         (
             "2026-09-08 ERROR worker failed",
-            serde_json::json!({"exact": 1, "anchored": 1, "lexical": 1}),
+            serde_json::json!({"exact": 1, "anchored": 1, "lexical": 1, "semantic": 1}),
         ),
         (
             "src/lib.rs",
-            serde_json::json!({"exact": 1, "path_lookup": 1, "lexical": 1}),
+            serde_json::json!({"exact": 1, "path_lookup": 1, "lexical": 1, "semantic": 1}),
         ),
     ]
     .into_iter()
@@ -265,7 +267,13 @@ fn public_readiness_disclosure_executes_once_without_entering_lanes_run() {
     );
     assert_eq!(
         plan["executed_callbacks"],
-        serde_json::json!(["exact", "lexical", "variants", "readiness_disclosure"])
+        serde_json::json!([
+            "exact",
+            "lexical",
+            "variants",
+            "semantic",
+            "readiness_disclosure"
+        ])
     );
     assert_eq!(
         plan["callback_counts"],
@@ -273,6 +281,7 @@ fn public_readiness_disclosure_executes_once_without_entering_lanes_run() {
             "exact": 1,
             "lexical": 1,
             "variants": 1,
+            "semantic": 1,
             "readiness_disclosure": 1
         })
     );

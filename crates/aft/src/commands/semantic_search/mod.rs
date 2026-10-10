@@ -10562,8 +10562,12 @@ mod tests {
             .contains("no exact match"));
     }
 
+    /// A short quoted span routes as a code literal (exact and lexical lanes
+    /// on the unquoted text) and, like every non-regex `query`, keeps the
+    /// semantic lane: names and literals that must match verbatim belong in
+    /// `pattern`, so `query` is always also searched by meaning.
     #[test]
-    fn three_token_quoted_span_routes_as_code_literal_without_embedding() {
+    fn three_token_quoted_span_routes_as_code_literal_and_keeps_semantic() {
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/reminder.rs");
         std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -10587,33 +10591,32 @@ mod tests {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+        let (base_url, handle) = start_mock_embedding_server();
+        ctx.update_config(|config| {
+            config.semantic.backend = SemanticBackend::OpenAiCompatible;
+            config.semantic.base_url = Some(base_url);
+            config.semantic.model = "test-embedding".to_string();
+        });
 
         let mut request = semantic_request("\"outside <touser>\" reminder text", 5);
         request.id = "b2-three-token-quoted-span".to_string();
         let response = response_value(handle_semantic_search(&request, &ctx));
         assert_eq!(response["success"], true);
-        assert_eq!(response["interpreted_as"], "engine");
+        assert_eq!(response["interpreted_as"], "hybrid");
         assert_eq!(
             response["structuredContent"]["plan"]["shape"],
             "code_literal"
         );
         assert_eq!(
             response["structuredContent"]["plan"]["lanes_run"],
-            serde_json::json!(["exact", "lexical"])
+            serde_json::json!(["exact", "lexical", "semantic"])
         );
         assert_eq!(
             response["structuredContent"]["search"]["embedding_calls"],
-            0
-        );
-        assert_eq!(
-            response["structuredContent"]["search"]["embedding_cache_hits"],
-            0
-        );
-        assert_eq!(
-            response["structuredContent"]["search"]["live_embed_calls"],
-            0
+            1
         );
         assert!(response.get("zero_result_escalation").is_none());
+        handle.join().expect("embedding server thread");
     }
 
     #[test]

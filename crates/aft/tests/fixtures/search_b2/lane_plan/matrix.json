@@ -17,16 +17,18 @@
       "symbol",
       "exact",
       "lexical",
-      "variants"
+      "variants",
+      "semantic"
     ],
     "executed_callbacks": [
       "symbol",
       "exact",
       "lexical",
-      "variants"
+      "variants",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -49,16 +51,18 @@
     "lanes_run": [
       "exact",
       "lexical",
-      "variants"
+      "variants",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
       "lexical",
       "variants",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -82,15 +86,17 @@
     "exact_mode": "fallback",
     "lanes_run": [
       "symbol",
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "symbol",
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -113,14 +119,16 @@
     "exact_input": "parse_header",
     "exact_mode": "fallback",
     "lanes_run": [
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -153,14 +161,17 @@
       "symbol",
       "exact",
       "lexical",
-      "variants"
+      "variants",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "identifier/long",
@@ -193,7 +204,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "symbol cache disabled; definition-first skipped"
+      "symbol cache disabled; definition-first skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -225,7 +237,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -256,7 +269,8 @@
     },
     "footer_lines": [
       "trigram index disabled; lexical lane skipped",
-      "symbol cache disabled; definition-first skipped"
+      "symbol cache disabled; definition-first skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -823,14 +837,16 @@
     "exact_mode": "ready",
     "lanes_run": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -852,14 +868,16 @@
     "exact_mode": "ready",
     "lanes_run": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -880,14 +898,16 @@
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
     "lanes_run": [
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -910,14 +930,16 @@
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
     "lanes_run": [
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -945,14 +967,17 @@
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "code_literal/long",
@@ -974,14 +999,17 @@
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "code_literal/long",
@@ -1010,7 +1038,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -1040,7 +1069,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -1059,14 +1089,16 @@
     "exact_mode": "fallback",
     "lanes_run": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -1088,14 +1120,16 @@
     "exact_mode": "fallback",
     "lanes_run": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -1116,14 +1150,16 @@
     "exact_input": "ab",
     "exact_mode": "fallback",
     "lanes_run": [
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -1146,14 +1182,16 @@
     "exact_input": "ab",
     "exact_mode": "fallback",
     "lanes_run": [
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -1181,14 +1219,17 @@
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "code_literal/tiny",
@@ -1210,14 +1251,17 @@
     ],
     "executed_callbacks": [
       "exact",
-      "lexical"
+      "lexical",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "code_literal/tiny",
@@ -1246,7 +1290,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -1276,7 +1321,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -2101,16 +2147,18 @@
       "path_lookup",
       "exact",
       "anchored",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "path_lookup",
       "exact",
       "anchored",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -2134,16 +2182,18 @@
       "path_lookup",
       "exact",
       "anchored",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "path_lookup",
       "exact",
       "anchored",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -2152,6 +2202,150 @@
   {
     "query_class": "log_excerpt/std",
     "readiness": "101",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
+    },
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "100",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
+    },
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "011",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
+    },
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "010",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
+    },
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "exact",
+      "anchored",
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "001",
     "query": "2026-09-08 ERROR open /tmp/a.rs failed",
     "shape": "log_excerpt",
     "query_facts": {
@@ -2180,141 +2374,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
-    ]
-  },
-  {
-    "query_class": "log_excerpt/std",
-    "readiness": "100",
-    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "shape": "log_excerpt",
-    "query_facts": {
-      "embedded_span": null,
-      "exact_input_tokens": 5,
-      "has_path_token": true,
-      "has_timestamp_or_pid": true,
-      "has_identifier_token": false
-    },
-    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "exact_mode": "fallback",
-    "lanes_run": [
-      "path_lookup",
-      "exact",
-      "anchored"
-    ],
-    "executed_callbacks": [
-      "path_lookup",
-      "exact",
-      "anchored",
-      "readiness_disclosure"
-    ],
-    "embedding_counters_cold": {
-      "embedding_calls": 0,
-      "embedding_cache_hits": 0,
-      "live_embed_calls": 0
-    },
-    "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
-    ]
-  },
-  {
-    "query_class": "log_excerpt/std",
-    "readiness": "011",
-    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "shape": "log_excerpt",
-    "query_facts": {
-      "embedded_span": null,
-      "exact_input_tokens": 5,
-      "has_path_token": true,
-      "has_timestamp_or_pid": true,
-      "has_identifier_token": false
-    },
-    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "exact_mode": "ready",
-    "lanes_run": [
-      "path_lookup",
-      "exact",
-      "anchored",
-      "lexical"
-    ],
-    "executed_callbacks": [
-      "path_lookup",
-      "exact",
-      "anchored",
-      "lexical"
-    ],
-    "embedding_counters_cold": {
-      "embedding_calls": 0,
-      "embedding_cache_hits": 0,
-      "live_embed_calls": 0
-    },
-    "footer_lines": []
-  },
-  {
-    "query_class": "log_excerpt/std",
-    "readiness": "010",
-    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "shape": "log_excerpt",
-    "query_facts": {
-      "embedded_span": null,
-      "exact_input_tokens": 5,
-      "has_path_token": true,
-      "has_timestamp_or_pid": true,
-      "has_identifier_token": false
-    },
-    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "exact_mode": "ready",
-    "lanes_run": [
-      "path_lookup",
-      "exact",
-      "anchored",
-      "lexical"
-    ],
-    "executed_callbacks": [
-      "path_lookup",
-      "exact",
-      "anchored",
-      "lexical"
-    ],
-    "embedding_counters_cold": {
-      "embedding_calls": 0,
-      "embedding_cache_hits": 0,
-      "live_embed_calls": 0
-    },
-    "footer_lines": []
-  },
-  {
-    "query_class": "log_excerpt/std",
-    "readiness": "001",
-    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "shape": "log_excerpt",
-    "query_facts": {
-      "embedded_span": null,
-      "exact_input_tokens": 5,
-      "has_path_token": true,
-      "has_timestamp_or_pid": true,
-      "has_identifier_token": false
-    },
-    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
-    "exact_mode": "fallback",
-    "lanes_run": [
-      "path_lookup",
-      "exact",
-      "anchored"
-    ],
-    "executed_callbacks": [
-      "path_lookup",
-      "exact",
-      "anchored",
-      "readiness_disclosure"
-    ],
-    "embedding_counters_cold": {
-      "embedding_calls": 0,
-      "embedding_cache_hits": 0,
-      "live_embed_calls": 0
-    },
-    "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -2348,7 +2409,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -2368,15 +2430,17 @@
     "lanes_run": [
       "path_lookup",
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "path_lookup",
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -2399,15 +2463,17 @@
     "lanes_run": [
       "path_lookup",
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "executed_callbacks": [
       "path_lookup",
       "exact",
-      "lexical"
+      "lexical",
+      "semantic"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -2429,15 +2495,17 @@
     "exact_mode": "fallback",
     "lanes_run": [
       "path_lookup",
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "path_lookup",
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -2461,15 +2529,17 @@
     "exact_mode": "fallback",
     "lanes_run": [
       "path_lookup",
-      "exact"
+      "exact",
+      "semantic"
     ],
     "executed_callbacks": [
       "path_lookup",
       "exact",
+      "semantic",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
-      "embedding_calls": 0,
+      "embedding_calls": 1,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
@@ -2499,14 +2569,17 @@
     "executed_callbacks": [
       "path_lookup",
       "exact",
-      "lexical"
+      "lexical",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "path/std",
@@ -2530,14 +2603,17 @@
     "executed_callbacks": [
       "path_lookup",
       "exact",
-      "lexical"
+      "lexical",
+      "readiness_disclosure"
     ],
     "embedding_counters_cold": {
       "embedding_calls": 0,
       "embedding_cache_hits": 0,
       "live_embed_calls": 0
     },
-    "footer_lines": []
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
   },
   {
     "query_class": "path/std",
@@ -2568,7 +2644,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   },
   {
@@ -2600,7 +2677,8 @@
       "live_embed_calls": 0
     },
     "footer_lines": [
-      "trigram index disabled; lexical lane skipped"
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
     ]
   }
 ]

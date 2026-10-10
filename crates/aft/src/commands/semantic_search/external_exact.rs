@@ -1122,8 +1122,9 @@ mod tests {
 
     /// Checks one rendered identifier reply line by line: every result is a
     /// `path:line [marker]` header followed by its matched line, then the
-    /// footer and the coverage line. Nothing else may appear (no status note,
-    /// no score, no empty snippet, no data file).
+    /// footer and the coverage line, and on the first search of an unopened
+    /// project the notice that its semantic search is off. Nothing else may
+    /// appear (no status note, no score, no empty snippet, no data file).
     fn assert_clean_identifier_text(text: &str, root: &Path, coverage_source: &str) {
         let root_text = root.display().to_string();
         // Paths render with the platform's separator.
@@ -1166,7 +1167,13 @@ mod tests {
             "{text}"
         );
         let footer_lines: Vec<&str> = footer.lines().collect();
-        assert_eq!(footer_lines.len(), 2, "{text}");
+        // An identifier `query` keeps the semantic lane, so the first search of
+        // an unopened project also carries the once-per-session notice that
+        // its semantic search is off.
+        let notice = footer_lines
+            .get(2)
+            .is_some_and(|line| line.starts_with("semantic search is off for "));
+        assert_eq!(footer_lines.len(), 2 + usize::from(notice), "{text}");
         assert!(
             footer_lines[0].starts_with("Lines marked [variant: ...]"),
             "{text}"
@@ -1177,6 +1184,12 @@ mod tests {
                 "exact pass: complete; checked all 15 files under {root_text} ({coverage_source})"
             )
         );
+        // The notice names the user's config file (`aft.jsonc`), so the
+        // forbidden-text check reads the reply without it.
+        let checked = match notice {
+            true => text.replace(footer_lines[2], ""),
+            false => text.to_string(),
+        };
         for forbidden in [
             "NaN",
             "score",
@@ -1185,7 +1198,7 @@ mod tests {
             ".json",
             "saved AFT index",
         ] {
-            assert!(!text.contains(forbidden), "{forbidden:?} in {text}");
+            assert!(!checked.contains(forbidden), "{forbidden:?} in {text}");
         }
     }
 

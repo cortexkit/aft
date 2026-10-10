@@ -2099,7 +2099,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
 }
 
 #[test]
-fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
+fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped_with_semantic() {
     let (project, entries) = project_with_repeated_needle_files(210);
     let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
     let ctx = openai_context(project.path(), base_url);
@@ -2113,7 +2113,7 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
         Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
     let mut identifier_request = request_with_top_k("needle_symbol", None, 100);
-    identifier_request.id = "identifier-ready-fallback-cap-no-semantic".to_string();
+    identifier_request.id = "identifier-ready-fallback-cap-with-semantic".to_string();
     let raw_response = handle_semantic_search(&identifier_request, &ctx);
     let rendered = aft::subc_format::format_response("search", &raw_response, false);
     let response = response_value(raw_response);
@@ -2125,13 +2125,14 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
     );
     assert_eq!(response["status"], "ready");
     assert_eq!(response["complete"], true);
-    assert_eq!(response["interpreted_as"], "engine");
+    assert_eq!(response["interpreted_as"], "hybrid");
     assert_eq!(response["engine_capped"], true);
     assert_eq!(response["more_available"], true);
-    assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
+    // `query` keeps the semantic lane for an identifier too: one embedding.
+    assert_eq!(embedding_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
         response["structuredContent"]["search"]["embedding_calls"],
-        0
+        1
     );
     assert_eq!(
         response["structuredContent"]["search"]["embedding_cache_hits"],
@@ -2139,7 +2140,7 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
     );
     assert_eq!(
         response["structuredContent"]["search"]["live_embed_calls"],
-        0
+        1
     );
     assert!(rendered
         .ends_with("shown 100 of ≥210 results (cap) · narrow: offset, topK, path, includeTests"));
@@ -2274,7 +2275,7 @@ fn excluded_test_results_do_not_starve_default_semantic_search() {
 }
 
 #[test]
-fn identifier_ready_reports_no_more_available_when_under_top_k_without_caps() {
+fn identifier_ready_reports_no_more_available_when_under_top_k_with_semantic() {
     let (project, source_file, source) = project_with_needle();
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
@@ -2296,7 +2297,7 @@ fn identifier_ready_reports_no_more_available_when_under_top_k_without_caps() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
     let mut identifier_request = request_with_top_k("needle_symbol", None, 5);
-    identifier_request.id = "identifier-ready-under-top-k-no-semantic".to_string();
+    identifier_request.id = "identifier-ready-under-top-k-with-semantic".to_string();
     let response = response_value(handle_semantic_search(&identifier_request, &ctx));
     handle.join().expect("negative embedding server thread");
 
@@ -2306,17 +2307,18 @@ fn identifier_ready_reports_no_more_available_when_under_top_k_without_caps() {
     );
     assert_eq!(response["status"], "ready");
     assert_eq!(response["complete"], true);
-    assert_eq!(response["interpreted_as"], "engine");
+    assert_eq!(response["interpreted_as"], "hybrid");
     assert_eq!(response["engine_capped"], false);
     assert!(
         response["result_count"].as_u64().expect("result_count") < 5,
         "test setup should stay under top_k: {response:?}"
     );
     assert_eq!(response["more_available"], false);
-    assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
+    // `query` keeps the semantic lane for an identifier too: one embedding.
+    assert_eq!(embedding_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
         response["structuredContent"]["search"]["embedding_calls"],
-        0
+        1
     );
     assert_eq!(
         response["structuredContent"]["search"]["embedding_cache_hits"],
@@ -2324,7 +2326,7 @@ fn identifier_ready_reports_no_more_available_when_under_top_k_without_caps() {
     );
     assert_eq!(
         response["structuredContent"]["search"]["live_embed_calls"],
-        0
+        1
     );
 }
 
@@ -2394,7 +2396,7 @@ fn auto_short_identifier_tokens_use_literal_scan() {
 }
 
 #[test]
-fn identifier_ready_reports_complete_success_without_semantic() {
+fn identifier_ready_reports_complete_success_with_semantic() {
     let (project, source_file, source) = project_with_needle();
     let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
     let ctx = openai_context(project.path(), base_url);
@@ -2408,7 +2410,7 @@ fn identifier_ready_reports_complete_success_without_semantic() {
         Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
     let mut identifier_request = request("needle_symbol");
-    identifier_request.id = "identifier-ready-complete-no-semantic".to_string();
+    identifier_request.id = "identifier-ready-complete-with-semantic".to_string();
     let response = response_value(handle_semantic_search(&identifier_request, &ctx));
     handle.join().expect("negative embedding server thread");
 
@@ -2419,11 +2421,12 @@ fn identifier_ready_reports_complete_success_without_semantic() {
     assert_eq!(response["complete"], true);
     assert_eq!(response["status"], "ready");
     assert_eq!(response["semantic_status"], "ready");
-    assert_eq!(response["interpreted_as"], "engine");
-    assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(response["interpreted_as"], "hybrid");
+    // `query` keeps the semantic lane for an identifier too: one embedding.
+    assert_eq!(embedding_requests.load(Ordering::SeqCst), 1);
     assert_eq!(
         response["structuredContent"]["search"]["embedding_calls"],
-        0
+        1
     );
     assert_eq!(
         response["structuredContent"]["search"]["embedding_cache_hits"],
@@ -2431,7 +2434,7 @@ fn identifier_ready_reports_complete_success_without_semantic() {
     );
     assert_eq!(
         response["structuredContent"]["search"]["live_embed_calls"],
-        0
+        1
     );
 }
 
