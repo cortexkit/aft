@@ -648,6 +648,24 @@ fn compiled_matches(pattern: &crate::pattern_compile::CompiledPattern, text: &st
     }
 }
 
+/// A `let`, `const` or `var` binding written inside a block (indented, with
+/// no visibility or export modifier) is a local variable of a function body,
+/// not a definition a reader looks up by name. `const fn` is a function.
+fn is_local_binding(line: &str) -> bool {
+    fn word(text: &str) -> (&str, &str) {
+        let end = text
+            .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .unwrap_or(text.len());
+        (&text[..end], text[end..].trim_start())
+    }
+    let trimmed = line.trim_start();
+    if trimmed.len() == line.len() {
+        return false;
+    }
+    let (keyword, rest) = word(trimmed);
+    matches!(keyword, "let" | "const" | "var") && word(rest).0 != "fn"
+}
+
 /// Judge each top-level alternative of `pattern` over the collected files.
 /// Every file keeps its first matching lines and any later keyword
 /// declaration (see `regex_route::keep_past_line_limit`), so definitions are
@@ -689,22 +707,27 @@ fn judge_alternatives(files: &[GrepFileMatches], pattern: &str) -> Vec<PatternAl
                     if compiled_matches(&matcher, &grep_match.match_text) {
                         matched = true;
                     }
-                    if defined
-                        || regex_route::match_declaration(grep_match)
-                            != Some(regex_route::Declaration::Keyword)
-                    {
+                    if defined {
                         continue;
                     }
-                    let Some((name, _)) = regex_route::declared_name(&grep_match.line_text) else {
+                    let Some((name, regex_route::Declaration::Keyword)) =
+                        regex_route::declared_name(&grep_match.line_text)
+                    else {
                         continue;
                     };
-                    // `match_declaration` already holds the declared name inside
-                    // the matched text, so an alternative that matches that
-                    // text names this declaration even when it is written as
-                    // the declaration (`^pub struct Name`, `fn name`) rather
-                    // than as the bare name.
+                    if is_local_binding(&grep_match.line_text) {
+                        continue;
+                    }
+                    // The alternative names this declaration when it matches
+                    // the declared name itself, which may be longer than the
+                    // match (`runAutoSearch` names `runAutoSearchHintForPi`),
+                    // or when the matched text holds the whole name and the
+                    // alternative is written as the declaration
+                    // (`^pub struct Name`, `fn name`) rather than as the name.
                     if compiled_matches(&matcher, name)
-                        || compiled_matches(&matcher, &grep_match.match_text)
+                        || (regex_route::match_declaration(grep_match)
+                            == Some(regex_route::Declaration::Keyword)
+                            && compiled_matches(&matcher, &grep_match.match_text))
                     {
                         defined = true;
                         definitions.push(AlternativeDefinition {
@@ -1563,6 +1586,94 @@ mod tests {
             assert_eq!(alternative.definitions[0].path, PathBuf::from(path));
             assert_eq!(alternative.definitions[0].name, name);
             assert!(alternative.is_selective());
+        }
+    }
+
+    /// The magic-context report: `autoSearch|auto_search|runAutoSearch`. The
+    /// exported `runAutoSearchHintForPi` declares a name `runAutoSearch`
+    /// matches although the match is only its prefix; the indented `const
+    /// autoSearch` in a component body is a local variable, not a definition.
+    fn auto_search_files() -> Vec<GrepFileMatches> {
+        vec![
+            matched_file(
+                "/p/dashboard/ConfigEditor.tsx",
+                vec![grep_match(
+                    "/p/dashboard/ConfigEditor.tsx",
+                    1362,
+                    "                const autoSearch = () =>",
+                    "autoSearch",
+                )],
+                0,
+            ),
+            matched_file(
+                "/p/pi/auto-search-pi.ts",
+                vec![grep_match(
+                    "/p/pi/auto-search-pi.ts",
+                    256,
+                    "export async function runAutoSearchHintForPi(",
+                    "runAutoSearch",
+                )],
+                0,
+            ),
+            matched_file(
+                "/p/pi/context-handler.ts",
+                vec![grep_match(
+                    "/p/pi/context-handler.ts",
+                    3954,
+                    "    await runAutoSearchHintForPi(state);",
+                    "runAutoSearch",
+                )],
+                0,
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_declared_name_longer_than_the_match_defines_the_alternative() {
+        let list = PatternList::from_collection(
+            collection(auto_search_files(), false),
+            Path::new("/p"),
+            "autoSearch|auto_search|runAutoSearch",
+        );
+        let [local, _, prefix] = &list.alternatives[..] else {
+            panic!("three alternatives: {:?}", list.alternatives);
+        };
+        assert_eq!(local.matched_files, 1);
+        assert!(
+            local.definitions.is_empty(),
+            "a local binding is not a definition: {local:?}"
+        );
+        assert!(!local.is_selective());
+        assert_eq!(
+            prefix.definitions,
+            [AlternativeDefinition {
+                path: PathBuf::from("/p/pi/auto-search-pi.ts"),
+                name: "runAutoSearchHintForPi".to_string(),
+                line: 256,
+            }]
+        );
+        assert!(prefix.is_selective());
+    }
+
+    #[test]
+    fn only_indented_unexported_value_bindings_are_local() {
+        for line in [
+            "    let total = 0;",
+            "\tconst autoSearch = () =>",
+            "  var x = 1",
+        ] {
+            assert!(is_local_binding(line), "{line:?}");
+        }
+        for line in [
+            "const MAX: usize = 4;",
+            "export const autoSearch = 1;",
+            "    pub const MAX: usize = 4;",
+            "    export const inner = 1;",
+            "    const fn limit() -> usize {",
+            "    fn helper() {",
+            "    constant = 1",
+        ] {
+            assert!(!is_local_binding(line), "{line:?}");
         }
     }
 
