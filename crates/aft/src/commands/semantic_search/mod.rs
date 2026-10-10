@@ -1577,15 +1577,14 @@ fn handle_split_search<'a>(
             serde_json::json!({ "placements": trace, "alternatives": alternatives }),
         );
     }
+    // The same sites, in the same order, as the summary line names.
     let definition_sites = patterns
-        .files
-        .iter()
-        .filter(|file| file.definition)
-        .map(|file| {
-            let leading = file.leading_line();
+        .definition_sites()
+        .into_iter()
+        .map(|(file, line)| {
             serde_json::json!({
-                "file": leading.file.display().to_string(),
-                "line": leading.line,
+                "file": file.display().to_string(),
+                "line": line,
             })
         })
         .collect::<Vec<_>>();

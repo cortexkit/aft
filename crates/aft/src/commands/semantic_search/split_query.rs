@@ -390,20 +390,14 @@ impl PatternList {
             if files == 1 { "" } else { "s" }
         );
         let sites = self
-            .files
-            .iter()
-            .filter(|file| file.definition)
+            .definition_sites()
+            .into_iter()
             .take(SUMMARY_DEFINITION_SITES)
-            .map(|file| {
-                let leading = file.leading_line();
+            .map(|(path, line)| {
                 format!(
                     "{}:{}",
-                    leading
-                        .file
-                        .strip_prefix(project_root)
-                        .unwrap_or(&leading.file)
-                        .display(),
-                    leading.line
+                    path.strip_prefix(project_root).unwrap_or(&path).display(),
+                    line
                 )
             })
             .collect::<Vec<_>>();
@@ -421,6 +415,58 @@ impl PatternList {
         }
         line.push(']');
         line
+    }
+
+    /// Every file that defines something the pattern names, one site per
+    /// file, best first; the summary line names the first few and the reply's
+    /// `pattern_summary` counts them all.
+    ///
+    /// 1. Declarations of a selective alternative, in pattern rank order. A
+    ///    selective alternative names something specific, and its
+    ///    declarations include longer names it matches
+    ///    (`runAutoSearchHintForPi` for `runAutoSearch`) and exclude local
+    ///    variables (see `judge_alternatives`).
+    /// 2. Files whose leading line declares a matched name as a whole, in
+    ///    pattern rank order, unless that line is a local variable inside a
+    ///    function body. A broad alternative such as `Error` contributes only
+    ///    here, so a name that merely contains it is not listed.
+    /// 3. Only when both are empty, the local variables from step 2, so the
+    ///    line still names the one declaration there is.
+    pub(crate) fn definition_sites(&self) -> Vec<(PathBuf, u32)> {
+        let rank = |path: &Path| {
+            self.files
+                .iter()
+                .position(|file| file.path() == path)
+                .unwrap_or(usize::MAX)
+        };
+        let mut selective = self
+            .alternatives
+            .iter()
+            .filter(|alternative| alternative.is_selective())
+            .flat_map(|alternative| alternative.definitions.iter())
+            .map(|definition| (definition.path.clone(), definition.line))
+            .collect::<Vec<_>>();
+        selective.sort_by_key(|(path, line)| (rank(path), *line));
+        let (locals, declared): (Vec<_>, Vec<_>) = self
+            .files
+            .iter()
+            .filter(|file| file.definition)
+            .map(|file| file.leading_line())
+            .partition(|leading| is_local_binding(&leading.line_text));
+        let whole_name = |lines: Vec<&GrepMatch>| {
+            lines
+                .into_iter()
+                .map(|leading| (leading.file.clone(), leading.line))
+                .collect::<Vec<_>>()
+        };
+        let mut sites = selective;
+        sites.extend(whole_name(declared));
+        if sites.is_empty() {
+            sites = whole_name(locals);
+        }
+        let mut seen = HashSet::new();
+        sites.retain(|(path, _)| seen.insert(path.clone()));
+        sites
     }
 }
 
@@ -1709,6 +1755,61 @@ mod tests {
         assert_eq!(
             list.summary_line(&prose, Path::new("/p")),
             "[pattern `load`: 5 files matched, 2 also found by the query; defined in src/a.rs:7, src/b.rs:7, src/c.rs:7]"
+        );
+    }
+
+    #[test]
+    fn summary_line_names_module_level_declarations_before_local_bindings() {
+        let list = PatternList::from_collection(
+            collection(auto_search_files(), false),
+            Path::new("/p"),
+            "autoSearch|auto_search|runAutoSearch",
+        );
+        assert_eq!(
+            list.summary_line(&HashSet::new(), Path::new("/p")),
+            "[pattern `autoSearch|auto_search|runAutoSearch`: 3 files matched, 0 also found by the query; defined in pi/auto-search-pi.ts:256]"
+        );
+        // With no module-level declaration the local binding is still named.
+        let local_only = PatternList::from_collection(
+            collection(vec![auto_search_files().remove(0)], false),
+            Path::new("/p"),
+            "autoSearch",
+        );
+        assert_eq!(
+            local_only.summary_line(&HashSet::new(), Path::new("/p")),
+            "[pattern `autoSearch`: 1 file matched, 0 also found by the query; defined in dashboard/ConfigEditor.tsx:1362]"
+        );
+        // A broad alternative names only whole-name declarations: `Error` in
+        // `ParseError` is not listed, `enum Error` is, after the selective
+        // alternative's declaration.
+        let mut files = vec![
+            declares("/p/src/backup.rs", "tracked_files"),
+            matched_file(
+                "/p/src/parse.rs",
+                vec![grep_match(
+                    "/p/src/parse.rs",
+                    4,
+                    "pub struct ParseError {",
+                    "Error",
+                )],
+                0,
+            ),
+            declares("/p/src/error.rs", "Error"),
+        ];
+        for index in 0..60 {
+            files.push(uses(&format!("/p/src/e{index:02}.rs"), "Error"));
+        }
+        let broad = PatternList::from_collection(
+            collection(files, false),
+            Path::new("/p"),
+            "tracked_files|Error",
+        );
+        assert_eq!(
+            broad.definition_sites(),
+            [
+                (PathBuf::from("/p/src/backup.rs"), 4),
+                (PathBuf::from("/p/src/error.rs"), 4)
+            ]
         );
     }
 
