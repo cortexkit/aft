@@ -106,7 +106,7 @@ maybeDescribe("e2e import commands", () => {
         runtime(h),
       ),
     );
-    expect(added).toContain("added lodash");
+    expect(added).toContain("added debounce");
     expect(added).toContain(`file ${resolvedFilePath}`);
     expect(added).toContain("group ");
     expect(added.trim().startsWith("{")).toBe(false);
@@ -118,7 +118,7 @@ maybeDescribe("e2e import commands", () => {
         runtime(h),
       ),
     );
-    expect(alreadyPresent).toContain("already present lodash");
+    expect(alreadyPresent).toContain("debounce already imported");
     expect(alreadyPresent).toContain("group —");
 
     const removed = toolResultText(
@@ -177,7 +177,7 @@ maybeDescribe("e2e import commands", () => {
         ),
       );
 
-      expect(output).toContain("added zod");
+      expect(output).toContain("added z");
       expect(asks.some((call) => call.permission === "external_directory")).toBe(true);
       expect(asks.some((call) => call.permission === "edit")).toBe(true);
       // A file with no imports and no formatter config gets double quotes.
