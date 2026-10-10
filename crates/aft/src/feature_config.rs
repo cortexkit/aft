@@ -94,7 +94,7 @@ pub const MIGRATION_POLICY_ID: &str = "feature-config-v1";
 pub const POLICY_INTRODUCED_MINOR: (u64, u64) = (0, 58);
 
 /// Retired top-level (or nested) config paths and their replacement.
-pub const RETIRED_PATHS: [(&str, &str); 9] = [
+pub const RETIRED_PATHS: [(&str, &str); 14] = [
     ("tool_surface", "disabled_tools"),
     ("hoist_builtin_tools", "disabled_tools"),
     ("enabled", "disabled_tools"),
@@ -104,6 +104,11 @@ pub const RETIRED_PATHS: [(&str, &str); 9] = [
     ("experimental_semantic_search", "indexes.semantic"),
     ("callgraph_store", "indexes.callgraph"),
     ("github.enabled", "github.read,github.write,github.shim"),
+    ("experimental_lsp_ty", "experimental.lsp_ty"),
+    ("experimental_bash_rewrite", "bash.rewrite"),
+    ("experimental_bash_compress", "bash.compress"),
+    ("experimental_bash_background", "bash.background"),
+    ("experimental.bash", "bash"),
 ];
 
 /// Retired inspect/LSP paths and their replacement. `idle.lsp_ttl_minutes`
@@ -390,6 +395,113 @@ fn translate_inspect_lsp_paths(
 /// `RETIRED_ENABLED_FALSE_INDEXES_NOTE`.
 pub const RETIRED_ENABLED_FALSE_INDEXES_NOTE: &str = "enabled: false no longer turns AFT off: it is translated to disabling every tool, but the trigram, semantic and callgraph indexes still build. To keep AFT from indexing this repository, also set indexes.trigram, indexes.semantic and indexes.callgraph to false.";
 
+/// Translate flat experimental aliases to nested settings. Graduating
+/// `experimental.bash` explicitly sets omitted feature flags to false;
+/// otherwise the current default-on bash settings would silently enable them.
+fn translate_experimental_paths(
+    map: &mut Map<String, Value>,
+    prefix: &str,
+    out: &mut DocumentTranslation,
+) {
+    for (old_key, leaf) in [
+        ("experimental_lsp_ty", "lsp_ty"),
+        ("experimental_bash_rewrite", "rewrite"),
+        ("experimental_bash_compress", "compress"),
+        ("experimental_bash_background", "background"),
+    ] {
+        let Some(value) = map.remove(old_key) else {
+            continue;
+        };
+        record_retired(out, prefix, old_key);
+        let experimental = map
+            .entry("experimental")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !experimental.is_object() {
+            *experimental = Value::Object(Map::new());
+        }
+        let experimental = experimental.as_object_mut().unwrap();
+        let destination = if leaf == "lsp_ty" {
+            experimental
+        } else {
+            let bash = experimental
+                .entry("bash")
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !bash.is_object() {
+                *bash = Value::Object(Map::new());
+            }
+            bash.as_object_mut().unwrap()
+        };
+        if destination.contains_key(leaf) {
+            let path = if leaf == "lsp_ty" {
+                leaf.to_string()
+            } else {
+                format!("bash.{leaf}")
+            };
+            superseded(
+                out,
+                old_key.to_string(),
+                format!("{old_key} is ignored because experimental.{path} is already set"),
+            );
+        } else {
+            destination.insert(leaf.to_string(), value);
+        }
+    }
+
+    let Some(experimental) = map.get("experimental").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(legacy) = experimental.get("bash") else {
+        return;
+    };
+    if let Some(legacy) = legacy.as_object() {
+        if !["rewrite", "compress", "background"]
+            .iter()
+            .any(|leaf| legacy.contains_key(*leaf))
+        {
+            return;
+        }
+        for leaf in legacy.keys() {
+            record_retired(out, prefix, &format!("experimental.bash.{leaf}"));
+        }
+        if map.contains_key("bash") {
+            superseded(
+                out,
+                "experimental.bash".to_string(),
+                "experimental.bash is ignored because top-level \"bash\" is already set"
+                    .to_string(),
+            );
+        } else {
+            let mut bash = Map::new();
+            for leaf in ["rewrite", "compress", "background"] {
+                bash.insert(
+                    leaf.to_string(),
+                    Value::Bool(legacy.get(leaf) == Some(&Value::Bool(true))),
+                );
+            }
+            for leaf in [
+                "long_running_reminder_enabled",
+                "long_running_reminder_interval_ms",
+            ] {
+                if let Some(value) = legacy.get(leaf) {
+                    bash.insert(leaf.to_string(), value.clone());
+                }
+            }
+            map.insert("bash".to_string(), Value::Object(bash));
+        }
+    } else {
+        record_retired(out, prefix, "experimental.bash");
+    }
+    let experimental = map
+        .get_mut("experimental")
+        .unwrap()
+        .as_object_mut()
+        .unwrap();
+    experimental.remove("bash");
+    if experimental.is_empty() {
+        map.remove("experimental");
+    }
+}
+
 /// Translate the retired keys of one tier/harness block in place.
 ///
 /// The false runtime gates (`backup.enabled`, `inspect.enabled`, `bash`,
@@ -410,6 +522,7 @@ fn translate_block(
     };
     translate_github_aliases(map, &prefix, out);
     translate_inspect_lsp_paths(map, &prefix, out);
+    translate_experimental_paths(map, &prefix, out);
 
     // Canonicalize the retired `aft_`-prefixed host tool names (for example
     // `aft_read` -> `read`) inside the disabled list.
@@ -435,6 +548,11 @@ fn translate_block(
     }
 
     for (path, _) in RETIRED_PATHS {
+        // A block with only reminder settings never opted into experimental
+        // bash features. Leave it unchanged instead of adding false flags.
+        if path == "experimental.bash" {
+            continue;
+        }
         if has_path(map, path) {
             record_retired(out, &prefix, path);
         }

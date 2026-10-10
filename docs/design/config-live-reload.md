@@ -119,7 +119,11 @@ A plugin in the startup config-error state starts no watch; that state still nee
 - the text does not parse as a JSON object (`parse_tier` would silently skip the tier);
 - a value does not deserialize strictly into `RawAftConfig`. `parse_config_partially` would reset only that key to its default;
 - the block for the **active harness** (`harnesses.<id>`) is not an object or does not deserialize strictly. The resolver would ignore the whole block with a warning, dropping any security key it sets. Blocks for other harnesses are not applied and are not checked;
-- the resolver rejects the candidate (for example a retired key).
+- the resolver rejects the candidate (for example an invalid disabled-tool name).
+
+Retired keys do not reject a load or reload. Rust and the plugins translate them in memory before validation, in the base block and every embedded harness block, then apply the current keys' ordinary trust rules. A project can only tighten protected user settings; translating a retired name does not grant it more authority. The project file's bytes are never changed by loading or reloading, and a notice explains the translation. This includes the retired `experimental_lsp_ty` and `experimental_bash_*` names and the graduated `experimental.bash` feature block: missing experimental bash flags remain false, rather than acquiring the current default-on values.
+
+Only Rust auto-migrates the user file (`~/.config/cortexkit/aft.jsonc`) on disk, using the same comment-preserving mapping as `aft doctor --fix`, with a backup and one migration notice. A read-only file, or a debug build refusing to write the account's production config directory without explicit opt-in, leaves the file untouched and still uses in-memory translation. Plugins neither rewrite config keys nor relocate legacy config files at load; location migration is an explicit operation. An explicit `aft doctor --fix` may repair the invocation project's file, but ordinary loading never does.
 
 Connect keeps today's behaviour: a missing file resolves as `{}`, and a bad value is dropped with the rest of the file applied. The two therefore disagree on purpose. The next connect after a deletion applies the deletion.
 

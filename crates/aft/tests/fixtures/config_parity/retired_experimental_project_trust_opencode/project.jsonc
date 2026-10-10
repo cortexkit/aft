@@ -1,0 +1,10 @@
+{
+  "experimental_bash_rewrite": true,
+  "experimental_lsp_ty": true,
+  "bash": {
+    "runon_enabled": true
+  },
+  "lsp": {
+    "auto_install": true
+  }
+}

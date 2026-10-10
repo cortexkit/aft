@@ -1,0 +1,7 @@
+{
+  "experimental": {
+    "bash": {
+      "long_running_reminder_enabled": false
+    }
+  }
+}

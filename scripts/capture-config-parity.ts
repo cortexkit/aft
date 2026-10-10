@@ -897,6 +897,58 @@ const CASES: ParityCase[] = [
   },
   { name: "retired_soft_deadline_project", project: { inspect: { tier2_soft_deadline_ms: 50 } } },
   { name: "retired_max_items_user", user: { inspect: { max_drill_down_items: 20 } } },
+  ...(["opencode", "pi"] as const).flatMap((harness) =>
+    [
+      "experimental_lsp_ty",
+      "experimental_bash_rewrite",
+      "experimental_bash_compress",
+      "experimental_bash_background",
+    ].flatMap((key): ParityCase[] => [
+      { name: `retired_${key}_user_${harness}`, harness, user: { [key]: true } },
+      { name: `retired_${key}_project_${harness}`, harness, project: { [key]: false } },
+    ]),
+  ),
+  ...(["opencode", "pi"] as const).flatMap((harness): ParityCase[] => [
+    {
+      name: `retired_experimental_canonical_wins_${harness}`,
+      harness,
+      user: {
+        experimental_lsp_ty: true,
+        experimental_bash_rewrite: true,
+        experimental: { lsp_ty: false, bash: { rewrite: false, compress: true } },
+        bash: { background: true },
+      },
+    },
+    {
+      name: `retired_experimental_nested_defaults_${harness}`,
+      harness,
+      user: {
+        experimental: { bash: { rewrite: true, long_running_reminder_enabled: false } },
+        harnesses: { [harness]: { experimental_bash_background: true } },
+      },
+      project: {
+        experimental: { bash: { compress: true } },
+        harnesses: { [harness]: { experimental_lsp_ty: true } },
+      },
+    },
+    {
+      name: `retired_experimental_project_trust_${harness}`,
+      harness,
+      user: { bash: { runon_enabled: false }, lsp: { auto_install: false } },
+      project: {
+        experimental_bash_rewrite: true,
+        experimental_lsp_ty: true,
+        bash: { runon_enabled: true },
+        lsp: { auto_install: true },
+      },
+    },
+    {
+      name: `retired_experimental_tuning_only_${harness}`,
+      harness,
+      user: { experimental: { bash: { long_running_reminder_enabled: false } } },
+      project: { experimental: { bash: true } },
+    },
+  ]),
   {
     name: "retired_window_keys_project",
     harness: "opencode",

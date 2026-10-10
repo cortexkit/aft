@@ -1,0 +1,12 @@
+{
+  "experimental": {
+    "bash": {
+      "compress": true
+    }
+  },
+  "harnesses": {
+    "opencode": {
+      "experimental_lsp_ty": true
+    }
+  }
+}

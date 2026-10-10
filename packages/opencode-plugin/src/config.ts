@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, parse as parsePath, resolve as resolvePath } from "node:path";
 import {
@@ -30,7 +30,7 @@ import {
   unionDisabledTools,
   validateResolvedConfig,
 } from "@cortexkit/aft-bridge";
-import { parse as parseJsonc, stringify as stringifyJsonc } from "comment-json";
+import { parse as parseJsonc } from "comment-json";
 import { z } from "zod";
 
 import { error, log, warn } from "./logger.js";
@@ -1204,262 +1204,6 @@ type Logger = {
   warn: (message: string) => void;
 };
 
-type MigrationTarget = {
-  oldKey: string;
-  newPath: readonly string[];
-};
-
-// On-disk key relocations still applied on load. The retired index/surface
-// keys are NOT rewritten here: ordinary loading translates them in memory and
-// only `aft doctor --fix` rewrites files for them.
-const CONFIG_MIGRATIONS: readonly MigrationTarget[] = [
-  { oldKey: "experimental_lsp_ty", newPath: ["experimental", "lsp_ty"] },
-  { oldKey: "experimental_bash_rewrite", newPath: ["experimental", "bash", "rewrite"] },
-  { oldKey: "experimental_bash_compress", newPath: ["experimental", "bash", "compress"] },
-  { oldKey: "experimental_bash_background", newPath: ["experimental", "bash", "background"] },
-];
-
-function isWritableMigrationError(errorValue: unknown): boolean {
-  const code = (errorValue as { code?: unknown })?.code;
-  return code === "EROFS" || code === "EACCES" || code === "EPERM";
-}
-
-/**
- * Pulls all `//` line comments and `/* ... *​/` block comments out of a JSONC
- * source string. Inline trailing comments are kept verbatim; block comments
- * are normalized to one line. Used as a backup safety net during migration so
- * comments attached to deleted/reshaped keys don't disappear silently — any
- * captured comment that doesn't survive the comment-json round-trip is
- * prepended to the rewritten file.
- */
-function extractCommentsForPreservation(content: string): string[] {
-  const comments: string[] = [];
-  // Match `//` line comments — both standalone (own-line) and inline trailing
-  // (after a value). Stripping any leading whitespace gives us a normalized
-  // form that we can dedupe against the rewritten file later.
-  const linePattern = /\/\/[^\n]*/g;
-  for (const match of content.match(linePattern) ?? []) {
-    comments.push(match.trim());
-  }
-  // Block comments may span multiple lines; collapse internal whitespace so
-  // they fit on a single preservation line if we have to relocate them.
-  const blockPattern = /\/\*[\s\S]*?\*\//g;
-  for (const match of content.match(blockPattern) ?? []) {
-    comments.push(match.replace(/\s+/g, " ").trim());
-  }
-  return comments;
-}
-
-function ensureRecordAtPath(root: Record<string, unknown>, path: readonly string[]) {
-  let current = root;
-  for (const segment of path) {
-    const existing = current[segment];
-    if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
-      current[segment] = {};
-    }
-    current = current[segment] as Record<string, unknown>;
-  }
-  return current;
-}
-
-function hasPath(root: Record<string, unknown>, path: readonly string[]): boolean {
-  let current: unknown = root;
-  for (const segment of path) {
-    if (!current || typeof current !== "object" || Array.isArray(current)) return false;
-    const record = current as Record<string, unknown>;
-    if (!Object.hasOwn(record, segment)) return false;
-    current = record[segment];
-  }
-  return true;
-}
-
-function setPath(root: Record<string, unknown>, path: readonly string[], value: unknown): void {
-  const parent = ensureRecordAtPath(root, path.slice(0, -1));
-  parent[path[path.length - 1]] = value;
-}
-
-function migrateRawConfig(
-  rawConfig: Record<string, unknown>,
-  configPath: string,
-  logger?: Logger,
-): string[] {
-  const oldKeys: string[] = [];
-  for (const migration of CONFIG_MIGRATIONS) {
-    if (!Object.hasOwn(rawConfig, migration.oldKey)) continue;
-
-    if (hasPath(rawConfig, migration.newPath)) {
-      logger?.warn(
-        `Config migration conflict at ${configPath}: ${migration.oldKey} ignored because ${migration.newPath.join(".")} is already set`,
-      );
-    } else {
-      setPath(rawConfig, migration.newPath, rawConfig[migration.oldKey]);
-    }
-    delete rawConfig[migration.oldKey];
-    oldKeys.push(migration.oldKey);
-  }
-  oldKeys.push(...migrateExperimentalBashBlock(rawConfig, configPath, logger));
-  return oldKeys;
-}
-
-/**
- * Graduation migration: `experimental.bash.*` → top-level `bash.*` (v0.27.2).
- *
- * Different shape than the flat-key migrations above: we move a whole nested
- * object up one level AND normalize defaults so the user's pre-migration
- * runtime behavior is preserved exactly. Inspired by magic-context's
- * `migrateLegacyExperimental` pattern (`packages/plugin/src/config/index.ts`
- * in opencode-magic-context), adapted for AFT's already-on-disk rewrite path
- * (so users don't even need to run `doctor`).
- *
- * Behavior:
- *   - If user has BOTH `experimental.bash` and top-level `bash`, top-level
- *     wins and we still strip the experimental block so the config stays
- *     clean (warned so the user knows their experimental keys were dropped).
- *   - If user has only `experimental.bash`, it lifts to top-level `bash` as
- *     an explicit object with all three sub-features materialized. This
- *     preserves the old default semantics: `experimental.bash: { rewrite:
- *     true }` had `compress: false, background: false` by default (the
- *     experimental block was opt-in). The new top-level `bash: { rewrite:
- *     true }` defaults `compress` and `background` to `true` (the block
- *     itself graduated to on-by-default). To prevent a silent behavior
- *     change, we materialize the implicit `false`s so the migrated config
- *     reads exactly as the old runtime did. Users can manually trim it to
- *     `bash: true` (or remove it for the new default) afterwards.
- *   - Tuning fields (`long_running_reminder_*`) carry through unchanged.
- *   - If `experimental` becomes an empty object after removing the bash
- *     block, the whole `experimental` key is dropped so we don't leave a
- *     dangling `"experimental": {}` in the user's file.
- *
- * Returns the list of migrated keys (formatted as `experimental.bash.*`) so
- * the caller's "migrated config" log line mentions them.
- */
-function migrateExperimentalBashBlock(
-  rawConfig: Record<string, unknown>,
-  configPath: string,
-  logger?: Logger,
-): string[] {
-  const experimental = rawConfig.experimental;
-  if (typeof experimental !== "object" || experimental === null || Array.isArray(experimental)) {
-    return [];
-  }
-  const expRecord = experimental as Record<string, unknown>;
-  if (!Object.hasOwn(expRecord, "bash")) return [];
-
-  const legacyBash = expRecord.bash;
-
-  // Non-object legacy value (e.g. `experimental.bash: true`) — shouldn't
-  // exist historically but be defensive. Drop it without inventing a
-  // top-level shape; the user can rewrite it themselves.
-  if (typeof legacyBash !== "object" || legacyBash === null || Array.isArray(legacyBash)) {
-    delete expRecord.bash;
-    if (Object.keys(expRecord).length === 0) delete rawConfig.experimental;
-    return ["experimental.bash"];
-  }
-
-  const bashRecord = legacyBash as Record<string, unknown>;
-  const hasFeatureFlag =
-    "rewrite" in bashRecord || "compress" in bashRecord || "background" in bashRecord;
-
-  // Pure tuning-only block (e.g. only long_running_reminder_*). Nothing
-  // semantic to graduate — materializing implicit feature flags here would
-  // surprise users who never opted into bash hoisting. Leave it alone.
-  if (!hasFeatureFlag) return [];
-
-  const movedKeys = Object.keys(bashRecord).map((k) => `experimental.bash.${k}`);
-
-  if (Object.hasOwn(rawConfig, "bash")) {
-    logger?.warn(
-      `Config migration conflict at ${configPath}: experimental.bash dropped because top-level "bash" is already set`,
-    );
-  } else {
-    // Materialize all three sub-features with their pre-migration runtime
-    // values. `=== true` collapses missing/undefined/null to false, which
-    // is exactly how the old experimental block treated unset sub-flags.
-    const migrated: Record<string, unknown> = {
-      rewrite: bashRecord.rewrite === true,
-      compress: bashRecord.compress === true,
-      background: bashRecord.background === true,
-    };
-    if (bashRecord.long_running_reminder_enabled !== undefined) {
-      migrated.long_running_reminder_enabled = bashRecord.long_running_reminder_enabled;
-    }
-    if (bashRecord.long_running_reminder_interval_ms !== undefined) {
-      migrated.long_running_reminder_interval_ms = bashRecord.long_running_reminder_interval_ms;
-    }
-    rawConfig.bash = migrated;
-  }
-  delete expRecord.bash;
-
-  // Strip an empty experimental object so the user's file doesn't keep an
-  // orphan `"experimental": {}` after migration.
-  if (Object.keys(expRecord).length === 0) {
-    delete rawConfig.experimental;
-  }
-
-  return movedKeys;
-}
-
-export function migrateAftConfigFile(
-  configPath: string,
-  logger: Logger = { log, warn },
-): { migrated: boolean; oldKeys: string[] } {
-  if (!existsSync(configPath)) {
-    return { migrated: false, oldKeys: [] };
-  }
-
-  let tmpPath: string | null = null;
-  let oldKeys: string[] = [];
-  try {
-    const content = readFileSync(configPath, "utf-8");
-    const rawConfig = parseJsonc<Record<string, unknown>>(content);
-    if (!rawConfig || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
-      return { migrated: false, oldKeys: [] };
-    }
-
-    oldKeys = migrateRawConfig(rawConfig, configPath, logger);
-    if (oldKeys.length === 0) {
-      return { migrated: false, oldKeys: [] };
-    }
-
-    // `comment-json` preserves comments natively through parse → mutate →
-    // stringify round-trip, including inline trailing comments and block
-    // comments — for any keys that survived the migration. Comments
-    // attached to keys we DELETED get dropped (they have no semantic anchor
-    // in the new shape). To keep user-authored prose around, we pull every
-    // comment out of the original file and prepend any that didn't make it
-    // into the rewritten form back onto the top so nothing is silently lost.
-    const serialized = `${stringifyJsonc(rawConfig, null, 2)}\n`;
-    const originalComments = extractCommentsForPreservation(content);
-    const droppedComments = originalComments.filter(
-      (comment) => !serialized.includes(comment.trim()),
-    );
-    const nextContent =
-      droppedComments.length > 0 ? `${droppedComments.join("\n")}\n${serialized}` : serialized;
-
-    tmpPath = `${configPath}.tmp.${process.pid}`;
-    writeFileSync(tmpPath, nextContent, "utf-8");
-    renameSync(tmpPath, configPath);
-    logger.log(`Migrated config at ${configPath}: removed ${oldKeys.join(", ")}`);
-    return { migrated: true, oldKeys };
-  } catch (err) {
-    if (tmpPath) {
-      try {
-        unlinkSync(tmpPath);
-      } catch {
-        // best-effort cleanup
-      }
-    }
-    if (isWritableMigrationError(err)) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.warn(
-        `Config migration could not write ${configPath} (${errorMsg}); using migrated config in memory`,
-      );
-      return { migrated: oldKeys.length > 0, oldKeys };
-    }
-    return { migrated: false, oldKeys: [] };
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Partial parse (valid sections survive, invalid sections are skipped)
 // ---------------------------------------------------------------------------
@@ -1612,12 +1356,10 @@ function loadConfigFromPath(configPath: string, tier: "user" | "project"): AftCo
     configLoadSources.push(configPath);
     configLoadTexts.set(configPath, content);
     const rawConfig = parseJsonc<Record<string, unknown>>(content);
-    migrateRawConfig(rawConfig, configPath, { log, warn });
     // comment-json attaches Symbol(before/after:<key>) props to track comments.
     // Zod stringifies keys when building error paths, which throws on those
     // symbols and would silently drop the whole config to defaults (issue #88).
-    // Validate against a symbol-free deep copy; the migration disk-write path
-    // above still uses the symbol-bearing object so comments survive.
+    // Validate against a symbol-free deep copy. Config files stay untouched.
     cleanConfig = stripJsoncSymbols(rawConfig);
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
@@ -2188,10 +1930,7 @@ export function migrateAftConfigLocations(
 }
 
 export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
-  const paths = resolveCortexKitConfigPaths(projectDirectory);
-  migrateAftConfigFile(paths.userConfigPath);
-  migrateAftConfigFile(paths.projectConfigPath);
-  return paths;
+  return resolveCortexKitConfigPaths(projectDirectory);
 }
 
 /** Resolve the checkout whose project config controls OpenCode's registered tool schema. */

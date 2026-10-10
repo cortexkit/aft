@@ -274,6 +274,43 @@ mod tests {
     }
 
     #[test]
+    fn experimental_keys_migrate_only_the_user_file_when_tiers_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user-aft.jsonc");
+        let project_root = dir.path().join("repo");
+        std::fs::create_dir_all(project_root.join(".cortexkit")).unwrap();
+        let project = project_root.join(".cortexkit/aft.jsonc");
+        let user_text = r#"{"experimental_lsp_ty":true,"experimental_bash_rewrite":true,"experimental_bash_compress":true,"experimental_bash_background":true}"#;
+        let project_text = "{\n // shared settings\n \"experimental_bash_compress\": false\n}\n";
+        std::fs::write(&user, user_text).unwrap();
+        std::fs::write(&project, project_text).unwrap();
+        let (tiers, migration) =
+            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
+        assert!(matches!(
+            migration,
+            Some(UserConfigMigration::Migrated { .. })
+        ));
+        let value: serde_json::Value = serde_json::from_str(&tiers[0].doc).unwrap();
+        assert_eq!(value["experimental"]["lsp_ty"], true);
+        assert_eq!(
+            value["bash"],
+            serde_json::json!({"rewrite":true,"compress":true,"background":true})
+        );
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
+        assert_eq!(tiers[1].doc, project_text);
+        let resolved = crate::config_resolve::resolve_config(&tiers);
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+        assert!(resolved.config.experimental_lsp_ty);
+        assert!(!resolved.config.experimental_bash_compress);
+        let user_after = std::fs::read_to_string(&user).unwrap();
+        let (_, again) =
+            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
+        assert_eq!(again, None);
+        assert_eq!(std::fs::read_to_string(&user).unwrap(), user_after);
+        assert_eq!(std::fs::read_to_string(&project).unwrap(), project_text);
+    }
+
+    #[test]
     fn missing_files_yield_no_tiers() {
         let dir = tempfile::tempdir().unwrap();
         let (tiers, _) = read_tiers_from(

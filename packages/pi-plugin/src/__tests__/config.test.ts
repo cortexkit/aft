@@ -1,7 +1,15 @@
 /// <reference path="../bun-test.d.ts" />
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +43,7 @@ function createConfigFixture() {
 
   mkdirSync(userConfigDir, { recursive: true });
   mkdirSync(projectConfigDir, { recursive: true });
+  mkdirSync(home, { recursive: true });
 
   return {
     root,
@@ -48,11 +57,14 @@ function createConfigFixture() {
   };
 }
 
-function spawnConfigLoader(projectDirectory: string, env: Record<string, string>) {
-  const script = `
+function spawnConfigLoader(
+  projectDirectory: string,
+  env: Record<string, string>,
+  script = `
     import { loadAftConfig } from "./src/config.ts";
     console.log(JSON.stringify(loadAftConfig(process.env.PROJECT_DIR!)));
-  `;
+  `,
+) {
   return spawnSync(process.execPath, ["-e", script], {
     cwd: packageRoot,
     env: { ...process.env, AFT_LOG_STDERR: "1", ...env, PROJECT_DIR: projectDirectory },
@@ -80,6 +92,56 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("plugin bootstrap leaves legacy config locations untouched", () => {
+    const fixture = createConfigFixture();
+    const legacyUserDir = join(fixture.root, "legacy-opencode");
+    const legacyProjectDir = join(fixture.projectDirectory, ".pi");
+    mkdirSync(legacyUserDir, { recursive: true });
+    mkdirSync(legacyProjectDir, { recursive: true });
+    const text = '{ "experimental_bash_rewrite": true }\n';
+    const legacyUser = join(legacyUserDir, "aft.jsonc");
+    const legacyProject = join(legacyProjectDir, "aft.jsonc");
+    writeFileSync(legacyUser, text);
+    writeFileSync(legacyProject, text);
+    const result = spawnConfigLoader(
+      fixture.projectDirectory,
+      {
+        OPENCODE_CONFIG_DIR: legacyUserDir,
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      },
+      `
+      import { resolvePiBootstrapConfig } from "./src/config-error-state.ts";
+      const result = await resolvePiBootstrapConfig(process.env.PROJECT_DIR!, () => {});
+      if (!result.ok) throw new Error(result.message);
+    `,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(readFileSync(legacyUser, "utf8")).toBe(text);
+    expect(readFileSync(legacyProject, "utf8")).toBe(text);
+    expect(existsSync(fixture.userConfigPath)).toBe(false);
+    expect(existsSync(fixture.projectConfigPath)).toBe(false);
+  });
+
+  test("project experimental keys keep their bytes after plugin load", () => {
+    const fixture = createConfigFixture();
+    const text = `{
+      // Committed project settings must not be rewritten by a plugin.
+      "experimental_lsp_ty": true,
+      "experimental_bash_rewrite": true,
+      "experimental_bash_compress": false,
+      "experimental_bash_background": true,
+      "harnesses": {
+        "opencode": { "experimental_bash_rewrite": false },
+        "pi": { "experimental_lsp_ty": false }
+      }
+    }\n`;
+    writeFileSync(fixture.projectConfigPath, text);
+
+    runConfigLoader(fixture.projectDirectory, { XDG_CONFIG_HOME: fixture.xdgConfigHome });
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(text);
+  });
+
   test("retired keys in either file load, translated, and are never refused", () => {
     const fixture = createConfigFixture();
     const userText = JSON.stringify({
@@ -998,7 +1060,7 @@ describe("loadAftConfig", () => {
     });
   });
 
-  test("migrates all old config keys to the v0.18 schema", () => {
+  test("translates all experimental keys in memory without rewriting the user file", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -1025,15 +1087,15 @@ describe("loadAftConfig", () => {
       bash: { rewrite: true, compress: true, background: true },
       experimental: { lsp_ty: true },
     });
-    // Retired index aliases translate in memory; only `aft doctor --fix`
-    // rewrites them.
-    expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_search_index");
-    expect(result.stderr).toContain(
-      `Migrated config at ${fixture.userConfigPath}: removed experimental_lsp_ty, experimental_bash_rewrite, experimental_bash_compress, experimental_bash_background`,
-    );
+    const unchanged = JSON.parse(readFileSync(fixture.userConfigPath, "utf-8"));
+    expect(unchanged.experimental_lsp_ty).toBe(true);
+    expect(unchanged.experimental_bash_rewrite).toBe(true);
+    expect(unchanged.experimental_bash_compress).toBe(true);
+    expect(unchanged.experimental_bash_background).toBe(true);
+    expect(result.stderr).toContain("applied their current equivalents in memory");
   });
 
-  test("migration is idempotent", () => {
+  test("repeated loads translate the same user input without writing", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_bash_rewrite: true }));
 
@@ -1046,12 +1108,13 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(first.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
-    expect(second.stderr).not.toContain(`Migrated config at ${fixture.userConfigPath}`);
+    expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(
+      JSON.stringify({ experimental_bash_rewrite: true }),
+    );
     expect(JSON.parse(second.stdout)).toEqual(JSON.parse(first.stdout));
   });
 
-  test("migration preserves JSONC comments", () => {
+  test("translation leaves user JSONC comments and bytes unchanged", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -1066,13 +1129,12 @@ describe("loadAftConfig", () => {
     const migrated = readFileSync(fixture.userConfigPath, "utf-8");
     expect(migrated).toContain("// keep me");
     expect(migrated).toContain("/* keep this block too */");
-    // After v0.27.2 graduation, the bash block lives at top-level and
-    // `experimental` is stripped when bash was the only key inside it.
-    expect(migrated).toContain('"bash"');
-    expect(migrated).not.toContain("experimental_bash_rewrite");
+    expect(migrated).toBe(
+      '{\n  // keep me\n  /* keep this block too */\n  "experimental_bash_rewrite": true,\n}\n',
+    );
   });
 
-  test("migrates the CortexKit jsonc config file", () => {
+  test("user experimental keys are left for the Rust migrator", () => {
     const fixture = createConfigFixture();
     writeFileSync(
       fixture.userConfigPath,
@@ -1084,13 +1146,13 @@ describe("loadAftConfig", () => {
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
 
-    expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
-    const migrated = readFileSync(fixture.userConfigPath, "utf-8");
-    expect(migrated).toContain("lsp_ty");
-    expect(migrated).not.toContain("experimental_bash_compress");
+    expect(result.stderr).toContain("applied their current equivalents in memory");
+    expect(readFileSync(fixture.userConfigPath, "utf-8")).toBe(
+      JSON.stringify({ experimental_lsp_ty: true, experimental_bash_compress: true }),
+    );
   });
 
-  test("migrates project and user config independently", () => {
+  test("translates project and user config independently without writes", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_lsp_ty: true }));
     writeFileSync(fixture.projectConfigPath, JSON.stringify({ experimental_bash_compress: true }));
@@ -1106,8 +1168,12 @@ describe("loadAftConfig", () => {
       experimental: { lsp_ty: true },
       bash: { compress: true, rewrite: false, background: false },
     });
-    expect(result.stderr).toContain(`Migrated config at ${fixture.userConfigPath}`);
-    expect(result.stderr).toContain(`Migrated config at ${fixture.projectConfigPath}`);
+    expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(
+      JSON.stringify({ experimental_lsp_ty: true }),
+    );
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(
+      JSON.stringify({ experimental_bash_compress: true }),
+    );
   });
 
   test("legacy index precedence: immediate legacy name beats the experimental alias", () => {
@@ -1128,7 +1194,7 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("superseded_legacy_config");
   });
 
-  test("read-only migration warning does not fail load", () => {
+  test("read-only user experimental keys translate without a write attempt", () => {
     const fixture = createConfigFixture();
     writeFileSync(fixture.userConfigPath, JSON.stringify({ experimental_lsp_ty: true }));
     chmodSync(fixture.userConfigPath, 0o444);
@@ -1142,9 +1208,10 @@ describe("loadAftConfig", () => {
       ...RESOLVED_DEFAULTS,
       experimental: { lsp_ty: true },
     });
-    if (result.stderr.includes("Config migration could not write")) {
-      expect(readFileSync(fixture.userConfigPath, "utf-8")).toContain("experimental_lsp_ty");
-    }
+    expect(result.stderr).not.toContain("Config migration could not write");
+    expect(readFileSync(fixture.userConfigPath, "utf-8")).toBe(
+      JSON.stringify({ experimental_lsp_ty: true }),
+    );
   });
 
   test("accepts shared disabled_tools but strips OpenCode-only auto_update", () => {

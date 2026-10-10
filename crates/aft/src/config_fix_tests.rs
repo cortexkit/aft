@@ -59,6 +59,8 @@ fn resolved(doc: &str, tier: &str, harness: Option<&Harness>) -> Value {
         "github": serde_json::to_value(&config.github).unwrap(),
         "backup": config.backup.enabled,
         "bash": config.bash.enabled,
+        "bash_features": [config.experimental_bash_rewrite, config.experimental_bash_compress, config.experimental_bash_background],
+        "lsp_ty": config.experimental_lsp_ty,
     })
 }
 
@@ -317,6 +319,96 @@ fn without_a_project_file_only_the_user_file_is_a_target() {
     std::fs::write(cwd.join(".cortexkit/aft.jsonc"), "{}").unwrap();
     assert_eq!(fix_targets(None, &cwd).len(), 1);
     assert_eq!(fix_targets(None, &cwd)[0].1, FixTier::Project);
+}
+
+#[test]
+fn experimental_keys_doctor_preserves_opt_in_defaults_and_precedence() {
+    for tier in [FixTier::User, FixTier::Project] {
+        for (input, expected) in [
+            (
+                json!({"experimental_lsp_ty": true}),
+                json!({"experimental": {"lsp_ty": true}}),
+            ),
+            (
+                json!({"experimental_bash_rewrite": true}),
+                json!({"bash": {"rewrite": true, "compress": false, "background": false}}),
+            ),
+            (
+                json!({"experimental_bash_compress": true}),
+                json!({"bash": {"rewrite": false, "compress": true, "background": false}}),
+            ),
+            (
+                json!({"experimental_bash_background": true}),
+                json!({"bash": {"rewrite": false, "compress": false, "background": true}}),
+            ),
+            (
+                json!({"experimental_bash_rewrite": true, "experimental": {"bash": {"rewrite": false, "compress": true}}}),
+                json!({"bash": {"rewrite": false, "compress": true, "background": false}}),
+            ),
+            (
+                json!({"experimental_bash_rewrite": true, "bash": {"compress": true}}),
+                json!({"bash": {"compress": true}}),
+            ),
+            (
+                json!({"experimental_lsp_ty": true, "experimental": {"lsp_ty": false}}),
+                json!({"experimental": {"lsp_ty": false}}),
+            ),
+            (
+                json!({"experimental": {"bash": {"rewrite": true, "long_running_reminder_enabled": false, "long_running_reminder_interval_ms": 1000}}}),
+                json!({"bash": {"rewrite": true, "compress": false, "background": false, "long_running_reminder_enabled": false, "long_running_reminder_interval_ms": 1000}}),
+            ),
+            (json!({"experimental": {"bash": true}}), json!({})),
+            (
+                json!({"harnesses": {"pi": {"experimental_bash_background": true}, "opencode": {"experimental_lsp_ty": true}}}),
+                json!({"harnesses": {"pi": {"bash": {"rewrite": false, "compress": false, "background": true}}, "opencode": {"experimental": {"lsp_ty": true}}}}),
+            ),
+        ] {
+            let migration = assert_fix_preserves_intent(&input.to_string(), tier);
+            let value: Value = serde_json::from_str(&migration.text).unwrap();
+            assert_eq!(value, expected, "{input}");
+            assert!(!migrate_config_text(&migration.text, tier).unwrap().changed);
+        }
+        let tuning_only = r#"{"experimental":{"bash":{"long_running_reminder_enabled":false}}}"#;
+        assert!(!migrate_config_text(tuning_only, tier).unwrap().changed);
+    }
+}
+
+#[test]
+fn experimental_keys_auto_migrate_user_once_via_doctor_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    let input = "{\n  // keep the opt-in settings\n  \"experimental_lsp_ty\": true,\n  \"experimental_bash_rewrite\": true,\n  \"experimental_bash_compress\": false,\n  \"experimental_bash_background\": true,\n  \"harnesses\": {\"pi\": {\"experimental_bash_background\": false}}\n}\n";
+    std::fs::write(&path, input).unwrap();
+    let outcome = auto_migrate_user_config(&path).expect("experimental keys need migration");
+    let UserConfigMigration::Migrated { backup, notice, .. } = outcome else {
+        panic!("expected a rewrite, got {outcome:?}");
+    };
+    assert_eq!(std::fs::read_to_string(&backup).unwrap(), input);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("// keep the opt-in settings"));
+    let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&text)).unwrap();
+    assert_eq!(
+        value["bash"],
+        json!({"rewrite": true, "compress": false, "background": true})
+    );
+    assert_eq!(value["experimental"], json!({"lsp_ty": true}));
+    assert_eq!(
+        value["harnesses"]["pi"]["bash"],
+        json!({"rewrite": false, "compress": false, "background": false})
+    );
+    assert!(!value
+        .as_object()
+        .unwrap()
+        .contains_key("experimental_lsp_ty"));
+    assert_eq!(
+        text,
+        migrate_config_text(input, FixTier::User).unwrap().text
+    );
+    assert!(notice.contains("experimental_lsp_ty"));
+    assert!(notice.contains("experimental_bash_rewrite"));
+    assert_eq!(auto_migrate_user_config(&path), None);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(backups(dir.path()).len(), 1);
 }
 
 const RETIRED_USER_FILE: &str =

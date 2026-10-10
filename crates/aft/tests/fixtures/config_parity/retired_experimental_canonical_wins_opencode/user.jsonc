@@ -1,0 +1,14 @@
+{
+  "experimental_lsp_ty": true,
+  "experimental_bash_rewrite": true,
+  "experimental": {
+    "lsp_ty": false,
+    "bash": {
+      "rewrite": false,
+      "compress": true
+    }
+  },
+  "bash": {
+    "background": true
+  }
+}

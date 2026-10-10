@@ -21,7 +21,12 @@
     "semantic_search": "indexes.semantic",
     "experimental_semantic_search": "indexes.semantic",
     "callgraph_store": "indexes.callgraph",
-    "github.enabled": "github.read,github.write,github.shim"
+    "github.enabled": "github.read,github.write,github.shim",
+    "experimental_lsp_ty": "experimental.lsp_ty",
+    "experimental_bash_rewrite": "bash.rewrite",
+    "experimental_bash_compress": "bash.compress",
+    "experimental_bash_background": "bash.background",
+    "experimental.bash": "bash"
   },
   "disabled_list_names": {
     "aft_read": "read",

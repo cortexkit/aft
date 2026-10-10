@@ -25,9 +25,8 @@ import {
   getConfigLoadSources,
   getConfigLoadTexts,
   loadAftConfig,
-  migrateAftConfigLocations,
 } from "./config.js";
-import { bridgeLogger, error, log } from "./logger.js";
+import { error, log } from "./logger.js";
 import { registerPiToolSurface, resolvePiToolSurface } from "./tool-registration.js";
 import type { PluginContext } from "./types.js";
 
@@ -69,8 +68,9 @@ const defaultDependencies: PiBootstrapDependencies = {
   configLoadErrors: getConfigLoadErrors,
   configLoadSources: getConfigLoadSources,
   configLoadTexts: getConfigLoadTexts,
-  migrateConfigLocations: (directory) =>
-    migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
+  // Moving old per-harness aft.jsonc files to shared CortexKit paths requires
+  // an explicit relocation operation, never an ordinary config load.
+  migrateConfigLocations: () => [],
   subcConnectionFileError,
 };
 
@@ -96,8 +96,9 @@ function parseFailure(dependencies: PiBootstrapDependencies): string | null {
 }
 
 /**
- * Load the config for `directory`, migrating legacy config file locations in
- * between two loads (migration may move the file the first read came from).
+ * Load the config for `directory` without writing files in production. An
+ * injected location migration hook is only for callers that explicitly opt
+ * into relocation; when present, the second load reads the relocated files.
  * A rejected configuration, a file that does not parse, any other load
  * failure, or a configured subc connection file that does not exist yields
  * the config error state. Migration is skipped when the first load fails.

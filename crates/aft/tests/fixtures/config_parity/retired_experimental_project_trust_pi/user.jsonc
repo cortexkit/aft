@@ -1,0 +1,8 @@
+{
+  "bash": {
+    "runon_enabled": false
+  },
+  "lsp": {
+    "auto_install": false
+  }
+}

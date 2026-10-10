@@ -1,0 +1,13 @@
+{
+  "experimental": {
+    "bash": {
+      "rewrite": true,
+      "long_running_reminder_enabled": false
+    }
+  },
+  "harnesses": {
+    "pi": {
+      "experimental_bash_background": true
+    }
+  }
+}

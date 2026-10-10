@@ -43,6 +43,70 @@ afterEach(() => {
 });
 
 describe("feature-config policy", () => {
+  test("experimental aliases preserve opt-in defaults and canonical precedence in both tiers", () => {
+    for (const tier of ["user", "project"] as const) {
+      for (const [key, expected] of [
+        ["experimental_lsp_ty", { experimental: { lsp_ty: true } }],
+        [
+          "experimental_bash_rewrite",
+          { bash: { rewrite: true, compress: false, background: false } },
+        ],
+        [
+          "experimental_bash_compress",
+          { bash: { rewrite: false, compress: true, background: false } },
+        ],
+        [
+          "experimental_bash_background",
+          { bash: { rewrite: false, compress: false, background: true } },
+        ],
+      ] as const) {
+        const doc: Record<string, unknown> = { [key]: true };
+        const out = translateConfigDocument(doc, tier);
+        expect(doc).toEqual(expected);
+        expect(out.retiredKeys).toContain(key);
+        expect(translateConfigDocument(doc, tier).legacyInput).toBe(false);
+      }
+      const conflict: Record<string, unknown> = {
+        experimental_lsp_ty: true,
+        experimental_bash_rewrite: true,
+        experimental: { lsp_ty: false, bash: { rewrite: false } },
+        bash: { compress: true },
+      };
+      const out = translateConfigDocument(conflict, tier);
+      expect(conflict).toEqual({ experimental: { lsp_ty: false }, bash: { compress: true } });
+      expect(out.warnings.map((warning) => warning.code)).toEqual([
+        "superseded_legacy_config",
+        "superseded_legacy_config",
+        "superseded_legacy_config",
+      ]);
+      const nested: Record<string, unknown> = {
+        harnesses: {
+          pi: {
+            experimental: { bash: { background: true, long_running_reminder_enabled: false } },
+          },
+        },
+      };
+      translateConfigDocument(nested, tier);
+      expect(nested).toEqual({
+        harnesses: {
+          pi: {
+            bash: {
+              rewrite: false,
+              compress: false,
+              background: true,
+              long_running_reminder_enabled: false,
+            },
+          },
+        },
+      });
+      const tuning: Record<string, unknown> = {
+        experimental: { bash: { long_running_reminder_enabled: false } },
+      };
+      expect(translateConfigDocument(tuning, tier).legacyInput).toBe(false);
+      expect(tuning).toEqual({ experimental: { bash: { long_running_reminder_enabled: false } } });
+    }
+  });
+
   test("notice digests match the shared Rust/TypeScript fixtures", () => {
     for (const fixture of fixtures.cases) {
       expect(noticeDigest(noticeProjection(fixture.doc)), fixture.name).toBe(fixture.digest);

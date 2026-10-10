@@ -199,6 +199,21 @@ fn migrate_block(
         }
     }
 
+    if !raw.contains_key("bash") {
+        if let Some(value) = translated.get("bash") {
+            doc.set(&path_of(prefix, &["bash"]), value)?;
+        }
+    }
+    let raw_lsp_ty = raw
+        .get("experimental")
+        .and_then(|experimental| experimental.get("lsp_ty"));
+    let translated_lsp_ty = translated
+        .get("experimental")
+        .and_then(|experimental| experimental.get("lsp_ty"));
+    if let (None, Some(value)) = (raw_lsp_ty, translated_lsp_ty) {
+        doc.set(&path_of(prefix, &["experimental", "lsp_ty"]), value)?;
+    }
+
     for leaf in ["read", "write", "shim"] {
         let raw_has = raw
             .get("github")
@@ -227,6 +242,14 @@ fn migrate_block(
         .into_iter()
         .chain(feature_config::REMOVED_INSPECT_LSP_PATHS)
     {
+        if path == "experimental.bash"
+            && translated
+                .get("experimental")
+                .and_then(|experimental| experimental.get("bash"))
+                .is_some()
+        {
+            continue;
+        }
         let segments: Vec<&str> = path.split('.').collect();
         let present = match segments.as_slice() {
             [key] => raw.contains_key(*key),

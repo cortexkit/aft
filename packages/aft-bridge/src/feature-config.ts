@@ -90,6 +90,11 @@ export const RETIRED_PATHS: ReadonlyArray<readonly [string, string]> = [
   ["experimental_semantic_search", "indexes.semantic"],
   ["callgraph_store", "indexes.callgraph"],
   ["github.enabled", "github.read,github.write,github.shim"],
+  ["experimental_lsp_ty", "experimental.lsp_ty"],
+  ["experimental_bash_rewrite", "bash.rewrite"],
+  ["experimental_bash_compress", "bash.compress"],
+  ["experimental_bash_background", "bash.background"],
+  ["experimental.bash", "bash"],
 ];
 
 /** Index leaf, immediate legacy key and optional experimental alias. */
@@ -315,6 +320,74 @@ function translateInspectLspPaths(map: JsonRecord, prefix: string, out: Document
 }
 
 /**
+ * Translate flat experimental aliases to nested settings. Graduating
+ * experimental.bash explicitly sets omitted feature flags to false;
+ * otherwise the current default-on bash settings would silently enable them.
+ */
+function translateExperimentalPaths(
+  map: JsonRecord,
+  prefix: string,
+  out: DocumentTranslation,
+): void {
+  for (const [oldKey, leaf] of [
+    ["experimental_lsp_ty", "lsp_ty"],
+    ["experimental_bash_rewrite", "rewrite"],
+    ["experimental_bash_compress", "compress"],
+    ["experimental_bash_background", "background"],
+  ]) {
+    if (!Object.hasOwn(map, oldKey)) continue;
+    recordRetired(out, prefix, oldKey);
+    const value = map[oldKey];
+    delete map[oldKey];
+    if (!isRecord(map.experimental)) map.experimental = {};
+    const experimental = map.experimental as JsonRecord;
+    let destination = experimental;
+    if (leaf !== "lsp_ty") {
+      if (!isRecord(experimental.bash)) experimental.bash = {};
+      destination = experimental.bash as JsonRecord;
+    }
+    if (Object.hasOwn(destination, leaf)) {
+      superseded(
+        out,
+        oldKey,
+        `${oldKey} is ignored because experimental.${leaf === "lsp_ty" ? leaf : `bash.${leaf}`} is already set`,
+      );
+    } else {
+      destination[leaf] = value;
+    }
+  }
+
+  if (!isRecord(map.experimental) || !Object.hasOwn(map.experimental, "bash")) return;
+  const experimental = map.experimental;
+  const legacy = experimental.bash;
+  if (isRecord(legacy)) {
+    if (!["rewrite", "compress", "background"].some((leaf) => Object.hasOwn(legacy, leaf))) return;
+    for (const leaf of Object.keys(legacy)) recordRetired(out, prefix, `experimental.bash.${leaf}`);
+    if (Object.hasOwn(map, "bash")) {
+      superseded(
+        out,
+        "experimental.bash",
+        'experimental.bash is ignored because top-level "bash" is already set',
+      );
+    } else {
+      const bash: JsonRecord = {
+        rewrite: legacy.rewrite === true,
+        compress: legacy.compress === true,
+        background: legacy.background === true,
+      };
+      for (const leaf of ["long_running_reminder_enabled", "long_running_reminder_interval_ms"]) {
+        if (Object.hasOwn(legacy, leaf)) bash[leaf] = legacy[leaf];
+      }
+      map.bash = bash;
+    }
+  } else {
+    recordRetired(out, prefix, "experimental.bash");
+  }
+  delete experimental.bash;
+  if (Object.keys(experimental).length === 0) delete map.experimental;
+}
+
+/**
  * Translate the retired keys of one tier/harness block in place.
  *
  * The false runtime gates (`backup.enabled`, `inspect.enabled`, `bash`,
@@ -332,6 +405,7 @@ function translateBlock(
   const prefix = blockLabel === "base" ? "" : `${blockLabel}.`;
   translateGithubAliases(map, prefix, out);
   translateInspectLspPaths(map, prefix, out);
+  translateExperimentalPaths(map, prefix, out);
 
   let explicitList: string[] | undefined;
   const rawList = map.disabled_tools;
@@ -345,6 +419,9 @@ function translateBlock(
   }
 
   for (const [path] of RETIRED_PATHS) {
+    // A block with only reminder settings never opted into experimental
+    // bash features. Leave it unchanged instead of adding false flags.
+    if (path === "experimental.bash") continue;
     if (hasPath(map, path)) recordRetired(out, prefix, path);
   }
   const gates = falseRuntimeGates(map);
