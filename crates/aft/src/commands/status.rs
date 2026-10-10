@@ -911,6 +911,10 @@ mod tests {
     #[test]
     fn status_bar_values_report_each_category_independently() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        // Diagnostics counts stay "pending" until a project-wide applicability
+        // snapshot exists. This fixture runs no server discovery, so record
+        // that no language server applies to the project.
+        ctx.lsp().store_project_applicability(Default::default());
         ctx.update_status_bar_tier2(None, Some(2), Some(1), Some(5), false);
         let response = handle_status(&request(), &ctx);
 
@@ -921,6 +925,7 @@ mod tests {
                 "errors": null,
                 "warnings": null,
                 "diagnostics": "no_language_server",
+                "diagnostics_gaps": [],
                 "dead_code": null,
                 "unused_exports": 2,
                 "duplicates": 1,
@@ -936,6 +941,9 @@ mod tests {
     #[test]
     fn status_bar_values_name_missing_language_server_instead_of_pending() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        // Server discovery has run and found no language server for this
+        // project. Before discovery has run, the counts would read "pending".
+        ctx.lsp().store_project_applicability(Default::default());
         ctx.update_status_bar_tier2(Some(1), Some(1), Some(0), Some(0), false);
         let response = handle_status(&request(), &ctx);
 

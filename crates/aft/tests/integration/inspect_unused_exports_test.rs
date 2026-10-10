@@ -57,7 +57,11 @@ fn inspect_unused_exports_empty_project_reports_zero() {
 
     assert_eq!(success.aggregate["count"], 0);
     assert_eq!(success.aggregate["scanned_files"], 0);
-    assert_eq!(success.aggregate["drill_down_capped"], false);
+    // An empty project has no rows to page through. The stored aggregate keeps
+    // every row and leaves cutting to render-time paging, so it carries no
+    // drill-down cap marker at all.
+    assert_eq!(success.aggregate["items"], serde_json::json!([]));
+    assert!(success.aggregate.get("drill_down_capped").is_none());
 }
 
 #[test]
@@ -244,8 +248,12 @@ fn inspect_unused_exports_skips_kotlin_export_like_declarations() {
     );
 }
 
+/// The scanner stores every unused export past the former 100-row drill-down
+/// cap, so render-time paging (`topK` plus `offset`) can reach all of them.
+/// `inspect_command_test::inspect_unused_exports_pages_101_items_past_the_former_cap`
+/// checks the paging itself.
 #[test]
-fn inspect_unused_exports_caps_drill_down_after_one_hundred_items() {
+fn inspect_unused_exports_stores_every_item_past_one_hundred_for_paging() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
     let source = (0..101)
@@ -256,7 +264,10 @@ fn inspect_unused_exports_caps_drill_down_after_one_hundred_items() {
     let success = scan(root, vec![file]);
 
     assert_eq!(success.aggregate["count"], 101);
-    assert_eq!(success.aggregate["items"].as_array().unwrap().len(), 100);
-    assert_eq!(success.aggregate["drill_down_capped"], true);
-    assert!(symbols(&success.aggregate["items"]).contains(&"unused_0".to_string()));
+    let stored = symbols(&success.aggregate["items"]);
+    assert_eq!(stored.len(), 101);
+    for symbol in ["unused_0", "unused_100"] {
+        assert!(stored.contains(&symbol.to_string()), "missing {symbol}");
+    }
+    assert!(success.aggregate.get("drill_down_capped").is_none());
 }

@@ -5461,6 +5461,68 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     );
 }
 
+/// The unused-exports drill-down used to stop at 100 rows and set
+/// `drill_down_capped`. Now the full list is stored and paged: at `topK` 100 a
+/// 101-row result shows a bounded first page that names the cut in text and in
+/// its structured envelope, and the next page returns the remaining row.
+#[test]
+fn inspect_unused_exports_pages_101_items_past_the_former_cap() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "package.json",
+        "{\"name\":\"cap-paging-app\",\"private\":true}",
+    );
+    write_file(&root, "src/main.ts", "console.log('entry');\n");
+    let source = (0..101)
+        .map(|i| format!("export function unused_{i:03}() {{ return {i}; }}\n"))
+        .collect::<String>();
+    write_file(&root, "src/spares.ts", &source);
+    let ctx = configured_context(&root);
+    let page = |offset| {
+        inspect(
+            &ctx,
+            json!({
+                "id": format!("cap-page-{offset}"), "command": "inspect",
+                "sections": ["unused_exports"], "topK": 100, "offset": offset,
+            }),
+        )
+    };
+
+    let first = page(0);
+    assert_eq!(first["success"], true, "{first:#}");
+    let first_rows = first["details"]["unused_exports"].as_array().unwrap();
+    assert_eq!(first_rows.len(), 100, "{first:#}");
+    let envelope = &first["details"]["unused_exports_list_envelope"];
+    assert_eq!(envelope["total"]["value"], 101, "{envelope:#}");
+    assert_eq!(envelope["next_offset"], 100, "{envelope:#}");
+    assert_eq!(envelope["reasons"], json!(["cap"]), "{envelope:#}");
+    let first_text = first["text"].as_str().unwrap();
+    assert!(
+        first_text.contains("shown 100 of 101 items (cap)"),
+        "{first_text}"
+    );
+
+    let second = page(100);
+    assert_eq!(second["success"], true, "{second:#}");
+    let second_rows = second["details"]["unused_exports"].as_array().unwrap();
+    assert_eq!(second_rows.len(), 1, "{second:#}");
+    let envelope = &second["details"]["unused_exports_list_envelope"];
+    assert_eq!(envelope["offset"], 100, "{envelope:#}");
+    assert_eq!(envelope["next_offset"], Value::Null, "{envelope:#}");
+    assert_eq!(envelope["reasons"], json!([]), "{envelope:#}");
+    let second_text = second["text"].as_str().unwrap();
+    assert!(!second_text.contains("shown "), "{second_text}");
+
+    let symbols = first_rows
+        .iter()
+        .chain(second_rows)
+        .filter_map(|row| row["symbol"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(symbols.len(), 101);
+    assert!(symbols.contains("unused_000") && symbols.contains("unused_100"));
+}
+
 #[test]
 fn inspect_offset_pages_all_150_unused_exports() {
     let (_temp_dir, root) = fixture_project();

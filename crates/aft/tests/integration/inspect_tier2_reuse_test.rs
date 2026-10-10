@@ -594,13 +594,17 @@ fn aggregate_test_only_item<'a>(
         })
 }
 
-fn assert_used_by(item: &Value, basename: &str) {
+/// `used_by` names each referencing test file by its project-relative path,
+/// the same form inspect output uses for every other file reference.
+fn assert_used_by(item: &Value, relative_path: &str) {
     let used_by = item["used_by"]
         .as_array()
         .unwrap_or_else(|| panic!("missing used_by on item: {item:#?}"));
     assert!(
-        used_by.iter().any(|value| value.as_str() == Some(basename)),
-        "missing used_by basename {basename} in {used_by:#?}"
+        used_by
+            .iter()
+            .any(|value| value.as_str() == Some(relative_path)),
+        "missing used_by path {relative_path} in {used_by:#?}"
     );
 }
 
@@ -729,11 +733,11 @@ throughBarrel();
     );
     let test_only = aggregate_test_only_item(&success, "src/api.ts", "testOnly")
         .unwrap_or_else(|| panic!("missing test-only item: {:#}", success.aggregate));
-    assert_used_by(test_only, "api.test.ts");
+    assert_used_by(test_only, "src/api.test.ts");
     let through_barrel =
         aggregate_test_only_item(&success, "src/barrel-target.ts", "throughBarrel")
             .unwrap_or_else(|| panic!("missing barrel test-only item: {:#}", success.aggregate));
-    assert_used_by(through_barrel, "barrel.test.ts");
+    assert_used_by(through_barrel, "src/barrel.test.ts");
 }
 
 #[test]
