@@ -1,22 +1,19 @@
 name: Unit suite
 
 # Reusable workflow that runs all unit-level coverage (Linux, macOS, Windows
-# cargo, Windows bash e2e). Called by both tests.yml (PR / push-to-main) and
-# release.yml (tag push). Single source of truth — PR-time and release-time
-# unit jobs cannot drift.
+# cargo, Windows bash e2e). Called by tests.yml (pull requests and pushes to
+# main and train/*). A release does not run it again: release.yml requires the
+# tagged commit's tests.yml run to be green instead, with every required check
+# of main (the Windows bash e2e job among them) concluded success.
 #
 # The `strict` input toggles whether the currently-scoped Windows bash e2e job
 # gates the caller:
 #   strict=false → PR mode. Linux, macOS, and Windows cargo block; Windows bash
 #     e2e remains non-blocking (continue-on-error: true).
-#   strict=true  → release mode. ALL four jobs gate. A failure in any of them
-#     fails the called-workflow's overall status, blocking downstream `needs:`
-#     jobs in the caller (e2e, build-*, publish-*).
-#
-# The release pipeline runs in strict mode so we don't ship with known
-# regressions on any platform. Currently-flaky tests in the strict-only path
-# must be either fixed or explicitly excluded before release time, surfacing
-# real bugs rather than silently masking them.
+#   strict=true  → ALL jobs gate. A failure in any of them fails the
+#     called-workflow's overall status, blocking downstream `needs:` jobs in
+#     the caller. It also builds every JS package. No caller sets it since the
+#     release stopped rerunning this suite.
 
 on:
   workflow_call:

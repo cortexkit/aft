@@ -14,8 +14,10 @@ set -euo pipefail
 #   3. Syncs version across all 7 package files
 #   4. Commits the version bump
 #   5. Creates a git tag (v0.2.0)
-#   6. Pushes commit + tag to origin
-#   7. CI takes over: test → build → publish npm + GitHub release
+#   6. Lands the commit on main through train-push (tests.yml must go green),
+#      then pushes the tag
+#   7. CI takes over: gate on that green tests.yml run → build → publish npm +
+#      GitHub release (release.yml does not rerun the tests)
 
 VERSION="${1:-}"
 DRY="${2:-}"
@@ -105,7 +107,7 @@ push_release() {
   echo ""
 
   echo "  ✓ Released $TAG"
-  echo "  → GitHub Actions will now: test → build → publish"
+  echo "  → GitHub Actions will now: check the green tests.yml run → build → publish"
   echo "  → Watch: https://github.com/cortexkit/aft/actions"
 }
 
@@ -232,12 +234,12 @@ cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fm
 # Publication-surface gates, run LOCALLY before the tag exists.
 #
 # These same gates run inside the release workflow's publish job, i.e. AFTER
-# the full test matrix and the whole build matrix have already burned ~20
-# minutes. Any drift in the governed manifests (a merged PR that touched a
-# governed surface file, a host version bump that moved the prefix capture, a
-# manifest whose source_commit no longer matches) fails there, which means a
-# dead tag and a full re-cut. The v0.49.0 release burned eight tag attempts on
-# exactly this class before the checks moved here.
+# the whole build matrix has already burned ~20 minutes. Any drift in the
+# governed manifests (a merged PR that touched a governed surface file, a host
+# version bump that moved the prefix capture, a manifest whose source_commit no
+# longer matches) fails there, which means a dead tag and a full re-cut. The
+# v0.49.0 release burned eight tag attempts on exactly this class before the
+# checks moved here.
 #
 # Prefer a gate dedicated to the current release line. The v0.49 gate is also
 # the shared surface-generation gate for later 0.x releases, matching the
@@ -334,7 +336,7 @@ fi
 
 if [ "${SKIP_RUST_TESTS:-}" = "1" ]; then
   echo "  (skipping local cargo tests — SKIP_RUST_TESTS=1)"
-  echo "  ↳ CI still runs the full suite on its own runners before publishing."
+  echo "  ↳ train-push still runs the full suite in CI, and the release publishes only after it is green."
 else
   echo "  rust test gate (unit on libtest, integration on nextest, watcher isolated)..."
   ./scripts/rust-test-gate.sh 2>&1 || { echo "Error: Rust tests failed"; exit 1; }

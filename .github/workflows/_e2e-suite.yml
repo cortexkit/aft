@@ -5,11 +5,9 @@ name: E2E Suite
 #   - macOS native e2e   — same stack on a real macOS-arm64 runner
 #   - Windows native e2e — same stack on a real Windows runner (no containers)
 #
-# Called from:
-#   - tests.yml (PR + main push) — catches regressions at PR time
-#   - release.yml (tag push)     — gates build/publish on e2e success
-#
-# Single source of truth so PR-time and release-time e2e never drift.
+# Called from tests.yml (pull requests and pushes to main and train/*). A
+# release does not run it again: release.yml requires the tagged commit's
+# tests.yml run to be green instead (scripts/release-ci-gate.sh).
 #
 # IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
 # locking, or platform-conditional code paths SHOULD touch the matching
@@ -23,13 +21,9 @@ on:
   workflow_call:
     inputs:
       cargo_profile:
-        description: "Cargo profile for the aft binaries under test: 'release' (fat LTO, tag releases) or 'stage' (optimized, no LTO — minutes less link time; PR/push)"
+        description: "Cargo profile for the aft binaries under test: 'release' (fat LTO, the shipped shape; pushes to main) or 'stage' (optimized, no LTO — minutes less link time; PRs and trains)"
         type: string
         default: release
-      publish_release_artifacts:
-        description: "Upload the release-tested macOS ARM64 and Windows x64 binaries for release.yml"
-        type: boolean
-        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -411,11 +405,7 @@ jobs:
   e2e-windows:
     name: E2E (Windows native)
     runs-on: windows-2022
-    # The 30-minute budget is the suite's. When release.yml folds the
-    # publishable release-profile build into this job (the other platform
-    # build jobs carry no cap at all), the build alone is 21.7 min cold and
-    # 9.6 min warm on v0.56.0, so the job gets the build class's headroom.
-    timeout-minutes: ${{ inputs.publish_release_artifacts && 60 || 30 }}
+    timeout-minutes: 30
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -437,14 +427,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-
-      # release.yml publishes this exact binary after it passes the native E2E
-      # harness, eliminating a duplicate release build and a second Windows
-      # runner queue. Branch validation keeps the checked-in version unchanged.
-      - name: Sync versions from tag
-        if: inputs.publish_release_artifacts == true && startsWith(github.ref, 'refs/tags/v')
-        run: node scripts/version-sync.mjs --from-tag
-        shell: pwsh
 
       - name: Build AFT binary (Windows x64)
         run: cargo build --profile $env:CARGO_PROFILE --target x86_64-pc-windows-msvc -p agent-file-tools
@@ -486,14 +468,6 @@ jobs:
           path: ${{ runner.temp }}/aft-e2e-artifacts/windows/aft-plugin.log
           if-no-files-found: warn
 
-      - name: Upload release-tested Windows x64 binary
-        if: inputs.publish_release_artifacts == true
-        uses: actions/upload-artifact@v4
-        with:
-          name: win32-x64
-          path: target/x86_64-pc-windows-msvc/${{ env.CARGO_PROFILE_DIR }}/aft.exe
-          if-no-files-found: error
-
   # ---------------------------------------------------------------------------
   # macOS native e2e — exercises the same OpenCode + plugin + binary stack on
   # a real macOS-arm64 runner. No containers (GH Actions macOS runners can't
@@ -510,12 +484,8 @@ jobs:
     # The 45-minute budget covers a cold build: when the sccache and rust-cache
     # entries miss, the debug build of the workspace crate alone takes about
     # 30 minutes on a hosted macOS runner, and two train runs were cancelled
-    # in that step. When release.yml folds the publishable release-profile
-    # build into this job, the fat-LTO link of the workspace crate runs
-    # single-threaded for 16 min on a normal runner and past 30 on a slow one
-    # (v0.56.0's retag timed out in exactly that step with a full cache hit),
-    # so the job gets the build class's headroom.
-    timeout-minutes: ${{ inputs.publish_release_artifacts && 60 || 45 }}
+    # in that step.
+    timeout-minutes: 45
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -541,23 +511,8 @@ jobs:
         with:
           bun-version: latest
 
-      # release.yml publishes this exact binary after native E2E, rather than
-      # scheduling a second macOS ARM64 build for the same target and profile.
-      - name: Sync versions from tag
-        if: inputs.publish_release_artifacts == true && startsWith(github.ref, 'refs/tags/v')
-        run: node scripts/version-sync.mjs --from-tag
-
       - name: Build AFT binary (macOS native)
         run: cargo build --profile "$CARGO_PROFILE" -p agent-file-tools
-
-      # Strip BEFORE signing and testing, never after: v0.51.1 shipped a
-      # SIGKILL-on-load arm64 binary (#238) because strip ran after the e2e
-      # suite — the post-verification mutation invalidated the signature and
-      # strip's auto-re-sign produced a corrupt one. The e2e suite below must
-      # exercise the exact bytes that get published.
-      - name: Strip release binary
-        if: inputs.publish_release_artifacts == true
-        run: strip "target/$CARGO_PROFILE_DIR/aft"
 
       # Ad-hoc sign + verify + exec once: an unsigned fresh binary gets
       # SIGKILLed on newer macOS, and the first exec pays a syspolicyd
@@ -591,31 +546,3 @@ jobs:
           name: e2e-macos-plugin-log-${{ github.run_attempt }}
           path: ${{ runner.temp }}/aft-e2e-data/cortexkit/aft/logs/aft-plugin.log
           if-no-files-found: warn
-
-      # Package the split debug info (dSYM) as a sibling release asset. The
-      # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed
-      # binary would otherwise return nameless offsets. `ditto` dereferences the
-      # `aft.dSYM` symlink cargo emits (it points at a hash-named bundle under
-      # deps/) and copies it to a canonical `aft.dSYM` before zipping, so the
-      # release asset is self-contained and keyed by the binary's UUID.
-      - name: Package dSYM
-        if: inputs.publish_release_artifacts == true
-        run: |
-          ditto "target/$CARGO_PROFILE_DIR/aft.dSYM" release-dsym/aft.dSYM
-          ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-arm64-dsym.zip
-
-      - name: Upload release-tested macOS ARM64 dSYM
-        if: inputs.publish_release_artifacts == true
-        uses: actions/upload-artifact@v4
-        with:
-          name: darwin-arm64-dsym
-          path: release-dsym/aft-darwin-arm64-dsym.zip
-          if-no-files-found: error
-
-      - name: Upload release-tested macOS ARM64 binary
-        if: inputs.publish_release_artifacts == true
-        uses: actions/upload-artifact@v4
-        with:
-          name: darwin-arm64
-          path: target/${{ env.CARGO_PROFILE_DIR }}/aft
-          if-no-files-found: error

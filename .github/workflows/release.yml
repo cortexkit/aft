@@ -4,8 +4,8 @@ on:
   push:
     tags:
       - "v*"
-  # Safe branch validation runs the full strict test and build fleet but leaves
-  # every publishing job skipped. Tag pushes retain the production release DAG.
+  # Branch validation runs the gate and the build fleet but leaves every
+  # publishing job skipped. Tag pushes retain the production release DAG.
   workflow_dispatch:
 
 concurrency:
@@ -22,42 +22,74 @@ env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 jobs:
-  # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e).
-  # Defined as a reusable workflow so tests.yml shares the exact same
-  # workload. Release mode (strict=true) makes EVERY job blocking — including
-  # the Windows jobs that are non-blocking at PR time. If a Windows-only
-  # regression slipped past PR-time CI, this gate catches it before publish.
-  unit:
-    name: Unit
-    uses: ./.github/workflows/_unit-suite.yml
-    with:
-      strict: true
-
-  # Run the full E2E matrix (Linux Docker + Pi RPC + Windows native +
-  # macOS native) at release time. Reuses the same workflow tests.yml runs
-  # at PR time — single source of truth, so PR-time and release-time e2e
-  # can never drift. Runs IN PARALLEL with unit (they share no artifacts);
-  # every publishing job still `needs:` BOTH, so a regression in either
-  # blocks the release exactly as before. Release e2e keeps the default
-  # `release` cargo profile: the shipped fat-LTO binary shape is tested.
-  e2e:
-    name: E2E
-    uses: ./.github/workflows/_e2e-suite.yml
+  # The tagged commit has already passed the unit and E2E matrix in tests.yml:
+  # every commit reaches main through scripts/train-push.sh, which fast-forwards
+  # main only after the commit's tests.yml run is green, and main's branch
+  # protection requires those checks. Rerunning that matrix here tested the
+  # same commit again and added nothing but flake exposure: GitHub reruns
+  # failed jobs only after the whole run finishes, so one flaky test held the
+  # publish behind the slowest build. This gate instead proves the commit is on
+  # main and its tests.yml run is green, every required check of main included
+  # (scripts/release-ci-gate.sh). There is no skip input: a refused tag is
+  # released by getting that run green and rerunning this workflow.
+  gate:
+    name: CI gate (tests.yml green on this commit)
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       actions: read
-      checks: read
-    with:
-      # The native E2E jobs upload the exact release-profile binaries they pass.
-      # Reusing them removes duplicate macOS ARM64 and Windows x64 builds while
-      # keeping both platform suites blocking through this called workflow.
-      publish_release_artifacts: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Fetch main
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+      - name: Require a green tests.yml run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/release-ci-gate.sh "$GITHUB_SHA"
+
+  # Every published JS package must build before anything is published. This
+  # step used to run only in the release-mode unit suite; tests.yml builds the
+  # packages a test needs but never builds all of them, so it is not a rerun.
+  build-js-packages:
+    name: Build JS packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      # Workspace consumers import the bridge's dist/, so it builds first.
+      - name: Build all JS packages
+        run: |
+          bun run --cwd packages/aft-bridge build
+          bun run --filter '*' build
 
   publish-crates:
     name: Publish to crates.io
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
-    needs: [unit, e2e]
+    needs:
+      - gate
+      - build-js-packages
+      - build-darwin-arm64
+      - build-darwin-x64
+      - build-linux-arm64
+      - build-linux-x64
+      - build-win32-arm64
+      - build-win32-x64
     steps:
       - uses: actions/checkout@v5
 
@@ -116,12 +148,73 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   # ---------------------------------------------------------------------------
-  # Four standalone binary builds have no `needs:` and start immediately. The
-  # macOS ARM64 and Windows x64 binaries are built, tested, and uploaded inside
-  # the parallel E2E workflow, removing duplicate builds and runner queues.
-  # Every publishing job still gates on unit+e2e, so all platform tests remain
-  # release-blocking before any side effect.
+  # The six platform builds have no `needs:` and start immediately, in
+  # parallel with the gate. Every publishing job needs the gate and all six
+  # builds, so a refused gate or a failed build blocks every side effect.
   # ---------------------------------------------------------------------------
+  build-darwin-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-26
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      # cache-bin: false keeps a cached ~/.cargo/bin from overwriting the fresh
+      # cargo shim, as in build-darwin-x64.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-darwin-arm64
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Sync versions from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/version-sync.mjs --from-tag
+
+      - name: Build
+        run: cargo build --release -p agent-file-tools
+
+      # Strip BEFORE signing, never after: v0.51.1 shipped a SIGKILL-on-load
+      # arm64 binary (#238) because strip ran after signing, and strip's
+      # automatic re-sign produced a corrupt signature.
+      - name: Strip binary
+        run: strip target/release/aft
+
+      # Ad-hoc sign, hard-verify, and execute once. --verify --strict fails on
+      # an unsigned or corrupt-signature binary; the --version run proves the
+      # exact bytes being published start on macOS.
+      - name: Sign, verify, and smoke-test binary
+        run: |
+          codesign -f -s - target/release/aft
+          codesign --verify --strict target/release/aft
+          target/release/aft --version
+
+      # Package the split debug info (dSYM) as a sibling release asset; see
+      # build-darwin-x64 for why it goes through ditto.
+      - name: Package dSYM
+        run: |
+          ditto target/release/aft.dSYM release-dsym/aft.dSYM
+          ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-arm64-dsym.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64
+          path: target/release/aft
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64-dsym
+          path: release-dsym/aft-darwin-arm64-dsym.zip
+          if-no-files-found: error
+
   build-darwin-x64:
     name: Build macOS x64
     runs-on: macos-26
@@ -310,6 +403,47 @@ jobs:
           path: target/aarch64-pc-windows-msvc/release/aft.exe
           if-no-files-found: error
 
+  build-win32-x64:
+    name: Build Windows x64
+    runs-on: windows-2022
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-win32-x64
+          cache-on-failure: true
+
+      - name: Sync versions from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/version-sync.mjs --from-tag
+        shell: pwsh
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc -p agent-file-tools
+        shell: pwsh
+
+      # Execute the exact bytes being published once on Windows.
+      - name: Smoke-test binary
+        run: target/x86_64-pc-windows-msvc/release/aft.exe --version
+        shell: pwsh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win32-x64
+          path: target/x86_64-pc-windows-msvc/release/aft.exe
+          if-no-files-found: error
+
   # npm publish runs AFTER github-release so that checksums.sha256 is already
   # available on the GitHub release page when ensureBinary() runs during
   # @cortexkit/aft-opencode@latest install.
@@ -317,10 +451,13 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     needs:
+      - gate
+      - build-darwin-arm64
       - build-darwin-x64
       - build-linux-arm64
       - build-linux-x64
       - build-win32-arm64
+      - build-win32-x64
       - github-release
     steps:
       - uses: actions/checkout@v5
@@ -507,10 +644,13 @@ jobs:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs:
+      - gate
+      - build-darwin-arm64
       - build-darwin-x64
       - build-linux-arm64
       - build-linux-x64
       - build-win32-arm64
+      - build-win32-x64
       - publish-crates
     steps:
       - uses: actions/checkout@v5
@@ -667,6 +807,7 @@ jobs:
     # leaving users who click the release link unable to install the
     # versions Discord just announced.
     needs:
+      - gate
       - github-release
       - publish-npm
     if: success()

@@ -1,10 +1,12 @@
 name: Tests
 
 # PR-time gate: runs Rust + plugin unit tests, Linux Docker e2e, and Windows e2e
-# before merge. Tag pushes go through `release.yml` which independently runs the
-# build matrix and publishes — both workflows call the SAME reusable unit-suite
-# (`_unit-suite.yml`) and e2e-suite (`_e2e-suite.yml`) so PR-time and
-# release-time tests never drift.
+# before merge. Train pushes run it too, and scripts/train-push.sh lands a
+# commit on main only when this run is green. Tag pushes go through
+# `release.yml`, which does not rerun these tests: it builds and publishes only
+# after scripts/release-ci-gate.sh finds this workflow's green run for the
+# tagged commit, so the job names below are what that gate checks against
+# main's required status checks.
 #
 # IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
 # locking, or platform-conditional code paths SHOULD touch the matching
@@ -63,10 +65,9 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e).
-  # Defined as a reusable workflow so release.yml shares the exact same
-  # workload. PR mode (strict=false): Windows jobs are non-blocking; Linux
-  # and macOS still block. See `_unit-suite.yml` for details.
+  # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e),
+  # defined as a reusable workflow. PR mode (strict=false): Windows bash e2e
+  # is non-blocking; Linux and macOS still block. See `_unit-suite.yml`.
   # ---------------------------------------------------------------------------
   unit:
     name: Unit
@@ -76,29 +77,22 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Linux Docker e2e + Pi RPC e2e + macOS native e2e + Windows native e2e.
-  # Reuses the same _e2e-suite.yml that release.yml calls.
   #
   # Runs IN PARALLEL with the unit stage: e2e jobs build their own binaries
   # and consume no unit artifacts, so a `needs: unit` gate only serialized
   # two independent ~19-minute stages (~39 min wall for a ~20 min critical
   # path). The tradeoff — runner minutes spent on e2e when unit fails — is
-  # accepted for the wall-clock halving. release.yml keeps its own gating.
+  # accepted for the wall-clock halving.
   #
-  # PR/push e2e builds use the `stage` cargo profile (optimized, no fat LTO):
-  # same test coverage, minutes less link time per lane. Tag releases run
-  # _e2e-suite.yml with the default `release` profile, so the shipped
-  # fat-LTO binary shape is still e2e-tested before publishing.
+  # PR/train e2e builds use the `stage` cargo profile (optimized, no fat LTO):
+  # same test coverage, minutes less link time per lane.
   #
-  # Pushes to main build the `release` profile instead. Actions cache scopes
-  # let a tag run read only its own ref and the default branch, and trains
-  # land on train/* refs, so main was the only place a release-profile cache
-  # could come from and it never held one: every tag run started cold. On
-  # v0.56.0 the Windows native build took 21.7 min cold and 9.6 min warm
-  # inside a 30-minute job; macOS gains only its ~1 min of deps because its
-  # cost is the fat-LTO link of the workspace crate, which no cache holds.
-  # A main run starts after main is already fast-forwarded, so it is off
-  # every critical path and can pay the release-profile build that keeps
-  # this cache warm for the next tag.
+  # Pushes to main build the `release` profile instead, so the shipped fat-LTO
+  # binary shape is e2e-tested on every commit that lands. A main run starts
+  # after main is already fast-forwarded, so it is off every critical path.
+  # (It was also meant to warm the release-profile cache for tag runs, back
+  # when release.yml reran this suite; the release builds now use their own
+  # cache keys.)
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E
