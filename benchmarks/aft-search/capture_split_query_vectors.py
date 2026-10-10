@@ -66,9 +66,11 @@ def main() -> None:
                 if query_key(text, template) not in pack["vectors"]:
                     texts.add(text)
     output = HERE / output_name
-    # Vectors already in the pack keep their exact bytes, including those of
-    # texts no current row names (the first tuning rows' vectors live in the
-    # gate pack); only texts the pack lacks are embedded.
+    # Vectors already in the pack keep their exact bytes, and none is dropped:
+    # split-query-vectors.bin also holds the vectors of tuning rows
+    # 920001-920008, captured before the tuning rows got their own pack, and
+    # dropping them would break the tuning replay. Only texts the pack lacks
+    # are embedded.
     previous = read_pack(output) if output.is_file() else None
     vectors = {key: previous["vectors"][key] for key in previous["vectors"]} if previous else {}
     missing = {query_key(text, template): text for text in sorted(texts)}

@@ -50,10 +50,12 @@ def main() -> None:
         census(910010, "R6", 7614, "how does structural search parallelize work across files", "handle_ast_search", "At the pin ast_search.rs:24 defines handle_ast_search and :146-149 fans work out with rayon. Index embeddings are held while lexical indexing completes.", answer_kind="definition", semantic_state="building"),
         census(910011, "R7", 7670, "perf tier2 phases freshness snapshot scan db rollup log emit", "Tier2PhaseTimings|Error", "At the pin inspect/manager.rs orchestrates tier2 phases and records Tier2PhaseTimings; this is the retained census opened file."),
         census(910012, "R7", 7656, "status snapshot session id checkpoints json serialization", "tracked_files|Error", "At the pin commands/status.rs:78-82 builds the status snapshot; the retained census asks for its tracked_files and session serialization."),
-        # The magic-context report (aft_search in that repository): prose
-        # with a semicolon or comma, and a camelCase/snake_case/longer-name
-        # alternation whose answer declares a name that only begins with one
-        # alternative. Rebuilt on the pin with names of the same shape.
+        # Rebuilt from a search in the magic-context repository (see
+        # MAGIC_CONTEXT_SOURCE): a sentence containing a comma or semicolon,
+        # and a pattern alternating camelCase, snake_case and a longer name,
+        # where the answer file declares a name that only begins with one
+        # alternative (runAutoSearch -> runAutoSearchHintForPi). The rows use
+        # names of the same shape that exist on the pin.
         row(910013, "R7", "Pi plugin resolves the user and project aft config file paths, migrating legacy config files first", "resolveAft|resolve_aft|resolveAftConfig", "packages/pi-plugin/src/config.ts", "At the pin packages/pi-plugin/src/config.ts:1764 declares resolveAftConfigPaths, which resolves the user and project config paths and migrates legacy config files first (migrateLegacyAftConfigFiles, from line 1741); opencode-plugin/src/config.ts:1789 declares the OpenCode twin. No file declares resolveAft or resolveAftConfig as a whole name.", source=MAGIC_CONTEXT_SOURCE, answer_kind="definition"),
         row(910014, "R7", "how are call edges resolved across files when the callee is imported, re-exported or aliased", "resolve_cross_file|resolveCrossFile|crossFileEdge", "crates/aft/src/callgraph.rs", "At the pin crates/aft/src/callgraph.rs:1120 declares resolve_cross_file_edge and :942 resolve_cross_file_edge_with_exports, which follows re-exports through resolve_reexported_symbol (lines 991-1059). resolve_cross_file is mentioned in 18 Markdown files and declared nowhere as a whole name.", source=MAGIC_CONTEXT_SOURCE, answer_kind="definition"),
     ]
@@ -78,8 +80,11 @@ def main() -> None:
         item["tuning_only"] = True
     tuning_path = HERE / "split-tuning-manifest.json"
     tuning_manifest = {"schema": manifest["schema"], "evidence_sha": manifest["evidence_sha"], "tuning_only": True, "rows": tuning}
-    # The tuning pack binding is written by the --tuning-only vector capture;
-    # keep it so regenerating the rows does not unbind their vectors.
+    # The manifest's split_query_pack entry names the vector pack (path and
+    # digest) that holds the tuning rows' query vectors; only the
+    # --tuning-only vector capture writes it. Carry it over, or the
+    # regenerated manifest would point at no vectors and the tuning replay
+    # would refuse its rows.
     if tuning_path.is_file() and "split_query_pack" in (previous := json.loads(tuning_path.read_text())):
         tuning_manifest["split_query_pack"] = previous["split_query_pack"]
     tuning_path.write_bytes(canonical_json(tuning_manifest))
