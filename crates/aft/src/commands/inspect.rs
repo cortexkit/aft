@@ -541,11 +541,7 @@ fn handle_inspect_payload(
     // Blocking requests already captured this inventory for stat verification.
     let scoped_inventory = scope_roots.map(|roots| {
         let count = observed_stats.map_or_else(
-            || {
-                crate::callgraph::walk_project_files(&snapshot.project_root)
-                    .filter(|file| scope.contains(file))
-                    .count()
-            },
+            || crate::callgraph::walk_project_files_in_scope(&snapshot.project_root, roots).count(),
             |stats| {
                 stats
                     .0

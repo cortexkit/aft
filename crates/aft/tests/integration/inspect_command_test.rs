@@ -1545,6 +1545,44 @@ fn scoped_inspect_inventory_survives_blocked_metrics() {
 }
 
 #[test]
+fn scoped_inspect_inventory_paths_agree_with_ignored_subfolders() {
+    let (_temp, root) = fixture_project();
+    write_file(&root, ".gitignore", "/src/ignored/\n/src/ignored.ts\n");
+    write_file(&root, ".aftignore", "/src/vendored/\n");
+    write_file(&root, "src/main.ts", "export const main = 1;\n");
+    write_file(&root, "src/nested/lib.ts", "export const lib = 2;\n");
+    write_file(&root, "src/ignored/hidden.ts", "export const hidden = 3;\n");
+    write_file(&root, "src/ignored.ts", "export const ignored = 4;\n");
+    write_file(&root, "src/vendored/dep.ts", "export const dep = 5;\n");
+    write_file(&root, "src/node_modules/pkg.ts", "export const pkg = 6;\n");
+    write_file(&root, "outside/other.ts", "export const other = 7;\n");
+    let ctx = configured_context(&root);
+    for (scope, expected) in [
+        (json!("src"), 2),
+        (json!(["src", "src/nested", "src/main.ts"]), 2),
+        (json!("src/main.ts"), 1),
+        (json!("src/ignored"), 0),
+        (json!("src/ignored.ts"), 0),
+        (json!("src/vendored"), 0),
+        (json!("src/node_modules"), 0),
+    ] {
+        let req = request(json!({
+            "id": "scope-ignore-parity", "command": "inspect", "scope": scope,
+            "sections": "duplicates"
+        }));
+        let nonblocking = handle_inspect(&req, &ctx);
+        let blocking = handle_inspect_tool_call(&req, &ctx);
+        assert!(nonblocking.success, "{nonblocking:?}");
+        assert!(blocking.success, "{blocking:?}");
+        assert_eq!(blocking.data["scope_files"], expected, "{blocking:?}");
+        assert_eq!(
+            nonblocking.data["scope_files"], blocking.data["scope_files"],
+            "{nonblocking:?}"
+        );
+    }
+}
+
+#[test]
 fn scoped_inspect_views_worktree_reports_checkout_only_dead_function() {
     let _env_lock = env_serial_lock();
     let (temp, owner) = fixture_project();

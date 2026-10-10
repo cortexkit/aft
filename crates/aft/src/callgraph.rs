@@ -3652,6 +3652,28 @@ const WALK_EXCLUDED_DIR_NAMES: [&str; 9] = [
 ///
 /// Returns an iterator of file paths for supported source file types.
 pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
+    walk_project_files_filtered(root, |_| true)
+}
+
+/// Walk only the requested subtrees and the ancestors needed to reach them.
+/// Starting at the project root preserves ignored-parent and nested ignore
+/// rules; pruning before descent avoids traversing unrelated subtrees.
+pub(crate) fn walk_project_files_in_scope(
+    root: &Path,
+    scope_roots: &[PathBuf],
+) -> impl Iterator<Item = PathBuf> {
+    let roots = scope_roots.to_vec();
+    walk_project_files_filtered(root, move |path| {
+        roots
+            .iter()
+            .any(|root| path.starts_with(root) || root.starts_with(path))
+    })
+}
+
+fn walk_project_files_filtered(
+    root: &Path,
+    include: impl Fn(&Path) -> bool + Send + Sync + 'static,
+) -> impl Iterator<Item = PathBuf> {
     use ignore::WalkBuilder;
 
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
@@ -3661,7 +3683,10 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
                                                  // .gitignore (also outside a git repository), global excludes,
                                                  // .git/info/exclude and .aftignore (e.g. submodules).
     let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
+            if !include(entry.path()) {
+                return false;
+            }
             let name = entry.file_name().to_string_lossy();
             // Always exclude these directories regardless of .gitignore
             if entry.file_type().map_or(false, |ft| ft.is_dir()) {
@@ -4301,6 +4326,39 @@ export function main() {
     }
 
     // --- Worktree walker ---
+
+    #[test]
+    fn scoped_project_walk_prunes_unrelated_subtrees() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::create_dir_all(dir.path().join("outside/deep")).unwrap();
+        fs::write(dir.path().join("src/main.ts"), "export const main = 1;\n").unwrap();
+        fs::write(
+            dir.path().join("outside/deep/other.ts"),
+            "export const other = 2;\n",
+        )
+        .unwrap();
+        let scope = dir.path().join("src");
+        let visited = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observations = visited.clone();
+        let files = walk_project_files_filtered(dir.path(), move |path| {
+            observations.lock().unwrap().push(path.to_path_buf());
+            path.starts_with(&scope) || scope.starts_with(path)
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(files, vec![dir.path().join("src/main.ts")]);
+        // Recording the traversal predicate distinguishes pruning a directory
+        // before descent from filtering its files after walking the subtree.
+        let visited = visited.lock().unwrap();
+        assert!(
+            !visited.contains(&dir.path().join("outside/deep")),
+            "{visited:?}"
+        );
+        assert!(
+            !visited.contains(&dir.path().join("outside/deep/other.ts")),
+            "{visited:?}"
+        );
+    }
 
     #[test]
     fn callgraph_walker_excludes_gitignored() {
