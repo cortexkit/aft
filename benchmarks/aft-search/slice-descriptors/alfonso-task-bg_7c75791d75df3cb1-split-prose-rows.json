@@ -1,0 +1,9 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens"
+  ],
+  "note": "Adds real-query rows followup-census:900035-900037 (wrong_lane_nl: prose with a comma or semicolon) and split rows 910013-910014 (R7, split_query_pattern_fusion), rebuilt on the pin after a magic-context aft_search report. Extends split-query-vectors.bin with the query texts of gate rows the main pack lacks (new vectors only; every existing vector keeps its bytes) and re-records the reference on the unchanged engine. No engine file changes."
+}

@@ -401,6 +401,39 @@ tuning manifest, so the gate's pack and manifest stay byte-identical:
 Set `AFT_SEARCH_SPLIT_TRACE=1` in the engine's environment to record each split
 row's `split_trace` (how every leading result was placed) in the score.
 
+The gate pack also holds the query text of every gate row that
+`real-query-vectors.bin` has no vector for: rows whose shape ran no semantic
+lane when the main pack was captured (identifiers, regexes, and prose the
+router took for a code literal). An engine that routes such a text to the
+semantic lane is then measured instead of faulting with `vector_missing`.
+The capture embeds only texts the pack lacks; every vector already in it keeps
+its bytes, and each run rebinds only its own manifest.
+
+Rows `910013` and `910014` (kind R7) rebuild a report from the magic-context
+repository, which is not a benchmark corpus, on the pin. There, `query: "Pi
+auto-search hint selects latest user message to search on; skips synthetic or
+custom messages"` with `pattern: "autoSearch|auto_search|runAutoSearch"`
+returned release notes and reports first, and the summary line named a local
+`const autoSearch` inside a dashboard component as the definition, while the
+answer, `auto-search-pi.ts`, declares `runAutoSearchHintForPi`. Two engine
+behaviours combine: prose with a comma or semicolon is routed as a code
+literal, so the query runs without its semantic lane, and a declaration whose
+name only begins with an alternative (`runAutoSearch` in
+`runAutoSearchHintForPi`) does not count as that alternative's definition.
+Both rows keep that shape: a sentence with a comma, and a camelCase,
+snake_case and longer-name alternation whose answer declares a longer name
+(`resolveAftConfigPaths` in the Pi plugin's `config.ts`;
+`resolve_cross_file_edge` in `callgraph.rs`, whose short name
+`resolve_cross_file` appears in 18 Markdown files). Their answer is the
+declaring file, so `answer_kind` is `definition`.
+
+Rows `900035`–`900037` (mechanism `wrong_lane_nl`) are query-only sentences
+with a comma or semicolon and no identifier, whose answer is found by meaning
+rather than shared words: where the search index decides a file is binary,
+how adjacent hashline replacements are merged, and how a timed-out background
+task's process group is killed. Like the split rows they are constructed from
+the pin after that report, not taken from telemetry.
+
 Descriptor suggestion for a change adding benchmark rows and harness support: `slice_class: non_ranking`,
 `kind: harness`, `targeted_mechanism: none`, `fixtures: ["harness-goldens"]`.
 For the subsequent engine implementation change: `slice_class: ranking`, `kind: ranking`,
