@@ -262,8 +262,17 @@ impl CallgraphKey {
         language: impl Into<String>,
         extractor_version: impl Into<String>,
     ) -> Self {
+        Self::from_source_digest(*blake3::hash(bytes).as_bytes(), language, extractor_version)
+    }
+
+    /// Reconstruct a key from a proven Git-object alias without rereading source.
+    pub(crate) fn from_source_digest(
+        source_digest: [u8; 32],
+        language: impl Into<String>,
+        extractor_version: impl Into<String>,
+    ) -> Self {
         Self {
-            source_digest: *blake3::hash(bytes).as_bytes(),
+            source_digest,
             language: language.into(),
             extractor_version: extractor_version.into(),
         }

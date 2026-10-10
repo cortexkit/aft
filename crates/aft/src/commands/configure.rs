@@ -7352,14 +7352,83 @@ fn manifest_checkout_paths(manifest: &crate::views::Manifest) -> BTreeSet<Vec<u8
 
 const VIEW_WORKING_TREE_VERIFY_LIMIT: usize = 200_000;
 
-/// A matching HEAD does not certify a persisted graph's working-tree bytes.
-/// Stop at the first changed member, or the verification budget, and request a
-/// full background publication in either case instead of trusting a partial scan.
+#[cfg(test)]
+thread_local! {
+    static VIEW_WORKING_TREE_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn view_git_changed_paths(root: &Path, max_examined: usize) -> Result<BTreeSet<Vec<u8>>, String> {
+    let child = crate::effective_path::new_command("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--relative",
+            "-z",
+            "HEAD",
+            "--",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let output = crate::format::wait_with_deadline(
+        child,
+        "git diff",
+        Instant::now() + Duration::from_secs(30),
+        || false,
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success()
+        || output.truncated
+        || output.stdout.contains('\u{fffd}')
+        || (!output.stdout.is_empty() && !output.stdout.ends_with('\0'))
+    {
+        return Err(format!(
+            "git dirty-path discovery incomplete: {}",
+            output.status
+        ));
+    }
+    let mut paths = BTreeSet::new();
+    for (examined, path) in output
+        .stdout
+        .split_terminator('\0')
+        .take(max_examined.saturating_add(1))
+        .enumerate()
+    {
+        if examined == max_examined {
+            return Err("git dirty-path discovery exceeded its verification budget".into());
+        }
+        let path = crate::views::RelPath::new(path.as_bytes().to_vec())
+            .map_err(|error| error.to_string())?;
+        paths.insert(path.as_bytes().to_vec());
+    }
+    Ok(paths)
+}
+
+/// Git's index stat cache finds changed tracked paths without hashing clean files.
+/// Proven aliases also identify manifest bytes that differ from HEAD, including
+/// dirty publications whose source was restored before this process started.
+/// Missing aliases remain candidates; errors or an exhausted iterator budget
+/// request a full publication rather than certifying an incomplete scan.
 fn view_working_tree_refresh_path(
     root: &Path,
     manifest: &crate::views::Manifest,
+    head: &[crate::alias::TrackedPath],
+    aliases: &crate::alias::AliasStore,
     max_examined: usize,
 ) -> Result<Option<Vec<u8>>, String> {
+    let changed_paths = view_git_changed_paths(root, max_examined)?;
+    let head_by_path = head
+        .iter()
+        .map(|entry| (entry.rel_path.as_slice(), entry))
+        .collect::<BTreeMap<_, _>>();
     for (examined, (path, entry)) in manifest
         .entries()
         .take(max_examined.saturating_add(1))
@@ -7380,11 +7449,6 @@ fn view_working_tree_refresh_path(
             continue;
         };
         let absolute = root.join(crate::callgraph_store::facts::byte_path(path.as_bytes()));
-        let source = crate::views::assembly::read_working_tree_file(&absolute)
-            .map_err(|error| error.to_string())?;
-        let Some(source) = source else {
-            return Ok(Some(path.as_bytes().to_vec()));
-        };
         let language = if *resolution_input {
             "config".to_string()
         } else {
@@ -7393,6 +7457,35 @@ fn view_working_tree_refresh_path(
             };
             format!("{language:?}").to_lowercase()
         };
+        if !changed_paths.contains(path.as_bytes()) {
+            if let Some(tracked) = head_by_path
+                .get(path.as_bytes())
+                .filter(|entry| entry.is_alias_eligible())
+            {
+                if let Some(digest) = aliases
+                    .resolve(tracked.git_oid)
+                    .map_err(|error| error.to_string())?
+                {
+                    let head_key = crate::blob_store::CallgraphKey::from_source_digest(
+                        digest,
+                        &language,
+                        crate::views::callgraph::PRODUCER,
+                    )
+                    .full_key()
+                    .to_hex();
+                    if head_key == expected {
+                        continue;
+                    }
+                }
+            }
+        }
+        let source = crate::views::assembly::read_working_tree_file(&absolute)
+            .map_err(|error| error.to_string())?;
+        let Some(source) = source else {
+            return Ok(Some(path.as_bytes().to_vec()));
+        };
+        #[cfg(test)]
+        VIEW_WORKING_TREE_HASHES.with(|count| count.set(count.get() + 1));
         let actual = crate::blob_store::CallgraphKey::from_bytes(
             &source,
             &language,
@@ -7405,6 +7498,23 @@ fn view_working_tree_refresh_path(
         }
     }
     Ok(None)
+}
+
+fn view_verification_publication_path(
+    result: Result<Option<Vec<u8>>, String>,
+    head: &[crate::alias::TrackedPath],
+) -> Option<Vec<u8>> {
+    result.unwrap_or_else(|error| {
+        slog_warn!(
+            "working-tree view verification requires full publication: {}",
+            error
+        );
+        Some(
+            head.first()
+                .map(|entry| entry.rel_path.clone())
+                .unwrap_or_else(|| b".git".to_vec()),
+        )
+    })
 }
 
 fn open_view_runtime_for_configure(
@@ -7530,11 +7640,16 @@ fn open_view_runtime_for_configure(
     let mut pending_inputs = BTreeMap::new();
     if input.callgraph {
         if let Some(manifest) = manifest.as_ref() {
-            if let Some(path) = view_working_tree_refresh_path(
-                &job.canonical_cache_root,
-                manifest,
-                VIEW_WORKING_TREE_VERIFY_LIMIT,
-            )? {
+            if let Some(path) = view_verification_publication_path(
+                view_working_tree_refresh_path(
+                    &job.canonical_cache_root,
+                    manifest,
+                    &head_entries,
+                    &alias_store,
+                    VIEW_WORKING_TREE_VERIFY_LIMIT,
+                ),
+                &head_entries,
+            ) {
                 pending_paths.insert(path.clone());
                 pending_inputs.insert(
                     path,
@@ -9149,8 +9264,78 @@ mod tests {
     }
 
     #[test]
-    fn view_working_tree_verification_is_bounded_and_hashes_source_bytes() {
+    fn views_clean_thousand_file_configure_hashes_zero_source_files() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
         let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        for index in 0..999 {
+            std::fs::write(
+                project.path().join(format!("file_{index:04}.rs")),
+                "pub fn clean() {}\n",
+            )
+            .unwrap();
+        }
+        assert!(git_command(project.path())
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(project.path())
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "thousand files"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let configure = configure_request_with_params(json!({
+            "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
+            "config": [user_tier(json!({
+                "views": {"enabled": true},
+                "indexes": {"trigram": false, "semantic": false, "callgraph": true}
+            }))]
+        }));
+        assert!(handle_configure_for_test(&configure, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(
+            ctx.view_runtime_snapshot()
+                .unwrap()
+                .manifest
+                .unwrap()
+                .entries()
+                .count(),
+            1000
+        );
+        drop(ctx);
+
+        let restarted = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        assert!(handle_configure_for_test(&configure, &restarted).success);
+        let mut state = super::ConfigureMaintenanceState::standalone();
+        state.absorb_enqueued(&restarted);
+        let job = &state.jobs.front().unwrap().job;
+        let input = super::ConfigureViewInput::capture(&restarted, job);
+        super::VIEW_WORKING_TREE_HASHES.with(|count| count.set(0));
+        let prepared = super::open_view_runtime_for_configure(&input, job).unwrap();
+        assert!(prepared.snapshot.pending_paths.is_empty());
+        super::VIEW_WORKING_TREE_HASHES
+            .with(|count| assert_eq!(count.get(), 0, "clean configure must not hash source files"));
+    }
+
+    #[test]
+    fn view_working_tree_verification_is_bounded_and_hashes_source_bytes() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
         let original = "export function alpha() {}\n";
         let entry = crate::views::ManifestEntry::Regular {
             mode: 0o100644,
@@ -9171,6 +9356,38 @@ mod tests {
         for name in ["a.ts", "b.ts"] {
             std::fs::write(project.path().join(name), original).unwrap();
         }
+        assert!(git_command(project.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(project.path())
+            .args(["add", "."])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(project.path())
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let head = crate::alias::head_tree_entries(project.path()).unwrap();
+        let mut aliases =
+            crate::alias::AliasStore::open(storage.path(), "verification-tests").unwrap();
+        for entry in &head {
+            aliases
+                .seed_proven_alias(entry, original.as_bytes())
+                .unwrap();
+        }
         let manifest = crate::views::Manifest::new(["a.ts", "b.ts"].map(|name| {
             (
                 crate::views::RelPath::new(name.as_bytes().to_vec()).unwrap(),
@@ -9179,25 +9396,100 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            super::view_working_tree_refresh_path(project.path(), &manifest, 1).unwrap(),
+            super::view_working_tree_refresh_path(project.path(), &manifest, &head, &aliases, 1)
+                .unwrap(),
             Some(b"b.ts".to_vec())
         );
         assert_eq!(
-            super::view_working_tree_refresh_path(project.path(), &manifest, 2).unwrap(),
+            super::view_working_tree_refresh_path(project.path(), &manifest, &head, &aliases, 2)
+                .unwrap(),
             None
         );
         let edited = "export function bravo() {}\n";
         assert_eq!(original.len(), edited.len());
         std::fs::write(project.path().join("a.ts"), edited).unwrap();
         assert_eq!(
-            super::view_working_tree_refresh_path(project.path(), &manifest, 2).unwrap(),
+            super::view_working_tree_refresh_path(project.path(), &manifest, &head, &aliases, 2)
+                .unwrap(),
             Some(b"a.ts".to_vec())
         );
+        assert!(git_command(project.path())
+            .args(["add", "a.ts"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            super::view_working_tree_refresh_path(project.path(), &manifest, &head, &aliases, 2)
+                .unwrap(),
+            Some(b"a.ts".to_vec())
+        );
+        let mut dirty_entry = entry.clone();
+        if let crate::views::ManifestEntry::Regular { planes, .. } = &mut dirty_entry {
+            planes.callgraph = Some(
+                crate::blob_store::CallgraphKey::from_bytes(
+                    edited.as_bytes(),
+                    "typescript",
+                    crate::views::callgraph::PRODUCER,
+                )
+                .full_key()
+                .to_hex(),
+            );
+        }
+        let dirty_manifest = crate::views::Manifest::new([
+            (
+                crate::views::RelPath::new(b"a.ts".to_vec()).unwrap(),
+                dirty_entry,
+            ),
+            (crate::views::RelPath::new(b"b.ts".to_vec()).unwrap(), entry),
+        ])
+        .unwrap();
+        assert!(git_command(project.path())
+            .args(["restore", "--staged", "--worktree", "a.ts"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(super::view_git_changed_paths(project.path(), 2)
+            .unwrap()
+            .is_empty());
+        super::VIEW_WORKING_TREE_HASHES.with(|count| count.set(0));
+        assert_eq!(
+            super::view_working_tree_refresh_path(
+                project.path(),
+                &dirty_manifest,
+                &head,
+                &aliases,
+                2
+            )
+            .unwrap(),
+            Some(b"a.ts".to_vec())
+        );
+        super::VIEW_WORKING_TREE_HASHES.with(|count| assert_eq!(count.get(), 1));
         std::fs::write(project.path().join("a.ts"), original).unwrap();
         std::fs::remove_file(project.path().join("b.ts")).unwrap();
         assert_eq!(
-            super::view_working_tree_refresh_path(project.path(), &manifest, 2).unwrap(),
+            super::view_working_tree_refresh_path(project.path(), &manifest, &head, &aliases, 2)
+                .unwrap(),
             Some(b"b.ts".to_vec())
+        );
+        std::fs::write(project.path().join("a.ts"), edited).unwrap();
+        assert_eq!(
+            super::view_git_changed_paths(project.path(), 2).unwrap(),
+            BTreeSet::from([b"a.ts".to_vec(), b"b.ts".to_vec()])
+        );
+        assert!(
+            super::view_git_changed_paths(project.path(), 1).is_err(),
+            "partial git discovery must not certify the checkout"
+        );
+    }
+
+    #[test]
+    fn views_git_verification_failure_requires_full_publication() {
+        let project = tempfile::tempdir().unwrap();
+        let failed = super::view_git_changed_paths(project.path(), 1000);
+        assert!(failed.is_err(), "non-repository git invocation must fail");
+        assert_eq!(
+            super::view_verification_publication_path(failed.map(|_| None), &[]),
+            Some(b".git".to_vec())
         );
     }
 

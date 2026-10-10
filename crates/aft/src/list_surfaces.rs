@@ -293,6 +293,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "startup verification of persisted view bytes, not a result list; reaching the iterator budget schedules a full background publication and refuses stale graph answers rather than treating partial verification as complete",
     },
     ExclusionEntry {
+        file: "commands/configure.rs",
+        enclosing_item: "view_git_changed_paths",
+        location_or_primitive: "max_examined .take()",
+        reason: "bounded startup dirty-path discovery, not a result list; truncated subprocess output or reaching the iterator budget forces full view publication rather than certifying the checkout as clean",
+    },
+    ExclusionEntry {
         file: "subc_format.rs",
         enclosing_item: "format_ast_search_capture",
         location_or_primitive: "AST_CAPTURE_INLINE_CHAR_LIMIT .chars().take()",
