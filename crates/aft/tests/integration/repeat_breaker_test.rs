@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use aft::response_finalize::append_repeat_breaker_reminder;
-use aft::response_finalize::repeat_breaker::{output_hash, semantic_key, RepeatBreaker};
+use aft::response_finalize::repeat_breaker::{output_hash, RepeatBreaker, RepeatCall};
 use serde_json::{json, Value};
 
 use crate::test_helpers::AftProcess;
@@ -155,8 +155,7 @@ fn observe_tool_as(
 ) -> Option<String> {
     let intervention = breaker.observe_at(
         SESSION,
-        tool,
-        semantic_key(tool, input),
+        &RepeatCall::new(tool, input),
         output_hash(output),
         now,
     )?;
@@ -256,7 +255,10 @@ fn repeat_breaker_ndjson_carries_the_worker_role_on_tool_call_and_raw_bash() {
             &serde_json::to_string(&json!({
                 "id": format!("worker-raw-bash-{index}"),
                 "command": "bash",
-                "session_id": SESSION,
+                // Bash may change files and resets same-session glob repeat
+                // counts. Separate sessions let both wording probes reach
+                // their third identical call independently.
+                "session_id": format!("{SESSION}-bash"),
                 "worker_session": true,
                 "params": params,
             }))
@@ -420,6 +422,262 @@ fn repeat_breaker_steers_third_a_across_three_alternating_keys() {
 
     let seventh = seventh.expect("third A must steer despite B and C calls between repeats");
     assert!(seventh.contains("This is the 3rd identical call"));
+}
+
+#[test]
+fn repeat_breaker_never_steers_restores_separated_by_edits() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+    let restore = json!({ "op": "restore", "name": "provider-quota-preflight-green" });
+
+    for round in 0..3 {
+        assert!(observe_tool(
+            &breaker,
+            "edit",
+            &json!({ "path": "src/quota.rs", "edits": [{ "oldString": "green", "newString": format!("red-{round}") }] }),
+            "edited one file",
+            start + Duration::from_secs(round * 20),
+        )
+        .is_none(), "edit round {round} must not steer");
+        assert!(
+            observe_tool(
+                &breaker,
+                "aft_safety",
+                &restore,
+                "restored one file",
+                start + Duration::from_secs(round * 20 + 1),
+            )
+            .is_none(),
+            "restore round {round} must not steer"
+        );
+    }
+}
+
+#[test]
+fn repeat_breaker_mutation_resets_read_observations() {
+    let start = Instant::now();
+    let read = json!({ "path": "src/quota.rs" });
+    for (mutator, arguments) in mutating_calls().into_iter().chain([
+        ("bash", json!({ "command": "touch src/quota.rs" })),
+        (
+            "powershell",
+            json!({ "command": "Set-Content src/quota.rs green" }),
+        ),
+    ]) {
+        let breaker = RepeatBreaker::default();
+        for (tool, input, seconds) in [
+            ("read", read.clone(), 0),
+            (mutator, arguments, 10),
+            ("read", read.clone(), 20),
+            ("read", read.clone(), 40),
+        ] {
+            assert!(
+                observe_tool(
+                    &breaker,
+                    tool,
+                    &input,
+                    STABLE_OUTPUT,
+                    start + Duration::from_secs(seconds),
+                )
+                .is_none(),
+                "{mutator}: {tool} at {seconds}s must not steer"
+            );
+        }
+        let third = observe_tool(
+            &breaker,
+            "read",
+            &read,
+            STABLE_OUTPUT,
+            start + Duration::from_secs(60),
+        )
+        .expect("three reads after the mutation must still steer");
+        assert!(third.contains("This is the 3rd identical call"));
+    }
+}
+
+fn mutating_calls() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "write",
+            json!({ "path": "src/quota.rs", "content": "green" }),
+        ),
+        (
+            "edit",
+            json!({ "path": "src/quota.rs", "edits": [{ "oldString": "green", "newString": "red" }] }),
+        ),
+        (
+            "apply_patch",
+            json!({ "patchText": "*** Begin Patch\n*** Delete File: src/quota.rs\n*** End Patch" }),
+        ),
+        ("delete", json!({ "files": ["src/quota.rs"] })),
+        ("aft_delete", json!({ "files": ["src/quota.rs"] })),
+        (
+            "move",
+            json!({ "path": "src/quota.rs", "destination": "src/quota-old.rs" }),
+        ),
+        (
+            "aft_move",
+            json!({ "path": "src/quota.rs", "destination": "src/quota-old.rs" }),
+        ),
+        (
+            "import",
+            json!({ "op": "add", "path": "src/quota.rs", "module": "std::fmt" }),
+        ),
+        (
+            "aft_import",
+            json!({ "op": "remove", "path": "src/quota.rs", "module": "std::fmt" }),
+        ),
+        (
+            "import",
+            json!({ "op": "organize", "path": "src/quota.rs" }),
+        ),
+        ("safety", json!({ "op": "restore", "name": "green" })),
+        (
+            "aft_safety",
+            json!({ "op": "undo", "path": "src/quota.rs" }),
+        ),
+        ("aft_safety", json!({ "op": "checkpoint", "name": "green" })),
+        (
+            "ast_replace",
+            json!({ "pattern": "green", "rewrite": "red", "lang": "rust" }),
+        ),
+        (
+            "ast_grep_replace",
+            json!({ "pattern": "green", "rewrite": "red", "lang": "rust", "dryRun": false }),
+        ),
+        ("bash_kill", json!({ "taskId": "task-1" })),
+        (
+            "bash_write",
+            json!({ "taskId": "task-1", "input": "hello" }),
+        ),
+    ]
+}
+
+#[test]
+fn repeat_breaker_never_steers_mutating_calls() {
+    let start = Instant::now();
+    for (tool, input) in mutating_calls() {
+        let breaker = RepeatBreaker::default();
+        for seconds in [0, 20, 40] {
+            assert!(
+                observe_tool(
+                    &breaker,
+                    tool,
+                    &input,
+                    STABLE_OUTPUT,
+                    start + Duration::from_secs(seconds),
+                )
+                .is_none(),
+                "{tool} {input} at {seconds}s must never steer"
+            );
+        }
+    }
+}
+
+#[test]
+fn repeat_breaker_still_steers_read_only_calls() {
+    let start = Instant::now();
+    for (tool, input) in [
+        ("read", json!({ "path": "src/quota.rs" })),
+        ("grep", json!({ "pattern": "green" })),
+        ("aft_search", json!({ "query": "green" })),
+        ("safety", json!({ "op": "history", "path": "src/quota.rs" })),
+        ("aft_safety", json!({ "op": "list" })),
+        (
+            "ast_replace",
+            json!({ "pattern": "green", "rewrite": "red", "lang": "rust", "dryRun": true }),
+        ),
+        (
+            "ast_grep_replace",
+            json!({ "pattern": "green", "rewrite": "red", "lang": "rust", "dryRun": true }),
+        ),
+    ] {
+        let breaker = RepeatBreaker::default();
+        for seconds in [0, 20] {
+            assert!(observe_tool(
+                &breaker,
+                tool,
+                &input,
+                STABLE_OUTPUT,
+                start + Duration::from_secs(seconds)
+            )
+            .is_none());
+        }
+        let third = observe_tool(
+            &breaker,
+            tool,
+            &input,
+            STABLE_OUTPUT,
+            start + Duration::from_secs(40),
+        )
+        .unwrap_or_else(|| panic!("{tool} {input}: unchanged read-only calls must steer"));
+        assert!(third.contains("This is the 3rd identical call"));
+    }
+}
+
+#[test]
+fn repeat_breaker_mutations_only_reset_the_calling_session() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+    let read = RepeatCall::new("read", &json!({ "path": "src/quota.rs" }));
+    for seconds in [0, 20] {
+        assert!(breaker
+            .observe_at(
+                SESSION,
+                &read,
+                output_hash(STABLE_OUTPUT),
+                start + Duration::from_secs(seconds)
+            )
+            .is_none());
+    }
+    breaker.observe_at(
+        "other-session",
+        &RepeatCall::new(
+            "write",
+            &json!({ "path": "src/quota.rs", "content": "red" }),
+        ),
+        output_hash("written"),
+        start + Duration::from_secs(30),
+    );
+    let third = breaker
+        .observe_at(
+            SESSION,
+            &read,
+            output_hash(STABLE_OUTPUT),
+            start + Duration::from_secs(40),
+        )
+        .expect("another session's mutation must not reset this session");
+    assert_eq!(third.count, 3);
+}
+
+#[test]
+fn repeat_breaker_varying_sleep_commands_do_not_hide_task_polling() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+    let mut third = None;
+    for round in 0..3 {
+        assert!(observe_tool(
+            &breaker,
+            "bash",
+            &json!({ "command": format!("sleep {}", round + 1) }),
+            "",
+            start + Duration::from_secs(round * 20),
+        )
+        .is_none());
+        third = observe_tool(
+            &breaker,
+            "bash_status",
+            &json!({ "taskId": "task-1" }),
+            "task still running",
+            start + Duration::from_secs(round * 20 + 1),
+        );
+        if round < 2 {
+            assert!(third.is_none());
+        }
+    }
+    assert!(third
+        .expect("interleaved sleep commands must not hide status polling")
+        .contains("This is the 3rd identical call"));
 }
 
 #[test]
@@ -874,18 +1132,17 @@ fn repeat_breaker_standalone_raw_bash_steers_on_every_answer_path() {
 }
 
 #[test]
-fn repeat_breaker_counts_a_previewed_mutation_once() {
+fn repeat_breaker_never_steers_previewed_mutations() {
     // Hoisted mutations send a preview and then the apply for one model call.
-    // Two genuine identical writes 31 s apart are two occurrences, below the
-    // three the breaker needs. Counting previews made them four, and the
-    // breaker fired on the second write claiming drifting output.
+    // Neither half is polling, even after three identical applied writes span
+    // the breaker's time threshold.
     let project = tempfile::tempdir().expect("preview repeat project");
     let target = project.path().join("notes.txt");
     let mut aft = AftProcess::spawn();
     aft.configure(project.path());
     let mut texts = Vec::new();
 
-    for cycle in 0..2 {
+    for cycle in 0..3 {
         for preview in [true, false] {
             let mut request = json!({
                 "id": format!("preview-repeat-{cycle}-{preview}"),
@@ -907,8 +1164,8 @@ fn repeat_breaker_counts_a_previewed_mutation_once() {
             );
             texts.push(response["text"].as_str().unwrap_or_default().to_string());
         }
-        if cycle == 0 {
-            // Remove the file so the second identical write creates it again;
+        if cycle < 2 {
+            // Remove the file so the next identical write creates it again;
             // writing unchanged content is refused as `no_change`.
             std::fs::remove_file(&target).expect("remove written file");
             std::thread::sleep(Duration::from_secs(31));
@@ -918,7 +1175,7 @@ fn repeat_breaker_counts_a_previewed_mutation_once() {
     for (index, text) in texts.iter().enumerate() {
         assert!(
             !text.contains("<system-reminder>"),
-            "call {index} must not steer after two genuine writes: {text:?}"
+            "call {index} must not steer after three genuine writes: {text:?}"
         );
     }
     assert!(aft.shutdown().success());

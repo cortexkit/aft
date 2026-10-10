@@ -469,8 +469,7 @@ pub(crate) fn finish_tool_call_response(
 #[derive(Debug, Clone)]
 pub(crate) struct RepeatObservation {
     session_id: String,
-    tool: String,
-    semantic_key: String,
+    call: crate::response_finalize::repeat_breaker::RepeatCall,
     /// Picks the reminder's wording: a delegated worker is never told to end
     /// its turn.
     worker_session: bool,
@@ -487,11 +486,9 @@ impl RepeatObservation {
     /// and the breaker could never see two agent calls in a row. The first live
     /// probe found exactly that: five identical bash calls over 78 s, no steer.
     ///
-    /// A preview is the first half of a hoisted mutation (`write`, `edit`,
-    /// `apply_patch`): the plugin previews, asks for permission, then applies,
-    /// all for one model call. Counting the preview as well would count every
-    /// mutation twice, fire on the second genuine repeat, and misread the
-    /// preview's different text as drifting output.
+    /// A preview is the read-only first half of a hoisted mutation (`write`,
+    /// `edit`, `apply_patch`). Only the apply can change the workspace and reset
+    /// read observations; previewing or declining permission must not reset them.
     ///
     /// The key is taken from the arguments the model sent. A bash command that
     /// AFT answers by rewriting it into another tool (for example `grep` into
@@ -507,13 +504,12 @@ impl RepeatObservation {
         worker_session: bool,
         bash_watch_available: bool,
     ) -> Option<Self> {
-        if crate::subc::is_subc_native_plumbing_tool(tool) || preview {
+        if crate::subc::is_native_plumbing_call(tool, args) || preview {
             return None;
         }
         Some(Self {
             session_id: session_id.to_string(),
-            tool: tool.to_string(),
-            semantic_key: crate::response_finalize::repeat_breaker::semantic_key(tool, args),
+            call: crate::response_finalize::repeat_breaker::RepeatCall::new(tool, args),
             worker_session,
             bash_watch_available,
         })
@@ -528,12 +524,11 @@ impl RepeatObservation {
     /// silently prevent the breaker from firing.
     pub(crate) fn observe(self, app_ctx: &AppContext, text: &mut String) {
         let output_hash = crate::response_finalize::repeat_breaker::output_hash(text);
-        if let Some(intervention) = app_ctx.repeat_breaker().observe(
-            &self.session_id,
-            &self.tool,
-            self.semantic_key,
-            output_hash,
-        ) {
+        if let Some(intervention) =
+            app_ctx
+                .repeat_breaker()
+                .observe(&self.session_id, &self.call, output_hash)
+        {
             crate::response_finalize::append_repeat_breaker_reminder(
                 text,
                 &self.session_id,
@@ -715,6 +710,28 @@ fn tool_call_result_from_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeat_observation_distinguishes_agent_task_status_from_native_plumbing() {
+        assert!(RepeatObservation::for_agent_call(
+            "session",
+            "bash_status",
+            &serde_json::json!({ "taskId": "task-1" }),
+            false,
+            false,
+            false,
+        )
+        .is_some());
+        assert!(RepeatObservation::for_agent_call(
+            "session",
+            "bash_status",
+            &serde_json::json!({ "task_id": "task-1" }),
+            false,
+            false,
+            false,
+        )
+        .is_none());
+    }
 
     #[test]
     fn phase_trace_reports_execution_and_writer_egress_subphases() {

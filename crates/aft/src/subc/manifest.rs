@@ -376,6 +376,27 @@ pub(super) fn filter_manifest_tools(
     manifest
 }
 
+/// Classify externally observable effects, not AFT's internal cache/index writes.
+/// The catalog conservatively classifies tools; individual calls can narrow that
+/// classification when their operation is explicitly read-only.
+fn tool_execution_mode(name: &str) -> ExecutionMode {
+    match crate::tool_gate::canonical_tool_name(name).unwrap_or(name) {
+        "bash" | "powershell" | "write" | "edit" | "apply_patch" | "ast_grep_replace"
+        | "aft_delete" | "aft_move" | "aft_import" | "aft_safety" | "bash_kill" | "bash_write" => {
+            ExecutionMode::Mutating
+        }
+        _ => ExecutionMode::Pure,
+    }
+}
+
+pub(crate) fn tool_call_is_mutating(name: &str, args: &Value) -> bool {
+    match crate::tool_gate::canonical_tool_name(name) {
+        Some("aft_safety") if matches!(args["op"].as_str(), Some("history" | "list")) => false,
+        Some("ast_grep_replace") if args["dryRun"].as_bool() == Some(true) => false,
+        _ => tool_execution_mode(name) == ExecutionMode::Mutating,
+    }
+}
+
 /// Builds the manifest for a host where PowerShell is or is not runnable.
 ///
 /// The `powershell` tool is advertised only when `pwsh` resolves, checked when
@@ -384,10 +405,10 @@ pub(super) fn filter_manifest_tools(
 /// call that arrives anyway (the tool stays routable) is refused with an error
 /// naming the fix rather than silently run under bash.
 pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManifest {
-    let tool = |name: &str, execution_mode: ExecutionMode| Tool {
+    let tool = |name: &str| Tool {
         name: name.to_string(),
         description: tool_description(name),
-        execution_mode,
+        execution_mode: tool_execution_mode(name),
         schema: tool_schema(name),
     };
     // execution_mode keys on externally-observable side effects, NOT internal
@@ -430,31 +451,31 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
         .provides(vec![
             ProviderRole::ToolProvider {
                 tools: [
-                    Some(tool("status", ExecutionMode::Pure)),
-                    Some(tool("bash", ExecutionMode::Mutating)),
-                    powershell_available.then(|| tool("powershell", ExecutionMode::Mutating)),
+                    Some(tool("status")),
+                    Some(tool("bash")),
+                    powershell_available.then(|| tool("powershell")),
                 ]
                 .into_iter()
                 .flatten()
                 .chain([
-                    tool("read", ExecutionMode::Pure),
-                    tool("write", ExecutionMode::Mutating),
-                    tool("edit", ExecutionMode::Mutating),
-                    tool("apply_patch", ExecutionMode::Mutating),
-                    tool("grep", ExecutionMode::Pure),
-                    tool("glob", ExecutionMode::Pure),
-                    tool("search", ExecutionMode::Pure),
-                    tool("outline", ExecutionMode::Pure),
-                    tool("zoom", ExecutionMode::Pure),
-                    tool("inspect", ExecutionMode::Pure),
-                    tool("callgraph", ExecutionMode::Pure),
-                    tool("conflicts", ExecutionMode::Pure),
-                    tool("ast_search", ExecutionMode::Pure),
-                    tool("ast_replace", ExecutionMode::Mutating),
-                    tool("delete", ExecutionMode::Mutating),
-                    tool("move", ExecutionMode::Mutating),
-                    tool("import", ExecutionMode::Mutating),
-                    tool("safety", ExecutionMode::Mutating),
+                    tool("read"),
+                    tool("write"),
+                    tool("edit"),
+                    tool("apply_patch"),
+                    tool("grep"),
+                    tool("glob"),
+                    tool("search"),
+                    tool("outline"),
+                    tool("zoom"),
+                    tool("inspect"),
+                    tool("callgraph"),
+                    tool("conflicts"),
+                    tool("ast_search"),
+                    tool("ast_replace"),
+                    tool("delete"),
+                    tool("move"),
+                    tool("import"),
+                    tool("safety"),
                     // Companions for the task ids `bash`/`powershell` hand back
                     // (explicit background, PTY, promotion after the wait
                     // window, detach on restart). The bash reply text tells
@@ -463,9 +484,9 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                     // There is no `bash_watch` here: that waiting loop is
                     // implemented inside the OpenCode and Pi plugins, not by
                     // the module, and the catalog text does not mention it.
-                    tool("bash_status", ExecutionMode::Pure),
-                    tool("bash_kill", ExecutionMode::Mutating),
-                    tool("bash_write", ExecutionMode::Mutating),
+                    tool("bash_status"),
+                    tool("bash_kill"),
+                    tool("bash_write"),
                 ])
                 .collect(),
                 identity_scope: vec![IdentityScope::Session, IdentityScope::Project],

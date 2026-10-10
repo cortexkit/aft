@@ -21,6 +21,30 @@ pub struct RepeatIntervention {
     pub outputs_identical: bool,
 }
 
+/// Capture the semantic input and the catalog's effect classification together
+/// before execution consumes the arguments.
+#[derive(Debug, Clone)]
+pub struct RepeatCall {
+    tool: String,
+    semantic_key: String,
+    mutating: bool,
+}
+
+impl RepeatCall {
+    pub fn new(tool: &str, input: &Value) -> Self {
+        let normalized = crate::tool_gate::canonical_tool_name(tool).unwrap_or(tool);
+        Self {
+            tool: normalized.to_string(),
+            semantic_key: semantic_key(normalized, input),
+            mutating: crate::subc::tool_call_is_mutating(tool, input),
+        }
+    }
+
+    fn is_shell(&self) -> bool {
+        matches!(self.tool.as_str(), "bash" | "powershell")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RepeatKey {
     tool: String,
@@ -97,25 +121,23 @@ impl RepeatBreaker {
     pub fn observe(
         &self,
         session_id: &str,
-        tool: &str,
-        semantic_key: String,
+        call: &RepeatCall,
         output_hash: u64,
     ) -> Option<RepeatIntervention> {
-        self.observe_at(session_id, tool, semantic_key, output_hash, Instant::now())
+        self.observe_at(session_id, call, output_hash, Instant::now())
     }
 
     #[doc(hidden)]
     pub fn observe_at(
         &self,
         session_id: &str,
-        tool: &str,
-        semantic_key: String,
+        call: &RepeatCall,
         output_hash: u64,
         now: Instant,
     ) -> Option<RepeatIntervention> {
         let key = RepeatKey {
-            tool: tool.to_string(),
-            input_hash: hash_value(&semantic_key),
+            tool: call.tool.clone(),
+            input_hash: hash_value(&call.semantic_key),
         };
         let mut sessions = self.sessions.lock();
         sessions.retain(|existing_id, state| {
@@ -124,6 +146,25 @@ impl RepeatBreaker {
                     now.saturating_duration_since(last_call.observed_at) <= SESSION_IDLE_EXPIRY
                 })
         });
+        if call.mutating {
+            if call.is_shell() {
+                if let Some(session) = sessions.get_mut(session_id) {
+                    // A shell can change the workspace, but task snapshots observe
+                    // a background task, not the workspace. Keep their histories
+                    // so interleaved sleep/status polling cannot evade steering.
+                    // Shell commands also keep their existing polling detection.
+                    session.calls.retain(|previous| {
+                        matches!(
+                            previous.key.tool.as_str(),
+                            "bash" | "powershell" | "bash_status" | "bash_watch"
+                        )
+                    });
+                }
+            } else {
+                sessions.remove(session_id);
+                return None;
+            }
+        }
         let session = sessions.entry(session_id.to_string()).or_default();
         session.expire_idle_keys(now);
         session.make_room_for_key(&key);
@@ -152,7 +193,7 @@ impl RepeatBreaker {
         }
 
         Some(RepeatIntervention {
-            tool: tool.to_string(),
+            tool: call.tool.clone(),
             count,
             span,
             outputs_identical,
@@ -263,8 +304,10 @@ mod tests {
             let session_id = format!("repeat-growth-{index}");
             breaker.observe_at(
                 &session_id,
-                "read",
-                format!("path-{index}"),
+                &RepeatCall::new(
+                    "read",
+                    &serde_json::json!({ "path": format!("path-{index}") }),
+                ),
                 index,
                 start + Duration::from_secs(cadence_secs * index),
             );
@@ -279,8 +322,7 @@ mod tests {
 
         breaker.observe_at(
             &current,
-            "read",
-            "path-127".to_owned(),
+            &RepeatCall::new("read", &serde_json::json!({ "path": "path-127" })),
             128,
             start + Duration::from_secs(cadence_secs * 127),
         );

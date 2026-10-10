@@ -219,6 +219,7 @@ use self::health::{
 };
 pub(crate) use self::manifest::is_native_plumbing_call;
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
+pub(crate) use self::manifest::tool_call_is_mutating;
 use self::manifest::{
     build_manifest_without, command_lane, control_flags, control_ops, is_bash_family_tool,
     is_subc_agent_core_tool,
