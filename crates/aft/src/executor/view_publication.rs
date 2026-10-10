@@ -265,7 +265,7 @@ pub(crate) fn cancel_for_context(ctx: &AppContext) {
 pub(crate) fn schedule(
     ctx: &AppContext,
     mut paths: BTreeSet<Vec<u8>>,
-    allow_blob_put: bool,
+    allow_semantic_blob_put: bool,
 ) -> Result<(), String> {
     if ctx.retire_deleted_view_root() {
         return Ok(());
@@ -280,7 +280,9 @@ pub(crate) fn schedule(
         {
             return Err("view publication retry is not due".to_owned());
         }
-        let result = ctx.publish_view_paths(paths, allow_blob_put).map(|_| ());
+        let result = ctx
+            .publish_view_paths(paths, allow_semantic_blob_put)
+            .map(|_| ());
         let root = ctx.canonical_cache_root_opt().unwrap_or_default();
         let mut retry = ctx.view_publication_retry().lock();
         match &result {
@@ -369,7 +371,7 @@ pub(crate) fn schedule(
                     crate::cold_build_limiter::progress::phase("preparing", if paths.is_empty() { None } else { Some(paths.len()) });
                     let mut prepared = target.ctx.prepare_view_paths(
                         paths.clone(),
-                        allow_blob_put,
+                        allow_semantic_blob_put,
                         &mut |phase| lifecycle.phase(phase),
                     )?;
                     crate::cold_build_limiter::progress::advance(paths.len());

@@ -6469,6 +6469,8 @@ impl AppContext {
         self.inspect_writer.load(Ordering::SeqCst)
     }
 
+    /// Shared legacy artifacts remain read-only without their writer lease.
+    /// A checkout may still contribute immutable blobs to its own scoped view.
     pub fn shared_artifacts_read_only(&self) -> bool {
         !self.callgraph_writer()
     }
@@ -6768,17 +6770,17 @@ impl AppContext {
     pub(crate) fn publish_view_paths(
         &self,
         changed_paths: BTreeSet<Vec<u8>>,
-        allow_blob_put: bool,
+        allow_semantic_blob_put: bool,
     ) -> Result<crate::views::assembly::AssemblyReport, String> {
         let mut prepared =
-            self.prepare_view_paths(changed_paths, allow_blob_put, &mut |_| Ok(()))?;
+            self.prepare_view_paths(changed_paths, allow_semantic_blob_put, &mut |_| Ok(()))?;
         self.commit_view_update(&mut prepared)
     }
 
     pub(crate) fn prepare_view_paths(
         &self,
         changed_paths: BTreeSet<Vec<u8>>,
-        allow_blob_put: bool,
+        allow_semantic_blob_put: bool,
         phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
     ) -> Result<PreparedViewUpdate, String> {
         #[cfg(test)]
@@ -6806,31 +6808,32 @@ impl AppContext {
         // semantic plane: its vectors came from the legacy semantic index,
         // which such a root no longer builds.
         let semantic_search = self.config().indexes.semantic && !self.checkout_semantic.active();
-        let semantic_keys = if semantic_search && allow_blob_put {
-            let index = self
-                .semantic_index
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-                .ok_or_else(|| {
-                    "semantic view publication is waiting for the semantic index".to_string()
-                })?;
-            let fingerprint = index
-                .fingerprint()
-                .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
-                .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
-            let mut request = crate::migration::SemanticMigrationRequest::for_root(
-                snapshot.storage.clone(),
-                root.clone(),
-                fingerprint,
-            );
-            request.family.clone_from(&snapshot.family);
-            request.view.clone_from(&snapshot.scope);
-            crate::migration::store_live_semantic_blobs(&request, &index)
-                .map_err(|error| error.to_string())?
-        } else {
-            BTreeMap::new()
-        };
+        let semantic_keys =
+            if semantic_search && allow_semantic_blob_put && !self.shared_artifacts_read_only() {
+                let index = self
+                    .semantic_index
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone()
+                    .ok_or_else(|| {
+                        "semantic view publication is waiting for the semantic index".to_string()
+                    })?;
+                let fingerprint = index
+                    .fingerprint()
+                    .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
+                    .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
+                let mut request = crate::migration::SemanticMigrationRequest::for_root(
+                    snapshot.storage.clone(),
+                    root.clone(),
+                    fingerprint,
+                );
+                request.family.clone_from(&snapshot.family);
+                request.view.clone_from(&snapshot.scope);
+                crate::migration::store_live_semantic_blobs(&request, &index)
+                    .map_err(|error| error.to_string())?
+            } else {
+                BTreeMap::new()
+            };
         let assembly = crate::views::assembly::prepare_checkout(
             &crate::views::assembly::AssemblyRequest {
                 storage: snapshot.storage.clone(),
@@ -6841,7 +6844,11 @@ impl AppContext {
                 changed_paths,
                 semantic_keys,
                 require_semantic: semantic_search,
-                allow_blob_put,
+                // Each checkout must contribute blobs for source only it has.
+                // These content-addressed inserts cannot overwrite another
+                // checkout's blobs, and the generation is checkout-scoped.
+                // This does not grant legacy-store or shared search-cache ownership.
+                allow_blob_put: true,
                 // Nothing reads a view's call graph while the index is off.
                 callgraph: self.config().indexes.callgraph,
             },
@@ -13481,6 +13488,154 @@ mod callgraph_store_for_ops_tests {
                 "watcher HEAD metadata event must schedule publication"
             );
         }
+    }
+
+    #[test]
+    fn worktree_view_publishes_dirty_source_after_a_watcher_event() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.ctx.set_cache_role(true, None);
+        fixture
+            .ctx
+            .update_config(|config| config.worktree.ram_overlay = false);
+        fixture.publish();
+        let edited = "pub fn dirty_caller() { target(); }\npub fn target() {}\n";
+        std::fs::write(&fixture.source, edited).unwrap();
+        fixture
+            .watcher_tx
+            .send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
+                fixture.source.clone(),
+            ]))
+            .unwrap();
+        let outcome = crate::runtime_drain::drain_watcher_events_bounded(&fixture.ctx, 1);
+        assert_eq!(outcome.processed, 1);
+        let mut state = fixture.ctx.watcher_drain_slice().lock().take().unwrap();
+        assert!(state.view_publication_due.is_some());
+        state.view_publication_due = Some(Instant::now());
+        crate::runtime_drain::publish_view_if_quiet(&fixture.ctx, &mut state);
+        assert!(state.view_publication_due.is_none());
+        *fixture.ctx.watcher_drain_slice().lock() = Some(state);
+
+        let response = fixture.callers();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_callers"], 1);
+        assert!(
+            response.data.to_string().contains("dirty_caller"),
+            "{response:?}"
+        );
+        assert!(fixture.ctx.shared_artifacts_read_only());
+        assert!(!fixture.ctx.callgraph_writer());
+        assert!(!fixture.ctx.ram_overlay_active());
+        assert!(
+            crate::callgraph_store::CallGraphRead::node_for(
+                fixture.legacy.as_ref(),
+                Path::new("lib.rs"),
+                "dirty_caller"
+            )
+            .is_err(),
+            "watcher must not update the legacy graph"
+        );
+    }
+
+    #[test]
+    fn worktree_view_publishes_callgraph_without_importing_legacy_semantics() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.ctx.set_cache_role(true, None);
+        fixture.commit_source(
+            "pub fn local_caller() { target(); }\npub fn target() {}\n",
+            "local source",
+        );
+        fixture
+            .ctx
+            .update_config(|config| config.indexes.semantic = true);
+        assert!(!fixture.ctx.checkout_semantic.active());
+        assert!(fixture.ctx.semantic_index().read().unwrap().is_none());
+
+        let report = fixture
+            .ctx
+            .publish_view_paths(BTreeSet::new(), true)
+            .unwrap();
+        assert!(
+            report.published,
+            "callgraph must not wait for a borrowed legacy semantic index"
+        );
+        assert_eq!(
+            report.pending_inputs[b"lib.rs".as_slice()].plane,
+            "semantic"
+        );
+        assert_eq!(
+            fixture.ctx.view_runtime_snapshot().unwrap().pending_inputs[b"lib.rs".as_slice()].plane,
+            "semantic"
+        );
+        let response = fixture.callers();
+        assert!(response.success, "{response:?}");
+        assert!(
+            response.data.to_string().contains("local_caller"),
+            "{response:?}"
+        );
+        assert!(fixture.ctx.shared_artifacts_read_only());
+        assert!(fixture.ctx.semantic_index().read().unwrap().is_none());
+    }
+
+    #[test]
+    fn readonly_assembly_building_names_missing_callgraph_blob() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.ctx.set_cache_role(true, None);
+        fixture.commit_source(
+            "pub fn local_caller() { target(); }\npub fn target() {}\n",
+            "local source",
+        );
+        let snapshot = fixture.ctx.view_runtime_snapshot().unwrap();
+        let source = std::fs::read(&fixture.source).unwrap();
+        let key = crate::blob_store::CallgraphKey::from_bytes(
+            &source,
+            "rust",
+            crate::views::callgraph::PRODUCER,
+        )
+        .full_key();
+        // Normal checkout publication may put its own immutable blobs. Keep
+        // refusal diagnostics covered with an explicitly read-only assembly.
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: snapshot.storage.clone(),
+                project_root: fixture.root.clone(),
+                family: snapshot.family.clone(),
+                scope: snapshot.scope.clone(),
+                desired_head: snapshot.head_fingerprint.clone(),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: BTreeMap::new(),
+                require_semantic: false,
+                allow_blob_put: false,
+                callgraph: true,
+            })
+            .unwrap();
+        assert!(!report.published);
+        fixture.ctx.install_view_runtime(
+            ViewRuntimeSnapshot {
+                generation: report.generation,
+                manifest: report.manifest,
+                pending_paths: report.pending_paths,
+                pending_inputs: report.pending_inputs,
+                ..snapshot
+            },
+            None,
+        );
+        let response = crate::commands::callgraph_store_adapter::index_refusal_response(
+            "building",
+            "callers",
+            &fixture.ctx,
+            &CallgraphStoreAccess::Building,
+        );
+        assert_eq!(response.data["progress"]["pending_paths"], 1);
+        assert_eq!(
+            response.data["progress"]["waiting_on"],
+            json!([{
+                "path": "lib.rs", "plane": "callgraph", "reason": "shared callgraph blob unavailable", "blob_key": key.to_hex(),
+            }])
+        );
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("lib.rs [callgraph:"), "{message}");
+        assert!(message.contains("artifact writer"), "{message}");
+        assert!(!message.contains("retry shortly"), "{message}");
     }
 
     #[test]

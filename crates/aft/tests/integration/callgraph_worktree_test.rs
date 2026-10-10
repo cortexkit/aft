@@ -92,7 +92,8 @@ fn configure_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContex
             "storage_dir": storage,
             "config": crate::test_helpers::user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": true },
-                "views": { "enabled": views }
+                "views": { "enabled": views },
+                "worktree": { "ram_overlay": false }
             }))
         })),
         &ctx,
@@ -131,6 +132,57 @@ const OPERATIONS: [&str; 6] = [
     "trace_to_symbol",
     "trace_data",
 ];
+
+#[test]
+fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay() {
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = linked_checkout(fixture.path());
+    let storage = fixture.path().join("storage");
+    let worker_source = source("workerCaller");
+    std::fs::write(checkout.join("index.ts"), &worker_source).unwrap();
+    std::fs::write(
+        checkout.join("added.ts"),
+        "import { target } from './index';\nexport function addedCaller(value: number) { return target(value); }\n",
+    )
+    .unwrap();
+    commit(&checkout);
+
+    let ctx = configure(&checkout, &storage, true);
+    assert!(ctx.shared_artifacts_read_only());
+    assert!(!ctx.callgraph_writer());
+    assert!(!ctx.ram_overlay_active());
+    let response = query(&ctx, &checkout, "callers", "workerCaller");
+    assert!(
+        response.success,
+        "worktree-only source must publish without an owner writer: {response:?}"
+    );
+    assert_eq!(response.data["total_callers"], 2);
+    assert!(response.data.to_string().contains("workerCaller"));
+    assert!(response.data.to_string().contains("addedCaller"));
+    assert!(!response.data.to_string().contains("ownerCaller"));
+    let key = aft::blob_store::CallgraphKey::from_bytes(
+        worker_source.as_bytes(),
+        "typescript",
+        aft::views::callgraph::PRODUCER,
+    )
+    .full_key();
+    let blobs = aft::blob_store::BlobStore::open(
+        &storage,
+        aft::search_index::artifact_cache_key(&checkout),
+        aft::blob_store::BlobPlane::Callgraph,
+    )
+    .unwrap();
+    assert!(
+        blobs.contains(&key).unwrap(),
+        "worktree must put its own immutable blob"
+    );
+    assert!(
+        aft::callgraph_store::CallGraphStore::open_readonly(ctx.callgraph_store_dir(), checkout)
+            .unwrap()
+            .is_none(),
+        "worktree must not acquire a legacy store writer"
+    );
+}
 
 #[test]
 fn callgraph_worktree_new_markdown_does_not_wait_for_unrelated_planes() {
@@ -200,41 +252,6 @@ fn callgraph_worktree_new_markdown_does_not_wait_for_unrelated_planes() {
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
     assert!(response.data.to_string().contains("ownerCaller"));
-}
-
-#[test]
-fn callgraph_worktree_building_names_missing_callgraph_blob() {
-    let fixture = tempfile::tempdir().unwrap();
-    let checkout = linked_checkout(fixture.path());
-    let storage = fixture.path().join("storage");
-    publish(&fixture.path().join("owner"), &storage);
-    let new_source = source("checkoutCaller");
-    std::fs::write(checkout.join("index.ts"), &new_source).unwrap();
-    commit(&checkout);
-    let ctx = configure(&checkout, &storage, true);
-    let response = query(&ctx, &checkout, "callers", "checkoutCaller");
-    let missing_key = aft::blob_store::CallgraphKey::from_bytes(
-        new_source.as_bytes(),
-        "typescript",
-        aft::views::callgraph::PRODUCER,
-    )
-    .full_key()
-    .to_hex();
-    assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
-    assert_eq!(response.data["progress"]["pending_paths"], 1);
-    assert_eq!(
-        response.data["progress"]["waiting_on"],
-        json!([{
-            "path": "index.ts",
-            "plane": "callgraph",
-            "reason": "shared callgraph blob unavailable",
-            "blob_key": missing_key,
-        }])
-    );
-    let message = response.data["message"].as_str().unwrap();
-    assert!(message.contains("index.ts [callgraph:"), "{message}");
-    assert!(message.contains("artifact writer"), "{message}");
-    assert!(!message.contains("retry shortly"), "{message}");
 }
 
 fn query(ctx: &AppContext, checkout: &Path, operation: &str, caller: &str) -> Response {
@@ -404,7 +421,7 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
 }
 
 #[test]
-fn callgraph_worktree_published_owner_routes_pending_then_own_view() {
+fn callgraph_worktree_published_owner_assembles_its_own_changed_source() {
     let fixture = tempfile::tempdir().unwrap();
     let checkout = linked_checkout(fixture.path());
     let owner = fixture.path().join("owner");
@@ -412,6 +429,10 @@ fn callgraph_worktree_published_owner_routes_pending_then_own_view() {
     // The main checkout has published only shared blobs and its own view, not
     // a legacy store. The linked checkout has not assembled a generation yet.
     publish(&owner, &storage);
+    let owner_view =
+        aft::views::ViewStore::open(&storage, &aft::path_identity::project_scope_key(&owner))
+            .unwrap();
+    let owner_generation = owner_view.current_generation().unwrap();
     std::fs::write(checkout.join("index.ts"), source("checkoutCaller")).unwrap();
     commit(&checkout);
     let ctx = configure_deferred(&checkout, &storage, true);
@@ -431,27 +452,25 @@ fn callgraph_worktree_published_owner_routes_pending_then_own_view() {
     );
     assert!(!message.contains("main checkout"), "{message}");
 
-    // A different branch cannot assemble until its missing blob arrives. Even
-    // after maintenance has run, it must not fall back to the legacy refusal.
+    // The worktree contributes its own source blob during maintenance. The
+    // owner keeps its original source and is never asked to build this branch.
     aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
-    let response = query(&ctx, &checkout, "callers", "checkoutCaller");
-    assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
-    assert_eq!(response.data["progress"]["phase"], "view_assembly");
-    assert_eq!(response.data["progress"]["pending_paths"], 1);
-    drop(ctx);
-
-    // Once shared blobs cover this branch, configure assembles the worktree's
-    // own generation. No query needs to walk or rebuild the tree.
-    std::fs::write(owner.join("index.ts"), source("checkoutCaller")).unwrap();
-    commit(&owner);
-    publish(&owner, &storage);
-    let ctx = configure(&checkout, &storage, true);
     let response = query(&ctx, &checkout, "callers", "checkoutCaller");
     assert!(response.success, "{response:?}");
     assert_eq!(response.data["total_callers"], 1);
     assert!(response.data.to_string().contains("checkoutCaller"));
     assert!(!response.data.to_string().contains("ownerCaller"));
     assert!(response.data.get("borrowed_callgraph").is_none());
+    assert_eq!(
+        std::fs::read_to_string(owner.join("index.ts")).unwrap(),
+        source("ownerCaller")
+    );
+    assert!(ctx.shared_artifacts_read_only());
+    assert_eq!(
+        owner_view.current_generation().unwrap(),
+        owner_generation,
+        "worktree publication must not replace the owner's view"
+    );
     match ctx.callgraph_store_for_ops() {
         aft::context::CallgraphStoreAccess::Ready(store) => {
             assert_eq!(store.reader_kind(), "view");
@@ -468,7 +487,7 @@ fn callgraph_worktree_published_owner_routes_pending_then_own_view() {
 }
 
 #[test]
-fn callgraph_worktree_without_owner_store_offers_local_fallback() {
+fn callgraph_worktree_without_owner_store_uses_own_view_or_legacy_refusal() {
     for views in [false, true] {
         let fixture = tempfile::tempdir().unwrap();
         let checkout = linked_checkout(fixture.path());
@@ -478,25 +497,13 @@ fn callgraph_worktree_without_owner_store_offers_local_fallback() {
         let ctx = configure(&checkout, &storage, views);
         for operation in OPERATIONS {
             let response = query(&ctx, &checkout, operation, "ownerCaller");
-            assert!(!response.success, "views={views}: {response:?}");
             if views {
-                // Without shared blobs, assembly remains pending. That is not
-                // a legacy-store refusal, and opening the main checkout is not
-                // a useful instruction to a worker already in this checkout.
-                assert_eq!(response.data["code"], "callgraph_building");
-                assert_eq!(response.data["index"]["callgraph"]["status"], "building");
-                assert_eq!(response.data["results"], Value::Null);
-                assert_eq!(response.data["progress"]["phase"], "view_assembly");
-                assert_eq!(response.data["progress"]["pending_paths"], 1);
-                let message = response.data["message"].as_str().unwrap();
-                assert!(message.contains("waiting for shared blobs"), "{message}");
-                assert!(
-                    message.contains("grep or aft_search with pattern"),
-                    "{message}"
-                );
-                assert!(!message.contains("main checkout"), "{message}");
+                assert!(response.success, "views={views}: {response:?}");
+                assert!(response.data.get("borrowed_callgraph").is_none());
+                assert!(ctx.shared_artifacts_read_only());
                 continue;
             }
+            assert!(!response.success, "views={views}: {response:?}");
             assert_eq!(response.data["code"], "callgraph_unavailable");
             assert_eq!(response.data["results"], Value::Null);
             assert_eq!(response.data["index"]["callgraph"]["status"], "unavailable");
