@@ -2505,6 +2505,10 @@ fn build_health_report_with_indexing(
             .unwrap_or(0),
     );
     let indexing_detail = indexing_detail(&indexing);
+    let indexing_has_rows = !indexing.running.is_empty()
+        || !indexing.queued.is_empty()
+        || indexing.omitted.running > 0
+        || indexing.omitted.queued > 0;
     metrics.insert("indexing".to_string(), json!(indexing));
     metrics.insert(
         "dispatch_liveness".to_string(),
@@ -2527,9 +2531,12 @@ fn build_health_report_with_indexing(
         "write_ledger_folds_deferred_total".to_string(),
         json!(crate::db::write_ledger::folds_deferred_total()),
     );
-    // ck's default health rendering displays top-level scalars. Selecting the
-    // nested indexing block must not hide any of those existing defaults.
-    let mut headline = vec![json!("indexing")];
+    // ck's default health rendering displays top-level scalars. When work rows
+    // exist, selecting the nested indexing block must not hide those defaults.
+    let mut headline = Vec::new();
+    if indexing_has_rows {
+        headline.push(json!("indexing"));
+    }
     headline.extend(
         metrics
             .iter()
@@ -2583,36 +2590,62 @@ fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> 
     if running == 0 && queued == 0 {
         return None;
     }
-    let mut detail = if let Some(job) = indexing.running.first() {
-        let total = job.total.map_or_else(|| "?".to_owned(), grouped_count);
-        let eta = job.eta_seconds.map_or_else(String::new, |seconds| {
-            if seconds >= 3600.0 {
-                format!(" (~{:.0} h)", seconds / 3600.0)
-            } else if seconds >= 60.0 {
-                format!(" (~{:.0} min)", seconds / 60.0)
+
+    let first_running = indexing.running.first();
+    let mut detail = if let Some(job) = first_running {
+        let progress = match job.total {
+            Some(total) => format!("{}/{} files", grouped_count(job.done), grouped_count(total)),
+            None if job.done == 0 => "preparing".to_owned(),
+            None => format!("{} files (total measuring)", grouped_count(job.done)),
+        };
+        let measured_rate = job.rate_per_minute.map(|per_minute| per_minute / 60.0);
+        let estimate = if let Some(per_second) = measured_rate {
+            let rate = format!("~{per_second:.3} files/s");
+            let eta = if job.total.is_some() {
+                job.eta_seconds.map(|seconds| {
+                    if seconds >= 3600.0 {
+                        format!("~{:.0} h", seconds / 3600.0)
+                    } else if seconds >= 60.0 {
+                        format!("~{:.0} min", seconds / 60.0)
+                    } else {
+                        format!("~{:.0} s", seconds)
+                    }
+                })
             } else {
-                format!(" (~{:.0} s)", seconds)
+                None
+            };
+            match eta {
+                Some(eta) => format!(" ({eta}, {rate})"),
+                None => format!(" ({rate})"),
             }
-        });
+        } else {
+            String::new()
+        };
+        let phase = if job.phase == "starting" {
+            "starting".to_owned()
+        } else if measured_rate.is_none() {
+            format!("{}; measuring rate", job.phase)
+        } else {
+            job.phase.to_owned()
+        };
         format!(
-            "indexing: {} {} {}/{} files{} [{}]",
-            job.kind,
-            job.root_label,
-            grouped_count(job.done),
-            total,
-            eta,
-            job.phase
+            "indexing: {} {} {}{} [{}]",
+            job.kind, job.root_label, progress, estimate, phase
         )
+    } else if running > 0 {
+        format!("indexing: {running} running; details omitted")
     } else {
-        "indexing:".to_owned()
+        format!("indexing: {queued} queued")
     };
-    if running > 1 {
+    if first_running.is_some() && running > 1 {
         detail.push_str(&format!(", {} other running", running - 1));
     }
-    if queued > 0 {
+    if running > 0 && queued > 0 {
         detail.push_str(&format!(", {queued} queued"));
     }
-    detail.push_str(&format!("; {} roots warming", indexing.warming_roots));
+    if indexing.warming_roots > 0 {
+        detail.push_str(&format!("; {} roots warming", indexing.warming_roots));
+    }
     Some(detail)
 }
 
@@ -2827,11 +2860,189 @@ mod tests {
             },
         };
         assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
-            "indexing: semantic view fill openclaw 1,280/31,705 files (~18 h) [embedding], 3 queued; 49 roots warming"));
+            "indexing: semantic view fill openclaw 1,280/31,705 files (~18 h, ~0.470 files/s) [embedding], 3 queued; 49 roots warming"));
         snapshot.running[0].total = None;
         snapshot.running[0].eta_seconds = None;
+        snapshot.running[0].rate_per_minute = None;
         assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
-            "indexing: semantic view fill openclaw 1,280/? files [embedding], 3 queued; 49 roots warming"));
+            "indexing: semantic view fill openclaw 1,280 files (total measuring) [embedding; measuring rate], 3 queued; 49 roots warming"));
+    }
+
+    #[test]
+    fn indexing_detail_shows_measured_rate_without_eta_when_total_is_unknown() {
+        use crate::cold_build_limiter::progress::{Omitted, Running, Snapshot};
+        let snapshot = Snapshot {
+            running: vec![Running {
+                root: "/fake/openclaw".to_owned(),
+                root_label: "openclaw".to_owned(),
+                kind: "semantic view fill".to_owned(),
+                phase: "embedding",
+                started_at_ms: 1,
+                done: 1_280,
+                total: None,
+                chunks_embedded: None,
+                rate_per_minute: Some(28.17),
+                eta_seconds: None,
+                age_seconds: 60.0,
+            }],
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 0,
+                queued: 0,
+            },
+        };
+        let detail = indexing_detail(&snapshot).unwrap();
+        assert!(detail.contains("total measuring"), "{detail}");
+        assert!(detail.contains("~0.470 files/s"), "{detail}");
+        assert_eq!(detail.matches('~').count(), 1, "{detail}");
+        assert!(!detail.contains("?"), "{detail}");
+
+        let mut slow = snapshot;
+        slow.running[0].rate_per_minute = Some(0.2);
+        let detail = indexing_detail(&slow).unwrap();
+        assert!(detail.contains("~0.003 files/s"), "{detail}");
+    }
+
+    #[test]
+    fn indexing_detail_does_not_estimate_from_an_unmeasured_rate() {
+        use crate::cold_build_limiter::progress::{Omitted, Running, Snapshot};
+        let snapshot = Snapshot {
+            running: vec![Running {
+                root: "/fake/openclaw".to_owned(),
+                root_label: "openclaw".to_owned(),
+                kind: "semantic view fill".to_owned(),
+                phase: "embedding",
+                started_at_ms: 1,
+                done: 0,
+                total: Some(100),
+                chunks_embedded: None,
+                rate_per_minute: None,
+                eta_seconds: Some(100.0),
+                age_seconds: 0.5,
+            }],
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 0,
+                queued: 0,
+            },
+        };
+        let detail = indexing_detail(&snapshot).unwrap();
+        assert!(detail.contains("measuring rate"), "{detail}");
+        assert!(!detail.contains("files/s"), "{detail}");
+        assert!(!detail.contains("~"), "{detail}");
+    }
+
+    #[test]
+    fn indexing_detail_uses_preparing_for_unknown_totals_at_start() {
+        use crate::cold_build_limiter::progress::{Omitted, Running, Snapshot};
+        let snapshot = Snapshot {
+            running: vec![Running {
+                root: "/fake/openclaw".to_owned(),
+                root_label: "openclaw".to_owned(),
+                kind: "view publication".to_owned(),
+                phase: "starting",
+                started_at_ms: 1,
+                done: 0,
+                total: None,
+                chunks_embedded: None,
+                rate_per_minute: None,
+                eta_seconds: None,
+                age_seconds: 0.0,
+            }],
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 0,
+                queued: 0,
+            },
+        };
+
+        let detail = indexing_detail(&snapshot).unwrap();
+        assert!(detail.contains("preparing [starting]"), "{detail}");
+        assert!(!detail.contains("0/?"), "{detail}");
+        assert!(!detail.contains("none"), "{detail}");
+        assert!(!detail.contains("files/s"), "{detail}");
+        assert!(!detail.contains("~"), "{detail}");
+    }
+
+    #[test]
+    fn indexing_detail_never_emits_an_empty_header_for_queued_or_omitted_work() {
+        use crate::cold_build_limiter::progress::{Omitted, Queued, Snapshot};
+        let queued = Snapshot {
+            running: Vec::new(),
+            queued: vec![Queued {
+                root: "/fake/openclaw".to_owned(),
+                kind: "semantic build".to_owned(),
+                waited_seconds: 1.0,
+            }],
+            warming_roots: 2,
+            omitted: Omitted {
+                running: 0,
+                queued: 0,
+            },
+        };
+        assert_eq!(
+            indexing_detail(&queued).as_deref(),
+            Some("indexing: 1 queued; 2 roots warming")
+        );
+
+        let omitted = Snapshot {
+            running: Vec::new(),
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 2,
+                queued: 0,
+            },
+        };
+        assert_eq!(
+            indexing_detail(&omitted).as_deref(),
+            Some("indexing: 2 running; details omitted")
+        );
+        assert!(indexing_detail(&Snapshot {
+            running: Vec::new(),
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 0,
+                queued: 0,
+            },
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn health_headline_omits_indexing_when_there_are_no_work_rows() {
+        use crate::cold_build_limiter::progress::{Omitted, Snapshot};
+        let executor = Executor::new();
+        let dispatch_metrics = DispatchPathMetrics::new();
+        let app = crate::context::App::default_shared();
+        let cache = HealthRollupCache::new();
+        cache.refresh(&executor, &app);
+        let report = build_health_report_with_indexing(
+            &cache,
+            &executor,
+            &HashMap::new(),
+            &dispatch_metrics,
+            &app,
+            |_| Snapshot {
+                running: Vec::new(),
+                queued: Vec::new(),
+                warming_roots: 0,
+                omitted: Omitted {
+                    running: 0,
+                    queued: 0,
+                },
+            },
+        );
+        let metrics = report.metrics.unwrap();
+        assert!(metrics["indexing"].is_object());
+        assert!(!metrics["headline"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("indexing")));
     }
 
     #[test]

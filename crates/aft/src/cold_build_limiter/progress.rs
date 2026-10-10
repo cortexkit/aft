@@ -78,6 +78,7 @@ pub(crate) struct Snapshot {
     pub running: Vec<Running>,
     pub queued: Vec<Queued>,
     pub warming_roots: u64,
+    #[serde(skip_serializing_if = "Omitted::is_empty")]
     pub omitted: Omitted,
 }
 
@@ -85,6 +86,12 @@ pub(crate) struct Snapshot {
 pub(crate) struct Omitted {
     pub running: usize,
     pub queued: usize,
+}
+
+impl Omitted {
+    fn is_empty(&self) -> bool {
+        self.running == 0 && self.queued == 0
+    }
 }
 
 /// The rate is files/minute in the current phase, measured over the last five
@@ -275,7 +282,7 @@ fn root_label(root: &Path) -> String {
                         .and_then(Path::parent)
                         .and_then(Path::file_name)
                     {
-                        return format!("{}/{}", repo.to_string_lossy(), basename)
+                        return format!("{} (worker {})", repo.to_string_lossy(), basename)
                             .replace(['\n', '\r'], " ");
                     }
                 }
@@ -560,6 +567,51 @@ mod tests {
             row.eta_seconds, None,
             "a rate alone does not determine an ETA"
         );
+    }
+
+    #[test]
+    fn empty_omission_counts_are_not_serialized() {
+        let snapshot = Snapshot {
+            running: Vec::new(),
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 0,
+                queued: 0,
+            },
+        };
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert!(value.get("omitted").is_none());
+
+        let snapshot = Snapshot {
+            running: Vec::new(),
+            queued: Vec::new(),
+            warming_roots: 0,
+            omitted: Omitted {
+                running: 2,
+                queued: 3,
+            },
+        };
+        let value = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(value["omitted"]["running"], 2);
+        assert_eq!(value["omitted"]["queued"], 3);
+    }
+
+    #[test]
+    fn worker_checkout_labels_name_the_repository_and_worker() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repository = fixture.path().join("prefrontal");
+        let gitdir = repository.join(".git/worktrees/bg_1a2b");
+        let checkout = fixture.path().join("alfonso/worktrees/task-123/bg_1a2b");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}", gitdir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(root_label(&checkout), "prefrontal (worker bg_1a2b)");
     }
 
     #[test]
