@@ -194,6 +194,23 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         edit::line_col_to_byte(&source, target.range.start_line, target.range.start_col);
     let end_byte = edit::line_col_to_byte(&source, target.range.end_line, target.range.end_col);
 
+    if operation == "replace" || operation == "delete" {
+        match has_multiple_declarators(&path, &source, &original_range, end_byte) {
+            Ok(true) => {
+                return Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "edit_symbol: cannot {} symbol '{}' because its declaration contains multiple declarators",
+                        operation, symbol_name
+                    ),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
+        }
+    }
+
     // Apply operation
     let replacement_content = if operation == "replace" {
         match content {
@@ -418,4 +435,45 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     edit::attach_mutation_diff(&mut result, file, &source, &final_content);
     Response::success(&req.id, result)
+}
+
+fn has_multiple_declarators(
+    path: &Path,
+    source: &str,
+    range: &Range,
+    end_byte: usize,
+) -> Result<bool, crate::error::AftError> {
+    use crate::parser::{detect_language, node_range_with_decorators, FileParser, LangId};
+
+    let Some(lang @ (LangId::TypeScript | LangId::Tsx | LangId::JavaScript)) =
+        detect_language(path)
+    else {
+        return Ok(false);
+    };
+    let tree = FileParser::parse_source(path, source, lang)?;
+    // The range may start at a doc comment outside the declaration. Its last
+    // byte still belongs to the declaration, even when an export wraps it.
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(end_byte.saturating_sub(1), end_byte);
+    while let Some(current) = node {
+        if matches!(
+            current.kind(),
+            "lexical_declaration" | "variable_declaration"
+        ) {
+            // Only a symbol owning this entire statement can replace it; a
+            // callable object property must not be mistaken for its container.
+            if node_range_with_decorators(&current, source, lang) == *range {
+                let mut cursor = current.walk();
+                return Ok(current
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "variable_declarator")
+                    .count()
+                    > 1);
+            }
+            return Ok(false);
+        }
+        node = current.parent();
+    }
+    Ok(false)
 }

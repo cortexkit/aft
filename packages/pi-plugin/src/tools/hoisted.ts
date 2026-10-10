@@ -1015,7 +1015,7 @@ export function buildMutationResult(
     // Fallback only for unit tests and legacy cases where response.text is
     // missing. Normally the caller has already provided the summary text.
     text = formatEditSummary(response as Record<string, unknown>);
-    if (noOp) {
+    if (noOp && response.rolled_back !== true) {
       text +=
         "\n\nNote: no net file change \u2014 the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.";
     }

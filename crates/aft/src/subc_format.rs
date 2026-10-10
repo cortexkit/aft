@@ -1257,7 +1257,9 @@ fn format_edit_response(data: &Value) -> String {
         result.push_str("\n\n");
         result.push_str(&note);
     }
-    if data.get("no_op").and_then(Value::as_bool) == Some(true) {
+    if data.get("no_op").and_then(Value::as_bool) == Some(true)
+        && data.get("rolled_back").and_then(Value::as_bool) != Some(true)
+    {
         result.push_str(
             "\n\nNote: no net file change — the match was found and applied, but the file content is byte-identical to before. Likely causes: oldString and newString are identical, or a formatter normalized the change away.",
         );
@@ -1358,6 +1360,23 @@ fn append_lsp_server_notes(output: &mut String, data: &Value) {
 
 #[cfg(test)]
 mod edit_diagnostics_tests {
+    #[test]
+    fn syntax_rollback_omits_no_net_change_hint() {
+        let output = super::format_edit_response(&serde_json::json!({
+            "rolled_back": true,
+            "no_op": true,
+            "syntax_valid": false
+        }));
+        assert!(output.starts_with("Edit rolled back:"), "{output}");
+        assert!(!output.contains("Likely causes"), "{output}");
+        assert_eq!(
+            output,
+            "Edit rolled back: the change produced invalid syntax, so the file was left unchanged."
+        );
+        let no_op = super::format_edit_response(&serde_json::json!({"no_op": true}));
+        assert!(no_op.contains("Likely causes"), "{no_op}");
+    }
+
     #[test]
     fn frozen_lsp_edit_rendering_reports_diagnostics_unknown() {
         let data = serde_json::json!({

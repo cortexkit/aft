@@ -189,6 +189,19 @@ describe("buildMutationResult", () => {
     expect(text).toContain("byte-identical");
   });
 
+  test("syntax rollback omits the no-net-change hint", () => {
+    const result = buildMutationResult({ rolled_back: true, no_op: true, syntax_valid: false });
+    const text = result.content
+      .filter((c) => c.type === "text")
+      .map((c) => (c as { text?: string }).text ?? "")
+      .join("");
+    expect(text).toStartWith("Edit rolled back:");
+    expect(text).not.toContain("Likely causes");
+    expect(text).toBe(
+      "Edit rolled back: the change produced invalid syntax, so the file was left unchanged.",
+    );
+  });
+
   test("absent no_op leaves details.noOp unset and no note in text", () => {
     // Real change must NOT trigger the no-op note path.
     const result = buildMutationResult({

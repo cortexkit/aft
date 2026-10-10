@@ -463,6 +463,87 @@ fn edit_symbol_replace() {
     assert!(status.success());
 }
 
+fn assert_empty_symbol_replacement(source: &str, expected: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = AftProcess::spawn();
+    for extension in ["ts", "tsx", "js"] {
+        let target = dir.path().join(format!("delete_const.{extension}"));
+        fs::write(&target, source).unwrap();
+        let req = serde_json::json!({
+            "id": format!("empty-symbol-{extension}"),
+            "command": "edit_symbol",
+            "file": target.display().to_string(),
+            "symbol": "formatReset",
+            "operation": "replace",
+            "content": ""
+        });
+        let resp = aft.send(&req.to_string());
+        assert_eq!(resp["success"], true, "{extension}: {resp:?}");
+        assert_eq!(resp["syntax_valid"], true, "{extension}: {resp:?}");
+        let after = fs::read_to_string(&target).unwrap();
+        assert_eq!(
+            after, expected,
+            "{extension}: declaration and docs must be gone"
+        );
+        assert_eq!(aft::edit::validate_syntax_str(&after, &target), Some(true));
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn edit_symbol_empty_content_deletes_nested_arrow_const() {
+    for value in ["() => { return 1; }", "function () { return 1; }"] {
+        let source = format!(
+            "function outer() {{\n  /** Format the reset time. */\n  const formatReset = {value};\n  return 2;\n}}\n"
+        );
+        assert_empty_symbol_replacement(&source, "function outer() {\n  \n  return 2;\n}\n");
+    }
+}
+
+#[test]
+fn edit_symbol_empty_content_deletes_top_level_arrow_const() {
+    for value in ["() => { return 1; }", "function () { return 1; }"] {
+        let source = format!(
+            "/** Format the reset time. */\nexport const formatReset = {value};\nconst keep = 2;\n"
+        );
+        assert_empty_symbol_replacement(&source, "\nconst keep = 2;\n");
+    }
+}
+
+#[test]
+fn edit_symbol_refuses_multi_declarator_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("shared.ts");
+    let mut aft = AftProcess::spawn();
+    for source in [
+        "export const formatReset = () => 1, keep = 2;\n",
+        "function outer() { const keep = 2, formatReset = function () { return 1; }; }\n",
+    ] {
+        for operation in ["replace", "delete"] {
+            fs::write(&target, source).unwrap();
+            let req = serde_json::json!({
+                "id": "shared-symbol",
+                "command": "edit_symbol",
+                "file": target.display().to_string(),
+                "symbol": "formatReset",
+                "operation": operation,
+                "content": ""
+            });
+            let resp = aft.send(&req.to_string());
+            assert_eq!(
+                resp["success"], false,
+                "must refuse before editing: {resp:?}"
+            );
+            assert_eq!(resp["code"], "invalid_request", "{resp:?}");
+            let message = resp["message"].as_str().unwrap();
+            assert!(message.contains("formatReset"), "{message}");
+            assert!(message.contains("multiple declarators"), "{message}");
+            assert_eq!(fs::read_to_string(&target).unwrap(), source);
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn edit_symbol_delete() {
     let mut aft = AftProcess::spawn();
