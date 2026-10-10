@@ -5357,6 +5357,10 @@ fn scoped_diagnostics_open_no_documents_and_close_none() {
     );
 }
 
+/// A scoped request whose `sections` list other categories and leave out
+/// diagnostics does no language-server work at all. A scoped request that
+/// omits `sections` is different: it still collects diagnostics, because
+/// checking a file's compiler errors is the main reason to scope an inspect.
 #[test]
 fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     let (_temp_dir, root) = fixture_project();
@@ -5378,12 +5382,11 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
     collect_lsp_notifications(&ctx, "custom/documentOpened", 1);
     ctx.update_status_bar_tier2(Some(11), Some(12), Some(13), Some(14), false);
 
-    for sections in [Some(json!(["dead_code"])), None] {
-        let mut params =
-            json!({"id": "inspect-no-diagnostics", "command": "inspect", "scope": "src"});
-        if let Some(sections) = sections {
-            params["sections"] = sections;
-        }
+    for sections in [json!(["dead_code"]), json!("todos")] {
+        let params = json!({
+            "id": "inspect-no-diagnostics", "command": "inspect", "scope": "src",
+            "sections": sections,
+        });
         let response = handle_inspect_tool_call(&request(params), &ctx);
         assert!(response.success, "{response:?}");
         // Check whether inspect opened or analyzed documents before checking
@@ -5428,6 +5431,34 @@ fn scoped_inspect_without_diagnostics_does_no_producer_work() {
             (Some(11), Some(12), Some(13), Some(14))
         );
     }
+
+    // Omitted sections: the scoped request reports diagnostics and waits for
+    // the started producers, unlike the explicit non-diagnostics requests above.
+    let response = handle_inspect_tool_call(
+        &request(json!({"id": "inspect-omitted-sections", "command": "inspect", "scope": "src"})),
+        &ctx,
+    );
+    assert!(response.success, "{response:?}");
+    let diagnostics = &response.data["summary"]["diagnostics"];
+    assert!(
+        diagnostics.is_object() && diagnostics.get("status").is_none(),
+        "omitted sections must still report diagnostics: {diagnostics:#}"
+    );
+    assert!(
+        response.data["wait_stamp"]["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|phase| phase["id"] == "lsp_quiescence"),
+        "omitted sections must wait for diagnostics producers: {:#}",
+        response.data["wait_stamp"]
+    );
+    let bar = ctx.status_bar_count_values();
+    assert_eq!(
+        (bar.dead_code, bar.unused_exports, bar.duplicates, bar.todos),
+        (Some(11), Some(12), Some(13), Some(14)),
+        "a scoped request must not overwrite project totals"
+    );
 }
 
 #[test]

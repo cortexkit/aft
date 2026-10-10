@@ -537,8 +537,7 @@ fn handle_inspect_payload(
     let scope_was_provided = scope_was_provided && !parsed_scope.roots.is_empty();
     let scope_roots = scope_was_provided.then_some(parsed_scope.roots.as_slice());
     let scope = parsed_scope.job;
-    let diagnostics_requested =
-        !scope_was_provided || sections.includes(InspectCategory::Diagnostics);
+    let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 
     if inspect_cancellation_requested() {
         return inspect_interrupted_response(&req.id);
@@ -2335,6 +2334,15 @@ impl Sections {
     fn includes(&self, category: InspectCategory) -> bool {
         self.detail_categories.contains(&category)
     }
+
+    /// Whether a scoped request should collect diagnostics. Checking a file's
+    /// compiler errors is the main reason to scope an inspect, so a request
+    /// that names no sections still gets diagnostics. Only a request whose
+    /// sections list other categories and leaves diagnostics out skips all
+    /// language-server work and reports diagnostics as `not_requested`.
+    fn requests_scoped_diagnostics(&self) -> bool {
+        self.detail_categories.is_empty() || self.includes(InspectCategory::Diagnostics)
+    }
 }
 
 fn build_snapshot(ctx: &AppContext) -> Result<InspectSnapshot, Response> {
@@ -2574,7 +2582,7 @@ fn parse_sections(value: Option<&Value>) -> Result<Sections, String> {
 
 fn diagnostics_selected(req: &RawRequest) -> bool {
     parse_sections(req.params.get("sections"))
-        .is_ok_and(|sections| sections.includes(InspectCategory::Diagnostics))
+        .is_ok_and(|sections| sections.requests_scoped_diagnostics())
 }
 
 fn scope_was_provided(value: Option<&Value>) -> bool {

@@ -1134,10 +1134,16 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
         .unwrap()
         .contains("still indexing after"));
     assert!(response["summary"]["diagnostics"]["errors"].is_null());
+    // A scoped inspect no longer writes its scoped counts into the project
+    // status bar, so on a fresh project with nothing known project-wide the
+    // bar may be absent. When it is shown, diagnostics must read as unknown,
+    // never as a made-up numeric error count.
+    let text = response["text"].as_str().unwrap();
     assert!(
-        response["text"].as_str().unwrap().contains("E? W?"),
+        !text.contains("[AFT ") || text.contains("[AFT E? W?"),
         "{response:#}"
     );
+    assert!(!text.contains("[AFT E0"), "{response:#}");
     assert!(elapsed < Duration::from_secs(5));
 }
 
