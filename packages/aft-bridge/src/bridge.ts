@@ -432,6 +432,22 @@ export class BinaryBridge implements AftProjectTransport {
   /** Once true, this bridge must not accept new requests and should be drained. */
   private _retiringDueToBinaryChange = false;
   private pending = new Map<string, PendingRequest>();
+  /**
+   * Public `send()` calls that have not settled yet, including the configure
+   * and version requests a first call runs before its own request. While this
+   * is above zero (or a background bash task is outstanding) the child process
+   * and its pipes keep the host's event loop alive; otherwise they are
+   * unreferenced, so an idle bridge never stops a one-shot host command from
+   * exiting. See `syncEventLoopHold`.
+   */
+  private activeSendCalls = 0;
+  /**
+   * Whether the current child's handles are referenced. A fresh spawn starts
+   * referenced, as Node and Bun create them. Tracked so `ref`/`unref` are
+   * only called on a change: Bun counts them on its child pipes, so a
+   * repeated `ref()` would need as many `unref()` calls to release the loop.
+   */
+  private processLoopReferenced = true;
   private outstandingBackgroundTaskIds = new Set<string>();
   private nextId = 1;
   private processGeneration = 0;
@@ -784,6 +800,53 @@ export class BinaryBridge implements AftProjectTransport {
     command: string,
     params: Record<string, unknown> = {},
     options?: SendOptions,
+  ): Promise<Record<string, unknown>> {
+    this.activeSendCalls += 1;
+    this.syncEventLoopHold();
+    try {
+      return await this.dispatchSend(command, params, options);
+    } finally {
+      this.activeSendCalls -= 1;
+      this.syncEventLoopHold();
+    }
+  }
+
+  /**
+   * Reference the child process and its stdio pipes while the bridge has work
+   * in flight, and unreference them while it is idle.
+   *
+   * A host that loads the plugin and then has nothing left to do (a one-shot
+   * CLI command, or a headless run after its last turn) must be able to exit
+   * even though a warm `aft` child is still running; the child sees its stdin
+   * close and exits on its own. While a request is in flight the handles stay
+   * referenced, so the host cannot exit mid-call and lose the response. A
+   * background bash task the child is still running counts as work in flight
+   * too: its completion frame can wake the session, so the host stays up for
+   * it, as it always did before idle bridges were released.
+   * `ref`/`unref` are optional because not every runtime exposes them on every
+   * pipe (Bun's child stdin has neither and does not hold the loop).
+   */
+  private syncEventLoopHold(): void {
+    const child = this.process;
+    if (!child) return;
+    const hold = this.activeSendCalls > 0 || this.outstandingBackgroundTaskIds.size > 0;
+    if (hold === this.processLoopReferenced) return;
+    this.processLoopReferenced = hold;
+    // The stdio pipes are typed as plain streams, but at runtime they are
+    // sockets (Node) or native readables (Bun) that carry ref/unref.
+    const handles = [child, child.stdin, child.stdout, child.stderr] as unknown as Array<
+      { ref?: () => unknown; unref?: () => unknown } | null | undefined
+    >;
+    for (const handle of handles) {
+      if (hold) handle?.ref?.();
+      else handle?.unref?.();
+    }
+  }
+
+  private async dispatchSend(
+    command: string,
+    params: Record<string, unknown>,
+    options: SendOptions | undefined,
   ): Promise<Record<string, unknown>> {
     let dispatchParams = params;
     if (command === "configure") {
@@ -1536,6 +1599,10 @@ export class BinaryBridge implements AftProjectTransport {
     // Fresh spawn — clear the stderr ring so crash diagnostics only reflect
     // the current child's output, not output from prior restart cycles.
     this.stderrTail = [];
+    // A child spawned by a call is held until that call settles; one spawned
+    // by an auto-restart with nothing in flight is released right away.
+    this.processLoopReferenced = true;
+    this.syncEventLoopHold();
   }
 
   private pushStderrLine(line: string): void {
@@ -1674,6 +1741,7 @@ export class BinaryBridge implements AftProjectTransport {
       if (response.type === "bash_completed") {
         const taskId = bashTaskIdFrom(response);
         if (taskId) this.outstandingBackgroundTaskIds.delete(taskId);
+        this.syncEventLoopHold();
         this.onBashCompletion?.(response as unknown as BashCompletedPayload, this);
         return;
       }
@@ -1852,7 +1920,7 @@ export class BinaryBridge implements AftProjectTransport {
       this._restartCount++;
       this.logVia(`Auto-restart #${this._restartCount} in ${delay}ms`);
 
-      setTimeout(() => {
+      const restartTimer = setTimeout(() => {
         if (!this._shuttingDown && !this.isAlive()) {
           try {
             this.spawnProcess();
@@ -1861,6 +1929,9 @@ export class BinaryBridge implements AftProjectTransport {
           }
         }
       }, delay);
+      // The crash already rejected every pending request, so nothing waits on
+      // this restart; it must not keep a host that is otherwise done alive.
+      restartTimer.unref?.();
       // Also decay the counter over time so repeated crashes without any
       // successful response don't permanently wedge the bridge.
       this.scheduleRestartCountReset();
@@ -1887,6 +1958,8 @@ export class BinaryBridge implements AftProjectTransport {
       this._restartCount = 0;
       this.restartResetTimer = null;
     }, BinaryBridge.RESTART_RESET_MS);
+    // Bookkeeping only: a five-minute counter reset must not hold the host open.
+    this.restartResetTimer.unref?.();
   }
 
   private clearRestartResetTimer(): void {

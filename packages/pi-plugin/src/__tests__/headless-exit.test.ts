@@ -49,7 +49,13 @@ let runPromise: Promise<HarnessRun> | undefined;
 
 /** Build a throwaway HOME/XDG/project sandbox and start the harness in it. */
 function spawnHarness(
-  mode: "session-shutdown" | "sigterm" | "subagent" | "plugin-validate" | "session-warmup",
+  mode:
+    | "session-shutdown"
+    | "sigterm"
+    | "subagent"
+    | "plugin-validate"
+    | "session-warmup"
+    | "session-repeat",
 ) {
   const tempDir = mkdtempSync(join(tmpdir(), "aft-pi-headless-exit-"));
   tempDirs.push(tempDir);
@@ -180,6 +186,7 @@ const SIGTERM_EXIT_BOUND_MS = 8_000;
 let sigtermNpmPid: number | null = null;
 let validateNpmPid: number | null = null;
 let warmupNpmPid: number | null = null;
+let repeatNpmPid: number | null = null;
 
 function runSigtermHarness(): Promise<SigtermRun> {
   return new Promise<SigtermRun>((resolveRun, rejectRun) => {
@@ -244,7 +251,7 @@ function runSigtermHarness(): Promise<SigtermRun> {
 afterAll(async () => {
   const run = await runPromise?.catch(() => undefined);
   // Never leave the stand-in npm behind if a regression orphaned it.
-  for (const pid of [run?.npmPid, sigtermNpmPid, validateNpmPid, warmupNpmPid]) {
+  for (const pid of [run?.npmPid, sigtermNpmPid, validateNpmPid, warmupNpmPid, repeatNpmPid]) {
     if (pid && isAlive(pid)) process.kill(pid, "SIGKILL");
   }
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
@@ -411,7 +418,7 @@ interface ValidateRun {
  * after the factory returned.
  */
 function runValidateHarness(
-  mode: "plugin-validate" | "session-warmup" = "plugin-validate",
+  mode: "plugin-validate" | "session-warmup" | "session-repeat" = "plugin-validate",
 ): Promise<ValidateRun> {
   return new Promise<ValidateRun>((resolveRun, rejectRun) => {
     const { child, npmMarker } = spawnHarness(mode);
@@ -462,6 +469,7 @@ function runValidateHarness(
       }
       run.npmPid = readNpmPid(npmMarker);
       if (mode === "plugin-validate") validateNpmPid = run.npmPid;
+      else if (mode === "session-repeat") repeatNpmPid = run.npmPid;
       else warmupNpmPid = run.npmPid;
       resolveRun(run);
     });
@@ -510,6 +518,28 @@ describe.skipIf(process.platform === "win32")("a real session still warms its br
     expect(sessionStarted).toBeGreaterThan(names.indexOf("plugin-ready"));
     expect(warmupSpawn).toBeGreaterThan(sessionStarted);
     expect(names).not.toContain("bridge-tool-call");
+    expect(run.killedAsHung).toBe(false);
+    expect(run.exitCode).toBe(0);
+  }, 60_000);
+});
+
+describe.skipIf(process.platform === "win32")("session startup runs once per process", () => {
+  test("later session_start and before_agent_start events start no second warmup", async () => {
+    const run = await runValidateHarness("session-repeat");
+    if (run.killedAsHung || run.exitCode !== 0) console.error(`harness stderr:\n${run.stderr}`);
+    const names = run.events.map((event) => event.name);
+    // The later signals really were delivered, after the first warmup.
+    expect(names.indexOf("second-session-start-fired")).toBeGreaterThan(
+      names.indexOf("warmup-observed"),
+    );
+    expect(names.indexOf("shutdown-done")).toBeGreaterThan(
+      names.indexOf("second-session-start-fired"),
+    );
+    const statusSends = run.events.filter(
+      (event) => event.name === "bridge-send" && event.detail === "command=status",
+    );
+    expect(statusSends).toHaveLength(1);
+    expect(names.filter((name) => name === "onnx-prepare")).toHaveLength(1);
     expect(run.killedAsHung).toBe(false);
     expect(run.exitCode).toBe(0);
   }, 60_000);

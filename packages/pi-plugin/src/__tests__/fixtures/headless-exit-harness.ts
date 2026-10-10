@@ -31,7 +31,11 @@
  *                       the factory, fire no session event at all), with the
  *                       ONNX Runtime ready at once, then let the script end;
  *                       "session-warmup": ONNX Runtime ready at once, fire
- *                       session_start, wait for the warmup bridge, shut down
+ *                       session_start, wait for the warmup bridge, shut down;
+ *                       "session-repeat": like "session-warmup", but the host
+ *                       also fires before_agent_start and a second
+ *                       session_start (a new session in the same process)
+ *                       before shutting down
  *
  * Stdout protocol, one line each: `EVENT <name> <detail>`.
  */
@@ -66,6 +70,7 @@ function makeFakeInnerPool() {
   const bridgeFor = (root: string) => ({
     cwd: root,
     async send(command: string) {
+      emit("bridge-send", `command=${command}`);
       spawnIfNeeded(root, `command=${command}`);
       return { success: true };
     },
@@ -112,7 +117,9 @@ const onnxReady = new Promise<string | null>((resolve) => {
 // The ONNX Runtime is available at once (as with a system install), so in
 // these modes nothing but the plugin's own startup decisions can hold back a
 // warmup.
-if (mode === "plugin-validate" || mode === "session-warmup") resolveOnnx("/fake/onnxruntime");
+if (mode === "plugin-validate" || mode === "session-warmup" || mode === "session-repeat") {
+  resolveOnnx("/fake/onnxruntime");
+}
 
 Bun.plugin({
   name: "headless-exit-bridge-seams",
@@ -194,6 +201,32 @@ if (mode === "plugin-validate") {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   emit("warmup-observed", `bridges=${bridgesSpawned}`);
+  for (const handler of handlers.get("session_shutdown") ?? []) {
+    await handler({}, {});
+  }
+  emit("shutdown-done", `pools=${poolsCreated} bridges=${bridgesSpawned}`);
+} else if (mode === "session-repeat") {
+  // Every later session signal must find the startup work already begun:
+  // one ONNX Runtime preparation and one warmup status call in total.
+  const deadline = Date.now() + 5_000;
+  while (bridgesSpawned === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  emit("warmup-observed", `bridges=${bridgesSpawned}`);
+  emit("before-agent-start-fired");
+  for (const handler of handlers.get("before_agent_start") ?? []) {
+    await handler(
+      { type: "before_agent_start", prompt: "hello", systemPrompt: "base" },
+      sessionCtx("harness-session"),
+    );
+  }
+  emit("second-session-start-fired");
+  for (const handler of handlers.get("session_start") ?? []) {
+    await handler({ type: "session_start", reason: "new" }, sessionCtx("harness-session-2"));
+  }
+  // Long enough for a second warmup `status` call, had startup run again, to
+  // reach the fake bridge pool and show up as a second bridge-send event.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   for (const handler of handlers.get("session_shutdown") ?? []) {
     await handler({}, {});
   }
