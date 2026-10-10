@@ -161,6 +161,15 @@ fn write_fresh_r3_cache(state_home: &Path, now: u64) {
 }
 
 fn write_fresh_r3_cache_for_manifest(state_home: &Path, now: u64, manifest_version: u64) {
+    write_fresh_r3_cache_for_repository(state_home, now, manifest_version, "cortexkit/aft");
+}
+
+fn write_fresh_r3_cache_for_repository(
+    state_home: &Path,
+    now: u64,
+    manifest_version: u64,
+    repository: &str,
+) {
     let rung_path = state_home.join("cortexkit/aft/gh-shim/rung-cache.json");
     fs::create_dir_all(rung_path.parent().expect("rung cache parent"))
         .expect("create shim state directory");
@@ -169,6 +178,7 @@ fn write_fresh_r3_cache_for_manifest(state_home: &Path, now: u64, manifest_versi
         serde_json::to_vec(&json!({
             "rung": "R3",
             "as_of_unix_secs": now,
+            "recorded_by_repo_key": repository,
             "last_reachable_unix_secs": now,
             "inputs": {
                 "connection_file": "ready",
@@ -194,6 +204,7 @@ fn write_recently_reachable_r3_cache(state_home: &Path, now: u64, age_secs: u64)
         serde_json::to_vec(&json!({
             "rung": "R3",
             "as_of_unix_secs": timestamp,
+            "recorded_by_repo_key": "cortexkit/aft",
             "last_reachable_unix_secs": timestamp,
             "inputs": {
                 "connection_file": "ready",
@@ -218,6 +229,7 @@ fn write_fresh_ambient_credentials_r2_cache(state_home: &Path, now: u64) {
         serde_json::to_vec(&json!({
             "rung": "R2",
             "as_of_unix_secs": now,
+            "recorded_by_repo_key": "cortexkit/aft",
             "inputs": {
                 "connection_file": "ready",
                 "agent_credentials_present": "env:GH_TOKEN",
@@ -879,7 +891,7 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
     write_upstream_gh(&upstream_bin);
     let now = unix_seconds();
     write_fresh_v9_manifest(&state_home, now);
-    write_fresh_r3_cache_for_manifest(&state_home, now, 9);
+    write_fresh_r3_cache_for_repository(&state_home, now, 9, "cortexkit/insula");
     write_user_config(&config_home, &connection_file, None);
 
     // `run delete` is the admin verb this test compares against the raw API
@@ -979,7 +991,7 @@ fn gh_shim_operator_bypass_does_not_lift_unclassified_refusal_and_keeps_admin_me
     write_upstream_gh(&upstream_bin);
     let now = unix_seconds();
     write_fresh_v9_manifest(&state_home, now);
-    write_fresh_r3_cache_for_manifest(&state_home, now, 9);
+    write_fresh_r3_cache_for_repository(&state_home, now, 9, "cortexkit/insula");
     write_user_config(&config_home, &connection_file, None);
 
     let unclassified = shim_command(
@@ -2743,6 +2755,94 @@ fn gh_shim_slow_daemon_connect_delay_expired_fallback_refuses_with_unreachable_o
     assert_eq!(status["last_probe"]["stage"], "connect");
     assert_eq!(status["last_probe"]["outcome"], "timed_out");
     assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
+}
+
+#[test]
+fn gh_shim_cached_unbound_repository_does_not_poison_bound_governed_write() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
+        first_connection_only: false,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let bound = write_project_repo(temp.path());
+    let unbound = write_project_repo_for(temp.path(), "unbound-project", "cortexkit/motor");
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_fresh_manifest(&state_home, unix_seconds());
+    write_user_config(&config_home, &connection_file, None);
+    let rung_path = state_home.join("cortexkit/aft/gh-shim/rung-cache.json");
+
+    for explicit_target in [false, true] {
+        // A mechanical read reaches determination on an unbound repository;
+        // an unbound write would refuse before it could seed the shared cache.
+        let read = shim_command(
+            &["issue", "list"],
+            &unbound,
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn unbound read");
+        assert_eq!(
+            read.status.code(),
+            Some(73),
+            "mechanical read passes through"
+        );
+        assert!(
+            recorder.exists(),
+            "mechanical read delegates to upstream gh"
+        );
+        fs::remove_file(&recorder).expect("clear read invocation");
+        let cached: Value = serde_json::from_slice(&fs::read(&rung_path).unwrap()).unwrap();
+        assert_eq!(cached["rung"], "R2");
+        assert_eq!(cached["inputs"]["agent_binding_unavailable"], "failed");
+        assert_eq!(cached["recorded_by_repo_key"], "cortexkit/motor");
+        assert!(unix_seconds().saturating_sub(cached["as_of_unix_secs"].as_u64().unwrap()) < 15);
+
+        let mut args = vec!["issue", "comment", "1", "--body", "bound bot comment"];
+        if explicit_target {
+            args.extend(["--repo", "cortexkit/aft"]);
+        }
+        let output = shim_command(
+            &args,
+            if explicit_target { &unbound } else { &bound },
+            &config_home,
+            &state_home,
+            &home,
+            &upstream_bin,
+            &recorder,
+        )
+        .output()
+        .expect("spawn bound governed write");
+        assert!(
+            output.status.success(),
+            "bound write must rediscover and route with explicit_target={explicit_target}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "https://github.com/cortexkit/aft/issues/1#issuecomment-123\n"
+        );
+        assert!(
+            !recorder.exists(),
+            "governed write must not use upstream gh"
+        );
+        let cached: Value = serde_json::from_slice(&fs::read(&rung_path).unwrap()).unwrap();
+        assert_eq!(cached["rung"], "R3");
+        assert_eq!(cached["recorded_by_repo_key"], "cortexkit/aft");
+    }
 }
 
 #[test]

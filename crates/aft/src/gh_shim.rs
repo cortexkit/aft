@@ -2188,12 +2188,12 @@ struct RungRecordProvenance {
 }
 
 impl RungRecordProvenance {
-    fn for_cwd(cwd: &Path) -> Self {
-        let project_root = project_root_for(cwd);
+    fn for_target(target: &TargetRepository, cwd: &Path) -> Self {
         Self {
             image_path: executing_image().to_string_lossy().into_owned(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            repo_key: repository_key_from_origin(&project_root)
+            repo_key: target
+                .repository_key(cwd)
                 .unwrap_or_else(|| "unresolved (no GitHub origin)".to_string()),
         }
     }
@@ -2521,7 +2521,15 @@ fn determine_rung_for_target(
         return RungDetermination::r1(now, R1Reason::Unreachable);
     }
 
-    let cached = load_rung_record(paths);
+    let provenance = RungRecordProvenance::for_target(target, cwd);
+    // The state directory is shared by every repository for this user. A rung
+    // determined for another target (including a missing binding) says nothing
+    // about this target's governance health, even during timeout fallback.
+    // Legacy or unresolved provenance cannot establish a repository match.
+    let cached = load_rung_record(paths).filter(|record| {
+        canonical_repository_key(&provenance.repo_key).is_some()
+            && record.recorded_by_repo_key.as_deref() == Some(provenance.repo_key.as_str())
+    });
     if std::time::Instant::now() >= deadline {
         let budget_ms = DISCOVERY_BUDGET.as_millis();
         let stage = ProbeStage::Connect;
@@ -2557,7 +2565,6 @@ fn determine_rung_for_target(
         }
     }
 
-    let provenance = RungRecordProvenance::for_cwd(cwd);
     // The signed manifest supplies the binding before the probe opens a route, so
     // rate accounting and audit records use the same agent session on every run.
     // A failed validation does not supply a manifest here because the regressed
@@ -14515,6 +14522,168 @@ INHERITED FLAGS
             .status()
             .expect("add git origin");
         project
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cached_lower_rungs_are_reused_only_with_same_repository_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let connection = temp.path().join("connection.json");
+        fs::write(&connection, "{}").unwrap();
+        let doc = json!({ "subc": { "connection_file": connection } }).to_string();
+        let project = write_test_project_repo(temp.path(), "cortexkit/motor");
+        write_signed_manifest(&paths, v12_fixture_manifest(), TEST_NOW);
+        let provenance = RungRecordProvenance::for_target(&TargetRepository::default(), &project);
+
+        for rung in [Rung::R1, Rung::R2] {
+            for repo in [
+                Some("cortexkit/motor"),
+                Some("cortexkit/aft"),
+                Some("unresolved (no GitHub origin)"),
+                None,
+            ] {
+                let mut record = RungDetermination::r2(
+                    TEST_NOW - 1,
+                    R2Reason::AgentBindingUnavailable,
+                    Some(12),
+                    &provenance,
+                )
+                .record;
+                record.rung = rung;
+                record.recorded_by_repo_key = repo.map(str::to_string);
+                write_rung_record_silently(&paths, &record);
+                let determination = determine_rung_from_doc(
+                    &paths,
+                    &project,
+                    TEST_NOW,
+                    Instant::now() + DISCOVERY_BUDGET,
+                    Some(&doc),
+                );
+                let same_repo = repo == Some("cortexkit/motor");
+                assert_eq!(
+                    determination.record.as_of_unix_secs,
+                    if same_repo { TEST_NOW - 1 } else { TEST_NOW },
+                    "cached {rung:?} provenance {repo:?}"
+                );
+                assert_eq!(
+                    determination.record.rung,
+                    if same_repo { rung } else { Rung::R2 }
+                );
+                assert_eq!(
+                    determination.record.recorded_by_repo_key.as_deref(),
+                    Some("cortexkit/motor")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_rung_deadline_fallback_requires_same_repository_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let connection = temp.path().join("connection.json");
+        fs::write(&connection, "{}").unwrap();
+        let doc = json!({ "subc": { "connection_file": connection } }).to_string();
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        for (rung, age) in [(Rung::R2, 1), (Rung::R3, 1), (Rung::R3, 30)] {
+            for repo in [Some("cortexkit/aft"), Some("cortexkit/motor"), None] {
+                let mut record =
+                    RungDetermination::r3(TEST_NOW - age, 12, &test_rung_provenance()).record;
+                record.rung = rung;
+                record.recorded_by_repo_key = repo.map(str::to_string);
+                write_rung_record_silently(&paths, &record);
+                let determination =
+                    determine_rung_from_doc(&paths, &project, TEST_NOW, Instant::now(), Some(&doc));
+                assert_eq!(
+                    determination.record.rung,
+                    if repo == Some("cortexkit/aft") {
+                        rung
+                    } else {
+                        Rung::R1
+                    },
+                    "deadline fallback for {rung:?} provenance {repo:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cached_unbound_repository_does_not_poison_bound_governed_write() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
+            catalog_delay: Duration::ZERO,
+            open_route_delay: Duration::ZERO,
+            first_connection_only: false,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let connection = temp.path().join("connection.json");
+        daemon.write_connection_file(&connection);
+        let doc = json!({ "subc": { "connection_file": connection } }).to_string();
+        let unbound = write_test_project_repo(&temp.path().join("unbound"), "cortexkit/motor");
+        let bound = write_test_project_repo(&temp.path().join("bound"), "cortexkit/aft");
+        let manifest = v12_fixture_manifest();
+        let now = TEST_NOW;
+        write_signed_manifest(&paths, manifest.clone(), now);
+
+        let unbound_determination = determine_rung_from_doc(
+            &paths,
+            &unbound,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(unbound_determination.record.rung, Rung::R2);
+        assert_eq!(
+            unbound_determination.record.inputs["agent_binding_unavailable"],
+            "failed"
+        );
+        assert_eq!(
+            load_rung_record(&paths)
+                .unwrap()
+                .recorded_by_repo_key
+                .as_deref(),
+            Some("cortexkit/motor")
+        );
+        assert!(read_last_probe(&paths).is_none());
+
+        let args = os_args(&["issue", "comment", "1", "--body", "bound bot comment"]);
+        let target = TargetRepository::default();
+        let determination = determine_rung_for_target(
+            &paths,
+            &target,
+            &bound,
+            now + 1,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert!(
+            matches!(
+                non_r3_governance_disposition(
+                    &bound,
+                    &target,
+                    &determination,
+                    &args,
+                    &manifest,
+                    current_platform(),
+                ),
+                GovernanceDisposition::Ready
+            ),
+            "a bound governed write must rediscover instead of reusing the unbound repo's R2: {:?}",
+            determination.record
+        );
+        assert_eq!(determination.record.rung, Rung::R3);
+        assert_eq!(
+            load_rung_record(&paths)
+                .unwrap()
+                .recorded_by_repo_key
+                .as_deref(),
+            Some("cortexkit/aft")
+        );
+        assert_eq!(read_last_probe(&paths).unwrap().outcome, "ready");
     }
 
     /// Stage-naming tests: a deadline wide enough that a listening loopback daemon's
