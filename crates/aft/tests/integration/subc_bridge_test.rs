@@ -3382,7 +3382,10 @@ fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
         Duration::from_secs(45),
         || {
             vec![
-                set_test_foreground_wait_ms(200),
+                // Delegated blocking waits promote at their worker wait cap
+                // without the ordinary foreground deadline handoff competing
+                // for the reply. This exercises delivered errors deterministically.
+                set_test_env("AFT_TEST_WORKER_WAIT_MAX_MS", "200"),
                 set_test_force_bash_promote_error(),
             ]
         },
@@ -3430,6 +3433,23 @@ fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
         "subc_bridge_bash_started_promotion_hands_off_before_transport_deadline",
         Duration::from_secs(45),
         || started_promotion_env(&started),
+        |input| drive_started_promotion_daemon(input, false),
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive() {
+    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let started = probe.path().join("started");
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive",
+        Duration::from_secs(45),
+        || {
+            let mut guards = started_promotion_env(&started);
+            guards.push(set_test_force_bash_promote_error());
+            guards
+        },
         |input| drive_started_promotion_daemon(input, false),
         |_, _, _| {},
     );
@@ -5298,19 +5318,35 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_routes_1_and_4(&mut stream, &root1).await;
-    send_tool_call(
-        &mut stream,
-        1,
-        114,
-        "bash",
-        json!({
-            "command": "sleep 2; printf 'promote-failure-done\\n'",
+    let marker = root1.join("promote-failure-started");
+    let release = root1.join("promote-failure-release");
+    let done = root1.join("promote-failure-done");
+    let body = json!({
+        "name": "bash",
+        "worker_session": true,
+        "arguments": {
+            "command": hold_bash_until_done_command(&marker, &release, &done),
             "foreground_orchestrate": true,
+            "wait": true,
             "compressed": false,
-        }),
+        },
+    });
+    send_frame(
+        &mut stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            1,
+            1,
+            114,
+            serde_json::to_vec(&body).expect("worker promotion error body"),
+        )
+        .expect("worker promotion error frame"),
     )
     .await;
     let frame = read_frame_timeout(&mut stream, "promote failure bash response").await;
+    // Release even an unexpected reply's command before checking the assertions.
+    std::fs::write(&release, b"release").expect("release promotion error command");
     assert_eq!(frame.header.corr, 114);
     assert!(tool_result_is_error(&frame));
     let text = tool_result_text(&frame);
@@ -5318,6 +5354,8 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
         text.contains("forced subc bash promote failure"),
         "expected promote failure text, got {text:?}"
     );
+    wait_for_file(&marker, "promotion error command start marker").await;
+    wait_for_file(&done, "promotion error command completion").await;
     send_tool_call(&mut stream, 4, 115, "echo", json!({ "case": "fast" })).await;
     let alive = read_frame_timeout(&mut stream, "post-promote-failure response").await;
     assert_eq!(alive.header.channel, 4);

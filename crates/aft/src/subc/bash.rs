@@ -180,27 +180,31 @@ async fn observe_deferred_bash_wait(
 /// (the task keeps running and delivers its completion later), off the
 /// executor and off the module loop's thread: promotion writes task metadata.
 pub(super) fn detach_held_bash_in_background(target: drain::BashDetachTarget, cancelled: bool) {
-    tokio::task::spawn_blocking(move || {
-        if target.server_completion
-            && (cancelled
-                || !target
-                    .registry
-                    .is_remote_task(&target.task_id, &target.session_id))
-        {
-            let _ = target.registry.kill(&target.task_id, &target.session_id);
-        } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
-            log::warn!(
-                "subc attach: could not hand bash task {} to the background after answering its call: {error}",
-                target.task_id
-            );
-        }
-        release_wait_registration(
-            &target.registry,
-            &target.session_id,
-            &target.task_id,
-            target.wait_mode,
+    tokio::task::spawn_blocking(move || detach_held_bash_sync(target, cancelled));
+}
+
+fn detach_held_bash_sync(target: drain::BashDetachTarget, cancelled: bool) {
+    if target.server_completion
+        && (cancelled
+            || !target
+                .registry
+                .is_remote_task(&target.task_id, &target.session_id))
+    {
+        let _ = target.registry.kill(&target.task_id, &target.session_id);
+    } else if let Err(error) = target.registry.promote(&target.task_id, &target.session_id) {
+        crate::slog_warn!(
+            "subc attach: bash background handoff failed task_id={:?} session={:?} error={:?}",
+            target.task_id,
+            target.session_id,
+            error
         );
-    });
+    }
+    release_wait_registration(
+        &target.registry,
+        &target.session_id,
+        &target.task_id,
+        target.wait_mode,
+    );
 }
 
 /// Answers the held bash calls the module loop must answer itself (see
@@ -1664,6 +1668,8 @@ async fn run_deferred_bash_wait(
                             &format_context,
                             repeat.clone(),
                             &claim,
+                            &task_id,
+                            &session_id,
                         )
                         .await;
                         break;
@@ -1716,6 +1722,8 @@ async fn run_deferred_bash_wait(
                             &format_context,
                             repeat.clone(),
                             &claim,
+                            &task_id,
+                            &session_id,
                         )
                         .await;
                         break;
@@ -1828,6 +1836,8 @@ async fn send_ready_bash_result(
     format_context: &crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     claim: &drain::BashCallClaim,
+    task_id: &str,
+    session_id: &str,
 ) {
     let fatal = response_is_fatal_panic(&result.response);
     if claim.try_claim_for_wait_task() {
@@ -1845,6 +1855,18 @@ async fn send_ready_bash_result(
             fatal,
         )
         .await;
+    } else if claim.claimed_by_deadline() && !result.response.success && !fatal {
+        // The deadline reply already exposed the task id. Keep a discarded
+        // nonfatal executor error visible without answering the request again.
+        let error = result
+            .response
+            .data
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or(&result.text);
+        crate::slog_warn!(
+            "subc attach: late bash result discarded after handoff task_id={task_id:?} session={session_id:?} error={error:?}"
+        );
     } else if claim.claimed_by_module_loop() {
         send_bash_deferred_completion(
             completion_tx,
@@ -2040,6 +2062,175 @@ mod grant_path_tests {
 
     use super::*;
 
+    #[test]
+    fn late_nonfatal_bash_error_after_handoff_logs_identity_without_another_reply() {
+        let (_dir, root) = super::super::test_support::test_root("late-nonfatal-log");
+        let ctx = super::super::test_support::test_ctx();
+        let claim = drain::BashCallClaim::default();
+        assert!(claim.claim_for_deadline_handoff());
+        let (tx, mut rx) = mpsc::channel(1);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            runtime.block_on(send_ready_bash_result(
+                &tx,
+                &DispatchPathMetrics::new(),
+                RouteChannel {
+                    channel: 1,
+                    epoch: 1,
+                },
+                116,
+                Flags::new(false, Priority::Interactive, false),
+                PROTOCOL_VERSION,
+                root,
+                "late-error".into(),
+                ToolCallResult {
+                    text: "late error".into(),
+                    response: Response::error(
+                        "late-error",
+                        "execution_failed",
+                        "late failure\nsecond line",
+                    ),
+                },
+                &ctx,
+                &crate::subc_format::FormatContext::default(),
+                None,
+                &claim,
+                "late-task",
+                "late-session",
+            ))
+        });
+        assert_eq!(lines.len(), 1, "one canonical warning: {lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.contains("late bash result discarded after handoff"),
+            "{line}"
+        );
+        assert!(line.contains("task_id=\"late-task\""), "{line}");
+        assert!(line.contains("session=\"late-session\""), "{line}");
+        assert!(
+            line.contains("error=\"late failure\\nsecond line\""),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "warning must fit one line: {line:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "handoff already answered and settled the request"
+        );
+    }
+
+    #[test]
+    fn failed_background_handoff_logs_identity_and_keeps_status_observable() {
+        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+
+        let (dir, _root) = super::super::test_support::test_root("detach-failure-log");
+        let ctx = super::super::test_support::test_ctx();
+        ctx.update_config(|config| {
+            config.project_root = Some(dir.path().into());
+            config.storage_dir = Some(dir.path().join("storage"));
+            config.sandbox.enabled = false;
+        });
+        let marker = dir.path().join("started");
+        let release = dir.path().join("release");
+        let _release_guard = DeferredWaitReleaseGuard(vec![release.clone()]);
+        let marker_path = marker.to_string_lossy().replace('\\', "/");
+        let release_path = release.to_string_lossy().replace('\\', "/");
+        let command = if cfg!(windows) {
+            format!("Set-Content -Path '{marker_path}' -Value started; while (-not (Test-Path '{release_path}')) {{ Start-Sleep -Milliseconds 20 }}; Write-Output 'handoff-finished'")
+        } else {
+            format!("printf started > '{marker_path}'; until [ -e '{release_path}' ]; do sleep 0.02; done; printf 'handoff-finished\\n'")
+        };
+        let session = "detach-log-session";
+        let request = RawRequest {
+            id: "detach-log".into(),
+            command: "bash".into(),
+            lsp_hints: None,
+            session_id: Some(session.into()),
+            params: json!({ "command": command, "timeout": 60000 }),
+        };
+        let spawned = running_bash_stub(request, &ctx);
+        assert!(spawned.success, "{spawned:?}");
+        let task_id = spawned.data["task_id"].as_str().unwrap().to_string();
+        let started_by = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < started_by,
+                "foreground command must actually start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let registry = ctx.bash_background();
+        registry.register_foreground_task(session, &task_id);
+        let target = drain::BashDetachTarget {
+            task_id: task_id.clone(),
+            session_id: session.into(),
+            wait_mode: false,
+            worker_session: false,
+            server_completion: false,
+            registry: registry.clone(),
+            request_id: "detach-log".into(),
+            ver: PROTOCOL_VERSION,
+            flags: Flags::new(false, Priority::Interactive, false),
+            format_context: crate::subc_format::FormatContext::default(),
+        };
+        let (_, lines) = crate::logging::capture_log_lines(|| {
+            with_task_io_fault(TaskIoFault::RunningEnospc, || {
+                detach_held_bash_sync(target, false)
+            })
+        });
+        let warnings: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("bash background handoff failed"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "one handoff warning: {lines:?}");
+        let line = warnings[0];
+        assert!(line.contains(&format!("task_id={task_id:?}")), "{line}");
+        assert!(line.contains("session=\"detach-log-session\""), "{line}");
+        assert!(
+            line.contains("error=\"failed to promote background task:"),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "warning must fit one line: {line:?}");
+
+        // A failed metadata write must not destroy the task id that the caller
+        // already received. Exercise the same status handler the caller can use.
+        let status_request = RawRequest {
+            id: "status-after-detach-error".into(),
+            command: "bash_status".into(),
+            lsp_hints: None,
+            session_id: Some(session.into()),
+            params: json!({ "task_id": task_id }),
+        };
+        let running = crate::commands::bash_status::handle(&status_request, &ctx);
+        assert!(running.success, "{running:?}");
+        assert_eq!(running.data["status"], "running", "{running:?}");
+        std::fs::write(&release, b"release").unwrap();
+        let completed_by = Instant::now() + Duration::from_secs(10);
+        let completed = loop {
+            let status = crate::commands::bash_status::handle(&status_request, &ctx);
+            assert!(status.success, "{status:?}");
+            if status.data["status"] == "completed" {
+                break status;
+            }
+            assert!(
+                Instant::now() < completed_by,
+                "command must finish after release: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(completed.data["exit_code"], 0, "{completed:?}");
+        let task = registry.task_for_test(&task_id).unwrap();
+        let state = task.state.lock().unwrap();
+        let notify = state.metadata.notify_on_completion;
+        let delivered = state.metadata.completion_delivered;
+        drop(state);
+        let notices = registry.drain_completions().len();
+        eprintln!("failed-detach observation: running_status={} terminal_status={} exit_code={} notify_on_completion={notify} completion_delivered={delivered} completion_notices={notices}",
+            running.data["status"], completed.data["status"], completed.data["exit_code"]);
+    }
+
     #[tokio::test]
     async fn late_promotion_fatal_signals_teardown_without_settling_hold_twice() {
         let (_dir, root) = super::super::test_support::test_root("late-promotion-fatal");
@@ -2069,9 +2260,14 @@ mod grant_path_tests {
             &crate::subc_format::FormatContext::default(),
             None,
             &claim,
+            "late-task",
+            "late-session",
         )
         .await;
-        let done = completion_rx.recv().await.expect("late fatal observation");
+        let done = tokio::time::timeout(Duration::from_secs(1), completion_rx.recv())
+            .await
+            .expect("late fatal must still reach the completion queue")
+            .expect("late fatal observation");
         assert!(done.fatal);
         assert!(done.result.is_none(), "handoff already answered the caller");
         assert!(!done.settles_hold, "handoff already settled its accounting");
