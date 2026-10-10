@@ -2584,6 +2584,27 @@ fn grouped_count(count: u64) -> String {
     result
 }
 
+fn format_indexing_rate(files_per_minute: f64) -> String {
+    let (rate, unit) = if files_per_minute >= 60.0 {
+        (files_per_minute / 60.0, "files/s")
+    } else if files_per_minute >= 1.0 {
+        (files_per_minute, "files/min")
+    } else {
+        (files_per_minute * 60.0, "files/h")
+    };
+    let magnitude = rate.abs().log10().floor() as i32;
+    let scale = 10_f64.powi(magnitude - 1);
+    let rounded = (rate / scale).round() * scale;
+    let precision = (1 - magnitude).max(0) as usize;
+    let formatted = format!("{rounded:.precision$}");
+    let formatted = if precision > 0 {
+        formatted.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &formatted
+    };
+    format!("~{formatted} {unit}")
+}
+
 fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> Option<String> {
     let running = indexing.running.len() + indexing.omitted.running;
     let queued = indexing.queued.len() + indexing.omitted.queued;
@@ -2598,9 +2619,9 @@ fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> 
             None if job.done == 0 => "preparing".to_owned(),
             None => format!("{} files (total measuring)", grouped_count(job.done)),
         };
-        let measured_rate = job.rate_per_minute.map(|per_minute| per_minute / 60.0);
-        let estimate = if let Some(per_second) = measured_rate {
-            let rate = format!("~{per_second:.3} files/s");
+        let measured_rate = job.rate_per_minute;
+        let estimate = if let Some(files_per_minute) = measured_rate {
+            let rate = format_indexing_rate(files_per_minute);
             let eta = if job.total.is_some() {
                 job.eta_seconds.map(|seconds| {
                     if seconds >= 3600.0 {
@@ -2860,7 +2881,7 @@ mod tests {
             },
         };
         assert_eq!(indexing_detail(&snapshot).as_deref(), Some(
-            "indexing: semantic view fill openclaw 1,280/31,705 files (~18 h, ~0.470 files/s) [embedding], 3 queued; 49 roots warming"));
+            "indexing: semantic view fill openclaw 1,280/31,705 files (~18 h, ~28 files/min) [embedding], 3 queued; 49 roots warming"));
         snapshot.running[0].total = None;
         snapshot.running[0].eta_seconds = None;
         snapshot.running[0].rate_per_minute = None;
@@ -2894,14 +2915,18 @@ mod tests {
         };
         let detail = indexing_detail(&snapshot).unwrap();
         assert!(detail.contains("total measuring"), "{detail}");
-        assert!(detail.contains("~0.470 files/s"), "{detail}");
+        assert!(detail.contains("~28 files/min"), "{detail}");
         assert_eq!(detail.matches('~').count(), 1, "{detail}");
         assert!(!detail.contains("?"), "{detail}");
 
-        let mut slow = snapshot;
-        slow.running[0].rate_per_minute = Some(0.2);
-        let detail = indexing_detail(&slow).unwrap();
-        assert!(detail.contains("~0.003 files/s"), "{detail}");
+        let mut varied = snapshot;
+        varied.running[0].rate_per_minute = Some(0.2);
+        let detail = indexing_detail(&varied).unwrap();
+        assert!(detail.contains("~12 files/h"), "{detail}");
+
+        varied.running[0].rate_per_minute = Some(720.0);
+        let detail = indexing_detail(&varied).unwrap();
+        assert!(detail.contains("~12 files/s"), "{detail}");
     }
 
     #[test]
