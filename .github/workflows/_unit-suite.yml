@@ -12,8 +12,8 @@ name: Unit suite
 #     e2e remains non-blocking (continue-on-error: true).
 #   strict=true  → ALL jobs gate. A failure in any of them fails the
 #     called-workflow's overall status, blocking downstream `needs:` jobs in
-#     the caller. It also builds every JS package. No caller sets it since the
-#     release stopped rerunning this suite.
+#     the caller. It also builds every JS package. tests.yml passes
+#     strict=false; nothing passes strict=true today.
 
 on:
   workflow_call:

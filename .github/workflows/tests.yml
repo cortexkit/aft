@@ -90,9 +90,8 @@ jobs:
   # Pushes to main build the `release` profile instead, so the shipped fat-LTO
   # binary shape is e2e-tested on every commit that lands. A main run starts
   # after main is already fast-forwarded, so it is off every critical path.
-  # (It was also meant to warm the release-profile cache for tag runs, back
-  # when release.yml reran this suite; the release builds now use their own
-  # cache keys.)
+  # Its cache does not serve release.yml: the release builds use their own
+  # cache keys.
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E

@@ -30,9 +30,8 @@ set -euo pipefail
 
 TAG=""
 # Full release span = CI gate + 6 platform builds + npm/crates/GitHub
-# publishes. It ran 60-90 min while the release also reran the test matrix;
-# 2100s (35m) expired mid-build during the v0.38.0 release, and 5400s (90m)
-# still leaves headroom for a cold build.
+# publishes. A 2100s (35m) limit once expired before a release finished
+# building; 5400s (90m) leaves room for cold builds.
 MAX_WAIT="${MAX_WAIT_SECONDS:-5400}"
 REPO="cortexkit/aft"
 INTERVAL=5

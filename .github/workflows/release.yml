@@ -196,8 +196,10 @@ jobs:
           codesign --verify --strict target/release/aft
           target/release/aft --version
 
-      # Package the split debug info (dSYM) as a sibling release asset; see
-      # build-darwin-x64 for why it goes through ditto.
+      # Package the split debug info (dSYM) as a sibling release asset, so a
+      # stripped binary's samples symbolicate. `ditto` dereferences the
+      # `aft.dSYM` symlink cargo emits before zipping, so the asset is
+      # self-contained.
       - name: Package dSYM
         run: |
           ditto target/release/aft.dSYM release-dsym/aft.dSYM

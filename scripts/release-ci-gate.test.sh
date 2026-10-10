@@ -198,7 +198,7 @@ gate "$LANDED"
 expect 0 "runs/103 (branch train/release-1.0.0, attempt 2) is green" "run rerun to green is releasable"
 
 # A green train run is enough even when the later main run of the same commit
-# was cancelled (what v0.59.0's commit carries).
+# was cancelled, a combination real release commits have had.
 reset_state
 write_runs "$(run_json 105 "$LANDED" main push completed cancelled 1)" \
   "$(run_json 104 "$LANDED" train/release-1.0.0 push completed success 1)"
