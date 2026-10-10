@@ -4036,6 +4036,11 @@ mod watcher_filter_tests {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let ctx = make_ctx_with_root(&root);
+        // Diagnostics totals count only after server discovery has recorded
+        // which language servers apply to the project; a context built
+        // without configure never runs discovery. Record an empty applicable
+        // set so the report published below is the whole project's answer.
+        ctx.lsp().store_empty_project_applicability_for_test();
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
         {
             let key = ServerKey {
@@ -5143,6 +5148,11 @@ mod watcher_filter_tests {
         std::fs::write(&file, "changed").unwrap();
 
         let ctx = make_ctx_with_root(&root);
+        // Diagnostics totals count only after server discovery has recorded
+        // which language servers apply to the project; a context built
+        // without configure never runs discovery. Record an empty applicable
+        // set so the report published below is the whole project's answer.
+        ctx.lsp().store_empty_project_applicability_for_test();
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
         // The bar renders only once every producer has reported; an empty
         // diagnostics publish is a proven zero, not a fabricated one. It is
@@ -5182,6 +5192,11 @@ mod watcher_filter_tests {
         std::fs::write(&file, "deleted").unwrap();
 
         let ctx = make_ctx_with_root(&root);
+        // Diagnostics totals count only after server discovery has recorded
+        // which language servers apply to the project; a context built
+        // without configure never runs discovery. Record an empty applicable
+        // set so the report published below is the whole project's answer.
+        ctx.lsp().store_empty_project_applicability_for_test();
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), true);
         {
             let key = ServerKey {

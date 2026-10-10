@@ -3179,6 +3179,15 @@ impl LspManager {
         &mut self.diagnostics
     }
 
+    /// Test-only: record that server discovery found no applicable language
+    /// servers for the project. Fixtures that publish reports straight into the
+    /// diagnostics store, without configure's discovery walk, use this so their
+    /// published reports count as the project-wide diagnostics answer.
+    #[doc(hidden)]
+    pub fn store_empty_project_applicability_for_test(&mut self) {
+        self.store_project_applicability(ApplicableServerSnapshot::default());
+    }
+
     #[doc(hidden)]
     pub fn post_edit_outcome_for_entry_for_test(
         key: ServerKey,
