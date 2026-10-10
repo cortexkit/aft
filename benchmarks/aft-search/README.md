@@ -502,6 +502,21 @@ commit message which change moved the rows and why it was the right direction.
 
 Re-records so far:
 
+- 2026-10-10, when rows `900035`-`900037` and `910013`-`910014` were added
+  (see Split query/pattern rows above). Recorded on macOS arm64 from a clean
+  release build of the unchanged engine at `bad57cf4e` (`aft 0.59.0`, binary
+  sha256 `b6ebfae631a7ad4faba05fc2a78828435c3b8ecebd04ed544587cacf2dd2df1a`),
+  in two steps on that binary: `--mode verify` with the old 93-row manifest
+  (its split pack bound from `bad57cf4e`), then `--mode record-reference
+  --manifest-changed --old-score <that replay> --base-ref bad57cf4e`. The 93
+  old rows are byte-equal to the previous reference in every replay, and two
+  recordings of the 98-row manifest on that binary are byte-equal row for
+  row, so the change is the new rows alone: answer ranks miss, 3 and 2 for
+  `900035`-`900037`, and miss for both split rows, with and without their
+  pattern. `paged` MRR@10 0.394892 -> 0.383248 (98 rows), census-weighted
+  MRR 0.382926 -> 0.379181, `wrong_lane_nl` 0.341026 -> 0.329167,
+  `split_query_pattern_fusion` 0.313889 -> 0.269048. Exact recall stayed
+  1.000 and concept recall 0.639423, re-measured in the recording run.
 - 2026-10-02, after train 271's ranking change `894133741` (search a
   hyphenated query as one literal) landed on `main`, together with the 17
   identifier rows `900018`–`900034` from `9aaef09d5` (see Definition,
