@@ -4713,8 +4713,10 @@ async fn drive_bash_worker_wait_limit_daemon(input: FakeDaemonInput) {
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
     for (corr, mode) in [(140_u64, "wait"), (141_u64, "block_to_completion")] {
+        let marker = root1.join(format!("worker-{mode}-started"));
+        let release = root1.join(format!("worker-{mode}-release"));
         let mut arguments = json!({
-            "command": "printf 'started\\n'; sleep 30",
+            "command": format!("{}; {}", print_line_command("started"), hold_bash_until_release_command(&marker, &release, "worker-done")),
             "foreground_orchestrate": true,
             "compressed": false,
         });
@@ -5060,7 +5062,7 @@ async fn drive_bash_watch_regex_pattern_daemon(input: FakeDaemonInput) {
         120,
         "bash",
         json!({
-            "command": "sleep 1; printf 'abc ready: 4242\\n'",
+            "command": print_line_command("abc ready: 4242"),
             "background": true,
             "foreground_orchestrate": true,
             "compressed": false,
@@ -5078,7 +5080,7 @@ async fn drive_bash_watch_regex_pattern_daemon(input: FakeDaemonInput) {
         .as_str()
         .unwrap_or_else(|| panic!("bash_watch status missing output preview: {status:?}"));
     assert!(
-        output.contains("ready: 4242"),
+        output.trim_end() == "abc ready: 4242",
         "unexpected bash_watch output: {output:?}"
     );
 
@@ -5316,7 +5318,12 @@ async fn drive_bash_promote_panic_daemon(input: FakeDaemonInput) {
     let frame = read_frame_timeout(&mut stream, "promote panic bash response").await;
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 116);
-    assert!(tool_result_is_error(&frame));
+    assert!(
+        tool_result_is_error(&frame),
+        "promote panic terminal: {:?}, body: {}",
+        frame.header,
+        String::from_utf8_lossy(&frame.body),
+    );
     let text = tool_result_text(&frame);
     assert!(
         text.contains("forced subc bash promote panic"),
@@ -8761,19 +8768,21 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
     .await;
     state.wait_until("in-flight heavy call started", |inner| inner.heavy_started);
 
-    // Two long foreground bash waits. Each writes a marker as it starts, then
-    // runs well past the terminal bound, then leaves its own sentinel.
+    // Keep both commands alive until their detached status has been checked;
+    // shell startup and frame handling must not consume a fixed sleep budget.
     let wait_started = root1.join("drain-wait-started");
     let wait_done = root1.join("drain-wait-done");
+    let wait_release = root1.join("drain-wait-release");
     let block_started = root1.join("drain-block-started");
     let block_done = root1.join("drain-block-done");
+    let block_release = root1.join("drain-block-release");
     send_tool_call(
         &mut stream,
         WAIT_CHANNEL,
         WAIT_CORR,
         "bash",
         json!({
-            "command": "printf s > drain-wait-started; sleep 6; printf d > drain-wait-done",
+            "command": hold_bash_until_done_command(&wait_started, &wait_release, &wait_done),
             "foreground_orchestrate": true,
             "wait": true,
             "timeout": 60_000,
@@ -8787,7 +8796,7 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
         BLOCK_CORR,
         "bash",
         json!({
-            "command": "printf s > drain-block-started; sleep 6; printf d > drain-block-done",
+            "command": hold_bash_until_done_command(&block_started, &block_release, &block_done),
             "foreground_orchestrate": true,
             "block_to_completion": true,
             "timeout": 60_000,
@@ -8953,6 +8962,8 @@ async fn drive_module_draining_releases_every_held_request_daemon(input: FakeDae
     assert_eq!(held, 0, "quiesced census: {line}");
 
     // The commands ran to completion and their completions are delivered.
+    std::fs::write(&wait_release, b"release").expect("release wait command");
+    std::fs::write(&block_release, b"release").expect("release block command");
     wait_for_file(&wait_done, "wait:true bash completion sentinel").await;
     wait_for_file(&block_done, "block_to_completion bash completion sentinel").await;
     drain_bg_completions_until(
@@ -9365,18 +9376,18 @@ async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaem
 
     // Two long foreground bash waits.
     let mut done_markers = Vec::new();
+    let mut release_markers = Vec::new();
     for (channel, corr) in WAIT_CHANNELS.into_iter().zip(WAIT_CORRS) {
         let started = root1.join(format!("credit-wait-{channel}-started"));
-        done_markers.push(root1.join(format!("credit-wait-{channel}-done")));
+        let done = root1.join(format!("credit-wait-{channel}-done"));
+        let release = root1.join(format!("credit-wait-{channel}-release"));
         send_tool_call(
             &mut stream,
             channel,
             corr,
             "bash",
             json!({
-                "command": format!(
-                    "printf s > credit-wait-{channel}-started; sleep 5; printf d > credit-wait-{channel}-done"
-                ),
+                "command": hold_bash_until_done_command(&started, &release, &done),
                 "foreground_orchestrate": true,
                 "wait": true,
                 "timeout": 60_000,
@@ -9386,6 +9397,8 @@ async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaem
         .await;
         ledger.open(channel, corr, "bash wait");
         wait_for_file(&started, "bash wait start marker").await;
+        done_markers.push(done);
+        release_markers.push(release);
     }
     pump_daemon_credits(
         &mut stream,
@@ -9427,6 +9440,9 @@ async fn drive_module_draining_closes_every_daemon_credit_daemon(input: FakeDaem
     // Let the cancelled job and the detached commands finish; none of them may
     // produce a second terminal.
     state.release_heavy();
+    for release in &release_markers {
+        std::fs::write(release, b"release").expect("release credit wait command");
+    }
     for marker in &done_markers {
         wait_for_file(marker, "detached bash completion sentinel").await;
     }
@@ -9473,13 +9489,14 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
 
     let started = root1.join("stuck-wait-started");
     let done = root1.join("stuck-wait-done");
+    let release = root1.join("stuck-wait-release");
     send_tool_call(
         &mut stream,
         WAIT_CHANNEL,
         WAIT_CORR,
         "bash",
         json!({
-            "command": "printf s > stuck-wait-started; sleep 6; printf d > stuck-wait-done",
+            "command": hold_bash_until_done_command(&started, &release, &done),
             "foreground_orchestrate": true,
             "wait": true,
             "timeout": 60_000,
@@ -9547,6 +9564,7 @@ async fn drive_module_draining_answers_stuck_bash_wait_daemon(input: FakeDaemonI
 
     // The command was detached, not killed, and its completion is delivered.
     assert!(!done.exists(), "the command should still be running");
+    std::fs::write(&release, b"release").expect("release stuck wait command");
     wait_for_file(&done, "detached bash completion sentinel").await;
     drain_bg_completions_until(
         &mut stream,
@@ -9586,13 +9604,14 @@ async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInpu
     bind_route1(&mut stream, &root1).await;
     let started = root1.join("cancel-wait-started");
     let done = root1.join("cancel-wait-done");
+    let release = root1.join("cancel-wait-release");
     send_tool_call(
         &mut stream,
         WAIT_CHANNEL,
         WAIT_CORR,
         "bash",
         json!({
-            "command": "printf s > cancel-wait-started; sleep 5; printf d > cancel-wait-done",
+            "command": hold_bash_until_done_command(&started, &release, &done),
             "foreground_orchestrate": true,
             "wait": true,
             "timeout": 60_000,
@@ -9634,6 +9653,7 @@ async fn drive_client_cancel_answers_held_bash_wait_daemon(input: FakeDaemonInpu
 
     // The command ran to completion as a background task, and its completion
     // is delivered to the session.
+    std::fs::write(&release, b"release").expect("release cancelled wait command");
     wait_for_file(&done, "cancelled wait's command completion sentinel").await;
     let mut delivered = None;
     for attempt in 0_u64..100 {
@@ -10278,17 +10298,39 @@ fn touch_command(path: &std::path::Path) -> String {
     format!("touch \"{}\"", shell_path(path))
 }
 
+fn print_line_command(text: &str) -> String {
+    if cfg!(windows) {
+        format!("Write-Output '{}'", text.replace('\'', "''"))
+    } else {
+        format!("printf '%s\\n' '{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+fn hold_bash_until_done_command(
+    marker: &std::path::Path,
+    release: &std::path::Path,
+    done: &std::path::Path,
+) -> String {
+    let hold = hold_bash_until_release_command(marker, release, "released");
+    if cfg!(windows) {
+        format!(
+            "{hold}; Set-Content -NoNewline -Path \"{}\" -Value done",
+            shell_path(done)
+        )
+    } else {
+        format!("{hold}; printf done > \"{}\"", shell_path(done))
+    }
+}
+
 fn hold_bash_until_release_command(
     marker: &std::path::Path,
     release: &std::path::Path,
     terminal_text: &str,
 ) -> String {
     if cfg!(windows) {
-        // Windows bash routes through the PowerShell wrapper, where POSIX
-        // `printf`/`until`/`sleep` do not exist - the marker would never be
-        // written and the hold could never release (fired as a 30s hang-catch
-        // timeout on Windows CI). Same pattern as bash_background_test.rs's
-        // cross_platform_hold_until_release_command.
+        // The Windows runner uses PowerShell, not a POSIX shell. Keep the
+        // command alive until the test releases it, even if frame handling is
+        // slower than the shell's startup.
         format!(
             "Set-Content -NoNewline -Path \"{}\" -Value started; $polls = 0; while ((-not (Test-Path \"{}\")) -and ($polls -lt 6000)) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (Test-Path \"{}\") {{ Write-Output '{}' }} else {{ Write-Output 'gate-timeout' }}",
             shell_path(marker),
