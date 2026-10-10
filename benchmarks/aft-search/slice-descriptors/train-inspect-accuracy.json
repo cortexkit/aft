@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "fenced_files": [
+    "crates/aft/src/subc_tool_schemas.json"
+  ],
+  "note": "aft_inspect accuracy slices: typed TypeScript liveness facts (namespace and export usage, dynamic imports, published executable targets) and a truthful, pageable aft_inspect (offset parameter; scoped calls keep diagnostics unless sections leave them out). Derived from git diff --name-only origin/main...HEAD against RANKING_FENCE_PREFIXES: the only fenced path is crates/aft/src/subc_tool_schemas.json, which changes aft_inspect's description and adds its offset parameter. aft_search's schema is untouched and no search ranking or routing code changes, so every benchmark row must stay byte-identical to the reference."
+}
