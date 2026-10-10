@@ -3259,7 +3259,8 @@ mod grant_path_tests {
     }
 
     fn short_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
-        inline_commit_then_sleep_stub(Duration::from_millis(300), req)
+        // Longer than the startup window below, shorter than INLINE_STARTUP_SETTLE.
+        inline_commit_then_sleep_stub(Duration::from_millis(1000), req)
     }
 
     fn stuck_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
@@ -3268,15 +3269,20 @@ mod grant_path_tests {
 
     #[tokio::test]
     async fn committed_inline_rewrite_answers_with_its_result_or_outcome_unknown() {
+        // The startup window must outlast executor admission on a loaded CI
+        // runner (an 80 ms window let a slow Windows runner refuse the call
+        // before the stub could commit), yet stay shorter than the stub's work,
+        // so the reply still has to come from the committed inline result.
+        const WINDOW_MS: u64 = 500;
         let mut call = startup_call(
             short_inline_stub,
-            80,
+            WINDOW_MS,
             "unused",
             Instant::now(),
             false,
             false,
         );
-        let done = first_reply(&mut call, Duration::from_millis(1200)).await;
+        let done = first_reply(&mut call, Duration::from_millis(3000)).await;
         let response = done.response_for_test();
         assert!(
             response.success,
@@ -3285,7 +3291,7 @@ mod grant_path_tests {
 
         let mut call = startup_call(
             stuck_inline_stub,
-            80,
+            WINDOW_MS,
             "unused",
             Instant::now(),
             false,
@@ -3293,7 +3299,7 @@ mod grant_path_tests {
         );
         let done = first_reply(
             &mut call,
-            INLINE_STARTUP_SETTLE + Duration::from_millis(500),
+            INLINE_STARTUP_SETTLE + Duration::from_millis(1500),
         )
         .await;
         let response = done.response_for_test();
