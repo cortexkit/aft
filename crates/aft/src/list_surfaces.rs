@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "subc_format.rs",
+        enclosing_item: "format_ast_search_capture",
+        location_or_primitive: "AST_CAPTURE_INLINE_CHAR_LIMIT .chars().take()",
+        reason: "long or multiline AST capture values are referenced by their line range in the matched excerpt with an ellipsized first-line character preview; no match or capture entries are omitted, and the complete values remain in the structured response",
+    },
+    ExclusionEntry {
         file: "bash_background/registry.rs",
         enclosing_item: "format_background_slot_refusal",
         location_or_primitive: "SLOT_REFUSAL_MAX_ROWS / SLOT_REFUSAL_COMMAND_CHARS .take()",
