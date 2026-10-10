@@ -18,7 +18,7 @@ const PRESETS_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_pre
 
 const REMOTE_PATH = path.join(REPO_ROOT, "crates", "aft", "src", "subc_tool_remote_schemas.json");
 const REMOTE_GUIDANCE =
-  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); the job sees exactly N CPUs, so ask for what the command uses: 2c for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.';
+  'When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output in the local worktree. Add `,Nc` to request N vCPUs (`linux,4c`); without it the job gets 2 vCPUs. The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.';
 
 const PLACEHOLDER = JSON.stringify({ type: "object" });
 
@@ -43,7 +43,7 @@ describe("subc tool schemas artifact", () => {
       expect((bash.properties as Record<string, unknown>).runon).toMatchObject({ type: "string" });
       expect((bash.properties as Record<string, unknown>).runon).toMatchObject({
         description:
-          'Run on the remote Linux build server: `linux`, optionally with an exact vCPU count such as `linux,4c`; add ",net" for outbound internet (offline by default).',
+          'Run on the remote Linux build server: `linux` (2 vCPUs), or `linux,Nc` for N vCPUs such as `linux,8c`; add ",net" for outbound internet (offline by default).',
       });
       expect((bash.description as string).split(REMOTE_GUIDANCE)).toHaveLength(2);
     }

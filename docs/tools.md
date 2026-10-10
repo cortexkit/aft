@@ -291,9 +291,9 @@ Returns combined stdout/stderr plus `exit_code`, `duration_ms`, truncation statu
 line, exactly as written (pipes, lists, environment prefixes and all), to the remote Linux
 build server (ck-motor, reached through the Subconscious daemon's `exec-remote/v1`). `runon:
 "linux,4c"` requests exactly four vCPUs; the runner refuses counts it cannot serve before the
-command starts. Without a count, AFT leaves the runner's existing default sizing behavior
-unchanged. Add `,net` for outbound internet: `linux,net`, `linux,4c,net` and `linux,net,4c`
-are accepted; remote jobs are offline by default. A plan's `default_demand` may include these
+command starts. Without a count, the job gets 2 vCPUs. Add `,net` for outbound internet:
+`linux,net`, `linux,4c,net` and `linux,net,4c` are accepted; remote jobs are offline by default. A plan's
+`default_demand` may include these
 options too. Duplicate options, unknown tokens and non-Linux platforms are refused by name
 before dispatch. It runs there under `bash -c` in the same working directory, with the same timeout
 and the same environment, minus the secret-shaped and AFT/CortexKit control variables AFT strips
@@ -306,6 +306,7 @@ Explicit whole-line `runon` also requires the user-only live safety switch
 hides and refuses `runon` without disabling legacy prefix routing.
 
 When remote runs are available, put `runon: "linux"` on build and test lines (cargo, bun test), including chains and pipes. Keep git, gh, interactive and file-editing commands local, and keep a line local if it needs macOS (Seatbelt, codesign, launchd, TCC, AppKit) or runs binaries built on this machine: a remote build leaves no binaries or target/ output here.
+The job sees exactly the CPUs it gets, so ask for what the command uses: 2c (the default) for a single test binary or script, 4c for `cargo check`/clippy on one crate, 8c for a workspace test suite, and 16c for a large release build.
 
 Who is offered `runon`:
 
