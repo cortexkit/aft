@@ -6839,7 +6839,11 @@ fn unscoped_rust_inspect_reports_a_compile_error_with_real_rust_analyzer() {
     assert!(
         diagnostic_sources_for(&response, "src/lib.rs")
             .iter()
-            .any(|(source, message)| source == "rustc" && message.contains("moved value")),
+            // Explicit inspect labels its compiler reports separately from LSP reports.
+            .any(|(source, message)| {
+                (source == "rustc" || source == "cargo check (aft_inspect)")
+                    && message.contains("moved value")
+            }),
         "{response:#}"
     );
 }
