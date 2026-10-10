@@ -602,7 +602,7 @@ describe("AFT Pi tools (real Pi RPC)", () => {
       );
 
       const importTexts = eventsForTool(events, "aft_import").map(resultText);
-      expect(importTexts.some((text) => text.includes("added node:path"))).toBe(true);
+      expect(importTexts.some((text) => text.includes("added join"))).toBe(true);
       expect(importTexts.some((text) => text.includes("organized"))).toBe(true);
       expect(await readFile(join(env.workdir, "import-add.ts"), "utf8")).toContain("node:path");
       expect(await readFile(join(env.workdir, "import-organize.ts"), "utf8")).toContain(
