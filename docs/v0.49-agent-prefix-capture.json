@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+  "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+      "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+      "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -1073,7 +1073,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+      "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -2053,7 +2053,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+      "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2244,7 +2244,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+      "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -3226,7 +3226,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "23628aa0d4b8f72e3acd7e0ddeced1b102760ecc",
+      "source_commit": "49bb7961afa70da37ef30e18c7dc4165c107e57a",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
