@@ -2590,10 +2590,7 @@ fn extract_ts_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
 
         // Arrow/function expression declarator
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
-            // Include the declaration keyword and semicolon, not just its initializer.
-            let range_node = arrow_decl_node
-                .and_then(|node| node.parent())
-                .unwrap_or(def_node);
+            let range_node = arrow_decl_node.unwrap_or(def_node);
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,
@@ -2918,10 +2915,7 @@ fn extract_js_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sy
         }
 
         if let (Some(name_node), Some(def_node)) = (arrow_name_node, arrow_def_node) {
-            // Include the declaration keyword and semicolon, not just its initializer.
-            let range_node = arrow_decl_node
-                .and_then(|node| node.parent())
-                .unwrap_or(def_node);
+            let range_node = arrow_decl_node.unwrap_or(def_node);
             symbols.push(Symbol {
                 name: node_text(source, &name_node).to_string(),
                 kind: SymbolKind::Function,

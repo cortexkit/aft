@@ -18,6 +18,45 @@ fn send(aft: &mut AftProcess, request: serde_json::Value) -> serde_json::Value {
 }
 
 #[test]
+fn outline_arrow_consts_keep_declarator_ranges() {
+    let dir = TempDir::new().unwrap();
+    let source = "/** Format reset. */\nexport const formatReset = () => 1;\nfunction outer() {\n  /** Nested reset. */\n  const nestedReset = () => 2;\n}\n";
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+    for extension in ["ts", "tsx", "js"] {
+        let file = write_file(dir.path(), &format!("ranges.{extension}"), source);
+        let response = send(
+            &mut aft,
+            json!({"id":"arrow-ranges", "command":"outline", "file":file}),
+        );
+        assert_eq!(response["success"], true, "{response}");
+        let text = response["text"].as_str().unwrap();
+        for (name, line_span, line, start_col, end_col) in [
+            ("formatReset", "2:2", 1, 13, 34),
+            ("nestedReset", "5:5", 4, 8, 29),
+        ] {
+            let entry = text.lines().find(|entry| entry.contains(name)).unwrap();
+            assert!(entry.ends_with(line_span), "{extension}: {entry}");
+            let symbols = aft::parser::FileParser::new()
+                .extract_symbols(&file)
+                .unwrap();
+            let symbol = symbols.iter().find(|symbol| symbol.name == name).unwrap();
+            assert_eq!(
+                symbol.range,
+                aft::symbols::Range {
+                    start_line: line,
+                    start_col,
+                    end_line: line,
+                    end_col,
+                },
+                "{extension}: {name}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn outline_directory_and_array_match_real_structure_golden() {
     let dir = TempDir::new().unwrap();
     let files = [

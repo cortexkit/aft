@@ -179,7 +179,6 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let target = &filtered[0].symbol;
-    let original_range = target.range.clone();
 
     // Read file content
     let source = match std::fs::read_to_string(&path) {
@@ -189,27 +188,29 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    // Convert symbol range to byte offsets
-    let start_byte =
-        edit::line_col_to_byte(&source, target.range.start_line, target.range.start_col);
-    let end_byte = edit::line_col_to_byte(&source, target.range.end_line, target.range.end_col);
-
-    if operation == "replace" || operation == "delete" {
-        match has_multiple_declarators(&path, &source, &original_range, end_byte) {
-            Ok(true) => {
-                return Response::error(
-                    &req.id,
-                    "invalid_request",
-                    format!(
-                        "edit_symbol: cannot {} symbol '{}' because its declaration contains multiple declarators",
-                        operation, symbol_name
-                    ),
-                );
-            }
-            Ok(false) => {}
+    let symbol_end_byte =
+        edit::line_col_to_byte(&source, target.range.end_line, target.range.end_col);
+    let (original_range, multiple_declarators) =
+        match callable_declaration_edit_range(&path, &source, &target.range, symbol_end_byte) {
+            Ok(resolved) => resolved,
             Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
-        }
+        };
+
+    if (operation == "replace" || operation == "delete") && multiple_declarators {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            format!(
+                "edit_symbol: cannot {} symbol '{}' because its declaration contains multiple declarators",
+                operation, symbol_name
+            ),
+        );
     }
+
+    // Convert the edit-specific range to byte offsets.
+    let start_byte =
+        edit::line_col_to_byte(&source, original_range.start_line, original_range.start_col);
+    let end_byte = edit::line_col_to_byte(&source, original_range.end_line, original_range.end_col);
 
     // Apply operation
     let replacement_content = if operation == "replace" {
@@ -462,43 +463,57 @@ fn whole_line_removal_range(source: &str, start_byte: usize, end_byte: usize) ->
     }
 }
 
-fn has_multiple_declarators(
+fn callable_declaration_edit_range(
     path: &Path,
     source: &str,
     range: &Range,
     end_byte: usize,
-) -> Result<bool, crate::error::AftError> {
-    use crate::parser::{detect_language, node_range_with_decorators, FileParser, LangId};
+) -> Result<(Range, bool), crate::error::AftError> {
+    use crate::parser::{
+        detect_language, node_range, node_range_with_decorators, FileParser, LangId,
+    };
 
     let Some(lang @ (LangId::TypeScript | LangId::Tsx | LangId::JavaScript)) =
         detect_language(path)
     else {
-        return Ok(false);
+        return Ok((range.clone(), false));
     };
     let tree = FileParser::parse_source(path, source, lang)?;
-    // The range may start at a doc comment outside the declaration. Its last
-    // byte still belongs to the declaration, even when an export wraps it.
     let mut node = tree
         .root_node()
         .descendant_for_byte_range(end_byte.saturating_sub(1), end_byte);
     while let Some(current) = node {
-        if matches!(
-            current.kind(),
-            "lexical_declaration" | "variable_declaration"
-        ) {
-            // Only a symbol owning this entire statement can replace it; a
-            // callable object property must not be mistaken for its container.
-            if node_range_with_decorators(&current, source, lang) == *range {
-                let mut cursor = current.walk();
-                return Ok(current
+        if current.kind() == "variable_declarator"
+            && node_range(&current) == *range
+            && current.child_by_field_name("value").is_some_and(|value| {
+                matches!(
+                    value.kind(),
+                    "arrow_function" | "function_expression" | "generator_function"
+                )
+            })
+        {
+            if let Some(declaration) = current.parent().filter(|parent| {
+                matches!(
+                    parent.kind(),
+                    "lexical_declaration" | "variable_declaration"
+                )
+            }) {
+                let mut cursor = declaration.walk();
+                let multiple_declarators = declaration
                     .named_children(&mut cursor)
                     .filter(|child| child.kind() == "variable_declarator")
                     .count()
-                    > 1);
+                    > 1;
+                // Expand only the edit range so navigation and semantic chunking
+                // retain the parser's symbol ranges. Include export wrappers and docs.
+                return Ok((
+                    node_range_with_decorators(&declaration, source, lang),
+                    multiple_declarators,
+                ));
             }
-            return Ok(false);
+            break;
         }
         node = current.parent();
     }
-    Ok(false)
+    Ok((range.clone(), false))
 }
