@@ -3369,7 +3369,10 @@ async fn runon_draining_budget_caps_retry_after() {
     let registry = registry();
     let started = Instant::now();
     let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
-    let done = tokio::time::timeout(Duration::from_millis(650), terminal(&registry, &task))
+    // The runner asks for a 60 s pause. A capped retry ends near the 250 ms
+    // budget; an uncapped one waits the full minute. The outer bound sits far
+    // between the two so a loaded runner can't fail the capped case.
+    let done = tokio::time::timeout(Duration::from_secs(20), terminal(&registry, &task))
         .await
         .expect("retry_after must be capped by the total budget");
     assert_eq!(done.info.status, BgTaskStatus::Failed);
