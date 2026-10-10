@@ -133,6 +133,7 @@ impl BashHoldPhase {
 const CLAIM_UNCLAIMED: u8 = 0;
 const CLAIM_WAIT_TASK: u8 = 1;
 const CLAIM_MODULE_LOOP: u8 = 2;
+const CLAIM_DEADLINE: u8 = 3;
 
 /// Decides, exactly once, who answers one held bash call.
 ///
@@ -150,6 +151,19 @@ pub(super) struct BashCallClaim {
 }
 
 impl BashCallClaim {
+    /// Reserves the answer for deadline handoff. Queued polls must not finalize
+    /// a second result after the handoff has observed and answered the call.
+    pub(super) fn claim_for_deadline_handoff(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CLAIM_UNCLAIMED,
+                CLAIM_DEADLINE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
     /// Takes an unclaimed answer without replacing a poll or promotion that
     /// already owns it. Deadline handoff uses this to preserve executor errors.
     pub(super) fn try_claim_for_wait_task(&self) -> bool {
@@ -623,6 +637,33 @@ pub(super) fn module_draining_response(request_id: &str, what: &str) -> Response
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_handoff_cannot_be_reclaimed_by_poll_or_promotion() {
+        let claim = BashCallClaim::default();
+        assert!(claim.claim_for_deadline_handoff());
+        assert!(
+            !claim.claim_for_wait_task(),
+            "a late poll must not finalize again"
+        );
+        assert!(
+            !claim.try_claim_for_wait_task(),
+            "a queued promotion must not run"
+        );
+        assert!(
+            !claim.claim_for_module_loop(),
+            "drain must not answer again"
+        );
+        assert!(
+            !claim.claim_for_deadline_handoff(),
+            "handoff must answer once"
+        );
+
+        let claimed_promotion = BashCallClaim::default();
+        assert!(claimed_promotion.try_claim_for_wait_task());
+        assert!(!claimed_promotion.claim_for_deadline_handoff());
+        assert!(claimed_promotion.claim_for_wait_task());
+    }
 
     #[test]
     fn census_line_lists_counts_and_oldest_age_per_kind() {

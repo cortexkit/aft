@@ -1058,7 +1058,7 @@ pub(super) fn submit_deferred_bash(
                     biased;
                     _ = &mut wait_future => {}
                     _ = tokio::time::sleep_until(reply_deadline.into()), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
-                        if claim.try_claim_for_wait_task() {
+                        if claim.claim_for_deadline_handoff() {
                             let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session));
                             let result = finalized_bash_result(response, &spawn_ctx, &deadline_target.session_id, &deadline_target.format_context, false, repeat_for_deadline);
                             detach_held_bash_in_background(deadline_target, false);
