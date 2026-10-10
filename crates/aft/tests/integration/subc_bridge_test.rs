@@ -3393,19 +3393,44 @@ fn subc_bridge_bash_promote_failure_is_normal_tool_error() {
 
 #[test]
 fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
+    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let started = probe.path().join("started");
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promote_panic_triggers_fatal_teardown",
         Duration::from_secs(45),
         || {
-            vec![
-                set_test_foreground_wait_ms(200),
-                set_test_force_bash_promote_panic(),
-                // Keep the executor's claimed promotion unresolved beyond the
-                // reply backstop, so the test also exercises panic delivery races.
-                set_test_env("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS", "500"),
-            ]
+            let mut guards = started_promotion_env(&started);
+            guards.push(set_test_force_bash_promote_panic());
+            guards
         },
         drive_bash_promote_panic_daemon,
+        |_, _, _| {},
+    );
+}
+
+fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
+    vec![
+        set_test_foreground_wait_ms(200),
+        // Delay the job that moves foreground bash to background after it starts,
+        // beyond the foreground wait plus reply timer. The marker distinguishes
+        // a running job from one merely queued behind a writer.
+        set_test_env("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS", "3000"),
+        set_test_env(
+            "AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE",
+            started.to_str().expect("probe path"),
+        ),
+    ]
+}
+
+#[test]
+fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
+    let probe = tempfile::tempdir().expect("promotion probe dir");
+    let started = probe.path().join("started");
+    run_subc_bridge_test_with_env(
+        "subc_bridge_bash_started_promotion_hands_off_before_transport_deadline",
+        Duration::from_secs(45),
+        || started_promotion_env(&started),
+        |input| drive_started_promotion_daemon(input, false),
         |_, _, _| {},
     );
 }
@@ -5302,12 +5327,17 @@ async fn drive_bash_promote_failure_daemon(input: FakeDaemonInput) {
 }
 
 async fn drive_bash_promote_panic_daemon(input: FakeDaemonInput) {
+    drive_started_promotion_daemon(input, true).await;
+}
+
+async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bool) {
     let FakeDaemonSession {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
     let marker = root1.join("promote-panic-started");
     let release = root1.join("promote-panic-release");
+    let sent_at = Instant::now();
     send_tool_call(
         &mut stream,
         1,
@@ -5320,29 +5350,54 @@ async fn drive_bash_promote_panic_daemon(input: FakeDaemonInput) {
         }),
     )
     .await;
-    let frame = read_frame_timeout(&mut stream, "promote panic bash response").await;
+    let probe = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE").expect("promotion probe");
+    wait_for_file(
+        std::path::Path::new(&probe),
+        "executor promotion start marker",
+    )
+    .await;
+    let remaining = Duration::from_secs(2).saturating_sub(sent_at.elapsed());
+    let frame = read_frame_within(&mut stream, remaining, "started promotion deadline handoff")
+        .await.expect("a started promotion must not hold its reply past the 2s test bound (25s transport budget)");
     std::fs::write(&release, b"release").expect("release panic command");
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 116);
     assert!(
-        tool_result_is_error(&frame),
-        "promote panic terminal: {:?}, body: {}",
+        !tool_result_is_error(&frame),
+        "promotion handoff terminal: {:?}, body: {}",
         frame.header,
         String::from_utf8_lossy(&frame.body),
     );
     let text = tool_result_text(&frame);
     assert!(
-        text.contains("forced subc bash promote panic"),
-        "expected promote panic text, got {text:?}"
+        text.contains("promoted to background"),
+        "expected deadline handoff, got {text:?}"
     );
 
-    let route_goodbye = read_any_frame_timeout(&mut stream, "promote panic route goodbye").await;
+    if !expect_fatal {
+        // This read cannot finish until the background-promotion job leaves the
+        // executor. A duplicate bash reply would carry correlation 116 rather
+        // than this read's 117 and fail the assertion below.
+        send_tool_call(&mut stream, 1, 117, "echo", json!({})).await;
+        let next = read_frame_timeout(&mut stream, "read after promotion completes").await;
+        assert_eq!(next.header.ty, FrameType::Response);
+        assert_eq!(
+            next.header.corr, 117,
+            "promotion must not answer a second time"
+        );
+        send_connection_goodbye(&mut stream).await;
+        return;
+    }
+
+    // The handed-off command may complete before the delayed panic. Its normal
+    // background pushes do not replace either ordered fatal Goodbye.
+    let route_goodbye = read_frame_timeout(&mut stream, "late promote panic route goodbye").await;
     assert_eq!(route_goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(route_goodbye.header.channel, 1);
     assert_eq!(route_goodbye.header.corr, 116);
 
     let connection_goodbye =
-        read_any_frame_timeout(&mut stream, "promote panic connection goodbye").await;
+        read_frame_timeout(&mut stream, "promote panic connection goodbye").await;
     assert_eq!(connection_goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(connection_goodbye.header.channel, 0);
 }

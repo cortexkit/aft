@@ -164,8 +164,9 @@ impl BashCallClaim {
             .is_ok()
     }
 
-    /// Takes an unclaimed answer without replacing a poll or promotion that
-    /// already owns it. Deadline handoff uses this to preserve executor errors.
+    /// Reserves the caller's single terminal response for a ready executor result.
+    /// The task-state and registry locks, storage writes and status formatting
+    /// have already finished, so a blocked job cannot prevent the deadline reply.
     pub(super) fn try_claim_for_wait_task(&self) -> bool {
         self.state
             .compare_exchange(
@@ -210,6 +211,17 @@ impl BashCallClaim {
 
     pub(super) fn claimed_by_module_loop(&self) -> bool {
         self.state.load(Ordering::SeqCst) == CLAIM_MODULE_LOOP
+    }
+
+    pub(super) fn answered_elsewhere(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::SeqCst),
+            CLAIM_MODULE_LOOP | CLAIM_DEADLINE
+        )
+    }
+
+    pub(super) fn claimed_by_deadline(&self) -> bool {
+        self.state.load(Ordering::SeqCst) == CLAIM_DEADLINE
     }
 
     fn request_cancel(&self) {
@@ -648,7 +660,7 @@ mod tests {
         );
         assert!(
             !claim.try_claim_for_wait_task(),
-            "a queued promotion must not run"
+            "a completed promotion must not answer again"
         );
         assert!(
             !claim.claim_for_module_loop(),
