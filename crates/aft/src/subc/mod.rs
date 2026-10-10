@@ -228,8 +228,8 @@ pub use self::wire::SubcError;
 
 /// Lifecycle milestones emitted only by the dedicated subc integration-test runner.
 ///
-/// Production entry points never install a probe, so these notifications cannot
-/// affect routing or delivery behavior.
+/// Production entry points never install a probe. Tests may also arm a one-shot
+/// turn-boundary rendezvous to arrange queued work without scheduling delays.
 #[doc(hidden)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SubcLifecycleEvent {
@@ -252,6 +252,14 @@ pub enum SubcLifecycleEvent {
         task_id: String,
         session_id: String,
     },
+    ReliablePushTurnHeld,
+    RouteBindCompletionQueued {
+        corr: u64,
+    },
+    RouteBindAckQueued {
+        corr: u64,
+        reliable_push_batches: u64,
+    },
     /// One drain census, exactly as logged: `held` is the line's `held` figure
     /// (on the `released` line it excludes the self-detaching bash waits),
     /// and `counts` breaks every route-held request down by kind.
@@ -263,17 +271,95 @@ pub enum SubcLifecycleEvent {
     },
 }
 
-/// Test-only observer for the detach/rebind lifecycle.
+/// Test-only observer and rendezvous for the frame-loop lifecycle.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct SubcTestLifecycleProbe {
     events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>,
+    bind_priority: Arc<StdMutex<Option<RouteBindPriorityProbe>>>,
+}
+
+struct RouteBindPriorityProbe {
+    corr: u64,
+    reliable_push_batches: u64,
+    batches_at_arrival: Option<u64>,
+    release_turn: Option<oneshot::Receiver<()>>,
 }
 
 impl SubcTestLifecycleProbe {
     #[doc(hidden)]
     pub fn new(events_tx: mpsc::UnboundedSender<SubcLifecycleEvent>) -> Self {
-        Self { events_tx }
+        Self {
+            events_tx,
+            bind_priority: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    /// Hold the next turn that drains reliable pushes at its end. Releasing the
+    /// returned sender lets the next turn see work queued during the rendezvous.
+    #[doc(hidden)]
+    pub fn hold_reliable_push_turn_for_test(&self, corr: u64) -> oneshot::Sender<()> {
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.bind_priority.lock().expect("bind priority probe lock") =
+            Some(RouteBindPriorityProbe {
+                corr,
+                reliable_push_batches: 0,
+                batches_at_arrival: None,
+                release_turn: Some(release_rx),
+            });
+        release_tx
+    }
+
+    fn reliable_push_batch_drained(&self, processed: usize) {
+        if processed > 0 {
+            if let Some(priority) = self
+                .bind_priority
+                .lock()
+                .expect("bind priority probe lock")
+                .as_mut()
+            {
+                priority.reliable_push_batches += 1;
+            }
+        }
+    }
+
+    async fn hold_reliable_push_turn(&self) {
+        let release = self
+            .bind_priority
+            .lock()
+            .expect("bind priority probe lock")
+            .as_mut()
+            .filter(|priority| priority.reliable_push_batches > 0)
+            .and_then(|priority| priority.release_turn.take());
+        if let Some(release) = release {
+            let _ = self
+                .events_tx
+                .send(SubcLifecycleEvent::ReliablePushTurnHeld);
+            let _ = release.await;
+        }
+    }
+
+    fn route_bind_completion_queued(&self, corr: u64) {
+        let mut guard = self.bind_priority.lock().expect("bind priority probe lock");
+        if let Some(priority) = guard.as_mut().filter(|priority| priority.corr == corr) {
+            priority.batches_at_arrival = Some(priority.reliable_push_batches);
+            let _ = self
+                .events_tx
+                .send(SubcLifecycleEvent::RouteBindCompletionQueued { corr });
+        }
+    }
+
+    fn route_bind_ack_queued(&self, corr: u64) {
+        let guard = self.bind_priority.lock().expect("bind priority probe lock");
+        if let Some(priority) = guard.as_ref().filter(|priority| priority.corr == corr) {
+            let batches_at_arrival = priority
+                .batches_at_arrival
+                .expect("bind completion arrival observed");
+            let _ = self.events_tx.send(SubcLifecycleEvent::RouteBindAckQueued {
+                corr,
+                reliable_push_batches: priority.reliable_push_batches - batches_at_arrival,
+            });
+        }
     }
 
     fn attach_decision(&self, attempt: u32, will_retry: bool) {
@@ -4628,7 +4714,7 @@ where
         // another lossy enqueue.
         let overflow_batch = lossy_overflow.drain();
         if !overflow_batch.is_empty() {
-            let (_, deferred) = push::drain_reliable_push_turn(
+            let (processed, deferred) = push::drain_reliable_push_turn(
                 &writer_tx,
                 &dispatch_path_metrics,
                 &routes,
@@ -4644,6 +4730,9 @@ where
                 None,
                 lifecycle_probe.as_ref(),
             );
+            if let Some(probe) = lifecycle_probe.as_ref() {
+                probe.reliable_push_batch_drained(processed);
+            }
             if deferred {
                 tokio::task::yield_now().await;
             }
@@ -5197,7 +5286,7 @@ where
                 // Reliable Push frames are FIFO and must-deliver, but draining an
                 // unbounded burst in one current-thread turn can starve RouteBind
                 // completions. The budget defers excess frames, never drops them.
-                let (_, deferred) = push::drain_reliable_push_turn(
+                let (processed, deferred) = push::drain_reliable_push_turn(
                     &writer_tx,
                     &dispatch_path_metrics,
                     &routes,
@@ -5213,6 +5302,9 @@ where
                     Some((root_id, frame)),
                     lifecycle_probe.as_ref(),
                 );
+                if let Some(probe) = lifecycle_probe.as_ref() {
+                    probe.reliable_push_batch_drained(processed);
+                }
                 if deferred {
                     tokio::task::yield_now().await;
                 }
@@ -5221,7 +5313,7 @@ where
                 // When both push lanes have work, handle a small reliable slice before lossy work.
                 // That ordering lets completed task ids suppress stale BashLongRunning frames.
                 // The slice stays bounded so reliable bursts cannot monopolize this loop turn.
-                let (_, deferred) = push::drain_reliable_push_turn(
+                let (processed, deferred) = push::drain_reliable_push_turn(
                     &writer_tx,
                     &dispatch_path_metrics,
                     &routes,
@@ -5237,6 +5329,9 @@ where
                     None,
                     lifecycle_probe.as_ref(),
                 );
+                if let Some(probe) = lifecycle_probe.as_ref() {
+                    probe.reliable_push_batch_drained(processed);
+                }
                 if deferred {
                     tokio::task::yield_now().await;
                 }
@@ -5455,6 +5550,9 @@ where
                 }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
             }
+        }
+        if let Some(probe) = lifecycle_probe.as_ref() {
+            probe.hold_reliable_push_turn().await;
         }
     };
 
@@ -6144,6 +6242,9 @@ async fn handle_route_bind_completion(
     )
     .map_err(SubcError::FrameBuild)?;
     send_reliable_writer_frame(tx, metrics, response, "RouteBindAck").await?;
+    if let Some(probe) = lifecycle_probe {
+        probe.route_bind_ack_queued(completion.corr);
+    }
     start_post_ack_database_open(executor, &completion.bind_root_id);
     queue_post_bind_configure_and_completion_maintenance(&completion.bind_root_id, live_roots);
     let replayed = push::replay_buffered_push_frames(
@@ -6706,6 +6807,7 @@ async fn handle_control_request(
             let completion_corr = frame.header.corr;
             let completion_flags = frame.header.flags;
             let completion_metrics = Arc::clone(metrics);
+            let completion_probe = lifecycle_probe.cloned();
             tokio::spawn(async move {
                 let _response_task = ResponseTaskGuard::new(&completion_metrics);
                 let configure_response =
@@ -6737,6 +6839,8 @@ async fn handle_control_request(
                         "subc attach: dropped RouteBind completion for route {} after loop exit",
                         completion_route_channel
                     );
+                } else if let Some(probe) = completion_probe {
+                    probe.route_bind_completion_queued(completion_corr);
                 }
             });
 
@@ -10961,6 +11065,33 @@ mod tests {
         test_root, wait_for_actor_root_count, wait_for_watcher_count,
     };
     use super::*;
+
+    #[test]
+    fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood_probe() {
+        for batches_after_arrival in [0, 1] {
+            let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+            let probe = SubcTestLifecycleProbe::new(events_tx);
+            let _release = probe.hold_reliable_push_turn_for_test(19);
+            probe.reliable_push_batch_drained(RELIABLE_PUSH_DRAIN_BUDGET);
+            probe.route_bind_completion_queued(19);
+            probe.reliable_push_batch_drained(0);
+            for _ in 0..batches_after_arrival {
+                probe.reliable_push_batch_drained(RELIABLE_PUSH_DRAIN_BUDGET);
+            }
+            probe.route_bind_ack_queued(19);
+            assert_eq!(
+                events_rx.try_recv().unwrap(),
+                SubcLifecycleEvent::RouteBindCompletionQueued { corr: 19 }
+            );
+            assert_eq!(
+                events_rx.try_recv().unwrap(),
+                SubcLifecycleEvent::RouteBindAckQueued {
+                    corr: 19,
+                    reliable_push_batches: batches_after_arrival,
+                }
+            );
+        }
+    }
     use crate::bash_background::BgTaskStatus;
 
     #[tokio::test]

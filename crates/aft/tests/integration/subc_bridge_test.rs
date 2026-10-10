@@ -64,6 +64,7 @@ pub(super) struct FakeDaemonInput {
     pub(super) executor: Arc<Executor>,
     pub(super) user_config_path: std::path::PathBuf,
     pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
+    lifecycle_probe: Option<SubcTestLifecycleProbe>,
 }
 
 struct InitialAttachInput {
@@ -425,11 +426,6 @@ impl BridgeState {
     fn slow_configure_started_count(&self) -> usize {
         let guard = self.inner.lock().expect("bridge state lock");
         guard.slow_configure_started
-    }
-
-    fn slow_configure_finished_count(&self) -> usize {
-        let guard = self.inner.lock().expect("bridge state lock");
-        guard.slow_configure_finished
     }
 
     fn wait_for_slow_configure_finished(&self, expected: usize) {
@@ -1729,6 +1725,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let callgraph_root_path = roots.callgraph_root.path().to_path_buf();
     let callgraph_file_path = roots.callgraph_file.clone();
     let user_config_path_for_daemon = user_config_path.clone();
+    let lifecycle_probe_for_daemon = lifecycle_probe.clone();
     let daemon = thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1754,6 +1751,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     executor: executor_for_daemon,
                     user_config_path: user_config_path_for_daemon,
                     lifecycle_events,
+                    lifecycle_probe: lifecycle_probe_for_daemon,
                 }),
             )
             .await
@@ -2308,11 +2306,12 @@ fn subc_bridge_heavy_response_egress_is_root_epoch_independent() {
 
 #[test]
 fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood() {
-    run_subc_bridge_test(
+    run_subc_bridge_test_with_dispatch_and_lifecycle_probe(
         "subc_bridge_routebind_ack_is_prioritized_over_reliable_flood",
         Duration::from_secs(60),
         drive_routebind_priority_daemon,
         |_, _, _| {},
+        bridge_dispatch,
     );
 }
 
@@ -3966,6 +3965,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
         executor,
         user_config_path: _,
         lifecycle_events,
+        lifecycle_probe: _,
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
     authenticate_server(
@@ -6559,13 +6559,17 @@ async fn drive_heavy_response_egress_is_root_epoch_independent_daemon(input: Fak
 }
 
 async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
+    let probe = input.lifecycle_probe.clone().expect("frame-loop probe");
     let FakeDaemonSession {
         mut stream,
         root1,
         slow_root,
         state,
+        executor,
+        lifecycle_events,
         ..
     } = open_fake_daemon_session(input).await;
+    let mut events = lifecycle_events.expect("frame-loop events");
     bind_route1(&mut stream, &root1).await;
     send_route_bind(&mut stream, 8, 18, &slow_root).await;
     expect_route_bind_ack(&mut stream, 18).await;
@@ -6586,29 +6590,9 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         inner.slow_configure_started > slow_bind_base
     });
 
+    let release_turn = probe.hold_reliable_push_turn_for_test(19);
     let flood_prefix = "routebind-priority-flood";
-    // The flood must comfortably exceed ACK_AFTER_FINISH_PUSH_BOUND or the
-    // assertion goes vacuous (a broken priority path parks the ack behind the
-    // ENTIRE flood, so the bound only means something while it is well below
-    // the flood size).
     let flood_count = 1024_u64;
-    const TEST_WRITER_QUEUE_CAPACITY: u64 = 256;
-    const TEST_RELIABLE_PUSH_DRAIN_BUDGET: u64 = 32;
-    // The counting baseline is the CONFIGURE-FINISHED flag, not the release:
-    // release -> finished crosses two thread wakes (configure thread, executor
-    // worker) whose scheduling latency is unbounded on a contended runner — a
-    // hot frame loop on a 2-core CI box can drain the entire remaining flood
-    // before those threads get a core (observed: ack behind 511/512 on
-    // Windows CI). Frames counted after the finished flag are loop-owned
-    // work: completion channel handoff, pre-turn bind drain, and the FIFO
-    // writer queue the ack rides behind — that is the priority mechanism
-    // under test, so a bound here is meaningful on any box. Each loop turn
-    // drains at most one reliable batch, so the multiplier is the number of
-    // turns the completion handoff may straddle; Windows CI measured 7 turns
-    // under contention (ack behind 479 with a 6-turn bound), so allow 12 —
-    // still under half the flood, far from vacuous.
-    const ACK_AFTER_FINISH_PUSH_BOUND: u64 =
-        TEST_WRITER_QUEUE_CAPACITY + 12 * TEST_RELIABLE_PUSH_DRAIN_BUDGET;
     send_tool_call(
         &mut stream,
         1,
@@ -6617,58 +6601,106 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
         json!({ "prefix": flood_prefix, "count": flood_count }),
     )
     .await;
+    expect_priority_event(&mut events, SubcLifecycleEvent::ReliablePushTurnHeld).await;
 
+    // Hold the loop at a turn boundary, not the configure worker: completion
+    // handoff must actually reach the loop's channel before the next turn runs.
+    state.release_slow_configures();
+    expect_priority_event(
+        &mut events,
+        SubcLifecycleEvent::RouteBindCompletionQueued { corr: 19 },
+    )
+    .await;
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let ctx = executor.actor_context(&root_id).expect("root1 actor");
+    let ready_task = "routebind-priority-ready";
+    assert!(emit_push_frame(
+        &ctx,
+        bash_completed_push(ready_task, "session-1")
+    ));
+    // Fill the 1024-slot lossy funnel and put an update in overflow while the
+    // loop is held. Overflow drains a reliable batch before the biased select,
+    // so only the pre-turn bind drain can put the ready ACK ahead of that batch.
+    emit_test_status_burst(&ctx, "routebind-priority-overflow", 1025);
+    release_turn.send(()).expect("release reliable push turn");
+
+    let ack_event = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events.recv().await.expect("frame-loop event channel") {
+                SubcLifecycleEvent::RouteBindAckQueued {
+                    corr: 19,
+                    reliable_push_batches,
+                } => {
+                    break reliable_push_batches;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("RouteBindAck enqueue observation timed out");
+    // An arrival during a turn may wait for its one in-flight reliable batch.
+    // This arrival was confirmed at a held turn boundary, so it must wait for zero.
+    assert_eq!(
+        ack_event, 0,
+        "pre-turn RouteBindAck waited behind {ack_event} reliable push batches"
+    );
+
+    // This push enters the reliable funnel only after the writer accepted the
+    // ACK. Its wire delivery must not overtake the ACK in the FIFO writer queue.
+    let after_ack_task = "routebind-priority-after-ack";
+    assert!(emit_push_frame(
+        &ctx,
+        bash_completed_push(after_ack_task, "session-1")
+    ));
     let mut flood_seen = 0_u64;
-    let mut flood_after_finish_before_ack = 0_u64;
     let mut flood_response_seen = false;
-    let mut saw_flood = false;
-    let mut configure_finished = false;
+    let mut ack_seen = false;
+    let mut ready_seen = false;
+    let mut after_ack_seen = false;
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    while !ack_seen
+        || flood_seen < flood_count
+        || !flood_response_seen
+        || !ready_seen
+        || !after_ack_seen
+    {
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for RouteBindAck during reliable flood"
+            "timed out draining reliable flood and RouteBindAck"
         );
-        if !configure_finished {
-            // Non-blocking poll: once the configure job has finished, the bind
-            // completion is en route to the loop and every flood frame read
-            // from here on is loop-owned latency.
-            configure_finished = state.slow_configure_finished_count() > slow_bind_base;
-        }
-        let frame = read_any_frame_timeout(&mut stream, "RouteBindAck during reliable flood").await;
+        let frame = read_any_frame_timeout(&mut stream, "reliable flood and RouteBindAck").await;
         match frame.header.ty {
             FrameType::Push => {
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                if push_type(&body) == Some("bash_completed")
-                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
-                {
-                    flood_seen += 1;
-                    if !saw_flood {
-                        saw_flood = true;
-                        state.release_slow_configures();
-                    }
-                    if configure_finished {
-                        flood_after_finish_before_ack += 1;
+                if push_type(&body) == Some("bash_completed") {
+                    let task = push_task_id(&body).expect("completed task id");
+                    if task.starts_with(flood_prefix) {
+                        flood_seen += 1;
+                    } else if task == ready_task {
+                        assert!(
+                            ack_seen,
+                            "ready flood frame overtook the pre-turn RouteBindAck"
+                        );
+                        ready_seen = true;
+                    } else if task == after_ack_task {
+                        assert!(
+                            ack_seen,
+                            "flood frame queued after RouteBindAck overtook it"
+                        );
+                        after_ack_seen = true;
                     }
                 }
             }
             FrameType::Response if frame.header.channel == 0 && frame.header.corr == 19 => {
                 assert!(
-                    saw_flood,
+                    flood_seen > 0,
                     "test must observe flood pressure before bind ack"
                 );
                 let ack: ModuleControlResponse =
                     serde_json::from_slice(&frame.body).expect("RouteBindAck body");
                 assert_eq!(ack, ModuleControlResponse::RouteBindAck {});
-                // The ack can legitimately sit behind flood frames already in
-                // the FIFO writer queue (capacity 256) plus a few 32-frame
-                // drain batches; anything far beyond that means the pre-turn
-                // bind drain lost priority to the flood.
-                assert!(
-                    flood_after_finish_before_ack <= ACK_AFTER_FINISH_PUSH_BOUND,
-                    "RouteBindAck waited behind {flood_after_finish_before_ack} reliable Push frames after configure finished"
-                );
-                break;
+                ack_seen = true;
             }
             FrameType::Response if frame.header.corr == 901 => {
                 flood_response_seen = true;
@@ -6676,27 +6708,27 @@ async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
             other => panic!("unexpected frame during reliable flood priority test: {other:?}"),
         }
     }
+    assert_eq!(
+        flood_seen, flood_count,
+        "every reliable flood frame must arrive"
+    );
     state.wait_for_slow_configure_finished(slow_bind_base + 1);
-
-    while flood_seen < flood_count || !flood_response_seen {
-        let frame = read_any_frame_timeout(&mut stream, "remaining reliable flood frames").await;
-        match frame.header.ty {
-            FrameType::Push => {
-                let body: Value = serde_json::from_slice(&frame.body).expect("push body");
-                if push_type(&body) == Some("bash_completed")
-                    && push_task_id(&body).is_some_and(|task| task.starts_with(flood_prefix))
-                {
-                    flood_seen += 1;
-                }
-            }
-            FrameType::Response if frame.header.corr == 901 => {
-                flood_response_seen = true;
-            }
-            other => panic!("unexpected frame while draining reliable flood: {other:?}"),
-        }
-    }
-
     send_connection_goodbye(&mut stream).await;
+}
+
+async fn expect_priority_event(
+    events: &mut mpsc::UnboundedReceiver<SubcLifecycleEvent>,
+    expected: SubcLifecycleEvent,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if events.recv().await.expect("frame-loop event channel") == expected {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected:?}"));
 }
 
 async fn drive_duplicate_routebind_daemon(input: FakeDaemonInput) {
