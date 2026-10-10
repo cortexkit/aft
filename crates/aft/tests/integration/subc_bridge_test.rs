@@ -46,8 +46,6 @@ use super::helpers::ReleaseOnDrop;
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-const STATUS_LINE_OPERATION: &str = "status.line";
-
 pub(super) struct FakeDaemonInput {
     pub(super) listener: TcpListener,
     pub(super) key: Vec<u8>,
@@ -7359,6 +7357,7 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         key,
         daemon_id,
         root1,
+        executor,
         ..
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
@@ -7410,6 +7409,11 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
         }
     }
 
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root id");
+    let ctx = executor.actor_context(&root_id).expect("bound context");
+    // Hold the LSP manager across the tool response so status finalization must
+    // skip publishing instead of queuing the fleet consumer's first request.
+    let held = ctx.lsp();
     send_tool_call(
         &mut stream,
         1,
@@ -7428,68 +7432,13 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
             break;
         }
     }
+    drop(held);
 
-    // Positive waits are generous: a loaded Windows runner can take well over
-    // 5 s before the module opens its fleet consumer connection.
-    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
-        .await
-        .expect("fleet consumer connection timeout")
-        .expect("accept fleet consumer");
-    authenticate_server(
-        &mut consumer_stream,
-        &key,
-        &daemon_id,
-        "subc-test",
-        Duration::from_secs(30),
-    )
-    .await
-    .expect("authenticate fleet consumer");
-    let catalog = read_raw_inventory_frame(&mut consumer_stream, "catalog.list").await;
-    assert_eq!(catalog.header.ty, FrameType::Request);
-    assert_eq!(frame_operation(&catalog).as_deref(), Some("catalog.list"));
-    let mut consumer_inventory = vec![catalog.clone()];
-    send_frame(
-        &mut consumer_stream,
-        Frame::build_with_version(
-            catalog.header.ver,
-            FrameType::Response,
-            catalog.header.flags,
-            catalog.header.channel,
-            catalog.header.epoch,
-            catalog.header.corr,
-            serde_json::to_vec(&json!({
-                "op": "catalog.list",
-                "generation": 1,
-                "modules": [],
-                "subc_ops": [],
-            }))
-            .expect("catalog response body"),
-        )
-        .expect("catalog response frame"),
-    )
-    .await;
-
-    let quiet_deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < quiet_deadline {
-        let remaining = quiet_deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, read_subc_frame(&mut stream)).await {
-            Ok(Ok(Some(frame))) => inventory.push(frame),
-            Ok(Ok(None)) => panic!("EOF while collecting post-completion inventory"),
-            Ok(Err(error)) => panic!("read post-completion inventory: {error}"),
-            Err(_) => break,
-        }
-    }
-    let consumer_quiet_deadline = Instant::now() + Duration::from_millis(100);
-    while Instant::now() < consumer_quiet_deadline {
-        let remaining = consumer_quiet_deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, read_subc_frame(&mut consumer_stream)).await {
-            Ok(Ok(Some(frame))) => consumer_inventory.push(frame),
-            Ok(Ok(None)) => panic!("EOF while collecting consumer inventory"),
-            Ok(Err(error)) => panic!("read consumer inventory: {error}"),
-            Err(_) => break,
-        }
-    }
-
+    // Completion bounds the supervision inventory. Fleet discovery starts only
+    // after an opportunistic status publish, which a busy diagnostics manager
+    // can suppress; a tool response therefore does not promise a consumer dial.
+    // The empty-catalog test in fleet_status.rs directly verifies that a queued
+    // publish cannot open a holder route or send status requests without discovery.
     let labels = frame_inventory_labels(&inventory);
     let status_requests = inventory
         .iter()
@@ -7504,18 +7453,6 @@ async fn drive_without_discovered_status_line_surface_daemon(input: FakeDaemonIn
     assert_eq!(
         status_requests, 0,
         "supervision connection received status traffic: {labels:?}"
-    );
-    let consumer_labels = frame_inventory_labels(&consumer_inventory);
-    let gated_consumer_frames = consumer_inventory
-        .iter()
-        .filter(|frame| {
-            frame.header.ty == FrameType::Request
-                && frame_operation(frame).as_deref() != Some("catalog.list")
-        })
-        .count();
-    assert_eq!(
-        gated_consumer_frames, 0,
-        "daemon without a discovered {STATUS_LINE_OPERATION} surface received consumer route/status traffic: {consumer_labels:?}"
     );
     assert!(
         inventory.iter().any(|frame| {

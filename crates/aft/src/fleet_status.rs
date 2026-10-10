@@ -893,6 +893,9 @@ mod tests {
 
     struct RejectingConsumer {
         attempts: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
+        advertises_status_line: bool,
+        catalog_calls: Arc<AtomicU64>,
+        publish_calls: Arc<AtomicU64>,
         succeeds_on: Option<usize>,
         connection_callback: Arc<parking_lot::Mutex<Option<Box<dyn Fn(ConnectionState) + Send>>>>,
         push_sender: Arc<parking_lot::Mutex<Option<mpsc::Sender<PushEvent>>>>,
@@ -913,12 +916,17 @@ mod tests {
         }
 
         async fn catalog_list(&self) -> Result<CatalogList, String> {
+            self.catalog_calls.fetch_add(1, Ordering::Relaxed);
             Ok(CatalogList {
                 generation: 1,
-                modules: vec![status_catalog_entry(
-                    STATUS_HOLDER_MODULE,
-                    STATUS_LINE_OPERATION,
-                )],
+                modules: if self.advertises_status_line {
+                    vec![status_catalog_entry(
+                        STATUS_HOLDER_MODULE,
+                        STATUS_LINE_OPERATION,
+                    )]
+                } else {
+                    Vec::new()
+                },
                 subc_ops: Vec::new(),
             })
         }
@@ -952,6 +960,7 @@ mod tests {
         }
 
         async fn request(&self, _route: &usize, _body: Vec<u8>) -> Result<Vec<u8>, String> {
+            self.publish_calls.fetch_add(1, Ordering::Relaxed);
             Err("not used in discovery test".to_owned())
         }
     }
@@ -971,6 +980,9 @@ mod tests {
         let callback = Arc::new(parking_lot::Mutex::new(None));
         let consumer = RejectingConsumer {
             attempts: attempts.clone(),
+            advertises_status_line: true,
+            catalog_calls: Arc::default(),
+            publish_calls: Arc::default(),
             succeeds_on,
             connection_callback: callback.clone(),
             push_sender: Arc::default(),
@@ -985,6 +997,65 @@ mod tests {
         ));
         tokio::task::yield_now().await;
         (task, attempts, callback)
+    }
+
+    #[tokio::test]
+    async fn subc_bridge_without_discovered_status_line_surface_emits_no_status_requests() {
+        let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+        assert!(!client.publish(Path::new("/project"), "opencode", "session-1", "local"));
+        let first_request = wire_rx.try_recv().expect("queued discovery publish");
+        assert_eq!(first_request.body()["op"], "status.publish");
+        assert_eq!(client.inner.state.lock().last_publish_at.len(), 1);
+        let identity = FleetRouteIdentity::from(&first_request);
+        let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let catalog_calls = Arc::new(AtomicU64::new(0));
+        let publish_calls = Arc::new(AtomicU64::new(0));
+        let consumer = RejectingConsumer {
+            attempts: attempts.clone(),
+            advertises_status_line: false,
+            catalog_calls: catalog_calls.clone(),
+            publish_calls: publish_calls.clone(),
+            succeeds_on: Some(1),
+            connection_callback: Arc::default(),
+            push_sender: Arc::default(),
+            control_sender: Arc::default(),
+        };
+
+        // Closing ingress lets the real dial finish after handling the queued
+        // publish. Its return is a processing barrier, not a quiet-time guess.
+        wire_rx.close();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run_connected_status_dial(
+                consumer,
+                client.clone(),
+                wire_rx,
+                identity,
+                Some(first_request),
+            ),
+        )
+        .await
+        .expect("empty-catalog dial must finish processing the queued publish");
+
+        assert!(
+            attempts.lock().is_empty(),
+            "empty catalog must not open a holder route"
+        );
+        assert_eq!(
+            publish_calls.load(Ordering::Relaxed),
+            0,
+            "empty catalog must not send status requests"
+        );
+        assert_eq!(
+            catalog_calls.load(Ordering::Relaxed),
+            1,
+            "catalog gate was exercised"
+        );
+        assert!(!client.inner.route_live.load(Ordering::Acquire));
+        assert!(
+            client.inner.state.lock().last_publish_at.is_empty(),
+            "unavailable publish must release its cadence reservation"
+        );
     }
 
     /// Opens the holder route, has the daemon close it for `reason` (the
@@ -1014,6 +1085,9 @@ mod tests {
         let consumer = RejectingConsumer {
             attempts: attempts.clone(),
             succeeds_on: Some(1),
+            advertises_status_line: true,
+            catalog_calls: Arc::default(),
+            publish_calls: Arc::default(),
             connection_callback: Arc::default(),
             push_sender: push_sender.clone(),
             control_sender: control_sender.clone(),
