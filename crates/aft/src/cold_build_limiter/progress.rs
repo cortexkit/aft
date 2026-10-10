@@ -269,8 +269,13 @@ fn root_label(root: &Path) -> String {
         .to_string_lossy();
     // Alfonso's directories are hash-keyed, so the parent basename is not the
     // repository name. Read only the small worktree gitdir marker at admission,
-    // never on health's frame loop and never by spawning git.
-    if root.to_string_lossy().contains("/alfonso/worktrees/") {
+    // never on health's frame loop and never by spawning git. Matched by path
+    // components, not text, so Windows' `\` separators match too.
+    let components: Vec<_> = root.components().map(|c| c.as_os_str()).collect();
+    let in_alfonso_worktrees = components
+        .windows(2)
+        .any(|pair| pair[0] == "alfonso" && pair[1] == "worktrees");
+    if in_alfonso_worktrees {
         let marker = root.join(".git");
         if std::fs::metadata(&marker).is_ok_and(|m| m.is_file() && m.len() <= 4096) {
             if let Ok(marker) = std::fs::read_to_string(marker) {
