@@ -537,6 +537,25 @@ fn handle_inspect_payload(
     let scope_was_provided = scope_was_provided && !parsed_scope.roots.is_empty();
     let scope_roots = scope_was_provided.then_some(parsed_scope.roots.as_slice());
     let scope = parsed_scope.job;
+    // File accounting describes the selected corpus, not a scanner's progress.
+    // Blocking requests already captured this inventory for stat verification.
+    let scoped_inventory = scope_roots.map(|roots| {
+        let count = observed_stats.map_or_else(
+            || {
+                crate::callgraph::walk_project_files(&snapshot.project_root)
+                    .filter(|file| scope.contains(file))
+                    .count()
+            },
+            |stats| {
+                stats
+                    .0
+                    .iter()
+                    .filter(|(file, _, _)| scope.contains(file))
+                    .count()
+            },
+        );
+        (roots, count as u64)
+    });
     let diagnostics_requested = !scope_was_provided || sections.requests_scoped_diagnostics();
 
     if inspect_cancellation_requested() {
@@ -586,6 +605,20 @@ fn handle_inspect_payload(
     for category in InspectCategory::active().iter().copied() {
         if !snapshot.config.inspect.category_enabled(category) {
             outcomes.insert(category, JobOutcome::off());
+        } else if scope_was_provided
+            && !sections.detail_categories.is_empty()
+            && !sections.includes(category)
+            && (!category.is_tier2() || use_checkout_view)
+        {
+            // Explicit scoped sections must not start unrequested producers.
+            // Legacy Tier-2 cache reads can still disclose existing results
+            // without starting a scan; checkout views would run real producers.
+            outcomes.insert(
+                category,
+                JobOutcome::Fresh {
+                    payload: serde_json::json!({"status": "not_requested"}),
+                },
+            );
         }
     }
     if blocking_tier1_deadline.is_none() {
@@ -857,7 +890,7 @@ fn handle_inspect_payload(
         top_k,
         offset,
         ctx,
-        scope_roots,
+        scoped_inventory,
     );
     // A scoped answer carries only the notes of servers for its own files; a
     // TypeScript SDK note from a server started for another request does not
@@ -2753,9 +2786,9 @@ fn build_inspect_payload(
     sections: &Sections,
     top_k: usize,
     ctx: &AppContext,
-    scope_roots: Option<&[PathBuf]>,
+    scope: Option<(&[PathBuf], u64)>,
 ) -> Value {
-    build_inspect_payload_with_offset(snapshot, payloads, sections, top_k, 0, ctx, scope_roots)
+    build_inspect_payload_with_offset(snapshot, payloads, sections, top_k, 0, ctx, scope)
 }
 
 fn build_inspect_payload_with_offset(
@@ -2765,27 +2798,10 @@ fn build_inspect_payload_with_offset(
     top_k: usize,
     offset: usize,
     ctx: &AppContext,
-    scope_roots: Option<&[PathBuf]>,
+    scope: Option<(&[PathBuf], u64)>,
 ) -> Value {
-    let scope_files = scope_roots.map(|_| {
-        payloads
-            .get(&InspectCategory::Diagnostics)
-            .and_then(|payload| {
-                payload.get("scope_files").or_else(|| {
-                    payload
-                        .get("coverage")
-                        .and_then(|coverage| coverage.get("files"))
-                })
-            })
-            .and_then(Value::as_u64)
-            .or_else(|| {
-                payloads
-                    .get(&InspectCategory::Metrics)
-                    .and_then(|payload| payload.get("files"))
-                    .and_then(Value::as_u64)
-            })
-            .unwrap_or(0)
-    });
+    let scope_roots = scope.map(|(roots, _)| roots);
+    let scope_files = scope.map(|(_, files)| files);
     let no_files_matched_scope = scope_files == Some(0);
     let mut summary = Map::new();
     let mut details = Map::new();
@@ -5466,7 +5482,7 @@ mod fresh_payload_tests {
             Default::default(),
         );
         let roots = [PathBuf::from("/repo/src")];
-        for scope in [None, Some(roots.as_slice())] {
+        for scope in [None, Some((roots.as_slice(), 2))] {
             let payload =
                 build_inspect_payload(&snapshot, &payloads, &Sections::all(), 10, &ctx, scope);
             let response = build_inspect_terminal(
@@ -5730,7 +5746,7 @@ mod fresh_payload_tests {
             &Sections::all(),
             1,
             &ctx,
-            Some(&[PathBuf::from("/repo/src")]),
+            Some((&[PathBuf::from("/repo/src")], 2)),
         );
         let response = build_inspect_terminal(
             "scoped-cached-gap",
@@ -6068,7 +6084,7 @@ mod fresh_payload_tests {
             &Sections::all(),
             20,
             &ctx,
-            Some(&[PathBuf::from("/repo/packages")]),
+            Some((&[PathBuf::from("/repo/packages")], 606)),
         );
         assert_eq!(payload["scope_files"], 606, "{payload:#}");
         assert!(
@@ -6090,17 +6106,19 @@ mod fresh_payload_tests {
         payloads.insert(InspectCategory::Metrics, serde_json::json!({
             "unavailable": true, "complete": false, "gaps": [{"kind": "analysis_incomplete", "reason": "metrics still scanning"}]
         }));
-        // Warm scoped collection inventories files without opening them. It has
-        // no sweep coverage, and an unfinished metrics scan has no file count.
-        payloads.get_mut(&InspectCategory::Diagnostics).unwrap()["scope_files"] =
-            serde_json::json!(1);
+        // Neither producer has a count; the selected corpus is inventoried
+        // separately without opening documents or waiting for scanner results.
+        payloads.insert(
+            InspectCategory::Diagnostics,
+            serde_json::json!({"status": "not_requested"}),
+        );
         let payload = build_inspect_payload(
             &snapshot(),
             &payloads,
             &Sections::all(),
             20,
             &ctx,
-            Some(&[PathBuf::from("/repo/src")]),
+            Some((&[PathBuf::from("/repo/src")], 1)),
         );
         assert_eq!(payload["scope_files"], 1, "{payload:#}");
         assert!(
@@ -6425,7 +6443,7 @@ mod fresh_payload_tests {
             &Sections::summary_only(),
             5,
             &ctx,
-            Some(&roots),
+            Some((&roots, 12)),
         );
         let text = payload["text"].as_str().expect("text");
 
@@ -6716,7 +6734,7 @@ mod fresh_payload_tests {
             &Sections::summary_only(),
             5,
             &ctx,
-            Some(&roots),
+            Some((&roots, 1)),
         );
         let text = payload["text"].as_str().expect("text");
 

@@ -8,7 +8,8 @@ use aft::cache_freshness;
 use aft::callgraph_store::CallGraphStore;
 use aft::commands::configure::handle_configure;
 use aft::commands::inspect::{
-    handle_inspect_tier2_run, handle_inspect_tool_call, handle_inspect_warm_for_test,
+    handle_inspect, handle_inspect_tier2_run, handle_inspect_tool_call,
+    handle_inspect_warm_for_test,
 };
 use aft::commands::tool_call::handle_with_dispatch;
 use aft::config::Config;
@@ -1435,6 +1436,112 @@ fn scoped_inspect_building_discloses_progress_and_last_complete() {
             assert!(summary.get("last_complete").is_none(), "{response:#}");
         }
     }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn scoped_inspect_inventory_skips_unrequested_scanners() {
+    for blocking in [false, true] {
+        let (_temp, root) = fixture_project();
+        write_file(&root, "src/foo.ts", duplicate_fixture_source());
+        write_file(&root, "outside.ts", "export const outside = 1;\n");
+        let ctx = configured_context(&root);
+        let req = request(json!({
+            "id": "scoped-inventory", "command": "inspect", "scope": "src",
+            "sections": "duplicates"
+        }));
+        let response = if blocking {
+            handle_inspect_tool_call(&req, &ctx)
+        } else {
+            handle_inspect(&req, &ctx)
+        };
+        assert!(response.success, "{response:?}");
+        // Each context has a cold, unique root, so memo reuse cannot mask an
+        // unrequested scanner reading the files.
+        assert_eq!(
+            aft::inspect::scanners::metrics::file_read_count_for_debug(&root),
+            0
+        );
+        assert_eq!(
+            aft::inspect::scanners::todos::file_read_count_for_debug(&root),
+            0
+        );
+        assert_eq!(response.data["scope_files"], 1, "{response:?}");
+        for category in ["metrics", "todos", "diagnostics"] {
+            assert_eq!(
+                response.data["summary"][category],
+                json!({"status": "not_requested"})
+            );
+        }
+        assert!(
+            response.data.get("no_files_matched_scope").is_none(),
+            "{response:?}"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn scoped_inspect_inventory_survives_blocked_metrics() {
+    let _env_lock = env_serial_lock();
+    let (temp, root) = fixture_project();
+    write_file(&root, "src/foo.ts", duplicate_fixture_source());
+    write_file(&root, "outside.ts", "export const outside = 1;\n");
+    let ctx = configured_context_with_diagnostics_timeout(&root, 10_000);
+    let ready = temp.path().join("metrics-ready");
+    let release = temp.path().join("metrics-release");
+    let _root = EnvVarGuard::set("AFT_TEST_METRICS_GATE_ROOT", &root.to_string_lossy());
+    let _ready = EnvVarGuard::set("AFT_TEST_METRICS_GATE_READY", &ready.to_string_lossy());
+    let _release = EnvVarGuard::set("AFT_TEST_METRICS_GATE_RELEASE", &release.to_string_lossy());
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::scope(|threads| {
+        threads.spawn(|| {
+            tx.send(inspect_tool_call(
+                &ctx,
+                json!({
+                    "id": "blocked-metrics", "command": "inspect", "scope": "src",
+                    "sections": "metrics"
+                }),
+            ))
+            .unwrap();
+        });
+        wait_for_path_event(&ready, "metrics scanner gate");
+        let response = rx.recv_timeout(Duration::from_secs(15));
+        // Release and reap the scanner before assertions, even on regression.
+        fs::write(&release, b"release").unwrap();
+        let completed = ctx.inspect_manager().submit_category_until(
+            tier2_snapshot(&root, &ctx.inspect_dir()),
+            InspectCategory::Metrics,
+            JobScope::from_roots(root.clone(), vec![root.join("src")]),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert!(
+            matches!(completed, JobOutcome::Fresh { .. }),
+            "{completed:?}"
+        );
+        let response = response.expect("inspect waited for a blocked metrics scanner");
+        assert_eq!(response["success"], true, "{response:#}");
+        assert_eq!(
+            response["summary"]["metrics"]["status"], "unavailable",
+            "{response:#}"
+        );
+        assert_eq!(
+            response["summary"]["diagnostics"],
+            json!({"status": "not_requested"})
+        );
+        assert_eq!(response["scope_files"], 1, "{response:#}");
+        assert!(
+            response.get("no_files_matched_scope").is_none(),
+            "{response:#}"
+        );
+        assert!(
+            response["text"]
+                .as_str()
+                .unwrap()
+                .contains("scope: 1 root, 1 file"),
+            "{response:#}"
+        );
+    });
 }
 
 #[test]
@@ -7348,7 +7455,7 @@ fn blocking_inspect_keeps_provisional_scoped_diagnostics_on_indexing_timeout() {
     wait_for_lsp_report_state(&ctx, &file, true);
     let response = serde_json::to_value(handle_inspect_tool_call(
         &request(json!({
-            "id": "inspect-partial-published", "command": "inspect", "scope": "src/main.rs", "sections": ["diagnostics"]
+            "id": "inspect-partial-published", "command": "inspect", "scope": "src/main.rs", "sections": ["diagnostics", "todos"]
         })),
         &ctx,
     ))

@@ -56,7 +56,33 @@ static METRICS_MEMO: OnceLock<Tier1FileMemo<CachedFileMetric>> = OnceLock::new()
 static FILE_READS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> = OnceLock::new();
 
 pub fn run_metrics_scan(job: &crate::inspect::InspectJob) -> crate::inspect::InspectResult {
+    #[cfg(debug_assertions)]
+    wait_at_metrics_gate_for_debug(&job.project_root);
     run_metrics_scan_with_memo(job, metrics_memo())
+}
+
+#[cfg(debug_assertions)]
+fn wait_at_metrics_gate_for_debug(project_root: &Path) {
+    let Some(root) = std::env::var_os("AFT_TEST_METRICS_GATE_ROOT") else {
+        return;
+    };
+    if crate::inspect::job::canonicalize_normalized(Path::new(&root))
+        != crate::inspect::job::canonicalize_normalized(project_root)
+    {
+        return;
+    }
+    let ready = std::env::var_os("AFT_TEST_METRICS_GATE_READY").map(PathBuf::from);
+    let release = std::env::var_os("AFT_TEST_METRICS_GATE_RELEASE").map(PathBuf::from);
+    if let (Some(ready), Some(release)) = (ready, release) {
+        fs::write(ready, b"ready").expect("signal metrics gate");
+        // The release file controls ordering; the deadline only catches a
+        // broken fixture rather than allowing a scanner to hang the suite.
+        let hang_deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !release.exists() {
+            assert!(Instant::now() < hang_deadline, "metrics gate not released");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 fn run_metrics_scan_with_memo(
