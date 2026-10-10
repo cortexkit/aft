@@ -1049,7 +1049,11 @@ fn standalone_edit_then_queued_grep_observes_watcher_update() {
     assert!(aft.shutdown().success());
 }
 
-fn warming_rust_inspect_response(cargo_owned: bool) -> (Value, Duration) {
+fn warming_rust_inspect_response(
+    cargo_owned: bool,
+    diagnostics_timeout_ms: u64,
+    rust_env: Value,
+) -> (Value, Duration) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     fs::create_dir_all(project.join("crates")).unwrap();
@@ -1088,9 +1092,9 @@ fn warming_rust_inspect_response(cargo_owned: bool) -> (Value, Duration) {
             "project_root": project, "storage_dir": temp.path().join("storage"),
             "config": user_config(json!({
                 "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-                "inspect": {"diagnostics_timeout_ms": 10000},
+                "inspect": {"diagnostics_timeout_ms": diagnostics_timeout_ms},
                 "lsp": {"servers": {
-                    "rust": {"binary": binary, "args": [], "root_markers": [root_marker]},
+                    "rust": {"binary": binary, "args": [], "root_markers": [root_marker], "env": rust_env},
                     "typescript": {"binary": binary, "args": []}
                 }}
             }))
@@ -1104,7 +1108,7 @@ fn warming_rust_inspect_response(cargo_owned: bool) -> (Value, Duration) {
             "id": "partial-inspect", "command": "inspect", "scope": "crates"
         })
         .to_string(),
-        Duration::from_secs(15),
+        Duration::from_millis(diagnostics_timeout_ms) + Duration::from_secs(5),
     );
     eprintln!(
         "partial inspect elapsed={:?} response={response:#}",
@@ -1118,7 +1122,7 @@ fn warming_rust_inspect_response(cargo_owned: bool) -> (Value, Duration) {
 #[test]
 fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
     // Without Cargo.toml, an analyzer still indexing cannot confirm complete diagnostics.
-    let (response, elapsed) = warming_rust_inspect_response(false);
+    let (response, elapsed) = warming_rust_inspect_response(false, 10_000, json!({}));
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], false);
     assert!(
@@ -1140,7 +1144,7 @@ fn standalone_inspect_preserves_partial_results_when_rust_keeps_indexing() {
 #[test]
 fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming() {
     // A completed explicit Cargo check supplies diagnostics while the analyzer is still warming.
-    let (response, elapsed) = warming_rust_inspect_response(true);
+    let (response, elapsed) = warming_rust_inspect_response(true, 10_000, json!({}));
     assert_eq!(response["success"], true, "{response:#}");
     assert_eq!(response["complete"], true, "{response:#}");
 
@@ -1153,6 +1157,36 @@ fn standalone_inspect_completed_cargo_check_is_fresh_while_analyzer_is_warming()
     assert!(text.contains("workspace analysis is warming"), "{text}");
     assert!(text.contains("from the last completed check"), "{text}");
     assert!(elapsed < Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_inspect_runs_cargo_check_while_the_analyzer_warms() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Inspect's own cargo check must run while inspect waits for the analyzer
+    // to settle, not after. With a 36 s budget (31 s of work time) that wait
+    // lasts about 15 s for an analyzer that never settles; a check started
+    // only after it would have about 7.5 s. The cargo below spends 9 s before
+    // checking anything, so only a check that ran during the wait can finish.
+    let temp = tempfile::tempdir().unwrap();
+    let real_cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let slow_cargo = temp.path().join("slow-cargo");
+    fs::write(
+        &slow_cargo,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = check ]; then sleep 9; fi\nunset CARGO\nexec '{}' \"$@\"\n",
+            Path::new(&real_cargo).display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&slow_cargo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (response, _) = warming_rust_inspect_response(true, 36_000, json!({ "CARGO": slow_cargo }));
+    assert_eq!(response["complete"], true, "{response:#}");
+    let text = response["text"].as_str().unwrap();
+    assert!(text.starts_with("FRESH"), "{text}");
+    assert!(text.contains("from the last completed check"), "{text}");
 }
 
 /// A search against an already-ready index is answered as soon as its worker

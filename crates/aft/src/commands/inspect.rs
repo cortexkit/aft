@@ -10,7 +10,9 @@ use serde_json::{Map, Value};
 use crate::alert_state::{AcceptedDiagnosticSnapshot, AcceptedObservationBatch};
 use crate::config::Config;
 use crate::context::AppContext;
-use crate::inspect::diagnostics_category::{inspect_request_timeout, run_diagnostics_category};
+use crate::inspect::diagnostics_category::{
+    inspect_request_timeout, run_diagnostics_category, start_inspect_rust_checks, InspectRustCheck,
+};
 #[cfg(test)]
 use crate::inspect::InspectBuilderState;
 use crate::inspect::{
@@ -352,7 +354,20 @@ fn verify_final_root_stats(
 }
 
 pub fn handle_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
-    handle_inspect_payload(req, ctx, false, false, &[], &[], &[], &[], None, None, None)
+    handle_inspect_payload(
+        req,
+        ctx,
+        false,
+        false,
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        Vec::new(),
+    )
 }
 
 /// Resolve the language servers an inspect should start, within the request
@@ -408,6 +423,7 @@ pub fn handle_inspect_warm_for_test(req: &RawRequest, ctx: &AppContext) -> Respo
         Some(&phase_log),
         None,
         None,
+        Vec::new(),
     )
 }
 
@@ -485,6 +501,7 @@ fn handle_inspect_payload(
     phase_log: Option<&InspectPhaseLog>,
     request_deadline: Option<InspectRequestDeadline>,
     observed_stats: Option<&InspectRootStatSnapshot>,
+    rust_checks: Vec<InspectRustCheck>,
 ) -> Response {
     let top_k = match parse_top_k(&req.params) {
         Ok(top_k) => top_k,
@@ -551,6 +568,7 @@ fn handle_inspect_payload(
         )
     });
     let mut outcomes = BTreeMap::new();
+    let mut rust_checks = Some(rust_checks);
     for category in InspectCategory::active().iter().copied() {
         if !snapshot.config.inspect.category_enabled(category) {
             outcomes.insert(category, JobOutcome::off());
@@ -686,6 +704,7 @@ fn handle_inspect_payload(
                 expected_producers,
                 indexing_gaps,
                 request_deadline.map(|deadline| deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP)),
+                rust_checks.take().unwrap_or_default(),
             )
         } else if category.is_tier2() {
             if let Some((rx, deadline, callgraph_phase, tier2_phase)) =
@@ -1292,6 +1311,16 @@ fn run_blocking_inspect_body(
             ))
         })
         .collect::<Vec<_>>();
+    // Rust producers whose automatic checks are off are certified only by the
+    // cargo check inspect runs itself. Start it now, bounded by the same
+    // deadline as the wait below, so it runs while the servers settle instead
+    // of in what the wait leaves over; the diagnostics phase, whose deadline
+    // is never earlier, collects the outcome.
+    let rust_checks = start_inspect_rust_checks(
+        ctx,
+        &start_outcomes.successful,
+        deadline.phase_deadline(INSPECT_PHASE_WAIT_CAP),
+    );
     // Give producers a bounded chance to settle before reading the warm store.
     // The wait is root-level: producers publish while events are drained. A
     // scoped request's per-file work happens later, in the diagnostics
@@ -1357,6 +1386,7 @@ fn run_blocking_inspect_body(
         Some(&phase_log),
         Some(deadline),
         Some(&initial_stats),
+        rust_checks,
     );
     if inspect_cancellation_requested() {
         return build_inspect_terminal(&req.id, &phase_log, InspectTerminal::Interrupted);
@@ -6913,6 +6943,7 @@ mod deferred_terminal_tests {
             Some(&phase_log),
             Some(InspectRequestDeadline::new(Duration::ZERO, Duration::ZERO)),
             None,
+            Vec::new(),
         );
 
         assert!(response.success);

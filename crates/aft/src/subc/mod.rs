@@ -13627,6 +13627,10 @@ mod tests {
         use crate::lsp::manager::ServerAttemptResult;
         use crate::lsp::registry::ServerKind;
 
+        // The inspect below must not run while a deferred-inspect test has
+        // armed its process-wide stat short-circuit: this request could take
+        // that short-circuit and answer with an empty fresh result.
+        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
         let (_root_dir, root) = test_root("quiesced-root-lsp");
         std::fs::write(
             root.as_path().join("Cargo.toml"),

@@ -26,6 +26,68 @@ use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 pub(crate) const RUST_CHECK_RUNNING_REASON: &str =
     "rust-analyzer: cargo check still running; retry";
 
+/// Why diagnostics are unknown after inspect's own `cargo check` finished in
+/// this request but the follow-up check that the Rust inputs did not change
+/// meanwhile ran out of time. The next request reuses the saved result.
+pub(crate) const EXPLICIT_CHECK_UNVERIFIED_REASON: &str = "cargo check for aft_inspect completed, but Rust inputs could not be re-verified before the inspect deadline; retry aft_inspect";
+
+const EXPLICIT_CHECK_RUNNING_REASON: &str = "cargo check running for aft_inspect; retry";
+
+/// The cargo check inspect runs itself for one Rust producer whose automatic
+/// checks are off. Its outcome arrives on `outcome`: `Ok` once the result is
+/// saved and certified current, or the reason it is unknown together with any
+/// compiler rows the check printed, which stay provisional.
+pub(crate) struct InspectRustCheck {
+    key: ServerKey,
+    outcome: std::sync::mpsc::Receiver<(Result<(), String>, Vec<StoredDiagnostic>)>,
+}
+
+/// Start inspect's own cargo check, each on its own thread bounded by
+/// `deadline`, for every producer in `producers` that needs one.
+///
+/// A blocking inspect starts these before it waits for language servers to
+/// settle. The analyzer settling cannot certify such a producer, and running
+/// the check only after that wait left it a quarter of the request budget;
+/// side by side, the check gets the whole wait. The diagnostics phase collects
+/// the outcomes with [`run_diagnostics_category`].
+pub(crate) fn start_inspect_rust_checks(
+    ctx: &AppContext,
+    producers: &[ServerKey],
+    deadline: Instant,
+) -> Vec<InspectRustCheck> {
+    let work = ctx.lsp().inspect_rust_check_work(producers);
+    work.into_iter()
+        .map(|(key, check)| {
+            let (sender, outcome) = std::sync::mpsc::sync_channel(1);
+            let cancellation = crate::executor::current_job_cancellation();
+            // A thread that cannot start drops the sender, which the
+            // diagnostics phase reports as a check that stopped without a result.
+            let _ = std::thread::Builder::new()
+                .name("aft-inspect-cargo-check".into())
+                .spawn(move || {
+                    let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+                    let result = match check.try_lock_until(deadline) {
+                        None => (Err(EXPLICIT_CHECK_RUNNING_REASON.to_string()), Vec::new()),
+                        Some(mut check) => {
+                            let result = check.run_for_inspect(deadline, || {
+                                crate::executor::current_job_cancellation()
+                                    .is_some_and(|token| token.cancel_requested_before_commit())
+                            });
+                            let reports = if result.is_err() {
+                                check.reports.values().flatten().cloned().collect()
+                            } else {
+                                Vec::new()
+                            };
+                            (result.map(|_| ()), reports)
+                        }
+                    };
+                    let _ = sender.send(result);
+                });
+            InspectRustCheck { key, outcome }
+        })
+        .collect()
+}
+
 /// Whole-request server budget for blocking inspect. Every phase shares one
 /// absolute deadline derived from this value; client transport adds separate
 /// headroom so the server always answers before the client gives up.
@@ -158,6 +220,7 @@ pub(crate) fn run_diagnostics_category(
     expected_producers: &[ServerKey],
     indexing_gaps: &[(ServerKey, String)],
     sweep_deadline: Option<Instant>,
+    rust_checks: Vec<InspectRustCheck>,
 ) -> JobOutcome {
     // A scoped request reports on the servers of its own files only, so a
     // server started earlier for another part of the project cannot add its
@@ -173,25 +236,28 @@ pub(crate) fn run_diagnostics_category(
         (candidates, producer_keys)
     });
     let mut explicit_check_reasons = HashMap::new();
+    let mut explicit_checks_completed = HashSet::new();
     let mut explicit_reports = Vec::new();
-    if let Some(deadline) = sweep_deadline {
-        let work = ctx.lsp().inspect_rust_check_work(expected_producers);
-        for (key, check) in work {
-            let result = check
-                .try_lock_until(deadline)
-                .ok_or_else(|| "cargo check running for aft_inspect; retry".to_string())
-                .and_then(|mut check| {
-                    let result = check.run_for_inspect(deadline, || {
-                        crate::executor::current_job_cancellation()
-                            .is_some_and(|token| token.cancel_requested_before_commit())
-                    });
-                    if result.is_err() {
-                        explicit_reports.extend(check.reports.values().flatten().cloned());
-                    }
-                    result
-                });
-            if let Err(reason) = result {
-                explicit_check_reasons.insert(key, reason);
+    for check in rust_checks {
+        let wait = sweep_deadline.map_or(Duration::ZERO, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        match check.outcome.recv_timeout(wait) {
+            Ok((Ok(()), _)) => {
+                explicit_checks_completed.insert(check.key);
+            }
+            Ok((Err(reason), reports)) => {
+                explicit_reports.extend(reports);
+                explicit_check_reasons.insert(check.key, reason);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                explicit_check_reasons.insert(check.key, EXPLICIT_CHECK_RUNNING_REASON.into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                explicit_check_reasons.insert(
+                    check.key,
+                    "aft_inspect: cargo check stopped without a result; retry aft_inspect".into(),
+                );
             }
         }
     }
@@ -287,6 +353,15 @@ pub(crate) fn run_diagnostics_category(
             .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
             .min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
     );
+    // A cargo check that completed during this request still needs this
+    // re-verification, which is bounded by the same phase deadline the check
+    // used. When it runs out of time the producer stays unknown, but its reason
+    // must say the check finished rather than that one is still required.
+    for key in explicit_checks_completed {
+        if !saved.contains_key(&key) && !explicit_check_reasons.contains_key(&key) {
+            explicit_check_reasons.insert(key, EXPLICIT_CHECK_UNVERIFIED_REASON.to_string());
+        }
+    }
     for (key, check) in saved {
         if scoped
             .as_ref()
@@ -1614,6 +1689,7 @@ mod payload_count_tests {
                 &[],
                 &[],
                 None,
+                Vec::new(),
             ) else {
                 panic!("missing producer must return a named gap")
             };
