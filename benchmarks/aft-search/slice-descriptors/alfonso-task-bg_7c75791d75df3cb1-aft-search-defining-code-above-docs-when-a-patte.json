@@ -1,0 +1,29 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "split_query_pattern_fusion",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/tests/search_b2_lane_plan.rs::code_looking_queries_keep_the_semantic_lane_when_it_is_ready",
+    "crates/aft/tests/fixtures/search_b2/lane_plan/matrix.json",
+    "crates/aft/src/commands/semantic_search/split_query.rs::a_declared_name_longer_than_the_match_defines_the_alternative",
+    "crates/aft/src/commands/semantic_search/split_query.rs::summary_line_names_module_level_declarations_before_local_bindings"
+  ],
+  "slices": [
+    "query-keeps-semantic-lane",
+    "split-longer-name-definitions",
+    "split-defined-in-order"
+  ],
+  "unreachable_split_rows": [
+    {
+      "episode_id": "followup-census:910001",
+      "predicate": "split_rank1_required",
+      "reason": "Unreachable by any pattern design: the query alone never ranks the answer (commands/ast_search.rs) in its first ten results, and the pattern ast_grep_search is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
+    },
+    {
+      "episode_id": "followup-census:910002",
+      "predicate": "split_rank1_required",
+      "reason": "Unreachable by any pattern design: the query alone ranks the answer (bash_background/registry.rs) 10th, and the pattern subagent_type is a stale name that declares nothing and does not occur in the answer file, so there is no definition to place and no mention of the answer to lift."
+    }
+  ],
+  "note": "Three engine commits on top of the branch that adds rows 900035-900037 and 910013-910014 and re-records the reference on the unchanged engine. (1) Every non-regex aft_search query keeps the semantic lane: identifier, code_literal, log_excerpt and path plans used to drop it, so a sentence with an unquoted comma (routed as code_literal) ran without it. wrong_lane_nl 0.329167 -> 0.416667, index_stale_or_missing 0.120455 -> 0.206169, 6 rows better, none worse. (2) A split alternative's definition includes a declaration whose name extends it (runAutoSearch -> runAutoSearchHintForPi) and excludes indented local let/const/var: split_query_pattern_fusion 0.269048 -> 0.316667 (910013 miss -> 6, 910014 miss -> 2), no other row moves. (3) The pattern summary's 'defined in' names those declarations first and local variables only when nothing else is declared: presentation only, four split rows change summary_text and pattern_summary alone. Rows 910001 and 910002 keep the unreachable_split_rows waivers earlier trains carry: stale pattern names that occur in no line of the answer file. Not included: reading ', ' and '; ' as prose punctuation, which lifts 900035, 910013 and 910014 further but drops 7972 from rank 1."
+}
