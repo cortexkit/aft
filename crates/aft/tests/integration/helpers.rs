@@ -71,6 +71,28 @@ pub fn inspect_reasking_tier1_deadline(
     }
 }
 
+/// Retry a callgraph request only while its persisted reader is being installed.
+/// Other responses are returned unchanged so each fixture can assert its own result.
+#[allow(dead_code)] // Shared with watcher_integration, which has no callgraph tests.
+pub fn callgraph_when_ready(
+    operation: &str,
+    mut query: impl FnMut() -> aft::protocol::Response,
+) -> aft::protocol::Response {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = query();
+        if response.data["code"] != "callgraph_building" {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{operation}: callgraph did not become ready within 30s: {response:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Observe readiness without delivering the result to a protocol session.
 /// A terminal bash_status reply consumes a completion, so replay/reminder
 /// fixtures must instead read the task's atomically published metadata.

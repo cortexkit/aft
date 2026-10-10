@@ -11,6 +11,8 @@ use aft::protocol::{RawRequest, Response};
 use aft::views::assembly::{head_tree_fingerprint, publish_checkout, AssemblyRequest};
 use serde_json::{json, Value};
 
+use crate::helpers::callgraph_when_ready;
+
 fn git(root: &Path, args: &[&str]) {
     let mut command = Command::new("git");
     crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
@@ -197,16 +199,20 @@ fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
         .data
         .to_string()
         .contains("recordNativeMigrationExpectations"));
-    let response = aft::commands::callers::handle_callers(
-        &request(json!({
-            "id": "nested-callers", "command": "callers", "file": file,
-            "symbol": "recordNativeMigrationExpectations"
-        })),
-        &ctx,
-    );
+    let response = callgraph_when_ready("callers", || {
+        aft::commands::callers::handle_callers(
+            &request(json!({
+                "id": "nested-callers", "command": "callers", "file": file,
+                "symbol": "recordNativeMigrationExpectations"
+            })),
+            &ctx,
+        )
+    });
     assert_eq!(response.data["code"], "not_indexed", "{response:?}");
     for operation in OPERATIONS {
-        let response = query_file(&ctx, &file, operation, "recordNativeMigrationExpectations");
+        let response = callgraph_when_ready(operation, || {
+            query_file(&ctx, &file, operation, "recordNativeMigrationExpectations")
+        });
         assert!(!response.success, "{operation}: {response:?}");
         assert_eq!(
             response.data["code"], "not_indexed",
@@ -223,13 +229,15 @@ fn callgraph_ignored_nested_worktree_is_not_indexed_not_symbol_missing() {
             "{message}"
         );
     }
-    let response = aft::commands::trace_to_symbol::handle_trace_to_symbol(
-        &request(json!({
-            "id": "nested-target", "command": "trace_to_symbol", "file": checkout.join("index.ts"),
-            "symbol": "ownerCaller", "toSymbol": "recordNativeMigrationExpectations", "toFile": file
-        })),
-        &ctx,
-    );
+    let response = callgraph_when_ready("trace_to_symbol", || {
+        aft::commands::trace_to_symbol::handle_trace_to_symbol(
+            &request(json!({
+                "id": "nested-target", "command": "trace_to_symbol", "file": checkout.join("index.ts"),
+                "symbol": "ownerCaller", "toSymbol": "recordNativeMigrationExpectations", "toFile": file
+            })),
+            &ctx,
+        )
+    });
     assert_eq!(response.data["code"], "not_indexed", "{response:?}");
     assert_eq!(response.data["reason"], "ignored");
 }
@@ -247,29 +255,37 @@ fn callgraph_unindexed_path_differs_from_missing_symbol() {
     let unindexed = checkout.join("not-yet-indexed.ts");
     std::fs::write(&unindexed, source("newCaller")).unwrap();
     for operation in OPERATIONS {
-        let response = query_file(&ctx, &unindexed, operation, "newCaller");
+        let response = callgraph_when_ready(operation, || {
+            query_file(&ctx, &unindexed, operation, "newCaller")
+        });
         assert_eq!(
             response.data["code"], "not_indexed",
             "{operation}: {response:?}"
         );
         assert_eq!(response.data["reason"], "not_in_generation");
     }
-    let response = aft::commands::callers::handle_callers(
-        &request(json!({
-            "id": "missing-symbol", "command": "callers", "file": checkout.join("index.ts"),
-            "symbol": "absentSymbol"
-        })),
-        &ctx,
-    );
+    let response = callgraph_when_ready("callers", || {
+        aft::commands::callers::handle_callers(
+            &request(json!({
+                "id": "missing-symbol", "command": "callers", "file": checkout.join("index.ts"),
+                "symbol": "absentSymbol"
+            })),
+            &ctx,
+        )
+    });
     assert_eq!(response.data["code"], "symbol_not_found", "{response:?}");
     for operation in OPERATIONS {
-        let response = query_file(&ctx, &empty, operation, "absentSymbol");
+        let response = callgraph_when_ready(operation, || {
+            query_file(&ctx, &empty, operation, "absentSymbol")
+        });
         assert_eq!(
             response.data["code"], "symbol_not_found",
             "{operation}: {response:?}"
         );
         let outside = fixture.path().join("owner/index.ts");
-        let response = query_file(&ctx, &outside, operation, "ownerCaller");
+        let response = callgraph_when_ready(operation, || {
+            query_file(&ctx, &outside, operation, "ownerCaller")
+        });
         assert_eq!(
             response.data["code"], "path_outside_project_root",
             "{operation}: {response:?}"
@@ -431,7 +447,9 @@ fn callgraph_worktree_own_view_serves_all_operations_without_owner_store() {
 
     let ctx = configure(&checkout, &storage, true);
     for operation in OPERATIONS {
-        let response = query(&ctx, &checkout, operation, "checkoutCaller");
+        let response = callgraph_when_ready(operation, || {
+            query(&ctx, &checkout, operation, "checkoutCaller")
+        });
         assert!(response.success, "{operation}: {response:?}");
         let data = response.data.to_string();
         assert!(data.contains("checkoutCaller"), "{operation}: {data}");
