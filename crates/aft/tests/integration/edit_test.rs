@@ -468,24 +468,26 @@ fn assert_empty_symbol_replacement(source: &str, expected: &str) {
     let mut aft = AftProcess::spawn();
     for extension in ["ts", "tsx", "js"] {
         let target = dir.path().join(format!("delete_const.{extension}"));
-        fs::write(&target, source).unwrap();
-        let req = serde_json::json!({
-            "id": format!("empty-symbol-{extension}"),
-            "command": "edit_symbol",
-            "file": target.display().to_string(),
-            "symbol": "formatReset",
-            "operation": "replace",
-            "content": ""
-        });
-        let resp = aft.send(&req.to_string());
-        assert_eq!(resp["success"], true, "{extension}: {resp:?}");
-        assert_eq!(resp["syntax_valid"], true, "{extension}: {resp:?}");
-        let after = fs::read_to_string(&target).unwrap();
-        assert_eq!(
-            after, expected,
-            "{extension}: declaration and docs must be gone"
-        );
-        assert_eq!(aft::edit::validate_syntax_str(&after, &target), Some(true));
+        for operation in ["replace", "delete"] {
+            fs::write(&target, source).unwrap();
+            let req = serde_json::json!({
+                "id": format!("empty-symbol-{extension}"),
+                "command": "edit_symbol",
+                "file": target.display().to_string(),
+                "symbol": "formatReset",
+                "operation": operation,
+                "content": ""
+            });
+            let resp = aft.send(&req.to_string());
+            assert_eq!(resp["success"], true, "{extension}: {resp:?}");
+            assert_eq!(resp["syntax_valid"], true, "{extension}: {resp:?}");
+            let after = fs::read_to_string(&target).unwrap();
+            assert_eq!(
+                after, expected,
+                "{extension}: declaration and docs must be gone"
+            );
+            assert_eq!(aft::edit::validate_syntax_str(&after, &target), Some(true));
+        }
     }
     assert!(aft.shutdown().success());
 }
@@ -496,7 +498,7 @@ fn edit_symbol_empty_content_deletes_nested_arrow_const() {
         let source = format!(
             "function outer() {{\n  /** Format the reset time. */\n  const formatReset = {value};\n  return 2;\n}}\n"
         );
-        assert_empty_symbol_replacement(&source, "function outer() {\n  \n  return 2;\n}\n");
+        assert_empty_symbol_replacement(&source, "function outer() {\n  return 2;\n}\n");
     }
 }
 
@@ -506,8 +508,29 @@ fn edit_symbol_empty_content_deletes_top_level_arrow_const() {
         let source = format!(
             "/** Format the reset time. */\nexport const formatReset = {value};\nconst keep = 2;\n"
         );
-        assert_empty_symbol_replacement(&source, "\nconst keep = 2;\n");
+        assert_empty_symbol_replacement(&source, "const keep = 2;\n");
     }
+}
+
+#[test]
+fn edit_symbol_deletion_preserves_inline_neighbors() {
+    assert_empty_symbol_replacement(
+        "function outer() { const formatReset = () => 1; return 2; }\n",
+        "function outer() {  return 2; }\n",
+    );
+    assert_empty_symbol_replacement(
+        "function outer() {\n  const formatReset = () => {\n    return 1;\n  }; return 2;\n}\n",
+        "function outer() {\n   return 2;\n}\n",
+    );
+}
+
+#[test]
+fn edit_symbol_deletion_removes_whole_crlf_lines_and_eof() {
+    assert_empty_symbol_replacement(
+        "\t/** Format reset. */\r\n\tconst formatReset = () => {\r\n\t  return 1;\r\n\t}; \t\r\nconst keep = 2;\r\n",
+        "const keep = 2;\r\n",
+    );
+    assert_empty_symbol_replacement("  const formatReset = () => 1; ", "");
 }
 
 #[test]

@@ -244,6 +244,12 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         None
     };
 
+    let (start_byte, end_byte) = if operation == "delete" || replacement_content == Some("") {
+        whole_line_removal_range(&source, start_byte, end_byte)
+    } else {
+        (start_byte, end_byte)
+    };
+
     let new_source = match operation {
         "replace" => {
             let replacement = replacement_content.unwrap_or_default();
@@ -435,6 +441,25 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
 
     edit::attach_mutation_diff(&mut result, file, &source, &final_content);
     Response::success(&req.id, result)
+}
+
+fn whole_line_removal_range(source: &str, start_byte: usize, end_byte: usize) -> (usize, usize) {
+    let line_start = source[..start_byte]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let line_end = source[end_byte..]
+        .find('\n')
+        .map_or(source.len(), |index| end_byte + index + 1);
+
+    // Consume indentation and the final line ending only when both boundary
+    // lines contain no other code. Inline neighbors must retain their spacing.
+    if source[line_start..start_byte].trim().is_empty()
+        && source[end_byte..line_end].trim().is_empty()
+    {
+        (line_start, line_end)
+    } else {
+        (start_byte, end_byte)
+    }
 }
 
 fn has_multiple_declarators(
