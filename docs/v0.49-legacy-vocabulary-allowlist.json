@@ -1657,11 +1657,11 @@
     },
     {
       "path": "crates/aft/tests/integration/callgraph_worktree_test.rs",
-      "line": 236,
+      "line": 358,
       "column": 92,
       "token": "toFile",
       "text": "\"symbol\": \"ownerCaller\", \"toSymbol\": \"recordNativeMigrationExpectations\", \"toFile\": file",
-      "location": "line 236, column 92",
+      "location": "line 358, column 92",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
