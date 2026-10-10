@@ -1508,7 +1508,9 @@ async fn run_deferred_bash_wait(
                                 );
                             }
                             if remote_handback_due && !snapshot.info.status.is_terminal() {
-                                if !claim_for_poll.claim_for_wait_task() {
+                                // Reserve the reply only after hand-back formatting finishes,
+                                // through the same delivery path as other ready results.
+                                if claim_for_poll.answered_elsewhere() {
                                     return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
                                 }
                                 let response = crate::commands::bash_orchestrate::handback_remote_bash(
@@ -1541,7 +1543,6 @@ async fn run_deferred_bash_wait(
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
                                     false,
-                                    &mut repeat_for_poll,
                                 );
                             }
                             match crate::commands::bash_orchestrate::decide_bash_step(
@@ -3178,7 +3179,7 @@ mod grant_path_tests {
             config.sandbox.enabled = false;
         });
         let arguments = json!({"command":"sleep 60", "timeout":60000});
-        let key = crate::response_finalize::repeat_breaker::semantic_key("bash", &arguments);
+        let call = crate::response_finalize::repeat_breaker::RepeatCall::new("bash", &arguments);
         // Seed prior calls with injected times instead of spending thirty
         // seconds waiting for the breaker's minimum observation span.
         let now = Instant::now();
@@ -3187,8 +3188,7 @@ mod grant_path_tests {
                 .repeat_breaker()
                 .observe_at(
                     "deadline-session",
-                    "bash",
-                    key.clone(),
+                    &call,
                     crate::response_finalize::repeat_breaker::output_hash(output),
                     now - Duration::from_secs(age),
                 )
@@ -3252,7 +3252,7 @@ mod grant_path_tests {
         );
         let next = ctx
             .repeat_breaker()
-            .observe_at("deadline-session", "bash", key, 0, Instant::now())
+            .observe_at("deadline-session", &call, 0, Instant::now())
             .expect("fourth call");
         assert_eq!(next.count, 4, "the deadline path observes exactly once");
     }
