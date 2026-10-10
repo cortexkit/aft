@@ -31,14 +31,21 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         made_tool_call: AtomicBool::new(false),
     }));
     let routes = HashMap::from([(route_key(41, 1), identity)]);
+    // The bash tool runs PowerShell on Windows, where `printf` does not exist.
+    // Each command writes the proof text with no trailing newline, so the
+    // exact output comparison below holds on every platform.
+    let command = if cfg!(windows) {
+        "[Console]::Out.Write('v1-bash-proof')"
+    } else {
+        "printf v1-bash-proof"
+    };
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),
         41,
         1,
         7,
-        serde_json::to_vec(&json!({"name":"bash","arguments":{"command":"printf v1-bash-proof"}}))
-            .unwrap(),
+        serde_json::to_vec(&json!({"name":"bash","arguments":{"command":command}})).unwrap(),
     )
     .unwrap();
     let (writer, _replies) = mpsc::channel(8);

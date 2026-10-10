@@ -1583,9 +1583,24 @@ impl HealthDiagnosticRollup {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
             metrics,
-            memory_census: json!({ "roots": {}, "process": {} }),
+            memory_census: placeholder_memory_census(),
         }
     }
+}
+
+/// The census served before a full snapshot exists, or when the executor could
+/// not be read without contention. It has no root or allocator rows, but it
+/// still carries `process_io` at both census positions: that sample reads only
+/// process-wide kernel counters, so it never depends on the actor snapshot.
+/// Consumers can rely on the field; `available: false` marks a host or moment
+/// where the counters could not be read.
+fn placeholder_memory_census() -> Value {
+    let process_io = crate::process_io::ProcessIoSnapshot::capture().to_value();
+    json!({
+        "roots": {},
+        "process": { "process_io": process_io.clone() },
+        "process_io": process_io,
+    })
 }
 
 #[derive(Clone)]
@@ -2036,7 +2051,7 @@ fn build_health_diagnostic_rollup(
                 "executor scheduler state could not be snapshotted without contention".to_string(),
             ),
             metrics: HealthDiagnosticRollup::unavailable().metrics,
-            memory_census: json!({ "roots": {}, "process": {} }),
+            memory_census: placeholder_memory_census(),
         };
     };
 
@@ -4916,6 +4931,17 @@ mod tests {
             root_row["suspended_domains"][0]["reason"],
             "zero_credit_death_limit"
         );
+    }
+
+    #[test]
+    fn placeholder_memory_census_carries_process_io() {
+        // A cache that has not refreshed yet serves the placeholder census.
+        let census = HealthRollupCache::new().memory_census();
+        assert!(census["roots"].is_object(), "{census}");
+        for io in [&census["process_io"], &census["process"]["process_io"]] {
+            assert!(io["available"].is_boolean(), "{census}");
+            assert!(io["sampled_at_ms"].is_u64(), "{census}");
+        }
     }
 
     #[test]
