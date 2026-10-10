@@ -4275,6 +4275,15 @@ fn rust_inspect_explicit_cargo_deadline_is_partial_and_kills_the_check() {
         .trim()
         .parse()
         .unwrap();
+    // The deadline sends the kill before inspect answers, but the OS reaps the
+    // process a moment later; a loaded runner can take longer than one check.
+    // A check that was never signalled stays alive for its full 30 s sleep.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while aft::bash_background::process::is_process_alive(pid)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     assert!(
         !aft::bash_background::process::is_process_alive(pid),
         "timed-out check must be terminated"
