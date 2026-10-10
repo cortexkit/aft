@@ -66,14 +66,12 @@ concurrency:
 jobs:
   # ---------------------------------------------------------------------------
   # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e),
-  # defined as a reusable workflow. PR mode (strict=false): Windows bash e2e
-  # is non-blocking; Linux and macOS still block. See `_unit-suite.yml`.
+  # defined as a reusable workflow. Windows bash e2e is continue-on-error;
+  # Linux and macOS block. See `_unit-suite.yml`.
   # ---------------------------------------------------------------------------
   unit:
     name: Unit
     uses: ./.github/workflows/_unit-suite.yml
-    with:
-      strict: false
 
   # ---------------------------------------------------------------------------
   # Linux Docker e2e + Pi RPC e2e + macOS native e2e + Windows native e2e.

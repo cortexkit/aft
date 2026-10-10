@@ -51,9 +51,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: scripts/release-ci-gate.sh "$GITHUB_SHA"
 
-  # Every published JS package must build before anything is published. This
-  # step used to run only in the release-mode unit suite; tests.yml builds the
-  # packages a test needs but never builds all of them, so it is not a rerun.
+  # Every published JS package must build before anything is published.
+  # tests.yml builds the packages a test needs but never builds all of them,
+  # so this is not a rerun.
   build-js-packages:
     name: Build JS packages
     runs-on: ubuntu-latest
@@ -151,6 +151,9 @@ jobs:
   # The six platform builds have no `needs:` and start immediately, in
   # parallel with the gate. Every publishing job needs the gate and all six
   # builds, so a refused gate or a failed build blocks every side effect.
+  # The shipped bytes are built here and only smoke-tested (macOS ARM64 and
+  # Windows x64 run `--version`), while the same source in the release profile
+  # is e2e-tested by the tests.yml run on the push to main.
   # ---------------------------------------------------------------------------
   build-darwin-arm64:
     name: Build macOS ARM64

@@ -6,22 +6,12 @@ name: Unit suite
 # tagged commit's tests.yml run to be green instead, with every required check
 # of main (the Windows bash e2e job among them) concluded success.
 #
-# The `strict` input toggles whether the currently-scoped Windows bash e2e job
-# gates the caller:
-#   strict=false → PR mode. Linux, macOS, and Windows cargo block; Windows bash
-#     e2e remains non-blocking (continue-on-error: true).
-#   strict=true  → ALL jobs gate. A failure in any of them fails the
-#     called-workflow's overall status, blocking downstream `needs:` jobs in
-#     the caller. It also builds every JS package. tests.yml passes
-#     strict=false; nothing passes strict=true today.
+# Linux, macOS, and Windows cargo jobs block the caller. The Windows bash e2e
+# job is continue-on-error, so it does not fail this suite, but it is a
+# required check on main and the release gate requires it to succeed.
 
 on:
   workflow_call:
-    inputs:
-      strict:
-        description: "When true, all jobs gate the caller; when false, only Windows bash e2e is continue-on-error"
-        type: boolean
-        default: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -217,12 +207,6 @@ jobs:
           # (unit-linux-storm) so its release-profile build is off this
           # job's critical path.
           AFT_GATE_SKIP_RELEASE_STORM: "1"
-
-      - name: Build all JS packages (release gate)
-        # Only at release time: every published JS package must build. At PR
-        # time, individual package builds run inside their own test scripts.
-        if: inputs.strict == true
-        run: bun run --filter '*' build
 
       # cortexkit/subconscious is public, so the default job-scoped token can
       # read its pinned release assets, including on fork pull requests.
@@ -771,7 +755,7 @@ jobs:
   # short tests are faster in one process, and watcher tests keep their existing
   # single-threaded libtest execution.
   #
-  # PR and release modes are blocking. Integration tests serialize filesystem
+  # These shards are blocking. Integration tests serialize filesystem
   # paths through serde_json before writing NDJSON requests, so Windows
   # backslashes are escaped correctly instead of being parsed as JSON escapes.
   # ---------------------------------------------------------------------------
@@ -899,10 +883,7 @@ jobs:
     timeout-minutes: 25
     strategy:
       fail-fast: false
-      # Release also schedules two shipping builds and native E2E on Windows.
-      # Capping strict mode at two avoids leaving one shard queued behind that
-      # fleet burst; PR mode keeps all three-way parallelism.
-      max-parallel: ${{ inputs.strict && 2 || 3 }}
+      max-parallel: 3
       matrix:
         shard: [1, 2, 3]
     steps:
@@ -998,14 +979,14 @@ jobs:
   # Unix-only (crates/aft/tests/integration/bash_rewrite_test.rs), and Linux+macOS
   # cover them. The permission-flow tests this job exists for run and gate here.
   #
-  # PR mode (strict=false): non-blocking.
-  # Release mode (strict=true): blocking.
+  # Non-blocking for this suite (continue-on-error), but a required check on
+  # main, so a failure still stops a train from landing.
   # ---------------------------------------------------------------------------
   unit-windows-bash:
     name: Bash permission e2e (Windows)
     runs-on: windows-2022
     timeout-minutes: 20
-    continue-on-error: ${{ inputs.strict != true }}
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
 

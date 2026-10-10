@@ -243,8 +243,8 @@ while true; do
     RUN_URL_PRINTED=1
   fi
   # Every failing job fails the train, including 'Bash permission e2e
-  # (Windows)'. That job is continue-on-error in PR mode (_unit-suite.yml
-  # strict=false), but it is a required check on main, so a red there makes
+  # (Windows)'. That job is continue-on-error in _unit-suite.yml, but it is
+  # a required check on main, so a red there makes
   # the landing refuse; treating it as advisory only hid the failure until
   # the end of the run.
   if ! FAILED_JOB_RESULT=$(jq -er '[.jobs[] | select(.conclusion == "failure")][0] | if . == null then "none=" else "failed=" + ((.name // "<unnamed>") | tostring) + "|" + ((.databaseId // "") | tostring) end' \
