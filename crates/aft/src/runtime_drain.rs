@@ -6966,6 +6966,7 @@ mod watcher_slice_tests {
                         resolved_ref_mtime: None,
                     }),
                 pending_paths: BTreeSet::new(),
+                pending_inputs: Default::default(),
             },
             None,
         );

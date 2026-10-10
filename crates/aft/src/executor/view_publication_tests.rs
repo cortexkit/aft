@@ -192,6 +192,7 @@ impl Fixture {
                 head_fingerprint: String::new(),
                 head_metadata: crate::alias::capture_git_head_metadata(&root_path, None).unwrap(),
                 pending_paths: BTreeSet::new(),
+                pending_inputs: Default::default(),
             },
             None,
         );

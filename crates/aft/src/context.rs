@@ -1673,6 +1673,7 @@ pub(crate) struct ViewRuntimeSnapshot {
     pub(crate) head_fingerprint: String,
     pub(crate) head_metadata: crate::alias::GitHeadMetadata,
     pub(crate) pending_paths: BTreeSet<Vec<u8>>,
+    pub(crate) pending_inputs: BTreeMap<Vec<u8>, crate::views::assembly::PendingInput>,
 }
 
 #[derive(Debug)]
@@ -6873,6 +6874,7 @@ impl AppContext {
                 head_fingerprint: desired_head,
                 head_metadata,
                 pending_paths: report.pending_paths.clone(),
+                pending_inputs: report.pending_inputs.clone(),
                 ..snapshot
             }),
             pin: pin.map(Arc::new),
@@ -13377,6 +13379,7 @@ mod callgraph_store_for_ops_tests {
                     head_fingerprint: String::new(),
                     head_metadata: crate::alias::capture_git_head_metadata(&root, None).unwrap(),
                     pending_paths: BTreeSet::from([b"lib.rs".to_vec()]),
+                    pending_inputs: BTreeMap::new(),
                 },
                 None,
             );
@@ -13543,6 +13546,7 @@ mod callgraph_store_for_ops_tests {
                     manifest: Some(manifest),
                     head_fingerprint: desired_head,
                     pending_paths: BTreeSet::new(),
+                    pending_inputs: BTreeMap::new(),
                     ..view
                 },
                 Some(pin),

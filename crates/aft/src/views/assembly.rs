@@ -10,7 +10,6 @@ use rusqlite::OptionalExtension;
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
 use crate::blob_store::{BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome};
 use crate::callgraph_store::join::CallgraphBlob;
-use crate::parser::detect_language;
 use crate::path_status::PathStatusStore;
 use crate::pins::AssemblyPin;
 
@@ -45,7 +44,18 @@ pub struct AssemblyReport {
     pub manifest: Option<Manifest>,
     pub blob_puts: usize,
     pub pending_paths: BTreeSet<Vec<u8>>,
+    pub pending_inputs: BTreeMap<Vec<u8>, PendingInput>,
     pub published: bool,
+}
+
+/// A missing blob or unsupported tracked-file mode found while assembling a
+/// checkout generation. Retain this evidence so queries can explain what must
+/// arrive or change without reading the blob stores or checkout files again.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PendingInput {
+    pub plane: &'static str,
+    pub reason: &'static str,
+    pub blob_key: Option<String>,
 }
 
 struct Candidate {
@@ -134,6 +144,7 @@ impl PreparedAssembly {
             manifest: self.report.manifest.take(),
             blob_puts: self.report.blob_puts,
             pending_paths: std::mem::take(&mut self.report.pending_paths),
+            pending_inputs: std::mem::take(&mut self.report.pending_inputs),
             published: self.report.published,
         })
     }
@@ -260,6 +271,7 @@ pub fn prepare_checkout(
     let assembly_started = Instant::now();
     let mut blocking_paths = BTreeSet::new();
     let mut semantic_pending_paths = BTreeSet::new();
+    let mut pending_inputs = BTreeMap::new();
     let mut candidates = Vec::with_capacity(head.len());
 
     for tracked in head {
@@ -332,7 +344,7 @@ pub fn prepare_checkout(
                 let language = if resolution_input {
                     Some("config".to_string())
                 } else {
-                    detect_language(&absolute)
+                    super::callgraph::source_language(&absolute)
                         .map(|language| format!("{language:?}").to_lowercase())
                 };
                 let (key, payload) = language
@@ -384,6 +396,14 @@ pub fn prepare_checkout(
                 });
             }
             GitMode::Other(_) => {
+                pending_inputs.insert(
+                    tracked.rel_path.clone(),
+                    PendingInput {
+                        plane: "membership",
+                        reason: "unsupported Git mode",
+                        blob_key: None,
+                    },
+                );
                 blocking_paths.insert(tracked.rel_path);
             }
         }
@@ -406,6 +426,14 @@ pub fn prepare_checkout(
                         )
             );
             if missing {
+                pending_inputs.insert(
+                    candidate.path.as_bytes().to_vec(),
+                    PendingInput {
+                        plane: "semantic",
+                        reason: "shared semantic blob unavailable",
+                        blob_key: None,
+                    },
+                );
                 semantic_pending_paths.insert(candidate.path.as_bytes().to_vec());
             }
         }
@@ -431,6 +459,7 @@ pub fn prepare_checkout(
             manifest: previous.clone(),
             blob_puts: 0,
             pending_paths: BTreeSet::new(),
+            pending_inputs: BTreeMap::new(),
             published: false,
         },
         publication: None,
@@ -467,6 +496,14 @@ pub fn prepare_checkout(
             .contains(key)
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
         {
+            pending_inputs.insert(
+                candidate.path.as_bytes().to_vec(),
+                PendingInput {
+                    plane: "callgraph",
+                    reason: "shared callgraph blob unavailable",
+                    blob_key: Some(key.to_hex()),
+                },
+            );
             blocking_paths.insert(candidate.path.as_bytes().to_vec());
         }
     }
@@ -480,15 +517,12 @@ pub fn prepare_checkout(
         status
             .mark_pending(
                 path,
-                if blocking_paths.contains(path) {
-                    "shared callgraph blob unavailable"
-                } else {
-                    "shared semantic blob unavailable"
-                },
+                pending_inputs[path].reason,
                 generation_number(&next_generation),
             )
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     }
+    prepared.report.pending_inputs = pending_inputs;
     if !blocking_paths.is_empty() {
         prepared.profile.outcome = "pending";
         prepared.report.blob_puts = blob_puts;
@@ -731,6 +765,7 @@ pub fn prepare_checkout(
         manifest: Some(manifest),
         blob_puts,
         pending_paths: prepared.report.pending_paths.clone(),
+        pending_inputs: prepared.report.pending_inputs.clone(),
         published: false,
     };
     Ok(prepared)
@@ -1252,7 +1287,8 @@ fn lacks_callgraph_key(entry: &ManifestEntry, rel_path: &[u8]) -> bool {
         return false;
     };
     planes.callgraph.is_none()
-        && (*resolution_input || detect_language(&path_from_bytes(rel_path)).is_some())
+        && (*resolution_input
+            || super::callgraph::source_language(&path_from_bytes(rel_path)).is_some())
 }
 
 fn missing_callgraph_payload(

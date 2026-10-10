@@ -7501,6 +7501,7 @@ fn open_view_runtime_for_configure(
             head_fingerprint: desired_head,
             head_metadata,
             pending_paths,
+            pending_inputs: Default::default(),
         },
         pin,
         import_ready: true,
@@ -17812,6 +17813,7 @@ mod startup_view_sweep_tests {
                 resolved_ref_mtime: None,
             },
             pending_paths: BTreeSet::new(),
+            pending_inputs: Default::default(),
         };
         run_configure_view_sweep(&view);
         assert_eq!(

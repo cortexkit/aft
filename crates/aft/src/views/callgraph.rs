@@ -39,6 +39,13 @@ pub struct CallgraphAttachment {
     pub key: FamilyKey,
 }
 
+/// Markdown has outline headings, not callable definitions or call references.
+/// It remains a manifest member for other planes, but needs no callgraph blob.
+pub(crate) fn source_language(path: &Path) -> Option<crate::parser::LangId> {
+    crate::parser::detect_language(path)
+        .filter(|language| *language != crate::parser::LangId::Markdown)
+}
+
 /// Attach evidence computed from exactly the caller's already-read byte buffer.
 /// No disk access, blob put, publication or membership decision occurs here.
 pub fn attach(
@@ -183,7 +190,7 @@ impl PlaneAdapter for CallgraphPlane {
         super::assembly::is_resolution_input(path.as_bytes())
             || std::str::from_utf8(path.as_bytes())
                 .ok()
-                .is_some_and(|p| crate::parser::detect_language(Path::new(p)).is_some())
+                .is_some_and(|p| source_language(Path::new(p)).is_some())
     }
     fn open_generation(
         &self,
@@ -276,5 +283,39 @@ fn error(reason: impl std::fmt::Display) -> PlaneError {
     PlaneError {
         plane: FamilyPlane::Callgraph,
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_is_not_a_callgraph_input_but_resolution_config_is() {
+        let plane = CallgraphPlane::default();
+        for document in [
+            "notes.md",
+            "notes.markdown",
+            "notes.mdx",
+            "notes.qmd",
+            "notes.Rmd",
+        ] {
+            let path = RelPath::from_os_path(Path::new(document)).unwrap();
+            assert!(
+                !plane.applies_to(&path),
+                "{document} requires a callgraph blob"
+            );
+        }
+        for input in [
+            "index.ts",
+            "src/lib.rs",
+            "package.json",
+            "tsconfig.json",
+            "Cargo.toml",
+            ".gitignore",
+        ] {
+            let path = RelPath::from_os_path(Path::new(input)).unwrap();
+            assert!(plane.applies_to(&path), "{input} lost its callgraph input");
+        }
     }
 }

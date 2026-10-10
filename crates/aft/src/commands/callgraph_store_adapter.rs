@@ -2280,18 +2280,54 @@ pub fn index_refusal_response(
         CallgraphStoreAccess::Building => {
             note_callgraph_building(ctx, operation);
             if ctx.config().views.enabled && ctx.is_worktree_bridge() {
+                let view = ctx.view_runtime_snapshot();
+                // Semantic fill is independent of callgraph publication. Only
+                // report inputs that can actually prevent this graph's publish.
+                let waiting_on = view.as_ref().map_or_else(Vec::new, |view| {
+                    view.pending_inputs
+                        .iter()
+                        .filter(|(_, input)| input.plane != "semantic")
+                        .map(|(path, input)| {
+                            serde_json::json!({
+                                "path": String::from_utf8_lossy(path),
+                                "plane": input.plane,
+                                "reason": input.reason,
+                                "blob_key": input.blob_key,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let waiting_details = waiting_on
+                    .iter()
+                    .map(|input| {
+                        format!(
+                            "{} [{}: {}]",
+                            input["path"].as_str().unwrap_or_default(),
+                            input["plane"].as_str().unwrap_or_default(),
+                            input["reason"].as_str().unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let message = if waiting_on.is_empty() {
+                    format!("{operation}: call graph for this worktree is assembling; retry shortly; use grep or aft_search with pattern meanwhile")
+                } else if waiting_on.iter().any(|input| input["plane"] == "callgraph") {
+                    format!("{operation}: call graph for this worktree is waiting for shared blobs: {waiting_details}; full blob keys are in progress.waiting_on; an artifact writer must publish the missing blobs; retry after the inputs are available; use grep or aft_search with pattern meanwhile")
+                } else {
+                    format!("{operation}: call graph for this worktree is waiting for publication inputs: {waiting_details}; retry after the inputs are available; use grep or aft_search with pattern meanwhile")
+                };
                 let mut response = callgraph_index_refusal(
                     req_id,
                     "callgraph_building",
-                    format!("{operation}: call graph for this worktree is assembling or waiting for shared blobs; retry shortly; use grep or aft_search with pattern meanwhile"),
+                    message,
                     IndexObservation::building(),
                 );
                 // Report the local view's phase and known pending count without
                 // opening a store or enumerating checkout files on the query.
-                let view = ctx.view_runtime_snapshot();
                 response.data["progress"] = serde_json::json!({
                     "phase": if view.is_some() { "view_assembly" } else { "configure_maintenance" },
-                    "pending_paths": view.as_ref().map(|view| view.pending_paths.len()),
+                    "pending_paths": view.as_ref().map(|view| if view.pending_inputs.is_empty() { view.pending_paths.len() } else { waiting_on.len() }),
+                    "waiting_on": waiting_on,
                 });
                 response
             } else {

@@ -132,6 +132,111 @@ const OPERATIONS: [&str; 6] = [
     "trace_data",
 ];
 
+#[test]
+fn callgraph_worktree_new_markdown_does_not_wait_for_unrelated_planes() {
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = linked_checkout(fixture.path());
+    let owner = fixture.path().join("owner");
+    let storage = fixture.path().join("storage");
+    publish(&owner, &storage);
+
+    // Only the worktree has these documents. No owner will ever produce a
+    // shared callgraph blob for them, and semantic fill has not run yet.
+    let documents = ["docs/audit/BRIEF.md", "docs/audit/audit.md"];
+    std::fs::create_dir_all(checkout.join("docs/audit")).unwrap();
+    for document in documents {
+        std::fs::write(
+            checkout.join(document),
+            format!("# {document}\nNew audit.\n"),
+        )
+        .unwrap();
+    }
+    commit(&checkout);
+    let head = aft::alias::head_tree_entries(&checkout).unwrap();
+    let report = publish_checkout(&AssemblyRequest {
+        storage: storage.clone(),
+        family: aft::search_index::artifact_cache_key(&checkout),
+        scope: aft::path_identity::project_scope_key(&checkout),
+        project_root: checkout.clone(),
+        desired_head: head_tree_fingerprint(&head),
+        changed_paths: Default::default(),
+        semantic_keys: Default::default(),
+        require_semantic: true,
+        allow_blob_put: false,
+        callgraph: true,
+    })
+    .unwrap();
+    assert!(
+        report.published,
+        "new documents must not block callgraph publication: {report:?}"
+    );
+    assert_eq!(report.blob_puts, 0);
+    assert_eq!(
+        report.pending_paths,
+        std::collections::BTreeSet::from([b"index.ts".to_vec()])
+    );
+    assert_eq!(
+        report.pending_inputs[b"index.ts".as_slice()].plane,
+        "semantic"
+    );
+    let manifest = report.manifest.as_ref().unwrap();
+    for document in documents {
+        let path = aft::views::RelPath::from_os_path(Path::new(document)).unwrap();
+        let entry = manifest
+            .get(&path)
+            .expect("document must remain a manifest member");
+        let aft::views::ManifestEntry::Regular { planes, .. } = entry else {
+            panic!("document is not a regular member: {entry:?}");
+        };
+        assert!(planes.callgraph.is_none(), "document has a callgraph key");
+        assert!(planes.semantic.is_none(), "semantic fill has not run");
+    }
+    assert!(!aft::views::assembly::manifest_lacks_callgraph(manifest));
+
+    let ctx = configure(&checkout, &storage, true);
+    let response = callgraph_when_ready("callers", || {
+        query(&ctx, &checkout, "callers", "ownerCaller")
+    });
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["total_callers"], 1);
+    assert!(response.data.to_string().contains("ownerCaller"));
+}
+
+#[test]
+fn callgraph_worktree_building_names_missing_callgraph_blob() {
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = linked_checkout(fixture.path());
+    let storage = fixture.path().join("storage");
+    publish(&fixture.path().join("owner"), &storage);
+    let new_source = source("checkoutCaller");
+    std::fs::write(checkout.join("index.ts"), &new_source).unwrap();
+    commit(&checkout);
+    let ctx = configure(&checkout, &storage, true);
+    let response = query(&ctx, &checkout, "callers", "checkoutCaller");
+    let missing_key = aft::blob_store::CallgraphKey::from_bytes(
+        new_source.as_bytes(),
+        "typescript",
+        aft::views::callgraph::PRODUCER,
+    )
+    .full_key()
+    .to_hex();
+    assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
+    assert_eq!(response.data["progress"]["pending_paths"], 1);
+    assert_eq!(
+        response.data["progress"]["waiting_on"],
+        json!([{
+            "path": "index.ts",
+            "plane": "callgraph",
+            "reason": "shared callgraph blob unavailable",
+            "blob_key": missing_key,
+        }])
+    );
+    let message = response.data["message"].as_str().unwrap();
+    assert!(message.contains("index.ts [callgraph:"), "{message}");
+    assert!(message.contains("artifact writer"), "{message}");
+    assert!(!message.contains("retry shortly"), "{message}");
+}
+
 fn query(ctx: &AppContext, checkout: &Path, operation: &str, caller: &str) -> Response {
     query_file(ctx, &checkout.join("index.ts"), operation, caller)
 }
