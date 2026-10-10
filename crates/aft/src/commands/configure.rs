@@ -10526,8 +10526,11 @@ mod tests {
         for harness in ["opencode", "pi"] {
             let temp = tempfile::tempdir().unwrap();
             let ctx = test_context();
-            let project_path = temp.path().join(format!(".{harness}/aft.jsonc"));
-            let canonical = temp.path().join(".cortexkit/aft.jsonc");
+            // Join one component at a time so the expected paths use the
+            // host separator, as the paths the notice prints do; a joined
+            // "dir/file" literal keeps its `/` on Windows and would not match.
+            let project_path = temp.path().join(format!(".{harness}")).join("aft.jsonc");
+            let canonical = temp.path().join(".cortexkit").join("aft.jsonc");
             let text = "{\n // committed config\n \"experimental_bash_compress\": false,\n \"callgraph_chunk_size\": 7,\n \"url_fetch_allow_private\": true\n}\n";
             write_config(&project_path, text);
             let request = configure_request_with_params(json!({

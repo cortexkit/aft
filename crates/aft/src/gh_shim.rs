@@ -8627,6 +8627,15 @@ mod tests {
 
     #[test]
     fn producer_edit_last_vectors_pin_consumer_wire_request_and_refusals() {
+        // The command names no repository, so the request takes it from
+        // GH_REPO, else from the working directory's git origin. Pin GH_REPO
+        // so the result does not depend on the checkout: a checkout without
+        // a github.com origin (a CI or Windows gate copy) would otherwise
+        // send no repository at all. The name deliberately differs from the
+        // producer's, the way a fork's origin would.
+        const CONSUMER_REPOSITORY: &str = "consumer-fork/aft";
+        let _env_lock = crate::test_env::process_env_lock();
+        let _gh_repo = ScopedTestEnvVar::set("GH_REPO", Some(CONSUMER_REPOSITORY));
         const EXPECTED_SHA256: &str =
             "cd22bb4de80b5c44b500d75220f03d3b0908f0e67101842de0c29c86b1e9b9e0";
         let fixture_bytes = include_bytes!("../tests/fixtures/gh_shim/edit-last-vectors-v1.json");
@@ -8690,20 +8699,14 @@ mod tests {
             .expect("expected metadata object")
             .remove("agent_id");
         let mut actual = wire;
-        // The repository field is derived from the checkout's git origin, so it
-        // is checkout-derived and intentionally different in a fork. Its shape
-        // still belongs to the pinned contract, so assert the shape here rather
-        // than letting the copy below accept a missing or malformed value
-        // (issue #278 asked for exactly this: presence and format, not value).
-        let actual_repository = actual["repository"]
-            .as_str()
-            .expect("wire request must carry a repository string");
-        let (owner, name) = actual_repository
-            .split_once('/')
-            .expect("repository must be owner/name");
-        assert!(
-            !owner.is_empty() && !name.is_empty() && !name.contains('/'),
-            "repository must be a single owner/name pair: {actual_repository}"
+        // The repository value is the consumer's own (GH_REPO above), so it
+        // intentionally differs from the producer's. Its presence and
+        // owner/name format still belong to the producer's request contract,
+        // so require exactly the pinned name before copying it into the
+        // expected request; a missing or malformed value fails here.
+        assert_eq!(
+            actual["repository"], CONSUMER_REPOSITORY,
+            "wire request must carry the GH_REPO repository as owner/name"
         );
         expected["repository"] = actual["repository"].clone();
         actual["metadata"]

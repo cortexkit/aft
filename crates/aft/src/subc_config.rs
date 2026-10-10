@@ -410,6 +410,15 @@ mod tests {
 }
 #[test]
 fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_writes() {
+    // The shared fixtures spell paths with `/`. Join them one component at a
+    // time so the expected paths use the host separator, as the paths the
+    // product builds and the notice prints do; `root.join("dir/file")` keeps
+    // the `/` on Windows and its display would never appear in the notice.
+    let fixture_path = |root: &Path, relative: &str| -> PathBuf {
+        relative
+            .split('/')
+            .fold(root.to_path_buf(), |path, part| path.join(part))
+    };
     let fixtures: serde_json::Value = serde_json::from_str(include_str!(
         "../tests/fixtures/config_locations/project_paths.json"
     ))
@@ -432,7 +441,7 @@ fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_wr
         let path = project_config_read_path(root, harness.as_ref());
         assert_eq!(
             path,
-            root.join(fixture["selected"].as_str().unwrap()),
+            fixture_path(root, fixture["selected"].as_str().unwrap()),
             "{}",
             fixture["name"]
         );
@@ -459,14 +468,15 @@ fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_wr
         let canonical_exists = files
             .iter()
             .any(|file| file.as_str() == Some(".cortexkit/aft.jsonc"));
-        assert_eq!(root.join(".cortexkit/aft.jsonc").exists(), canonical_exists);
+        let canonical = fixture_path(root, ".cortexkit/aft.jsonc");
+        assert_eq!(canonical.exists(), canonical_exists);
         let notice = legacy_project_config_location_notice(root, &path);
-        if path == root.join(".cortexkit/aft.jsonc") {
+        if path == canonical {
             assert!(notice.is_none());
         } else {
             let notice = notice.unwrap();
             assert!(notice.contains(&path.display().to_string()));
-            assert!(notice.contains(&root.join(".cortexkit/aft.jsonc").display().to_string()));
+            assert!(notice.contains(&canonical.display().to_string()));
             assert!(notice.contains("doctor --fix"));
         }
     }

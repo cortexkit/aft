@@ -847,10 +847,7 @@ mod tests {
         );
         executor.hold_state_lock_for_test(|| {
             let context = metrics.frame_loop_context();
-            assert!(
-                context.contains("holder=crates/aft/src/executor/mod.rs:"),
-                "{context}"
-            );
+            assert!(names_executor_scheduler_holder(&context), "{context}");
             assert!(context.contains("held_for_ms="), "{context}");
         });
         assert!(metrics.frame_loop_context().contains("holder=none"));
@@ -906,6 +903,20 @@ mod tests {
             1,
             "only the nonempty snapshot remains"
         );
+    }
+
+    /// Whether a diagnostic line names the executor's scheduler lock site as
+    /// the current holder. The site is the executor's `file!()`, which the
+    /// compiler spells with the host's path separator
+    /// (`crates\aft\src\executor\mod.rs` on Windows), so the separators are
+    /// normalized here, at the comparison, rather than in the diagnostic.
+    fn names_executor_scheduler_holder(line: &str) -> bool {
+        line.split_whitespace().any(|token| {
+            token.strip_prefix("holder=").is_some_and(|site| {
+                site.replace('\\', "/")
+                    .starts_with("crates/aft/src/executor/mod.rs:")
+            })
+        })
     }
 
     fn test_config(
@@ -1142,10 +1153,7 @@ mod tests {
                 line.contains("awaited=executor.scheduler/register_actor"),
                 "{line}"
             );
-            assert!(
-                line.contains("holder=crates/aft/src/executor/mod.rs:"),
-                "{line}"
-            );
+            assert!(names_executor_scheduler_holder(line), "{line}");
             assert!(line.contains("held_for_ms="), "{line}");
         }
     }
