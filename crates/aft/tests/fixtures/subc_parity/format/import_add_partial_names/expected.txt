@@ -1,0 +1,3 @@
+added PrimeManager; LogTestRecord already imported
+file <PROJECT_ROOT>/src/main.ts
+group external

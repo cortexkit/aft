@@ -80,6 +80,9 @@ interface FormatCase {
   tool_name: BareToolName;
   agent_args: Record<string, unknown>;
   native_response_json: Record<string, unknown>;
+  // Server-rendered tools forward this text. Keep it out of the native fixture
+  // so the Rust parity gate still has to render the metadata independently.
+  server_text?: string;
 }
 
 function setupProjectRoot(): void {
@@ -474,7 +477,9 @@ async function captureFormatCase(caseDef: FormatCase): Promise<void> {
       if (caseDef.tool_name === "zoom" && command === "zoom" && multiTargetResponses) {
         return multiTargetResponses[multiTargetIndex++] ?? { success: false, message: "missing zoom response" };
       }
-      return caseDef.native_response_json;
+      return caseDef.server_text === undefined
+        ? caseDef.native_response_json
+        : { ...caseDef.native_response_json, text: caseDef.server_text };
     });
     const def = tools(ctx)[caseDef.tool_name];
     if (!def) throw new Error(`missing tool ${caseDef.tool_name}`);
@@ -599,6 +604,30 @@ const FORMAT_CASES: FormatCase[] = [
       native_response_json: { id: "1", success: true, task_id: "bash-unknown", status: "fate_unknown", mode: "pipes", output_preview: output },
     },
   ]),
+  {
+    name: "import_add_added", tool_name: "import",
+    agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg" },
+    native_response_json: { id: "1", success: true, file: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", added: true, group: "External" },
+    server_text: `added pkg\nfile ${PROJECT_ROOT}/src/main.ts\ngroup External`,
+  },
+  {
+    name: "import_add_already_present", tool_name: "import",
+    agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "react" },
+    native_response_json: { id: "1", success: true, file: `${PROJECT_ROOT}/src/main.ts`, module: "react", added: false, already_present: true },
+    server_text: `already present react\nfile ${PROJECT_ROOT}/src/main.ts\ngroup —`,
+  },
+  {
+    name: "import_add_partial_names", tool_name: "import",
+    agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "@cortexkit/anthropic-auth-core", names: ["PrimeManager", "LogTestRecord"], typeOnly: true },
+    native_response_json: { id: "fixture", success: true, file: `${PROJECT_ROOT}/src/main.ts`, module: "@cortexkit/anthropic-auth-core", added: true, group: "external", added_names: ["PrimeManager"], already_imported_names: ["LogTestRecord"] },
+    server_text: `added PrimeManager; LogTestRecord already imported\nfile ${PROJECT_ROOT}/src/main.ts\ngroup external`,
+  },
+  {
+    name: "import_add_all_names_present", tool_name: "import",
+    agent_args: { op: "add", filePath: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", names: ["Value", "X as LocalX"], typeOnly: true },
+    native_response_json: { id: "fixture", success: true, file: `${PROJECT_ROOT}/src/main.ts`, module: "pkg", added: false, already_present: true, added_names: [], already_imported_names: ["Value", "X as LocalX"] },
+    server_text: `Value, X as LocalX already imported\nfile ${PROJECT_ROOT}/src/main.ts\ngroup —`,
+  },
   { name: "status_text", tool_name: "status", agent_args: {}, native_response_json: { id: "1", success: true, text: "indexes ready" } },
   { name: "read_truncated_footer", tool_name: "read", agent_args: { filePath: "README.md" }, native_response_json: { id: "1", success: true, content: "1: hello\n", truncated: true, start_line: 1, end_line: 100, total_lines: 250 } },
   { name: "read_range_no_footer", tool_name: "read", agent_args: { filePath: "README.md", startLine: 1 }, native_response_json: { id: "1", success: true, content: "1: hello\n", truncated: true, start_line: 1, end_line: 100, total_lines: 250 } },

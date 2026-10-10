@@ -88,6 +88,42 @@ pub(crate) fn merge_named_import_specifiers(
     merged
 }
 
+fn partition_es_named_specifiers(
+    block: &imports::ImportBlock,
+    module: &str,
+    requested: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut additions: Vec<String> = Vec::new();
+    let mut already_imported = Vec::new();
+    for name in requested {
+        // Deduplicate by local binding: `X as Y` binds `Y`, not `X`.
+        // Check all imports from this module, treating type and value imports
+        // alike, and skip repeated local names within the request.
+        let local = imports::specifier_local_name(name);
+        let present = block
+            .imports
+            .iter()
+            .filter(|imp| imp.module_path == module)
+            .any(|imp| {
+                imp.names
+                    .iter()
+                    .any(|stored| imports::specifier_local_name(stored) == local)
+                    || imp.default_import.as_deref() == Some(local)
+                    || imp.namespace_import.as_deref() == Some(local)
+            });
+        if present
+            || additions
+                .iter()
+                .any(|addition| imports::specifier_local_name(addition) == local)
+        {
+            already_imported.push(name.clone());
+        } else {
+            additions.push(name.clone());
+        }
+    }
+    (additions, already_imported)
+}
+
 /// Reject bindings that cannot be represented by an attributed JSON module.
 ///
 /// The same check runs before either the merge branch or the fresh-import branch
@@ -200,7 +236,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(message) => return Response::error(&req.id, "invalid_request", message),
     };
 
-    let default_import = req
+    let mut default_import = req
         .params
         .get("default_import")
         .and_then(|v| v.as_str())
@@ -214,7 +250,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
 
     // Namespace import (`* as ns`) and whole-module alias — used by engines
     // that support them (ES namespace; Solidity namespace + whole-file alias).
-    let namespace = req
+    let mut namespace = req
         .params
         .get("namespace")
         .and_then(|v| v.as_str())
@@ -363,6 +399,48 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         modifiers.push("scala2".to_string());
     }
 
+    let es_import = matches!(
+        lang,
+        LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
+    );
+    let es_named_request = es_import && !names.is_empty();
+    let (names, mut already_imported_names) = if es_named_request {
+        partition_es_named_specifiers(&block, module, &names)
+    } else {
+        (names, Vec::new())
+    };
+    // For requests with named imports, filter any requested default and
+    // namespace bindings separately. Existing bindings must not make the
+    // whole request a no-op while new named bindings remain.
+    if es_named_request {
+        if let Some(default) = default_import.as_deref() {
+            if block.imports.iter().any(|imp| {
+                imp.module_path == module && imp.default_import.as_deref() == Some(default)
+            }) {
+                already_imported_names.push(default.to_string());
+                default_import = None;
+            }
+        }
+        if let Some(ns) = namespace.as_deref() {
+            if block
+                .imports
+                .iter()
+                .any(|imp| imp.module_path == module && imp.namespace_import.as_deref() == Some(ns))
+            {
+                already_imported_names.push(format!("* as {ns}"));
+                namespace = None;
+            }
+        }
+    }
+    let mut added_names = names.clone();
+    if es_named_request {
+        if let Some(default) = &default_import {
+            added_names.push(default.clone());
+        }
+        if let Some(ns) = &namespace {
+            added_names.push(format!("* as {ns}"));
+        }
+    }
     let import_request = imports::ImportRequest {
         module_path: module,
         names: &names,
@@ -375,17 +453,22 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     // --- Check for duplicates ---
-    if imports::is_duplicate_import_request(lang, &block, &import_request) {
+    if (es_named_request && added_names.is_empty())
+        || (!es_named_request
+            && imports::is_duplicate_import_request(lang, &block, &import_request))
+    {
         log::debug!("add_import: {} (already present)", file);
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "file": file,
-                "added": false,
-                "module": module,
-                "already_present": true,
-            }),
-        );
+        let mut result = serde_json::json!({
+            "file": file,
+            "added": false,
+            "module": module,
+            "already_present": true,
+        });
+        if es_named_request {
+            result["added_names"] = serde_json::json!([]);
+            result["already_imported_names"] = serde_json::json!(already_imported_names);
+        }
+        return Response::success(&req.id, result);
     }
 
     // --- Determine group ---
@@ -406,9 +489,8 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     // (TS/JS, Rust, Py). That produces duplicate imports the linter then complains
     // about, and the agent has to call `organize` afterwards to clean up.
     //
-    // Instead, when the target module already has a value/type import statement of
-    // the matching kind with named specifiers, merge `names` into that statement's
-    // existing names (deduped + sorted) and replace its byte range. This only
+    // Instead, extend a compatible statement's named list in place, preserving
+    // comments, formatting and the order of untouched specifiers. This only
     // applies to languages where named imports are a list inside one statement —
     // Go's "import (...)" block is handled separately by the insertion path.
     let target_kind = if type_only {
@@ -418,29 +500,55 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let merge_target = if !names.is_empty()
         && default_import.is_none()
+        && namespace.is_none()
         && matches!(
             lang,
-            LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Python | LangId::Rust
+            LangId::TypeScript
+                | LangId::Tsx
+                | LangId::JavaScript
+                | LangId::Vue
+                | LangId::Python
+                | LangId::Rust
         ) {
-        block.imports.iter().find(|imp| {
-            let es_import = matches!(
-                lang,
-                LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
-            );
-            imp.module_path == module
-                && imp.kind == target_kind
-                && imp.namespace_import.is_none()
-                && (es_import || imp.default_import.is_none())
-                && (es_import || !imp.names.is_empty())
-                && (lang != LangId::Python
-                    || matches!(
-                        imp.form,
-                        imports::ImportForm::Python {
-                            from_import: true,
-                            ..
-                        }
-                    ))
-        })
+        block
+            .imports
+            .iter()
+            .find(|imp| {
+                let es_import = matches!(
+                    lang,
+                    LangId::TypeScript | LangId::Tsx | LangId::JavaScript | LangId::Vue
+                );
+                imp.module_path == module
+                    && imp.kind == target_kind
+                    && imp.namespace_import.is_none()
+                    && (es_import || imp.default_import.is_none())
+                    && (es_import || !imp.names.is_empty())
+                    && (lang != LangId::Python
+                        || matches!(
+                            imp.form,
+                            imports::ImportForm::Python {
+                                from_import: true,
+                                ..
+                            }
+                        ))
+            })
+            .or_else(|| {
+                // Follow the module's inline-type style only when there is no
+                // standalone type import available to extend.
+                if es_import && type_only {
+                    block.imports.iter().find(|imp| {
+                        imp.module_path == module
+                            && imp.kind == imports::ImportKind::Value
+                            && imp.namespace_import.is_none()
+                            && imp
+                                .names
+                                .iter()
+                                .any(|name| name.trim_start().starts_with("type "))
+                    })
+                } else {
+                    None
+                }
+            })
     } else {
         None
     };
@@ -466,9 +574,6 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
     let (insert_offset, replace_end, insert_text, merged_into_existing) = if let Some(existing) =
         merge_target
     {
-        // Build the merged named-import list: union of existing + new, sorted.
-        let merged_names = merge_named_import_specifiers(&existing.names, &names);
-
         let additions: Vec<String> = names
             .iter()
             .filter(|addition| {
@@ -479,8 +584,19 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                             == imports::specifier_local_name(addition)
                 })
             })
-            .cloned()
+            .map(|name| {
+                if es_import
+                    && type_only
+                    && existing.kind == imports::ImportKind::Value
+                    && !name.trim_start().starts_with("type ")
+                {
+                    format!("type {name}")
+                } else {
+                    name.clone()
+                }
+            })
             .collect();
+        let merged_names = merge_named_import_specifiers(&existing.names, &additions);
         let merged_line = import_specifier_edit::insert_named_specifiers(
             &existing.raw_text,
             &existing.names,
@@ -494,7 +610,7 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
                 &merged_names,
                 existing.default_import.as_deref(),
                 existing.namespace_import.as_deref(),
-                type_only,
+                existing.kind == imports::ImportKind::Type,
                 imports::es_import_attribute_clause(existing),
                 Some(imports::quotes::statement_style(&existing.raw_text)),
             )
@@ -690,6 +806,11 @@ pub fn handle_add_import(req: &RawRequest, ctx: &AppContext) -> Response {
         "group": group.label(),
         "formatted": write_result.formatted,
     });
+
+    if es_named_request {
+        result["added_names"] = serde_json::json!(added_names);
+        result["already_imported_names"] = serde_json::json!(already_imported_names);
+    }
 
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);

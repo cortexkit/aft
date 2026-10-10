@@ -1,0 +1,29 @@
+{
+  "tool_name": "import",
+  "native_response_json": {
+    "id": "fixture",
+    "success": true,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "module": "pkg",
+    "added": false,
+    "already_present": true,
+    "added_names": [],
+    "already_imported_names": [
+      "Value",
+      "X as LocalX"
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "add",
+      "filePath": "<PROJECT_ROOT>/src/main.ts",
+      "module": "pkg",
+      "names": [
+        "Value",
+        "X as LocalX"
+      ],
+      "typeOnly": true
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}

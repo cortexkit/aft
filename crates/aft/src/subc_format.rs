@@ -602,13 +602,41 @@ fn format_import(data: &Value, ctx: &FormatContext) -> String {
             .join("\n")
         }
         Some("add") => {
-            let status = if response.get("already_present").and_then(Value::as_bool) == Some(true) {
-                "already present"
+            let binding_names = |key| {
+                response
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .map(|names| {
+                        names
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default()
+            };
+            let status = if response.contains_key("added_names") {
+                let added = binding_names("added_names");
+                let present = binding_names("already_imported_names");
+                let mut parts = Vec::new();
+                if !added.is_empty() {
+                    parts.push(format!("added {added}"));
+                }
+                if !present.is_empty() {
+                    parts.push(format!("{present} already imported"));
+                }
+                parts.join("; ")
             } else {
-                "added"
+                let action =
+                    if response.get("already_present").and_then(Value::as_bool) == Some(true) {
+                        "already present"
+                    } else {
+                        "added"
+                    };
+                format!("{action} {}", import_module_name(response, ctx))
             };
             [
-                format!("{status} {}", import_module_name(response, ctx)),
+                status,
                 format!("file {}", import_file_name(response, ctx)),
                 format!(
                     "group {}",

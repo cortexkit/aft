@@ -3523,9 +3523,7 @@ fn es_import_commands_preserve_missing_semicolons() {
         let response = send_add_import(&mut aft, "nosemi-merge", file.to_str().unwrap(), "z", Some(&["y"]), None, false);
         assert_eq!(response["success"], true, "{response}");
         let text = fs::read_to_string(&file).unwrap();
-        // Vue add_import never merges into an existing statement; it inserts
-        // a new one, which must still follow the semicolon-free majority.
-        let merged = if extension == "vue" { "import { y } from 'z'\n" } else { "import { y, z } from 'z'\n" };
+        let merged = "import { y, z } from 'z'\n";
         assert!(text.contains(merged), "{extension} add to existing:\n{text}");
 
         let response = send_add_import(&mut aft, "nosemi-new", file.to_str().unwrap(), "c", Some(&["c"]), None, false);
@@ -3572,7 +3570,7 @@ fn es_import_commands_keep_semicolons() {
         assert_eq!(response["success"], true, "{response}");
 
         let text = fs::read_to_string(&file).unwrap();
-        let merged = if extension == "vue" { "import { y } from 'z';\n" } else { "import { y, z } from 'z';\n" };
+        let merged = "import { y, z } from 'z';\n";
         for line in ["{ B } from './types.ts';\n", merged, "import { c } from 'c';\n"] {
             assert!(text.contains(line), "{extension} missing {line:?}:\n{text}");
         }
@@ -3815,4 +3813,217 @@ fn add_named_specifier_preserves_existing_multiline_layout() {
         assert_eq!(actual, expected, "{extension} import layout changed");
     }
     aft.shutdown();
+}
+
+fn send_add_es_names(
+    aft: &mut AftProcess,
+    file: &Path,
+    module: &str,
+    names: &[&str],
+    type_only: bool,
+) -> serde_json::Value {
+    aft.send(
+        &serde_json::json!({
+            "id": "add-es-names", "command": "tool_call", "name": "import",
+            "arguments": {
+                "op": "add", "filePath": file, "module": module,
+                "names": names, "typeOnly": type_only
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn es_script(extension: &str, script: &str) -> String {
+    if extension == "vue" {
+        format!("<template><div /></template>\n<script setup lang=\"ts\">\n{script}</script>\n")
+    } else {
+        script.to_string()
+    }
+}
+
+#[test]
+fn add_import_es_inline_type_dedup_reports_partial_add() {
+    for extension in ["ts", "tsx", "vue"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("inline.{extension}"));
+        let module = "@cortexkit/anthropic-auth-core";
+        let source = es_script(extension, "import {\n  Zap, // keep authored order\n  Api,\n  type LogTestRecord,\n} from \"@cortexkit/anthropic-auth-core\";\n");
+        let expected = es_script(extension, "import {\n  Zap, // keep authored order\n  Api,\n  type LogTestRecord,\n  type PrimeManager,\n} from \"@cortexkit/anthropic-auth-core\";\n");
+        fs::write(&file, &source).unwrap();
+        let mut aft = AftProcess::spawn();
+        let response = send_add_es_names(
+            &mut aft,
+            &file,
+            module,
+            &["PrimeManager", "LogTestRecord"],
+            true,
+        );
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "added PrimeManager; LogTestRecord already imported",
+            "{extension}: {response}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected, "{extension}");
+        assert_eq!(response["added_names"], serde_json::json!(["PrimeManager"]));
+        assert_eq!(
+            response["already_imported_names"],
+            serde_json::json!(["LogTestRecord"])
+        );
+        aft.shutdown();
+    }
+}
+
+#[test]
+fn add_import_es_all_names_present_is_byte_identical() {
+    for extension in ["ts", "tsx", "js", "vue"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("present.{extension}"));
+        let source = es_script(
+            extension,
+            "// keep bytes\r\nimport { B as LocalB, A } from 'pkg'\r\n",
+        );
+        fs::write(&file, &source).unwrap();
+        let mut aft = AftProcess::spawn();
+        let response = send_add_es_names(&mut aft, &file, "pkg", &["A", "B as LocalB"], true);
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(response["added"], false, "{extension}: {response}");
+        assert_eq!(response["already_present"], true, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "A, B as LocalB already imported"
+        );
+        assert_eq!(fs::read(&file).unwrap(), source.as_bytes(), "{extension}");
+        assert!(response.get("backup_id").is_none(), "{response}");
+        aft.shutdown();
+    }
+}
+
+#[test]
+fn add_import_es_alias_dedup_uses_local_binding() {
+    for extension in ["ts", "tsx", "js", "vue"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("aliases.{extension}"));
+        let source = es_script(extension, "import { X as Y, Z } from 'pkg';\n");
+        fs::write(&file, &source).unwrap();
+        let mut aft = AftProcess::spawn();
+        let response = send_add_es_names(
+            &mut aft,
+            &file,
+            "pkg",
+            &["X as Y", "Y", "X", "X as Other"],
+            false,
+        );
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "added X, X as Other; X as Y, Y already imported"
+        );
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            es_script(
+                extension,
+                "import { X as Other, X, X as Y, Z } from 'pkg';\n"
+            ),
+            "{extension}"
+        );
+        aft.shutdown();
+    }
+}
+
+#[test]
+fn add_import_es_type_statement_dedup_and_in_place_extension() {
+    for extension in ["ts", "tsx", "vue"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("types.{extension}"));
+        let source = es_script(extension, "import { Value } from 'pkg'\nimport type {\n  Zed, // preserve order and comment\n  A as LocalA,\n} from 'pkg'\n");
+        fs::write(&file, &source).unwrap();
+        let mut aft = AftProcess::spawn();
+        let response = send_add_es_names(
+            &mut aft,
+            &file,
+            "pkg",
+            &["Value", "A as LocalA", "NewType"],
+            true,
+        );
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "added NewType; Value, A as LocalA already imported"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), es_script(extension, "import { Value } from 'pkg'\nimport type {\n  Zed, // preserve order and comment\n  A as LocalA,\n  NewType,\n} from 'pkg'\n"), "{extension}");
+        let before = fs::read(&file).unwrap();
+        let response =
+            send_add_es_names(&mut aft, &file, "pkg", &["NewType", "A as LocalA"], false);
+        assert_eq!(response["added"], false, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "NewType, A as LocalA already imported"
+        );
+        assert_eq!(fs::read(&file).unwrap(), before);
+        aft.shutdown();
+    }
+}
+
+#[test]
+fn add_import_es_prefers_type_statement_over_inline_type() {
+    for extension in ["ts", "tsx", "vue"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("prefer.{extension}"));
+        let source = es_script(
+            extension,
+            "import { Value, type Inline } from 'pkg';\nimport type { Existing } from 'pkg';\n",
+        );
+        fs::write(&file, &source).unwrap();
+        let mut aft = AftProcess::spawn();
+        let response = send_add_es_names(&mut aft, &file, "pkg", &["NewType"], true);
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "added NewType"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), es_script(extension, "import { Value, type Inline } from 'pkg';\nimport type { Existing, NewType } from 'pkg';\n"), "{extension}");
+        aft.shutdown();
+    }
+}
+
+#[test]
+fn add_import_es_inline_type_present_and_plain_value_fallback() {
+    for extension in ["ts", "tsx", "vue"] {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("fallback.{extension}"));
+        let mut aft = AftProcess::spawn();
+        let source = es_script(
+            extension,
+            "import { Value, type X as LocalX } from 'pkg';\n",
+        );
+        fs::write(&file, &source).unwrap();
+        let response = send_add_es_names(&mut aft, &file, "pkg", &["X as LocalX"], true);
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        assert_eq!(response["added"], false, "{extension}: {response}");
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "X as LocalX already imported"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), source);
+        let source = es_script(extension, "import { Value } from 'pkg';\n");
+        fs::write(&file, &source).unwrap();
+        let response = send_add_es_names(&mut aft, &file, "pkg", &["Value", "NewType"], true);
+        assert_eq!(response["success"], true, "{extension}: {response}");
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            text.contains("import { Value } from 'pkg';\n"),
+            "{extension}: {text}"
+        );
+        assert!(
+            text.contains("import type { NewType } from 'pkg';\n"),
+            "{extension}: {text}"
+        );
+        assert_eq!(
+            response["text"].as_str().unwrap().lines().next().unwrap(),
+            "added NewType; Value already imported"
+        );
+        aft.shutdown();
+    }
 }

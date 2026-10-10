@@ -1,0 +1,30 @@
+{
+  "tool_name": "import",
+  "native_response_json": {
+    "id": "fixture",
+    "success": true,
+    "file": "<PROJECT_ROOT>/src/main.ts",
+    "module": "@cortexkit/anthropic-auth-core",
+    "added": true,
+    "group": "external",
+    "added_names": [
+      "PrimeManager"
+    ],
+    "already_imported_names": [
+      "LogTestRecord"
+    ]
+  },
+  "ctx": {
+    "agent_args": {
+      "op": "add",
+      "filePath": "<PROJECT_ROOT>/src/main.ts",
+      "module": "@cortexkit/anthropic-auth-core",
+      "names": [
+        "PrimeManager",
+        "LogTestRecord"
+      ],
+      "typeOnly": true
+    },
+    "project_root": "<PROJECT_ROOT>"
+  }
+}
