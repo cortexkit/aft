@@ -287,6 +287,12 @@ pub struct ExclusionEntry {
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
+        file: "commands/configure.rs",
+        enclosing_item: "view_working_tree_refresh_path",
+        location_or_primitive: "max_examined .take()",
+        reason: "startup verification of persisted view bytes, not a result list; reaching the iterator budget schedules a full background publication and refuses stale graph answers rather than treating partial verification as complete",
+    },
+    ExclusionEntry {
         file: "subc_format.rs",
         enclosing_item: "format_ast_search_capture",
         location_or_primitive: "AST_CAPTURE_INLINE_CHAR_LIMIT .chars().take()",

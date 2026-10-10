@@ -2279,6 +2279,24 @@ pub fn index_refusal_response(
         CallgraphStoreAccess::Off => off_response(req_id, operation),
         CallgraphStoreAccess::Building => {
             note_callgraph_building(ctx, operation);
+            if let Some(view) = ctx.view_runtime_snapshot().filter(|view| {
+                view.pending_inputs
+                    .values()
+                    .any(|input| input.plane == "checkout")
+            }) {
+                let mut response = callgraph_index_refusal(
+                    req_id,
+                    "callgraph_building",
+                    format!("{operation}: call graph is waiting for working-tree verification and view publication; retry shortly"),
+                    IndexObservation::building(),
+                );
+                response.data["progress"] = serde_json::json!({
+                    "phase": "working_tree_refresh",
+                    "pending_paths": view.pending_paths.len(),
+                    "waiting_on": [{"plane": "checkout", "reason": "working-tree verification and view publication"}],
+                });
+                return response;
+            }
             if ctx.config().views.enabled && ctx.is_worktree_bridge() {
                 let view = ctx.view_runtime_snapshot();
                 // Semantic fill is independent of callgraph publication. Only

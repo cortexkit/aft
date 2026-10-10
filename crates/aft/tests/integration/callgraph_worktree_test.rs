@@ -78,6 +78,14 @@ fn configure(checkout: &Path, storage: &Path, views: bool) -> AppContext {
 }
 
 fn configure_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContext {
+    let ctx = configure_checkout_deferred(checkout, storage, views);
+    assert!(ctx.is_worktree_bridge());
+    assert!(ctx.shared_artifacts_read_only());
+    assert!(!ctx.callgraph_writer());
+    ctx
+}
+
+fn configure_checkout_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContext {
     crate::test_helpers::disable_in_process_file_watcher();
     let ctx = AppContext::new(
         Box::new(TreeSitterProvider::new()),
@@ -99,9 +107,6 @@ fn configure_deferred(checkout: &Path, storage: &Path, views: bool) -> AppContex
         &ctx,
     );
     assert!(response.success, "{response:?}");
-    assert!(ctx.is_worktree_bridge());
-    assert!(ctx.shared_artifacts_read_only());
-    assert!(!ctx.callgraph_writer());
     ctx
 }
 
@@ -132,6 +137,78 @@ const OPERATIONS: [&str; 6] = [
     "trace_to_symbol",
     "trace_data",
 ];
+
+#[test]
+fn callgraph_restart_reconciles_source_dirtied_before_configure() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    std::fs::write(root.join("index.ts"), source("committedCaller")).unwrap();
+    commit(&root);
+    let storage = fixture.path().join("storage");
+    publish(&root, &storage);
+    std::fs::write(
+        root.join("index.ts"),
+        format!(
+            "{}export function beforeRestart(value: number) {{ return dirtyTarget(value); }}\n\
+             export function dirtyTarget(value: number) {{ return value; }}\n",
+            source("dirtyCaller")
+        ),
+    )
+    .unwrap();
+
+    // No watcher is installed, and no source write occurs after the new context.
+    let ctx = configure_checkout_deferred(&root, &storage, true);
+    assert!(!ctx.is_worktree_bridge());
+    let zoom = aft::commands::zoom::handle_zoom(
+        &request(json!({
+            "id": "restart-zoom", "command": "zoom",
+            "file": root.join("index.ts"), "symbol": "dirtyTarget"
+        })),
+        &ctx,
+    );
+    assert!(
+        zoom.success,
+        "zoom should read live source independently: {zoom:?}"
+    );
+    aft::runtime_drain::drain_deferred_configure_maintenance(&ctx);
+    let req = request(json!({
+        "id": "restart-callers", "command": "callers",
+        "file": root.join("index.ts"), "symbol": "dirtyTarget"
+    }));
+    let response = callgraph_when_ready("callers", || {
+        aft::commands::callers::handle_callers(&req, &ctx)
+    });
+    assert!(
+        response.success,
+        "pre-restart dirty symbol must be found: {response:?}"
+    );
+    assert_eq!(response.data["total_callers"], 1);
+    assert!(response.data.to_string().contains("beforeRestart"));
+}
+
+#[test]
+fn callgraph_restart_reconciles_a_dirty_view_after_git_restore() {
+    let fixture = tempfile::tempdir().unwrap();
+    let checkout = linked_checkout(fixture.path());
+    let storage = fixture.path().join("storage");
+    std::fs::write(checkout.join("index.ts"), source("dirtyCaller")).unwrap();
+    publish(&checkout, &storage);
+    git(&checkout, &["restore", "index.ts"]);
+    let ctx = configure(&checkout, &storage, true);
+    let response = query(&ctx, &checkout, "callers", "ownerCaller");
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["total_callers"], 1);
+    assert!(
+        response.data.to_string().contains("ownerCaller"),
+        "{response:?}"
+    );
+    assert!(
+        !response.data.to_string().contains("dirtyCaller"),
+        "{response:?}"
+    );
+}
 
 #[test]
 fn callgraph_worktree_publishes_unique_source_without_an_owner_writer_or_overlay() {

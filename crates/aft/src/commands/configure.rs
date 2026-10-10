@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::unbounded;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
@@ -7350,6 +7350,63 @@ fn manifest_checkout_paths(manifest: &crate::views::Manifest) -> BTreeSet<Vec<u8
         .collect()
 }
 
+const VIEW_WORKING_TREE_VERIFY_LIMIT: usize = 200_000;
+
+/// A matching HEAD does not certify a persisted graph's working-tree bytes.
+/// Stop at the first changed member, or the verification budget, and request a
+/// full background publication in either case instead of trusting a partial scan.
+fn view_working_tree_refresh_path(
+    root: &Path,
+    manifest: &crate::views::Manifest,
+    max_examined: usize,
+) -> Result<Option<Vec<u8>>, String> {
+    for (examined, (path, entry)) in manifest
+        .entries()
+        .take(max_examined.saturating_add(1))
+        .enumerate()
+    {
+        if examined == max_examined {
+            return Ok(Some(path.as_bytes().to_vec()));
+        }
+        let crate::views::ManifestEntry::Regular {
+            planes,
+            resolution_input,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let Some(expected) = planes.callgraph.as_deref() else {
+            continue;
+        };
+        let absolute = root.join(crate::callgraph_store::facts::byte_path(path.as_bytes()));
+        let source = crate::views::assembly::read_working_tree_file(&absolute)
+            .map_err(|error| error.to_string())?;
+        let Some(source) = source else {
+            return Ok(Some(path.as_bytes().to_vec()));
+        };
+        let language = if *resolution_input {
+            "config".to_string()
+        } else {
+            let Some(language) = crate::views::callgraph::source_language(&absolute) else {
+                continue;
+            };
+            format!("{language:?}").to_lowercase()
+        };
+        let actual = crate::blob_store::CallgraphKey::from_bytes(
+            &source,
+            &language,
+            crate::views::callgraph::PRODUCER,
+        )
+        .full_key()
+        .to_hex();
+        if actual != expected {
+            return Ok(Some(path.as_bytes().to_vec()));
+        }
+    }
+    Ok(None)
+}
+
 fn open_view_runtime_for_configure(
     input: &ConfigureViewInput,
     job: &ConfigureMaintenanceJob,
@@ -7455,7 +7512,7 @@ fn open_view_runtime_for_configure(
             generation.as_deref().unwrap_or_default()
         );
     }
-    let pending_paths = if callgraph_missing || callgraph_unready {
+    let mut pending_paths = if callgraph_missing || callgraph_unready {
         head_paths.clone()
     } else if generation_matches_head {
         BTreeSet::new()
@@ -7470,6 +7527,26 @@ fn open_view_runtime_for_configure(
             .map(|entry| entry.rel_path.clone())
             .collect::<BTreeSet<_>>()
     };
+    let mut pending_inputs = BTreeMap::new();
+    if input.callgraph {
+        if let Some(manifest) = manifest.as_ref() {
+            if let Some(path) = view_working_tree_refresh_path(
+                &job.canonical_cache_root,
+                manifest,
+                VIEW_WORKING_TREE_VERIFY_LIMIT,
+            )? {
+                pending_paths.insert(path.clone());
+                pending_inputs.insert(
+                    path,
+                    crate::views::assembly::PendingInput {
+                        plane: "checkout",
+                        reason: "working-tree verification requires a fresh publication",
+                        blob_key: None,
+                    },
+                );
+            }
+        }
+    }
     if !pending_paths.is_empty() {
         slog_info!(
             "content-addressed view publication scheduled paths={} root={}",
@@ -7501,7 +7578,7 @@ fn open_view_runtime_for_configure(
             head_fingerprint: desired_head,
             head_metadata,
             pending_paths,
-            pending_inputs: Default::default(),
+            pending_inputs,
         },
         pin,
         import_ready: true,
@@ -8992,6 +9069,136 @@ mod tests {
             .jobs
             .iter()
             .all(|pending| pending.job.generation == ctx.configure_generation()));
+    }
+
+    #[test]
+    fn views_restart_dirty_source_reports_working_tree_refresh_until_publication() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let head = crate::alias::head_tree_entries(&root).unwrap();
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: storage.path().to_path_buf(),
+                project_root: root.clone(),
+                family: crate::search_index::artifact_cache_key(&root),
+                scope: crate::path_identity::project_scope_key(&root),
+                desired_head: crate::views::assembly::head_tree_fingerprint(&head),
+                changed_paths: BTreeSet::new(),
+                semantic_keys: Default::default(),
+                require_semantic: false,
+                allow_blob_put: true,
+                callgraph: true,
+            })
+            .unwrap();
+        assert!(report.published);
+        std::fs::write(
+            root.join("tracked.rs"),
+            "pub fn dirty() {}\npub fn caller() { dirty(); }\n",
+        )
+        .unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        assert!(
+            handle_configure_for_test(
+                &configure_request_with_params(json!({
+                    "project_root": root, "storage_dir": storage.path(), "harness": "opencode",
+                    "config": [user_tier(json!({
+                        "views": {"enabled": true},
+                        "indexes": {"trigram": false, "semantic": false, "callgraph": true}
+                    }))]
+                })),
+                &ctx
+            )
+            .success
+        );
+        let mut state = super::ConfigureMaintenanceState::standalone();
+        state.absorb_enqueued(&ctx);
+        let job = &state.jobs.front().unwrap().job;
+        let input = super::ConfigureViewInput::capture(&ctx, job);
+        let prepared = super::open_view_runtime_for_configure(&input, job).unwrap();
+        assert_eq!(
+            prepared.snapshot.pending_paths,
+            BTreeSet::from([b"tracked.rs".to_vec()])
+        );
+        ctx.install_view_runtime(prepared.snapshot, prepared.pin);
+        let request = RawRequest {
+            id: "restart-dirty".into(),
+            command: "callers".into(),
+            session_id: None,
+            lsp_hints: None,
+            params: json!({"file": root.join("tracked.rs"), "symbol": "dirty"}),
+        };
+        let response = crate::commands::callers::handle_callers(&request, &ctx);
+        assert_eq!(response.data["code"], "callgraph_building", "{response:?}");
+        assert_eq!(response.data["progress"]["phase"], "working_tree_refresh");
+        assert_eq!(response.data["progress"]["pending_paths"], 1);
+        assert!(response.data["progress"]["waiting_on"]
+            .to_string()
+            .contains("view publication"));
+        assert!(
+            ctx.publish_view_paths(BTreeSet::new(), true)
+                .unwrap()
+                .published
+        );
+        let response = crate::commands::callers::handle_callers(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_callers"], 1);
+    }
+
+    #[test]
+    fn view_working_tree_verification_is_bounded_and_hashes_source_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let original = "export function alpha() {}\n";
+        let entry = crate::views::ManifestEntry::Regular {
+            mode: 0o100644,
+            resolution_input: false,
+            planes: crate::views::RegularPlanes {
+                semantic: None,
+                callgraph: Some(
+                    crate::blob_store::CallgraphKey::from_bytes(
+                        original.as_bytes(),
+                        "typescript",
+                        crate::views::callgraph::PRODUCER,
+                    )
+                    .full_key()
+                    .to_hex(),
+                ),
+            },
+        };
+        for name in ["a.ts", "b.ts"] {
+            std::fs::write(project.path().join(name), original).unwrap();
+        }
+        let manifest = crate::views::Manifest::new(["a.ts", "b.ts"].map(|name| {
+            (
+                crate::views::RelPath::new(name.as_bytes().to_vec()).unwrap(),
+                entry.clone(),
+            )
+        }))
+        .unwrap();
+        assert_eq!(
+            super::view_working_tree_refresh_path(project.path(), &manifest, 1).unwrap(),
+            Some(b"b.ts".to_vec())
+        );
+        assert_eq!(
+            super::view_working_tree_refresh_path(project.path(), &manifest, 2).unwrap(),
+            None
+        );
+        let edited = "export function bravo() {}\n";
+        assert_eq!(original.len(), edited.len());
+        std::fs::write(project.path().join("a.ts"), edited).unwrap();
+        assert_eq!(
+            super::view_working_tree_refresh_path(project.path(), &manifest, 2).unwrap(),
+            Some(b"a.ts".to_vec())
+        );
+        std::fs::write(project.path().join("a.ts"), original).unwrap();
+        std::fs::remove_file(project.path().join("b.ts")).unwrap();
+        assert_eq!(
+            super::view_working_tree_refresh_path(project.path(), &manifest, 2).unwrap(),
+            Some(b"b.ts".to_vec())
+        );
     }
 
     #[test]

@@ -7573,6 +7573,15 @@ impl AppContext {
                         return CallgraphStoreAccess::Unavailable;
                     };
                     let generation = view.generation.as_deref().expect("pinned generation");
+                    // A restart can leave HEAD unchanged while source bytes have
+                    // changed. Do not answer from the old graph during that refresh.
+                    if view
+                        .pending_inputs
+                        .values()
+                        .any(|input| input.plane == "checkout")
+                    {
+                        return CallgraphStoreAccess::Building;
+                    }
                     if !crate::views::generation_matches_head(generation, &view.head_fingerprint) {
                         crate::slog_debug!(
                             "callgraph view unavailable root={} reason=view_pending generation={}",
