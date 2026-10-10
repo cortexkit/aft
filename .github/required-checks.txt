@@ -1,0 +1,37 @@
+# Required status checks on main, one check name per line.
+#
+# scripts/release-ci-gate.sh reads this list when the token it runs with cannot
+# read main's branch protection, which is always the case inside release.yml
+# (GITHUB_TOKEN has no repository administration access). A release is refused
+# unless every name here is a job of the commit's green tests.yml run and that
+# job concluded success, so keep this list in step with branch protection: add a
+# name when it becomes required and remove it when it stops being required. Run
+# the gate with a token that can read protection to see any difference.
+#
+# Captured from GET /repos/cortexkit/aft/branches/main/protection/required_status_checks.
+Unit / Unit tests (Linux)
+Unit / Unit tests (macOS)
+Unit / Bash permission e2e (Windows)
+Unit / Cargo check deny-warnings (Windows)
+Unit / Cargo integration shard 1/3 (Linux)
+Unit / Cargo integration shard 1/3 (Windows)
+Unit / Cargo integration shard 1/3 (macOS)
+Unit / Cargo integration shard 2/3 (Linux)
+Unit / Cargo integration shard 2/3 (Windows)
+Unit / Cargo integration shard 2/3 (macOS)
+Unit / Cargo integration shard 3/3 (Linux)
+Unit / Cargo integration shard 3/3 (Windows)
+Unit / Cargo integration shard 3/3 (macOS)
+Unit / Cargo libtest + watcher (Windows)
+Unit / Cargo test archive (Linux)
+Unit / Cargo test archive (Windows)
+Unit / Cargo test archive (macOS)
+Unit / MSRV check (rustc 1.92)
+Unit / Release storm (Linux)
+Unit / Sandbox real-kernel Landlock probes
+E2E / E2E (Linux Docker)
+E2E / E2E (Pi RPC)
+E2E / E2E (Windows native)
+E2E / E2E (macOS native)
+E2E / E2E binary (Linux x64)
+E2E / OpenCode 2 (Linux Docker)
