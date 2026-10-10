@@ -3400,6 +3400,9 @@ fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
             vec![
                 set_test_foreground_wait_ms(200),
                 set_test_force_bash_promote_panic(),
+                // Keep the executor's claimed promotion unresolved beyond the
+                // reply backstop, so the test also exercises panic delivery races.
+                set_test_env("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS", "500"),
             ]
         },
         drive_bash_promote_panic_daemon,
@@ -5303,19 +5306,22 @@ async fn drive_bash_promote_panic_daemon(input: FakeDaemonInput) {
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let marker = root1.join("promote-panic-started");
+    let release = root1.join("promote-panic-release");
     send_tool_call(
         &mut stream,
         1,
         116,
         "bash",
         json!({
-            "command": "sleep 2; printf 'promote-panic-done\\n'",
+            "command": hold_bash_until_release_command(&marker, &release, "promote-panic-done"),
             "foreground_orchestrate": true,
             "compressed": false,
         }),
     )
     .await;
     let frame = read_frame_timeout(&mut stream, "promote panic bash response").await;
+    std::fs::write(&release, b"release").expect("release panic command");
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 116);
     assert!(

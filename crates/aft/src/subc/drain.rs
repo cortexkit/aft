@@ -150,6 +150,19 @@ pub(super) struct BashCallClaim {
 }
 
 impl BashCallClaim {
+    /// Takes an unclaimed answer without replacing a poll or promotion that
+    /// already owns it. Deadline handoff uses this to preserve executor errors.
+    pub(super) fn try_claim_for_wait_task(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CLAIM_UNCLAIMED,
+                CLAIM_WAIT_TASK,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
     /// Claims the call for its wait task. True when the wait task owns the
     /// answer (it just claimed it, or had already); false when the module loop
     /// answered, in which case the wait task must stop without a frame.

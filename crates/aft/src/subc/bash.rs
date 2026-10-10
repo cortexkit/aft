@@ -1019,6 +1019,7 @@ pub(super) fn submit_deferred_bash(
                     flags,
                     format_context: format_context.clone(),
                 };
+                let repeat_for_deadline = repeat.clone();
                 let wait_future = run_deferred_bash_wait(
                     executor,
                     completion_tx.clone(),
@@ -1048,21 +1049,22 @@ pub(super) fn submit_deferred_bash(
                     repeat,
                     server_completion,
                 );
-                // A healthy executor normally finishes the deadline poll and
-                // promotion, including repeat steering and the hard-kill note,
-                // within one poll turn. Only bypass it when it fails to answer;
-                // the bounded grace still leaves nearly five seconds under the
-                // 25 s transport class, even at the largest plain wait window.
+                // Bypass work still queued on the executor, but not a job that
+                // has claimed the answer: dropping that future would hide its
+                // error (including a fatal panic) behind a successful handoff.
+                tokio::pin!(wait_future);
                 let reply_deadline = deadline + PENDING_POLL_INTERVAL * 2;
                 tokio::select! {
                     biased;
-                    _ = wait_future => {}
+                    _ = &mut wait_future => {}
                     _ = tokio::time::sleep_until(reply_deadline.into()), if !block_to_completion && !server_completion && worker_cap_ms.is_none() => {
-                        if claim.claim_for_wait_task() {
+                        if claim.try_claim_for_wait_task() {
                             let response = deadline_handoff_response(&request_id, &deadline_target.task_id, wait_window_ms, worker_session, deadline_target.format_context.bash_watch_available.unwrap_or(worker_session));
-                            let result = bash_result_from_response(response, &deadline_target.format_context);
+                            let result = finalized_bash_result(response, &spawn_ctx, &deadline_target.session_id, &deadline_target.format_context, false, repeat_for_deadline);
                             detach_held_bash_in_background(deadline_target, false);
                             send_bash_deferred_completion(&completion_tx, &task_metrics, route, corr, flags, ver, root_for_task, request_id, Some(result), false).await;
+                        } else {
+                            wait_future.await;
                         }
                     }
                 }
@@ -1545,20 +1547,8 @@ async fn run_deferred_bash_wait(
                                     )
                                 }
                                 crate::commands::bash_orchestrate::BashStep::Promote => {
-                                    if !claim_for_poll.claim_for_wait_task() {
-                                        return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
-                                    }
-                                    if detach_on_user_message {
-                                        ctx.bash_background().end_wait_mode_session(
-                                            &session_for_poll,
-                                            &task_id_for_poll,
-                                        );
-                                    } else {
-                                        ctx.bash_background().unregister_foreground_task(
-                                            &session_for_poll,
-                                            &task_id_for_poll,
-                                        );
-                                    }
+                                    // Promotion claims the answer when its mutating
+                                    // job starts, not while it is queued behind a writer.
                                     if let Some(tx) = poll_control_tx.take() {
                                         let _ = tx.send(BashPollControl::Promote);
                                     }
@@ -1668,6 +1658,8 @@ async fn run_deferred_bash_wait(
                             worker_cap_ms.is_some(),
                             format_context.clone(),
                             repeat.clone(),
+                            claim.clone(),
+                            detach_on_user_message,
                         )
                         .await;
                         let fatal = response_is_fatal_panic(&result.response);
@@ -1680,7 +1672,7 @@ async fn run_deferred_bash_wait(
                             ver,
                             root,
                             request_id,
-                            Some(result),
+                            (!claim.claimed_by_module_loop()).then_some(result),
                             fatal,
                         )
                         .await;
@@ -1705,6 +1697,8 @@ async fn submit_bash_promote(
     capped_worker_wait: bool,
     format_context: crate::subc_format::FormatContext,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
+    claim: Arc<drain::BashCallClaim>,
+    detach_on_user_message: bool,
 ) -> ToolCallResult {
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let request_id_for_promote = request_id.clone();
@@ -1716,7 +1710,26 @@ async fn submit_bash_promote(
         Lane::Mutating,
         request_id.clone(),
         Box::new(move |ctx| {
+            if !claim.try_claim_for_wait_task() {
+                return Response::error(
+                    &request_id_for_promote,
+                    "cancelled",
+                    "bash already answered",
+                );
+            }
+            release_wait_registration(
+                ctx.bash_background(),
+                &session_for_promote,
+                &task_id_for_promote,
+                detach_on_user_message,
+            );
             log_ctx::with_session(Some(session_for_promote.clone()), || {
+                if let Some(delay) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
                 let response = if let Some(value) =
                     std::env::var_os("AFT_TEST_FORCE_SUBC_BASH_PROMOTE_ERROR")
                 {
