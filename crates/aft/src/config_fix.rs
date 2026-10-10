@@ -343,14 +343,14 @@ pub struct FixOutcome {
 
 /// Files a fix run may touch for an invocation in `cwd`: the existing user
 /// file and, when present, the project file at the invocation directory.
-/// These are exactly the files ordinary loading consumes; legacy per-harness
-/// locations are not loaded and so are not repaired.
+/// A legacy project file is repaired in place when the shared file is absent;
+/// explicit fix never relocates it or creates a shared project file.
 pub fn fix_targets(user_config_path: Option<&Path>, cwd: &Path) -> Vec<(PathBuf, FixTier)> {
     let mut targets = Vec::new();
     if let Some(user) = user_config_path.filter(|path| path.is_file()) {
         targets.push((user.to_path_buf(), FixTier::User));
     }
-    let project = crate::setup_plan::project_config_path(cwd);
+    let project = crate::subc_config::project_config_read_path(cwd, None);
     if project.is_file() {
         targets.push((project, FixTier::Project));
     }

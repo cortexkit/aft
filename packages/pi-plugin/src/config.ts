@@ -9,6 +9,7 @@ import {
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
   legacyConfigNoticeMessage,
+  legacyProjectConfigLocationNotice,
   MIN_WORKER_WAIT_MAX_MS,
   mergeIndexes,
   migrateAftConfigFile as migrateLegacyAftConfigFile,
@@ -22,6 +23,7 @@ import {
   resolveCortexKitConfigPaths,
   resolveIndexes,
   resolveLegacyAftConfigSources,
+  resolveProjectConfigReadPath,
   semanticCostNotice,
   sortedUnique,
   stripHarnessSpecificConfigKeys,
@@ -1975,18 +1977,14 @@ export function migrateAftConfigLocations(
       operatingHarness: "pi",
       logger,
     }),
-    migrateLegacyAftConfigFile({
-      scope: "project",
-      targetPath: paths.projectConfigPath,
-      legacySources: legacy.project,
-      operatingHarness: "pi",
-      logger,
-    }),
   ];
 }
 
 export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
-  return resolveCortexKitConfigPaths(projectDirectory);
+  return {
+    ...resolveCortexKitConfigPaths(projectDirectory),
+    projectConfigPath: resolveProjectConfigReadPath(projectDirectory, ACTIVE_HARNESS),
+  };
 }
 
 export function buildConfigTierConfigureParams(
@@ -2035,6 +2033,15 @@ export function loadAftConfig(projectDirectory: string): AftConfig {
   semanticInputSupplied = false;
 
   const { userConfigPath, projectConfigPath } = resolveAftConfigPaths(projectDirectory);
+  const locationNotice = legacyProjectConfigLocationNotice(projectDirectory, projectConfigPath);
+  if (locationNotice) {
+    log(locationNotice);
+    configLoadNotices.push({
+      configPath: projectConfigPath,
+      digest: "legacy-project-config-location",
+      message: locationNotice,
+    });
+  }
 
   // A missing or unreadable user file behaves like `{}`, which still receives
   // the absent-base disabled default.

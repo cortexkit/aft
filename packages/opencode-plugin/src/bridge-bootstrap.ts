@@ -58,6 +58,7 @@ import {
   getConfigLoadSources,
   getConfigLoadTexts,
   loadAftConfig,
+  migrateAftConfigLocations,
   resolvedIndexes,
 } from "./config.js";
 import { bridgeLogger, error, log, warn } from "./logger.js";
@@ -312,9 +313,9 @@ export const defaultBridgeBootstrapDependencies: BridgeBootstrapDependencies = {
   configLoadSources: getConfigLoadSources,
   configLoadTexts: getConfigLoadTexts,
   subcConnectionFileError,
-  // Moving old per-harness aft.jsonc files to shared CortexKit paths requires
-  // an explicit relocation operation, never an ordinary config load.
-  migrateConfigLocations: () => [],
+  // User files may relocate automatically; committed project files stay in place.
+  migrateConfigLocations: (directory) =>
+    migrateAftConfigLocations(directory, bridgeLogger).flatMap((result) => result.warnings),
   resolveBinary: resolveBinaryWithWarmup,
   ensureStorageMigrated: (binaryPath) =>
     ensureStorageMigrated({
@@ -382,15 +383,14 @@ function parseFailure(dependencies: BridgeBootstrapDependencies): string | null 
 }
 
 /**
- * Load the config for `directory` without writing files in production.
+ * Load the config for `directory`, relocating only legacy user files.
  * Notices for a project file whose retired keys were translated are
  * delivered through `notify`, once per notice identity.
  *
  * A configuration that is rejected (an incomplete resolved configuration),
  * that does not parse, or whose load throws for any other reason yields the
  * config error state with the default tool
- * surface. Nothing falls back to defaults. An injected location migration
- * hook is only for callers that explicitly opt into relocation.
+ * surface. Nothing falls back to defaults. Project config files are read in place.
  */
 export function loadBootstrapConfig(
   directory: string,

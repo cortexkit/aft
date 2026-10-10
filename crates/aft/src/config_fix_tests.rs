@@ -305,6 +305,27 @@ fn a_multi_file_run_keeps_successful_repairs_when_another_file_fails() {
 }
 
 #[test]
+fn explicit_fix_repairs_legacy_project_file_in_place_without_relocating() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".pi/aft.jsonc");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "{\n // committed settings\n \"experimental_bash_compress\": false\n}\n",
+    )
+    .unwrap();
+    let targets = fix_targets(None, dir.path());
+    assert_eq!(targets, vec![(path.clone(), FixTier::Project)]);
+    let outcomes = fix_files(&targets);
+    assert_eq!(outcomes[0].status, "rewritten");
+    assert!(outcomes[0].error.is_none());
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("// committed settings"));
+    assert!(!dir.path().join(".cortexkit/aft.jsonc").exists());
+}
+
+#[test]
 fn without_a_project_file_only_the_user_file_is_a_target() {
     let dir = tempfile::tempdir().unwrap();
     let user = dir.path().join("aft.jsonc");

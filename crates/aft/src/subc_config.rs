@@ -2,6 +2,8 @@
 //!
 //! Config is read directly from the CortexKit user and project files: user
 //! `~/.config/cortexkit/aft.jsonc` and project `<root>/.cortexkit/aft.jsonc`.
+//! When the shared project file is absent, legacy per-harness project files
+//! are read in place, never moved or rewritten.
 //! There is NO wire-relayed config path, so a front (runner, `mcp:*`, or `fed:*`)
 //! cannot push config over the connection. `config_resolve` then selects the
 //! active bind's optional harness override from each file tier.
@@ -12,6 +14,7 @@
 
 use crate::config_fix::UserConfigMigration;
 use crate::config_resolve::ConfigTier;
+use crate::harness::Harness;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -55,6 +58,41 @@ pub fn cortexkit_user_config_path() -> Option<PathBuf> {
 /// CortexKit project config: `<root>/.cortexkit/aft.jsonc`.
 fn cortexkit_project_config_path(project_root: &Path) -> PathBuf {
     project_root.join(".cortexkit").join("aft.jsonc")
+}
+
+/// Prefer the shared file, then the active harness's legacy files, without writes.
+/// Within a harness, aft.jsonc precedes aft.json. Without a plugin harness,
+/// OpenCode is checked before Pi, matching the TypeScript fallback ordering.
+pub fn project_config_read_path(project_root: &Path, harness: Option<&Harness>) -> PathBuf {
+    let canonical = cortexkit_project_config_path(project_root);
+    if canonical.exists() {
+        return canonical;
+    }
+    let directories = if matches!(harness, Some(Harness::Pi)) {
+        [".pi", ".opencode"]
+    } else {
+        [".opencode", ".pi"]
+    };
+    for directory in directories {
+        for filename in ["aft.jsonc", "aft.json"] {
+            let path = project_root.join(directory).join(filename);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+    canonical
+}
+
+pub fn legacy_project_config_location_notice(project_root: &Path, path: &Path) -> Option<String> {
+    let canonical = cortexkit_project_config_path(project_root);
+    if path == canonical {
+        return None;
+    }
+    Some(format!(
+        "Legacy project config {} is read in place; move it to {} yourself, and use aft doctor --fix to update retired keys.",
+        path.display(), canonical.display()
+    ))
 }
 
 /// Rewrite the user file's retired keys before it is read (see
@@ -127,10 +165,20 @@ pub fn read_local_cortexkit_config_tiers_with_migration(
     user_config_path: Option<&Path>,
     project_root: &Path,
 ) -> (Vec<ConfigTier>, Option<UserConfigMigration>) {
-    read_tiers_from(
-        user_config_path,
-        &cortexkit_project_config_path(project_root),
-    )
+    read_local_cortexkit_config_tiers_for_harness(user_config_path, project_root, None)
+}
+
+/// The local tier reader with legacy-file precedence for the active harness.
+pub fn read_local_cortexkit_config_tiers_for_harness(
+    user_config_path: Option<&Path>,
+    project_root: &Path,
+    harness: Option<&Harness>,
+) -> (Vec<ConfigTier>, Option<UserConfigMigration>) {
+    let path = project_config_read_path(project_root, harness);
+    if let Some(notice) = legacy_project_config_location_notice(project_root, &path) {
+        crate::slog_warn!("{notice}");
+    }
+    read_tiers_from(user_config_path, &path)
 }
 
 /// The `disabled_tools` list the module-wide subc catalog is filtered by,
@@ -358,5 +406,68 @@ mod tests {
             dropped.iter().any(|d| d.key == "semantic.api_key_env"),
             "project-file privileged field must be dropped by the resolver"
         );
+    }
+}
+#[test]
+fn legacy_project_paths_match_shared_typescript_fixtures_and_are_read_without_writes() {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/config_locations/project_paths.json"
+    ))
+    .unwrap();
+    for fixture in fixtures["cases"].as_array().unwrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let text = "{\n // committed legacy config\n \"experimental_bash_compress\": false\n}\n";
+        let files = fixture["files"].as_array().unwrap();
+        for file in files {
+            let path = root.join(file.as_str().unwrap());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let harness = match fixture["harness"].as_str() {
+            Some("opencode") => Some(Harness::Opencode),
+            Some("pi") => Some(Harness::Pi),
+            _ => None,
+        };
+        let path = project_config_read_path(root, harness.as_ref());
+        assert_eq!(
+            path,
+            root.join(fixture["selected"].as_str().unwrap()),
+            "{}",
+            fixture["name"]
+        );
+        let (tiers, migration) =
+            read_local_cortexkit_config_tiers_for_harness(None, root, harness.as_ref());
+        assert!(migration.is_none());
+        if files.is_empty() {
+            assert!(tiers.is_empty());
+        } else {
+            assert_eq!(tiers.len(), 1);
+            assert_eq!(tiers[0].tier, "project");
+            assert_eq!(tiers[0].source, path.to_string_lossy());
+            assert_eq!(tiers[0].doc, text);
+            let resolved = crate::config_resolve::resolve_config(&tiers);
+            assert!(resolved.errors.is_empty());
+            assert!(!resolved.config.experimental_bash_compress);
+        }
+        for file in files {
+            assert_eq!(
+                std::fs::read_to_string(root.join(file.as_str().unwrap())).unwrap(),
+                text
+            );
+        }
+        let canonical_exists = files
+            .iter()
+            .any(|file| file.as_str() == Some(".cortexkit/aft.jsonc"));
+        assert_eq!(root.join(".cortexkit/aft.jsonc").exists(), canonical_exists);
+        let notice = legacy_project_config_location_notice(root, &path);
+        if path == root.join(".cortexkit/aft.jsonc") {
+            assert!(notice.is_none());
+        } else {
+            let notice = notice.unwrap();
+            assert!(notice.contains(&path.display().to_string()));
+            assert!(notice.contains(&root.join(".cortexkit/aft.jsonc").display().to_string()));
+            assert!(notice.contains("doctor --fix"));
+        }
     }
 }

@@ -513,6 +513,23 @@ fn project_watcher_filter_recognises_the_config_file() {
         root,
         Path::new("/r/aft.jsonc")
     ));
+    for directory in [".opencode", ".pi"] {
+        for filename in [
+            "aft.jsonc",
+            "aft.json",
+            "aft.json.tmp.123",
+            ".aft.jsonc.tmp.123",
+        ] {
+            assert!(is_project_config_event_path(
+                root,
+                &root.join(directory).join(filename)
+            ));
+        }
+        assert!(!is_project_config_event_path(
+            root,
+            &root.join(directory).join("other.json")
+        ));
+    }
 }
 
 #[test]
@@ -1049,4 +1066,101 @@ fn reverting_the_project_file_releases_the_hold() {
     let outcome = fixture.reload();
     assert_eq!(applied(&outcome), vec!["sandbox.enabled"]);
     assert!(!fixture.ctx.config().sandbox.enabled);
+}
+#[test]
+fn legacy_project_sources_keep_actual_file_paths() {
+    for (directory, harness) in [
+        (".opencode", crate::harness::Harness::Opencode),
+        (".pi", crate::harness::Harness::Pi),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(directory).join("aft.jsonc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text = "{\"format_on_edit\":false}";
+        std::fs::write(&path, text).unwrap();
+        let config = crate::config::Config {
+            harness: Some(harness),
+            ..Default::default()
+        };
+        let tiers = [crate::config_resolve::ConfigTier {
+            tier: "project".to_string(),
+            source: path.to_string_lossy().into_owned(),
+            doc: text.to_string(),
+        }];
+        let sources = super::ConfigSources::from_configure(None, dir.path(), &tiers, &config);
+        assert_eq!(sources.project.path.as_deref(), Some(path.as_path()));
+        assert!(sources.project.from_file);
+        assert_eq!(sources.project.text.as_deref(), Some(text));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(!dir.path().join(".cortexkit/aft.jsonc").exists());
+    }
+}
+
+#[test]
+fn legacy_project_config_events_trigger_reload_with_an_existing_project_watcher() {
+    let _env = crate::test_env::process_env_lock();
+    enable_config_watches_for_test();
+    for directory in [".opencode", ".pi"] {
+        for filename in ["aft.jsonc", "aft.json"] {
+            let fixture = Fixture::new(r#"{"format_on_edit":true}"#, Some("{}"));
+            let legacy = fixture.root.join(directory).join(filename);
+            write(&legacy, r#"{"format_on_edit":false}"#);
+            std::fs::remove_file(&fixture.project_path).unwrap();
+            fixture.configure();
+            fixture.ctx.stop_watcher_runtime();
+            // Install an idle project-watcher thread and mark .cortexkit covered.
+            // It delivers no events, so the real legacy-file watch must request the reload.
+            let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_shutdown = Arc::clone(&shutdown);
+            let join = std::thread::spawn(move || {
+                while !thread_shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                drop(dispatch_tx);
+            });
+            fixture.ctx.install_watcher_runtime(
+                dispatch_rx,
+                crate::watcher_filter::WatcherThreadHandle::new(shutdown, join),
+            );
+            let state = fixture.ctx.config_live();
+            state.set_project_watcher_sees_config(true);
+            sync_config_watches(&fixture.ctx);
+            assert!(fixture.ctx.watcher_runtime_active());
+            assert!(state
+                .project_watcher_sees_config
+                .load(std::sync::atomic::Ordering::Acquire));
+            let watches = state.watches.lock();
+            assert_eq!(
+                watches.project_fallback.as_ref().map(ConfigFileWatch::file),
+                Some(legacy.as_path())
+            );
+            drop(watches);
+            assert!(!fixture.ctx.config().format_on_edit);
+            // Drain setup events before observing the next write's reload request.
+            std::thread::sleep(Duration::from_millis(500));
+            state
+                .signal()
+                .due_at_ms
+                .store(0, std::sync::atomic::Ordering::Release);
+            write(&legacy, r#"{"format_on_edit":true}"#);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !state.signal().is_pending() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                state.signal().is_pending(),
+                "legacy edit did not request a reload: {}",
+                legacy.display()
+            );
+            assert!(applied(&fixture.reload()).contains(&"format_on_edit"));
+            assert!(fixture.ctx.config().format_on_edit);
+            assert_eq!(
+                std::fs::read_to_string(&legacy).unwrap(),
+                r#"{"format_on_edit":true}"#
+            );
+            assert!(!fixture.project_path.exists());
+            fixture.ctx.stop_watcher_runtime();
+        }
+    }
 }

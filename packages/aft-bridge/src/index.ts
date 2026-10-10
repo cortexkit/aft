@@ -294,6 +294,7 @@ export {
 export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
 export {
   decodeFileUrl,
+  legacyProjectConfigLocationNotice,
   markAnnouncementSeen,
   repairRootScopedStorageFile,
   resolveCortexKitConfigPaths,
@@ -301,6 +302,7 @@ export {
   resolveCortexKitUserConfigPath,
   resolveHarnessStoragePath,
   resolveLegacyAftConfigSources,
+  resolveProjectConfigReadPath,
   shouldShowAnnouncement,
 } from "./paths.js";
 // --- platform helpers ---

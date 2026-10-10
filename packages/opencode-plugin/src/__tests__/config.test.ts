@@ -61,7 +61,13 @@ function spawnConfigLoader(
 ) {
   return spawnSync(process.execPath, ["-e", script], {
     cwd: packageRoot,
-    env: { ...process.env, AFT_LOG_STDERR: "1", ...env, PROJECT_DIR: projectDirectory },
+    env: {
+      ...process.env,
+      OPENCODE_CONFIG_DIR: "",
+      AFT_LOG_STDERR: "1",
+      ...env,
+      PROJECT_DIR: projectDirectory,
+    },
     encoding: "utf8",
   });
 }
@@ -86,7 +92,115 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
-  test("plugin bootstrap leaves legacy config locations untouched", () => {
+  test("legacy user override cannot relocate a project config file", () => {
+    const fixture = createConfigFixture();
+    const directory = join(fixture.projectDirectory, ".opencode");
+    mkdirSync(directory, { recursive: true });
+    const path = join(directory, "aft.jsonc");
+    const text = '{ "experimental_bash_compress": false, "url_fetch_allow_private": true }\n';
+    writeFileSync(path, text);
+    const result = spawnConfigLoader(
+      fixture.projectDirectory,
+      {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+        OPENCODE_CONFIG_DIR: directory,
+      },
+      `
+      import { loadBootstrapConfig } from "./src/bridge-bootstrap.ts";
+      const result = loadBootstrapConfig(process.env.PROJECT_DIR!, () => {});
+      if (!result.ok) throw new Error(result.message);
+      console.log(JSON.stringify(result.config));
+    `,
+    );
+    expect(result.status).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(text);
+    expect(existsSync(fixture.userConfigPath)).toBe(false);
+    expect(existsSync(fixture.projectConfigPath)).toBe(false);
+    expect(JSON.parse(result.stdout).url_fetch_allow_private).not.toBe(true);
+  });
+
+  test("legacy project config is sent to Rust as the raw project tier", () => {
+    const fixture = createConfigFixture();
+    const path = join(fixture.projectDirectory, ".opencode", "aft.json");
+    const text = '{ "experimental_bash_compress": false, "url_fetch_allow_private": true }';
+    mkdirSync(join(fixture.projectDirectory, ".opencode"), { recursive: true });
+    writeFileSync(path, text);
+    const result = spawnConfigLoader(
+      fixture.projectDirectory,
+      { XDG_CONFIG_HOME: fixture.xdgConfigHome },
+      `
+      import { buildConfigTierConfigureParams } from "./src/config.ts";
+      console.log(JSON.stringify(buildConfigTierConfigureParams(process.env.PROJECT_DIR!, {}).config));
+    `,
+    );
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual([{ tier: "project", source: path, doc: text }]);
+    expect(readFileSync(path, "utf8")).toBe(text);
+    expect(existsSync(fixture.projectConfigPath)).toBe(false);
+  });
+
+  test("legacy user locations relocate automatically during plugin bootstrap", () => {
+    for (const source of ["opencode", "pi"] as const) {
+      const fixture = createConfigFixture();
+      const home = join(fixture.root, "home");
+      const directory =
+        source === "opencode"
+          ? join(fixture.xdgConfigHome, "opencode")
+          : join(home, ".pi", "agent");
+      mkdirSync(directory, { recursive: true });
+      const path = join(directory, "aft.jsonc");
+      const text = '{ "experimental_lsp_ty": true, "bash": false }\n';
+      writeFileSync(path, text);
+      const result = spawnConfigLoader(
+        fixture.projectDirectory,
+        {
+          HOME: home,
+          XDG_CONFIG_HOME: fixture.xdgConfigHome,
+          OPENCODE_CONFIG_DIR: "",
+        },
+        `
+        import { loadBootstrapConfig } from "./src/bridge-bootstrap.ts";
+        const result = loadBootstrapConfig(process.env.PROJECT_DIR!, () => {});
+        if (!result.ok) throw new Error(result.message);
+        console.log(JSON.stringify(result.config));
+      `,
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(existsSync(path)).toBe(false);
+      expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(text);
+      expect(JSON.parse(result.stdout).experimental.lsp_ty).toBe(true);
+      expect(JSON.parse(result.stdout).bash).toBe(false);
+    }
+  });
+
+  test("legacy project config loads in place without creating a canonical file", () => {
+    for (const directory of [".opencode", ".pi"]) {
+      const fixture = createConfigFixture();
+      const legacyDir = join(fixture.projectDirectory, directory);
+      mkdirSync(legacyDir, { recursive: true });
+      const path = join(legacyDir, "aft.jsonc");
+      const text = '{\n // committed legacy settings\n "experimental_bash_compress": false\n}\n';
+      writeFileSync(path, text);
+      const result = runConfigLoader(fixture.projectDirectory, {
+        HOME: join(fixture.root, "home"),
+        XDG_CONFIG_HOME: fixture.xdgConfigHome,
+      });
+      expect(JSON.parse(result.stdout).bash).toEqual({
+        rewrite: false,
+        compress: false,
+        background: false,
+      });
+      expect(readFileSync(path, "utf8")).toBe(text);
+      expect(existsSync(fixture.projectConfigPath)).toBe(false);
+      expect(result.stderr).toContain(path);
+      expect(result.stderr).toContain(fixture.projectConfigPath);
+      expect(result.stderr).toContain("doctor --fix");
+    }
+  });
+
+  test("plugin bootstrap relocates legacy user config and leaves project config in place", () => {
     const fixture = createConfigFixture();
     const legacyUserDir = join(fixture.root, "legacy-opencode");
     const legacyProjectDir = join(fixture.projectDirectory, ".opencode");
@@ -107,13 +221,16 @@ describe("loadAftConfig", () => {
       import { loadBootstrapConfig } from "./src/bridge-bootstrap.ts";
       const result = loadBootstrapConfig(process.env.PROJECT_DIR!, () => {});
       if (!result.ok) throw new Error(result.message);
+      console.log(JSON.stringify(result.config));
     `,
     );
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(0);
-    expect(readFileSync(legacyUser, "utf8")).toBe(text);
+    expect(existsSync(legacyUser)).toBe(false);
+    expect(readFileSync(fixture.userConfigPath, "utf8")).toBe(text);
+    expect(JSON.parse(result.stdout).bash.rewrite).toBe(true);
     expect(readFileSync(legacyProject, "utf8")).toBe(text);
-    expect(existsSync(fixture.userConfigPath)).toBe(false);
+
     expect(existsSync(fixture.projectConfigPath)).toBe(false);
   });
 

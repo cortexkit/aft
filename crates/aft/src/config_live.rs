@@ -135,7 +135,8 @@ impl ConfigSources {
     ) -> Self {
         let owns_user_watch = user_config_path.is_some() && process_user_config_path().is_none();
         let user_path = user_config_path.or_else(process_user_config_path);
-        let project_path = project_config_path(project_root);
+        let project_path =
+            crate::subc_config::project_config_read_path(project_root, connected.harness.as_ref());
         let source_for = |tier: &'static str, path: Option<PathBuf>| {
             let used = tiers.iter().find(|candidate| candidate.tier == tier);
             let from_file = match (used, path.as_ref()) {
@@ -164,9 +165,9 @@ pub fn project_config_path(project_root: &Path) -> PathBuf {
     project_root.join(".cortexkit").join(CONFIG_FILE_NAME)
 }
 
-/// Whether `path` is `<root>/.cortexkit/aft.jsonc` or an editor's temporary
-/// sibling of it. `path` and `root` must be spelled the same way (both
-/// canonical in the project watcher).
+/// Whether `path` names a shared or legacy project config, or an editor's
+/// temporary sibling. `root` is the configured canonical directory; the
+/// event's containing root is canonicalized if needed, while filenames stay literal.
 pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
     if !is_config_file_name(path) {
         return false;
@@ -174,7 +175,10 @@ pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
     let Some(dir) = path.parent() else {
         return false;
     };
-    if dir.file_name() != Some(std::ffi::OsStr::new(".cortexkit")) {
+    if !matches!(
+        dir.file_name().and_then(|name| name.to_str()),
+        Some(".cortexkit" | ".opencode" | ".pi")
+    ) {
         return false;
     }
     let Some(dir_root) = dir.parent() else {
@@ -189,7 +193,7 @@ pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
 fn is_config_file_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with(CONFIG_FILE_NAME) || name.starts_with(".aft.jsonc"))
+        .is_some_and(|name| name.starts_with("aft.json") || name.starts_with(".aft.json"))
 }
 
 static PROCESS_USER_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -298,7 +302,9 @@ impl ConfigLiveState {
 
 /// Start or stop this root's own file watches to match its state: a user-file
 /// watch when the context owns one (standalone), and a project-file watch when
-/// the project watcher does not cover `<root>/.cortexkit/`.
+/// the project watcher does not cover the selected file's directory. Legacy
+/// files always retain a direct watch because the coverage flag certifies only
+/// the extra `.cortexkit` watch, not legacy directories or symlink targets.
 pub fn sync_config_watches(ctx: &AppContext) {
     if config_watches_disabled() {
         return;
@@ -307,8 +313,13 @@ pub fn sync_config_watches(ctx: &AppContext) {
     let Some(sources) = state.sources() else {
         return;
     };
-    let covered =
-        ctx.watcher_runtime_active() && state.project_watcher_sees_config.load(Ordering::Acquire);
+    let shared_project_file = sources.project.path.as_ref().is_some_and(|path| {
+        path.file_name() == Some(std::ffi::OsStr::new(CONFIG_FILE_NAME))
+            && path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".cortexkit"))
+    });
+    let covered = shared_project_file
+        && ctx.watcher_runtime_active()
+        && state.project_watcher_sees_config.load(Ordering::Acquire);
     let mut watches = state.watches.lock();
 
     let wanted_user = sources

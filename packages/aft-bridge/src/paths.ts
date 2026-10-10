@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { MigrationHarness } from "./migration.js";
@@ -63,6 +63,32 @@ export function resolveCortexKitProjectConfigPath(projectDirectory: string): str
   return join(projectDirectory, ".cortexkit", "aft.jsonc");
 }
 
+/** Read legacy project files in place; an existing shared file always wins. */
+export function resolveProjectConfigReadPath(
+  projectDirectory: string,
+  operatingHarness?: MigrationHarness,
+): string {
+  const canonical = resolveCortexKitProjectConfigPath(projectDirectory);
+  if (existsSync(canonical)) return canonical;
+  const sources = resolveLegacyAftConfigSources(projectDirectory).project;
+  const ordered = operatingHarness
+    ? [
+        ...sources.filter((source) => source.harness === operatingHarness),
+        ...sources.filter((source) => source.harness !== operatingHarness),
+      ]
+    : sources;
+  return ordered.find((source) => existsSync(source.path))?.path ?? canonical;
+}
+
+export function legacyProjectConfigLocationNotice(
+  projectDirectory: string,
+  path: string,
+): string | null {
+  const canonical = resolveCortexKitProjectConfigPath(projectDirectory);
+  if (path === canonical) return null;
+  return `Legacy project config ${path} is read in place; move it to ${canonical} yourself, and use aft doctor --fix to update retired keys.`;
+}
+
 export function resolveCortexKitConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
   return {
     userConfigPath: resolveCortexKitUserConfigPath(),
@@ -74,15 +100,31 @@ export function resolveLegacyAftConfigSources(projectDirectory: string): {
   user: LegacyAftConfigSource[];
   project: LegacyAftConfigSource[];
 } {
+  const project = [
+    ...legacySources(join(projectDirectory, ".opencode", "aft"), "OpenCode project", "opencode"),
+    ...legacySources(join(projectDirectory, ".pi", "aft"), "Pi project", "pi"),
+  ];
+  const identity = (path: string): string => {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
+  };
+  const protectedPaths = new Set(
+    [
+      resolveCortexKitProjectConfigPath(projectDirectory),
+      ...project.map((source) => source.path),
+    ].map(identity),
+  );
   return {
     user: [
       ...legacySources(join(legacyOpenCodeConfigDir(), "aft"), "OpenCode user", "opencode"),
       ...legacySources(join(legacyPiAgentDir(), "aft"), "Pi user", "pi"),
-    ],
-    project: [
-      ...legacySources(join(projectDirectory, ".opencode", "aft"), "OpenCode project", "opencode"),
-      ...legacySources(join(projectDirectory, ".pi", "aft"), "Pi project", "pi"),
-    ],
+      // OPENCODE_CONFIG_DIR can point at a project config directory. Do not
+      // relocate those committed files as user sources, even through a symlink.
+    ].filter((source) => !protectedPaths.has(identity(source.path))),
+    project,
   };
 }
 

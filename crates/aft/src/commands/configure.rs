@@ -2542,6 +2542,7 @@ fn find_config_tier(
 fn resolve_config_tiers_for_configure(
     params: &serde_json::Value,
     project_root: &Path,
+    harness: Option<&Harness>,
 ) -> Result<
     (
         Vec<crate::config_resolve::ConfigTier>,
@@ -2551,11 +2552,11 @@ fn resolve_config_tiers_for_configure(
 > {
     let wire_tiers = parse_config_tiers(params).unwrap_or_default();
     let user_config_path = parse_cortexkit_user_config_path(params)?;
-    let (file_tiers, migration) =
-        crate::subc_config::read_local_cortexkit_config_tiers_with_migration(
-            user_config_path.as_deref(),
-            project_root,
-        );
+    let (file_tiers, migration) = crate::subc_config::read_local_cortexkit_config_tiers_for_harness(
+        user_config_path.as_deref(),
+        project_root,
+        harness,
+    );
 
     let mut tiers = Vec::new();
     for tier_name in ["user", "project"] {
@@ -2891,7 +2892,7 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         return cancelled;
     }
     let (tiers, user_config_migration) =
-        match resolve_config_tiers_for_configure(params, &root_path) {
+        match resolve_config_tiers_for_configure(params, &root_path, Some(&harness)) {
             Ok(read) => read,
             Err(error) => return Response::error(&req.id, "invalid_request", error),
         };
@@ -2947,6 +2948,23 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             "hint": migration.notice(),
             "message": migration.notice(),
         }));
+    }
+    if let Some(project) = find_config_tier(&tiers, "project") {
+        if let Some(notice) = crate::subc_config::legacy_project_config_location_notice(
+            &root_path,
+            Path::new(&project.source),
+        )
+        .filter(|_| {
+            crate::subc_config::project_config_read_path(&root_path, Some(&harness))
+                == Path::new(&project.source)
+        }) {
+            configure_warnings.push(json!({
+                "code": "legacy_project_config_location",
+                "tier": "project",
+                "hint": notice,
+                "message": notice,
+            }));
+        }
     }
 
     // NO configure-time SSRF guard on semantic.base_url — deliberate (config
@@ -10501,6 +10519,43 @@ mod tests {
                 .iter()
                 .any(|warning| warning["kind"] == "config_migrated")));
         assert_eq!(fs::read_to_string(&project_path).unwrap(), project_text);
+    }
+
+    #[test]
+    fn configure_legacy_project_file_is_read_in_place_and_reports_its_location() {
+        for harness in ["opencode", "pi"] {
+            let temp = tempfile::tempdir().unwrap();
+            let ctx = test_context();
+            let project_path = temp.path().join(format!(".{harness}/aft.jsonc"));
+            let canonical = temp.path().join(".cortexkit/aft.jsonc");
+            let text = "{\n // committed config\n \"experimental_bash_compress\": false,\n \"callgraph_chunk_size\": 7,\n \"url_fetch_allow_private\": true\n}\n";
+            write_config(&project_path, text);
+            let request = configure_request_with_params(json!({
+                "project_root": temp.path(),
+                "harness": harness,
+                "cortexkit_user_config_path": temp.path().join("missing-user.jsonc"),
+                "config": [project_tier(json!({"callgraph_chunk_size": 4}))],
+            }));
+            let response = handle_configure_for_test(&request, &ctx);
+            assert!(response.success, "{:?}", response.data);
+            assert_eq!(ctx.config().callgraph_chunk_size, 7);
+            assert!(!ctx.config().experimental_bash_compress);
+            assert!(
+                !ctx.config().url_fetch_allow_private,
+                "legacy paths retain project-tier trust"
+            );
+            assert_eq!(fs::read_to_string(&project_path).unwrap(), text);
+            assert!(!canonical.exists());
+            let warnings = response.data["warnings"].as_array().unwrap();
+            let notice = warnings
+                .iter()
+                .find(|warning| warning["code"] == "legacy_project_config_location")
+                .expect("location notice");
+            let message = notice["message"].as_str().unwrap();
+            assert!(message.contains(&project_path.display().to_string()));
+            assert!(message.contains(&canonical.display().to_string()));
+            assert!(message.contains("doctor --fix"));
+        }
     }
 
     #[test]

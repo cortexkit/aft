@@ -1,0 +1,15 @@
+{
+  "cases": [
+    { "name": "missing", "harness": null, "files": [], "selected": ".cortexkit/aft.jsonc" },
+    { "name": "canonical_wins", "harness": "pi", "files": [".cortexkit/aft.jsonc", ".opencode/aft.jsonc", ".pi/aft.jsonc"], "selected": ".cortexkit/aft.jsonc" },
+    { "name": "opencode_jsonc", "harness": "opencode", "files": [".opencode/aft.jsonc"], "selected": ".opencode/aft.jsonc" },
+    { "name": "opencode_json", "harness": "pi", "files": [".opencode/aft.json"], "selected": ".opencode/aft.json" },
+    { "name": "pi_jsonc", "harness": "opencode", "files": [".pi/aft.jsonc"], "selected": ".pi/aft.jsonc" },
+    { "name": "pi_json", "harness": null, "files": [".pi/aft.json"], "selected": ".pi/aft.json" },
+    { "name": "opencode_extension_precedence", "harness": "opencode", "files": [".opencode/aft.json", ".opencode/aft.jsonc"], "selected": ".opencode/aft.jsonc" },
+    { "name": "pi_extension_precedence", "harness": "pi", "files": [".pi/aft.json", ".pi/aft.jsonc"], "selected": ".pi/aft.jsonc" },
+    { "name": "opencode_harness_precedence", "harness": "opencode", "files": [".pi/aft.jsonc", ".opencode/aft.json"], "selected": ".opencode/aft.json" },
+    { "name": "pi_harness_precedence", "harness": "pi", "files": [".opencode/aft.jsonc", ".pi/aft.json"], "selected": ".pi/aft.json" },
+    { "name": "no_harness_inventory_order", "harness": null, "files": [".pi/aft.jsonc", ".opencode/aft.json"], "selected": ".opencode/aft.json" }
+  ]
+}
