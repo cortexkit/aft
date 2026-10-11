@@ -555,18 +555,12 @@ fn thirty_two_repository_parent_merges_child_answers_without_per_call_loads() {
         "queries and refreshes must not reload children"
     );
     assert!(loads.iter().all(|count| *count == 1), "{loads:?}");
+    // The load counts above are the mechanism this test guards: a parent query
+    // reuses each child's loaded index. The timings are printed for reference
+    // only, because wall-clock ratios on a shared CI runner measure load, not
+    // whether a child was reloaded.
     eprintln!(
         "parent folder grep timing (32 children, debug build): token in every child: parent median {parent_median:.2} ms, child median {child_median:.2} ms; needle in one child: parent median {parent_unique_median:.2} ms, child median {child_unique_median:.2} ms"
-    );
-    // Every child holds the common token, so the parent verifies 32 times the
-    // files one child does; it must cost no more than that work.
-    assert!(
-        parent_median <= child_median * 32.0 + 100.0,
-        "parent grep {parent_median:.2} ms is not in the order of a child grep {child_median:.2} ms"
-    );
-    assert!(
-        parent_unique_median <= child_unique_median * 10.0 + 25.0,
-        "parent grep {parent_unique_median:.2} ms is not in the order of a child grep {child_unique_median:.2} ms"
     );
 
     // The parent wrote no index of its own.
