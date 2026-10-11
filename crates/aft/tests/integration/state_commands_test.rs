@@ -406,6 +406,24 @@ fn standalone_database_retry_does_not_block_read_only_requests() {
     let exhausted = set_host_state(&mut aft, "initial", "no");
     assert_eq!(exhausted["retryable"], true, "{exhausted}");
     assert_eq!(exhausted["code"], "database_unavailable", "{exhausted}");
+    let busy_message = exhausted["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing refusal message: {exhausted}"));
+    assert!(
+        busy_message
+            .starts_with("Project persistence is busy after bounded initialization retries: "),
+        "{exhausted}"
+    );
+    assert!(
+        busy_message.contains("sqlite PRAGMA journal_mode=WAL: database is locked."),
+        "{exhausted}"
+    );
+    assert!(
+        busy_message.ends_with(
+            "Retry the tool shortly; no rebind is needed. No tool operation was performed."
+        ),
+        "{exhausted}"
+    );
 
     // Keep the lock held through both responses. Send the read behind the retry
     // so a long synchronous retry cannot masquerade as a responsive main loop.
@@ -426,12 +444,15 @@ fn standalone_database_retry_does_not_block_read_only_requests() {
             Some("retry-held") => {
                 assert_eq!(response["success"], false, "{response}");
                 assert_eq!(response["retryable"], true, "{response}");
+                assert_eq!(response["code"], "database_unavailable", "{response}");
+                assert_eq!(response["message"], busy_message, "{response}");
                 saw_retry = true;
             }
             _ => {}
         }
     }
     lock.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(set_host_state(&mut aft, "released", "yes")["success"], true);
+    let released = set_host_state(&mut aft, "released", "yes");
+    assert_eq!(released["success"], true, "{released}");
     assert!(aft.shutdown().success());
 }

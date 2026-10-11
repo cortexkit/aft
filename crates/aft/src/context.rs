@@ -2481,6 +2481,35 @@ fn database_connection_busy() -> crate::db::OpenError {
     ))
 }
 
+#[cfg(test)]
+thread_local! {
+    static DATABASE_SLOT_CONTENDED_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn lock_database_slot<T>(
+    slot: &parking_lot::Mutex<T>,
+    mode: crate::db::OpenMode,
+) -> Result<parking_lot::MutexGuard<'_, T>, crate::db::OpenError> {
+    if mode == crate::db::OpenMode::SingleAttempt {
+        if let Some(guard) = slot.try_lock() {
+            return Ok(guard);
+        }
+        #[cfg(test)]
+        DATABASE_SLOT_CONTENDED_FOR_TEST.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        // Even reading the installed handle briefly owns this mutex. Give those
+        // readers time to leave without queuing behind an unbounded database open.
+        return slot
+            .try_lock_for(crate::db::TOOL_RETRY_BUSY_WAIT)
+            .ok_or_else(database_connection_busy);
+    }
+    Ok(slot.lock())
+}
+
 #[derive(Default)]
 struct DatabaseRuntimeFailure {
     error: Option<String>,
@@ -2716,11 +2745,7 @@ impl App {
         mode: crate::db::OpenMode,
     ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
-        let mut slot = if mode == crate::db::OpenMode::SingleAttempt {
-            self.db.try_lock().ok_or_else(database_connection_busy)?
-        } else {
-            self.db.lock()
-        };
+        let mut slot = lock_database_slot(&self.db, mode)?;
         if let Some((existing_path, conn)) = slot.as_ref() {
             if existing_path == &key {
                 return Ok(Arc::clone(conn));
@@ -2742,11 +2767,7 @@ impl App {
         mode: crate::db::OpenMode,
     ) -> Result<(Option<u32>, bool), crate::db::OpenError> {
         let key = database_path_key(path);
-        let slot = if mode == crate::db::OpenMode::SingleAttempt {
-            self.db.try_lock().ok_or_else(database_connection_busy)?
-        } else {
-            self.db.lock()
-        };
+        let slot = lock_database_slot(&self.db, mode)?;
         if let Some((existing_path, shared)) = slot.as_ref() {
             if existing_path == &key {
                 let shared = Arc::clone(shared);
@@ -15944,6 +15965,72 @@ mod shared_db_tests {
     }
 
     #[test]
+    fn busy_database_retry_recovers_from_brief_database_slot_contention() {
+        let storage = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_canonical_cache_root(root.path().to_path_buf());
+        // Recreate the reported busy state after deferred initialization exhausted
+        // its budget. SQLite is available now, but another reader owns the App slot.
+        ctx.finish_database_runtime_error(
+            "sqlite PRAGMA journal_mode=WAL: database is locked".into(),
+            true,
+        );
+        let exhausted = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
+        assert_eq!(exhausted["code"], "database_unavailable", "{exhausted}");
+        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 5);
+
+        let app = ctx.app();
+        let held = app.db.lock();
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let retry_ctx = Arc::clone(&ctx);
+        let retry = std::thread::spawn(move || {
+            DATABASE_SLOT_CONTENDED_FOR_TEST.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    contended_tx.send(()).unwrap();
+                    released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                }));
+            });
+            persistence_call(&retry_ctx)
+        });
+        contended_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(held);
+        released_tx.send(()).unwrap();
+        let refusal = retry
+            .join()
+            .unwrap()
+            .map(|response| serde_json::to_value(response).unwrap());
+        eprintln!(
+            "write after SQLite became available, with transient App slot contention: {refusal:?}"
+        );
+        assert!(
+            refusal.is_none(),
+            "available database was refused: {refusal:?}"
+        );
+        let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "released", "command": "db_set_host_state",
+            "params": { "key": "released", "value": "yes" }
+        }))
+        .unwrap();
+        let response = crate::commands::state::handle_db_set_host_state(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        let db = ctx.db().unwrap();
+        assert_eq!(
+            crate::db::state::get_host_state(&db.lock().unwrap(), "released").unwrap(),
+            Some("yes".into())
+        );
+    }
+
+    #[test]
     fn resident_database_open_slot_busy_recovers_on_next_call() {
         let (_storage, _root, ctx) = resident_database_context();
         let resident = ctx.db().unwrap();
@@ -16111,7 +16198,7 @@ mod shared_db_tests {
     }
 
     #[test]
-    fn database_single_attempt_does_not_wait_for_a_held_connection_or_open_slot() {
+    fn database_single_attempt_bounds_wait_for_a_held_connection_or_open_slot() {
         let storage = tempdir().unwrap();
         let path = storage.path().join("aft.db");
         let app = App::default_shared();
@@ -16123,6 +16210,7 @@ mod shared_db_tests {
             .is_busy());
         drop(held);
         let held = app.db.lock();
+        let started = Instant::now();
         assert!(app
             .database_schema_version(&path, crate::db::OpenMode::SingleAttempt)
             .unwrap_err()
@@ -16131,6 +16219,7 @@ mod shared_db_tests {
             .open_db_with_mode(&path, crate::db::OpenMode::SingleAttempt)
             .unwrap_err()
             .is_busy());
+        assert!(started.elapsed() < Duration::from_secs(2));
         drop(held);
     }
 
