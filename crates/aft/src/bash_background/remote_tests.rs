@@ -2947,11 +2947,23 @@ fn orchestrated_request(params: serde_json::Value) -> crate::protocol::RawReques
 
 /// Spawn `params` through the bash handler and drive its foreground wait the
 /// way the standalone request loop does, until the call answers. Returns the
-/// reply and how long after the call arrived it came.
+/// reply and how long its foreground wait took.
 async fn orchestrated_reply(
     ctx: &crate::context::AppContext,
     daemon: &crate::exec_remote::wire_tests::Daemon,
+    params: serde_json::Value,
+) -> (crate::protocol::Response, Duration) {
+    orchestrated_reply_with_probe(ctx, daemon, params, |_| true).await
+}
+
+/// Wait for a remote-state probe before starting the foreground wait budget.
+/// This separates daemon connection and stream-processing latency from tests
+/// of the wait cap in a particular remote phase.
+async fn orchestrated_reply_with_probe(
+    ctx: &crate::context::AppContext,
+    daemon: &crate::exec_remote::wire_tests::Daemon,
     mut params: serde_json::Value,
+    ready: impl Fn(&str) -> bool,
 ) -> (crate::protocol::Response, Duration) {
     // The handler resolves an omitted cwd against the process, not this
     // disposable test project. Keep the remote request inside its own root.
@@ -2961,12 +2973,20 @@ async fn orchestrated_reply(
         .entry("workdir")
         .or_insert_with(|| serde_json::json!(ctx.config().project_root));
     let request = orchestrated_request(params);
-    let received = std::time::Instant::now();
     let spawned =
         crate::bash_background::with_remote_policy(Some(launch(daemon.connection.clone())), || {
             crate::commands::bash::handle(&request, ctx)
         });
     assert!(spawned.success, "{spawned:?}");
+    let task_id = spawned.data["task_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ready(task_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the remote task must satisfy the probe before starting its foreground wait");
+    let received = std::time::Instant::now();
     match crate::commands::bash_orchestrate::build_bash_outcome(&request, ctx, spawned) {
         crate::response_finalize::DispatchOutcome::Immediate(response) => {
             (response, received.elapsed())
@@ -3678,7 +3698,7 @@ async fn head_blocking_runon_uses_configured_cap_while_queued() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = restarted_context(dir.path());
     ctx.update_config(|config| config.bash.worker_wait_max_ms = 250);
-    let (reply, waited) = orchestrated_reply(
+    let (reply, waited) = orchestrated_reply_with_probe(
         &ctx,
         &daemon,
         serde_json::json!({
@@ -3689,6 +3709,11 @@ async fn head_blocking_runon_uses_configured_cap_while_queued() {
             "foreground_orchestrate": true,
             "compressed": false,
         }),
+        |task_id| {
+            ctx.bash_background()
+                .remote_progress(task_id, "session")
+                .is_some_and(|progress| progress.phase == RemotePhase::Queued { position: 9 })
+        },
     )
     .await;
     assert!(reply.success, "{reply:?}");
@@ -3702,6 +3727,63 @@ async fn head_blocking_runon_uses_configured_cap_while_queued() {
     assert_eq!(exec_runs(&daemon).len(), 1);
     let registry = ctx.bash_background().clone();
     let task_id = reply.data["task_id"].as_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || registry.kill(&task_id, "session"))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn head_blocking_runon_uses_configured_cap_before_any_stream_record() {
+    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = restarted_context(dir.path());
+    ctx.update_config(|config| config.bash.worker_wait_max_ms = 250);
+    let (reply, waited) = orchestrated_reply_with_probe(
+        &ctx,
+        &daemon,
+        serde_json::json!({
+            "command": "uname -s",
+            "runon": "linux",
+            "wait": true,
+            "timeout": 5_000,
+            "foreground_orchestrate": true,
+            "compressed": false,
+        }),
+        |_| !exec_runs(&daemon).is_empty(),
+    )
+    .await;
+    assert!(reply.success, "{reply:?}");
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    assert!(waited < plugin_transport_deadline(250), "{waited:?}");
+    assert_eq!(reply.data["status"], "running", "{reply:?}");
+    assert_eq!(reply.data["remote_phase"], "waiting_on_runner", "{reply:?}");
+    assert_eq!(reply.data["queue_position"], serde_json::Value::Null);
+    assert_eq!(reply.data["remote_job_id"], serde_json::Value::Null);
+    assert!(
+        reply.data["output"]
+            .as_str()
+            .unwrap()
+            .contains("waiting on the runner"),
+        "{reply:?}"
+    );
+    assert_eq!(runner_cancels(&daemon), 0);
+    assert_eq!(exec_runs(&daemon).len(), 1);
+    // Let AFT learn the job ID so cleanup can cancel the held-open stream.
+    daemon.acceptance_gate.notify_one();
+    let task_id = reply.data["task_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !ctx
+            .bash_background()
+            .remote_progress(&task_id, "session")
+            .is_some_and(|progress| progress.phase == RemotePhase::Queued { position: 1 })
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("released acceptance must be processed before cancellation");
+    let registry = ctx.bash_background().clone();
     tokio::task::spawn_blocking(move || registry.kill(&task_id, "session"))
         .await
         .unwrap()

@@ -99,6 +99,8 @@ pub(crate) enum Script {
         queue: Duration,
         run: Duration,
     },
+    /// Withhold the first stream record until `Daemon::acceptance_gate` is notified.
+    GatedAcceptance,
     NetworkGranted,
     NetworkUnknown,
     NetworkLost,
@@ -109,6 +111,8 @@ pub(crate) enum Script {
 pub(crate) struct Daemon {
     pub(crate) connection: std::path::PathBuf,
     pub(crate) log: Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) acceptance_gate: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
 }
@@ -131,6 +135,8 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
     let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
     let log = Arc::new(Mutex::new(Vec::new()));
     let server_log = Arc::clone(&log);
+    let acceptance_gate = Arc::new(tokio::sync::Notify::new());
+    let server_acceptance_gate = acceptance_gate.clone();
     let server_key = key.clone();
     let claim = claim.to_string();
     let server = tokio::spawn(async move {
@@ -188,7 +194,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported) {
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance) {
                                 let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 });
                                 if matches!(script, Script::NetworkGranted | Script::NetworkLost) {
                                     accepted = accepted.with_network(Network::Outbound);
@@ -215,7 +221,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                                     Script::Expired => Outcome::HistoryExpired,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started) && !attaching { /* accepted, still running */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started | Script::GatedAcceptance) && !attaching { /* held-open run stream */ }
                             else if attaching && matches!(script, Script::GappedAttach(_) | Script::GappedCancel(_)) { /* delayed producer below */ }
                             else {
                                 if matches!(script, Script::Restart) {
@@ -281,6 +287,26 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
                     subc_transport::write_frame(&mut *writer.lock().await, &response)
                         .await
                         .unwrap();
+                }
+                if matches!(script, Script::GatedAcceptance) && body["method"] == "exec.run" {
+                    let writer = writer.clone();
+                    let gate = server_acceptance_gate.clone();
+                    producers.push(tokio::spawn(async move {
+                        gate.notified().await;
+                        let accepted = Frame::build_with_version(
+                            header.ver,
+                            FrameType::StreamData,
+                            header.flags,
+                            header.channel,
+                            header.epoch,
+                            header.corr,
+                            serde_json::to_vec(&StreamRecord::Accepted(Accepted::new(id(), 1)))
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        let _ =
+                            subc_transport::write_frame(&mut *writer.lock().await, &accepted).await;
+                    }));
                 }
                 if body["method"] == "exec.attach" {
                     if let Script::GappedAttach(gap) | Script::GappedCancel(gap) = script {
@@ -467,6 +493,7 @@ pub(crate) async fn daemon_with_clients(script: Script, claim: &str, clients: us
     Daemon {
         connection,
         log,
+        acceptance_gate,
         server,
         _dir: dir,
     }
