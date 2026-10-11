@@ -7480,6 +7480,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         key,
         daemon_id,
         root1,
+        executor,
         ..
     } = input;
     let (mut stream, _) = listener.accept().await.expect("accept aft client");
@@ -7537,6 +7538,11 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
         }
     }
 
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root id");
+    let ctx = executor.actor_context(&root_id).expect("bound context");
+    // Hold the LSP manager through the first response to force status
+    // finalization to skip the publish that would otherwise start discovery.
+    let held = ctx.lsp();
     send_tool_call(
         &mut stream,
         1,
@@ -7561,13 +7567,51 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
             break;
         }
     }
+    drop(held);
 
-    // Positive waits are generous: a loaded Windows runner can take well over
-    // 5 s before the module opens its fleet consumer connection.
-    let (mut consumer_stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
-        .await
-        .expect("fleet consumer connection timeout")
-        .expect("accept fleet consumer");
+    // Discovery needs a queued publish, not merely a completed tool response.
+    // Keep supplying tool-result signals after releasing diagnostics until the
+    // consumer actually connects. Finish each response before stopping so no
+    // partial supervision-frame read is cancelled when the connection arrives.
+    let (connected_tx, mut connected_rx) = tokio::sync::oneshot::channel();
+    let ((mut consumer_stream, _), ()) = tokio::join!(
+        async {
+            let accepted = listener.accept().await.expect("accept fleet consumer");
+            connected_tx.send(()).expect("status signal driver active");
+            accepted
+        },
+        async {
+            let mut corr = 80_000;
+            while matches!(
+                connected_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ) {
+                send_tool_call(
+                    &mut stream,
+                    1,
+                    corr,
+                    "echo",
+                    json!({ "case": "status_bar", "dead_code": 21 }),
+                )
+                .await;
+                loop {
+                    let frame =
+                        read_raw_inventory_frame(&mut stream, "discovery signal response").await;
+                    let completed = frame.header.ty == FrameType::Response
+                        && frame.header.channel == 1
+                        && frame.header.corr == corr;
+                    if completed {
+                        assert_tool_success(&tool_response_json(&frame), "discovery signal");
+                    }
+                    module_inventory.push(frame);
+                    if completed {
+                        break;
+                    }
+                }
+                corr += 1;
+            }
+        }
+    );
     authenticate_server(
         &mut consumer_stream,
         &key,
@@ -7683,7 +7727,6 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(20)).await;
     send_tool_call(
         &mut stream,
         1,
