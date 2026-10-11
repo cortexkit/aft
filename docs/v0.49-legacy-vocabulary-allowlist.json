@@ -624,22 +624,22 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 3038,
+      "line": 3057,
       "column": 23,
       "token": "toFile",
       "text": "\"Pass toFile to disambiguate\"",
-      "location": "line 3038, column 23",
+      "location": "line 3057, column 23",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "line": 3040,
+      "line": 3059,
       "column": 45,
       "token": "toFile",
       "text": "\"Try one of these files for toFile\"",
-      "location": "line 3040, column 45",
+      "location": "line 3059, column 45",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
