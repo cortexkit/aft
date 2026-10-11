@@ -6823,6 +6823,185 @@ fn reported_check_still_running(response: &Value) -> bool {
     still_checking
 }
 
+fn completed_rust_check_record(storage: &Path, expected_errors: u64) -> Option<PathBuf> {
+    fs::read_dir(storage.join("rust-completed-checks"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .find(|path| {
+            let Some(reports) = fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|record| record["record"]["diagnostics"].as_object().cloned())
+            else {
+                return false;
+            };
+            let errors = reports
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .filter(|diagnostic| diagnostic["severity"] == "Error")
+                .count() as u64;
+            errors == expected_errors
+        })
+}
+
+fn wait_for_completed_rust_check(
+    storage: &Path,
+    expected_errors: u64,
+    ready: impl FnOnce(),
+) -> Result<PathBuf, String> {
+    use notify::Watcher;
+
+    let directory = storage.join("rust-completed-checks");
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if !matches!(&event, Ok(event) if event.kind.is_access()) {
+            let _ = event_tx.send(event);
+        }
+    })
+    .map_err(|error| format!("watch completed checks: {error}"))?;
+    watcher
+        .watch(&directory, notify::RecursiveMode::NonRecursive)
+        .map_err(|error| format!("watch {}: {error}", directory.display()))?;
+    ready();
+    // Register before reading so the atomic rename cannot fall between the
+    // absence check and the subscription. Events wake us; record contents prove
+    // the expected check, not an older clean record, reached disk.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(record) = completed_rust_check_record(storage, expected_errors) {
+            return Ok(record);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no completed check with {expected_errors} errors was persisted"
+            ));
+        }
+        event_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| {
+                format!("no completed check with {expected_errors} errors was persisted: {error}")
+            })?
+            .map_err(|error| format!("completed-check watch failed: {error}"))?;
+    }
+}
+
+#[test]
+fn rust_inspect_waits_for_gated_persistence_before_module_restart() {
+    crate::helpers::disable_in_process_file_watcher();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("checkout");
+    let storage = temp.path().join("storage");
+    write_file(
+        &root,
+        "Cargo.toml",
+        "[package]\nname = \"gated-save\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(
+        &root,
+        "Cargo.lock",
+        "version = 4\n[[package]]\nname = \"gated-save\"\nversion = \"0.1.0\"\n",
+    );
+    let new_context = || {
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.clone()),
+                ..Config::default()
+            },
+        );
+        ctx.isolate_cold_build_limiter_for_test(2);
+        let response = handle_configure(
+            &request(json!({
+                "id": "gated-configure", "command": "configure", "project_root": root,
+                "storage_dir": storage, "harness": "opencode",
+                "config": crate::helpers::user_config(json!({
+                    "indexes": { "trigram": false, "semantic": false },
+                    "inspect": { "diagnostics_timeout_ms": 40_000 }
+                }))
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{response:?}");
+        ctx.lsp()
+            .override_binary(ServerKind::Rust, fake_server_path());
+        ctx
+    };
+    let directory = storage.join("rust-completed-checks");
+    fs::create_dir_all(&directory).unwrap();
+    for (source, expected_errors) in [
+        ("pub fn answer() -> u8 { 42 }\n", 0),
+        ("pub fn answer() -> u8 { unknown }\n", 1),
+    ] {
+        write_file(&root, "src/lib.rs", source);
+        // Hold the writer's actual cross-process lock, so an authoritative in-memory
+        // check cannot race ahead of the assertion about its persistence observer.
+        let writer_gate = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(".write-lock"))
+            .unwrap();
+        writer_gate.lock().unwrap();
+        let ctx = new_context();
+        let warm = scoped_diagnostics_inspect(&ctx, "gated-warm", "src");
+        assert_eq!(
+            warm["summary"]["diagnostics"]["errors"], expected_errors,
+            "{warm:#}"
+        );
+        assert_eq!(
+            warm["summary"]["diagnostics"]["coverage"]["authoritative"], 1,
+            "{warm:#}"
+        );
+        assert!(completed_rust_check_record(&storage, expected_errors).is_none());
+        // The detached writer owns the snapshot and must finish even if the
+        // module is torn down before its cache write completes.
+        drop(ctx);
+        thread::scope(|scope| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let storage = &storage;
+            scope.spawn(move || {
+                let result = wait_for_completed_rust_check(storage, expected_errors, || {
+                    ready_tx.send(()).unwrap();
+                });
+                result_tx.send(result).unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let result = result_rx.try_recv();
+            assert!(
+                matches!(result, Err(std::sync::mpsc::TryRecvError::Empty)),
+                "persistence observer returned before the writer gate was released: {result:?}"
+            );
+            drop(writer_gate);
+            let record = result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert!(record.is_file());
+        });
+        let ctx = new_context();
+        let cold = scoped_diagnostics_inspect(&ctx, "gated-cold", "src");
+        assert_eq!(
+            cold["summary"]["diagnostics"]["errors"], expected_errors,
+            "{cold:#}"
+        );
+        assert!(
+            cold["text"]
+                .as_str()
+                .unwrap()
+                .contains("last completed check"),
+            "{cold:#}"
+        );
+    }
+}
+
 #[test]
 fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_analyzer() {
     if !crate::helpers::real_rust_analyzer_available(
@@ -6890,16 +7069,9 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         assert!(std::time::Instant::now() < deadline, "{warm:#}");
     };
     assert_eq!(warm["summary"]["diagnostics"]["errors"], 0, "{warm:#}");
-    assert!(
-        fs::read_dir(storage.join("rust-completed-checks"))
-            .unwrap()
-            .any(|entry| entry
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "json")),
-        "no completed check was persisted: {warm:#}"
-    );
+    // Inspect certifies the live result before its detached cache writer finishes.
+    // A restart can restore only the record whose atomic write has completed.
+    let record = wait_for_completed_rust_check(&storage, 0, || {}).unwrap();
     drop(ctx);
     let ctx = new_context();
     let started = std::time::Instant::now();
@@ -6913,12 +7085,6 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
     );
     assert_eq!(cold["summary"]["diagnostics"]["errors"], 0, "{cold:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
-    let record = fs::read_dir(storage.join("rust-completed-checks"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
     println!(
         "real restart: cold inspect {} ms; record {} bytes at {}",
         started.elapsed().as_millis(),
@@ -6967,6 +7133,12 @@ fn rust_inspect_restores_completed_check_after_module_restart_with_real_rust_ana
         }
         assert!(std::time::Instant::now() < deadline, "{response:#}");
     };
+    wait_for_completed_rust_check(
+        &storage,
+        errors["summary"]["diagnostics"]["errors"].as_u64().unwrap(),
+        || {},
+    )
+    .unwrap();
     drop(ctx);
     let ctx = new_context();
     let restored_errors = scoped_diagnostics_inspect(&ctx, "saved-errors-cold", "src");
