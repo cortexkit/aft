@@ -44,7 +44,7 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             concurrency["cancel-in-progress"], "${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' }}"
         )
 
-    def test_required_reusable_suites_have_no_queue_skips(self) -> None:
+    def test_required_reusable_suites_skip_only_prs_not_queue_or_pushes(self) -> None:
         jobs = self.workflow["jobs"]
         for job_id, name, file in (
             ("unit", "Unit", "_unit-suite.yml"),
@@ -53,7 +53,7 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             job = jobs[job_id]
             self.assertEqual(job["name"], name)
             self.assertEqual(job["uses"], f"./.github/workflows/{file}")
-            self.assertNotIn("if", job)
+            self.assertEqual(job.get("if"), "${{ github.event_name != 'pull_request' }}")
             called = workflow_gates.parse_workflow(str(ROOT / ".github/workflows" / file))
             self.assertIn("workflow_call", called["on"])
             for nested in called["jobs"].values():
@@ -61,6 +61,43 @@ class MergeQueueWorkflowTests(unittest.TestCase):
                 self.assertNotIn("github.event_name", condition)
                 self.assertNotIn("github.ref", condition)
         self.assertEqual(jobs["e2e"]["with"]["cargo_profile"], "stage")
+
+    def test_pr_checks_keep_format_lint_types_and_script_guards_without_native_builds(self) -> None:
+        job = self.workflow["jobs"]["pr-checks"]
+        self.assertEqual(job["if"], "${{ github.event_name == 'pull_request' }}")
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        for command in (
+            "cargo fmt --all -- --check",
+            "bun run lint",
+            "bun run --cwd packages/aft-bridge build",
+            "bun run typecheck",
+            "python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v",
+            "python3 -m unittest discover -s scripts/lib -p test_merge_queue_workflow.py -v",
+            "bash scripts/train-push.test.sh",
+        ):
+            self.assertIn(command, commands)
+        self.assertNotIn("cargo build", commands)
+        self.assertNotIn("cargo test", commands)
+
+    def test_search_quality_prs_validate_descriptors_without_builds_or_corpora(self) -> None:
+        jobs = self.workflow["jobs"]
+        self.assertEqual(jobs["search-quality-binary"].get("if"), "${{ github.event_name != 'pull_request' }}")
+        gate = jobs["search-quality-gate"]
+        self.assertEqual(gate["if"], "${{ !cancelled() }}")
+        descriptor = next(step for step in gate["steps"] if step.get("name") == "Validate PR search-quality descriptor")
+        self.assertEqual(descriptor["if"], "${{ github.event_name == 'pull_request' }}")
+        self.assertIn("--base", descriptor["run"])
+        self.assertIn("--head", descriptor["run"])
+        for step in gate["steps"]:
+            if step.get("name") in (
+                "Download the shared release AFT",
+                "Check the shared release AFT",
+                "Provision search-quality corpora at their pinned commits",
+                "Evaluate committed search-quality reference",
+            ):
+                self.assertEqual(step.get("if"), "${{ github.event_name != 'pull_request' }}")
+            if step.get("name") == "Build the product binary when the artifact is absent":
+                self.assertEqual(step["if"], "${{ github.event_name != 'pull_request' && steps.release-aft.outputs.available != 'true' }}")
 
     def test_landing_policy_reports_original_commits_on_pr_group_and_main(self) -> None:
         job = self.workflow["jobs"]["landing-policy"]

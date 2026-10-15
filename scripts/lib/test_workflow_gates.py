@@ -100,6 +100,16 @@ class BranchPatternTests(unittest.TestCase):
         ))
 
 
+class LightPREventGateTests(unittest.TestCase):
+    def test_pr_exclusion_is_an_event_warning_not_a_dead_train_ref_gate(self) -> None:
+        self.assertEqual(workflow_gates.classify("${{ github.event_name != 'pull_request' }}"), "warn")
+
+    def test_pr_exclusion_does_not_hide_a_main_only_ref_gate(self) -> None:
+        self.assertEqual(workflow_gates.classify(
+            "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
+        ), "ref")
+
+
 class CISpeedWorkflowTests(unittest.TestCase):
     def test_release_binary_cache_requires_exact_commit_and_compiler(self) -> None:
         path = Path(__file__).resolve().parents[2] / ".github/workflows/tests.yml"

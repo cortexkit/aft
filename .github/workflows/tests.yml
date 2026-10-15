@@ -1,8 +1,11 @@
 name: Tests
 
-# PR-time gate: runs Rust + plugin unit tests, Linux Docker e2e, and Windows e2e
-# before merge, including the queue's synthetic merge-group commit. Train
-# pushes remain enabled while landing moves from train pushes to queued PRs.
+# PR runs are deliberately light: main requires the merge queue, whose
+# merge-group run tests the actual landing candidate with the full suite.
+# Heavy reusable suites are skipped at their callers on PRs so required checks
+# pass without running twice; policy, descriptors, formatting and lint still
+# catch mistakes early. Main, train and CI-experiment pushes and manual runs
+# retain the full suite, with exact-SHA main-push runs serving release evidence.
 # Tag pushes go through release.yml, which builds/publishes only after
 # release-ci-gate.sh finds a successful Tests main-push run for the exact tagged
 # commit and verifies every required job succeeded in that run.
@@ -20,7 +23,7 @@ on:
   merge_group:
     types: [checks_requested]
   # Required checks must report even for docs-only or otherwise unlisted files.
-  # Keep the legacy train push trigger until repository administrators enable the queue.
+  # Side-branch trains and CI experiments still need full push coverage.
   push:
     branches:
       - main
@@ -94,6 +97,53 @@ jobs:
           git fetch --no-tags origin refs/tags/v0.48.1:refs/tags/v0.48.1
           node scripts/release-gate-v049.mjs --check-inputs
 
+  pr-checks:
+    name: PR checks
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+      - name: Bun lint
+        run: bun run lint
+      - name: Build bridge dependency for workspace imports
+        run: bun run --cwd packages/aft-bridge build
+      - name: Bun typecheck
+        run: bun run typecheck
+      - name: Source and workflow guards
+        run: |
+          python3 --version
+          python3 -m unittest discover -s scripts/lib -p test_workflow_gates.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_rustc_cache.py -v
+          python3 -m unittest discover -s scripts/lib -p test_rust_gate_collection.py -v
+          python3 -m unittest discover -s scripts/lib -p test_ci_macos_integration_archive.py -v
+          python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
+          python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
+          python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
+          python3 -m unittest discover -s scripts/lib -p test_merge_queue_workflow.py -v
+          python3 -m unittest discover -s scripts/lib -p test_pr_search_descriptor.py -v
+          python3 -m unittest discover -s scripts/lib -p test_landing_policy.py -v
+          bash scripts/train-push.test.sh
+          bash scripts/land-pr.test.sh
+          bash scripts/release-ci-gate.test.sh
+      - name: Validate publication shapes and release notes
+        run: |
+          node scripts/validate-packages.mjs
+          node scripts/check-release-notes.mjs .alfonso/release-notes/v*.md
+
   # ---------------------------------------------------------------------------
   # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e),
   # defined as a reusable workflow. Windows bash e2e is continue-on-error;
@@ -101,6 +151,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit:
     name: Unit
+    if: ${{ github.event_name != 'pull_request' }}
     uses: ./.github/workflows/_unit-suite.yml
 
   # ---------------------------------------------------------------------------
@@ -117,6 +168,7 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E
+    if: ${{ github.event_name != 'pull_request' }}
     uses: ./.github/workflows/_e2e-suite.yml
     # The nested e2e-opencode2-linux job reads its own emitted check context
     # (actions/checks read); a called workflow may not exceed the caller's grant.
@@ -129,6 +181,7 @@ jobs:
 
   search-quality-binary:
     name: Search quality binary (Linux x64)
+    if: ${{ github.event_name != 'pull_request' }}
     # The gate rebuilds from source if artifact production is unavailable.
     continue-on-error: true
     runs-on: ubuntu-22.04
@@ -195,7 +248,17 @@ jobs:
         run: |
           scripts/telemetry/cost-gate.sh --search-quality --self-test
           python3 benchmarks/aft-search/ci_quality_mode.py --self-test
+      - name: Validate PR search-quality descriptor
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          QUALITY_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          python3 benchmarks/aft-search/search_quality.py --mode check-descriptor \
+            --base-ref "$PR_BASE_SHA" --head "$PR_HEAD_SHA" --branch "$QUALITY_BRANCH"
       - name: Download the shared release AFT
+        if: ${{ github.event_name != 'pull_request' }}
         id: download-release-aft
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -203,6 +266,7 @@ jobs:
           name: search-quality-aft-${{ github.sha }}
           path: target/release
       - name: Check the shared release AFT
+        if: ${{ github.event_name != 'pull_request' }}
         id: release-aft
         shell: bash
         run: |
@@ -213,15 +277,17 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Build the product binary when the artifact is absent
-        if: steps.release-aft.outputs.available != 'true'
+        if: ${{ github.event_name != 'pull_request' && steps.release-aft.outputs.available != 'true' }}
         run: cargo build --release --locked -p agent-file-tools --bin aft
       - name: Provision search-quality corpora at their pinned commits
+        if: ${{ github.event_name != 'pull_request' }}
         # The only network-enabled step: evaluation itself runs offline against
         # these trees and fails with an input fault if either one is absent.
         run: |
           python3 benchmarks/aft-search/provision_corpus.py
           python3 benchmarks/aft-search/provision_evidence.py
       - name: Evaluate committed search-quality reference
+        if: ${{ github.event_name != 'pull_request' }}
         env:
           GH_TOKEN: ${{ github.token }}
           QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}

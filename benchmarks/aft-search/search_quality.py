@@ -10,7 +10,7 @@ from search_quality_lib import (
     EVIDENCE_SHA, PAGE_SIZE, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
     aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
     included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
-    row_metrics, sample_plan, sha256_bytes, sha256_file, split_rows_not_applicable, total_gate,
+    resolve_descriptor, row_metrics, sample_plan, sha256_bytes, sha256_file, split_rows_not_applicable, total_gate,
     validate_manifest_maintenance_scores, validate_manifest_relabels, validate_profile_score, validate_scored_population,
 )
 
@@ -217,6 +217,20 @@ def old_json(revision:str,path:Path)->dict[str,Any]:
 def run(args:argparse.Namespace)->int:
     if args.self_test:
         self_test(); print("search_quality_goldens:ok"); return 0
+    if args.mode == "check-descriptor":
+        # PRs validate the diff contract without building a binary or replaying
+        # corpora; the merge queue still performs the complete quality evaluation.
+        if not args.base_ref:
+            raise InputFault("missing_diff_base")
+        paths = diff_paths(args.base_ref, args.head)
+        path = descriptor_path(args.descriptor, args.branch)
+        descriptor = read_json(path) if path else None
+        resolved, missing_ranking = resolve_descriptor(descriptor, paths)
+        if missing_ranking:
+            print("missing ranking descriptor", file=sys.stderr)
+            return 1
+        print(f"descriptor:green slice_class={resolved['slice_class']} changed_paths={len(paths)}")
+        return 0
     manifest_path=Path(args.manifest); reference_path=Path(args.reference); sidecar_path=Path(args.sidecar)
     manifest=read_json(manifest_path)
     included_manifest_ids(manifest)
@@ -287,7 +301,7 @@ def run(args:argparse.Namespace)->int:
 
 
 def parser()->argparse.ArgumentParser:
-    p=argparse.ArgumentParser(); p.add_argument("--mode",choices=("evaluate","record-reference","verify"),default="evaluate"); p.add_argument("--manifest",default=str(BENCH/"real-query-manifest.json")); p.add_argument("--reference",default=str(BENCH/"real-query-baseline.json")); p.add_argument("--sidecar",default=str(BENCH/"manifest.sha256")); p.add_argument("--score"); p.add_argument("--descriptor"); p.add_argument("--branch"); p.add_argument("--base-ref",default="HEAD^"); p.add_argument("--head",default="HEAD"); p.add_argument("--model-id",default="aft-search-fixture-v1"); p.add_argument("--manifest-changed",action="store_true"); p.add_argument("--old-score"); p.add_argument("--rebaseline",action="store_true"); p.add_argument("--from-profile"); p.add_argument("--to-profile"); p.add_argument("--dry-run",action="store_true"); p.add_argument("--self-test",action="store_true"); return p
+    p=argparse.ArgumentParser(); p.add_argument("--mode",choices=("evaluate","record-reference","verify","check-descriptor"),default="evaluate"); p.add_argument("--manifest",default=str(BENCH/"real-query-manifest.json")); p.add_argument("--reference",default=str(BENCH/"real-query-baseline.json")); p.add_argument("--sidecar",default=str(BENCH/"manifest.sha256")); p.add_argument("--score"); p.add_argument("--descriptor"); p.add_argument("--branch"); p.add_argument("--base-ref",default="HEAD^"); p.add_argument("--head",default="HEAD"); p.add_argument("--model-id",default="aft-search-fixture-v1"); p.add_argument("--manifest-changed",action="store_true"); p.add_argument("--old-score"); p.add_argument("--rebaseline",action="store_true"); p.add_argument("--from-profile"); p.add_argument("--to-profile"); p.add_argument("--dry-run",action="store_true"); p.add_argument("--self-test",action="store_true"); return p
 
 def main()->int:
     try: return run(parser().parse_args())
