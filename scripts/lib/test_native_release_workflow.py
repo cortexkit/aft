@@ -36,7 +36,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             job = suite["jobs"][f"e2e-{suffix}"]
             self.assertEqual(job["name"], name)
             self.assertNotIn("needs", job)
-            self.assertNotIn("if", job)
+            self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
             self.assertNotIn("pack-binary", commands(job))
 
     def test_every_publish_job_requires_shipped_e2e_on_release_sha(self):

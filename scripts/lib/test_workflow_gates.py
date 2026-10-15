@@ -109,6 +109,70 @@ class LightPREventGateTests(unittest.TestCase):
             "${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
         ), "ref")
 
+    def test_prs_report_all_26_required_contexts_as_static_skipped_jobs(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        required = {
+            line for line in (root / ".github/required-checks.txt").read_text().splitlines()
+            if line.startswith(("Unit / ", "E2E / "))
+        }
+        self.assertEqual(len(required), 26)
+        jobs = {}
+        for caller, file in (("Unit", "_unit-suite.yml"), ("E2E", "_e2e-suite.yml")):
+            suite = workflow_gates.parse_workflow(str(root / ".github/workflows" / file))
+            for job in suite["jobs"].values():
+                name = f"{caller} / {job['name']}"
+                self.assertNotIn(name, jobs)
+                jobs[name] = job
+        for context in required:
+            with self.subTest(context=context):
+                self.assertIn(context, jobs)
+                self.assertNotIn("strategy", jobs[context])
+                self.assertIn(jobs[context]["if"], (
+                    "${{ github.event_name != 'pull_request' }}",
+                    "${{ always() && github.event_name != 'pull_request' }}",
+                ))
+
+    def test_static_integration_shards_share_one_partition_action(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        wrappers = []
+        for job in suite["jobs"].values():
+            steps = job.get("steps", [])
+            for step in steps:
+                if step.get("uses") == "./.github/actions/integration-shard":
+                    wrappers.append((job, step))
+        self.assertEqual(len(wrappers), 9)
+        expected = {(os, str(shard)) for os in ("linux", "macos", "windows") for shard in (1, 2, 3)}
+        actual = {(step["with"]["platform"], step["with"]["shard"]) for _, step in wrappers}
+        self.assertEqual(actual, expected)
+        for job, step in wrappers:
+            platform, shard = step["with"]["platform"], step["with"]["shard"]
+            label, runner, timeout = {
+                "linux": ("Linux", "ubuntu-22.04", "20"),
+                "macos": ("macOS", "macos-26", "20"),
+                "windows": ("Windows", "windows-2022", "25"),
+            }[platform]
+            with self.subTest(platform=platform, shard=shard):
+                self.assertEqual(job["name"], f"Cargo integration shard {shard}/3 ({label})")
+                self.assertEqual(job["runs-on"], runner)
+                self.assertEqual(job["timeout-minutes"], timeout)
+                self.assertEqual(job["needs"], f"unit-{platform}-nextest-archive")
+                self.assertNotIn("strategy", job)
+                self.assertEqual(job["steps"], [{"uses": "actions/checkout@v5"}, step])
+        action = workflow_gates.parse_workflow(str(root / ".github/actions/integration-shard/action.yml"))
+        self.assertEqual(action["runs"]["using"], "composite")
+        steps = action["runs"]["steps"]
+        gate_steps = [step for step in steps if step.get("run") == "./scripts/rust-test-gate.sh"]
+        self.assertEqual(len(gate_steps), 2)
+        self.assertEqual({step["if"] for step in gate_steps}, {"inputs.platform == 'windows'", "inputs.platform != 'windows'"})
+        for step in gate_steps:
+            self.assertEqual(step["shell"], "bash")
+            self.assertEqual(step["env"]["AFT_NEXTEST_PARTITION"], "hash:${{ inputs.shard }}/3")
+            self.assertEqual(step["env"]["AFT_GATE_PHASES"], "nextest")
+            self.assertEqual(step["env"]["AFT_GATE_SKIP_RELEASE_STORM"], "1")
+        download = next(step for step in steps if step.get("uses") == "actions/download-artifact@v4")
+        self.assertEqual(download["with"]["name"], "${{ inputs.platform }}-nextest-archive")
+
 
 class CISpeedWorkflowTests(unittest.TestCase):
     def test_release_binary_cache_requires_exact_commit_and_compiler(self) -> None:
@@ -186,16 +250,27 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             "unit-macos-inventory-proof",
             "unit-macos-libtest-shard",
             "unit-macos-nextest",
+            "unit-macos-nextest-2",
+            "unit-macos-nextest-3",
             "unit-macos-watcher",
             "unit-macos-conformance",
         }
 
         self.assertIn("name: Unit tests (macOS)", summary)
-        self.assertRegex(summary, r"(?m)^    if: always\(\)$")
+        self.assertIn("if: ${{ always() && github.event_name != 'pull_request' }}", summary)
         for lane in expected_lanes:
             self.assertIn(f"- {lane}", summary)
             self.assertIn(f"needs.{lane}.result", summary)
         self.assertIn('if [[ "$result" != "success" ]]', summary)
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        aggregate = suite["jobs"]["unit-macos"]["steps"][0]
+        loop = re.search(r"for lane in (.*); do", aggregate["run"])
+        self.assertIsNotNone(loop)
+        self.assertEqual(
+            set(loop.group(1).split()),
+            {key.removesuffix("_RESULT") for key in aggregate["env"]},
+        )
 
     def test_macos_rust_buckets_and_bun_suite_run_in_parallel_lanes(self) -> None:
         integration_archive = workflow_job("unit-macos-nextest-archive")
@@ -238,10 +313,9 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertIn("AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}", libtest)
 
         integration = workflow_job("unit-macos-nextest")
-        self.assertIn("max-parallel: 3", integration)
-        self.assertIn("AFT_GATE_PHASES: nextest", integration)
-        self.assertIn("AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3", integration)
-        self.assertIn("macos-nextest-archive", integration)
+        self.assertIn("./.github/actions/integration-shard", integration)
+        self.assertIn("platform: macos", integration)
+        self.assertIn('shard: "1"', integration)
 
         watcher = workflow_job("unit-macos-watcher")
         self.assertIn("AFT_GATE_PHASES: watcher", watcher)

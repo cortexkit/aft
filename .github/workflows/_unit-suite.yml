@@ -36,6 +36,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-linux-nextest-archive:
     name: Cargo test archive (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
@@ -98,6 +99,7 @@ jobs:
 
   unit-linux:
     name: Unit tests (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
     # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -248,6 +250,7 @@ jobs:
 
   plugin-e2e-linux:
     name: Plugin e2e (${{ matrix.suite }}, Linux)
+    if: ${{ github.event_name != 'pull_request' }}
     # ck-subc release binaries need glibc 2.39 (Ubuntu 24.04).
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -316,96 +319,47 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Branch protection requires each numbered shard's exact check name. Literal
+  # job names let skipped PRs report all nine checks without reserving runners;
+  # a skipped matrix does not expand its names. The shared action owns execution.
   unit-linux-nextest:
-    name: Cargo integration shard ${{ matrix.shard }}/3 (Linux)
+    name: Cargo integration shard 1/3 (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: unit-linux-nextest-archive
     runs-on: ubuntu-22.04
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/integration-shard
         with:
-          components: rust-analyzer
+          platform: linux
+          shard: "1"
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
-
-      - uses: actions/setup-node@v5
+  unit-linux-nextest-2:
+    name: Cargo integration shard 2/3 (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-linux-nextest-archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/integration-shard
         with:
-          node-version: "24"
+          platform: linux
+          shard: "2"
 
-      - name: Install Pyright integration dependency
-        run: npm install --global pyright@1.1.411
-
-      - uses: oven-sh/setup-bun@v2
+  unit-linux-nextest-3:
+    name: Cargo integration shard 3/3 (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-linux-nextest-archive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/integration-shard
         with:
-          bun-version: latest
-
-      # Real TypeScript 7 and TypeScript 5 installs for
-      # typescript_native_lsp_test; the script exports their paths. Without
-      # them those tests skip, and the native server path has no coverage.
-      - uses: actions/cache/restore@v4
-        id: typescript-servers
-        with:
-          path: ${{ runner.temp }}/typescript-test-servers
-          key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
-
-      - name: Install TypeScript test servers (pinned)
-        run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: linux-nextest-archive
-          path: ${{ runner.temp }}
-
-      - name: Rust integration shard (nextest archive)
-        run: ./scripts/rust-test-gate.sh
-        env:
-          NEXTEST_TEST_THREADS: "num-cpus"
-          AFT_GATE_PHASES: nextest
-          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/linux-nextest.tar.zst
-          # Extract under the checkout so compile-time CARGO_BIN_EXE paths from
-          # the archive builder resolve to the downloaded helper binaries.
-          AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
-          AFT_GATE_SKIP_RELEASE_STORM: "1"
-          # rust-analyzer is installed above; tests that need a real one
-          # fail instead of skipping when it is missing.
-          AFT_TEST_REQUIRE_RUST_ANALYZER: "1"
-          AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
-
-      - name: Save TypeScript test servers on main
-        if: ${{ github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/typescript-test-servers
-          key: ${{ steps.typescript-servers.outputs.cache-primary-key }}
-
-      - name: Upload Linux integration crash cores
-        if: failure() && matrix.shard == 2
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-integration-crash-${{ matrix.shard }}
-          path: |
-            ${{ github.workspace }}/core*
-            ${{ runner.temp }}/core*
-          if-no-files-found: warn
-          retention-days: 3
+          platform: linux
+          shard: "3"
 
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
@@ -414,6 +368,7 @@ jobs:
   # ---------------------------------------------------------------------------
   sandbox-landlock-probes:
     name: Sandbox real-kernel Landlock probes
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -447,6 +402,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-linux-storm:
     name: Release storm (Linux)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
     # The storm runs a release-profile build first. With a cold compiler cache
     # that build plus the storm takes about 23 minutes on a normal runner, and
@@ -497,6 +453,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-linux-msrv:
     name: MSRV check (rustc 1.92)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
@@ -534,6 +491,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -602,6 +560,7 @@ jobs:
 
   unit-macos-libtest-archive:
     name: Cargo libtest archive (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-26
     timeout-minutes: 30
     env:
@@ -662,6 +621,7 @@ jobs:
 
   unit-macos-bin-archive:
     name: Cargo bin-test archive (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-26
     timeout-minutes: 25
     env:
@@ -719,6 +679,7 @@ jobs:
 
   unit-macos-inventory-proof:
     name: Prove Rust test inventory (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     needs:
       - unit-macos-nextest-archive
       - unit-macos-libtest-archive
@@ -773,7 +734,7 @@ jobs:
 
   unit-macos:
     name: Unit tests (macOS)
-    if: always()
+    if: ${{ always() && github.event_name != 'pull_request' }}
     needs:
       - unit-macos-nextest-archive
       - unit-macos-libtest-archive
@@ -781,6 +742,8 @@ jobs:
       - unit-macos-inventory-proof
       - unit-macos-libtest-shard
       - unit-macos-nextest
+      - unit-macos-nextest-2
+      - unit-macos-nextest-3
       - unit-macos-watcher
       - unit-macos-conformance
     runs-on: ubuntu-22.04
@@ -796,11 +759,13 @@ jobs:
           INVENTORY_RESULT: ${{ needs.unit-macos-inventory-proof.result }}
           LIBTEST_RESULT: ${{ needs.unit-macos-libtest-shard.result }}
           INTEGRATION_RESULT: ${{ needs.unit-macos-nextest.result }}
+          INTEGRATION_2_RESULT: ${{ needs.unit-macos-nextest-2.result }}
+          INTEGRATION_3_RESULT: ${{ needs.unit-macos-nextest-3.result }}
           WATCHER_RESULT: ${{ needs.unit-macos-watcher.result }}
           CONFORMANCE_BUN_RESULT: ${{ needs.unit-macos-conformance.result }}
         run: |
           set -euo pipefail
-          for lane in ARCHIVE LIBTEST_ARCHIVE BIN_ARCHIVE INVENTORY LIBTEST INTEGRATION WATCHER CONFORMANCE_BUN; do
+          for lane in ARCHIVE LIBTEST_ARCHIVE BIN_ARCHIVE INVENTORY LIBTEST INTEGRATION INTEGRATION_2 INTEGRATION_3 WATCHER CONFORMANCE_BUN; do
             result_var="${lane}_RESULT"
             result="${!result_var}"
             if [[ "$result" != "success" ]]; then
@@ -810,92 +775,47 @@ jobs:
           done
 
   unit-macos-nextest:
-    name: Cargo integration shard ${{ matrix.shard }}/3 (macOS)
+    name: Cargo integration shard 1/3 (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: unit-macos-nextest-archive
     runs-on: macos-26
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      max-parallel: 3
-      matrix:
-        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
-
-      - uses: actions/setup-node@v5
+      - uses: ./.github/actions/integration-shard
         with:
-          node-version: "24"
+          platform: macos
+          shard: "1"
 
-      - uses: oven-sh/setup-bun@v2
+  unit-macos-nextest-2:
+    name: Cargo integration shard 2/3 (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-macos-nextest-archive
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/integration-shard
         with:
-          bun-version: latest
+          platform: macos
+          shard: "2"
 
-      # Real TypeScript 7 and TypeScript 5 installs for
-      # typescript_native_lsp_test; the script exports their paths. Without
-      # them those tests skip, and the native server path has no coverage.
-      - uses: actions/cache/restore@v4
-        id: typescript-servers
+  unit-macos-nextest-3:
+    name: Cargo integration shard 3/3 (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-macos-nextest-archive
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/integration-shard
         with:
-          path: ${{ runner.temp }}/typescript-test-servers
-          key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
-
-      - name: Install TypeScript test servers (pinned)
-        run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-nextest-archive
-          path: ${{ runner.temp }}
-
-      - name: Rust integration shard (nextest archive)
-        run: ./scripts/rust-test-gate.sh
-        env:
-          NEXTEST_TEST_THREADS: "num-cpus"
-          AFT_GATE_PHASES: nextest
-          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/macos-nextest.tar.zst
-          # GitHub gives every job the same checkout path. Recreating target/
-          # there preserves compile-time helper paths embedded in test binaries.
-          AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
-          AFT_GATE_SKIP_RELEASE_STORM: "1"
-          AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
-
-      - name: Save TypeScript test servers on main
-        if: ${{ github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ runner.temp }}/typescript-test-servers
-          key: ${{ steps.typescript-servers.outputs.cache-primary-key }}
-
-      - name: Upload macOS integration crash cores
-        if: failure() && matrix.shard == 2
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-integration-crash-${{ matrix.shard }}
-          path: |
-            ${{ github.workspace }}/core*
-            ${{ runner.temp }}/core*
-            /cores/core.*
-          if-no-files-found: warn
-          retention-days: 3
+          platform: macos
+          shard: "3"
 
   unit-macos-libtest-shard:
     name: Cargo libtest shard ${{ matrix.shard }}/3 (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     needs:
       - unit-macos-libtest-archive
       - unit-macos-bin-archive
@@ -968,6 +888,7 @@ jobs:
 
   unit-macos-watcher:
     name: Cargo watcher tests (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-26
     timeout-minutes: 20
     env:
@@ -1031,6 +952,7 @@ jobs:
 
   unit-macos-conformance:
     name: Cargo conformance + Bun tests (macOS)
+    if: ${{ github.event_name != 'pull_request' }}
     # This runner builds its own binary and consumes no archive artifacts.
     # The summary still requires both conformance and every archive/shard lane.
     runs-on: macos-26
@@ -1132,6 +1054,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-windows-nextest-archive:
     name: Cargo test archive (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2022
     timeout-minutes: 25
     steps:
@@ -1198,7 +1121,7 @@ jobs:
 
   unit-windows-libtest:
     name: Cargo libtest + watcher (Windows)
-    if: always()
+    if: ${{ always() && github.event_name != 'pull_request' }}
     needs:
       - unit-windows-nextest-archive
       - unit-windows-libtest-shard
@@ -1226,6 +1149,7 @@ jobs:
 
   unit-windows-libtest-shard:
     name: Cargo libtest shard ${{ matrix.shard }}/3 (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: unit-windows-nextest-archive
     runs-on: windows-2022
     timeout-minutes: 20
@@ -1292,6 +1216,7 @@ jobs:
 
   unit-windows-watcher:
     name: Cargo watcher + conformance (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
@@ -1338,52 +1263,43 @@ jobs:
           if-no-files-found: warn
 
   unit-windows-cargo:
-    name: Cargo integration shard ${{ matrix.shard }}/3 (Windows)
+    name: Cargo integration shard 1/3 (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: unit-windows-nextest-archive
     runs-on: windows-2022
     timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      max-parallel: 3
-      matrix:
-        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/integration-shard
         with:
-          targets: x86_64-pc-windows-msvc
+          platform: windows
+          shard: "1"
 
-      - name: Install cargo-nextest (direct, installer-action-independent)
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "$(uname -s)" in
-            Linux) plat="linux" ;;
-            Darwin) plat="mac" ;;
-            *) plat="windows-tar" ;;
-          esac
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
-          "$HOME/.cargo/bin/cargo-nextest" --version
-
-      - uses: actions/download-artifact@v4
+  unit-windows-cargo-2:
+    name: Cargo integration shard 2/3 (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-windows-nextest-archive
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/integration-shard
         with:
-          name: windows-nextest-archive
-          path: ${{ runner.temp }}
+          platform: windows
+          shard: "2"
 
-      - name: Rust integration shard (nextest archive)
-        # The archive exports runtime paths for helper binaries. Hash partitioning
-        # assigns every non-watcher integration test to one shard.
-        run: ./scripts/rust-test-gate.sh
-        shell: bash
-        env:
-          AFT_TEST_DIAG: "1"
-          NEXTEST_TEST_THREADS: "4"
-          AFT_GATE_PHASES: nextest
-          AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
-          AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
-          AFT_GATE_SKIP_RELEASE_STORM: "1"
+  unit-windows-cargo-3:
+    name: Cargo integration shard 3/3 (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
+    needs: unit-windows-nextest-archive
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/integration-shard
+        with:
+          platform: windows
+          shard: "3"
   # ---------------------------------------------------------------------------
   # Cross-target warning gate (Windows, compile-only, DENIES warnings).
   # Split from unit-windows-cargo: with unique RUSTFLAGS it shares no
@@ -1393,6 +1309,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-windows-check:
     name: Cargo check deny-warnings (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2022
     timeout-minutes: 30
     steps:
@@ -1446,6 +1363,7 @@ jobs:
   # ---------------------------------------------------------------------------
   unit-windows-bash:
     name: Bash permission e2e (Windows)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2022
     timeout-minutes: 20
     continue-on-error: true

@@ -1,0 +1,116 @@
+name: Rust integration shard
+description: Run one hash partition of the platform's nextest archive
+inputs:
+  platform:
+    description: Archive platform (linux, macos, or windows)
+    required: true
+  shard:
+    description: Hash partition number (1, 2, or 3)
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      if: inputs.platform == 'linux'
+      with:
+        components: rust-analyzer
+    - uses: dtolnay/rust-toolchain@stable
+      if: inputs.platform == 'macos'
+    - uses: dtolnay/rust-toolchain@stable
+      if: inputs.platform == 'windows'
+      with:
+        targets: x86_64-pc-windows-msvc
+
+    - name: Install cargo-nextest (direct, installer-action-independent)
+      shell: bash
+      run: |
+        set -euo pipefail
+        case "$(uname -s)" in
+          Linux) plat="linux" ;;
+          Darwin) plat="mac" ;;
+          *) plat="windows-tar" ;;
+        esac
+        mkdir -p "$HOME/.cargo/bin"
+        curl -LsSf --retry 5 --retry-delay 2 "https://get.nexte.st/0.9.138/$plat" | tar zxf - -C "$HOME/.cargo/bin"
+        "$HOME/.cargo/bin/cargo-nextest" --version
+
+    - uses: actions/setup-node@v5
+      if: inputs.platform != 'windows'
+      with:
+        node-version: "24"
+    - name: Install Pyright integration dependency
+      if: inputs.platform == 'linux'
+      shell: bash
+      run: npm install --global pyright@1.1.411
+    - uses: oven-sh/setup-bun@v2
+      if: inputs.platform != 'windows'
+      with:
+        bun-version: latest
+
+    # Install TypeScript 7's native server and the TypeScript 5 fallback server;
+    # without these pinned binaries, the TypeScript LSP integration tests skip.
+    - uses: actions/cache/restore@v4
+      if: inputs.platform != 'windows'
+      id: typescript-servers
+      with:
+        path: ${{ runner.temp }}/typescript-test-servers
+        key: typescript-test-servers-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/install-typescript-test-servers.sh') }}
+    - name: Install TypeScript test servers (pinned)
+      if: inputs.platform != 'windows'
+      shell: bash
+      run: ./scripts/install-typescript-test-servers.sh "${{ runner.temp }}/typescript-test-servers"
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.platform }}-nextest-archive
+        path: ${{ runner.temp }}
+
+    - name: Require the real Linux rust-analyzer
+      if: inputs.platform == 'linux'
+      shell: bash
+      run: echo "AFT_TEST_REQUIRE_RUST_ANALYZER=1" >> "$GITHUB_ENV"
+
+    - name: Rust integration shard (nextest archive, Unix)
+      if: inputs.platform != 'windows'
+      shell: bash
+      run: ./scripts/rust-test-gate.sh
+      env:
+        NEXTEST_TEST_THREADS: "num-cpus"
+        AFT_GATE_PHASES: nextest
+        AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/${{ inputs.platform }}-nextest.tar.zst
+        # Restore helper binaries to the compile-time checkout paths in the archive.
+        AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
+        AFT_NEXTEST_PARTITION: hash:${{ inputs.shard }}/3
+        AFT_GATE_SKIP_RELEASE_STORM: "1"
+        AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ inputs.shard == '2' && '1' || '0' }}
+
+    - name: Rust integration shard (nextest archive, Windows)
+      if: inputs.platform == 'windows'
+      shell: bash
+      run: ./scripts/rust-test-gate.sh
+      env:
+        AFT_TEST_DIAG: "1"
+        NEXTEST_TEST_THREADS: "4"
+        AFT_GATE_PHASES: nextest
+        AFT_NEXTEST_ARCHIVE_FILE: ${{ runner.temp }}/windows-nextest.tar.zst
+        AFT_NEXTEST_PARTITION: hash:${{ inputs.shard }}/3
+        AFT_GATE_SKIP_RELEASE_STORM: "1"
+
+    - name: Save TypeScript test servers on main
+      if: ${{ inputs.platform != 'windows' && github.ref == 'refs/heads/main' && steps.typescript-servers.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/typescript-test-servers
+        key: ${{ steps.typescript-servers.outputs.cache-primary-key }}
+
+    - name: Upload integration crash cores
+      if: failure() && inputs.platform != 'windows' && inputs.shard == '2'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.platform }}-integration-crash-${{ inputs.shard }}
+        path: |
+          ${{ github.workspace }}/core*
+          ${{ runner.temp }}/core*
+          ${{ inputs.platform == 'macos' && '/cores/core.*' || '' }}
+        if-no-files-found: warn
+        retention-days: 3

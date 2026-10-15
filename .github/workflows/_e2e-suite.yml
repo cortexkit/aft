@@ -44,6 +44,7 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-linux-binary:
     name: E2E binary (Linux x64)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 25
     env:
@@ -117,6 +118,7 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-linux:
     name: E2E (Linux Docker)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -185,6 +187,7 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-opencode2-linux:
     name: OpenCode 2 (Linux Docker)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     timeout-minutes: 25
@@ -357,6 +360,7 @@ jobs:
   # ---------------------------------------------------------------------------
   pi-rpc-e2e:
     name: E2E (Pi RPC)
+    if: ${{ github.event_name != 'pull_request' }}
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     # 25: the job builds cargo + bun deps + dists before testing; with cold or
@@ -408,6 +412,7 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-windows:
     name: E2E (Windows native)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -485,6 +490,7 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e-macos:
     name: E2E (macOS native)
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: macos-26
     # Stage codegen avoids the shipped profile's long fat-LTO link.
     timeout-minutes: 45

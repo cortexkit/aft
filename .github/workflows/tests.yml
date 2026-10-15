@@ -2,7 +2,7 @@ name: Tests
 
 # PR runs are deliberately light: main requires the merge queue, whose
 # merge-group run tests the actual landing candidate with the full suite.
-# Heavy reusable suites are skipped at their callers on PRs so required checks
+# Heavy jobs inside reusable suites are skipped on PRs so required checks
 # pass without running twice; policy, descriptors, formatting and lint still
 # catch mistakes early. Main, train and CI-experiment pushes and manual runs
 # retain the full suite, with exact-SHA main-push runs serving release evidence.
@@ -151,7 +151,6 @@ jobs:
   # ---------------------------------------------------------------------------
   unit:
     name: Unit
-    if: ${{ github.event_name != 'pull_request' }}
     uses: ./.github/workflows/_unit-suite.yml
 
   # ---------------------------------------------------------------------------
@@ -168,7 +167,6 @@ jobs:
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E
-    if: ${{ github.event_name != 'pull_request' }}
     uses: ./.github/workflows/_e2e-suite.yml
     # The nested e2e-opencode2-linux job reads its own emitted check context
     # (actions/checks read); a called workflow may not exceed the caller's grant.

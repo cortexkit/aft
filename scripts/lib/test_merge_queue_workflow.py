@@ -44,7 +44,7 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             concurrency["cancel-in-progress"], "${{ github.event_name != 'merge_group' && github.ref != 'refs/heads/main' }}"
         )
 
-    def test_required_reusable_suites_skip_only_prs_not_queue_or_pushes(self) -> None:
+    def test_required_reusable_suites_skip_pr_leaf_jobs_not_callers(self) -> None:
         jobs = self.workflow["jobs"]
         for job_id, name, file in (
             ("unit", "Unit", "_unit-suite.yml"),
@@ -53,12 +53,15 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             job = jobs[job_id]
             self.assertEqual(job["name"], name)
             self.assertEqual(job["uses"], f"./.github/workflows/{file}")
-            self.assertEqual(job.get("if"), "${{ github.event_name != 'pull_request' }}")
+            self.assertNotIn("if", job)
             called = workflow_gates.parse_workflow(str(ROOT / ".github/workflows" / file))
             self.assertIn("workflow_call", called["on"])
             for nested in called["jobs"].values():
                 condition = nested.get("if", "")
-                self.assertNotIn("github.event_name", condition)
+                self.assertIn(condition, (
+                    "${{ github.event_name != 'pull_request' }}",
+                    "${{ always() && github.event_name != 'pull_request' }}",
+                ))
                 self.assertNotIn("github.ref", condition)
         self.assertEqual(jobs["e2e"]["with"]["cargo_profile"], "stage")
 
