@@ -377,6 +377,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "remote document previews use an explicit truncated-at-N-of-M-bytes footer with URL and symbol narrowing advice; this is a byte cut, not a paginated list of records",
     },
     ExclusionEntry {
+        file: "commands/file_read_exact.rs",
+        enclosing_item: "bounded_bytes",
+        location_or_primitive: "exact binary read byte ceiling",
+        reason: "the module operation refuses oversized files after at most one lookahead byte; no truncated list or partial file is returned",
+    },
+    ExclusionEntry {
         file: "url_fetch.rs",
         enclosing_item: "read_response_body, fetch_url_to_cache",
         location_or_primitive: "URL download byte ceiling and UTF-8 prefix repair",

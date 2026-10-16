@@ -804,6 +804,7 @@ async fn exercise_catalog_remote_bash(
         false,
         1024 * 1024,
         &drain::ModuleDrainWindow::default(),
+        None,
     )
     .await
     .unwrap();

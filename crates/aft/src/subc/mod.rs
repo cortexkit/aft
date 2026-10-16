@@ -203,6 +203,7 @@ mod bash;
 mod bash_selector_tests;
 mod consent;
 mod drain;
+mod flow_read;
 mod health;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -4736,7 +4737,7 @@ where
     let (scope_describes, mut scopes_ended_rx, scope_describe_task) =
         scope_describe::start(control.clone(), executor.clone(), run_scopes.clone());
     let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
-    let readiness_task = spawn_readiness(control, spawn_role, hello_at);
+    let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at);
     // `read_frame` is NOT cancellation-safe, so it must never sit directly inside
     // the `select!` below: a drain-interval tick (or shutdown) firing while a
     // frame is mid-transit would drop the partially-consumed bytes and desync the
@@ -5402,6 +5403,7 @@ where
                                 allow_native_passthrough,
                                 tool_response_body_limit,
                                 &module_drain,
+                                Some(&control),
                             )
                             .await
                         };
@@ -6928,6 +6930,9 @@ async fn handle_control_request(
 
             let bind_trust = trust_for_bind(&identity.harness, &principal);
             if let RouteTarget::ManagementSurface { module_id } = &target {
+                if let Err(refusal) = flow_read::admit_management(scope.as_ref()) {
+                    return send_route_bind_error_body(tx, frame, &refusal, metrics).await;
+                }
                 if module_id != "aft" {
                     return send_route_bind_error(
                         tx,
@@ -8283,6 +8288,7 @@ async fn handle_tool_call(
     allow_native_passthrough: bool,
     tool_response_body_limit: usize,
     module_drain: &drain::ModuleDrainWindow,
+    daemon_control: Option<&Arc<readiness::DaemonControl>>,
 ) -> Result<(), SubcError> {
     let module_draining = module_drain.is_active();
     let route_id = route_key(frame.header.channel, frame.header.epoch);
@@ -8320,6 +8326,25 @@ async fn handle_tool_call(
         return send_reliable_writer_frame(tx, metrics, error, "unbound or reclaimed route error")
             .await;
     };
+    let envelope = match parsed_body.unwrap_or_else(|| serde_json::from_slice::<Value>(&frame.body))
+    {
+        Ok(envelope) => envelope,
+        Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
+    };
+    if flow_read::intercept(&identity, &envelope) {
+        return flow_read::dispatch(
+            tx,
+            metrics,
+            frame,
+            identity,
+            envelope,
+            routes,
+            executor,
+            active_tool_calls,
+            daemon_control,
+        )
+        .await;
+    }
     let restore_watcher = live_roots
         .get(&identity.root)
         .is_some_and(|meta| meta.idle_artifacts_evicted);
@@ -8335,11 +8360,6 @@ async fn handle_tool_call(
         }
     }
 
-    let envelope = match parsed_body.unwrap_or_else(|| serde_json::from_slice::<Value>(&frame.body))
-    {
-        Ok(envelope) => envelope,
-        Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
-    };
     let operation = envelope.get("op").and_then(Value::as_str).or_else(|| {
         envelope
             .get("name")
@@ -10726,6 +10746,7 @@ pub(crate) mod test_support {
             false,
             1024 * 1024,
             &drain::ModuleDrainWindow::default(),
+            None,
         )
         .await
         .unwrap();
@@ -17823,7 +17844,7 @@ mod tests {
                 &deferred_tx,
                 false,
                 1024 * 1024,
-                &drain::ModuleDrainWindow::default(),),
+                &drain::ModuleDrainWindow::default(), None,),
             )
             .await
             .expect("persistence refusal must not wait for the executor")
