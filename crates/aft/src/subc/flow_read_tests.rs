@@ -453,3 +453,214 @@ fn flow_read_parent_floor_from_stored_policy() {
         Err(Refusal::AccessDenied)
     );
 }
+
+#[test]
+fn flow_read_bad_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = head(dir.path());
+    let child = identity(dir.path(), stamp(), "reserved:basal");
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Config::default(),
+    );
+    for body in [json!({}), json!({"path": 123}), json!({"path": ""})] {
+        assert_eq!(
+            read_as_parent(&child, &parent, &body, &ctx),
+            Err(Refusal::BadRequest)
+        );
+    }
+}
+
+#[test]
+fn flow_read_persistence_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = head(dir.path());
+    let child = identity(dir.path(), stamp(), "reserved:basal");
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Config::default(),
+    );
+    assert_eq!(
+        read_as_parent(&child, &parent, &json!({"path":"script"}), &ctx),
+        Err(Refusal::IoError)
+    );
+}
+
+fn read_fixture() -> (
+    tempfile::TempDir,
+    Arc<AppContext>,
+    RouteIdentity,
+    RouteIdentity,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("head");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("script"), "abc").unwrap();
+    let parent = head(&root);
+    let child = identity(&root, stamp(), "reserved:basal");
+    let mut config = Config::default();
+    config.project_root = Some(root);
+    config.storage_dir = Some(dir.path().join("store"));
+    let ctx = Arc::new(AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        config,
+    ));
+    ctx.set_db(Arc::new(StdMutex::new(
+        crate::db::open(&ctx.storage_dir().join("aft.db")).unwrap(),
+    )));
+    access_grants::register(&parent, &ctx).unwrap();
+    (dir, ctx, parent, child)
+}
+
+struct ReadPause {
+    entered: std::sync::mpsc::Receiver<()>,
+    resume: Option<std::sync::mpsc::SyncSender<()>>,
+}
+
+impl ReadPause {
+    fn wait(&self) {
+        self.entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read reached the mid-read hook");
+    }
+    fn resume(&mut self) {
+        if let Some(sender) = self.resume.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+impl Drop for ReadPause {
+    fn drop(&mut self) {
+        self.resume();
+    }
+}
+
+fn pause_read() -> (file_read_exact::ReadHooks, ReadPause) {
+    let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
+    let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+    let resumed = StdMutex::new(resumed);
+    let hooks = file_read_exact::ReadHooks {
+        mid_read: Some(Arc::new(move || {
+            let _ = entered_tx.send(());
+            resumed
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test releases the paused read");
+        })),
+    };
+    (
+        hooks,
+        ReadPause {
+            entered,
+            resume: Some(resume),
+        },
+    )
+}
+
+#[test]
+fn flow_read_database_lock_released_during_read() {
+    let (_dir, ctx, parent, child) = read_fixture();
+    let (hooks, mut pause) = pause_read();
+    let reader_ctx = ctx.clone();
+    let worker = std::thread::spawn(move || {
+        read_as_parent_with_hooks(
+            &child,
+            &parent,
+            &json!({"path":"script"}),
+            &reader_ctx,
+            hooks,
+        )
+    });
+    pause.wait();
+    let db = ctx.db().unwrap();
+    let conn = db
+        .try_lock()
+        .expect("another route can acquire aft.db during the paused read");
+    assert_eq!(
+        conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    pause.resume();
+    drop(conn);
+    assert_eq!(worker.join().unwrap().unwrap()["bytes_base64"], "YWJj");
+}
+
+#[test]
+fn flow_read_revoked_between_snapshot_and_recheck() {
+    use crate::access_policy::{AccessGrant, AccessOperation, ApprovalMode, GrantKind};
+    use crate::db::access_grants as store;
+    let (_dir, ctx, parent, child) = read_fixture();
+    let key = access_grants::scope_key(&parent);
+    let path = parent.project_root.join("script").canonicalize().unwrap();
+    {
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        let mut config = ctx.config().as_ref().clone();
+        // Without an implicit policy root, this in-checkout file depends on its
+        // explicit grant; revocation removes its only read authority.
+        config.project_root = None;
+        store::register_scope(&conn, &key, None, &config).unwrap();
+        store::set_mode(&conn, &key, ApprovalMode::Ask).unwrap();
+        store::insert(
+            &conn,
+            &key,
+            &AccessGrant {
+                path: path.clone(),
+                kind: GrantKind::File,
+                operation: AccessOperation::Read,
+            },
+        )
+        .unwrap();
+    }
+    let (hooks, mut pause) = pause_read();
+    let reader_ctx = ctx.clone();
+    let worker = std::thread::spawn(move || {
+        read_as_parent_with_hooks(
+            &child,
+            &parent,
+            &json!({"path":"script"}),
+            &reader_ctx,
+            hooks,
+        )
+    });
+    pause.wait();
+    {
+        let db = ctx.db().unwrap();
+        let conn = db
+            .try_lock()
+            .expect("grant revocation must not wait for the paused file read");
+        assert_eq!(store::revoke(&conn, &key, &path).unwrap(), 1);
+    }
+    pause.resume();
+    assert_eq!(worker.join().unwrap(), Err(Refusal::AccessDenied));
+}
+
+#[test]
+fn flow_read_stalled_read_expires_without_late_success() {
+    let (_dir, ctx, parent, _child) = read_fixture();
+    let mut scope = stamp();
+    scope["expires_at_ms"] = json!(crate::db::call_ledger::now_ms() + 1500);
+    let child = identity(&parent.project_root, scope, "reserved:basal");
+    let (hooks, mut pause) = pause_read();
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let answer =
+            read_as_parent_with_hooks(&child, &parent, &json!({"path":"script"}), &ctx, hooks);
+        let _ = done.send(answer);
+    });
+    pause.wait();
+    let answer = result
+        .recv_timeout(Duration::from_secs(3))
+        .expect("expiry returns while the filesystem read is still paused");
+    assert!(
+        matches!(
+            answer,
+            Err(Refusal::RouteNotAdmitted("expiry")) | Err(Refusal::IoError)
+        ),
+        "no late success: {answer:?}"
+    );
+    pause.resume();
+    worker.join().unwrap();
+}

@@ -310,27 +310,57 @@ pub(super) fn policy_for_scope(
     key: &ScopeKey,
     ctx: &AppContext,
 ) -> rusqlite::Result<Option<AccessPolicy>> {
+    Ok(policy_snapshot(conn, key)?.map(|snapshot| snapshot.resolve(&ctx.storage_dir())))
+}
+
+pub(super) struct PolicySnapshot {
+    config: Config,
+    mode: crate::access_policy::ApprovalMode,
+    grants: Vec<AccessGrant>,
+    worker: bool,
+}
+
+/// Copy database-backed authority without probing any filesystem paths.
+pub(super) fn policy_snapshot(
+    conn: &rusqlite::Connection,
+    key: &ScopeKey,
+) -> rusqlite::Result<Option<PolicySnapshot>> {
     let Some(config) = store::scope_config(conn, key)? else {
         return Ok(None);
     };
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    let roots = config
-        .project_root
-        .as_ref()
-        .map(|root| vec![policy_path(root)])
-        .unwrap_or_default();
-    let mut policy = AccessPolicy::from_config(&config, &ctx.storage_dir(), roots, &home);
-    policy.mode = store::mode(conn, key)?;
-    policy.grants = store::list(conn, key)?;
-    if store::is_worker(conn, key)? {
+    Ok(Some(PolicySnapshot {
+        config,
+        mode: store::mode(conn, key)?,
+        grants: store::list(conn, key)?,
+        worker: store::is_worker(conn, key)?,
+    }))
+}
+
+impl PolicySnapshot {
+    /// Resolve filesystem-backed path identities separately from the database snapshot.
+    pub(super) fn resolve(self, storage: &Path) -> AccessPolicy {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        let roots = self
+            .config
+            .project_root
+            .as_ref()
+            .map(|root| vec![policy_path(root)])
+            .unwrap_or_default();
+        let mut policy = AccessPolicy::from_config(&self.config, storage, roots, &home);
+        policy.mode = self.mode;
+        policy.grants = self.grants;
+        if self.worker {
+            // Worker standing reads resolve daemon-owned roots on disk, so they
+            // are added here rather than while the database lock is held.
+            policy
+                .grants
+                .extend(crate::access_policy::worker_rust_read_grants());
+        }
         policy
-            .grants
-            .extend(crate::access_policy::worker_rust_read_grants());
     }
-    Ok(Some(policy))
 }
 
 fn param_refused(index: usize, path: Value, reason: &str) -> subc_protocol::ErrorBody {

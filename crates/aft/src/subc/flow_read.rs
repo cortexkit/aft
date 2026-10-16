@@ -238,25 +238,106 @@ fn read_as_parent(
     envelope: &Value,
     ctx: &AppContext,
 ) -> Result<Value, Refusal> {
+    read_as_parent_with_hooks(
+        identity,
+        parent,
+        envelope,
+        ctx,
+        file_read_exact::ReadHooks::default(),
+    )
+}
+
+fn read_as_parent_with_hooks(
+    identity: &RouteIdentity,
+    parent: &RouteIdentity,
+    envelope: &Value,
+    ctx: &AppContext,
+    hooks: file_read_exact::ReadHooks,
+) -> Result<Value, Refusal> {
+    use crate::access_policy::{AccessDecision, AccessOperation};
     let stamp = identity
         .scope
         .as_ref()
         .ok_or(Refusal::RouteNotAdmitted("owner"))?;
     unexpired(stamp)?;
-    let db = ctx.db().ok_or(Refusal::AccessDenied)?;
-    let conn = db.lock().map_err(|_| Refusal::AccessDenied)?;
-    let policy = access_grants::policy_for_scope(&conn, &access_grants::scope_key(parent), ctx)
-        .map_err(|_| Refusal::AccessDenied)?
-        .ok_or(Refusal::AccessDenied)?;
-    // Hold the grant database mutex through the bounded read so a revoke cannot
-    // interleave between the policy snapshot and reading the contents.
     let path = envelope
         .get("path")
         .and_then(Value::as_str)
-        .ok_or(Refusal::IoError)?;
-    let value = file_read_exact::read_exact(Path::new(path), &parent.project_root, &policy)?;
+        .filter(|path| !path.is_empty() && !path.contains('\0'))
+        .ok_or(Refusal::BadRequest)?;
+    let path = PathBuf::from(path);
+    let deadline = read_deadline(stamp)?;
+    let key = access_grants::scope_key(parent);
+    let initial = parent_policy_snapshot(ctx, &key)?;
+    let storage = ctx.storage_dir();
+    let read_storage = storage.clone();
+    let root = parent.project_root.clone();
+    let read = timed_io(stamp, deadline, &parent.project_root, move |_| {
+        let policy = initial.resolve(&read_storage);
+        file_read_exact::read_exact(&path, &root, &policy, hooks)
+    })?;
+
+    // Recheck the actual resolved target, not an alias that may now point elsewhere.
+    // Each snapshot releases its database lock before its filesystem work starts.
+    let current = parent_policy_snapshot(ctx, &key)?;
+    let allowed = timed_io(stamp, deadline, &read.resolved, move |resolved| {
+        Ok(current
+            .resolve(&storage)
+            .decide(AccessOperation::Read, &resolved, false))
+    })?;
+    if allowed != AccessDecision::Allow {
+        return Err(Refusal::AccessDenied);
+    }
+    before_deadline(stamp, deadline)?;
+    Ok(read.value)
+}
+
+fn parent_policy_snapshot(
+    ctx: &AppContext,
+    key: &crate::db::access_grants::ScopeKey,
+) -> Result<access_grants::PolicySnapshot, Refusal> {
+    let db = ctx.db().ok_or(Refusal::IoError)?;
+    let conn = db.lock().map_err(|_| Refusal::IoError)?;
+    access_grants::policy_snapshot(&conn, key)
+        .map_err(|_| Refusal::IoError)?
+        .ok_or(Refusal::AccessDenied)
+}
+
+fn read_deadline(stamp: &ScopeStamp) -> Result<Instant, Refusal> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let remaining = stamp
+        .expires_at_ms
+        .and_then(|at| u128::from(at).checked_sub(now))
+        .filter(|remaining| *remaining > 0)
+        .ok_or(Refusal::RouteNotAdmitted("expiry"))?;
+    Instant::now()
+        .checked_add(Duration::from_millis(remaining as u64))
+        .ok_or(Refusal::RouteNotAdmitted("expiry"))
+}
+
+fn before_deadline(stamp: &ScopeStamp, deadline: Instant) -> Result<(), Refusal> {
     unexpired(stamp)?;
-    Ok(value)
+    if Instant::now() >= deadline {
+        return Err(Refusal::RouteNotAdmitted("expiry"));
+    }
+    Ok(())
+}
+
+fn timed_io<T: Send + 'static>(
+    stamp: &ScopeStamp,
+    deadline: Instant,
+    path: &Path,
+    work: impl FnOnce(PathBuf) -> Result<T, Refusal> + Send + 'static,
+) -> Result<T, Refusal> {
+    before_deadline(stamp, deadline)?;
+    // A stalled helper retains only owned read inputs and a bounded pool permit,
+    // never the shared database connection or the executor's actor context.
+    let result = crate::bounded_io::run(path, Some(deadline), move |path| Ok(work(path)));
+    before_deadline(stamp, deadline)?;
+    result.map_err(|_| Refusal::IoError)?
 }
 
 #[cfg(test)]

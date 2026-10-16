@@ -4,17 +4,29 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const OPERATION: &str = "file.read_exact";
 const MAX_BYTES: u64 = 1024 * 1024;
+
+pub(crate) struct ExactRead {
+    pub value: Value,
+    pub resolved: PathBuf,
+}
+
+#[derive(Default)]
+pub(crate) struct ReadHooks {
+    #[cfg(test)]
+    pub mid_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
 
 pub(crate) fn read_exact(
     path: &Path,
     root: &Path,
     policy: &AccessPolicy,
-) -> Result<Value, ReadExactRefusal> {
-    read_with(path, root, policy, open_contents)
+    hooks: ReadHooks,
+) -> Result<ExactRead, ReadExactRefusal> {
+    read_with(path, root, policy, open_contents, hooks)
 }
 
 fn read_with(
@@ -22,7 +34,8 @@ fn read_with(
     root: &Path,
     policy: &AccessPolicy,
     open: impl FnOnce(&Path) -> io::Result<File>,
-) -> Result<Value, ReadExactRefusal> {
+    _hooks: ReadHooks,
+) -> Result<ExactRead, ReadExactRefusal> {
     let joined = root.join(path);
     let resolved = crate::inspect::job::normalize_path(&joined.canonicalize().map_err(open_error)?);
     let bind_root = crate::inspect::job::normalize_path(&root.canonicalize().map_err(open_error)?);
@@ -49,8 +62,36 @@ fn read_with(
     if metadata.len() > MAX_BYTES {
         return Err(ReadExactRefusal::TooLarge);
     }
+    #[cfg(test)]
+    let bytes = bounded_bytes(HookedRead {
+        file: &mut file,
+        hook: _hooks.mid_read,
+    })?;
+    #[cfg(not(test))]
     let bytes = bounded_bytes(&mut file)?;
-    Ok(encode_bytes(&bytes))
+    Ok(ExactRead {
+        value: encode_bytes(&bytes),
+        resolved,
+    })
+}
+
+#[cfg(test)]
+struct HookedRead<'a> {
+    file: &'a mut File,
+    hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(test)]
+impl Read for HookedRead<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.file.read(bytes)?;
+        if count > 0 {
+            if let Some(hook) = self.hook.take() {
+                hook();
+            }
+        }
+        Ok(count)
+    }
 }
 
 fn encode_bytes(bytes: &[u8]) -> Value {
@@ -154,6 +195,7 @@ fn handle_identity(file: &File) -> io::Result<(u64, u64)> {
 /// Stable module-operation refusals; messages deliberately omit paths and policy contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadExactRefusal {
+    BadRequest,
     AccessDenied,
     NotFound,
     NotRegular,
@@ -165,6 +207,7 @@ pub(crate) enum ReadExactRefusal {
 impl ReadExactRefusal {
     pub(crate) fn code(self) -> &'static str {
         match self {
+            Self::BadRequest => "file_read_exact_bad_request",
             Self::AccessDenied => "file_read_exact_access_denied",
             Self::NotFound => "file_read_exact_not_found",
             Self::NotRegular => "file_read_exact_not_regular",
@@ -176,6 +219,7 @@ impl ReadExactRefusal {
 
     pub(crate) fn message(self) -> String {
         match self {
+            Self::BadRequest => "Missing or invalid path.".into(),
             Self::AccessDenied => "Access denied by the parent head's policy.".into(),
             Self::NotFound => "File not found.".into(),
             Self::NotRegular => "Not a regular file.".into(),
@@ -198,6 +242,23 @@ impl ReadExactRefusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_exact(
+        path: &Path,
+        root: &Path,
+        policy: &AccessPolicy,
+    ) -> Result<Value, ReadExactRefusal> {
+        super::read_exact(path, root, policy, ReadHooks::default()).map(|read| read.value)
+    }
+
+    fn read_with(
+        path: &Path,
+        root: &Path,
+        policy: &AccessPolicy,
+        open: impl FnOnce(&Path) -> io::Result<File>,
+    ) -> Result<Value, ReadExactRefusal> {
+        super::read_with(path, root, policy, open, ReadHooks::default()).map(|read| read.value)
+    }
 
     fn fixture() -> (tempfile::TempDir, AccessPolicy) {
         let dir = tempfile::tempdir().unwrap();
@@ -528,6 +589,11 @@ mod tests {
     #[test]
     fn file_read_exact_refusal_contract() {
         for (refusal, code, message) in [
+            (
+                ReadExactRefusal::BadRequest,
+                "file_read_exact_bad_request",
+                "Missing or invalid path.",
+            ),
             (
                 ReadExactRefusal::AccessDenied,
                 "file_read_exact_access_denied",
