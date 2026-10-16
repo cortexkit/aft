@@ -297,9 +297,6 @@ function canonicalizeSchema(toolName: string, value: unknown): JsonValue {
     ) {
       required.add("path");
     }
-    if (bare === "zoom" && "path" in properties && "symbol" in properties) {
-      required.add("path");
-    }
     if (required.size > 0) result.required = sorted(required);
   }
   return Object.fromEntries(

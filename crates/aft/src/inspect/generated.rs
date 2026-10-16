@@ -1,6 +1,5 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{BufRead, BufReader};
 #[cfg(any(test, windows))]
 use std::path::PathBuf;
@@ -95,7 +94,7 @@ fn first_lines_have_generated_marker(path: &Path) -> bool {
     #[cfg(test)]
     bump_file_probe_count(path);
 
-    let Ok(file) = File::open(path) else {
+    let Ok(file) = crate::project_content::open(path) else {
         return false;
     };
     let reader = BufReader::new(file);

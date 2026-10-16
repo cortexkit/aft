@@ -1983,3 +1983,16 @@ describe("Hoisted bash registration follows only bash.background", () => {
     });
   }
 });
+
+test("V1 file tool descriptions match filePath headers and V2 projects path", () => {
+  const { tools } = createMockHoistedHarness(() => ({ success: true, text: "ok" }));
+  for (const name of ["read", "write", "edit"]) {
+    expect(tools[name].args.filePath).toBeDefined();
+    expect(tools[name].args.path).toBeUndefined();
+    expect(tools[name].description).toContain("filePath");
+    expect(tools[name].description).not.toContain('"path":');
+    const projected = projectV2Tool(name, tools[name], { directory: PROJECT_CWD });
+    expect(projected.description).not.toContain("filePath");
+    expect(projected.description).toContain("path");
+  }
+});

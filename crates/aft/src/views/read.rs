@@ -56,7 +56,7 @@ pub(crate) fn take_verification_io() -> VerificationIo {
 }
 
 fn read_verification_source(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-    let source = std::fs::read(path)?;
+    let source = crate::project_content::read(path)?;
     #[cfg(test)]
     VERIFICATION_IO.with(|io| {
         let mut count = io.get();

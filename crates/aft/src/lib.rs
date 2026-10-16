@@ -144,6 +144,7 @@ mod privacy_spawn;
 pub mod private_storage;
 pub mod process_io;
 pub(crate) mod production_storage;
+pub(crate) mod project_content;
 pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;

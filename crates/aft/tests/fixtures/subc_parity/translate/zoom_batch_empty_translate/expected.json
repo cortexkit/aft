@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "'batch' must be a non-empty array of {target, symbols}"
+  }
+}

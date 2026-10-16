@@ -259,7 +259,10 @@ pub(super) fn alfonso_worker(identity: &RouteIdentity) -> bool {
 /// retain compatibility behavior: an outside-root ask is treated as allow.
 pub(super) fn ask_route(identity: &RouteIdentity) -> crate::access_policy::AskRoute {
     if identity.scope.as_ref().is_some_and(alfonso) {
-        crate::access_policy::AskRoute::Consent { once: Vec::new() }
+        crate::access_policy::AskRoute::Consent {
+            once: Vec::new(),
+            worker: alfonso_worker(identity),
+        }
     } else {
         crate::access_policy::AskRoute::Lowered
     }

@@ -569,7 +569,7 @@ fn known_tool_translate_errors_surface_as_invalid_request() {
             "zoom-mutually-exclusive-targets",
             "zoom",
             json!({"filePath": "src/main.ts", "url": "https://example.com/doc", "symbols": "run"}),
-            "Provide exactly ONE of 'filePath' or 'url'",
+            "Conflicting 'filePath' location 'src/main.ts' and 'url' 'https://example.com/doc'",
         ),
         (
             "apply-patch-missing-patch-text",

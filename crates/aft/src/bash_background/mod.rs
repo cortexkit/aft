@@ -1132,13 +1132,15 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     let lookup = |name: &str| std::env::var_os(name);
     let fallback_home = std::env::home_dir();
     let current_dir = std::env::current_dir().ok();
-    storage_dir_from(
+    let root = storage_dir_from(
         configured,
         &lookup,
         StoragePlatform::current(),
         fallback_home.as_deref(),
         current_dir.as_deref(),
-    )
+    );
+    crate::project_content::register_storage_root(&root);
+    root
 }
 
 /// Resolve the current test environment's default, excluding AFT-specific

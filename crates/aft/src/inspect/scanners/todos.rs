@@ -502,7 +502,7 @@ fn read_text_file(path: &Path) -> (Option<FileFreshness>, Option<String>) {
     let metadata = std::fs::metadata(path).ok();
     #[cfg(debug_assertions)]
     bump_file_read_count(path);
-    let bytes = std::fs::read(path).ok();
+    let bytes = crate::project_content::read(path).ok();
     let freshness = metadata
         .as_ref()
         .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));

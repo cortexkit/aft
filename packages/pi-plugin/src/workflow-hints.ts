@@ -80,7 +80,7 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 
   if (hasOutline && hasZoom) {
     sections.push(
-      `**Web/URL access**: \`aft_outline({ target: "<url>" })\` first for structure, then \`aft_zoom({ url: "<url>", symbols: "<heading>" })\` for the specific section.`,
+      `**Web/URL access**: \`aft_outline({ target: "<url>" })\` first for structure, then \`aft_zoom({ batch: [{ target: "<url>", symbols: "<heading>" }] })\` for the specific section.`,
     );
   }
 

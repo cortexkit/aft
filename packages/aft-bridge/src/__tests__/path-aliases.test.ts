@@ -87,7 +87,7 @@ describe("canonical path alias preparation", () => {
       prepareCanonicalPathArguments("zoom", {
         targets: [{ filePath: "src/main.ts", symbol: "main" }],
       }),
-    ).toEqual({ targets: [{ path: "src/main.ts", symbol: "main" }] });
+    ).toEqual({ batch: [{ target: "src/main.ts", symbols: "main" }] });
     expect(
       prepareCanonicalPathArguments("callgraph", {
         path: "src/main.ts",
@@ -120,7 +120,7 @@ describe("canonical path alias preparation", () => {
   test("strips empty or null optional path sentinels as absent", () => {
     // Optional-path tools: an empty-string or null `path` is treated as not
     // supplied, so the prepared record carries no `path` key at all.
-    for (const tool of ["grep", "search", "conflicts", "zoom", "safety"]) {
+    for (const tool of ["grep", "search", "conflicts", "safety"]) {
       expect(prepareCanonicalPathArguments(tool, { path: "" })).toEqual({});
       expect(prepareCanonicalPathArguments(tool, { path: null })).toEqual({});
     }
@@ -134,7 +134,7 @@ describe("canonical path alias preparation", () => {
       }),
     ).toEqual({ path: "src/main.ts", op: "callers", symbol: "main" });
     // zoom's legacy optional `filePath` alias is stripped the same way.
-    expect(prepareCanonicalPathArguments("zoom", { filePath: "" })).toEqual({});
+    expectInvalid("zoom", { filePath: "" }, ["batch"]);
   });
 
   test("required tools report empty path as missing, not malformed", () => {
@@ -642,4 +642,37 @@ describe("edit boundary preparation", () => {
       ).toThrow("occurrence");
     }
   });
+});
+
+test("zoom normalizes canonical batch and all quiet aliases without mutating inputs", () => {
+  const batch = [
+    { target: "http_client.rs", symbols: ["client", "connect"] },
+    { target: "https://example.test/docs", symbols: "Overview" },
+  ];
+  expect(prepareCanonicalPathArguments("zoom", { batch })).toEqual({ batch });
+  for (const key of ["target", "path", "filePath", "url"]) {
+    const input = { [key]: "https://example.test/docs", symbols: "Overview" };
+    expect(prepareCanonicalPathArguments("zoom", input)).toEqual({
+      batch: [{ target: "https://example.test/docs", symbols: "Overview" }],
+    });
+    expect(input).toEqual({ [key]: "https://example.test/docs", symbols: "Overview" });
+    expect(
+      prepareCanonicalPathArguments("zoom", {
+        targets: [{ [key]: "https://example.test/docs", symbol: "Overview" }],
+      }),
+    ).toEqual({ batch: [{ target: "https://example.test/docs", symbols: "Overview" }] });
+  }
+});
+
+test("zoom refuses empty batch and names conflicting entry locations", () => {
+  expectInvalid("zoom", { batch: [] }, ["batch"]);
+  expectInvalid("zoom", { batch: [{ target: "a.rs", url: "b.rs", symbols: "main" }] }, [
+    "a.rs",
+    "b.rs",
+    "target",
+    "url",
+  ]);
+  expect(
+    prepareCanonicalPathArguments("zoom", { target: "a.rs", url: "a.rs", symbols: "main" }),
+  ).toEqual({ batch: [{ target: "a.rs", symbols: "main" }] });
 });

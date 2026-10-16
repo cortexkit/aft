@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "Conflicting 'batch[0].target' location 'a.ts' and 'batch[0].url' 'b.ts': provide the same location or only one target"
+  }
+}

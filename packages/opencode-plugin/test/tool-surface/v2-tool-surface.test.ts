@@ -188,7 +188,10 @@ describe("OpenCode V2 tool surface", () => {
     expect([...projected.keys()]).toEqual(Object.keys(definitions).map(v2HostToolName));
     for (const [name, definition] of Object.entries(definitions)) {
       const v2 = projected.get(v2HostToolName(name));
-      expect(v2?.description).toBe(renameV2ToolReferences(definition.description));
+      const description = ["read", "write", "edit"].includes(name)
+        ? definition.description.replaceAll("filePath", "path")
+        : definition.description;
+      expect(v2?.description).toBe(renameV2ToolReferences(description));
       expect(jsonSchema(v2 as V2ProviderTool)).toEqual(
         JSON.parse(
           renameV2ToolReferences(JSON.stringify(canonicalV1Schema(name, definition.args))),

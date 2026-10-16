@@ -416,6 +416,46 @@ pub fn open_connections(path: &Path) -> usize {
         .sum()
 }
 
+/// Cheap name check for project walkers whose roots are already canonical.
+pub(crate) fn is_registered_file_path(path: &Path) -> bool {
+    open_databases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .is_some_and(|database| !database.openers.is_empty())
+}
+
+/// Source readers must also reject aliases to live databases and their
+/// sidecars. `stat` inspects the inode without opening a descriptor, so it does
+/// not release SQLite's process-wide file locks.
+pub(crate) fn is_live_sqlite_file(path: &Path) -> bool {
+    let key = registry_key(path);
+    let identity = identity_of(&key);
+    let databases = open_databases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    databases.iter().any(|(registered, database)| {
+        if database.openers.is_empty() {
+            return false;
+        }
+        if registered == &key
+            || identity.is_some()
+                && database
+                    .openers
+                    .iter()
+                    .any(|opener| opener.identity == identity)
+        {
+            return true;
+        }
+        ["-wal", "-shm", "-journal"].iter().any(|suffix| {
+            let mut sidecar = registered.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let sidecar = PathBuf::from(sidecar);
+            sidecar == key || identity.is_some() && identity_of(&sidecar) == identity
+        })
+    })
+}
+
 /// Called under the filesystem gate before unlinking a whole cache directory.
 /// Consult the registry, not a pre-gate directory inventory: another opener may
 /// have created a new database after that inventory was collected.

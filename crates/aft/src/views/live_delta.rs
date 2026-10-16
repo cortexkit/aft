@@ -1,7 +1,6 @@
 //! Hash current checkout bytes and attach their trigrams to `snapshot::LiveDelta`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,7 +62,7 @@ pub fn strict_walk(root: &Path, policy: &TrigramPolicy, seq: u64) -> Walk {
             .strip_prefix(root)
             .ok()
             .and_then(|path| RelPath::from_os_path(path).ok());
-        match (relative, fs::read(path)) {
+        match (relative, crate::project_content::read(path)) {
             (Some(relative), Ok(bytes)) => {
                 walk.entries.insert(relative, entry(&bytes, policy, seq));
             }
@@ -117,8 +116,11 @@ pub fn apply_event(
         super::segment_store::rel_path_to_os(path)
             .map_err(|e| std::io::Error::other(e.to_string()))?,
     );
+    if crate::project_content::is_excluded(&absolute) {
+        return Ok(());
+    }
     let snapshot = delta.snapshot();
-    let observed = match fs::read(absolute) {
+    let observed = match crate::project_content::read(absolute) {
         Ok(bytes) => entry(&bytes, policy, delta.version() + 1),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             LiveEntry::new(DiskState::Absent, delta.version() + 1)

@@ -66,6 +66,100 @@ fn request(project: &Path, storage: &Path, head: &str, changed: &[String]) -> As
 }
 
 #[test]
+fn views_committed_sqlite_members_are_excluded_before_reading() {
+    let project = repository(1);
+    let root = project.path().canonicalize().unwrap();
+    fs::create_dir(root.join("fixtures")).unwrap();
+    for name in [
+        "example.db",
+        "example.sqlite",
+        "example.sqlite3",
+        "example.db-wal",
+        "example.db-shm",
+        "example.db-journal",
+    ] {
+        fs::write(root.join("fixtures").join(name), "not project source").unwrap();
+    }
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixtures",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let probe = crate::project_content::Probe::new(&root);
+    let report = publish_checkout(&request(&root, storage.path(), "fixtures", &[])).unwrap();
+    assert!(report.published);
+    let view = ViewStore::open(storage.path(), SCOPE).unwrap();
+    let manifest = view
+        .load_manifest(report.generation.as_deref().unwrap())
+        .unwrap();
+    let paths: Vec<_> = manifest
+        .entries()
+        .map(|(path, _)| path.as_bytes().to_vec())
+        .collect();
+    assert_eq!(paths, vec![b"file_0.ts".to_vec()]);
+    assert_eq!(probe.paths(), vec![root.join("file_0.ts")]);
+}
+
+#[test]
+fn views_newly_excluded_storage_members_are_not_reused() {
+    let project = repository(1);
+    let root = project.path().canonicalize().unwrap();
+    let internal = root.join("internal");
+    fs::create_dir(&internal).unwrap();
+    fs::write(
+        internal.join("generated.ts"),
+        "export function generated() {}\n",
+    )
+    .unwrap();
+    git(&root, &["add", "."]);
+    git(
+        &root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "generated",
+        ],
+    );
+    let storage = tempfile::tempdir().unwrap();
+    let initial =
+        publish_checkout(&request(&root, storage.path(), "before-exclusion", &[])).unwrap();
+    assert_eq!(initial.manifest.unwrap().entries().count(), 2);
+    crate::project_content::register_storage_root(&internal);
+    let probe = crate::project_content::Probe::new(&root);
+    let report = publish_checkout(&request(
+        &root,
+        storage.path(),
+        "after-exclusion",
+        &["file_0.ts".into()],
+    ))
+    .unwrap();
+    assert!(report.published);
+    let paths: Vec<_> = report
+        .manifest
+        .unwrap()
+        .entries()
+        .map(|(path, _)| path.as_bytes().to_vec())
+        .collect();
+    assert_eq!(paths, vec![b"file_0.ts".to_vec()]);
+    assert_eq!(probe.paths(), vec![root.join("file_0.ts")]);
+}
+
+#[test]
 fn empty_desired_head_does_not_take_the_no_op_path() {
     let project = repository(2);
     let storage = tempfile::tempdir().unwrap();

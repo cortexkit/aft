@@ -45,17 +45,20 @@ pub(crate) fn current_scope() -> Option<crate::db::access_grants::ScopeKey> {
 /// Who answers an `ask` decision for the call running on this thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AskRoute {
-    /// `ask` is treated as allow. Standalone calls and stamped Alfonso heads
-    /// use this route: standalone calls have no Cingulate to ask, and a head
-    /// has no full-access setting yet to opt out of blocking on every outside
-    /// path. Restricted configurations turn outside paths into deny, so they
-    /// never reach an `ask`.
+    /// `ask` is treated as allow for standalone or unattested calls, which
+    /// have no Cingulate consent route. Restricted configurations turn outside
+    /// paths into deny, so they never reach an `ask`.
     #[default]
     Lowered,
-    /// A stamped Alfonso worker: an `ask` refuses with `access_ask_required`
-    /// so the subc layer can put the question to Cingulate. `once` holds the
-    /// capabilities an `allow_once` answer approved for this one dispatch.
-    Consent { once: Vec<AccessGrant> },
+    /// An attested agent scope: an `ask` refuses with `access_ask_required`
+    /// so tool-provider dispatch can ask the Cingulate consent service. `once`
+    /// holds the capabilities approved by `allow_once` for this dispatch.
+    Consent {
+        once: Vec<AccessGrant>,
+        /// Enables missing-path suggestions and filesystem-root refusals for
+        /// workers only. Primary agents in ask mode also use consent.
+        worker: bool,
+    },
 }
 
 /// Internal refusal code for an `ask` that must go to Cingulate. The subc

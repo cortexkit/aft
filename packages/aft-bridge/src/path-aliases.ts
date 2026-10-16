@@ -6,6 +6,7 @@
  * or resolve paths before comparing the two spellings.
  */
 
+import { coerceJsonCollectionParam, isBlankParam, usableZoomTargets } from "./coerce.js";
 import { AftToolError } from "./error-contract.js";
 
 export type CanonicalPathTool =
@@ -128,48 +129,76 @@ function validateOptionalCanonicalPath(record: Record<string, unknown>, property
   pathValue(record, property);
 }
 
-function normalizeZoomTargets(record: Record<string, unknown>): void {
-  if (!hasOwn(record, "targets")) return;
-  const targets = record.targets;
-  const normalizeTarget = (target: unknown, index: number): Record<string, unknown> => {
-    if (!target || typeof target !== "object" || Array.isArray(target)) {
-      throw new InvalidRequestError(`'targets[${index}].path' must be a non-empty string`);
+function normalizeZoomLocation(record: Record<string, unknown>, prefix = ""): void {
+  let first: { key: string; value: string } | undefined;
+  for (const key of ["target", "path", "filePath", "url"]) {
+    const value = record[key];
+    if (value === undefined || value === null || (typeof value === "string" && !value.trim())) {
+      delete record[key];
+      continue;
     }
-    const source = target as Record<string, unknown>;
-    // Models that fill every declared property serialize an omitted target as
-    // an entry whose path and symbol are all blank. Preserve that placeholder
-    // untouched so the tool can drop it. An entry with only a symbol (or only
-    // a path) is not refused here either: the server reports it as its own
-    // per-target error line and still answers the rest of the batch.
-    const blank = (value: unknown) =>
-      value === undefined || value === null || (typeof value === "string" && !value.trim());
-    const emptyTarget = blank(source.symbol) && blank(source.path) && blank(source.filePath);
-    if (emptyTarget) return { ...source };
-    const normalized = { ...source };
-    try {
-      normalizeAliasPair(normalized, "path", "filePath", false);
-    } catch (error) {
-      if (error instanceof InvalidRequestError) {
+    const location = pathValue(record, key);
+    if (first && first.value !== location) {
+      throw new InvalidRequestError(
+        `Conflicting '${prefix}${first.key}' location '${first.value}' and '${prefix}${key}' '${location}': provide the same location or only one target`,
+      );
+    }
+    first ??= { key, value: location };
+  }
+  for (const alias of ["path", "filePath", "url"]) delete record[alias];
+  if (first) record.target = first.value;
+}
+
+function normalizeZoomTargets(record: Record<string, unknown>): void {
+  const normalizeEntry = (value: unknown, prefix: string): Record<string, unknown> => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new InvalidRequestError(`'${prefix}target' must be a non-empty string`);
+    }
+    const entry = { ...(value as Record<string, unknown>) };
+    normalizeZoomLocation(entry, prefix);
+    if (hasOwn(entry, "symbol")) {
+      if (
+        !isBlankParam(entry.symbols) &&
+        JSON.stringify(entry.symbols) !== JSON.stringify(entry.symbol)
+      ) {
         throw new InvalidRequestError(
-          error.message
-            .replace("'filePath'", `'targets[${index}].filePath'`)
-            .replace("'path'", `'targets[${index}].path'`),
+          `Conflicting '${prefix}symbols' and '${prefix}symbol': provide the same symbols or only one spelling`,
         );
       }
-      throw error;
+      if (isBlankParam(entry.symbols)) entry.symbols = entry.symbol;
+      delete entry.symbol;
     }
-    return normalized;
+    entry.target ??= "";
+    entry.symbols ??= "";
+    return entry;
   };
-
-  if (Array.isArray(targets)) {
-    if (targets.length === 0) return;
-    record.targets = targets.map(normalizeTarget);
-    return;
+  const batch: Record<string, unknown>[] = [];
+  if (hasOwn(record, "batch")) {
+    const entries = coerceJsonCollectionParam(record.batch, "batch");
+    if (!Array.isArray(entries) || entries.length === 0) {
+      throw new InvalidRequestError("'batch' must be a non-empty array of {target, symbols}");
+    }
+    batch.push(...entries.map((entry, index) => normalizeEntry(entry, `batch[${index}].`)));
   }
-
-  if (targets && typeof targets === "object") {
-    record.targets = normalizeTarget(targets, 0);
+  normalizeZoomLocation(record);
+  if (!isBlankParam(record.target) || !isBlankParam(record.symbols)) {
+    const entry: Record<string, unknown> = {};
+    if (record.target !== undefined) entry.target = record.target;
+    if (record.symbols !== undefined) entry.symbols = record.symbols;
+    batch.unshift(normalizeEntry(entry, ""));
   }
+  if (hasOwn(record, "targets")) {
+    const targets = coerceJsonCollectionParam(record.targets, "targets");
+    batch.push(
+      ...usableZoomTargets(targets).map((entry, index) =>
+        normalizeEntry(entry, `targets[${index}].`),
+      ),
+    );
+  }
+  for (const key of ["target", "symbols", "targets"]) delete record[key];
+  if (!batch.length)
+    throw new InvalidRequestError("'batch' must be a non-empty array of {target, symbols}");
+  record.batch = batch;
 }
 
 function bareToolName(toolName: string): CanonicalPathTool | undefined {
@@ -196,7 +225,7 @@ function bareToolName(toolName: string): CanonicalPathTool | undefined {
 /**
  * Prepare raw arguments for one registered tool before schema validation.
  *
- * The returned object is a fresh object, and nested zoom targets are copied,
+ * The returned object is a fresh object, and nested zoom batch entries are copied,
  * so an alias conflict or invalid value cannot partially mutate caller state.
  */
 export function prepareCanonicalPathArguments(
@@ -221,7 +250,6 @@ export function prepareCanonicalPathArguments(
       normalizeAliasPair(record, "path", "filePath", true);
       break;
     case "zoom":
-      normalizeAliasPair(record, "path", "filePath", false);
       normalizeZoomTargets(record);
       break;
     case "callgraph":

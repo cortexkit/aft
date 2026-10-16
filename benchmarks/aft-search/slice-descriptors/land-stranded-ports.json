@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "The ranking-fenced changes only route worker path validation through the shared checkout guidance gate, exclude AFT storage and SQLite sets from project-source admission, and regenerate the batch-only zoom tool schema. Storage exclusion prevents source readers from closing live SQLite sidecar descriptors and releasing SQLite process locks. Search scoring, routing and fusion are unchanged; benchmark rows must remain byte-identical. This single descriptor covers land/stranded-ports and replaces the original did-you-mean and SQLite-exclude train descriptors."
+}

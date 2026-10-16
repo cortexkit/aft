@@ -198,7 +198,7 @@ fn handle_outline_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             return Response::error(
                 &req.id,
                 "invalid_request",
-                "outline: missing required param 'file', 'files', or 'directory'",
+                "outline: missing required param 'target'",
             );
         }
     };

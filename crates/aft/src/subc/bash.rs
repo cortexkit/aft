@@ -2759,7 +2759,10 @@ mod grant_path_tests {
             let (touch, _touch_rx) = mpsc::channel(8);
             {
                 let _route = crate::access_policy::ask_route_guard(Some(
-                    crate::access_policy::AskRoute::Consent { once: Vec::new() },
+                    crate::access_policy::AskRoute::Consent {
+                        once: Vec::new(),
+                        worker: true,
+                    },
                 ));
                 submit_deferred_bash(
                     &executor,

@@ -1,0 +1,13 @@
+{
+  "agent_args": {
+    "batch": [
+      {
+        "symbols": "run",
+        "target": "a.ts",
+        "url": "b.ts"
+      }
+    ]
+  },
+  "project_root": "<PROJECT_ROOT>",
+  "tool_name": "zoom"
+}

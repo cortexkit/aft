@@ -4030,6 +4030,9 @@ fn read_search_corpus_file_inner(
     max_file_size: u64,
     classify_generated: bool,
 ) -> SearchCorpusEligibility {
+    if crate::project_content::is_excluded(path) {
+        return SearchCorpusEligibility::Skipped;
+    }
     #[cfg(test)]
     AUDIT_IO_PROBE.with(|probe| {
         if let Some(probe) = probe.borrow_mut().as_mut() {
@@ -4052,7 +4055,7 @@ fn read_search_corpus_file_inner(
         Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
-    let read = File::open(path).and_then(|file| {
+    let read = crate::project_content::open(path).and_then(|file| {
         file.take(max_file_size.saturating_add(1))
             .read_to_end(&mut bytes)
     });
@@ -5766,6 +5769,9 @@ pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     // the daemon, so never open directories outside this walk root's filesystem.
     builder.same_file_system(true).hidden(false);
     crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(|entry| {
+        if crate::project_content::is_excluded(entry.path()) {
+            return false;
+        }
         let name = entry.file_name().to_string_lossy();
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             return !matches!(
@@ -8046,6 +8052,54 @@ pub(crate) fn audit_work() -> AuditWork {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_and_sqlite_files_never_reach_corpus_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let storage = root.join("task-storage");
+        fs::create_dir_all(storage.join("nested")).unwrap();
+        {
+            let _env = crate::test_env::without_storage_override();
+            assert_eq!(crate::bash_background::storage_dir(Some(&storage)), storage);
+        }
+        fs::write(root.join("source.rs"), "fn user_source() {}\n").unwrap();
+        for path in [
+            storage.join("aft.db"),
+            storage.join("aft.db-wal"),
+            storage.join("aft.db-shm"),
+            storage.join("nested/internal.rs"),
+            root.join("other.sqlite"),
+            root.join("other.sqlite-wal"),
+            root.join("other.sqlite-shm"),
+        ] {
+            fs::write(path, "must not open this as project content\n").unwrap();
+        }
+        let probe = crate::project_content::Probe::new(&root);
+        let index = SearchIndex::build_with_limit(&root, DEFAULT_MAX_FILE_SIZE);
+        let opened = probe.paths();
+        assert!(
+            opened.contains(&root.join("source.rs")),
+            "source was not indexed: {opened:?}"
+        );
+        assert!(
+            opened.iter().all(|path| path == &root.join("source.rs")),
+            "indexer opened storage or SQLite files: {opened:?}"
+        );
+        drop(index);
+        for path in [
+            storage.join("aft.db-shm"),
+            storage.join("nested/internal.rs"),
+        ] {
+            audit_work_reset();
+            let _ = read_search_corpus_file(&path, DEFAULT_MAX_FILE_SIZE);
+            assert_eq!(
+                audit_work().corpus_opens,
+                0,
+                "direct corpus read opened {path:?}"
+            );
+        }
+    }
+
     #[test]
     fn perf_audit_empty_filters_skip_path_keys() {
         let root = Path::new("/project");

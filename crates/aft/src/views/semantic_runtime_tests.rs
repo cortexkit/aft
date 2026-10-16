@@ -1252,26 +1252,28 @@ fn fifth_small_fill_waits_for_preparation_capacity_and_stays_pending() {
         .all(|(_, runtime)| query(runtime, "small").complete()));
 }
 
-/// A real HTTP backend, initially refusing connections, with counts separated
-/// into identity probes and source texts. Binding is delayed until the test
-/// has observed the worker's first failure.
+/// A real HTTP backend whose loopback port stays reserved before and between
+/// listens. Offline requests fail immediately, with counts separated into
+/// identity probes and source texts.
 struct RecoveringBackend {
     addr: std::net::SocketAddr,
+    socket: Option<tokio::net::TcpSocket>,
     probes: Arc<AtomicUsize>,
     texts: Arc<AtomicUsize>,
+    status: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RecoveringBackend {
     fn offline() -> Self {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let (socket, addr) = crate::semantic_index::reserved_refused_backend_for_test();
         Self {
             addr,
+            socket: Some(socket),
             probes: Arc::new(AtomicUsize::new(0)),
             texts: Arc::new(AtomicUsize::new(0)),
+            status: Arc::new(AtomicUsize::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
@@ -1289,15 +1291,45 @@ impl RecoveringBackend {
 
     fn start(&mut self, status: u16) {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind(self.addr).unwrap();
-        self.stop.store(false, Ordering::SeqCst);
+        self.status.store(usize::from(status), Ordering::SeqCst);
+        if self.worker.is_some() {
+            return;
+        }
+        let listener = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap()
+            .block_on(async {
+                self.socket
+                    .take()
+                    .expect("reserved backend socket")
+                    .listen(128)?
+                    .into_std()
+            })
+            .unwrap();
+        listener.set_nonblocking(true).unwrap();
         let probes = Arc::clone(&self.probes);
         let texts = Arc::clone(&self.texts);
+        let status = Arc::clone(&self.status);
         let stop = Arc::clone(&self.stop);
         self.worker = Some(std::thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
+            while !stop.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept test backend connection: {error}"),
+                };
                 if stop.load(Ordering::SeqCst) {
                     break;
+                }
+                let response_status = status.load(Ordering::SeqCst) as u16;
+                if response_status == 0 {
+                    // Keep the port reserved between retries, but close requests
+                    // immediately while the test backend is offline.
+                    continue;
                 }
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1338,29 +1370,58 @@ impl RecoveringBackend {
                         serde_json::json!({"index": index, "embedding": vector(text)})
                     })
                     .collect();
-                let body = if status == 200 {
+                let body = if response_status == 200 {
                     serde_json::json!({"data": data}).to_string()
                 } else {
                     "wrong model".to_string()
                 };
-                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                write!(stream, "HTTP/1.1 {response_status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         }));
     }
 
     fn shutdown(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = std::net::TcpStream::connect(self.addr);
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
-        }
+        self.status.store(0, Ordering::SeqCst);
     }
 }
 
 impl Drop for RecoveringBackend {
     fn drop(&mut self) {
         self.shutdown();
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
     }
+}
+
+#[test]
+fn offline_backend_port_cannot_be_stolen_before_start() {
+    let mut backend = RecoveringBackend::offline();
+    let refusal = std::net::TcpStream::connect(backend.addr).unwrap_err();
+    assert_eq!(refusal.kind(), std::io::ErrorKind::ConnectionRefused);
+    let stolen = std::net::TcpListener::bind(backend.addr);
+    if let Ok(stolen) = stolen {
+        let start = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.start(503);
+        }));
+        drop(stolen);
+        let panic = start.expect_err("a competing listener must block backend startup");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("AddrInUse"),
+            "unexpected startup panic: {message}"
+        );
+        panic!("the offline backend port was stolen before start");
+    }
+    let error = stolen.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+    backend.start(503);
+    backend.shutdown();
 }
 
 #[test]

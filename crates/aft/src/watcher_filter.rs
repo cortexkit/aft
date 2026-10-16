@@ -262,7 +262,7 @@ pub fn watcher_event_invalidates(kind: &notify::EventKind) -> bool {
 pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
     // Operating-system metadata files (a Finder `.DS_Store` rewrite, say) are
     // never indexed by the project walks, so their events carry no change.
-    if crate::os_metadata::is_os_metadata_path(path) {
+    if crate::project_content::is_excluded(path) {
         return true;
     }
     path.components().any(|c| {
@@ -274,8 +274,10 @@ pub fn watcher_path_is_infra_skip(path: &Path) -> bool {
 }
 
 pub(crate) fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root)
-        .is_ok_and(watcher_path_is_infra_skip)
+    crate::project_content::is_excluded(path)
+        || path
+            .strip_prefix(root)
+            .is_ok_and(watcher_path_is_infra_skip)
 }
 
 /// High-churn ignored directories that can be dropped from the raw event stream

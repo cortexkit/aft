@@ -91,6 +91,164 @@ fn configure_with_storage(project: &Path, storage: &Path) -> AftProcess {
     aft
 }
 
+fn translated_zoom(
+    aft: &mut AftProcess,
+    project: &Path,
+    args: serde_json::Value,
+) -> serde_json::Value {
+    let translated = aft::subc_translate::subc_translate("zoom", &args, project).unwrap();
+    let mut request = translated.args;
+    request.insert("id".into(), json!("translated-zoom"));
+    request.insert("command".into(), json!(translated.command));
+    // Enable private-address access for this test request so it can reach
+    // the loopback fixture server.
+    request.insert("allow_private".into(), json!(true));
+    aft.send(&serde_json::Value::Object(request).to_string())
+}
+
+#[test]
+fn translated_zoom_http_path_fetches_local_heading() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |path, stream| {
+        assert_eq!(path, "/docs/extension-authoring");
+        write_response(
+            stream,
+            "200 OK",
+            "text/markdown",
+            b"# Extension authoring\n\n## Public extension interfaces\n\nAn extension exports its public API.\n",
+        );
+    });
+    let url = server.url("/docs/extension-authoring");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    for key in ["target", "path", "filePath", "url"] {
+        let response = translated_zoom(
+            &mut aft,
+            project.path(),
+            json!({ key: url, "symbols": "Public extension interfaces" }),
+        );
+        assert_eq!(response["success"], true, "{key}: {response:#}");
+        assert!(
+            response["targets"][0]["response"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("An extension exports its public API."),
+            "{key}: {response:#}"
+        );
+    }
+    assert!(cache_content_path_for_url(storage.path(), &url, ".md").exists());
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn translated_zoom_http_symbol_strings_expand_after_download() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/plain",
+            b"pub fn alpha() {}\npub fn beta() {}\n",
+        );
+    });
+    let url = server.url("/source.rs");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    for (args, expected) in [
+        (
+            json!({"batch": [{"target": url, "symbols": "alpha, beta"}]}),
+            vec!["alpha", "beta"],
+        ),
+        (
+            json!({"url": url, "symbols": "alpha, beta"}),
+            vec!["alpha", "beta"],
+        ),
+        (
+            json!({"targets": [{"path": url, "symbols": "- `alpha` — fn (lines 1-1)"}]}),
+            vec!["alpha"],
+        ),
+    ] {
+        let response = translated_zoom(&mut aft, project.path(), args);
+        assert_eq!(response["success"], true, "{response:#}");
+        let targets = response["targets"].as_array().unwrap();
+        let names: Vec<_> = targets
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, expected);
+        for target in targets {
+            assert_eq!(target["response"]["success"], true, "{response:#}");
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn translated_zoom_http_targets_fetch_local_heading() {
+    let project = TempDir::new().unwrap();
+    let storage = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("http_client.rs"),
+        "pub fn client() {}\n",
+    )
+    .unwrap();
+    let server = spawn_mock_server(1, |_path, stream| {
+        write_response(
+            stream,
+            "200 OK",
+            "text/markdown",
+            b"# Guide\n\n## Public extension interfaces\n\nThe public API is documented here.\n",
+        );
+    });
+    let url = server.url("/guide.md");
+    let mut aft = configure_with_storage(project.path(), storage.path());
+    let response = translated_zoom(
+        &mut aft,
+        project.path(),
+        json!({
+            "path": url,
+            "url": url,
+            "symbols": "Public extension interfaces",
+            "batch": [
+                { "target": url, "symbols": "Public extension interfaces" },
+                { "target": "http_client.rs", "symbols": "client" }
+            ],
+            "targets": [
+                { "path": url, "symbol": "Public extension interfaces" },
+                { "filePath": url, "url": url, "symbol": "Public extension interfaces" },
+                { "path": "http_client.rs", "symbol": "client" }
+            ]
+        }),
+    );
+    assert_eq!(response["success"], true, "{response:#}");
+    let targets = response["targets"].as_array().expect("batch results");
+    assert!(
+        targets
+            .iter()
+            .all(|target| target["response"]["success"] == true),
+        "{response:#}"
+    );
+    assert_eq!(targets.len(), 6, "{response:#}");
+    for index in [0, 1, 3, 4] {
+        let target = &targets[index];
+        assert!(
+            target["response"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("The public API is documented here."),
+            "{response:#}"
+        );
+    }
+    assert!(
+        targets[5]["response"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pub fn client()"),
+        "{response:#}"
+    );
+    assert!(aft.shutdown().success());
+}
+
 const DOCUSAURUS_HTML: &str = r##"<!doctype html>
 <html>
 <head>

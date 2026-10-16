@@ -1,0 +1,25 @@
+{
+  "args": {
+    "callgraph": true,
+    "context_lines": 2,
+    "targets": [
+      {
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "symbol": "run",
+        "target_label": "src/main.ts"
+      },
+      {
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "symbol": "missing",
+        "target_label": "src/main.ts"
+      },
+      {
+        "file": "https://example.test/docs",
+        "parse_symbols": true,
+        "symbol": "Overview",
+        "target_label": "https://example.test/docs"
+      }
+    ]
+  },
+  "command": "zoom"
+}

@@ -433,10 +433,7 @@ fn belongs_to_child(child: &Child, path: &Path) -> bool {
     }) {
         return false;
     }
-    if path
-        .file_name()
-        .is_some_and(crate::os_metadata::is_os_metadata_file_name)
-    {
+    if crate::project_content::is_excluded(path) {
         return false;
     }
     let mut directories = path

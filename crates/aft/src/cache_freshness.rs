@@ -106,7 +106,7 @@ pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blak
             }
         }
     }
-    fs::read(path).map(|bytes| Some(hash_bytes(&bytes)))
+    crate::project_content::read(path).map(|bytes| Some(hash_bytes(&bytes)))
 }
 
 pub fn metadata_matches(path: &Path, cached: &FileFreshness) -> std::io::Result<bool> {

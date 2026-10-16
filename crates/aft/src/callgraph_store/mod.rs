@@ -9627,7 +9627,7 @@ fn symbol_query_matches(symbol: &str, query: &str) -> bool {
 }
 
 fn read_trimmed_source_lines(path: &Path) -> Option<Vec<String>> {
-    let source = std::fs::read_to_string(path).ok()?;
+    let source = crate::project_content::read_to_string(path).ok()?;
     Some(source.lines().map(|line| line.trim().to_string()).collect())
 }
 
@@ -11177,7 +11177,7 @@ fn staged_content_matches(conn: &Connection, project_root: &Path, path: &Path) -
     };
     #[cfg(test)]
     work_counts::note_staging_read(path);
-    let Ok(source) = std::fs::read_to_string(path) else {
+    let Ok(source) = crate::project_content::read_to_string(path) else {
         return Ok(false);
     };
     let Ok(freshness) = collect_source_freshness(path, &source) else {
@@ -12847,7 +12847,7 @@ fn build_file_extract_with_memo(
     let rel_path = relative_path(project_root, &abs_path);
     #[cfg(test)]
     work_counts::note_parse(&abs_path);
-    let source = std::fs::read_to_string(&abs_path)?;
+    let source = crate::project_content::read_to_string(&abs_path)?;
     let freshness = collect_source_freshness(&abs_path, &source)?;
     let mut data = callgraph::build_file_data_from_source(&abs_path, &source)?;
     let lang = data.lang;
@@ -13306,7 +13306,7 @@ fn rust_declared_module_targets(
     facts: &FactPaths<'_>,
 ) -> HashMap<String, Option<String>> {
     let declaring_file = project_root.join(caller_file);
-    let Ok(source) = std::fs::read_to_string(&declaring_file) else {
+    let Ok(source) = crate::project_content::read_to_string(&declaring_file) else {
         return HashMap::new();
     };
     let Ok(tree) = parse_source_with_cached_parser(&declaring_file, &source, LangId::Rust) else {
@@ -17563,7 +17563,7 @@ fn parse_dispatch_source(
     caller_file: &str,
     lang: LangId,
 ) -> Option<ParsedDispatchSource> {
-    let source = std::fs::read_to_string(project_root.join(caller_file)).ok()?;
+    let source = crate::project_content::read_to_string(project_root.join(caller_file)).ok()?;
     let grammar = crate::parser::grammar_for(lang);
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&grammar).ok()?;
@@ -21757,7 +21757,7 @@ impl CorpusFingerprint {
             hasher.update(&sum.to_le_bytes());
         }
         let ignore_rules = project_root.join(".gitignore");
-        if let Ok(contents) = std::fs::read(ignore_rules) {
+        if let Ok(contents) = crate::project_content::read(ignore_rules) {
             hasher.update(b".gitignore\0");
             hasher.update(blake3::hash(&contents).as_bytes());
         }
@@ -21766,7 +21766,7 @@ impl CorpusFingerprint {
 }
 
 fn hash_file_bounded(path: &Path) -> std::io::Result<blake3::Hash> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::project_content::open(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {

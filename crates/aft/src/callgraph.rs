@@ -1364,9 +1364,10 @@ pub(crate) fn build_file_data(path: &Path) -> Result<FileCallData, AftError> {
         message: format!("unsupported file for call graph: {}", path.display()),
     })?;
 
-    let source = std::fs::read_to_string(path).map_err(|e| AftError::FileNotFound {
-        path: format!("{}: {}", path.display(), e),
-    })?;
+    let source =
+        crate::project_content::read_to_string(path).map_err(|e| AftError::FileNotFound {
+            path: format!("{}: {}", path.display(), e),
+        })?;
 
     build_file_data_from_source_with_lang(path, &source, lang)
 }
@@ -2548,7 +2549,7 @@ fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
 }
 
 fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
-    let source = std::fs::read_to_string(path).ok()?;
+    let source = crate::project_content::read_to_string(path).ok()?;
     toml::from_str(&source).ok()
 }
 
@@ -3589,7 +3590,7 @@ where
         return None;
     }
 
-    let source = std::fs::read_to_string(&canon).ok()?;
+    let source = crate::project_content::read_to_string(&canon).ok()?;
     let lang = detect_language(&canon)?;
     if !matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         if symbol_name == "default" {
@@ -3869,7 +3870,7 @@ fn walk_project_files_filtered(
                                                  // .git/info/exclude and .aftignore (e.g. submodules).
     let walker = crate::context::apply_project_ignore_rules(&mut builder, root)
         .filter_entry(move |entry| {
-            if !include(entry.path()) {
+            if crate::project_content::is_excluded(entry.path()) || !include(entry.path()) {
                 return false;
             }
             let name = entry.file_name().to_string_lossy();

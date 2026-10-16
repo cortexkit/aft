@@ -157,7 +157,7 @@ fn freshness_from_metadata(metadata: &fs::Metadata, bytes: Option<&[u8]>) -> Fil
 fn read_file_bytes(path: &Path) -> Option<Vec<u8>> {
     #[cfg(debug_assertions)]
     bump_file_read_count(path);
-    fs::read(path).ok()
+    crate::project_content::read(path).ok()
 }
 
 fn cached_symbol_count(path: &Path, job: &crate::inspect::InspectJob) -> usize {

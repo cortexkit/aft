@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "6bd3ecb58570fc22269b8c801b31515dd53bcd38fa0797f97fbce71d186121a6",
-      "catalog_digest": "6bd3ecb58570fc22269b8c801b31515dd53bcd38fa0797f97fbce71d186121a6",
+      "generation": "86f04fa5bdc78e754fbf68e29abf33b6d5e9db7e524a66228605f874c90cf89a",
+      "catalog_digest": "86f04fa5bdc78e754fbf68e29abf33b6d5e9db7e524a66228605f874c90cf89a",
       "tools": [
         {
           "name": "status",
@@ -125,7 +125,7 @@
           "capabilities": [
             "code.read/v1"
           ],
-          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -175,7 +175,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `filePath` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -206,7 +206,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -465,7 +465,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -475,86 +475,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -1264,8 +1235,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "01e2491d455b15b0b23bf00f992e677c25e18be3270c83f88ab09392ed92caed",
-      "catalog_digest": "01e2491d455b15b0b23bf00f992e677c25e18be3270c83f88ab09392ed92caed",
+      "generation": "46a1d0b0b51f5c70c31698097b9ddeb63d141c1b5a780880ef6b2e02683f3ed8",
+      "catalog_digest": "46a1d0b0b51f5c70c31698097b9ddeb63d141c1b5a780880ef6b2e02683f3ed8",
       "tools": [
         {
           "name": "status",
@@ -1452,7 +1423,7 @@
           "capabilities": [
             "code.read/v1"
           ],
-          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1502,7 +1473,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `filePath` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1533,7 +1504,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -1792,7 +1763,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -1802,86 +1773,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -2592,8 +2534,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1ef3eaff895e258779ed6bc1bd22c1adeca82b68e26a9631a60b6be276baf2ee",
-      "catalog_digest": "1ef3eaff895e258779ed6bc1bd22c1adeca82b68e26a9631a60b6be276baf2ee",
+      "generation": "27431dc906d69be3c5150db64908ae1c8461c927bef968c9787e7fd793f2ad59",
+      "catalog_digest": "27431dc906d69be3c5150db64908ae1c8461c927bef968c9787e7fd793f2ad59",
       "tools": [
         {
           "name": "read",
@@ -2611,7 +2553,7 @@
           "capabilities": [
             "code.read/v1"
           ],
-          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2812,7 +2754,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2822,86 +2764,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -3066,8 +2979,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "1ef3eaff895e258779ed6bc1bd22c1adeca82b68e26a9631a60b6be276baf2ee",
-      "catalog_digest": "1ef3eaff895e258779ed6bc1bd22c1adeca82b68e26a9631a60b6be276baf2ee",
+      "generation": "27431dc906d69be3c5150db64908ae1c8461c927bef968c9787e7fd793f2ad59",
+      "catalog_digest": "27431dc906d69be3c5150db64908ae1c8461c927bef968c9787e7fd793f2ad59",
       "tools": [
         {
           "name": "read",
@@ -3085,7 +2998,7 @@
           "capabilities": [
             "code.read/v1"
           ],
-          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3286,7 +3199,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -3296,86 +3209,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -3541,8 +3425,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "2d83a4e96e00854c1456232c15c4e29c5b9d8ec760c65f2d4b4427ef9b805be6",
-      "catalog_digest": "2d83a4e96e00854c1456232c15c4e29c5b9d8ec760c65f2d4b4427ef9b805be6",
+      "generation": "bfe0e8eb5a3834e6f11b21518058754450a7ac31926e0aff77c1597ad7339b5f",
+      "catalog_digest": "bfe0e8eb5a3834e6f11b21518058754450a7ac31926e0aff77c1597ad7339b5f",
       "tools": [
         {
           "name": "status",
@@ -3660,7 +3544,7 @@
           "capabilities": [
             "code.read/v1"
           ],
-          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3710,7 +3594,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `filePath` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -3741,7 +3625,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4000,7 +3884,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -4010,86 +3894,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {
@@ -4800,8 +4655,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "ce7cde40779e4da162ac3c023907ca4cee3ff2c0d2e5f8c3f1f2d9942bc093a2",
-      "catalog_digest": "ce7cde40779e4da162ac3c023907ca4cee3ff2c0d2e5f8c3f1f2d9942bc093a2",
+      "generation": "5e2a0655bef71a36bfcd49332bc0c5f3c09a1b137f9ddf483b46b37a9e7a6cd2",
+      "catalog_digest": "5e2a0655bef71a36bfcd49332bc0c5f3c09a1b137f9ddf483b46b37a9e7a6cd2",
       "tools": [
         {
           "name": "status",
@@ -4992,7 +4847,7 @@
           "capabilities": [
             "code.read/v1"
           ],
-          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"path\": \"src/app.ts\" }\n  Read lines 50-100: { \"path\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"path\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"path\": \"src/\" }\n",
+          "description": "Read file contents or list directory entries.\n\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\n\nBehavior:\n- Returns line-numbered content (e.g., \"1: const x = 1\")\n- Lines longer than 2000 characters are truncated\n- Output capped at 50KB\n- Binary files are auto-detected and return a size-only message\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\n\nExamples:\n  Read full file: { \"filePath\": \"src/app.ts\" }\n  Read lines 50-100: { \"filePath\": \"src/app.ts\", \"startLine\": 50, \"endLine\": 100 }\n  Read 30 lines from line 200: { \"filePath\": \"src/app.ts\", \"offset\": 200, \"limit\": 30 }\n  List directory: { \"filePath\": \"src/\" }\n",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5042,7 +4897,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Write content to a file, creating it and parent directories automatically. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
+          "description": "Write content to a file, creating it and parent directories automatically. Use `filePath` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5073,7 +4928,7 @@
           "capabilities": [
             "code.edit/v1"
           ],
-          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+          "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `filePath` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"filePath\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `filePath` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"filePath\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5332,7 +5187,7 @@
         },
         {
           "name": "zoom",
-          "schema_digest": "9b66f99ea854116cbd7d980e090b90e1a70ae11a00318340d888ab94112fa2ec",
+          "schema_digest": "0c709b2d562766296a0e4601b4a16304488d2ffff6e8ac4ccfc4b68e1fe9be39",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5342,86 +5197,57 @@
           "capabilities": [
             "code.outline/v1"
           ],
-          "description": "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line.",
+          "description": "Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: \"src/app.ts\", symbols: \"run\" }, { target: \"https://example.com/docs\", symbols: \"Overview\" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
             "properties": {
-              "path": {
-                "description": "Path to file (absolute or relative to project root)",
-                "type": "string"
-              },
-              "url": {
-                "description": "HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into",
-                "type": "string"
-              },
-              "symbols": {
-                "description": "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-                "anyOf": [
-                  {
-                    "type": "string"
-                  },
-                  {
-                    "type": "array",
-                    "items": {
+              "batch": {
+                "description": "One or more lookups; entries may mix file paths and URLs",
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "description": "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
                       "type": "string"
-                    }
-                  }
-                ]
-              },
-              "targets": {
-                "description": "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "path": {
-                        "description": "Path to file (absolute or relative to project root)",
-                        "type": "string"
-                      },
-                      "symbol": {
-                        "description": "Symbol name in that file",
-                        "type": "string"
-                      }
                     },
-                    "required": [
-                      "path",
-                      "symbol"
-                    ]
-                  },
-                  {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "path": {
-                          "description": "Path to file (absolute or relative to project root)",
+                    "symbols": {
+                      "description": "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                      "anyOf": [
+                        {
                           "type": "string"
                         },
-                        "symbol": {
-                          "description": "Symbol name in that file",
-                          "type": "string"
+                        {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
                         }
-                      },
-                      "required": [
-                        "path",
-                        "symbol"
                       ]
                     }
-                  }
-                ]
+                  },
+                  "required": [
+                    "target",
+                    "symbols"
+                  ]
+                }
               },
               "contextLines": {
-                "description": "Lines of context before/after the symbol (default: 3)",
+                "description": "Lines of context before/after each symbol (default: 3)",
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 9007199254740991
               },
               "callgraph": {
-                "description": "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
+                "description": "Include call-graph annotations for every entry (default: false)",
                 "type": "boolean"
               }
-            }
+            },
+            "required": [
+              "batch"
+            ]
           }
         },
         {

@@ -360,6 +360,19 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
     ).rejects.toThrow(/HTTP 404/);
   });
 
+  test("zoom canonical batch mixes a file and a loopback URL", async () => {
+    const result = await harness.callTool("aft_zoom", {
+      batch: [
+        { target: "sample.ts", symbols: ["funcA", "funcB"] },
+        { target: `${serverUrl}/doc.md`, symbols: "Section A" },
+      ],
+    });
+    const text = harness.text(result);
+    expect(text).toContain("funcA");
+    expect(text).toContain("funcB");
+    expect(text).toContain("Body of section A.");
+  });
+
   test("zoom URL — rejects when both path and url provided", async () => {
     await expect(
       harness.callTool("aft_zoom", {
@@ -367,7 +380,7 @@ urlMaybeDescribe("aft_outline + aft_zoom — URL targets (real bridge + real fet
         url: `${serverUrl}/doc.md`,
         symbols: "anything",
       }),
-    ).rejects.toThrow(/exactly ONE of 'path' or 'url'/);
+    ).rejects.toThrow(/Conflicting 'filePath'.*'sample.ts'.*'url'/);
   });
 
   test("zoom URL — multi-section via symbols array", async () => {

@@ -197,8 +197,7 @@ describe("reading tool adapters", () => {
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params.name).toBe("zoom");
     expect(toolArgs(calls[0])).toEqual({
-      filePath: "src.ts",
-      symbols: ["ok", "missing"],
+      batch: [{ target: "src.ts", symbols: ["ok", "missing"] }],
       contextLines: 2,
     });
     expect(result.content[0].text).toContain("src.ts:1-1");
@@ -212,7 +211,7 @@ describe("reading tool adapters", () => {
 
     await expect(
       executeTool(tools.get("aft_zoom")!, { filePath: "src.ts", url: "https://example.com/a.md" }),
-    ).rejects.toThrow("not both");
+    ).rejects.toThrow("Conflicting");
     expect(calls).toHaveLength(0);
   });
 
@@ -268,9 +267,9 @@ describe("reading tool adapters", () => {
     expect(calls[0].command).toBe("tool_call");
     expect(calls[0].params.name).toBe("zoom");
     expect(toolArgs(calls[0])).toEqual({
-      targets: [
-        { filePath: "src/a.ts", symbol: "foo" },
-        { filePath: "src/b.ts", symbol: "bar" },
+      batch: [
+        { target: "src/a.ts", symbols: "foo" },
+        { target: "src/b.ts", symbols: "bar" },
       ],
     });
     expect(result.content[0].text).toContain("src/a.ts:1-1 [function foo]");
@@ -290,15 +289,13 @@ describe("reading tool adapters", () => {
     ]) {
       await executeTool(tools.get("aft_zoom")!, { targets: JSON.stringify(targets) });
       expect(toolArgs(calls.at(-1)!)).toEqual({
-        targets: targets.map(({ path, symbol }) => ({ filePath: path, symbol })),
+        batch: targets.map(({ path, symbol }) => ({ target: path, symbols: symbol })),
       });
     }
     await executeTool(tools.get("aft_zoom")!, {
       targets: JSON.stringify({ path: "src/a.ts", symbol: "foo" }),
     });
-    expect(toolArgs(calls.at(-1)!)).toEqual({
-      targets: [{ filePath: "src/a.ts", symbol: "foo" }],
-    });
+    expect(toolArgs(calls.at(-1)!)).toEqual({ batch: [{ target: "src/a.ts", symbols: "foo" }] });
     expect(calls).toHaveLength(3);
   });
 
@@ -308,7 +305,7 @@ describe("reading tool adapters", () => {
     registerReadingTools(api, makePluginContext(bridge), { outline: false, zoom: true });
     for (const targets of ["[{bad", "not JSON", "42", 42]) {
       await expect(executeTool(tools.get("aft_zoom")!, { targets })).rejects.toThrow(
-        /targets must be an array of \{path, symbol\}/,
+        /targets must be an array of \{target, symbols\}/,
       );
     }
     expect(calls).toHaveLength(0);
@@ -381,9 +378,10 @@ describe("reading tool adapters", () => {
     });
     expect(calls).toHaveLength(1);
     expect(toolArgs(calls[0])).toEqual({
-      targets: [{ filePath: "x", symbol: "x" }],
-      filePath: "src/a.ts",
-      symbols: ["foo", "bar"],
+      batch: [
+        { target: "src/a.ts", symbols: ["foo", "bar"] },
+        { target: "x", symbols: "x" },
+      ],
     });
 
     // Partial entries are forwarded for the server's per-target errors.
@@ -394,9 +392,9 @@ describe("reading tool adapters", () => {
       ],
     });
     expect(toolArgs(calls[1])).toEqual({
-      targets: [
-        { filePath: "src/a.ts", symbol: "" },
-        { filePath: "", symbol: "x" },
+      batch: [
+        { target: "src/a.ts", symbols: "" },
+        { target: "", symbols: "x" },
       ],
     });
 
@@ -407,7 +405,7 @@ describe("reading tool adapters", () => {
         filePath: "src/a.ts",
         url: "https://example.com/doc.md",
       }),
-    ).rejects.toThrow(/not both/);
+    ).rejects.toThrow(/Conflicting/);
     expect(calls).toHaveLength(2);
   });
 
@@ -426,7 +424,7 @@ describe("reading tool adapters", () => {
       symbols: "ok",
     });
     expect(calls).toHaveLength(1);
-    expect(toolArgs(calls[0])).toEqual({ filePath: "src.ts", symbols: "ok" });
+    expect(toolArgs(calls[0])).toEqual({ batch: [{ target: "src.ts", symbols: "ok" }] });
 
     // Single object form, same all-empty pattern.
     calls.length = 0;
@@ -436,7 +434,7 @@ describe("reading tool adapters", () => {
       symbols: "ok",
     });
     expect(calls).toHaveLength(1);
-    expect(toolArgs(calls[0])).toEqual({ filePath: "src.ts", symbols: "ok" });
+    expect(toolArgs(calls[0])).toEqual({ batch: [{ target: "src.ts", symbols: "ok" }] });
   });
 
   test("aft_zoom symbols accepts string form for single-symbol lookup", async () => {
@@ -457,7 +455,7 @@ describe("reading tool adapters", () => {
     })) as { content: Array<{ text: string }> };
 
     expect(calls).toHaveLength(1);
-    expect(toolArgs(calls[0])).toEqual({ filePath: "src.ts", symbols: "ok" });
+    expect(toolArgs(calls[0])).toEqual({ batch: [{ target: "src.ts", symbols: "ok" }] });
     expect(result.content[0].text).not.toContain("Incomplete zoom results");
     expect(result.content[0].text).toContain("src.ts:1-1 [function ok]");
   });
@@ -482,8 +480,7 @@ describe("reading tool adapters", () => {
 
     expect(calls).toHaveLength(1);
     expect(toolArgs(calls[0])).toEqual({
-      url: "https://example.com/doc.md",
-      symbols: ["Section A", "Section B"],
+      batch: [{ target: "https://example.com/doc.md", symbols: ["Section A", "Section B"] }],
     });
     expect(result.content[0].text).toContain("Body A");
     expect(result.content[0].text).toContain("Body B");
@@ -502,7 +499,7 @@ describe("reading tool adapters", () => {
     })) as { content: Array<{ text: string }> };
 
     expect(calls).toHaveLength(1);
-    expect(toolArgs(calls[0])).toEqual({ targets: [{ filePath: "src/a.ts", symbol: "foo" }] });
+    expect(toolArgs(calls[0])).toEqual({ batch: [{ target: "src/a.ts", symbols: "foo" }] });
     expect(result.content[0].text).toContain("src/a.ts:1-2 [function foo]");
   });
 
@@ -523,14 +520,14 @@ describe("reading tool adapters", () => {
     await executeTool(tools.get("aft_zoom")!, { filePath: "src/a.ts", callgraph: true });
 
     expect(calls.map((call) => toolArgs(call))).toEqual([
-      { targets: [{ filePath: "src/a.ts", symbol: "foo" }], callgraph: true },
-      { filePath: "src/a.ts", symbols: ["foo"], callgraph: true },
-      { filePath: "src/a.ts", callgraph: true },
+      { batch: [{ target: "src/a.ts", symbols: "foo" }], callgraph: true },
+      { batch: [{ target: "src/a.ts", symbols: ["foo"] }], callgraph: true },
+      { batch: [{ target: "src/a.ts", symbols: "" }], callgraph: true },
     ]);
 
     calls.length = 0;
     await executeTool(tools.get("aft_zoom")!, { filePath: "src/a.ts", symbols: "foo" });
-    expect(toolArgs(calls[0])).toEqual({ filePath: "src/a.ts", symbols: "foo" });
+    expect(toolArgs(calls[0])).toEqual({ batch: [{ target: "src/a.ts", symbols: "foo" }] });
   });
 
   test("aft_zoom schema does not expose read-style line ranges", () => {
@@ -542,4 +539,69 @@ describe("reading tool adapters", () => {
     expect(schema).not.toContain("startLine");
     expect(schema).not.toContain("endLine");
   });
+});
+
+test("zoom advertises only a required non-empty batch and shared options", () => {
+  const { api, tools } = makeMockApi();
+  const { bridge } = makeMockBridge();
+  registerReadingTools(api, makePluginContext(bridge), { outline: true, zoom: true });
+  const schema = tools.get("aft_zoom")!.parameters as {
+    properties: Record<string, unknown>;
+    required: string[];
+    anyOf?: unknown;
+    oneOf?: unknown;
+    allOf?: unknown;
+  };
+  expect(Object.keys(schema.properties).sort()).toEqual(["batch", "callgraph", "contextLines"]);
+  expect(schema.required).toEqual(["batch"]);
+  expect(schema.properties.batch).toMatchObject({
+    type: "array",
+    minItems: 1,
+    items: { required: ["target", "symbols"] },
+  });
+  expect(schema.anyOf ?? schema.oneOf ?? schema.allOf).toBeUndefined();
+});
+
+test("zoom canonical batch mixes files and URLs and preserves symbol arrays", async () => {
+  const { api, tools } = makeMockApi();
+  const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "zoom" }));
+  registerReadingTools(api, makePluginContext(bridge), { outline: true, zoom: true });
+  const batch = [
+    { target: "http_client.rs", symbols: ["client", "connect"] },
+    { target: "https://example.test/docs", symbols: "Overview" },
+  ];
+  await executeTool(tools.get("aft_zoom")!, { batch, contextLines: 2, callgraph: true }, {
+    cwd: process.cwd(),
+  } as never);
+  expect(toolArgs(calls[0])).toEqual({ batch, contextLines: 2, callgraph: true });
+});
+
+test("zoom quietly maps every legacy location shape to batch", async () => {
+  for (const key of ["target", "path", "filePath", "url"]) {
+    for (const input of [
+      { [key]: "https://example.test/docs", symbols: "Overview" },
+      { targets: [{ [key]: "https://example.test/docs", symbol: "Overview" }] },
+    ]) {
+      const { api, tools } = makeMockApi();
+      const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "zoom" }));
+      registerReadingTools(api, makePluginContext(bridge), { outline: true, zoom: true });
+      await executeTool(tools.get("aft_zoom")!, input, { cwd: process.cwd() } as never);
+      expect(toolArgs(calls[0])).toEqual({
+        batch: [{ target: "https://example.test/docs", symbols: "Overview" }],
+      });
+    }
+  }
+});
+
+test("zoom refuses empty batch and conflicting locations before dispatch", async () => {
+  const { api, tools } = makeMockApi();
+  const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "zoom" }));
+  registerReadingTools(api, makePluginContext(bridge), { outline: true, zoom: true });
+  await expect(executeTool(tools.get("aft_zoom")!, { batch: [] })).rejects.toThrow("'batch'");
+  await expect(
+    executeTool(tools.get("aft_zoom")!, {
+      batch: [{ target: "a.rs", url: "b.rs", symbols: "main" }],
+    }),
+  ).rejects.toThrow("'b.rs'");
+  expect(calls).toHaveLength(0);
 });

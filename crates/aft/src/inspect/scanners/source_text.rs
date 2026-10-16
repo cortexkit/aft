@@ -31,8 +31,8 @@ pub(crate) enum SourceText {
     Text(String),
     /// The file was read but is not valid UTF-8; the scanner skips it.
     NotUtf8,
-    /// The file disappeared between the scope walk and this read. Treated as
-    /// deleted: no contribution, exactly as the next walk will see it.
+    /// The file disappeared or is excluded from project source (for example,
+    /// internal storage). No contribution, exactly as the next walk will see it.
     Vanished,
 }
 
@@ -40,9 +40,12 @@ pub(crate) enum SourceText {
 /// example permission denied) are returned unchanged so each scanner keeps
 /// its existing contract for them.
 pub(crate) fn read_source_text(path: &Path) -> std::io::Result<SourceText> {
+    if crate::project_content::is_excluded(path) {
+        return Ok(SourceText::Vanished);
+    }
     #[cfg(debug_assertions)]
     bump_source_read_count(path);
-    match std::fs::read(path) {
+    match crate::project_content::read(path) {
         Ok(bytes) => Ok(match String::from_utf8(bytes) {
             Ok(text) => SourceText::Text(text),
             Err(_) => SourceText::NotUtf8,

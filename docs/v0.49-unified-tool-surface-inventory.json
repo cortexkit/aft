@@ -90,23 +90,11 @@
         "harnesses": ["opencode", "pi"],
         "subc_artifact": "zoom",
         "tool": "aft_zoom",
-        "json_pointer": "/path",
-        "semantic_role": "single subject file in file mode",
-        "canonical": "path",
+        "json_pointer": "/batch/{index}/target",
+        "semantic_role": "auto-detected file, URL, or GitHub location in a batch item",
+        "canonical": "target",
         "legacy": "filePath",
-        "requiredness": "optional; required when file mode is selected",
-        "baseline_property": "filePath"
-      },
-      {
-        "id": "PATH-V049-005",
-        "harnesses": ["opencode", "pi"],
-        "subc_artifact": "zoom",
-        "tool": "aft_zoom",
-        "json_pointer": "/targets/{index}/path",
-        "semantic_role": "subject file in a cross-file target item",
-        "canonical": "path",
-        "legacy": "filePath",
-        "requiredness": "required per target item",
+        "requiredness": "required per batch item",
         "baseline_property": "targets[{index}].filePath"
       },
       {

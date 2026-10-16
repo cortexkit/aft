@@ -11,3 +11,4 @@
 - Workflow hints ship inside the host's system entry — fixes "System message must be at the beginning" on Qwen-family endpoints (issue #150).
 - Checkpoints under restrict_to_project_root now snapshot a symlink itself rather than its target.
 - Callgraph stores sweep orphaned build temporaries (age-based, both layouts).
+- Worker agents that ask for a missing absolute path which exists in their own checkout now get "path not found: …; did you mean …?" instead of an access request to their head. A worker search of the filesystem root is refused with "use your checkout instead: <worktree>".

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::ast_grep_lang::AstGrepLang;
-use crate::context::AppContext;
+use crate::context::{AppContext, WorkerSearchTool};
 use crate::protocol::Response;
 
 use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResolution};
@@ -30,7 +30,8 @@ pub(crate) fn collect_ast_files(
     paths: &[String],
     globs: &[String],
 ) -> Result<AstScope, Response> {
-    let roots = resolve_roots(req_id, read_session, ctx, project_root, paths)?;
+    let search_tool = read_session.map(|_| WorkerSearchTool::AstGrepSearch);
+    let roots = resolve_roots(req_id, read_session, ctx, project_root, paths, search_tool)?;
 
     for root in &roots {
         if !root.path.exists() {
@@ -63,6 +64,7 @@ fn resolve_roots(
     ctx: &AppContext,
     project_root: &Path,
     paths: &[String],
+    search_tool: Option<WorkerSearchTool>,
 ) -> Result<Vec<SearchRoot>, Response> {
     if paths.is_empty() {
         return Ok(vec![SearchRoot {
@@ -76,9 +78,12 @@ fn resolve_roots(
         match resolve_path_or_multi(
             path,
             project_root,
-            |candidate| match read_session {
-                Some(session) => ctx.validate_read_path(req_id, session, candidate),
-                None => ctx.validate_path(req_id, candidate),
+            |candidate| match (read_session, search_tool) {
+                (Some(session), Some(search_tool)) => {
+                    ctx.validate_search_path(req_id, session, candidate, search_tool)
+                }
+                (Some(session), None) => ctx.validate_read_path(req_id, session, candidate),
+                (None, _) => ctx.validate_path(req_id, candidate),
             },
             req_id,
         )? {

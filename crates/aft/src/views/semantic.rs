@@ -727,13 +727,13 @@ impl SemanticPlane {
                     DiskState::Present { size, .. } => size,
                     DiskState::Absent => 0,
                 };
-                std::fs::File::open(&source).and_then(|file| {
+                crate::project_content::open(&source).and_then(|file| {
                     let mut bytes = Vec::new();
                     file.take(size.saturating_add(1)).read_to_end(&mut bytes)?;
                     Ok(bytes)
                 })
             } else {
-                std::fs::read(&source)
+                crate::project_content::read(&source)
             };
             report.source_reads += 1;
             report.source_bytes += bytes.as_ref().map_or(0, |bytes| bytes.len() as u64);

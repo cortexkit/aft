@@ -1,8 +1,14 @@
 {
   "args": {
     "context_lines": 2,
-    "file": "https://example.com/doc",
-    "symbol": "Features"
+    "targets": [
+      {
+        "file": "https://example.com/doc",
+        "parse_symbols": true,
+        "symbol": "Features",
+        "target_label": "https://example.com/doc"
+      }
+    ]
   },
   "command": "zoom"
 }

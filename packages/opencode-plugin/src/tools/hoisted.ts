@@ -358,6 +358,12 @@ Examples:
   List directory: { "path": "src/" }
 `;
 
+function v1FileParameterDescription(description: string): string {
+  // OpenCode 1.18.30's read/write/edit renderers use input.filePath for file
+  // headers; match their advertised argument without changing patch grammar.
+  return description.replaceAll("`path`", "`filePath`").replaceAll('"path":', '"filePath":');
+}
+
 function readDescription(ghReadEnabled: boolean): string {
   const githubDescription = whenGhReadEnabled(ghReadEnabled, ISSUE_AND_PR_READ_DESCRIPTION);
   if (!githubDescription) return READ_DESCRIPTION;
@@ -370,7 +376,9 @@ function readDescription(ghReadEnabled: boolean): string {
 export function createReadTool(ctx: PluginContext): ToolDefinition {
   return prepareToolMap({
     read: {
-      description: readDescription(resolveGithubConfig(ctx.config).read),
+      description: v1FileParameterDescription(
+        readDescription(resolveGithubConfig(ctx.config).read),
+      ),
       args: {
         // OpenCode-only exception to the canonical `path` vocabulary: the
         // hoisted read/write/edit trio overrides OpenCode's built-in tools,
@@ -551,12 +559,12 @@ function getWriteDescription(ctx: PluginContext, editToolName: string): string {
   const githubText = resolveGithubConfig(ctx.config).write
     ? ' When enabled, `write("issue://N", content)` or `write("pr://N", content)` publishes a new comment.'
     : "";
-  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.${githubText}`;
+  return `Write content to a file, creating it and parent directories automatically. Use \`path\` for the file location. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.${githubText}`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
   return {
-    description: getWriteDescription(ctx, editToolName),
+    description: v1FileParameterDescription(getWriteDescription(ctx, editToolName)),
     args: {
       // filePath, not path: host UI header contract — see createReadTool.
       filePath: z
@@ -816,7 +824,7 @@ function createHashlineEditTool(ctx: PluginContext): ToolDefinition {
 function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefinition {
   if (ctx.hashlineEffective === true) return createHashlineEditTool(ctx);
   return {
-    description: getEditDescription(ctx, writeToolName),
+    description: v1FileParameterDescription(getEditDescription(ctx, writeToolName)),
     args: {
       // filePath, not path: host UI header contract — see createReadTool.
       filePath: z

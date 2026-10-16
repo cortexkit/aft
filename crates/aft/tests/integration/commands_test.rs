@@ -345,7 +345,7 @@ fn test_outline_missing_param() {
 
     assert_eq!(resp["success"], false);
     assert_eq!(resp["code"], "invalid_request");
-    assert!(resp["message"].as_str().unwrap().contains("file"));
+    assert_eq!(resp["message"], "outline: missing required param 'target'");
 
     let status = aft.shutdown();
     assert!(status.success());

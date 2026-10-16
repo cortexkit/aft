@@ -246,6 +246,11 @@ function makeCtx(
             rawArgs: Record<string, unknown> = {},
             options?: ToolCallOptions,
           ) => {
+            if (name === "zoom") {
+              const translated = translateAftZoomToolCall(rawArgs);
+              calls.push(translated);
+              return responseForCall(translated.command, translated.params);
+            }
             if (name === "apply_patch") {
               const translated = translateApplyPatchToolCall(rawArgs, options);
               calls.push(translated);
@@ -343,42 +348,17 @@ function successForTranslate(command: string, params: Record<string, unknown>): 
   return { id: "translate", success: true, text: "" };
 }
 
-function zoomTargetEntries(agentArgs: Record<string, unknown>): Array<{ filePath: string; symbol: string }> | undefined {
-  const rawTargets = agentArgs.targets;
-  const targets = Array.isArray(rawTargets) ? rawTargets : rawTargets ? [rawTargets] : undefined;
-  if (!targets) return undefined;
-  return targets.map((entry) => {
-    const obj = entry as { filePath?: unknown; symbol?: unknown };
-    return { filePath: String(obj.filePath ?? ""), symbol: String(obj.symbol ?? "") };
+
+function translateAftZoomToolCall(rawArgs: Record<string, unknown>): BridgeCall {
+  const batch = rawArgs.batch as Array<{ target?: string; symbols?: string | string[] }>;
+  const targets = batch.flatMap((entry, index) => {
+    const target = entry.target ?? "";
+    const names = Array.isArray(entry.symbols) ? entry.symbols : [entry.symbols ?? ""];
+    const remote = /^(https?:\/\/|issue:\/\/|pr:\/\/)/.test(target);
+    const parseSymbols = /^https?:\/\//.test(target) && !/^https?:\/\/(?:www\.)?github\.com\/[^/]+\/[^/]+\/(?:issues|pull)\/\d+/.test(target) && typeof entry.symbols === "string";
+    return (names.length ? names : [""]).map((symbol) => ({ file: target ? (remote ? target : resolveProjectPath(target)) : "", symbol, target_label: target || "(no target)", ...(parseSymbols ? { parse_symbols: true } : {}), ...(!target.trim() || !symbol.trim() ? { batch_index: index } : {}) }));
   });
-}
-
-function expectedZoomMultiTargetTranslate(
-  caseDef: TranslateCase,
-  calls: BridgeCall[],
-): Record<string, unknown> | undefined {
-  if (caseDef.tool_name !== "zoom") return undefined;
-  const targets = zoomTargetEntries(caseDef.agent_args);
-  if (!targets || targets.length === 0) return undefined;
-
-  const zoomCalls = calls.filter((call) => call.command === "zoom" && call.params.preview !== true);
-  if (zoomCalls.length !== targets.length) {
-    throw new Error(
-      `zoom multi-target case ${caseDef.name} expected ${targets.length} zoom calls, got ${zoomCalls.length}`,
-    );
-  }
-
-  const args: Record<string, unknown> = {
-    targets: targets.map((target, index) => ({
-      file: zoomCalls[index]?.params.file,
-      symbol: zoomCalls[index]?.params.symbol,
-      target_label: target.filePath,
-    })),
-  };
-  const firstParams = zoomCalls[0]?.params ?? {};
-  if (firstParams.context_lines !== undefined) args.context_lines = firstParams.context_lines;
-  if (firstParams.callgraph === true) args.callgraph = true;
-  return { command: "zoom", args };
+  return { command: "zoom", params: { targets, ...(rawArgs.contextLines !== undefined ? { context_lines: rawArgs.contextLines } : {}), ...(rawArgs.callgraph === true ? { callgraph: true } : {}) } };
 }
 
 function zoomMultiTargetResponses(
@@ -419,12 +399,9 @@ async function captureTranslateCase(caseDef: TranslateCase): Promise<void> {
   let expected: unknown;
   try {
     await def.execute(caseDef.agent_args, makeRuntime());
-    expected = expectedZoomMultiTargetTranslate(caseDef, calls);
-    if (!expected) {
-      const finalCall = [...calls].reverse().find((call) => call.params.preview !== true) ?? calls.at(-1);
-      if (!finalCall) throw new Error(`tool ${caseDef.tool_name} did not call bridge`);
-      expected = { command: finalCall.command, args: finalCall.params };
-    }
+    const finalCall = [...calls].reverse().find((call) => call.params.preview !== true) ?? calls.at(-1);
+    if (!finalCall) throw new Error(`tool ${caseDef.tool_name} did not call bridge`);
+    expected = { command: finalCall.command, args: finalCall.params };
   } catch (error) {
     expected = {
       error: {
@@ -567,6 +544,9 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "outline_array_files", tool_name: "outline", agent_args: { target: ["src", "docs"], files: true } },
   { name: "outline_directory_json_mode", tool_name: "outline", agent_args: { target: "src" } },
   { name: "outline_directory_include_tests", tool_name: "outline", agent_args: { target: "src", includeTests: true } },
+  { name: "zoom_batch_mixed_translate", tool_name: "zoom", agent_args: { batch: [{ target: "src/main.ts", symbols: ["run", "missing"] }, { target: "https://example.test/docs", symbols: "Overview" }], contextLines: 2, callgraph: true } },
+  { name: "zoom_batch_empty_translate", tool_name: "zoom", agent_args: { batch: [] } },
+  { name: "zoom_batch_conflict_translate", tool_name: "zoom", agent_args: { batch: [{ target: "a.ts", url: "b.ts", symbols: "run" }] } },
   { name: "zoom_url_translate", tool_name: "zoom", agent_args: { url: "https://example.com/doc", symbols: "Features", contextLines: 2 } },
   { name: "zoom_single_symbol_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: "run", contextLines: 2, callgraph: true } },
   { name: "zoom_multi_symbol_batch_translate", tool_name: "zoom", agent_args: { filePath: "src/main.ts", symbols: ["run", "missing"] } },

@@ -102,7 +102,7 @@ impl OxcFactsCache {
             }
         }
 
-        let source = fs::read_to_string(path)?;
+        let source = crate::project_content::read_to_string(path)?;
         Ok(self.facts_for_source_with_metadata(
             file_id,
             path,

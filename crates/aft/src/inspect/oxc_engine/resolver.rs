@@ -55,7 +55,7 @@ impl ResolverConfigTracker {
         if self.inputs.contains_key(&normalized) {
             return;
         }
-        if let Ok(bytes) = fs::read(path) {
+        if let Ok(bytes) = crate::project_content::read(path) {
             self.inputs
                 .insert(normalized, blake3::hash(&bytes).to_hex().to_string());
         }

@@ -115,6 +115,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         &req.id,
         req.session(),
+        Some(crate::context::WorkerSearchTool::Grep),
     ) {
         Ok(scope) => scope,
         Err(response) => return response,

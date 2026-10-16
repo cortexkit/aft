@@ -22,7 +22,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
 use crate::alias::AliasStore;
@@ -633,14 +633,17 @@ impl PublicationClosure for MigrationClosure {
         let Some(key) = decode_hex_key(full_key) else {
             return Ok(false);
         };
-        Ok(Connection::open(&self.semantic_database)?
-            .query_row(
-                "SELECT 1 FROM blob_payloads WHERE full_key = ?1",
-                params![key.as_slice()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
+        Ok(crate::db::file_identity::IdentityConnection::open(
+            &self.semantic_database,
+            "migration publication semantic closure",
+        )?
+        .query_row(
+            "SELECT 1 FROM blob_payloads WHERE full_key = ?1",
+            params![key.as_slice()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
     }
 
     fn trigram_is_present(&self) -> crate::views::Result<bool> {
@@ -659,7 +662,10 @@ fn create_publication_artifacts(
 ) -> Result<PublicationArtifacts, MigrationError> {
     crate::production_storage::refuse_write(view_dir)?;
     let derived_database = view_dir.join("derived.sqlite");
-    let derived = Connection::open(&derived_database)?;
+    let derived = crate::db::file_identity::IdentityConnection::open(
+        &derived_database,
+        "migration publication derived artifact",
+    )?;
     derived.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;

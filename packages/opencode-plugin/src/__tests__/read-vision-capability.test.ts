@@ -141,10 +141,10 @@ Behavior:
 - Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.
 
 Examples:
-  Read full file: { "path": "src/app.ts" }
-  Read lines 50-100: { "path": "src/app.ts", "startLine": 50, "endLine": 100 }
-  Read 30 lines from line 200: { "path": "src/app.ts", "offset": 200, "limit": 30 }
-  List directory: { "path": "src/" }
+  Read full file: { "filePath": "src/app.ts" }
+  Read lines 50-100: { "filePath": "src/app.ts", "startLine": 50, "endLine": 100 }
+  Read 30 lines from line 200: { "filePath": "src/app.ts", "offset": 200, "limit": 30 }
+  List directory: { "filePath": "src/" }
 `);
   });
 

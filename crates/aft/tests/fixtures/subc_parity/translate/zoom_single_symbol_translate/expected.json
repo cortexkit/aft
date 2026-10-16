@@ -2,8 +2,13 @@
   "args": {
     "callgraph": true,
     "context_lines": 2,
-    "file": "<PROJECT_ROOT>/src/main.ts",
-    "symbol": "run"
+    "targets": [
+      {
+        "file": "<PROJECT_ROOT>/src/main.ts",
+        "symbol": "run",
+        "target_label": "src/main.ts"
+      }
+    ]
   },
   "command": "zoom"
 }

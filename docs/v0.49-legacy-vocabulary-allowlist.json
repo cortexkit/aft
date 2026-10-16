@@ -569,6 +569,39 @@
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2230,
+      "column": 46,
+      "token": "filePath",
+      "text": "// for read/write/edit instead requires `filePath`, so check an equivalent",
+      "location": "line 2230, column 46",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Provider schema admission normalizes older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2232,
+      "column": 33,
+      "token": "filePath",
+      "text": "if properties.contains_key(\"filePath\") && !properties.contains_key(\"path\") {",
+      "location": "line 2232, column 33",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Provider schema admission normalizes older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2234,
+      "column": 31,
+      "token": "filePath",
+      "text": "arguments.insert(\"filePath\".into(), path);",
+      "location": "line 2234, column 31",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Provider schema admission normalizes older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
       "line": 2460,
       "column": 44,
       "token": "filePath",
@@ -577,6 +610,83 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2516,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"destination\": \"next.ts\"}),",
+      "location": "line 2516, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2520,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"organize\"}),",
+      "location": "line 2520, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2522,
+      "column": 32,
+      "token": "filePath",
+      "text": "(\"safety\", json!({\"filePath\": \"fixture.ts\", \"op\": \"history\"})),",
+      "location": "line 2522, column 32",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2525,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"callers\", \"symbol\": \"run\"}),",
+      "location": "line 2525, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2529,
+      "column": 25,
+      "token": "filePath",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"trace_to_symbol\", \"symbol\": \"run\", \"toSymbol\": \"next\", \"toFile\": \"next.ts\"}),",
+      "location": "line 2529, column 25",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2529,
+      "column": 113,
+      "token": "toFile",
+      "text": "json!({\"filePath\": \"fixture.ts\", \"op\": \"trace_to_symbol\", \"symbol\": \"run\", \"toSymbol\": \"next\", \"toFile\": \"next.ts\"}),",
+      "location": "line 2529, column 113",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
+    },
+    {
+      "path": "crates/aft/src/subc/tool_provider.rs",
+      "line": 2549,
+      "column": 24,
+      "token": "filePath",
+      "text": "arguments[\"filePath\"] = json!(\"fixture.ts\");",
+      "location": "line 2549, column 24",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Compatibility regression fixture uses older argument names without adding them to advertised schemas."
     },
     {
       "path": "crates/aft/src/subc/tool_provider.rs",
@@ -832,26 +942,114 @@
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
-      "line": 122,
-      "column": 48,
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 202,
+      "column": 770,
       "token": "filePath",
-      "text": "normalize_path_alias_pair(object, \"path\", \"filePath\", false)",
-      "location": "line 122, column 48",
+      "text": "\"description\": \"Read file contents or list directory entries.\\n\\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\\n\\nBehavior:\\n- Returns line-numbered content (e.g., \\\"1: const x = 1\\\")\\n- Lines longer than 2000 characters are truncated\\n- Output capped at 50KB\\n- Binary files are auto-detected and return a size-only message\\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\\n\\nExamples:\\n Read full file: { \\\"filePath\\\": \\\"src/app.ts\\\" }\\n Read lines 50-100: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"startLine\\\": 50, \\\"endLine\\\": 100 }\\n Read 30 lines from line 200: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"offset\\\": 200, \\\"limit\\\": 30 }\\n List directory: { \\\"filePath\\\": \\\"src/\\\" }\\n\"",
+      "location": "line 202, column 770",
       "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
-      "line": 149,
-      "column": 45,
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 202,
+      "column": 825,
       "token": "filePath",
-      "text": "normalize_path_alias_pair(map, \"path\", \"filePath\", false)?;",
-      "location": "line 149, column 45",
+      "text": "\"description\": \"Read file contents or list directory entries.\\n\\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\\n\\nBehavior:\\n- Returns line-numbered content (e.g., \\\"1: const x = 1\\\")\\n- Lines longer than 2000 characters are truncated\\n- Output capped at 50KB\\n- Binary files are auto-detected and return a size-only message\\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\\n\\nExamples:\\n Read full file: { \\\"filePath\\\": \\\"src/app.ts\\\" }\\n Read lines 50-100: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"startLine\\\": 50, \\\"endLine\\\": 100 }\\n Read 30 lines from line 200: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"offset\\\": 200, \\\"limit\\\": 30 }\\n List directory: { \\\"filePath\\\": \\\"src/\\\" }\\n\"",
+      "location": "line 202, column 825",
+      "ordinal": 2,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 202,
+      "column": 927,
+      "token": "filePath",
+      "text": "\"description\": \"Read file contents or list directory entries.\\n\\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\\n\\nBehavior:\\n- Returns line-numbered content (e.g., \\\"1: const x = 1\\\")\\n- Lines longer than 2000 characters are truncated\\n- Output capped at 50KB\\n- Binary files are auto-detected and return a size-only message\\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\\n\\nExamples:\\n Read full file: { \\\"filePath\\\": \\\"src/app.ts\\\" }\\n Read lines 50-100: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"startLine\\\": 50, \\\"endLine\\\": 100 }\\n Read 30 lines from line 200: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"offset\\\": 200, \\\"limit\\\": 30 }\\n List directory: { \\\"filePath\\\": \\\"src/\\\" }\\n\"",
+      "location": "line 202, column 927",
+      "ordinal": 3,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 202,
+      "column": 1011,
+      "token": "filePath",
+      "text": "\"description\": \"Read file contents or list directory entries.\\n\\nUse either startLine/endLine OR offset/limit to read a section of a file or sorted directory listing.\\n\\nBehavior:\\n- Returns line-numbered content (e.g., \\\"1: const x = 1\\\")\\n- Lines longer than 2000 characters are truncated\\n- Output capped at 50KB\\n- Binary files are auto-detected and return a size-only message\\n- Supported images (PNG, JPEG, GIF, WebP) and PDFs are returned as tool attachments; range arguments are ignored for media\\n- Directories return sorted entries with trailing / for subdirectories; offset is 1-based, limit defaults to and is capped at 1000 entries. Enumeration stops at 10,000 entries; partial listings carry a shown/total trailer.\\n\\nExamples:\\n Read full file: { \\\"filePath\\\": \\\"src/app.ts\\\" }\\n Read lines 50-100: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"startLine\\\": 50, \\\"endLine\\\": 100 }\\n Read 30 lines from line 200: { \\\"filePath\\\": \\\"src/app.ts\\\", \\\"offset\\\": 200, \\\"limit\\\": 30 }\\n List directory: { \\\"filePath\\\": \\\"src/\\\" }\\n\"",
+      "location": "line 202, column 1011",
+      "ordinal": 4,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 221,
+      "column": 101,
+      "token": "filePath",
+      "text": "\"description\": \"Write content to a file, creating it and parent directories automatically. Use `filePath` for the file location. Existing files are backed up before overwriting (undo via aft_safety). Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the `edit` tool. Write very large new files in parts: a single call can exceed the model's output limit and is then aborted with empty arguments.\"",
+      "location": "line 221, column 101",
       "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 291,
+      "column": 683,
+      "token": "filePath",
+      "text": "\"description\": \"Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\\n\\n**Modes** (determined by which parameters you provide):\\n\\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \\\"write\\\" fallback. To edit multiple files, make parallel `edit` calls in one response.\\n\\n1. **Append** — pass `filePath` + `appendContent`\\n Appends text to the end of a file, creating it if it does not exist.\\n Example: `{ \\\"filePath\\\": \\\"notes.txt\\\", \\\"appendContent\\\": \\\"new line\\\\n\\\" }`\\n\\n2. **Batch edits** — pass `filePath` + `edits` array\\n Multiple edits in one file atomically. Each edit is either:\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\" }` — find/replace\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\", \\\"replaceAll\\\": true }` — replace every match\\n - `{ \\\"startLine\\\": 5, \\\"endLine\\\": 7, \\\"content\\\": \\\"new lines\\\" }` — replace line range (1-based, both inclusive)\\n Set content to empty string to delete lines.\\n\\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\\n Replaces an entire named symbol (function, class, type).\\n Includes decorators, attributes, and doc comments in the replacement range.\\n Example: `{ \\\"filePath\\\": \\\"src/app.ts\\\", \\\"symbol\\\": \\\"handleRequest\\\", \\\"content\\\": \\\"function handleRequest() { ... }\\\" }`\\n\\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\\n Finds the exact text in `oldString` and replaces it with `newString`.\\n Supports fuzzy matching (handles whitespace differences automatically).\\n If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\\n\\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\\n\\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\\n When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\\n\\n**Behavior:**\\n- Backs up files before editing (recoverable via aft_safety undo)\\n- Auto-formats using project formatter if configured\\n- Tree-sitter syntax validation on all edits\\n- Symbol replace includes decorators, attributes, and doc comments in range\\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.\"",
+      "location": "line 291, column 683",
+      "ordinal": 1,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 291,
+      "column": 802,
+      "token": "filePath",
+      "text": "\"description\": \"Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\\n\\n**Modes** (determined by which parameters you provide):\\n\\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \\\"write\\\" fallback. To edit multiple files, make parallel `edit` calls in one response.\\n\\n1. **Append** — pass `filePath` + `appendContent`\\n Appends text to the end of a file, creating it if it does not exist.\\n Example: `{ \\\"filePath\\\": \\\"notes.txt\\\", \\\"appendContent\\\": \\\"new line\\\\n\\\" }`\\n\\n2. **Batch edits** — pass `filePath` + `edits` array\\n Multiple edits in one file atomically. Each edit is either:\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\" }` — find/replace\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\", \\\"replaceAll\\\": true }` — replace every match\\n - `{ \\\"startLine\\\": 5, \\\"endLine\\\": 7, \\\"content\\\": \\\"new lines\\\" }` — replace line range (1-based, both inclusive)\\n Set content to empty string to delete lines.\\n\\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\\n Replaces an entire named symbol (function, class, type).\\n Includes decorators, attributes, and doc comments in the replacement range.\\n Example: `{ \\\"filePath\\\": \\\"src/app.ts\\\", \\\"symbol\\\": \\\"handleRequest\\\", \\\"content\\\": \\\"function handleRequest() { ... }\\\" }`\\n\\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\\n Finds the exact text in `oldString` and replaces it with `newString`.\\n Supports fuzzy matching (handles whitespace differences automatically).\\n If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\\n\\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\\n\\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\\n When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\\n\\n**Behavior:**\\n- Backs up files before editing (recoverable via aft_safety undo)\\n- Auto-formats using project formatter if configured\\n- Tree-sitter syntax validation on all edits\\n- Symbol replace includes decorators, attributes, and doc comments in range\\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.\"",
+      "location": "line 291, column 802",
+      "ordinal": 2,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 291,
+      "column": 897,
+      "token": "filePath",
+      "text": "\"description\": \"Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\\n\\n**Modes** (determined by which parameters you provide):\\n\\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \\\"write\\\" fallback. To edit multiple files, make parallel `edit` calls in one response.\\n\\n1. **Append** — pass `filePath` + `appendContent`\\n Appends text to the end of a file, creating it if it does not exist.\\n Example: `{ \\\"filePath\\\": \\\"notes.txt\\\", \\\"appendContent\\\": \\\"new line\\\\n\\\" }`\\n\\n2. **Batch edits** — pass `filePath` + `edits` array\\n Multiple edits in one file atomically. Each edit is either:\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\" }` — find/replace\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\", \\\"replaceAll\\\": true }` — replace every match\\n - `{ \\\"startLine\\\": 5, \\\"endLine\\\": 7, \\\"content\\\": \\\"new lines\\\" }` — replace line range (1-based, both inclusive)\\n Set content to empty string to delete lines.\\n\\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\\n Replaces an entire named symbol (function, class, type).\\n Includes decorators, attributes, and doc comments in the replacement range.\\n Example: `{ \\\"filePath\\\": \\\"src/app.ts\\\", \\\"symbol\\\": \\\"handleRequest\\\", \\\"content\\\": \\\"function handleRequest() { ... }\\\" }`\\n\\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\\n Finds the exact text in `oldString` and replaces it with `newString`.\\n Supports fuzzy matching (handles whitespace differences automatically).\\n If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\\n\\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\\n\\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\\n When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\\n\\n**Behavior:**\\n- Backs up files before editing (recoverable via aft_safety undo)\\n- Auto-formats using project formatter if configured\\n- Tree-sitter syntax validation on all edits\\n- Symbol replace includes decorators, attributes, and doc comments in range\\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.\"",
+      "location": "line 291, column 897",
+      "ordinal": 3,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 291,
+      "column": 1366,
+      "token": "filePath",
+      "text": "\"description\": \"Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\\n\\n**Modes** (determined by which parameters you provide):\\n\\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \\\"write\\\" fallback. To edit multiple files, make parallel `edit` calls in one response.\\n\\n1. **Append** — pass `filePath` + `appendContent`\\n Appends text to the end of a file, creating it if it does not exist.\\n Example: `{ \\\"filePath\\\": \\\"notes.txt\\\", \\\"appendContent\\\": \\\"new line\\\\n\\\" }`\\n\\n2. **Batch edits** — pass `filePath` + `edits` array\\n Multiple edits in one file atomically. Each edit is either:\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\" }` — find/replace\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\", \\\"replaceAll\\\": true }` — replace every match\\n - `{ \\\"startLine\\\": 5, \\\"endLine\\\": 7, \\\"content\\\": \\\"new lines\\\" }` — replace line range (1-based, both inclusive)\\n Set content to empty string to delete lines.\\n\\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\\n Replaces an entire named symbol (function, class, type).\\n Includes decorators, attributes, and doc comments in the replacement range.\\n Example: `{ \\\"filePath\\\": \\\"src/app.ts\\\", \\\"symbol\\\": \\\"handleRequest\\\", \\\"content\\\": \\\"function handleRequest() { ... }\\\" }`\\n\\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\\n Finds the exact text in `oldString` and replaces it with `newString`.\\n Supports fuzzy matching (handles whitespace differences automatically).\\n If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\\n\\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\\n\\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\\n When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\\n\\n**Behavior:**\\n- Backs up files before editing (recoverable via aft_safety undo)\\n- Auto-formats using project formatter if configured\\n- Tree-sitter syntax validation on all edits\\n- Symbol replace includes decorators, attributes, and doc comments in range\\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.\"",
+      "location": "line 291, column 1366",
+      "ordinal": 4,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "crates/aft/src/subc_tool_schemas.json",
+      "line": 291,
+      "column": 1558,
+      "token": "filePath",
+      "text": "\"description\": \"Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\\n\\n**Modes** (determined by which parameters you provide):\\n\\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \\\"write\\\" fallback. To edit multiple files, make parallel `edit` calls in one response.\\n\\n1. **Append** — pass `filePath` + `appendContent`\\n Appends text to the end of a file, creating it if it does not exist.\\n Example: `{ \\\"filePath\\\": \\\"notes.txt\\\", \\\"appendContent\\\": \\\"new line\\\\n\\\" }`\\n\\n2. **Batch edits** — pass `filePath` + `edits` array\\n Multiple edits in one file atomically. Each edit is either:\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\" }` — find/replace\\n - `{ \\\"oldString\\\": \\\"old\\\", \\\"newString\\\": \\\"new\\\", \\\"replaceAll\\\": true }` — replace every match\\n - `{ \\\"startLine\\\": 5, \\\"endLine\\\": 7, \\\"content\\\": \\\"new lines\\\" }` — replace line range (1-based, both inclusive)\\n Set content to empty string to delete lines.\\n\\n3. **Symbol replace** — pass `filePath` + `symbol` + `content`\\n Replaces an entire named symbol (function, class, type).\\n Includes decorators, attributes, and doc comments in the replacement range.\\n Example: `{ \\\"filePath\\\": \\\"src/app.ts\\\", \\\"symbol\\\": \\\"handleRequest\\\", \\\"content\\\": \\\"function handleRequest() { ... }\\\" }`\\n\\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\\n Finds the exact text in `oldString` and replaces it with `newString`.\\n Supports fuzzy matching (handles whitespace differences automatically).\\n If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\\n\\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\\n\\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\\n When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\\n\\n**Behavior:**\\n- Backs up files before editing (recoverable via aft_safety undo)\\n- Auto-formats using project formatter if configured\\n- Tree-sitter syntax validation on all edits\\n- Symbol replace includes decorators, attributes, and doc comments in range\\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.\"",
+      "location": "line 291, column 1558",
+      "ordinal": 5,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
@@ -987,47 +1185,58 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 2510,
-      "column": 54,
+      "line": 2549,
+      "column": 35,
       "token": "filePath",
-      "text": "blank(obj.get(\"path\")) && blank(obj.get(\"filePath\")) && blank(obj.get(\"symbol\"))",
-      "location": "line 2510, column 54",
+      "text": "&& blank(obj.get(\"filePath\"))",
+      "location": "line 2549, column 35",
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 2604,
-      "column": 42,
+      "line": 3068,
+      "column": 34,
       "token": "filePath",
-      "text": "\"Provide exactly ONE of 'filePath' or 'url' — not both\",",
-      "location": "line 2604, column 42",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 3068, column 34",
       "ordinal": 1,
       "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+      "reason": "URL translation regression coverage verifies that the legacy filePath input behaves like canonical path."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "line": 2690,
-      "column": 42,
+      "line": 3086,
+      "column": 30,
       "token": "filePath",
-      "text": "\"Provide exactly one of 'filePath', 'url', or 'targets'\",",
-      "location": "line 2690, column 42",
-      "ordinal": 1,
-      "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
-    },
-    {
-      "path": "crates/aft/src/subc_translate.rs",
-      "line": 2695,
-      "column": 42,
-      "token": "filePath",
-      "text": "\"Provide exactly ONE of 'filePath' or 'url' — not both\",",
-      "location": "line 2695, column 42",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 3086, column 30",
       "ordinal": 2,
       "class": "rust-compatibility",
-      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+      "reason": "Conflicting URL regression coverage verifies refusal for both legacy filePath and canonical path inputs."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 3121,
+      "column": 98,
+      "token": "filePath",
+      "text": "serde_json::json!({ \"targets\": [{ \"path\": url, \"url\": url, \"symbol\": \"Heading\" }, { \"filePath\": \"http://localhost/docs\", \"symbol\": \"Other\" }] }),",
+      "location": "line 3121, column 98",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Batched URL translation regression coverage retains a legacy filePath input alongside canonical targets."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 3159,
+      "column": 34,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 3159, column 34",
+      "ordinal": 3,
+      "class": "rust-compatibility",
+      "reason": "Read URL refusal regression coverage verifies the legacy filePath input receives the same explicit unsupported-URL error."
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
@@ -1204,6 +1413,61 @@
       "ordinal": 1,
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 137,
+      "column": 36,
+      "token": "filePath",
+      "text": "for key in [\"target\", \"path\", \"filePath\", \"url\"] {",
+      "location": "line 137, column 36",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 153,
+      "column": 28,
+      "token": "filePath",
+      "text": "for alias in [\"path\", \"filePath\", \"url\"] {",
+      "location": "line 153, column 28",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 2962,
+      "column": 44,
+      "token": "filePath",
+      "text": "for key in [\"target\", \"path\", \"filePath\", \"url\"] {",
+      "location": "line 2962, column 44",
+      "ordinal": 2,
+      "class": "rust-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 2990,
+      "column": 30,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\", \"url\"] {",
+      "location": "line 2990, column 30",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "line": 3008,
+      "column": 98,
+      "token": "filePath",
+      "text": "let aliases = serde_json::json!({ \"target\": \"http_client.rs\", \"path\": \"http_client.rs\", \"filePath\": \"http_client.rs\", \"url\": \"http_client.rs\", \"symbols\": \"client\" });",
+      "location": "line 3008, column 98",
+      "ordinal": 1,
+      "class": "rust-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
     },
     {
       "path": "crates/aft/src/views/parent/query.rs",
@@ -2328,6 +2592,17 @@
     },
     {
       "path": "crates/aft/tests/integration/subc_translate_test.rs",
+      "line": 633,
+      "column": 26,
+      "token": "filePath",
+      "text": "for key in [\"path\", \"filePath\"] {",
+      "location": "line 633, column 26",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The tool-call regression verifies unsupported HTTP reads are refused explicitly for canonical and legacy inputs."
+    },
+    {
+      "path": "crates/aft/tests/integration/subc_translate_test.rs",
       "line": 600,
       "column": 19,
       "token": "filePath",
@@ -2369,6 +2644,28 @@
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/url_fetch_test.rs",
+      "line": 171,
+      "column": 20,
+      "token": "filePath",
+      "text": "{ \"filePath\": url, \"url\": url, \"symbol\": \"Public extension interfaces\" },",
+      "location": "line 171, column 20",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "The loopback HTTP batch regression retains a legacy filePath target to verify equal URL aliases describe one location."
+    },
+    {
+      "path": "crates/aft/tests/integration/url_fetch_test.rs",
+      "line": 124,
+      "column": 36,
+      "token": "filePath",
+      "text": "for key in [\"target\", \"path\", \"filePath\", \"url\"] {",
+      "location": "line 124, column 36",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
     },
     {
       "path": "crates/aft/tests/integration/tool_call_parity_test.rs",
@@ -2428,10 +2725,10 @@
     {
       "path": "crates/aft/tests/integration/tool_call_parity_test.rs",
       "line": 572,
-      "column": 38,
+      "column": 27,
       "token": "filePath",
-      "text": "\"Provide exactly ONE of 'filePath' or 'url'\",",
-      "location": "line 572, column 38",
+      "text": "\"Conflicting 'filePath' location 'src/main.ts' and 'url' 'https://example.com/doc'\",",
+      "location": "line 572, column 27",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
@@ -3186,28 +3483,6 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "line": 168,
-      "column": 20,
-      "token": "filePath",
-      "text": "\"legacy\": \"filePath\",",
-      "location": "line 168, column 20",
-      "ordinal": 9,
-      "class": "normative_inventory",
-      "reason": "The S0 inventory records canonical/legacy pairs and baseline spellings as contract data."
-    },
-    {
-      "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "line": 170,
-      "column": 31,
-      "token": "filePath",
-      "text": "\"baseline_property\": \"filePath\"",
-      "location": "line 170, column 31",
-      "ordinal": 8,
-      "class": "normative_inventory",
-      "reason": "The S0 inventory records canonical/legacy pairs and baseline spellings as contract data."
-    },
-    {
-      "path": "docs/v0.49-unified-tool-surface-inventory.json",
       "line": 418,
       "column": 80,
       "token": "filePath",
@@ -3693,17 +3968,6 @@
     },
     {
       "path": "packages/aft-bridge/src/coerce.ts",
-      "line": 243,
-      "column": 48,
-      "token": "filePath",
-      "text": "* an array of them). An entry whose path (or `filePath`) and symbol are both",
-      "location": "line 243, column 48",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/coerce.ts",
       "line": 258,
       "column": 27,
       "token": "filePath",
@@ -3721,50 +3985,6 @@
       "text": "// Glob edit (filePath is a glob pattern): Rust reports per-file results plus",
       "location": "line 70, column 17",
       "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/path-aliases.ts",
-      "line": 146,
-      "column": 84,
-      "token": "filePath",
-      "text": "const emptyTarget = blank(source.symbol) && blank(source.path) && blank(source.filePath);",
-      "location": "line 146, column 84",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/path-aliases.ts",
-      "line": 150,
-      "column": 47,
-      "token": "filePath",
-      "text": "normalizeAliasPair(normalized, \"path\", \"filePath\", false);",
-      "location": "line 150, column 47",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/path-aliases.ts",
-      "line": 155,
-      "column": 24,
-      "token": "filePath",
-      "text": ".replace(\"'filePath'\", `'targets[${index}].filePath'`)",
-      "location": "line 155, column 24",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/path-aliases.ts",
-      "line": 155,
-      "column": 56,
-      "token": "filePath",
-      "text": ".replace(\"'filePath'\", `'targets[${index}].filePath'`)",
-      "location": "line 155, column 56",
-      "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
@@ -3809,17 +4029,6 @@
       "text": "normalizeAliasPair(record, \"toPath\", \"toFile\", false);",
       "location": "line 229, column 45",
       "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-bridge/src/path-aliases.ts",
-      "line": 232,
-      "column": 43,
-      "token": "filePath",
-      "text": "normalizeAliasPair(record, \"path\", \"filePath\", false);",
-      "location": "line 232, column 43",
-      "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
@@ -3932,6 +4141,28 @@
       "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "packages/aft-bridge/src/path-aliases.ts",
+      "line": 134,
+      "column": 41,
+      "token": "filePath",
+      "text": "for (const key of [\"target\", \"path\", \"filePath\", \"url\"]) {",
+      "location": "line 134, column 41",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
+    },
+    {
+      "path": "packages/aft-bridge/src/path-aliases.ts",
+      "line": 148,
+      "column": 33,
+      "token": "filePath",
+      "text": "for (const alias of [\"path\", \"filePath\", \"url\"]) delete record[alias];",
+      "location": "line 148, column 33",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "Reviewed batch zoom changes retain this spelling only for quiet legacy-input compatibility or compatibility regression coverage."
     },
     {
       "path": "packages/aft-bridge/src/tool-format.ts",
@@ -4687,6 +4918,17 @@
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
     },
     {
+      "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
+      "line": 376,
+      "column": 46,
+      "token": "filePath",
+      "text": "? definition.description.replaceAll(\"filePath\", \"path\")",
+      "location": "line 376, column 46",
+      "ordinal": 1,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
       "path": "packages/opencode-plugin/src/tools/hoisted.ts",
       "line": 81,
       "column": 62,
@@ -5270,6 +5512,39 @@
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },
     {
+      "path": "packages/opencode-plugin/src/tools/hoisted.ts",
+      "line": 362,
+      "column": 61,
+      "token": "filePath",
+      "text": "// OpenCode 1.18.30's read/write/edit renderers use input.filePath for file",
+      "location": "line 362, column 61",
+      "ordinal": 1,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "packages/opencode-plugin/src/tools/hoisted.ts",
+      "line": 364,
+      "column": 45,
+      "token": "filePath",
+      "text": "return description.replaceAll(\"`path`\", \"`filePath`\").replaceAll('\"path\":', '\"filePath\":');",
+      "location": "line 364, column 45",
+      "ordinal": 1,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
+      "path": "packages/opencode-plugin/src/tools/hoisted.ts",
+      "line": 364,
+      "column": 81,
+      "token": "filePath",
+      "text": "return description.replaceAll(\"`path`\", \"`filePath`\").replaceAll('\"path\":', '\"filePath\":');",
+      "location": "line 364, column 81",
+      "ordinal": 2,
+      "class": "host-display-contract",
+      "reason": "OpenCode 1 read/write/edit renderers require input.filePath headers; the V1 descriptions match that advertised field and V2 projects path."
+    },
+    {
       "path": "packages/opencode-plugin/src/tools/imports.ts",
       "line": 96,
       "column": 15,
@@ -5397,50 +5672,6 @@
       "token": "toFile",
       "text": "if (!isEmptyParam(args.toPath)) rawArgs.toFile = args.toPath;",
       "location": "line 127, column 49",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/opencode-plugin/src/tools/reading.ts",
-      "line": 302,
-      "column": 67,
-      "token": "filePath",
-      "text": "const targetPath = isBlankParam(record.path) ? record.filePath : record.path;",
-      "location": "line 302, column 67",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/opencode-plugin/src/tools/reading.ts",
-      "line": 324,
-      "column": 15,
-      "token": "filePath",
-      "text": "filePath: target.path,",
-      "location": "line 324, column 15",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/opencode-plugin/src/tools/reading.ts",
-      "line": 328,
-      "column": 36,
-      "token": "filePath",
-      "text": "if (hasFilePath) rawArgs.filePath = args.path;",
-      "location": "line 328, column 36",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/opencode-plugin/src/tools/reading.ts",
-      "line": 361,
-      "column": 15,
-      "token": "filePath",
-      "text": ": { filePath: args.path };",
-      "location": "line 361, column 15",
       "ordinal": 1,
       "class": "compatibility-boundary",
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
@@ -6261,50 +6492,6 @@
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },
     {
-      "path": "packages/pi-plugin/src/tools/reading.ts",
-      "line": 520,
-      "column": 69,
-      "token": "filePath",
-      "text": "const targetPath = isBlankParam(record.path) ? record.filePath : record.path;",
-      "location": "line 520, column 69",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/pi-plugin/src/tools/reading.ts",
-      "line": 536,
-      "column": 51,
-      "token": "filePath",
-      "text": "targets: targets.map((target) => ({ filePath: target.path, symbol: target.symbol })),",
-      "location": "line 536, column 51",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/pi-plugin/src/tools/reading.ts",
-      "line": 538,
-      "column": 34,
-      "token": "filePath",
-      "text": "if (hasPath) rawArgs.filePath = params.path;",
-      "location": "line 538, column 34",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
-      "path": "packages/pi-plugin/src/tools/reading.ts",
-      "line": 570,
-      "column": 17,
-      "token": "filePath",
-      "text": ": { filePath: params.path };",
-      "location": "line 570, column 17",
-      "ordinal": 1,
-      "class": "compatibility-boundary",
-      "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
-    },
-    {
       "path": "packages/pi-plugin/src/tools/safety.ts",
       "line": 210,
       "column": 15,
@@ -6740,61 +6927,6 @@
       "token": "filePath",
       "text": "file: resolveProjectPath(rawArgs.filePath),",
       "location": "line 210, column 40",
-      "ordinal": 1,
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/capture-subc-parity.ts",
-      "line": 346,
-      "column": 73,
-      "token": "filePath",
-      "text": "function zoomTargetEntries(agentArgs: Record<string, unknown>): Array<{ filePath: string; symbol: string }> | undefined {",
-      "location": "line 346, column 73",
-      "ordinal": 1,
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/capture-subc-parity.ts",
-      "line": 351,
-      "column": 28,
-      "token": "filePath",
-      "text": "const obj = entry as { filePath?: unknown; symbol?: unknown };",
-      "location": "line 351, column 28",
-      "ordinal": 1,
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/capture-subc-parity.ts",
-      "line": 352,
-      "column": 14,
-      "token": "filePath",
-      "text": "return { filePath: String(obj.filePath ?? \"\"), symbol: String(obj.symbol ?? \"\") };",
-      "location": "line 352, column 14",
-      "ordinal": 1,
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/capture-subc-parity.ts",
-      "line": 352,
-      "column": 35,
-      "token": "filePath",
-      "text": "return { filePath: String(obj.filePath ?? \"\"), symbol: String(obj.symbol ?? \"\") };",
-      "location": "line 352, column 35",
-      "ordinal": 2,
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/capture-subc-parity.ts",
-      "line": 375,
-      "column": 28,
-      "token": "filePath",
-      "text": "target_label: target.filePath,",
-      "location": "line 375, column 28",
       "ordinal": 1,
       "class": "audit-implementation",
       "reason": "The audit or capture implementation names the vocabulary it checks."

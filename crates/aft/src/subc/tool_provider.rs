@@ -2215,15 +2215,25 @@ fn admit_as(
             );
         }
     }
-    let arguments = call
-        .arguments
-        .as_object()
-        .ok_or_else(|| errors::invalid_request("arguments", "arguments must be an object"))?;
+    let mut normalized =
+        crate::subc_translate::normalize_path_arguments(&call.name, call.arguments.clone())
+            .map_err(|error| errors::invalid_request("arguments", error.message))?;
+    let arguments = normalized
+        .as_object_mut()
+        .expect("normalization requires an argument object");
     let properties = tool
         .input_schema
         .get("properties")
         .and_then(Value::as_object)
         .expect("embedded schemas have properties");
+    // The shared normalizer returns `path` for file locations. The catalog
+    // for read/write/edit instead requires `filePath`, so check an equivalent
+    // copy with that name, without changing the original request or catalog.
+    if properties.contains_key("filePath") && !properties.contains_key("path") {
+        if let Some(path) = arguments.remove("path") {
+            arguments.insert("filePath".into(), path);
+        }
+    }
     for key in arguments.keys() {
         if !properties.contains_key(key) {
             return Err(errors::invalid_request(
@@ -2244,7 +2254,7 @@ fn admit_as(
         jsonschema::validator_for(&tool.input_schema)
             .expect("embedded schemas are valid JSON schemas")
     });
-    if let Some(error) = validator.iter_errors(&call.arguments).next() {
+    if let Some(error) = validator.iter_errors(&normalized).next() {
         let field = error.instance_path.to_string();
         return Err(errors::invalid_request(
             if field.is_empty() {
@@ -2490,6 +2500,88 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, errors::INVALID_REQUEST);
         assert_eq!(error.detail.unwrap()["field"], "not_served");
+    }
+
+    #[test]
+    fn admission_accepts_quiet_path_aliases_without_changing_the_call() {
+        for (name, arguments) in [
+            ("read", json!({"path": "fixture.ts"})),
+            ("write", json!({"path": "fixture.ts", "content": "new"})),
+            (
+                "edit",
+                json!({"path": "fixture.ts", "appendContent": "new"}),
+            ),
+            (
+                "move",
+                json!({"filePath": "fixture.ts", "destination": "next.ts"}),
+            ),
+            (
+                "import",
+                json!({"filePath": "fixture.ts", "op": "organize"}),
+            ),
+            ("safety", json!({"filePath": "fixture.ts", "op": "history"})),
+            (
+                "callgraph",
+                json!({"filePath": "fixture.ts", "op": "callers", "symbol": "run"}),
+            ),
+            (
+                "callgraph",
+                json!({"filePath": "fixture.ts", "op": "trace_to_symbol", "symbol": "run", "toSymbol": "next", "toFile": "next.ts"}),
+            ),
+        ] {
+            let request = call(name, arguments.clone());
+            admit_plain(&request, &[], true, "session", true)
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(request.arguments, arguments, "{name}");
+        }
+    }
+
+    #[test]
+    fn admission_accepts_quiet_edit_forms() {
+        for fields in [
+            json!({"oldString": "old", "newString": "new"}),
+            json!({"edits": [{"oldText": "old", "newText": "new"}]}),
+            json!({"edits": "[{\"oldText\":\"old\",\"newText\":\"new\"}]"}),
+            json!({"edits": [{"oldText": "old", "newText": "new", "replaceAll": "true"}]}),
+            json!({"edits": [{"oldText": "old", "newText": "new", "occurrence": "2"}]}),
+        ] {
+            let mut arguments = fields;
+            arguments["filePath"] = json!("fixture.ts");
+            admit_plain(&call("edit", arguments.clone()), &[], true, "session", true)
+                .unwrap_or_else(|error| panic!("{arguments}: {error:?}"));
+        }
+    }
+
+    #[test]
+    fn zoom_catalog_advertises_only_batch_arguments() {
+        for preset in [
+            CatalogPreset::Head,
+            CatalogPreset::Worker,
+            CatalogPreset::Reader,
+        ] {
+            let tools = tools_for_session(preset, &[], true, false);
+            let zoom = tools.iter().find(|tool| tool.name == "zoom").unwrap();
+            let properties = zoom.input_schema["properties"].as_object().unwrap();
+            assert_eq!(
+                properties
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["batch", "callgraph", "contextLines"]),
+                "{preset:?}"
+            );
+            assert_eq!(zoom.input_schema["required"], json!(["batch"]));
+            let entry = &properties["batch"]["items"];
+            assert_eq!(
+                entry["properties"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["target", "symbols"])
+            );
+        }
     }
 
     #[test]
@@ -4477,6 +4569,70 @@ mod route_tests {
     fn error_body(reply: &WriterFrame) -> subc_protocol::ErrorBody {
         assert_eq!(reply.header.ty, FrameType::Error);
         serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    async fn assert_v1_zoom_alias_dispatch(arguments: Value) {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        LAST_DISPATCH.lock().unwrap().take();
+        let reply = exchange(
+            json!({"name": "zoom", "arguments": arguments}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["isError"], false, "{body}");
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
+        let dispatched = LAST_DISPATCH.lock().unwrap().take().unwrap();
+        assert_eq!(dispatched["command"], "zoom");
+        let targets = dispatched["params"]["targets"].as_array().unwrap();
+        assert_eq!(targets.len(), 1, "{dispatched}");
+        assert!(
+            std::path::Path::new(targets[0]["file"].as_str().unwrap()).ends_with("fixture.ts"),
+            "{dispatched}"
+        );
+        assert_eq!(targets[0]["symbol"], "run");
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_legacy_path_symbols_reaches_dispatch() {
+        assert_v1_zoom_alias_dispatch(json!({"path": "fixture.ts", "symbols": "run"})).await;
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_legacy_targets_reaches_dispatch() {
+        assert_v1_zoom_alias_dispatch(
+            json!({"targets": [{"path": "fixture.ts", "symbols": "run"}]}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn v1_zoom_conflicting_locations_names_both_without_dispatch() {
+        let _guard = EXCHANGE_LOCK.lock().await;
+        ACTIONS.store(0, Ordering::SeqCst);
+        let reply = exchange(
+            json!({"name": "zoom", "arguments": {
+                "path": "fixture.ts", "target": "other.ts", "symbols": "run"
+            }}),
+            RouteRole::ToolProviderV1,
+            "session",
+            vec![],
+        )
+        .await;
+        let error = error_body(&reply);
+        assert_eq!(error.code, "invalid_request");
+        assert!(error.message.contains("'path'"), "{error:?}");
+        assert!(error.message.contains("'target'"), "{error:?}");
+        assert_eq!(ACTIONS.load(Ordering::SeqCst), 0);
     }
 
     fn presets_health(metrics: &DispatchPathMetrics) -> Value {

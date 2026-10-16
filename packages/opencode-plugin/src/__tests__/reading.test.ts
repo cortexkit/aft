@@ -259,9 +259,9 @@ describe("reading tool adapters", () => {
         sessionId: "reading-session",
         name: "zoom",
         rawArgs: {
-          targets: [
-            { filePath: "src/a.ts", symbol: "foo" },
-            { filePath: "src/b.ts", symbol: "bar" },
+          batch: [
+            { target: "src/a.ts", symbols: "foo" },
+            { target: "src/b.ts", symbols: "bar" },
           ],
         },
       },
@@ -289,7 +289,7 @@ describe("reading tool adapters", () => {
         createMockSdkContext(root),
       );
       expect(toolCallCalls.at(-1)?.rawArgs).toEqual({
-        targets: targets.map(({ path, symbol }) => ({ filePath: path, symbol })),
+        batch: targets.map(({ path, symbol }) => ({ target: path, symbols: symbol })),
       });
     }
     await tools.aft_zoom.execute(
@@ -297,7 +297,7 @@ describe("reading tool adapters", () => {
       createMockSdkContext(root),
     );
     expect(toolCallCalls.at(-1)?.rawArgs).toEqual({
-      targets: [{ filePath: "src/a.ts", symbol: "foo" }],
+      batch: [{ target: "src/a.ts", symbols: "foo" }],
     });
     expect(toolCallCalls).toHaveLength(3);
   });
@@ -307,7 +307,7 @@ describe("reading tool adapters", () => {
     const { toolCallCalls, tools } = createMockReadingHarness(() => ({ success: true }));
     for (const targets of ["[{bad", "not JSON", "42", 42]) {
       await expect(tools.aft_zoom.execute({ targets }, createMockSdkContext(root))).rejects.toThrow(
-        /targets must be an array of \{path, symbol\}/,
+        /targets must be an array of \{target, symbols\}/,
       );
     }
     expect(toolCallCalls).toHaveLength(0);
@@ -371,13 +371,14 @@ describe("reading tool adapters", () => {
     expect(sendCalls).toHaveLength(0);
     expect(toolCallCalls.map((call) => call.rawArgs)).toEqual([
       {
-        targets: [{ filePath: "x", symbol: "x" }],
-        filePath: "src/a.ts",
-        symbols: ["foo", "bar"],
+        batch: [
+          { target: "src/a.ts", symbols: ["foo", "bar"] },
+          { target: "x", symbols: "x" },
+        ],
       },
     ]);
 
-    // A path and a url together are still two different files: refused.
+    // Different location aliases are refused.
     await expect(
       tools.aft_zoom.execute(
         {
@@ -387,7 +388,7 @@ describe("reading tool adapters", () => {
         },
         createMockSdkContext(root),
       ),
-    ).rejects.toThrow(/not both/);
+    ).rejects.toThrow(/Conflicting/);
     expect(toolCallCalls).toHaveLength(1);
   });
 
@@ -418,7 +419,7 @@ describe("reading tool adapters", () => {
       {
         sessionId: "reading-session",
         name: "zoom",
-        rawArgs: { filePath: "src/a.ts", symbols: "foo" },
+        rawArgs: { batch: [{ target: "src/a.ts", symbols: "foo" }] },
       },
     ]);
 
@@ -437,7 +438,7 @@ describe("reading tool adapters", () => {
       {
         sessionId: "reading-session",
         name: "zoom",
-        rawArgs: { filePath: "src/a.ts", symbols: "foo" },
+        rawArgs: { batch: [{ target: "src/a.ts", symbols: "foo" }] },
       },
     ]);
   });
@@ -490,7 +491,7 @@ describe("reading tool adapters", () => {
       {
         sessionId: "reading-session",
         name: "zoom",
-        rawArgs: { filePath: "src/job.rs", symbols: "a b" },
+        rawArgs: { batch: [{ target: "src/job.rs", symbols: "a b" }] },
       },
     ]);
     expect(text).toBe("server-rendered batch text");
@@ -562,9 +563,9 @@ describe("reading tool adapters", () => {
     expect(sendCalls).toHaveLength(0);
     expect(toolCallCalls.map((call) => call.rawArgs)).toEqual([
       {
-        targets: [
-          { filePath: "src/a.ts", symbol: "" },
-          { filePath: "", symbol: "x" },
+        batch: [
+          { target: "src/a.ts", symbols: "" },
+          { target: "", symbols: "x" },
         ],
       },
     ]);
@@ -599,17 +600,17 @@ describe("reading tool adapters", () => {
       {
         sessionId: "reading-session",
         name: "zoom",
-        rawArgs: { targets: [{ filePath: "src/a.ts", symbol: "foo" }], callgraph: true },
+        rawArgs: { batch: [{ target: "src/a.ts", symbols: "foo" }], callgraph: true },
       },
       {
         sessionId: "reading-session",
         name: "zoom",
-        rawArgs: { filePath: "src/a.ts", symbols: ["foo"], callgraph: true },
+        rawArgs: { batch: [{ target: "src/a.ts", symbols: ["foo"] }], callgraph: true },
       },
       {
         sessionId: "reading-session",
         name: "zoom",
-        rawArgs: { filePath: "src/a.ts", callgraph: true },
+        rawArgs: { batch: [{ target: "src/a.ts", symbols: "" }], callgraph: true },
       },
     ]);
 
@@ -623,8 +624,78 @@ describe("reading tool adapters", () => {
     expect(toolCallCalls[0]).toEqual({
       sessionId: "reading-session",
       name: "zoom",
-      rawArgs: { filePath: "src/a.ts", symbols: "foo" },
+      rawArgs: { batch: [{ target: "src/a.ts", symbols: "foo" }] },
     });
     expect(toolCallCalls[0]?.rawArgs).not.toHaveProperty("callgraph");
   });
+});
+
+test("zoom advertises only a required non-empty batch and shared options", () => {
+  const harness = createMockReadingHarness(() => ({ success: true, text: "zoom" }));
+  const definition = harness.tools.aft_zoom;
+  expect(Object.keys(definition.args).sort()).toEqual(["batch", "callgraph", "contextLines"]);
+  expect(definition.args.batch.safeParse([]).success).toBe(false);
+  expect(definition.args.batch.safeParse([{ target: "a.ts", symbols: "main" }]).success).toBe(true);
+  expect(definition.description).toContain("batch: [{ target, symbols }]");
+  expect(definition.description).not.toContain("{ path, symbols }");
+  expect(definition.description).not.toContain("{ url, symbols }");
+});
+
+test("zoom canonical batch mixes files and URLs and preserves symbol arrays", async () => {
+  const harness = createMockReadingHarness(() => ({ success: true, text: "zoom" }));
+  const batch = [
+    { target: "http_client.rs", symbols: ["client", "connect"] },
+    { target: "https://example.test/docs", symbols: "Overview" },
+  ];
+  await harness.tools.aft_zoom.execute(
+    { batch, contextLines: 2, callgraph: true },
+    createMockSdkContext(process.cwd()),
+  );
+  expect(harness.toolCallCalls[0].rawArgs).toEqual({ batch, contextLines: 2, callgraph: true });
+});
+
+test("zoom quietly maps every legacy location shape to batch", async () => {
+  for (const key of ["target", "path", "filePath", "url"]) {
+    for (const input of [
+      { [key]: "https://example.test/docs", symbols: "Overview" },
+      { targets: [{ [key]: "https://example.test/docs", symbol: "Overview" }] },
+    ]) {
+      const harness = createMockReadingHarness(() => ({ success: true, text: "zoom" }));
+      await harness.tools.aft_zoom.execute(input, createMockSdkContext(process.cwd()));
+      expect(harness.toolCallCalls[0].rawArgs).toEqual({
+        batch: [{ target: "https://example.test/docs", symbols: "Overview" }],
+      });
+    }
+  }
+});
+
+test("zoom refuses empty batch and conflicting locations before dispatch", async () => {
+  const harness = createMockReadingHarness(() => ({ success: true, text: "zoom" }));
+  const tool = harness.tools.aft_zoom;
+  await expect(tool.execute({ batch: [] }, createMockSdkContext(process.cwd()))).rejects.toThrow(
+    "'batch'",
+  );
+  await expect(
+    tool.execute(
+      { batch: [{ target: "a.rs", url: "b.rs", symbols: "main" }] },
+      createMockSdkContext(process.cwd()),
+    ),
+  ).rejects.toThrow("'b.rs'");
+  expect(harness.toolCallCalls).toHaveLength(0);
+});
+
+test("committed zoom schema pins the batch-only surface without root unions", async () => {
+  const schemas = await Bun.file(
+    new URL("../../../../crates/aft/src/subc_tool_schemas.json", import.meta.url),
+  ).json();
+  const schema = schemas.zoom;
+  expect(Object.keys(schema.properties).sort()).toEqual(["batch", "callgraph", "contextLines"]);
+  expect(schema.required).toEqual(["batch"]);
+  expect(schema.properties.batch.minItems).toBe(1);
+  expect(Object.keys(schema.properties.batch.items.properties).sort()).toEqual([
+    "symbols",
+    "target",
+  ]);
+  expect(schema.properties.batch.items.required.sort()).toEqual(["symbols", "target"]);
+  for (const key of ["anyOf", "oneOf", "allOf"]) expect(schema[key]).toBeUndefined();
 });

@@ -9195,7 +9195,8 @@ fn collect_semantic_file(
 
         #[cfg(test)]
         crate::search_hot_path_measurements::record_file_read();
-        let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
+        let source =
+            crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
         indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
             cache_freshness::hash_bytes(source.as_bytes())
         } else {
@@ -9235,7 +9236,7 @@ pub fn collect_file_chunks_for_census(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
+    let source = crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
     let tree =
         parse_source_with_cached_parser(file, &source, lang).map_err(|error| error.to_string())?;
     let symbols =
@@ -9256,7 +9257,7 @@ fn collect_file_chunks(project_root: &Path, file: &Path) -> Result<Vec<SemanticC
     if fs::metadata(file).is_ok_and(|m| m.len() > MAX_SEMANTIC_FILE_BYTES) {
         return Ok(Vec::new());
     }
-    let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
+    let source = crate::project_content::read_to_string(file).map_err(|error| error.to_string())?;
     collect_file_chunks_from_source(project_root, file, lang, &source)
 }
 

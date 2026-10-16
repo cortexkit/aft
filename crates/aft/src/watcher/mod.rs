@@ -114,7 +114,7 @@ impl From<io::Error> for StableReadError {
 pub fn read_stable_file(path: &Path) -> Result<StableRead<Vec<u8>>, StableReadError> {
     read_stable(
         || Ok(FileStamp::from_metadata(&fs::metadata(path)?)),
-        || fs::read(path),
+        || crate::project_content::read(path),
     )
 }
 

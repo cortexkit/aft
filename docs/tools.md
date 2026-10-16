@@ -664,37 +664,26 @@ are listed under `skipped_files` with a per-file `reason` (e.g. `parse_error`,
 
 ### aft_zoom
 
-Inspect code symbols. Returns the full source of named symbols. Pass `callgraph: true` to also
-annotate each symbol with `calls_out` (what it calls) and `called_by` (what calls it); it
-defaults to `false` to keep output minimal. Use exactly one input mode.
-
-Use this when you need to understand a specific function, class, or type in detail — not for
-reading entire files (use `read` for that).
+Inspect code symbols or documentation sections using one non-empty `batch` array.
+Each entry has a `target` and `symbols` (a string or string array). Targets are auto-detected
+as file paths (absolute or relative to the project root), HTTP/HTTPS URLs, or `issue://N` /
+`pr://N` when GitHub reads are enabled. Files and URLs can share the same batch.
+For Markdown and HTML, use the heading text as the symbol name.
 
 ```json
-// Single symbol in a file
-{ "path": "src/app.ts", "symbols": "handleRequest" }
+// One lookup
+{ "batch": [{ "target": "src/app.ts", "symbols": "handleRequest" }] }
 
-// Add call-graph annotations (calls_out / called_by) for the symbol
-{ "path": "src/app.ts", "symbols": "handleRequest", "callgraph": true }
-
-// Multiple symbols in the SAME file (polymorphic: string or array)
-{ "path": "src/app.ts", "symbols": ["Config", "createApp"] }
-
-// Cross-file batch — each target names its own file
-{ "targets": [
-  { "path": "src/app.ts", "symbol": "createApp" },
-  { "path": "src/db.ts", "symbol": "connect" }
-] }
-
-// Section of a remote/cached document by heading (OpenCode)
-{ "url": "https://docs.example.com/api.md", "symbols": "Authentication" }
+// Mix a file and a remote document; options apply to every entry
+{ "batch": [
+  { "target": "src/app.ts", "symbols": ["Config", "createApp"] },
+  { "target": "https://docs.example.com/api.md", "symbols": "Authentication" }
+], "contextLines": 3, "callgraph": true }
 ```
 
-`symbols` (string or array, same file), `targets` (cross-file array), and `path`/`url`
-(single-file or URL) are mutually exclusive — pass exactly one mode. For Markdown/HTML, use the
-heading text as the symbol name. Cross-file batches return partial results with per-symbol
-`symbol_not_found` rather than failing the whole call.
+`callgraph` defaults to `false`. Enabling it adds `calls_out` and `called_by` annotations.
+Each failed lookup reports its own error line while other entries still return results.
+Use `read` rather than zoom to read an entire local file.
 
 ---
 

@@ -447,7 +447,10 @@ where
                 holder: claimed,
             } => {
                 holder = Some((ask, claimed));
-                let running = rerun(AskRoute::Consent { once });
+                let running = rerun(AskRoute::Consent {
+                    once,
+                    worker: access_grants::alfonso_worker(&call.identity),
+                });
                 tokio::pin!(running);
                 let (response, text) = loop {
                     tokio::select! {

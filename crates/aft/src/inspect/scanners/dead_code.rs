@@ -250,7 +250,7 @@ impl DeadCodeFileAnalyzer {
             return FileAnalysis::default();
         }
 
-        let Ok(source) = fs::read_to_string(file) else {
+        let Ok(source) = crate::project_content::read_to_string(file) else {
             return FileAnalysis::default();
         };
         let needs_tree = needs_type_refs

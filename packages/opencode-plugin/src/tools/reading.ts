@@ -1,11 +1,4 @@
-import {
-  coerceBoolean,
-  coerceJsonCollectionParam,
-  coerceTargetParam,
-  formatZoomText,
-  isBlankParam,
-  usableZoomTargets,
-} from "@cortexkit/aft-bridge";
+import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { resolveGithubConfig, toolEnabled } from "../config.js";
@@ -28,32 +21,16 @@ function isGithubPathArg(value: unknown): boolean {
   return typeof value === "string" && (value.startsWith("issue://") || value.startsWith("pr://"));
 }
 
-function buildZoomTitle(args: {
-  path?: string;
-  url?: string;
-  symbols?: string | string[];
-  targets?: { path: string; symbol: string } | Array<{ path: string; symbol: string }>;
-}): string {
-  const targets = args.targets;
-  if (!isEmptyParam(targets)) {
-    if (Array.isArray(targets)) {
-      if (targets.length === 1) {
-        return `${targets[0].path}#${targets[0].symbol}`;
-      }
-      return `${targets.length} targets across files`;
-    }
-    if (targets && typeof targets === "object") {
-      return `${targets.path}#${targets.symbol}`;
-    }
-  }
+function isUrl(value: string): boolean {
+  return value.startsWith("http://") || value.startsWith("https://");
+}
 
-  const path = args.path ?? args.url ?? "";
-  if (typeof args.symbols === "string") return path ? `${path}#${args.symbols}` : args.symbols;
-  if (Array.isArray(args.symbols) && args.symbols.length > 0) {
-    if (args.symbols.length === 1) return path ? `${path}#${args.symbols[0]}` : args.symbols[0];
-    return path ? `${path} (${args.symbols.length} symbols)` : `${args.symbols.length} symbols`;
-  }
-  return path || "(no target)";
+function buildZoomTitle(args: {
+  batch: Array<{ target: string; symbols: string | string[] }>;
+}): string {
+  if (args.batch.length !== 1) return `${args.batch.length} locations`;
+  const entry = args.batch[0];
+  return `${entry.target}#${Array.isArray(entry.symbols) ? entry.symbols.join(", ") : entry.symbols}`;
 }
 
 interface ZoomBatchSymbolResult {
@@ -98,7 +75,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
   );
   const githubZoomDescription = whenGhReadEnabled(
     ghReadEnabled,
-    "GitHub issue and pull-request discussion ordinals can be zoomed with `path: issue://…` or `path: pr://…` and `symbols`.",
+    "Batch targets may use `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms) to inspect GitHub discussion ordinals.",
   );
   const tools = prepareToolMap({
     aft_outline: {
@@ -196,178 +173,65 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
     aft_zoom: {
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse `{ path, symbols }` or `{ url, symbols }` for one file/URL. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them. Sending both merges them into one batch; a lookup that fails reports its own error line." +
+        'Inspect code symbols or documentation sections. Use `batch: [{ target, symbols }]` for a single lookup. Mix files and URLs in one batch, for example `batch: [{ target: "src/app.ts", symbols: "run" }, { target: "https://example.com/docs", symbols: "Overview" }]`. Each target is auto-detected as a file path or an HTTP/HTTPS URL. `symbols` is a string or string array. Markdown and HTML lookups return the section under the heading. Top-level `contextLines` and `callgraph` apply to every entry; callgraph adds calls-out and called-by annotations. Each failed lookup reports its own error line.' +
         (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
       args: {
-        path: z.string().optional().describe("Path to file (absolute or relative to project root)"),
-        url: z
-          .string()
-          .optional()
-          .describe("HTTP/HTTPS URL of an HTML or Markdown document to fetch and zoom into"),
-        symbols: z
-          .union([z.string(), z.array(z.string())])
-          .optional()
-          .describe(
-            "Symbol name for code, or heading text for Markdown/HTML. Pass a string for one lookup or an array for batched lookups in the same file/URL.",
-          ),
-        targets: z
-          .union([
+        batch: z
+          .array(
             z.object({
-              path: z.string().describe("Path to file (absolute or relative to project root)"),
-              symbol: z.string().describe("Symbol name in that file"),
+              target: z
+                .string()
+                .describe(
+                  "File path (absolute or project-relative) or HTTP/HTTPS URL, auto-detected; issue://N or pr://N when GitHub reads are enabled",
+                ),
+              symbols: z
+                .union([z.string(), z.array(z.string())])
+                .describe(
+                  "Symbol name for code or heading text for Markdown/HTML; a string or array of strings",
+                ),
             }),
-            z.array(
-              z.object({
-                path: z.string().describe("Path to file (absolute or relative to project root)"),
-                symbol: z.string().describe("Symbol name in that file"),
-              }),
-            ),
-          ])
-          .optional()
-          .describe(
-            "Cross-file batch: `{ path, symbol }` or an array of them. May be combined with path/url + symbols; all lookups are answered in one batch.",
-          ),
+          )
+          .min(1)
+          .describe("One or more lookups; entries may mix file paths and URLs"),
         contextLines: optionalInt(1, Number.MAX_SAFE_INTEGER).describe(
-          "Lines of context before/after the symbol (default: 3)",
+          "Lines of context before/after each symbol (default: 3)",
         ),
         callgraph: z
           .boolean()
           .optional()
-          .describe(
-            "Include call-graph annotations (calls-out / called-by within the same file). Default false; off keeps zoom output minimal.",
-          ),
+          .describe("Include call-graph annotations for every entry (default: false)"),
       },
       execute: async (args, context): Promise<ToolResult> => {
-        // Some models fill every declared property on every call, sending
-        // empty strings / arrays / objects (or whitespace) for the ones they
-        // do not mean. Blank values count as absent, and `targets` entries
-        // whose path and symbol are both blank are dropped as placeholders.
-        const targetsInput = coerceJsonCollectionParam(args.targets, "targets");
-        const targetEntries = usableZoomTargets(targetsInput);
-        const hasFilePath = !isBlankParam(args.path);
-        const hasUrl = !isBlankParam(args.url);
-        const hasTargets = targetEntries.length > 0;
-        const hasSymbols = !isBlankParam(args.symbols);
-        // Coerce at the boundary: stringified "true" must request callgraph (coerceBoolean).
-        const wantCallgraph = coerceBoolean(args.callgraph);
+        if (!Array.isArray(args.batch) || args.batch.length === 0)
+          throw new Error("'batch' must be a non-empty array of {target, symbols}");
+        // Remote targets are fetched by Rust; only filesystem locations need
+        // external-directory approval before dispatch.
+        const paths = args.batch
+          .map((entry) => entry.target)
+          .filter((target) => target && !isGithubPathArg(target) && !isUrl(target));
+        const resolved = await Promise.all(
+          paths.map((target) => resolvePathArg(ctx, context, target)),
+        );
+        const permissionDenied = await assertPathExternalPermissions(ctx, context, resolved);
+        if (permissionDenied) return permissionDeniedResponse(permissionDenied);
+        const rawArgs: Record<string, unknown> = { batch: args.batch };
         const contextLines = coerceOptionalInt(
           args.contextLines,
           "contextLines",
           1,
           Number.MAX_SAFE_INTEGER,
         );
-
-        // TUI title + scalar metadata for the tool-call header. OpenCode's UI
-        // only auto-renders SCALAR args (strings, numbers, booleans) — arrays
-        // and objects are dropped from the `[key=value, ...]` line. Stringify
-        // collection-shaped args here so `targets`/`symbols` stay visible.
-        // Attached to every successful return via `withMeta`. (Error paths
-        // can't carry a title: OpenCode skips `tool.execute.after` when execute
-        // throws, and the plugin `context.metadata()` callback is unbridged, so
-        // the return value is the only channel that survives.)
-        const zoomTitle = buildZoomTitle({
-          ...args,
-          targets: (hasTargets ? targetEntries : undefined) as Parameters<
-            typeof buildZoomTitle
-          >[0]["targets"],
-        });
-        const zoomDisplay: Record<string, unknown> = { title: zoomTitle };
-        if (hasFilePath) zoomDisplay.path = args.path;
-        if (hasUrl) zoomDisplay.url = args.url;
-        if (hasSymbols) {
-          zoomDisplay.symbols =
-            typeof args.symbols === "string" ? args.symbols : JSON.stringify(args.symbols);
-        }
-        if (hasTargets) zoomDisplay.targets = JSON.stringify(targetEntries);
-        if (contextLines !== undefined) zoomDisplay.contextLines = contextLines;
-        if (wantCallgraph) zoomDisplay.callgraph = true;
-        const withMeta = (output: string): ToolResult => ({
-          output,
-          title: zoomTitle,
-          metadata: zoomDisplay,
-        });
-
-        // Cross-file batch. `path`/`url` + `symbols` sent alongside `targets`
-        // join the same batch instead of being refused: the server answers
-        // every lookup and reports each one that fails on its own line.
-        if (hasTargets) {
-          if (hasFilePath && hasUrl) {
-            throw new Error("Provide exactly ONE of 'path' or 'url' — not both");
-          }
-          const targets = targetEntries.map((entry, i) => {
-            if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-              throw new Error(`targets[${i}].path must be a non-empty string`);
-            }
-            const record = entry as Record<string, unknown>;
-            const targetPath = isBlankParam(record.path) ? record.filePath : record.path;
-            return {
-              path: typeof targetPath === "string" ? targetPath : "",
-              symbol: typeof record.symbol === "string" ? record.symbol : "",
-            };
-          });
-          const localPaths = targets
-            .map((target) => target.path)
-            .filter((path) => path.trim().length > 0 && !isGithubPathArg(path));
-          if (hasFilePath && !isGithubPathArg(args.path)) localPaths.push(args.path as string);
-          const resolvedTargets = await Promise.all(
-            localPaths.map((path) => resolvePathArg(ctx, context, path)),
-          );
-          const permissionDenied = await assertPathExternalPermissions(
-            ctx,
-            context,
-            resolvedTargets,
-          );
-          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
-
-          const rawArgs: Record<string, unknown> = {
-            targets: targets.map((target) => ({
-              filePath: target.path,
-              symbol: target.symbol,
-            })),
-          };
-          if (hasFilePath) rawArgs.filePath = args.path;
-          else if (hasUrl) rawArgs.url = args.url;
-          if (hasSymbols) rawArgs.symbols = args.symbols;
-          if (contextLines !== undefined) rawArgs.contextLines = contextLines;
-          if (wantCallgraph) rawArgs.callgraph = true;
-
-          const response = await callToolCall(ctx, context, "zoom", rawArgs);
-          if (response.success === false) {
-            throw new Error(response.text || response.message || "zoom failed");
-          }
-          return withMeta(response.text);
-        }
-
-        if (!hasFilePath && !hasUrl) {
-          throw new Error("Provide exactly one of 'path', 'url', or 'targets'");
-        }
-        if (hasFilePath && hasUrl) {
-          throw new Error("Provide exactly ONE of 'path' or 'url' — not both");
-        }
-
-        // URL mode passes through to Rust; Rust fetches, validates, and caches.
-        // File mode still resolves locally before dispatch so external-directory
-        // permission checks approve the same path the server will read.
-        const githubPath =
-          (hasFilePath && isGithubPathArg(args.path)) || (hasUrl && isGithubPathArg(args.url));
-        if (!hasUrl && !githubPath) {
-          const file = await resolvePathArg(ctx, context, args.path as string);
-          const permissionDenied = await assertPathExternalPermissions(ctx, context, file);
-          if (permissionDenied) return permissionDeniedResponse(permissionDenied);
-        }
-
-        const rawArgs: Record<string, unknown> = hasUrl
-          ? { url: args.url }
-          : { filePath: args.path };
-        if (hasSymbols) rawArgs.symbols = args.symbols;
         if (contextLines !== undefined) rawArgs.contextLines = contextLines;
-        if (wantCallgraph) rawArgs.callgraph = true;
-
+        if (coerceBoolean(args.callgraph)) rawArgs.callgraph = true;
         const response = await callToolCall(ctx, context, "zoom", rawArgs);
-        if (response.success === false) {
+        if (response.success === false)
           throw new Error(response.text || response.message || "zoom failed");
-        }
-        return withMeta(response.text);
+        const title = buildZoomTitle({ batch: args.batch });
+        return {
+          output: response.text,
+          title,
+          metadata: { title, ...rawArgs, batch: JSON.stringify(args.batch) },
+        };
       },
     },
   });

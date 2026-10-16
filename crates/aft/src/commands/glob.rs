@@ -70,7 +70,14 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         Some(path) => match resolve_path_or_multi(
             path,
             &project_root,
-            |candidate| ctx.validate_read_path(&req.id, req.session(), candidate),
+            |candidate| {
+                ctx.validate_search_path(
+                    &req.id,
+                    req.session(),
+                    candidate,
+                    crate::context::WorkerSearchTool::Glob,
+                )
+            },
             &req.id,
         ) {
             Ok(SearchPathResolution::Single(root)) => vec![root],
