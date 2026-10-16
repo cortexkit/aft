@@ -67,6 +67,248 @@ fn catalog_request(raw: Value) -> Value {
     json!({"preset":"worker","params":{"allow_paths":raw}})
 }
 
+fn worker_at_parent_epoch(root: &Path, parent: &str, epoch: u64) -> RouteIdentity {
+    let mut worker = identity(root, "worker", "worker", Some(parent));
+    Arc::get_mut(&mut worker.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .parent
+        .as_mut()
+        .unwrap()
+        .scope_epoch = epoch;
+    worker
+}
+
+#[test]
+fn grants_head_policy_survives_an_unregistered_parent_epoch() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = worker_at_parent_epoch(&worker.project_root, "head", 12);
+    let target = head
+        .project_root
+        .join(".cortexkit")
+        .join("parent-inputs")
+        .join("setup-process-preview-original-r1");
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    let grants = operation(json!({}), "grants.list", &worker, &ctx).unwrap();
+    assert_eq!(grants["grants"].as_array().unwrap().len(), 1);
+    assert_eq!(grants["grants"][0]["path"], json!(target));
+    assert_eq!(grants["grants"][0]["mode"], "read");
+}
+
+#[test]
+fn grants_head_policy_ended_epoch_blocks_older_live_policy() {
+    let (_dir, ctx, head, worker) = fixture();
+    let mut ended = scope_key(&head);
+    ended.epoch = 10;
+    store::end_scope_grants(&ctx.db().unwrap().lock().unwrap(), &ended).unwrap();
+    for epoch in [10, 12] {
+        let worker = worker_at_parent_epoch(&worker.project_root, "head", epoch);
+        let error = remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+            &worker,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+    }
+}
+
+#[test]
+fn grants_head_policy_does_not_cross_scope_refs() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = worker_at_parent_epoch(&worker.project_root, "different-head", 12);
+    let error = remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+}
+
+#[test]
+fn grants_head_policy_does_not_cross_owners_or_read_future_epochs() {
+    let (_dir, ctx, head, worker) = fixture();
+    let mut other_owner = worker_at_parent_epoch(&worker.project_root, "head", 12);
+    Arc::get_mut(&mut other_owner.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .parent
+        .as_mut()
+        .unwrap()
+        .owner =
+        serde_json::from_value(json!({"kind":"reserved","module_id":"another-owner"})).unwrap();
+    let earlier = worker_at_parent_epoch(&worker.project_root, "head", 6);
+    for caller in [&other_owner, &earlier] {
+        let error = remote_policy::catalog(
+            catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+            caller,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+    }
+}
+
+#[test]
+fn grants_head_policy_prefers_the_latest_restrictions() {
+    let (_dir, ctx, head, worker) = fixture();
+    let mut newer_head = identity(&worker.project_root, "head", "head", None);
+    Arc::get_mut(&mut newer_head.0)
+        .unwrap()
+        .scope
+        .as_mut()
+        .unwrap()
+        .scope_epoch = 10;
+    register(&newer_head, &ctx).unwrap();
+    store::set_mode(
+        &ctx.db().unwrap().lock().unwrap(),
+        &scope_key(&newer_head),
+        crate::access_policy::ApprovalMode::Ask,
+    )
+    .unwrap();
+    let worker = worker_at_parent_epoch(&worker.project_root, "head", 12);
+    let error = remote_policy::catalog(
+        catalog_request(json!([{"path":head.project_root,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
+}
+
+#[test]
+fn grants_head_policy_rechecks_revocation_at_source_epoch() {
+    let (_dir, ctx, head, worker) = fixture();
+    let worker = worker_at_parent_epoch(&worker.project_root, "head", 12);
+    let target = worker.project_root.join("shared");
+    store::insert(
+        &ctx.db().unwrap().lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: target.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    remote_policy::catalog(
+        catalog_request(json!([{"path":target,"mode":"read"}])),
+        &worker,
+        &ctx,
+    )
+    .unwrap();
+    operation(json!({"path":target}), "grants.revoke", &head, &ctx).unwrap();
+    let error = remote_policy::catalog(json!({"preset":"worker"}), &worker, &ctx).unwrap_err();
+    assert_eq!(error.detail.unwrap()["reason"], "head_not_held");
+}
+
+#[test]
+fn grants_head_policy_missing_is_unknown_not_not_held() {
+    let (_dir, _ctx, head, _worker) = fixture();
+    let error = validate(
+        &json!([{"path":head.project_root,"mode":"read"}]),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "plan_param_refused");
+    assert_eq!(error.detail.unwrap()["reason"], "head_policy_unknown");
+}
+
+#[test]
+fn grants_allow_paths_refusals_log_entry_and_head_at_info() {
+    const CHILD: &str = "AFT_TEST_ALLOW_PATHS_LOG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // A separate test process keeps the global logger independent of other tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc::access_grants::tests::grants_allow_paths_refusals_log_entry_and_head_at_info",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    static LINES: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+    struct Logger;
+    impl log::Log for Logger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            LINES
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", record.level(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+    log::set_logger(&Logger).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+    let (_dir, ctx, head, worker) = fixture();
+    let unknown = worker_at_parent_epoch(&worker.project_root, "missing-head", 12);
+    for (caller, raw, index, reason, path, head_ref, epoch) in [
+        (
+            &head,
+            json!([{"path":head.project_root,"mode":"read"},{"path":"relative","mode":"read"}]),
+            1,
+            "not_absolute",
+            json!("relative"),
+            "head",
+            7,
+        ),
+        (
+            &unknown,
+            json!([{"path":head.project_root,"mode":"read"}]),
+            0,
+            "head_policy_unknown",
+            json!(head.project_root),
+            "missing-head",
+            12,
+        ),
+        (&head, json!({}), 0, "malformed", Value::Null, "head", 7),
+    ] {
+        remote_policy::catalog(catalog_request(raw), caller, &ctx).unwrap_err();
+        let lines: Vec<_> = LINES
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter(|line| line.contains("allow_paths refused:"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        for expected in [
+            "INFO allow_paths refused:".to_owned(),
+            format!("index={index}"),
+            format!("reason={reason}"),
+            format!("path={path}"),
+            "prefrontal-core".to_owned(),
+            format!("scope_ref: \"{head_ref}\""),
+            format!("epoch: {epoch}"),
+        ] {
+            assert!(line.contains(&expected), "missing {expected:?} in {line}");
+        }
+    }
+}
+
 #[test]
 fn grants_allow_paths_accepts_a_literal_tilde_inside_an_absolute_path() {
     // Windows short names (C:\Users\RUNNER~1) put `~` inside absolute paths.
@@ -169,7 +411,10 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
         .is_none());
     }
     assert_eq!(
-        validate(&json!({}), None).unwrap_err().detail.unwrap()["reason"],
+        validate(&json!({}), None, None)
+            .unwrap_err()
+            .detail
+            .unwrap()["reason"],
         "malformed"
     );
     let oversized = Value::Array(
@@ -178,7 +423,10 @@ fn grants_allow_paths_atomic_validation_and_named_refusals() {
             .collect(),
     );
     assert_eq!(
-        validate(&oversized, None).unwrap_err().detail.unwrap()["index"],
+        validate(&oversized, None, None)
+            .unwrap_err()
+            .detail
+            .unwrap()["index"],
         64
     );
 }

@@ -501,6 +501,84 @@ impl SubcLifecycleAdmission {
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_WAIT: Duration = Duration::from_secs(5);
 const GRACEFUL_SHUTDOWN_SEARCH_BUILD_POLL: Duration = Duration::from_millis(10);
 
+#[derive(Debug)]
+enum SearchIndexShutdownOutcome {
+    Flushed,
+    Skipped,
+    Failed(&'static str),
+}
+
+/// Completion messages received before the search-index shutdown deadline.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct SearchIndexShutdownReport {
+    pub completed: usize,
+    pub flushed: usize,
+    pub failed_roots: Vec<PathBuf>,
+    pub unfinished_roots: Vec<PathBuf>,
+    // Tests join the actual writers before reopening persisted cache files;
+    // the production deadline only bounds how long shutdown waits for them.
+    #[cfg(test)]
+    pub(crate) workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+/// Wait for each root's synchronous write to finish, bounded by the caller's
+/// exit deadline. A deadline is not a completion event: unfinished workers
+/// retain their deltas, but process exit may interrupt them, so name each root
+/// whose cache was not saved instead of reporting an aggregate success.
+#[doc(hidden)]
+pub fn flush_search_indexes_before(
+    contexts: &[Arc<AppContext>],
+    deadline: Instant,
+) -> SearchIndexShutdownReport {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pending = std::collections::BTreeMap::new();
+    let mut report = SearchIndexShutdownReport::default();
+    for (id, ctx) in contexts.iter().enumerate() {
+        let root = ctx
+            .canonical_cache_root_opt()
+            .unwrap_or_else(|| ctx.config().project_root.clone().unwrap_or_default());
+        pending.insert(id, root);
+        let ctx = Arc::clone(ctx);
+        let tx = tx.clone();
+        let _worker = std::thread::spawn(move || {
+            let _ = tx.send((id, ctx.search_index_shutdown_outcome()));
+        });
+        #[cfg(test)]
+        report.workers.push(_worker);
+    }
+    drop(tx);
+    while !pending.is_empty() {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((id, outcome)) => {
+                let root = pending.remove(&id).expect("pending search flush root");
+                report.completed += 1;
+                match outcome {
+                    SearchIndexShutdownOutcome::Flushed => report.flushed += 1,
+                    SearchIndexShutdownOutcome::Skipped => {}
+                    SearchIndexShutdownOutcome::Failed(reason) => {
+                        crate::slog_warn!(
+                            "search index: shutdown flush failed root={}: {}",
+                            root.display(),
+                            reason
+                        );
+                        report.failed_roots.push(root);
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    for root in pending.into_values() {
+        crate::slog_warn!(
+            "search index: shutdown flush unfinished root={}: completion not received before exit deadline; delta may not be saved",
+            root.display()
+        );
+        report.unfinished_roots.push(root);
+    }
+    report
+}
+
 /// Numeric projection for consumers that still require the legacy status-bar
 /// shape. It is derived from [`StatusBarCountValues`], which preserves whether
 /// each category is present instead of converting missing values to zero.
@@ -5381,6 +5459,9 @@ impl AppContext {
     }
 
     pub fn completion_drains_have_work(&self) -> bool {
+        if self.bash_background.project_replay_has_work() {
+            return true;
+        }
         let search_pending = self
             .search_index_rx
             .try_read()
@@ -6210,6 +6291,7 @@ impl AppContext {
             && slot.pending.is_none()
             && slot.ready_for.as_ref() == Some(&target)
             && self.app.db_for_path(&target.1.join("aft.db")).is_some()
+            && self.bash_background.db_pool_attached()
         {
             return;
         }
@@ -9655,8 +9737,16 @@ impl AppContext {
     /// and never write the shared artifact.
     #[doc(hidden)]
     pub fn flush_search_index_on_graceful_shutdown(&self) -> bool {
+        matches!(
+            self.search_index_shutdown_outcome(),
+            SearchIndexShutdownOutcome::Flushed
+        )
+    }
+
+    fn search_index_shutdown_outcome(&self) -> SearchIndexShutdownOutcome {
+        use SearchIndexShutdownOutcome::{Failed, Flushed, Skipped};
         if self.shared_artifacts_read_only() {
-            return false;
+            return Skipped;
         }
 
         self.drain_search_index_events_for_graceful_shutdown();
@@ -9666,18 +9756,8 @@ impl AppContext {
         }
 
         if self.search_index_build_in_progress() {
-            return false;
+            return Failed("search index rebuild did not settle");
         }
-
-        let Some(canonical_root) = self.canonical_cache_root_opt() else {
-            return false;
-        };
-        let config = self.config();
-        let project_key = self.memoized_artifact_cache_key(&canonical_root);
-        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
-            &project_key,
-            config.storage_dir.as_deref(),
-        );
 
         {
             let search_index = self
@@ -9685,12 +9765,25 @@ impl AppContext {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(index) = search_index.as_ref() else {
-                return false;
+                return Skipped;
             };
-            if !index.ready || !index.has_pending_disk_changes() {
-                return false;
+            if !index.ready {
+                return Failed("search index is not ready");
+            }
+            if !index.has_pending_disk_changes() {
+                return Skipped;
             }
         }
+
+        let Some(canonical_root) = self.canonical_cache_root_opt() else {
+            return Failed("canonical cache root is unavailable");
+        };
+        let config = self.config();
+        let project_key = self.memoized_artifact_cache_key(&canonical_root);
+        let cache_dir = crate::search_index::resolve_cache_dir_with_key(
+            &project_key,
+            config.storage_dir.as_deref(),
+        );
 
         let _cache_lock = match crate::search_index::CacheLock::try_acquire_for_shutdown(
             &cache_dir,
@@ -9702,7 +9795,7 @@ impl AppContext {
                     "search index: skipped shutdown flush because cache lock was unavailable: {}",
                     error
                 );
-                return false;
+                return Failed("cache lock unavailable");
             }
         };
 
@@ -9711,14 +9804,21 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(index) = search_index.as_mut() else {
-            return false;
+            return Skipped;
         };
-        if !index.ready || !index.has_pending_disk_changes() {
-            return false;
+        if !index.ready {
+            return Failed("search index is not ready");
+        }
+        if !index.has_pending_disk_changes() {
+            return Skipped;
         }
 
         let git_head = index.stored_git_head().map(str::to_owned);
-        index.write_to_disk(&cache_dir, git_head.as_deref())
+        if index.write_to_disk(&cache_dir, git_head.as_deref()) {
+            Flushed
+        } else {
+            Failed("disk cache write failed")
+        }
     }
 
     pub fn inspect_manager(&self) -> Arc<InspectManager> {

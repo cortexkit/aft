@@ -141,7 +141,7 @@ describe("SubcTransport root dormancy", () => {
       text: "ok",
     });
     expect(client.routeOpens).toHaveLength(2);
-    expect(messages).toEqual([
+    expect(messages.filter((message) => !message.startsWith("subc head scope:"))).toEqual([
       `root ${bridge.getCwd()} reclaimed/absent; suspending attach until it exists`,
     ]);
   });

@@ -590,9 +590,17 @@ impl FamilyStore {
     pub fn rows_oldest(&self, limit: usize) -> StoreResult<Vec<StoredRow>> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let connection = lock(&self.inner.connection);
+        // ref_epoch follows payload in the WITHOUT ROWID record, so reading it
+        // from the table visits overflow pages even though length(BLOB) does not.
+        // Scan lengths in place and fetch epochs from the covering index. A
+        // primary-key lookup of the payload row can also load its whole record
+        // while comparing keys, so the length scan must not become point probes.
         let mut statement = connection.prepare(
-            "SELECT full_key, length(payload), ref_epoch FROM blob_payloads
-             ORDER BY ref_epoch ASC, full_key ASC LIMIT ?1",
+            "SELECT p.full_key, length(p.payload),
+                    (SELECT b.ref_epoch FROM blob_payloads AS b INDEXED BY blob_membership
+                     WHERE b.full_key = p.full_key) AS epoch
+             FROM blob_payloads AS p NOT INDEXED
+             ORDER BY epoch ASC, p.full_key ASC LIMIT ?1",
         )?;
         let rows = statement.query_map(params![limit], |row| {
             Ok((
@@ -1154,6 +1162,9 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod sizing_tests;
 
 #[cfg(test)]
 mod tests {

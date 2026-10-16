@@ -515,6 +515,40 @@ fn bash_tasks_dual_write_disabled_db_pool_skips_dual_write() {
     registry.detach();
 }
 
+#[test]
+fn bash_tasks_dual_write_late_db_attachment_backfills_completed_task() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+    registry.set_harness(Harness::Opencode);
+
+    let task_id = spawn_task(&registry, storage.path(), project.path(), "echo late-db");
+    wait_for_json_status(storage.path(), SESSION, &task_id, BgTaskStatus::Completed);
+    let health = registry.try_health_counts().unwrap();
+    assert_eq!(health.db_rows_missing, 1);
+    assert_eq!(
+        health.db_persistence_warning,
+        Some(
+            "aft.db is not attached to this registry; task bundles remain on disk without DB rows"
+        )
+    );
+
+    let conn = Arc::new(Mutex::new(
+        aft::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    assert!(fetch_row(&conn, "opencode", SESSION, &task_id).is_none());
+    registry.set_db_pool(Arc::clone(&conn));
+
+    let row = fetch_row(&conn, "opencode", SESSION, &task_id)
+        .expect("late DB attachment should persist the completed task row");
+    assert_eq!(row.status, "completed");
+    assert!(row.output_bytes.unwrap_or_default() > 0);
+    let health = registry.try_health_counts().unwrap();
+    assert_eq!(health.db_rows_missing, 0);
+    assert_eq!(health.db_persistence_warning, None);
+    registry.detach();
+}
+
 fn direct_row(harness: &str, session_id: &str, task_id: &str, status: &str) -> BashTaskRow {
     BashTaskRow {
         harness: harness.to_string(),

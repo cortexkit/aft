@@ -4152,32 +4152,11 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     // Index deltas can be rebuilt after a restart. Give the independent roots
     // one short shared window to persist them, without extending the outage
     // when a rebuild or a cache lock holds one root for several seconds.
-    let (tx, rx) = std::sync::mpsc::channel();
-    for actor_ctx in actor_contexts {
-        let ctx = Arc::clone(actor_ctx);
-        let tx = tx.clone();
-        let _worker = std::thread::spawn(move || {
-            let _ = tx.send(ctx.flush_search_index_on_graceful_shutdown());
-        });
-        #[cfg(test)]
-        tests::record_exit_index_flush_worker(_worker);
-    }
-    drop(tx);
     let started = Instant::now();
     let flush_deadline = crate::callgraph_store::exit_index_flush_deadline(drained_at);
     let deadline =
         (started + crate::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline);
-    let mut completed = 0;
-    let mut flushed = 0;
-    while completed < actor_contexts.len() {
-        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(saved) => {
-                completed += 1;
-                flushed += usize::from(saved);
-            }
-            Err(_) => break,
-        }
-    }
+    let report = crate::context::flush_search_indexes_before(actor_contexts, deadline);
     // Refreshes are reconstructible, so exit waits for them only until the
     // flush deadline and otherwise leaves them to the next start.
     let refreshed =
@@ -4185,8 +4164,8 @@ fn flush_actor_indexes_on_graceful_shutdown_with(
     let line = format!(
         "subc exit phase=index_flush roots={} completed={} flushed={} callgraph={} elapsed_ms={}",
         actor_contexts.len(),
-        completed,
-        flushed,
+        report.completed,
+        report.flushed,
         refreshed.as_str(),
         started.elapsed().as_millis()
     );
@@ -9583,6 +9562,7 @@ fn submit_maintenance_job(
                 }
             }
             MaintenanceDrainKind::CompletionDrains => {
+                runtime_drain::drain_bash_project_replay(ctx);
                 runtime_drain::drain_search_index_events(ctx);
                 runtime_drain::drain_callgraph_store_events(ctx);
                 runtime_drain::drain_semantic_index_events(ctx);
@@ -12918,15 +12898,6 @@ mod tests {
         )
     }
 
-    thread_local! {
-        static EXIT_INDEX_FLUSH_WORKERS: std::cell::RefCell<Vec<std::thread::JoinHandle<()>>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    pub(super) fn record_exit_index_flush_worker(worker: std::thread::JoinHandle<()>) {
-        EXIT_INDEX_FLUSH_WORKERS.with(|workers| workers.borrow_mut().push(worker));
-    }
-
     fn actor_ctx_with_dirty_search_index(
         root: &Path,
         storage: &Path,
@@ -12989,6 +12960,76 @@ mod tests {
     }
 
     #[test]
+    fn graceful_shutdown_reports_failed_search_flush_root() {
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let (root_dir, _) = test_root("failed-shutdown-flush");
+        let (ctx, root, cache_dir) = actor_ctx_with_dirty_search_index(
+            root_dir.path(),
+            storage.path(),
+            "source.txt",
+            "old token\n",
+            "new token\n",
+        );
+        // Make replacement fail without depending on Windows sharing flags or
+        // an antivirus scanner holding a particular file open.
+        std::fs::rename(cache_dir.join("cache.bin"), cache_dir.join("old-cache.bin"))
+            .expect("move old cache");
+        std::fs::create_dir(cache_dir.join("cache.bin")).expect("block cache replacement");
+        let (report, logs) = crate::logging::capture_log_lines(|| {
+            crate::context::flush_search_indexes_before(
+                &[Arc::clone(&ctx)],
+                Instant::now() + Duration::from_secs(30),
+            )
+        });
+        assert_eq!(report.completed, 1, "{report:?}");
+        assert_eq!(report.flushed, 0, "{report:?}");
+        assert_eq!(report.failed_roots, vec![root.clone()]);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("shutdown flush failed root=")
+                    && line.contains(&root.display().to_string())
+                    && line.contains("disk cache write failed")),
+            "{logs:?}"
+        );
+        assert!(ctx
+            .search_index()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .has_pending_disk_changes());
+    }
+
+    #[test]
+    fn graceful_shutdown_reports_unfinished_search_flush_root() {
+        let (root_dir, _) = test_root("unfinished-shutdown-flush");
+        let root = std::fs::canonicalize(root_dir.path()).expect("canonical root");
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        ));
+        ctx.set_canonical_cache_root(root.clone());
+        // Keep the worker from finishing until the coordinator has classified
+        // the root. An already expired deadline makes this independent of load.
+        let held = ctx.search_index().write().unwrap();
+        let (report, logs) = crate::logging::capture_log_lines(|| {
+            crate::context::flush_search_indexes_before(&[Arc::clone(&ctx)], Instant::now())
+        });
+        drop(held);
+        assert_eq!(report.completed, 0, "{report:?}");
+        assert_eq!(report.unfinished_roots, vec![root.clone()]);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("shutdown flush unfinished root=")
+                    && line.contains(&root.display().to_string())),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
     fn graceful_shutdown_flushes_every_actor_search_index() {
         let storage = tempfile::tempdir().expect("storage tempdir");
         let (root1_dir, root1) = test_root("shutdown-flush-root-1");
@@ -13012,15 +13053,20 @@ mod tests {
         assert!(executor.register_actor(root1.clone(), Arc::clone(&ctx1)));
         assert!(executor.register_actor(root2.clone(), Arc::clone(&ctx2)));
 
-        flush_actor_indexes_on_graceful_shutdown(&executor.actor_contexts(), Instant::now());
+        // Wait for the workers' completion messages, not the transport's short
+        // best-effort exit window, before reopening their cache files.
+        let report = crate::context::flush_search_indexes_before(
+            &executor.actor_contexts(),
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(report.completed, 2, "{report:?}");
+        assert_eq!(report.flushed, 2, "{report:?}");
 
         // Shutdown deliberately stops waiting after its shared flush budget.
         // Join the actual workers before checking persistence: this tests that
         // every actor was flushed, not that disk writes always fit that budget.
-        let workers =
-            EXIT_INDEX_FLUSH_WORKERS.with(|workers| std::mem::take(&mut *workers.borrow_mut()));
-        assert_eq!(workers.len(), 2, "one flush worker per actor");
-        for worker in workers {
+        assert_eq!(report.workers.len(), 2, "one flush worker per actor");
+        for worker in report.workers {
             worker.join().expect("search index flush worker");
         }
 
@@ -15086,6 +15132,251 @@ mod tests {
         assert!(due.is_empty());
         assert!(!deferred);
         assert!(!live_roots[&root].maintenance_pending);
+    }
+
+    #[test]
+    fn bash_replay_slow_recovery_does_not_block_route_changes_or_other_roots() {
+        use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+
+        let (_dir, root) = test_root("slow-bash-replay");
+        let (_other_dir, other_root) = test_root("beside-slow-bash-replay");
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let other_ctx = test_ctx();
+        let registry = ctx.bash_background();
+        let session = "slow-replay-session";
+        registry.set_project_replay_scan_budget_for_test(2, Duration::from_secs(5));
+        let task_ids = (0..12)
+            .map(|index| format!("bash-{index:016x}"))
+            .collect::<Vec<_>>();
+        for task_id in &task_ids {
+            let paths = task_paths(storage.path(), session, task_id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                task_id.clone(),
+                session.into(),
+                "echo recovered".into(),
+                root.as_path().to_path_buf(),
+                Some(root.as_path().to_path_buf()),
+                None,
+                true,
+                true,
+            );
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&paths.json, &metadata).unwrap();
+            std::fs::write(&paths.stdout, "recovered\n").unwrap();
+            std::fs::write(&paths.stderr, "").unwrap();
+        }
+        registry
+            .replay_session_for_project(storage.path(), session, root.as_path())
+            .unwrap();
+        let before = registry.pending_completions_for_session(session).len();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        assert!(executor.register_actor(other_root.clone(), Arc::clone(&other_ctx)));
+        let (reached, release) = registry.pause_project_replay_recovery_for_test();
+        let recovery_ctx = Arc::clone(&ctx);
+        let recovery = std::thread::spawn(move || {
+            for _ in 0..100 {
+                runtime_drain::drain_bash_project_replay(&recovery_ctx);
+            }
+        });
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        for _ in 0..2 {
+            registry
+                .replay_session_for_project(storage.path(), session, root.as_path())
+                .unwrap();
+        }
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            1
+        );
+
+        let (unbound_tx, unbound_rx) = crossbeam_channel::bounded(1);
+        let (other_tx, other_rx) = crossbeam_channel::bounded(1);
+        let transport_ctx = Arc::clone(&other_ctx);
+        let transport_root = root.clone();
+        let transport = std::thread::spawn(move || {
+            let mut live_roots = HashMap::from([
+                (transport_root.clone(), RootMeta::new(Instant::now())),
+                (other_root.clone(), RootMeta::new(Instant::now())),
+            ]);
+            let mut channels = HashMap::from([
+                (transport_root.clone(), HashSet::from([route_key(7, 1)])),
+                (other_root.clone(), HashSet::from([route_key(8, 1)])),
+            ]);
+            // These operations run sequentially on the shared transport loop.
+            remove_root_channel(&mut channels, &transport_root, route_key(7, 1));
+            quiesce_unbound_root(&transport_root, &mut live_roots, &executor);
+            unbound_tx.send(()).unwrap();
+            remove_root_channel(&mut channels, &other_root, route_key(8, 1));
+            quiesce_unbound_root(&other_root, &mut live_roots, &executor);
+            transport_ctx.mark_subc_bound();
+            live_roots.get_mut(&other_root).unwrap().reactivate_bound();
+            channels.insert(other_root.clone(), HashSet::from([route_key(8, 2)]));
+            let admitted = transport_ctx
+                .run_if_subc_bound_generation(transport_ctx.configure_generation(), || true);
+            other_tx.send(admitted).unwrap();
+        });
+        let unbound_while_paused = unbound_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        let other_while_paused = other_rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        recovery.join().unwrap();
+        transport.join().unwrap();
+        assert!(
+            unbound_while_paused,
+            "mark_subc_unbound and last-route removal must finish while recovery is paused"
+        );
+        assert_eq!(
+            other_while_paused.ok(),
+            Some(Some(true)),
+            "the shared transport loop must process another root while recovery is paused"
+        );
+
+        assert!(ctx.subc_unbound_quiesced());
+        let recovered = task_ids
+            .iter()
+            .filter_map(|id| registry.task_for_test(id).map(|task| (id, task)))
+            .collect::<Vec<_>>();
+        assert!(
+            recovered.len() > before,
+            "the admitted batch must finish recovery"
+        );
+        assert!(recovered.len() < task_ids.len());
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            1
+        );
+        let examined = registry.project_replay_scan_total_examined_for_test();
+        for _ in 0..3 {
+            runtime_drain::drain_bash_project_replay(&ctx);
+        }
+        assert_eq!(
+            registry.project_replay_scan_total_examined_for_test(),
+            examined
+        );
+        assert!(registry.live_delivery_sessions_for_test().is_empty());
+
+        ctx.mark_subc_bound();
+        registry.set_project_replay_scan_budget_for_test(128, Duration::from_secs(5));
+        for _ in 0..20 {
+            runtime_drain::drain_bash_project_replay(&ctx);
+        }
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            0
+        );
+        assert_eq!(
+            registry.pending_completions_for_session(session).len(),
+            task_ids.len()
+        );
+        for (id, task) in recovered {
+            assert!(Arc::ptr_eq(&task, &registry.task_for_test(id).unwrap()));
+        }
+        assert!(registry.live_delivery_sessions_for_test().is_empty());
+        registry.detach();
+        other_ctx.bash_background().detach();
+    }
+
+    #[tokio::test]
+    async fn bash_registry_replay_backlog_schedules_completion_maintenance_until_done() {
+        use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+        let (_dir, root) = test_root("maintenance-bash-replay");
+        let storage = tempfile::tempdir().unwrap();
+        let ctx = test_ctx();
+        let registry = ctx.bash_background();
+        registry.set_project_replay_scan_budget_for_test(2, Duration::from_secs(5));
+        for index in 0..4 {
+            let task_id = format!("bash-{index:016x}");
+            let paths = task_paths(storage.path(), "replay-session", &task_id).unwrap();
+            let mut metadata = PersistedTask::starting(
+                task_id,
+                "replay-session".into(),
+                "echo recovered".into(),
+                root.as_path().to_path_buf(),
+                Some(root.as_path().to_path_buf()),
+                None,
+                true,
+                true,
+            );
+            metadata.mark_terminal(
+                crate::bash_background::BgTaskStatus::Completed,
+                Some(0),
+                None,
+            );
+            write_task(&paths.json, &metadata).unwrap();
+            std::fs::write(&paths.stdout, "recovered\n").unwrap();
+            std::fs::write(&paths.stderr, "").unwrap();
+        }
+        registry
+            .replay_session_for_project(storage.path(), "replay-session", root.as_path())
+            .unwrap();
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(1);
+        let mut batches = 0;
+        while ctx.completion_drains_have_work() && batches < 20 {
+            let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+            let (jobs, _) = due_maintenance_jobs(
+                &mut live_roots,
+                Some(&executor),
+                &BgSubsBySession::new(),
+                &BgWakePending::new(),
+                MAINTENANCE_SUBMIT_BUDGET,
+                &HashSet::new(),
+            );
+            assert_eq!(
+                jobs,
+                vec![(root.clone(), MaintenanceDrainKind::CompletionDrains)]
+            );
+            submit_maintenance_job(
+                &executor,
+                root.clone(),
+                jobs[0].1,
+                Vec::new(),
+                &completion_tx,
+                &metrics,
+            );
+            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(completion.response.success);
+            batches += 1;
+        }
+        assert!(
+            batches > 1,
+            "replay must use multiple bounded maintenance jobs"
+        );
+        assert_eq!(
+            registry
+                .pending_completions_for_session("replay-session")
+                .len(),
+            4
+        );
+        assert_eq!(
+            registry
+                .try_health_counts()
+                .unwrap()
+                .replay_pending_sessions,
+            0
+        );
+        assert!(!ctx.completion_drains_have_work());
+        registry.detach();
     }
 
     #[test]
@@ -18312,6 +18603,132 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(other_storage.path().join("aft.db").is_file());
+    }
+
+    #[test]
+    fn evicted_quiesced_root_rebind_reopens_db_pool_before_bash() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let executor = Arc::new(Executor::new());
+        let fixture = ConfiguredRoot::unconfigured(&executor);
+        let disabled_indexes = json!({
+            "indexes": { "semantic": false, "trigram": false, "callgraph": false },
+            "experimental": { "bash": { "background": true } }
+        });
+        let mut first_bind = fixture.bind_request(0, "opencode");
+        first_bind.params["config"][0]["doc"] = disabled_indexes.to_string().into();
+        let first_bind = fixture
+            .submit_bind(&executor, first_bind)
+            .blocking_recv()
+            .unwrap();
+        assert!(first_bind.success, "first bind failed: {}", first_bind.data);
+        fixture.ctx.mark_subc_bound();
+        start_post_ack_database_open(&executor, &fixture.root);
+        assert!(wait_for_database_ready(&fixture.ctx, Duration::from_secs(5)).is_some());
+        crate::commands::configure::drain_deferred_configure_maintenance(&fixture.ctx);
+        assert!(fixture.ctx.bash_background().db_pool_attached());
+
+        fixture.ctx.mark_subc_unbound();
+        assert!(
+            fixture.ctx.try_artifact_eviction_blocker(true).is_none(),
+            "artifact blocker before eviction: {:?}",
+            fixture.ctx.try_artifact_eviction_blocker(true)
+        );
+        let mut live_roots = HashMap::new();
+        let mut meta = RootMeta::new(Instant::now());
+        meta.last_touched = Instant::now() - IDLE_ROOT_TTL - Duration::from_secs(1);
+        meta.unbound_quiesced = true;
+        live_roots.insert(fixture.root.clone(), meta);
+        assert_eq!(
+            reap_idle_roots(
+                Instant::now(),
+                &mut live_roots,
+                &HashMap::new(),
+                &HashMap::new(),
+                &executor,
+                &DispatchPathMetrics::new(),
+            )
+            .evicted,
+            1,
+            "the unbound root should pass through artifact eviction"
+        );
+
+        let wait_started = Instant::now();
+        while fixture.ctx.bash_background().db_pool_attached()
+            && wait_started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!fixture.ctx.bash_background().db_pool_attached());
+        let prior_ready_opens = crate::database_open::recorded_opens_for_test()
+            .into_iter()
+            .filter(|open| open.root == fixture.canonical_root)
+            .count();
+
+        let mut rebind_request = fixture.bind_request(1, "opencode");
+        rebind_request.params["config"][0]["doc"] = disabled_indexes.to_string().into();
+        let rebind = fixture
+            .submit_bind(&executor, rebind_request)
+            .blocking_recv()
+            .expect("rebind response");
+        assert!(rebind.success, "rebind failed: {}", rebind.data);
+        fixture.ctx.mark_subc_bound();
+        start_post_ack_database_open(&executor, &fixture.root);
+
+        let opened = Instant::now();
+        loop {
+            let opens = crate::database_open::recorded_opens_for_test()
+                .into_iter()
+                .filter(|open| open.root == fixture.canonical_root)
+                .collect::<Vec<_>>();
+            if let Some(open) = opens.get(prior_ready_opens) {
+                if open.finished_at.is_some() {
+                    assert_eq!(
+                        open.outcome,
+                        Some(crate::database_open::DatabaseOpenOutcome::Ready),
+                        "the rebind should log a ready aft.db open"
+                    );
+                    break;
+                }
+            }
+            assert!(
+                opened.elapsed() < Duration::from_secs(5),
+                "rebind did not stage and log a fresh aft.db open"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(fixture.ctx.bash_background().db_pool_attached());
+        assert!(fixture
+            .ctx
+            .database_runtime_refusal("probe", "bash")
+            .is_none());
+
+        let task_id = fixture
+            .ctx
+            .bash_background()
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "printf rebind-persisted",
+                "herd-session-1".to_string(),
+                fixture.canonical_root.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                fixture.storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(fixture.canonical_root.clone()),
+            )
+            .expect("spawn Bash after rebind");
+        let db = fixture.ctx.db().expect("opened aft.db handle");
+        let row = crate::db::bash_tasks::get_bash_task(
+            &db.lock().expect("aft.db lock"),
+            "opencode",
+            "herd-session-1",
+            &task_id,
+        )
+        .expect("query Bash task row");
+        assert!(row.is_some(), "Bash row was not persisted after rebind");
+        fixture.ctx.bash_background().shutdown();
     }
 
     #[test]

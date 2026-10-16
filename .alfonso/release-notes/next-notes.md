@@ -11,3 +11,4 @@
 - Workflow hints ship inside the host's system entry — fixes "System message must be at the beginning" on Qwen-family endpoints (issue #150).
 - Checkpoints under restrict_to_project_root now snapshot a symlink itself rather than its target.
 - Callgraph stores sweep orphaned build temporaries (age-based, both layouts).
+- Worker `allow_paths` validation can reuse the parent agent's (head's) latest observed access policy when reconnecting advances its scope generation, without reviving ended policies or revoked grants. Missing head policy is reported as `head_policy_unknown` rather than `head_not_held`; refusals are logged with the entry and head identity.

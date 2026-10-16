@@ -2170,17 +2170,23 @@ describe("SubcTransport bg_events subscription (S3)", () => {
 
     await pool.getBridge(TEST_PROJECT_ROOT).toolCall("sess-1", "read", {});
     await tick();
-    expect(lifecycleLogs[0]).toEqual({
-      message: "subc bg_events: subscription open channel=2@2",
-      meta: { sessionId: "sess-1" },
-    });
+    expect(lifecycleLogs.filter((entry) => entry.message.startsWith("subc bg_events:"))[0]).toEqual(
+      {
+        message: "subc bg_events: subscription open channel=2@2",
+        meta: { sessionId: "sess-1" },
+      },
+    );
 
     client.subscriptions[0]?.end();
     await tick();
     await tick();
 
     expect(client.subscriptions.length).toBe(2);
-    expect(lifecycleLogs.map((entry) => entry.message)).toEqual([
+    expect(
+      lifecycleLogs
+        .filter((entry) => entry.message.startsWith("subc bg_events:"))
+        .map((entry) => entry.message),
+    ).toEqual([
       "subc bg_events: subscription open channel=2@2",
       "subc bg_events: stream ended channel=2@2",
       "subc bg_events: reconnect attempt=1",

@@ -3101,6 +3101,13 @@ impl LspManager {
         self.send_due_rust_saves();
     }
 
+    /// Whether any client carries a raw note, including notes hidden by text rendering.
+    pub fn has_runtime_notes(&self) -> bool {
+        self.clients
+            .values()
+            .any(|client| client.runtime_note.is_some())
+    }
+
     /// Runtime notes (the SDK a server started with) for the given servers
     /// only, so an inspect scoped to Rust files does not repeat a TypeScript
     /// note from a server started for some other request.
@@ -7355,6 +7362,26 @@ mod env_binary_override_tests {
 #[cfg(all(test, unix))]
 mod project_applicability_tests {
     use super::*;
+
+    #[test]
+    fn runtime_note_presence_reports_only_raw_client_notes() {
+        assert!(!LspManager::new().has_runtime_notes());
+        let (_dir, mut manager, _config, ts) = fixture(false, false);
+        assert!(!manager.has_runtime_notes());
+        manager.clients.get_mut(&ts).unwrap().runtime_note = Some("selected SDK".into());
+        assert!(manager.has_runtime_notes());
+    }
+
+    #[test]
+    fn scoped_runtime_notes_preserve_selection_when_notes_exist() {
+        let (_dir, mut manager, _config, ts) = fixture(false, false);
+        manager.clients.get_mut(&ts).unwrap().runtime_note = Some("selected SDK".into());
+        assert_eq!(
+            manager.runtime_notes_for(&HashSet::from([ts])),
+            vec!["selected SDK"]
+        );
+        assert!(manager.runtime_notes_for(&HashSet::new()).is_empty());
+    }
 
     fn fixture(yaml_enabled: bool, go: bool) -> (tempfile::TempDir, LspManager, Config, ServerKey) {
         let dir = tempfile::tempdir().unwrap();

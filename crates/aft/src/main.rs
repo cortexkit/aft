@@ -778,6 +778,7 @@ fn main() {
 #[cfg(test)]
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
+        aft::runtime_drain::drain_bash_project_replay(runtime);
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
         aft::config_live::drain_config_reload(runtime);
@@ -818,6 +819,7 @@ fn drain_runtime_events_cooperatively(
 
 fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     let runtime = registry.current();
+    aft::runtime_drain::drain_bash_project_replay(runtime);
     // Preserve the dependency order: install finished search artifacts before
     // watcher deltas, then advance the other build channels and diagnostics.
     aft::runtime_drain::drain_configure_warning_events(runtime);
@@ -927,17 +929,14 @@ fn flush_indexes_on_graceful_shutdown(
     let flush_deadline = aft::callgraph_store::exit_index_flush_deadline(drained_at);
     let runtime = Arc::clone(registry.current());
     aft::slog_info!("shutdown phase=search_index_flush_start");
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(runtime.flush_search_index_on_graceful_shutdown());
-    });
-    let search_wait = aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT
-        .min(flush_deadline.saturating_duration_since(Instant::now()));
-    let flushed = rx.recv_timeout(search_wait);
+    let report = aft::context::flush_search_indexes_before(
+        &[runtime],
+        (Instant::now() + aft::callgraph_store::EXIT_SEARCH_INDEX_FLUSH_WAIT).min(flush_deadline),
+    );
     aft::slog_info!(
         "shutdown phase=search_index_flush_done completed={} flushed={} elapsed_ms={}",
-        flushed.is_ok(),
-        flushed.unwrap_or(false),
+        report.completed == 1,
+        report.flushed == 1,
         shutdown_started.elapsed().as_millis()
     );
     aft::slog_info!("shutdown phase=callgraph_refresh_flush_start");
@@ -3545,7 +3544,14 @@ mod graceful_shutdown_search_index_tests {
                 .update_file(&file);
         }
 
-        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
+        // The transport may abandon a slow flush at its exit deadline. This
+        // persistence test instead waits for the worker's completion message.
+        let report = aft::context::flush_search_indexes_before(
+            &[Arc::clone(ctx)],
+            Instant::now() + Duration::from_secs(30),
+        );
+        assert_eq!(report.completed, 1, "{report:?}");
+        assert_eq!(report.flushed, 1, "{report:?}");
 
         let mut restored =
             aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)
@@ -3604,8 +3610,13 @@ mod graceful_shutdown_search_index_tests {
                 .send(())
                 .expect("release search rebuild publish gate");
         });
-        flush_indexes_on_graceful_shutdown(&registry, Instant::now(), Instant::now());
+        let report = aft::context::flush_search_indexes_before(
+            &[Arc::clone(ctx)],
+            Instant::now() + Duration::from_secs(30),
+        );
         release.join().expect("publish gate release thread");
+        assert_eq!(report.completed, 1, "{report:?}");
+        assert!(report.failed_roots.is_empty(), "{report:?}");
 
         let mut restored =
             aft::search_index::SearchIndex::read_from_disk(&cache_dir, &canonical_root)

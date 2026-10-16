@@ -52,6 +52,10 @@ class HostClient implements SubcClientLike {
   >();
   private readonly endedChannels = new Set<number>();
 
+  get activeSubscriptionChannels() {
+    return [...this.subscriptions.keys()];
+  }
+
   bumpScopeEpoch(epoch: number, refusedBinds: number, code = "scope_not_live") {
     this.answer = { owner: scope.owner, ref: scope.ref, scope_epoch: epoch };
     this.pendingScopeBinds = refusedBinds;
@@ -228,11 +232,12 @@ function retryClock() {
   };
 }
 
-function scopeLogs() {
+function scopeLogs(outcomesOnly = false) {
   const lines: string[] = [];
   setActiveLogger({
     log: (line: string) => {
-      if (line.startsWith("subc head scope:")) lines.push(line);
+      if (line.startsWith("subc head scope:") && (!outcomesOnly || line.includes(" result=")))
+        lines.push(line);
     },
     error() {},
     warn() {},
@@ -299,6 +304,137 @@ test("module restart reopens every head route with its cached scope through relo
     expect(client.reads).toHaveLength(1);
     await pool.shutdown();
   }
+});
+
+test("head restart refreshes a refused cached scope for bg_events and a third channel", async () => {
+  const lines = scopeLogs();
+  const { client, pool, push } = setup("opencode", true);
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  expect(client.subscriptionChannels).toHaveLength(1);
+  expect(client.reads).toHaveLength(1);
+
+  // A refusal on another carrier must not permanently downgrade the whole session.
+  client.refusal = "scope_carrier_denied";
+  const other = pool.getBridge(TEST_OTHER_ROOT);
+  await other.toolCall("head", "read", {});
+  await settle();
+  expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toBeUndefined();
+  client.refusal = undefined;
+
+  const firstOpens = client.opens.length;
+  client.toolOpenErrors.push(
+    new SubcError("AFT restarting", "module_reloading"),
+    new SubcError("AFT restarting", "module_reloading"),
+  );
+  push({ op: "route.closed", body: { module_id: "aft", reason: "restart" } });
+  await bridge.toolCall("head", "read", {});
+  await other.toolCall("head", "read", {});
+  await settle();
+
+  const reopened = client.opens.slice(firstOpens).filter((open) => open.target.module_id === "aft");
+  expect(reopened.length).toBeGreaterThanOrEqual(5);
+  expect(reopened.map((open) => open.opts?.scope)).toEqual(reopened.map(() => scope));
+  expect(client.reads.length).toBeGreaterThan(1);
+  expect(
+    client.activeSubscriptionChannels
+      .map((channel) => client.opens[channel - 1].identity.project_root)
+      .sort(),
+  ).toEqual([TEST_PROJECT_ROOT, TEST_OTHER_ROOT].sort());
+  for (const channel of [...client.toolChannels.slice(-2), ...client.activeSubscriptionChannels]) {
+    expect(client.opens[channel - 1].opts?.scope).toEqual(scope);
+  }
+  const decisions = lines.filter((line) => / bind=(scoped|unscoped) /.test(line));
+  const toolOpens = client.opens.filter((open) => open.target.module_id === "aft");
+  expect(decisions).toHaveLength(toolOpens.length);
+  for (const [index, open] of toolOpens.entries()) {
+    expect(decisions[index]).toContain(`bind=${open.opts?.scope ? "scoped" : "unscoped"}`);
+    expect(decisions[index]).toContain(`root=${open.identity.project_root}`);
+  }
+  expect(decisions.every((line) => line.includes("session=head") && line.includes("reason="))).toBe(
+    true,
+  );
+  expect(decisions.some((line) => line.includes("channel=bg_events"))).toBe(true);
+  expect(lines.some((line) => line.includes("lookup=skipped reason=cached_scope"))).toBe(true);
+  expect(lines.some((line) => line.includes("lookup=started reason=previous_bind_refusal"))).toBe(
+    true,
+  );
+});
+
+test("head bind decisions log every unscoped backoff skip", async () => {
+  const lines = scopeLogs();
+  const { client, pool } = setup();
+  client.answer = new SubcError("core restarting", "module_reloading");
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  expect(lines.some((line) => line.includes("lookup=skipped reason=backoff"))).toBe(true);
+  const binds = lines.filter((line) => line.includes(" bind="));
+  expect(binds).toHaveLength(2);
+  expect(
+    binds.every(
+      (line) =>
+        line.includes("session=head") && line.includes("reason=lookup_error code=module_reloading"),
+    ),
+  ).toBe(true);
+});
+
+test("a refused head scope keeps background recovery when the fresh lookup is unavailable", async () => {
+  const clock = retryClock();
+  const lines = scopeLogs();
+  const { client, pool, push } = setup("opencode", true);
+  const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  client.refusal = "scope_carrier_denied";
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  await settle();
+  client.refusal = undefined;
+  client.scopeOpenError = new SubcError("core restarting", "module_reloading");
+  push({ op: "route.closed", body: { module_id: "aft", reason: "restart" } });
+  await bridge.toolCall("head", "read", {});
+  await settle();
+  expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toBeUndefined();
+  expect(clock.pending.size).toBe(1);
+  expect(
+    lines.some(
+      (line) =>
+        line.includes("bind=unscoped") &&
+        line.includes("reason=lookup_error code=module_reloading"),
+    ),
+  ).toBe(true);
+
+  client.scopeOpenError = undefined;
+  await clock.tick(5_000);
+  await bridge.toolCall("head", "read", {});
+  await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
+  await settle();
+  expect(clock.pending.size).toBe(0);
+  expect(client.activeSubscriptionChannels).toHaveLength(2);
+  for (const channel of [...client.toolChannels.slice(-2), ...client.activeSubscriptionChannels]) {
+    expect(client.opens[channel - 1].opts?.scope).toEqual(scope);
+  }
+});
+
+test("a cached head scope refusal rechecks core before binding unscoped", async () => {
+  const clock = retryClock();
+  const { client, pool } = setup();
+  await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
+  client.refusal = "scope_carrier_denied";
+  client.scopeOpenError = new SubcError("core restarting", "module_reloading");
+  const other = pool.getBridge(TEST_OTHER_ROOT);
+  await other.toolCall("head", "read", {});
+  expect(client.opens.filter((open) => open.target.module_id === "prefrontal-core")).toHaveLength(
+    2,
+  );
+  expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toBeUndefined();
+  expect(clock.pending.size).toBe(1);
+  client.refusal = undefined;
+  client.scopeOpenError = undefined;
+  await clock.tick(5_000);
+  await other.toolCall("head", "read", {});
+  expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toEqual(scope);
+  expect(clock.pending.size).toBe(0);
 });
 
 test("client reconnect reopens both head routes with the cached scope", async () => {
@@ -492,7 +628,7 @@ test("a stalled scope lookup falls back and closes its late management route", a
 
 test("a timed out head scope lookup retries and binds scoped after backoff", async () => {
   const clock = fakeClock();
-  const lines = scopeLogs();
+  const lines = scopeLogs(true);
   const { client, pool } = setup();
   let release!: () => void;
   client.scopeOpenGate = new Promise<void>((resolve) => {
@@ -802,7 +938,8 @@ test("head scope background retries stop on explicit absence or carrier refusal"
     await bridge.toolCall("head", "read", {});
     expect(clock.pending.size).toBe(0);
     await clock.tick(300_000);
-    expect(client.reads).toHaveLength(2);
+    // Revalidate a refused cached scope once before leaving a fallback route in place.
+    expect(client.reads).toHaveLength(stop === "refusal" ? 3 : 2);
     expect(client.opens.at(-1)?.opts?.scope).toBeUndefined();
     await pool.shutdown();
   }
@@ -917,7 +1054,7 @@ test("head scope lookup errors are retried rather than cached", async () => {
 
 test("explicit no_scope is cached across head binds", async () => {
   const clock = fakeClock();
-  const lines = scopeLogs();
+  const lines = scopeLogs(true);
   const { client, pool } = setup();
   client.answer = { answer: "no_scope" };
   await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
@@ -976,7 +1113,7 @@ test("head scope retries back off exponentially to five minutes without delaying
 
 test("head scope logs once per session outcome change without error messages or full refs", async () => {
   const clock = fakeClock();
-  const lines = scopeLogs();
+  const lines = scopeLogs(true);
   const { client, pool, push } = setup();
   const request = client.request.bind(client);
   let elapsed = 0;
@@ -1047,7 +1184,7 @@ test("no_scope, missing prefrontal and lookup errors preserve an unscoped bind",
   }
 });
 
-test("a scoped open carrier refusal falls back unscoped and logs its code once", async () => {
+test("a scoped open carrier refusal falls back unscoped and rechecks core on the next bind", async () => {
   const warnings: string[] = [];
   setActiveLogger({
     log() {},
@@ -1060,9 +1197,10 @@ test("a scoped open carrier refusal falls back unscoped and logs its code once",
   await bridge.toolCall("head", "read", {});
   await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
   const tools = client.opens.filter((open) => open.target.module_id === "aft");
-  expect(tools.map((open) => open.opts?.scope)).toEqual([scope, undefined, undefined]);
-  expect(warnings).toHaveLength(1);
-  expect(warnings[0]).toContain("scope_carrier_denied");
+  expect(tools.map((open) => open.opts?.scope)).toEqual([scope, undefined, scope, undefined]);
+  expect(client.reads).toHaveLength(2);
+  expect(warnings).toHaveLength(2);
+  expect(warnings.every((line) => line.includes("scope_carrier_denied"))).toBe(true);
 });
 
 test("scope end and carrier removal invalidate an idle head cache and re-read its epoch", async () => {

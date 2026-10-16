@@ -1,0 +1,78 @@
+{
+  "baseline_commit": "3044304035317f5fbede501e87c2ef8fd26504ec",
+  "candidate_parent_commit": "1993bdfc38916f5436251517490985e66b3e0b4b",
+  "corpus_commit": "17e858da8d2becab1ca47826f670a4660da70142",
+  "runner": "linux,4c",
+  "job": "01a13bc3-79f3-7679-96d7-fd274eb6e33a",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "python": "Python 3.14.4",
+  "normalization": "remove root id and scanner_state.tier2_last_run only; preserve all other fields and object/list ordering",
+  "request": {"scope": ["packages"], "sections": ["dead_code"], "topK": 100},
+  "producer_barriers": {"before": "configure_warm", "after": "configure_warm"},
+  "barrier_observations": {"before": {"seed": 2, "measured_process": 51}, "after": {"seed": 2, "measured_process": 43}},
+  "barrier": "Seed published stores, close seed process, restart with same stores, require a successful published-graph initialize caller query and completed blocking Tier2 summaries with an observed scheduler refresh; require identical observed reasons in both arms. No sleep or response-field override.",
+  "untraced_fresh_trials": {"before": {"null": 3, "configure_warm": 2, "pull": 0}, "after": {"null": 1, "pull": 4}},
+  "traced_fresh_trials": {"before": {"null": 3, "pull": 2}, "after": {"null": 2, "pull": 3}},
+  "trace_note": "All five accepted pull demands came from the existing runtime_drain callgraph Ready-install path before scoped arrival. No pull demand occurred during any of the ten scoped reads. Tracing perturbs timing; the controlled barrier does not prove the timing shift is zero.",
+  "parity_cases": 8,
+  "parity_hashes": {
+    "0": "2b5cf630e11a6ed2c22f1c4de5b17edb1a141448ef3be2bbfddfcd25fb874a01",
+    "1": "b07a40673f15893202be01047d4f4a76f411fad9fee0d27a6e101ae63519967d",
+    "2": "c29ff636b03988efb1ff286542365fdb91d6d0182b032d5593802880005d54b3",
+    "3": "c70566c743e4d98910ddfdef5473c18cf37ba18b8371eb180cfc72a3393944cf",
+    "4": "745fdb9f155253f34c202602fb7f60103cebb68869a500f96ca496d634d1c248",
+    "5": "5f4a8777387e37ac4f2ae83719e59ba4b187c60e9db28445fa4437e200736fb9",
+    "6": "74c669cdac680ce4b9425247892d18d1735a4baaa5dc9c50dbe0e2035f6d36ee",
+    "7": "aa024c09c189eda52a4209d86ae4002b1f456a3f081d1d398440304e9d6e5dc3"
+  },
+  "runs": [
+    {"binary": "before", "iteration": 0, "seconds": 7.414787987014279},
+    {"binary": "after", "iteration": 0, "seconds": 3.2074545100331306},
+    {"binary": "after", "iteration": 1, "seconds": 3.4084621199872345},
+    {"binary": "before", "iteration": 1, "seconds": 7.8205842359457165},
+    {"binary": "before", "iteration": 2, "seconds": 7.815235599060543},
+    {"binary": "after", "iteration": 2, "seconds": 3.706930901040323},
+    {"binary": "after", "iteration": 3, "seconds": 3.711818825919181},
+    {"binary": "before", "iteration": 3, "seconds": 9.824751125066541},
+    {"binary": "before", "iteration": 4, "seconds": 8.51421512500383},
+    {"binary": "after", "iteration": 4, "seconds": 3.305484005017206}
+  ],
+  "medians": {"before": 7.8205842359457165, "after": 3.4084621199872345},
+  "phase_means": {
+    "before": {
+      "decode/complexity": 0.0153751484, "decode/cycles": 0.0472401094,
+      "decode/dead_code": 0.068956361, "decode/duplicates": 0.0590433342,
+      "decode/unused_exports": 0.0416942332,
+      "fetch/complexity": 0.0430395648, "fetch/cycles": 0.0984507788,
+      "fetch/dead_code": 0.0957428036, "fetch/duplicates": 0.0508035648,
+      "fetch/unused_exports": 0.092056506,
+      "freshness/complexity": 0.0588288804, "freshness/cycles": 0.0611670152,
+      "freshness/dead_code": 0.0590438692, "freshness/duplicates": 0.0625034962,
+      "freshness/unused_exports": 0.0594675786,
+      "render": 0.000930048, "request": 8.1085357152, "runtime_notes": 0.6361544982,
+      "scope/complexity": 0.1203582142, "scope/cycles": 0.8085019564,
+      "scope/dead_code": 4.4889183416, "scope/duplicates": 0.31096729,
+      "scope/unused_exports": 1.0249881074
+    },
+    "after": {
+      "decode/complexity": 0.0181672388, "decode/cycles": 0.0540402966,
+      "decode/dead_code": 0.0488033932, "decode/duplicates": 0.0542997122,
+      "decode/unused_exports": 0.043178489,
+      "fetch/complexity": 0.0470301866, "fetch/cycles": 0.0860442944,
+      "fetch/dead_code": 0.0842275002, "fetch/duplicates": 0.0444613674,
+      "fetch/unused_exports": 0.0837125116,
+      "freshness/complexity": 0.0617730842, "freshness/cycles": 0.0584539562,
+      "freshness/dead_code": 0.054355156, "freshness/duplicates": 0.0547098486,
+      "freshness/unused_exports": 0.0559121264,
+      "render": 0.0011336448, "request": 3.3196462388, "runtime_notes": 0.0000012444,
+      "scope/complexity": 0.0773712258, "scope/cycles": 0.8365549608,
+      "scope/dead_code": 0.5574541312, "scope/duplicates": 0.2101861346,
+      "scope/unused_exports": 0.918544137
+    }
+  },
+  "binary_sha256": {
+    "before": "251d37b2c5a714205c5ef8fc179b51ffb662f30de5ca236978fb5296d1b6ff35",
+    "after": "d222d4b81e41b590d7b0b5ddf0c3eafc3bd4166c9196cc1676adf6add3ba2164"
+  },
+  "per_run_phase_evidence": "Full per-run phases are retained in runner stdout bash-a7984ba57524a64c; this committed summary keeps wall samples and mean phases outside build directories."
+}

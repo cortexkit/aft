@@ -119,6 +119,25 @@ pub(crate) struct DeadCodeRollupState {
     cache_key: Option<String>,
 }
 
+impl DeadCodeRollupState {
+    /// The caller must also prove that the callgraph projection is unchanged.
+    pub(crate) fn aggregate_for_unchanged_inputs(
+        &self,
+        cache_key: &str,
+        contributions: &[FileContribution],
+        public_api_files: &BTreeSet<String>,
+        roles: &crate::inspect::entry_points::ProjectRoles,
+    ) -> Option<Value> {
+        (self.cache_key.as_deref() == Some(cache_key)
+            && self.contribution_hashes
+                == contribution_hashes(None, contributions, &BTreeSet::new())
+            && self.public_api_files == *public_api_files
+            && self.roles_fingerprint == format!("{roles:?}")
+            && self.drill_down_limit.is_none())
+        .then(|| self.aggregate.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DeadCodeFileFragment {
     contribution_hash: String,

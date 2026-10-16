@@ -1460,6 +1460,7 @@ impl InspectManager {
                     let age =
                         generated_at.map(|at| unix_now_secs().saturating_sub(at.max(0) as u64));
                     let cached = filter_outcome_for_scope_with_contributions(
+                        None,
                         JobOutcome::Fresh { payload: cached },
                         snapshot,
                         category,
@@ -2392,15 +2393,30 @@ impl InspectManager {
         &self,
         project_root: &Path,
         state: super::scanners::dead_code::DeadCodeRollupState,
+        snapshot: &CallgraphSnapshot,
     ) {
         if let Ok(mut cached) = self.callgraph_projection.lock() {
-            if let Some(cached) = cached
-                .as_mut()
-                .filter(|cached| cached.identity.project_root == project_root)
-            {
+            if let Some(cached) = cached.as_mut().filter(|cached| {
+                cached.identity.project_root == project_root
+                    && std::ptr::eq(cached.snapshot.as_ref(), snapshot)
+            }) {
                 cached.rollup = Some((cached.identity.clone(), Arc::new(state)));
             }
         }
+    }
+
+    fn current_dead_code_rollup_state(
+        &self,
+        project_root: &Path,
+        snapshot: &CallgraphSnapshot,
+    ) -> Option<Arc<super::scanners::dead_code::DeadCodeRollupState>> {
+        let cached = self.callgraph_projection.lock().ok()?;
+        let cached = cached.as_ref()?;
+        let (identity, state) = cached.rollup.as_ref()?;
+        (identity.project_root == project_root
+            && *identity == cached.identity
+            && std::ptr::eq(cached.snapshot.as_ref(), snapshot))
+        .then(|| Arc::clone(state))
     }
 
     fn clear_callgraph_projection(&self) {
@@ -2725,6 +2741,7 @@ impl InspectManager {
 
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                None,
                 outcome,
                 &snapshot,
                 category,
@@ -2976,6 +2993,7 @@ impl InspectManager {
     ) -> JobOutcome {
         match waiter_rx.recv() {
             Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                None,
                 outcome,
                 snapshot,
                 key.category,
@@ -3073,6 +3091,9 @@ impl InspectManager {
             Ok(Some(payload)) => {
                 match self.tier2_cached_aggregate_is_fresh(snapshot, category, cache) {
                     Ok(true) => filter_outcome_for_scope_with_contributions(
+                        // Only verified source inventories may reuse a rollup.
+                        // Stale/last-complete reads still reconstruct it below.
+                        Some(self),
                         JobOutcome::Fresh { payload },
                         snapshot,
                         category,
@@ -3080,6 +3101,7 @@ impl InspectManager {
                         caller_scope,
                     ),
                     Ok(false) => filter_outcome_for_scope_with_contributions(
+                        None,
                         JobOutcome::Stale {
                             cached: Some(payload),
                             in_flight,
@@ -3094,6 +3116,7 @@ impl InspectManager {
             }
             Ok(None) => match cache.latest_aggregate_any_hash(category) {
                 Ok(Some(payload)) => filter_outcome_for_scope_with_contributions(
+                    None,
                     JobOutcome::Stale {
                         cached: Some(payload),
                         in_flight,
@@ -4002,7 +4025,7 @@ impl InspectManager {
                     .or(Some("cold"));
             }
             phases.rollup_verdict = Some(verdict);
-            self.cache_dead_code_rollup_state(&job.project_root, state);
+            self.cache_dead_code_rollup_state(&job.project_root, state, snapshot);
             aggregate
         } else {
             roll_up_tier2_contributions(&aggregate_job, &contributions)
@@ -4185,6 +4208,7 @@ impl InspectManager {
                 recv(waiter_rx) -> outcome => {
                     return match outcome {
                         Ok(outcome) => filter_outcome_for_scope_with_contributions(
+                            None,
                             outcome,
                             &snapshot,
                             key.category,
@@ -4243,6 +4267,7 @@ impl InspectManager {
     ) -> JobOutcome {
         match cache.get_aggregated_for_config(key, snapshot.config.as_ref()) {
             Ok(Some(cached)) => filter_outcome_for_scope_with_contributions(
+                None,
                 JobOutcome::Stale {
                     cached: Some(cached),
                     in_flight: true,
@@ -4789,6 +4814,7 @@ fn log_tier2_benchmark_category_end(result: &InspectResult) {
     }
 }
 
+#[cfg(test)]
 fn build_tier2_callgraph_snapshot(
     job: &InspectJob,
     allow_cold_build: bool,
@@ -5817,6 +5843,7 @@ fn roll_up_tier2_contributions_with_limit(
 }
 
 fn scoped_tier2_payload_from_contributions(
+    manager: Option<&InspectManager>,
     snapshot: &InspectSnapshot,
     category: InspectCategory,
     cache: &(impl InspectCacheRead + ?Sized),
@@ -5828,14 +5855,55 @@ fn scoped_tier2_payload_from_contributions(
     }
 
     let project_scope = JobScope::for_project(snapshot.project_root.clone());
-    let rollup_job = scoped_tier2_rollup_job(snapshot, category, &project_scope);
+    let rollup_job = scoped_tier2_rollup_job(manager, snapshot, category, &project_scope);
     let contributions = load_contributions(cache, &rollup_job)?;
+    if let (Some(manager), Some(graph)) = (manager, rollup_job.callgraph_snapshot.as_deref()) {
+        let cache_key = cache
+            .contribution_set_hash_for_config(category, snapshot.config.as_ref())
+            .map_err(|error| error.to_string())?;
+        let public_api_files =
+            super::scanners::dead_code::collect_public_api_files(&snapshot.project_root);
+        let roles = super::entry_points::resolve_project_roles(&snapshot.project_root);
+        // Global liveness includes callers outside the scope. Reuse the existing
+        // projection's rollup only while its durable revision and all contribution
+        // inputs still match; otherwise rebuild it before filtering findings.
+        if let Some(mut payload) = manager
+            .current_dead_code_rollup_state(&snapshot.project_root, graph)
+            .and_then(|state| {
+                state.aggregate_for_unchanged_inputs(
+                    &cache_key,
+                    &contributions,
+                    &public_api_files,
+                    &roles,
+                )
+            })
+        {
+            super::job::attach_dead_code_language_coverage(&mut payload, &rollup_job.scope_files);
+            return Ok(filter_payload_for_scope(payload, scope));
+        }
+        let (mut payload, state, _) =
+            super::scanners::dead_code::aggregate_dead_code_contributions_incremental(
+                &snapshot.project_root,
+                graph,
+                &contributions,
+                &public_api_files,
+                &roles,
+                None,
+                Some(&cache_key),
+                None,
+                &BTreeSet::new(),
+            );
+        manager.cache_dead_code_rollup_state(&snapshot.project_root, state, graph);
+        super::job::attach_dead_code_language_coverage(&mut payload, &rollup_job.scope_files);
+        return Ok(filter_payload_for_scope(payload, scope));
+    }
     let full_payload = roll_up_tier2_contributions_with_limit(&rollup_job, &contributions, None);
     let scoped_payload = filter_payload_for_scope(full_payload, scope);
     Ok(scoped_payload)
 }
 
 fn scoped_tier2_rollup_job(
+    manager: Option<&InspectManager>,
     snapshot: &InspectSnapshot,
     category: InspectCategory,
     scope: &JobScope,
@@ -5844,7 +5912,13 @@ fn scoped_tier2_rollup_job(
         job_id: 0,
         key: JobKey::for_project_category(category),
         category,
-        scope_files: scope_files(&snapshot.project_root, scope),
+        // Only dead code needs a file inventory here. Other categories use it
+        // solely for language coverage, which the scoped filter removes.
+        scope_files: if category == InspectCategory::DeadCode {
+            scope_files(&snapshot.project_root, scope)
+        } else {
+            Vec::new()
+        },
         project_root: snapshot.project_root.clone(),
         inspect_dir: snapshot.inspect_dir.clone(),
         config: Arc::clone(&snapshot.config),
@@ -5859,7 +5933,9 @@ fn scoped_tier2_rollup_job(
         // contributions. Use a real ready store snapshot when one exists; if no
         // snapshot is available, leave it absent so the rollup reports degraded
         // callgraph_unavailable instead of treating an empty graph as truth.
-        job.callgraph_snapshot = build_tier2_callgraph_snapshot(&job, false);
+        job.callgraph_snapshot =
+            build_tier2_callgraph_snapshot_with_refresh_inner(&job, false, false, &[], manager)
+                .map(|(snapshot, _, _)| snapshot);
     }
 
     job
@@ -6593,6 +6669,7 @@ fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<Stri
 }
 
 fn filter_outcome_for_scope_with_contributions(
+    manager: Option<&InspectManager>,
     outcome: JobOutcome,
     snapshot: &InspectSnapshot,
     category: InspectCategory,
@@ -6605,8 +6682,9 @@ fn filter_outcome_for_scope_with_contributions(
 
     match outcome {
         JobOutcome::Fresh { payload } => {
-            match scoped_tier2_payload_from_contributions(snapshot, category, cache, payload, scope)
-            {
+            match scoped_tier2_payload_from_contributions(
+                manager, snapshot, category, cache, payload, scope,
+            ) {
                 Ok(payload) => JobOutcome::Fresh { payload },
                 Err(message) => JobOutcome::Failed { message },
             }
@@ -6614,7 +6692,7 @@ fn filter_outcome_for_scope_with_contributions(
         JobOutcome::Stale { cached, in_flight } => match cached {
             Some(payload) => {
                 match scoped_tier2_payload_from_contributions(
-                    snapshot, category, cache, payload, scope,
+                    manager, snapshot, category, cache, payload, scope,
                 ) {
                     Ok(payload) => JobOutcome::Stale {
                         cached: Some(payload),
@@ -9821,7 +9899,9 @@ mod dead_code_projection_tests {
             "live.ts file scope must be scoped"
         );
 
+        let manager = InspectManager::new();
         let ready_payload = scoped_tier2_payload_from_contributions(
+            Some(&manager),
             &snapshot,
             InspectCategory::DeadCode,
             &cache,
@@ -9838,8 +9918,105 @@ mod dead_code_projection_tests {
         );
         assert_live_item(&ready_payload, "src/live.ts", "knownLive");
 
+        let read = || {
+            scoped_tier2_payload_from_contributions(
+                Some(&manager),
+                &snapshot,
+                InspectCategory::DeadCode,
+                &cache,
+                success.aggregate.clone(),
+                &scope,
+            )
+            .expect("scoped payload")
+        };
+        let first_state = manager.previous_dead_code_rollup_state(&root).unwrap();
+        assert_eq!(read(), ready_payload);
+        assert!(
+            Arc::ptr_eq(
+                &first_state,
+                &manager.previous_dead_code_rollup_state(&root).unwrap()
+            ),
+            "unchanged scoped reads must reuse the existing rollup"
+        );
+
+        // Refreshing analysis facts need not change the source hash. The stored
+        // contribution bytes must participate in the reuse decision too.
+        let mut refreshed = success.contributions.clone();
+        refreshed[0].contribution["refresh_marker"] = json!(true);
+        cache
+            .store_tier2_result(
+                scan_job.key.clone(),
+                &success.scanned_files,
+                &refreshed,
+                success.aggregate.clone(),
+            )
+            .unwrap();
+        assert_eq!(read(), ready_payload);
+        assert!(
+            !Arc::ptr_eq(
+                &first_state,
+                &manager.previous_dead_code_rollup_state(&root).unwrap()
+            ),
+            "changed facts with the same source hash must invalidate reuse"
+        );
+        let first_state = manager.previous_dead_code_rollup_state(&root).unwrap();
+
+        cache
+            .delete_tier2_contribution(InspectCategory::DeadCode, &Path::new("src").join("live.ts"))
+            .unwrap();
+        let changed_contributions = read();
+        assert!(
+            !Arc::ptr_eq(
+                &first_state,
+                &manager.previous_dead_code_rollup_state(&root).unwrap()
+            ),
+            "contribution changes must invalidate rollup reuse"
+        );
+        assert_eq!(
+            changed_contributions,
+            scoped_tier2_payload_from_contributions(
+                None,
+                &snapshot,
+                InspectCategory::DeadCode,
+                &cache,
+                success.aggregate.clone(),
+                &scope,
+            )
+            .unwrap()
+        );
+
+        let before_graph_change = manager.previous_dead_code_rollup_state(&root).unwrap();
+        write_file(
+            &root.join("src/main.ts"),
+            "import { knownDead } from './dead';\nexport function main() { knownDead(); }\n",
+        );
+        let store = CallGraphStore::open(callgraph_dir.clone(), root.clone()).unwrap();
+        store.refresh_files(&[root.join("src/main.ts")]).unwrap();
+        drop(store);
+        let changed_graph = read();
+        assert!(
+            !Arc::ptr_eq(
+                &before_graph_change,
+                &manager.previous_dead_code_rollup_state(&root).unwrap()
+            ),
+            "graph revisions must invalidate rollup reuse even with identical contributions"
+        );
+        assert_eq!(
+            changed_graph,
+            scoped_tier2_payload_from_contributions(
+                None,
+                &snapshot,
+                InspectCategory::DeadCode,
+                &cache,
+                success.aggregate.clone(),
+                &scope,
+            )
+            .unwrap()
+        );
+
         std::fs::remove_dir_all(&callgraph_dir).expect("remove ready callgraph store");
         let unavailable_payload = scoped_tier2_payload_from_contributions(
+            Some(&manager),
             &snapshot,
             InspectCategory::DeadCode,
             &cache,

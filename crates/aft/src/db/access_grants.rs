@@ -181,6 +181,33 @@ pub fn scope_config(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Optio
     json.map(|json| decode(&json)).transpose()
 }
 
+/// Resolve a head's last observed policy at or before its attested epoch.
+/// Select tombstones too: an ended epoch must block an older live policy.
+/// Read grants from the selected row instead of copying them, so revocation
+/// remains effective on the next check.
+pub fn head_policy_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<Option<ScopeKey>> {
+    // Match remote-exec's unsigned decimal ordering without a signed SQL cast.
+    let row: Option<(String, bool)> = conn
+        .query_row(
+            "SELECT epoch,ended FROM access_scopes WHERE owner=?1 AND scope_ref=?2
+             AND (length(epoch)<length(?3) OR (length(epoch)=length(?3) AND epoch<=?3))
+             ORDER BY length(epoch) DESC,epoch DESC LIMIT 1",
+            params![key.owner, key.scope_ref, key.epoch.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((epoch, ended)) = row else {
+        return Ok(None);
+    };
+    if ended {
+        return Ok(None);
+    }
+    Ok(Some(ScopeKey {
+        epoch: epoch.parse().map_err(|_| rusqlite::Error::InvalidQuery)?,
+        ..key.clone()
+    }))
+}
+
 pub fn resolve_scope(
     conn: &Connection,
     owner: &str,
@@ -365,6 +392,25 @@ pub fn materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grants_head_policy_orders_unsigned_epochs_without_signed_casts() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let config = Config::default();
+        for epoch in [7, 10, u64::MAX - 1] {
+            register_scope(&conn, &scope("head", epoch), None, &config).unwrap();
+        }
+        for (epoch, expected) in [
+            (6, None),
+            (7, Some(7)),
+            (12, Some(10)),
+            (u64::MAX, Some(u64::MAX - 1)),
+        ] {
+            let resolved = head_policy_scope(&conn, &scope("head", epoch)).unwrap();
+            assert_eq!(resolved.map(|key| key.epoch), expected);
+        }
+    }
     fn scope(name: &str, epoch: u64) -> ScopeKey {
         ScopeKey {
             owner: "owner".into(),

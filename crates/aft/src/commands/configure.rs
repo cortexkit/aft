@@ -3395,6 +3395,13 @@ fn handle_configure_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
+        if !ctx.database_runtime_pending("bash") {
+            ctx.begin_database_runtime(
+                canonical_cache_root.clone(),
+                crate::bash_background::storage_dir(next_config.storage_dir.as_deref()),
+                req.session().to_string(),
+            );
+        }
         refresh_changed_workspace_manifests(ctx, &canonical_cache_root, workspace_manifests);
         register_hashline_for_configure(
             ctx,

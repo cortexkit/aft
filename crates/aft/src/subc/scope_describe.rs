@@ -253,6 +253,14 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> Vec<crate::db::c
                     .db()
                     .and_then(|db| {
                         let conn = db.lock().ok()?;
+                        // Persist confirmed ends even if this epoch never registered
+                        // a policy, so older head policies cannot be reused after end.
+                        if let Err(error) = crate::db::access_grants::end_scope_grants(
+                            &conn,
+                            &crate::db::access_grants::ScopeKey::from_stamp(&stamp),
+                        ) {
+                            log::warn!("scope-ended grant revocation failed: {error}");
+                        }
                         match crate::db::call_ledger::end_scope(
                             &conn,
                             &scope,
@@ -288,6 +296,101 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> Vec<crate::db::c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn confirmed_head_end_tombstones_policy_for_later_epochs() {
+        use crate::db::access_grants::{self as store, ScopeKey};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("head");
+        std::fs::create_dir(&root).unwrap();
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.clone());
+        config.storage_dir = Some(dir.path().join("store"));
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config.clone(),
+        ));
+        ctx.set_db(Arc::new(StdMutex::new(
+            crate::db::open(&ctx.storage_dir().join("aft.db")).unwrap(),
+        )));
+        let stamp: ScopeStamp = serde_json::from_value(json!({
+            "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+            "ref":"head", "scope_epoch":10, "kind":"head", "owner_authorized":true
+        }))
+        .unwrap();
+        let key = ScopeKey::from_stamp(&stamp);
+        let older = ScopeKey {
+            epoch: 7,
+            ..key.clone()
+        };
+        {
+            let db = ctx.db().unwrap();
+            let conn = db.lock().unwrap();
+            store::register_scope(&conn, &older, None, &config).unwrap();
+            assert_eq!(
+                store::head_policy_scope(&conn, &key).unwrap(),
+                Some(older.clone())
+            );
+        }
+        let executor = Arc::new(Executor::new());
+        executor.register_actor(ProjectRootId::from_path(&root).unwrap(), ctx.clone());
+        let (writer, mut frames) = mpsc::channel(8);
+        let pending = readiness::PendingControlReplies::default();
+        let control = Arc::new(readiness::DaemonControl::new(
+            writer,
+            Arc::new(DispatchPathMetrics::new()),
+            PROTOCOL_VERSION,
+            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
+            vec![],
+            pending.clone(),
+            HELLO_CORR + 1,
+        ));
+        let live = stamp.clone();
+        let (scopes, mut ended, worker) =
+            start_with_scope_source(control, executor, Duration::from_secs(60), move || {
+                std::future::ready(vec![live.clone()])
+            });
+        scopes.goodbye(stamp);
+        let request = tokio::time::timeout(Duration::from_secs(5), frames.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = ModuleControlResponseToModule::ScopeDescribe {
+            status: subc_protocol::scope::ScopeStatus::Ended,
+            scope_epoch: Some(10),
+            daemon_incarnation: "test-daemon".into(),
+            owner_synced: true,
+            owner_configured: true,
+            scope: None,
+        };
+        assert!(pending.resolve(
+            Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&answer).unwrap(),
+            )
+            .unwrap()
+        ));
+        tokio::time::timeout(Duration::from_secs(5), ended.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        worker.abort();
+        let db = ctx.db().unwrap();
+        let conn = db.lock().unwrap();
+        assert!(store::scope_config(&conn, &older).unwrap().is_some());
+        for epoch in [10, 12] {
+            let target = ScopeKey {
+                epoch,
+                ..key.clone()
+            };
+            assert!(store::head_policy_scope(&conn, &target).unwrap().is_none());
+        }
+    }
+
     #[cfg(not(feature = "test-timing-hooks"))]
     #[test]
     fn production_scope_timing_is_exact() {

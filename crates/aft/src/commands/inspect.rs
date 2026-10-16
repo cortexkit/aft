@@ -991,9 +991,9 @@ fn handle_inspect_payload(
     // TypeScript SDK note from a server started for another request does not
     // belong in an answer about Rust files.
     let runtime_notes = if scope_was_provided {
-        let producers =
-            scope_producer_keys(&snapshot, &scope, expected_producers, producer_failures);
-        ctx.lsp().runtime_notes_for(&producers)
+        scoped_runtime_notes(ctx, || {
+            scope_producer_keys(&snapshot, &scope, expected_producers, producer_failures)
+        })
     } else {
         ctx.lsp().runtime_notes()
     };
@@ -1012,6 +1012,20 @@ fn start_on_demand_callgraph_for_inspect(ctx: &AppContext, config: &crate::confi
     if tier2_enabled && ctx.callgraph_build_on_demand() {
         let _ = ctx.callgraph_store_for_query_without_wait();
     }
+}
+
+fn scoped_runtime_notes(
+    ctx: &AppContext,
+    producer_keys: impl FnOnce() -> std::collections::HashSet<ServerKey>,
+) -> Vec<String> {
+    // Scope discovery can walk the project and its tsconfigs. Only inspect the
+    // client roster while locked, then release the guard before that discovery.
+    let has_notes = ctx.lsp().has_runtime_notes();
+    if !has_notes {
+        return Vec::new();
+    }
+    let producer_keys = producer_keys();
+    ctx.lsp().runtime_notes_for(&producer_keys)
 }
 
 fn append_inspect_runtime_notes(payload: &mut Value, runtime_notes: &[String]) {
@@ -4906,6 +4920,73 @@ fn empty_array(value: &Value) -> bool {
 
 fn invalid_request(id: &str, message: String) -> Response {
     Response::error(id, "invalid_request", message)
+}
+
+#[cfg(test)]
+mod runtime_note_tests {
+    use super::*;
+
+    fn context() -> AppContext {
+        AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn scoped_runtime_notes_skip_discovery_without_notes() {
+        assert!(scoped_runtime_notes(&context(), || panic!("unneeded scope discovery")).is_empty());
+        #[cfg(unix)]
+        {
+            let (_dir, ctx, _) = context_with_client(None);
+            assert!(scoped_runtime_notes(&ctx, || panic!("clients have no notes")).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    fn context_with_client(note: Option<&str>) -> (tempfile::TempDir, AppContext, ServerKey) {
+        use crate::lsp::child_registry::LspChildRegistry;
+        use crate::lsp::client::LspClient;
+        use crate::lsp::registry::ServerKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = context();
+        let mut client = LspClient::spawn(
+            ServerKind::TypeScript,
+            root.clone(),
+            Path::new("/bin/sh"),
+            &["-c".into(), "while read line; do :; done".into()],
+            &std::collections::HashMap::new(),
+            ctx.lsp().event_sender_for_test(),
+            LspChildRegistry::new(),
+        )
+        .unwrap();
+        client.runtime_note = note.map(str::to_owned);
+        ctx.lsp().insert_client_for_test(client);
+        (
+            dir,
+            ctx,
+            ServerKey {
+                kind: ServerKind::TypeScript,
+                root,
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_runtime_note_discovery_releases_lsp_manager() {
+        let (_dir, ctx, key) = context_with_client(Some("selected SDK"));
+        let notes = scoped_runtime_notes(&ctx, || {
+            assert!(
+                ctx.try_lsp().is_some(),
+                "producer discovery must run without the LSP manager guard"
+            );
+            std::collections::HashSet::from([key])
+        });
+        assert_eq!(notes, vec!["selected SDK"]);
+    }
 }
 
 #[cfg(test)]

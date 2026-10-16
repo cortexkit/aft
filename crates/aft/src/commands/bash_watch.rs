@@ -300,7 +300,7 @@ pub fn handle_deferred(req: &RawRequest, ctx: Arc<AppContext>) -> DispatchOutcom
             // slots, and without replaying unrelated tasks or relaxing the session.
             if registry.observed_status(&task_id, &session, 0).is_none() {
                 registry.set_worker_wait_window(Duration::from_millis(worker_limit_ms));
-                if let Err(error) = registry.recover_watch_task(
+                if let Err(error) = registry.recover_owned_task(
                     &storage_dir,
                     &session,
                     &task_id,
