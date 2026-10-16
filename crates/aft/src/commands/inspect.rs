@@ -763,7 +763,7 @@ fn handle_inspect_payload(
             // ready). Completion is owned by finish_tier2_phases from the
             // builder aggregate so this check cannot mark callgraph_ready
             // while the builder still reports callgraph_unavailable.
-            if !manager.callgraph_ready_for_snapshot(&snapshot) {
+            if matches!(manager.callgraph_ready_for_snapshot(&snapshot), Ok(false)) {
                 crate::slog_debug!("tier2 dead_code: callgraph store not ready at inspect start");
             }
             Some(phase_log.start(InspectPhaseEntry::category(
@@ -915,6 +915,9 @@ fn handle_inspect_payload(
     // served from cache, still contributes real gaps to request completion.
     if scope_was_provided {
         for (category, outcome) in &mut outcomes {
+            if outcome.is_pending() && outcome.payload().is_some() {
+                continue;
+            }
             if category.is_tier2() && !matches!(outcome, JobOutcome::Fresh { .. }) {
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
@@ -943,6 +946,9 @@ fn handle_inspect_payload(
         // Completed categories survive another scanner's budget exhaustion. Do
         // not reuse unverified stale rows as if they were current findings.
         for (category, outcome) in outcomes.iter_mut() {
+            if outcome.is_pending() && outcome.payload().is_some() {
+                continue;
+            }
             if !matches!(outcome, JobOutcome::Fresh { .. }) {
                 let reason = match &*outcome {
                     JobOutcome::Failed { message } => message.clone(),
@@ -2693,11 +2699,7 @@ fn receive_tier2_completion_until(
         let now = std::time::Instant::now();
         if now >= deadline {
             if category == InspectCategory::DeadCode && manager.dead_code_build_is_pending() {
-                return Some(JobOutcome::Fresh {
-                    payload: serde_json::json!({
-                        "status": "pending", "reason": "callgraph_building", "complete": false,
-                    }),
-                });
+                return Some(JobOutcome::callgraph_pending());
             }
             if request_deadline.is_some_and(|request| now >= request.work_at()) {
                 return Some(JobOutcome::Failed {
@@ -2751,6 +2753,14 @@ fn fresh_payloads(
     for category in InspectCategory::active() {
         match outcomes.get(category) {
             Some(JobOutcome::Fresh { payload }) => {
+                payloads.insert(*category, payload.clone());
+            }
+            // Explicit pending observations are renderable gaps, not completed
+            // findings or a reason to discard the other categories' results.
+            Some(JobOutcome::Pending {
+                payload: Some(payload),
+                ..
+            }) => {
                 payloads.insert(*category, payload.clone());
             }
             Some(JobOutcome::Stale { .. }) => {
@@ -5146,6 +5156,31 @@ mod status_bar_refresh_tests {
 mod render_text_tests {
     use super::*;
 
+    #[test]
+    fn readonly_busy_dead_code_reuses_count_free_pending_wording() {
+        let outcome = JobOutcome::callgraph_pending();
+        assert!(outcome.is_pending());
+        let mut outcomes = InspectCategory::active()
+            .iter()
+            .map(|category| (*category, JobOutcome::off()))
+            .collect::<BTreeMap<_, _>>();
+        outcomes.insert(InspectCategory::DeadCode, outcome);
+        let pending = fresh_payloads(&outcomes)
+            .expect("pending observations are renderable")
+            .remove(&InspectCategory::DeadCode)
+            .unwrap();
+        let text = render(serde_json::json!({"dead_code": pending}));
+        assert_eq!(text, "PARTIAL — dead code incomplete: callgraph_building; retry aft_inspect.\nDead code: pending (callgraph_building)");
+        println!("BUSY INSPECT AFTER:\n{text}");
+        let unavailable = crate::inspect::scanners::dead_code::borrow_only_unavailable_aggregate(3);
+        let before = render(serde_json::json!({"dead_code": {
+            "status": "unavailable", "unavailable": true, "complete": false,
+            "gaps": incomplete_category_gaps(InspectCategory::DeadCode, &unavailable),
+        }}));
+        assert_eq!(before, "PARTIAL — dead code unavailable: dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout; retry aft_inspect.\nIncomplete dead_code: Tier-2 unavailable (dead code: unavailable in this worktree (call graph is borrow-only); run aft_inspect in the main checkout)");
+        println!("BUSY INSPECT BEFORE:\n{before}");
+    }
+
     fn summary_map(value: Value) -> Map<String, Value> {
         value.as_object().cloned().unwrap_or_default()
     }
@@ -5747,6 +5782,90 @@ mod fresh_payload_tests {
             }
             assert!(!text.contains("PARTIAL"), "{text}");
         }
+    }
+
+    #[test]
+    fn scoped_busy_payload_survives_scope_and_deadline_finalization() {
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let path = root.join("lib.ts");
+        std::fs::write(&path, "function unused() {}\n").unwrap();
+        let mut config = Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        config.views.enabled = false;
+        config.indexes.callgraph = true;
+        config.harness = Some(crate::harness::Harness::Opencode);
+        config.inspect.categories = serde_json::from_value(serde_json::json!({
+            "diagnostics":false, "todos":false, "dead_code":true, "unused_exports":false,
+            "duplicates":false, "cycles":false, "complexity":false,
+        }))
+        .unwrap();
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        ctx.set_canonical_cache_root(root.clone());
+        let key = crate::search_index::artifact_cache_key(&root);
+        crate::root_cache::configure_artifact_access(&root, &key, false);
+        let store =
+            crate::callgraph_store::CallGraphStore::open(ctx.callgraph_store_dir(), root.clone())
+                .unwrap();
+        store.cold_build(&[path.clone()]).unwrap();
+        let snapshot = build_snapshot(&ctx).unwrap();
+        let manager = ctx.inspect_manager();
+        let seeded = manager.tier2_run_with_reuse_blocking(
+            snapshot,
+            InspectCategory::DeadCode,
+            JobScope::for_project(root),
+        );
+        assert!(matches!(seeded, JobOutcome::Fresh { .. }), "{seeded:?}");
+        let blocker = store.lock_readiness_for_test();
+        drop(store);
+        let req = RawRequest {
+            id: "scoped-busy".into(),
+            command: "inspect".into(),
+            lsp_hints: None,
+            session_id: None,
+            params: serde_json::json!({"scope":path, "sections":"dead_code"}),
+        };
+        let response = handle_inspect_payload(
+            &req,
+            &ctx,
+            false,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            None,
+            Some(InspectRequestDeadline::new(
+                Duration::from_secs(5),
+                Duration::ZERO,
+            )),
+            None,
+            Vec::new(),
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["complete"], false, "{response:?}");
+        assert_eq!(
+            response.data["summary"]["dead_code"],
+            serde_json::json!({
+                "status":"pending", "reason":"callgraph_building", "complete":false,
+            }),
+            "{response:?}"
+        );
+        assert!(
+            response.data["text"]
+                .as_str()
+                .unwrap()
+                .contains("Dead code: pending (callgraph_building)"),
+            "{response:?}"
+        );
+        assert_eq!(ctx.lsp().server_count(), 0);
     }
 
     #[test]
@@ -7510,8 +7629,16 @@ mod deferred_terminal_tests {
             None,
         )
         .expect("deadline produces an honest failure");
-        assert!(matches!(outcome, JobOutcome::Fresh { payload }
-            if payload == serde_json::json!({"status": "pending", "reason": "callgraph_building", "complete": false})));
+        assert!(
+            outcome.is_pending(),
+            "unfinished analysis must not be Fresh: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.payload(),
+            Some(&serde_json::json!({
+                "status": "pending", "reason": "callgraph_building", "complete": false,
+            }))
+        );
     }
 
     #[test]

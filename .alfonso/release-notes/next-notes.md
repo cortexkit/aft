@@ -9,3 +9,4 @@
 - Workflow hints ship inside the host's system entry — fixes "System message must be at the beginning" on Qwen-family endpoints (issue #150).
 - Checkpoints under restrict_to_project_root now snapshot a symlink itself rather than its target.
 - Callgraph stores sweep orphaned build temporaries (age-based, both layouts).
+- When the call-graph database is briefly busy, `aft_callgraph` says it is busy and to retry, and `aft_inspect` reports dead code as pending, instead of claiming no call graph exists. Background call-graph maintenance no longer gives up on a store it could not read.

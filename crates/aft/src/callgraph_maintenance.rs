@@ -274,8 +274,8 @@ fn settle_reconcile(
 ) -> CallgraphReconcileOutcome {
     if let Err(error) = &report {
         if error.is_transient_lock_contention() {
-            // The readonly connection already waited out its busy timeout.
-            // Lock contention says nothing about whether the stored graph
+            // Lock contention in either the open probe or comparison says
+            // nothing about whether the stored graph
             // is valid, so keep the request pending rather than forcing a
             // cold rebuild. Dropping the unfinished ownership restores the
             // reasons, and the next store access starts another attempt.
@@ -376,6 +376,47 @@ fn log_outcome(project_root: &std::path::Path, outcome: &CallgraphReconcileOutco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readonly_busy_reconcile_does_not_finish_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let dir = temp.path().join("store");
+        let store = CallGraphStore::open(dir.clone(), root.clone()).unwrap();
+        store.cold_build(&[]).unwrap();
+        let path = store.sqlite_path().to_path_buf();
+        drop(store);
+        let blocker = rusqlite::Connection::open(path).unwrap();
+        blocker
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let state = Arc::new(CallgraphReconcileState::default());
+        state.request("watcher overflow");
+        let force = Arc::new(CallgraphForceDemand::default());
+        let outcome = CallgraphReconcileJob {
+            ownership: state.begin().unwrap(),
+            callgraph_dir: dir,
+            project_root: root,
+            max_examined: 10,
+            force: Arc::clone(&force),
+            enqueue_refresh: Box::new(|_| panic!("busy must not enqueue a refresh")),
+        }
+        .run();
+        assert!(
+            matches!(outcome.action, CallgraphReconcileAction::Deferred(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(state.completed(), 0, "busy must not finish ownership");
+        assert!(state.last().is_none());
+        assert_eq!(state.pending_reason().as_deref(), Some("watcher overflow"));
+        assert!(
+            state.begin().is_some(),
+            "unfinished ownership must be retryable"
+        );
+        assert_eq!(force.pending(), None);
+        blocker.execute_batch("ROLLBACK").unwrap();
+    }
 
     #[test]
     fn abandoned_reconcile_restores_demand_and_releases_running() {

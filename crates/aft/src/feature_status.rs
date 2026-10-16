@@ -401,6 +401,9 @@ pub fn callgraph_access_observation(
         CallgraphStoreAccess::Off => IndexObservation::off(),
         CallgraphStoreAccess::Ready(_) => IndexObservation::ready(),
         CallgraphStoreAccess::Building => IndexObservation::building(),
+        CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => {
+            IndexObservation::building()
+        }
         CallgraphStoreAccess::Suspended(_) => IndexObservation::unavailable(cause::BUILD_SUSPENDED),
         CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
             match observed_index_status(ctx, IndexPlane::Callgraph) {

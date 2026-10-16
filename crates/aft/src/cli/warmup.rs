@@ -632,6 +632,7 @@ fn trigger_callgraph_warm(ctx: &AppContext) -> Option<SubsystemState> {
         ))),
         // Read-only worktree or not configured: nothing to build here.
         CallgraphStoreAccess::Unavailable => Some(SubsystemState::Ready),
+        CallgraphStoreAccess::Error(error) if error.is_transient_lock_contention() => None,
         CallgraphStoreAccess::Error(error) => Some(SubsystemState::Failed(error.to_string())),
     }
 }
@@ -650,6 +651,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         fulfilled_force_token,
         receiver_generation,
         receiver_epoch,
+        reopen_epoch,
     ) = {
         let rx_ref = ctx.callgraph_store_rx().lock();
         let Some(rx) = rx_ref.as_ref() else {
@@ -661,6 +663,7 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
         let mut settled = false;
         let mut fulfilled_force_token = None;
         let mut disconnected = false;
+        let mut reopen_epoch = None;
         loop {
             match rx.try_recv() {
                 Ok(CallGraphStoreBuildEvent::Ready {
@@ -671,8 +674,20 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                     if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
                         latest = Some(store);
                         fulfilled_force_token = token;
+                        reopen_epoch = Some(publication_epoch);
                     } else {
                         drop(store);
+                        settled = true;
+                    }
+                }
+                Ok(CallGraphStoreBuildEvent::Reopen {
+                    fulfilled_force_token: token,
+                    publication_epoch,
+                }) => {
+                    if ctx.callgraph_persist_epoch_flag().current() == publication_epoch {
+                        reopen_epoch = Some(publication_epoch);
+                        fulfilled_force_token = token;
+                    } else {
                         settled = true;
                     }
                 }
@@ -697,22 +712,27 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
             fulfilled_force_token,
             ctx.callgraph_store_rx_generation(),
             ctx.callgraph_store_rx_epoch(),
+            reopen_epoch,
         )
     };
 
-    let terminal =
-        latest.is_some() || denied.is_some() || suspended.is_some() || settled || disconnected;
+    let terminal = reopen_epoch.is_some()
+        || denied.is_some()
+        || suspended.is_some()
+        || settled
+        || disconnected;
     if !terminal {
         return;
     }
     let mut reopened = None;
-    if let Some(store) = latest {
-        drop(store);
+    let mut busy_reopen = false;
+    if reopen_epoch.is_some() {
+        drop(latest);
         if let Some(project_root) = ctx.callgraph_project_root() {
-            if let Ok(Some(store)) =
-                CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root)
-            {
-                reopened = Some(std::sync::Arc::new(store));
+            match CallGraphStore::open_readonly(ctx.callgraph_store_dir(), project_root) {
+                Ok(Some(store)) => reopened = Some(std::sync::Arc::new(store)),
+                Err(error) if error.is_transient_lock_contention() => busy_reopen = true,
+                _ => {}
             }
         }
     }
@@ -737,6 +757,13 @@ fn drain_callgraph_store_events(ctx: &AppContext) {
                 ctx.record_callgraph_store_build_suspension(receiver_generation, suspension);
             }
             *receiver = None;
+            if busy_reopen {
+                ctx.defer_callgraph_store_reopen(
+                    receiver,
+                    fulfilled_force_token,
+                    reopen_epoch.expect("published store"),
+                );
+            }
             if installed {
                 if let Some(force_token) = fulfilled_force_token {
                     ctx.fulfill_callgraph_store_force_token(force_token);
@@ -912,6 +939,84 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn readonly_busy_warmup_drain_retries_without_retiring_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root_path.clone()),
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        ctx.set_canonical_cache_root(root_path.clone());
+        let key = aft::search_index::artifact_cache_key(&root_path);
+        aft::root_cache::configure_artifact_access(&root_path, &key, false);
+        let store = CallGraphStore::open(ctx.callgraph_store_dir(), root_path).unwrap();
+        store.cold_build(&[]).unwrap();
+        let path = store.sqlite_path().to_path_buf();
+        drop(store);
+        let blocker = rusqlite::Connection::open(path).unwrap();
+        blocker
+            .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let token = ctx.mark_callgraph_store_force_rebuild("warmup reopen");
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        {
+            let mut receiver = ctx.callgraph_store_rx().lock();
+            assert_eq!(
+                ctx.callgraph_store_rx_generation(),
+                ctx.configure_generation()
+            );
+            *receiver = Some(rx);
+        }
+        tx.send(CallGraphStoreBuildEvent::Reopen {
+            fulfilled_force_token: Some(token),
+            publication_epoch: ctx.callgraph_persist_epoch_flag().current(),
+        })
+        .unwrap();
+        drop(tx);
+        let original_epoch = ctx.callgraph_store_rx_epoch();
+        drain_callgraph_store_events(&ctx);
+        let retry_epoch = ctx.callgraph_store_rx_epoch();
+        assert_ne!(
+            retry_epoch, original_epoch,
+            "a retry channel needs a new identity"
+        );
+        assert!(
+            ctx.with_current_callgraph_store_rx(
+                ctx.configure_generation(),
+                original_epoch,
+                |receiver| *receiver = None,
+            )
+            .is_none(),
+            "a disconnected waiter must not retire the retry channel"
+        );
+        assert!(
+            ctx.callgraph_store_rx().lock().is_some(),
+            "busy reopen must stay pending"
+        );
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token_for_test(),
+            Some(token)
+        );
+        assert!(ctx.callgraph_store().read().unwrap().is_none());
+        drain_callgraph_store_events(&ctx);
+        assert_ne!(
+            ctx.callgraph_store_rx_epoch(),
+            retry_epoch,
+            "repeated busy retries also replace the channel"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drain_callgraph_store_events(&ctx);
+        assert!(ctx.callgraph_store_rx().lock().is_none());
+        assert!(ctx.callgraph_store().read().unwrap().is_some());
+        assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
     }
 
     #[test]

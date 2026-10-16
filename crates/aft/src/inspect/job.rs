@@ -677,6 +677,13 @@ pub struct InspectResult {
     pub config: Arc<Config>,
     pub outcome: Result<InspectScanSuccess, String>,
     pub duration: Duration,
+    // A transient dependency probe yielded no cacheable analysis result.
+    pub(crate) deferred: Option<InspectDeferral>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum InspectDeferral {
+    CallgraphBusy,
 }
 
 impl InspectResult {
@@ -690,6 +697,7 @@ impl InspectResult {
             config: Arc::clone(&job.config),
             outcome: Ok(success),
             duration,
+            deferred: None,
         }
     }
 
@@ -703,7 +711,18 @@ impl InspectResult {
             config: Arc::clone(&job.config),
             outcome: Err(message.into()),
             duration,
+            deferred: None,
         }
+    }
+
+    pub(crate) fn callgraph_busy(
+        job: &InspectJob,
+        error: crate::callgraph_store::CallGraphStoreError,
+        duration: Duration,
+    ) -> Self {
+        let mut result = Self::failed(job, error.to_string(), duration);
+        result.deferred = Some(InspectDeferral::CallgraphBusy);
+        result
     }
 }
 
@@ -776,6 +795,8 @@ pub enum JobOutcome {
         in_flight: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         wait: Option<PendingWait>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
     },
     Failed {
         message: String,
@@ -783,6 +804,18 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
+    pub(crate) fn callgraph_pending() -> Self {
+        // Contention proves neither readiness nor absence. Retain the count-free
+        // observation without letting scoped rollups treat it as completed work.
+        Self::Pending {
+            in_flight: false,
+            wait: None,
+            payload: Some(serde_json::json!({
+                "status": "pending", "reason": "callgraph_building", "complete": false,
+            })),
+        }
+    }
+
     pub fn off() -> Self {
         Self::Fresh {
             payload: serde_json::json!({"off": true, "complete": true}),
@@ -792,6 +825,7 @@ impl JobOutcome {
         Self::Pending {
             in_flight,
             wait: None,
+            payload: None,
         }
     }
 
@@ -804,6 +838,7 @@ impl JobOutcome {
         Self::Pending {
             in_flight,
             wait: Some(PendingWait::new(cause, elapsed, budget)),
+            payload: None,
         }
     }
 
@@ -820,7 +855,8 @@ impl JobOutcome {
         match self {
             JobOutcome::Fresh { payload } => Some(payload),
             JobOutcome::Stale { cached, .. } => cached.as_ref(),
-            JobOutcome::Pending { .. } | JobOutcome::Failed { .. } => None,
+            JobOutcome::Pending { payload, .. } => payload.as_ref(),
+            JobOutcome::Failed { .. } => None,
         }
     }
 
