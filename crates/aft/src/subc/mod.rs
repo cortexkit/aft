@@ -6084,9 +6084,9 @@ where
     // The run-scope coordinator owns a writer sender even when no run is live.
     // Release it before joining the writer so an idle connection can drain.
     drop(run_scopes);
-    // The daemon control handle holds a writer sender too (the loop keeps it
-    // for flow-read parent checks), so the writer tasks cannot drain while it
-    // lives.
+    // The daemon control handle also holds a writer sender. The loop keeps it
+    // so flow reads can ask the daemon whether their parent scope is still
+    // live; the writer tasks cannot drain while the handle is alive.
     drop(control);
     drop(writer_tx);
     if tokio::time::timeout(Duration::from_secs(5), &mut ledger_writer_task)
