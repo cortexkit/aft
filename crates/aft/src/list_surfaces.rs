@@ -226,7 +226,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "OutlineFileDiscovery, discover_outline_files_with_options, discover_outline_files_unbounded, collect_outline_files_with_device_lookup, collect_outline_files_breadth_first_with_device_lookup, outline_walk_skips_and_reports_injected_foreign_mount, slow_outline_discovery_returns_a_partial_not_read_blocked, ITERATIONS, collection_truncated, walk_truncated, skipped_foreign_mounts",
             },
         ],
     },
@@ -579,9 +579,9 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/glob.rs",
-        enclosing_item: "exact_file_glob_with_ready_index_matches_basename_without_widening_scope, exact_file_glob_fallback_matches_basename_without_widening_scope",
+        enclosing_item: "exact_file_glob_with_ready_index_matches_basename_without_widening_scope, exact_file_glob_fallback_matches_basename_without_widening_scope, slow_large_walk_returns_an_honest_partial_not_read_blocked, walk_stall_after_matches_keeps_them_and_names_the_stalled_directory",
         location_or_primitive: "test walk_truncated assertions",
-        reason: "test-only assertions on walk_truncated for indexed and fallback exact-file discovery; they do not cut a list or produce a tool response",
+        reason: "test-only assertions on walk_truncated for indexed and fallback exact-file discovery and for slow or stalled fallback walks; they do not cut a list or produce a tool response",
     },
     // Checkpoint and restore results name their first files and then say how
     // many more there are; the checkpoint itself always covers every file.
