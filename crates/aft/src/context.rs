@@ -3521,9 +3521,10 @@ pub struct AppContext {
     /// rollup reopens the database only after it changed (see
     /// `view_path_status_summary`).
     view_path_status_cache: parking_lot::Mutex<Option<PathStatusCache>>,
-    /// The last index memory walk the health rollup made for this root, so a
-    /// rollup can reuse it while the indexes keep their shape (see
-    /// `health_memory_root_snapshot_and_rollup`).
+    /// The last walk of this root's semantic index, trigram index and symbol
+    /// cache that the health rollup made for its memory estimate. A later
+    /// rollup reuses it while those indexes' `memory_shape` counters are
+    /// unchanged (see `memory_root_snapshot_and_rollup`).
     health_memory_walk: parking_lot::Mutex<Option<WalkedMemory>>,
     /// At most one diagnostics collector may outlive its caller's budget.
     /// Later edits queue their latest disk contents instead of growing a pool
@@ -12690,8 +12691,8 @@ impl AppContext {
         }
     }
 
-    /// A full memory estimate from index walks (fresh or reused) plus the
-    /// cheap subsystem estimates, which are always taken now.
+    /// Build a full memory estimate from index walks (fresh or reused) plus
+    /// the cheap subsystem estimates, which are always taken fresh.
     fn memory_estimates_from(&self, walked: WalkedMemory) -> [crate::memory::MemoryEstimate; 10] {
         let WalkedMemory {
             mut semantic,
@@ -12875,14 +12876,15 @@ impl AppContext {
         ])
     }
 
-    /// Both [`Self::memory_root_snapshot`] and the health rollup's
-    /// pre-aggregated root memory from one estimate, for the health rollup.
+    /// Return both [`Self::memory_root_snapshot`] and the health rollup's
+    /// pre-aggregated root memory, computed from one estimate. Only the
+    /// health rollup calls this.
     ///
     /// The index walks inside an estimate visit every entry of the root's
     /// resident indexes, and the rollup asks for every root every few seconds.
     /// So the last walk is reused while the indexes' shape counters stay the
-    /// same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]; the cheap
-    /// subsystem estimates are always taken now. The rollup's
+    /// same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]. The cheap
+    /// subsystem estimates are always taken fresh. The rollup's
     /// `measured_age_ms` says how old the walked figures are.
     pub(crate) fn memory_root_snapshot_and_rollup(
         &self,

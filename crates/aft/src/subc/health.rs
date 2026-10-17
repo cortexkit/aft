@@ -4606,7 +4606,8 @@ mod tests {
         let before = walks();
         let _ = ctx.memory_root_snapshot();
         assert_eq!(walks() - before, 1);
-        // The memory census the rollup publishes names the age per root too.
+        // The memory census the rollup publishes also carries, per root, the
+        // age of the index walk behind its memory figures.
         let (_root_dir, root) = test_root("rollup-shape-census");
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));

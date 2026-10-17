@@ -1304,8 +1304,10 @@ const ADMISSION_BATCH: usize = 16;
 #[derive(Default)]
 struct DueBatch {
     items: Vec<PreparedDue>,
-    /// Owner manifests for the checks made before the barrier, read once per
-    /// pass. The recheck reads them again under the barrier.
+    /// Owner manifests for the checks made before the retention barrier
+    /// (`retention/sweep.lock`, which binds and pins also take), read once
+    /// per pass. The admission recheck reads them again while holding the
+    /// barrier, just before each rename.
     owners: Option<OwnerManifests>,
     /// Set while the due-first lane prepares caches, so their outcomes also
     /// count toward [`SweepReport::due_first`].
@@ -1340,8 +1342,9 @@ impl DueBatch {
         }
         let items = std::mem::take(&mut self.items);
         let phase = Instant::now();
-        // Retention yields to admission instead of spending another lane's
-        // budget waiting for a bind or pin that already protects this storage.
+        // Try the retention barrier without waiting. If a bind or pin holds it,
+        // that caller is protecting this storage right now, so retention backs
+        // off instead of spending its pass budget waiting.
         let admission =
             crate::fs_lock::try_acquire(&storage.join("retention/sweep.lock"), Duration::ZERO)
                 .map_err(|error| io::Error::other(error.to_string()))
@@ -1419,8 +1422,9 @@ impl PreparedDue {
         attribute_due(storage, &self.directory, self.due_lane, before, report)
     }
 
-    /// The barrier could not be taken: keep the cache and name the reason,
-    /// as a candidate that failed would.
+    /// The retention barrier (`retention/sweep.lock`) could not be taken: the
+    /// cache stays, counted as `skipped_protected` with the error and the
+    /// cache path, as a lane reports any candidate whose checks failed.
     fn refuse(&self, error: &io::Error, report: &mut SweepReport) {
         report.skipped_protected += 1;
         if report.errors.len() < 16 {
@@ -1488,9 +1492,10 @@ impl PreparedDue {
     }
 }
 
-/// Entirely due roots do not need obsolete-generation GC or four byte walks.
-/// Validate once without measuring, then queue the cache for the batched
-/// admission recheck that retires it.
+/// A cache whose every binding is past its grace is about to be retired whole,
+/// so it skips the obsolete-generation GC and the byte-measuring tree walks
+/// that other candidates get. Validate its tree once without measuring, then
+/// queue it in `batch` for the admission recheck that retires it.
 fn prepare_due_cache(
     storage: &Path,
     directory: &Path,
@@ -3896,7 +3901,8 @@ mod storage_retention_tests {
                 cache(temp.path(), "views", &key);
                 cache(temp.path(), "callgraph", &key);
             } else {
-                // Present checkouts: history the recheck reads but never removes.
+                // Bindings whose checkout still exists: every admission
+                // recheck reads them, and retention must never remove them.
                 let live = checkouts.path().join(format!("live-{number}"));
                 fs::create_dir(&live).unwrap();
                 binding.root = live;

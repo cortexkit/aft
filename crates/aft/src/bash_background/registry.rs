@@ -821,8 +821,9 @@ pub(crate) struct RegistryInner {
     gc_db_liveness_queries: AtomicU64,
     #[cfg(test)]
     pub(crate) child_polls: AtomicU64,
-    /// Snapshots built for any reader; tests count what a deferred wait's
-    /// observations cost.
+    /// Test-only count of task snapshots built (`snapshot_with_terminal_cache`,
+    /// which can open task files on disk), by any caller. Tests use it to
+    /// check that a held foreground bash call's periodic task checks build none.
     #[cfg(test)]
     pub(crate) snapshots_built: AtomicU64,
     /// Name of the thread the once-per-process persisted GC ran on. Lets the
