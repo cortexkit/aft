@@ -726,7 +726,6 @@ mod tests {
 
     /// A checkout `root/sub/file` with an `outside/file` twin beside it, and a
     /// full-access policy, so only the checkout fence can refuse the twin.
-    #[cfg(unix)]
     fn swap_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, AccessPolicy) {
         let (dir, mut policy) = fixture();
         let base = dir.path().canonicalize().unwrap();
@@ -734,32 +733,50 @@ mod tests {
         let outside = base.join("outside");
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(root.join("sub/file"), "inside").unwrap();
+        std::fs::write(root.join("sub").join("file"), "inside").unwrap();
         std::fs::write(outside.join("file"), "outside").unwrap();
         policy.mode = crate::access_policy::ApprovalMode::FullAccess;
         (dir, root, outside, policy)
     }
 
-    /// Replaces `root/sub` with a symlink to `target` once the path and policy
+    /// Makes `link` a directory link to `target`: a symlink on Unix, and a
+    /// junction on Windows, which needs no symlink privilege.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(crate::inspect::job::normalize_path(link))
+                .arg(crate::inspect::job::normalize_path(target))
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J failed: {status}");
+        }
+    }
+
+    /// Replaces `root/sub` with a link to `target` once the path and policy
     /// checks have passed, as a concurrent writer in the checkout could.
-    #[cfg(unix)]
     fn swap_after_check(root: &Path, target: &Path) -> ReadHooks {
         let (root, target) = (root.to_path_buf(), target.to_path_buf());
         ReadHooks {
             after_check: Some(std::sync::Arc::new(move || {
                 std::fs::rename(root.join("sub"), root.join("sub.old")).unwrap();
-                std::os::unix::fs::symlink(&target, root.join("sub")).unwrap();
+                link_dir(&target, &root.join("sub"));
             })),
             ..ReadHooks::default()
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn file_read_exact_directory_swapped_for_symlink_refused() {
         let (_dir, root, outside, policy) = swap_fixture();
         let result = super::read_exact(
-            Path::new("sub/file"),
+            &Path::new("sub").join("file"),
             &root,
             &policy,
             swap_after_check(&root, &outside),
