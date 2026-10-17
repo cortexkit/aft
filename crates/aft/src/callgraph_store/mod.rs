@@ -12485,24 +12485,29 @@ fn sweep_orphaned_build_temps_store_wide(callgraph_dir: &Path) {
     };
     let mut skipped_foreign_mounts = 0usize;
 
-    // Root-keyed layout: every `<storage>/callgraph/<key>` directory.
+    // Root-keyed layout: every `<storage>/callgraph/<key>` directory. The
+    // callgraph folder may be a separate volume mounted under the storage
+    // root, so its children are compared against the callgraph folder's own
+    // device. Skipping that whole folder as "foreign" would leave every other
+    // key's orphaned build temporaries on it forever.
     let root_keyed_dir = storage_root.join(domain);
     if root_keyed_dir.is_dir() {
-        if boundary.should_descend(&root_keyed_dir).unwrap_or(false) {
-            if let Ok(entries) = std::fs::read_dir(&root_keyed_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        if boundary.should_descend(&path).unwrap_or(false) {
-                            sweep_orphaned_build_temps(&path);
-                        } else {
-                            skipped_foreign_mounts += 1;
+        match crate::walk_boundary::DeviceBoundary::for_root(&root_keyed_dir) {
+            Ok(domain_boundary) => {
+                if let Ok(entries) = std::fs::read_dir(&root_keyed_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if domain_boundary.should_descend(&path).unwrap_or(false) {
+                                sweep_orphaned_build_temps(&path);
+                            } else {
+                                skipped_foreign_mounts += 1;
+                            }
                         }
                     }
                 }
             }
-        } else {
-            skipped_foreign_mounts += 1;
+            Err(_) => skipped_foreign_mounts += 1,
         }
     }
 
@@ -24951,6 +24956,32 @@ mod cold_build_insert_tests {
         assert!(
             !legacy_dir.join(orphan).exists(),
             "legacy orphan must be reclaimed by the store-wide sweep"
+        );
+    }
+
+    #[test]
+    fn orphan_temp_sweep_reaches_a_callgraph_folder_mounted_from_another_volume() {
+        let storage = tempdir().unwrap();
+        let storage_root = storage.path();
+        let callgraph = storage_root.join("callgraph");
+        let dead_dir = callgraph.join("deadkey");
+        fs::create_dir_all(&dead_dir).unwrap();
+        let orphan = "deadkey.g100.1.sqlite.tmp.1.200";
+        write_build_temp_with_age(
+            &dead_dir,
+            orphan,
+            ORPHANED_BUILD_TEMP_MIN_AGE + Duration::from_secs(60),
+        );
+        let live_dir = callgraph.join("livekey");
+        fs::create_dir_all(&live_dir).unwrap();
+        // The callgraph folder is a separate volume from the storage root.
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(&callgraph, u64::MAX - 40);
+
+        sweep_orphaned_build_temps_store_wide(&live_dir);
+
+        assert!(
+            !dead_dir.join(orphan).exists(),
+            "another key's orphan on the mounted callgraph folder must be reclaimed"
         );
     }
 

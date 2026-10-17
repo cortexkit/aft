@@ -1544,7 +1544,18 @@ pub(crate) fn repair_legacy_user_filter_dir(storage_dir: &Path, harness: Harness
         if target.exists() {
             continue;
         }
-        let _ = fs::rename(entry.path(), target);
+        // The harness folder and the root normally share a volume, but a move
+        // that crosses volumes falls back to a copy instead of failing.
+        if let Err(error) = crate::cross_volume::move_path(&entry.path(), &target) {
+            // The filter stays at its legacy path; say so instead of dropping
+            // the failure.
+            crate::slog_warn!(
+                "legacy filter {} kept in place: cannot move it to {}: {}",
+                entry.path().display(),
+                target.display(),
+                error
+            );
+        }
     }
 
     if fs::read_dir(&legacy_dir)
@@ -1660,6 +1671,28 @@ mod tests {
             "root"
         );
         assert!(!storage.join("filters/root-only.toml").exists());
+    }
+
+    #[test]
+    fn repair_legacy_user_filter_dir_moves_filters_into_a_harness_folder_on_another_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path();
+        fs::create_dir_all(storage.join("filters")).unwrap();
+        fs::create_dir_all(storage.join("opencode/filters")).unwrap();
+        fs::write(storage.join("filters/root-only.toml"), "root").unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume = crate::walk_boundary::simulated_volumes::simulate(
+            &storage.join("opencode"),
+            u64::MAX - 23,
+        );
+
+        repair_legacy_user_filter_dir(storage, Harness::Opencode);
+
+        assert_eq!(
+            fs::read_to_string(storage.join("opencode/filters/root-only.toml")).unwrap(),
+            "root"
+        );
+        assert!(!storage.join("filters").exists());
     }
 }
 

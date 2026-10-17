@@ -1101,10 +1101,18 @@ fn validate_tree(
 
 /// Keep trash on the cache's filesystem so retiring a root is a single rename.
 /// A failed unlink or daemon exit leaves a recognizable directory for retry.
+///
+/// A cache folder that is itself a mount point (its own volume, separate from
+/// the domain folder above it) cannot be renamed into the domain's trash: the
+/// rename would cross volumes, and a mount point cannot be moved anyway. Its
+/// contents are retired instead, see `retire_mount_point_contents`.
 fn retire_directory(cache: &Path) -> io::Result<()> {
     let parent = cache
         .parent()
         .ok_or_else(|| io::Error::other("missing cache parent"))?;
+    if crate::cross_volume::is_mount_point(cache)? {
+        return retire_mount_point_contents(cache);
+    }
     let trash = parent.join(".retention-trash");
     fs::create_dir_all(&trash)?;
     if !fs::symlink_metadata(&trash)?.is_dir() {
@@ -1114,10 +1122,51 @@ fn retire_directory(cache: &Path) -> io::Result<()> {
     test_hook(cache, "rename-root");
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    fs::rename(
+    crate::cross_volume::rename(
         cache,
-        trash.join(format!("retired-{:032x}", u128::from_le_bytes(nonce))),
+        &trash.join(format!("retired-{:032x}", u128::from_le_bytes(nonce))),
     )
+}
+
+/// Retire a mount-point cache folder by emptying it. Its entries are first
+/// renamed into a trash folder inside the mount, so every rename stays on that
+/// volume and a crash leaves one recognizable `retired-*` folder. The trash is
+/// then deleted right away: the background reaper only looks in the domain
+/// folder's trash, which is on the other volume. The caller has already
+/// validated the tree, which bounds it to `TREE_ENTRIES` entries. The empty
+/// mount point stays, and `emptied_mount_point` makes later passes treat it
+/// as absent.
+fn retire_mount_point_contents(cache: &Path) -> io::Result<()> {
+    let trash = cache.join(".retention-trash");
+    fs::create_dir_all(&trash)?;
+    if !fs::symlink_metadata(&trash)?.is_dir() {
+        return Err(io::Error::other("non-directory retention trash retained"));
+    }
+    #[cfg(test)]
+    test_hook(cache, "rename-root");
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    let retired = trash.join(format!("retired-{:032x}", u128::from_le_bytes(nonce)));
+    fs::create_dir(&retired)?;
+    for entry in fs::read_dir(cache)? {
+        let entry = entry?;
+        if entry.file_name() == ".retention-trash" {
+            continue;
+        }
+        crate::cross_volume::rename(&entry.path(), &retired.join(entry.file_name()))?;
+    }
+    fs::remove_dir_all(&trash)
+}
+
+/// True for a mount-point cache folder that `retire_mount_point_contents`
+/// already emptied (or that never held anything). The folder itself cannot be
+/// removed, so without this check every later pass would find the key again
+/// and retire it again.
+fn emptied_mount_point(cache: &Path) -> bool {
+    crate::cross_volume::is_mount_point(cache).unwrap_or(false)
+        && fs::read_dir(cache).is_ok_and(|mut entries| {
+            entries.all(|entry| entry.is_ok_and(|entry| entry.file_name() == ".retention-trash"))
+        })
 }
 
 fn reap_retired(storage: &Path) -> io::Result<()> {
@@ -1514,6 +1563,10 @@ fn candidate_inner(
     } else {
         directory.join(key)
     };
+    if !flat && emptied_mount_point(&cache) {
+        // Already retired: only the mount point itself is left.
+        return Ok(());
+    }
     if !flat
         && history
             .get(key)
@@ -1771,7 +1824,9 @@ fn due_first(
             if *flat {
                 continue;
             }
-            if fs::symlink_metadata(directory.join(&key)).is_ok_and(|metadata| metadata.is_dir()) {
+            if fs::symlink_metadata(directory.join(&key)).is_ok_and(|metadata| metadata.is_dir())
+                && !emptied_mount_point(&directory.join(&key))
+            {
                 present = true;
                 if directory == &storage.join("views") {
                     report.due_views_remaining += 1;
@@ -3235,6 +3290,45 @@ mod storage_retention_tests {
     }
 
     #[test]
+    fn retention_retires_a_mount_point_cache_by_emptying_it_on_its_own_volume() {
+        let (temp, _, _, path) = due_cache_fixture();
+        fs::create_dir_all(path.join("nested")).unwrap();
+        fs::write(path.join("nested/derived.bin"), b"rebuildable").unwrap();
+        // The domain folder and the cache folder below it report different
+        // devices, as when a separate volume is mounted at the cache folder.
+        // Renaming the cache into `views/.retention-trash` would then fail
+        // with EXDEV.
+        let _views = crate::walk_boundary::simulated_volumes::simulate(
+            &temp.path().join("views"),
+            u64::MAX - 10,
+        );
+        let _mount = crate::walk_boundary::simulated_volumes::simulate(&path, u64::MAX - 11);
+
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 1, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(path.is_dir(), "the mount point itself must stay");
+        assert_eq!(
+            fs::read_dir(&path).unwrap().count(),
+            0,
+            "every entry of the mounted cache is retired"
+        );
+        assert!(
+            !temp.path().join("views/.retention-trash").exists()
+                || fs::read_dir(temp.path().join("views/.retention-trash"))
+                    .unwrap()
+                    .count()
+                    == 0,
+            "nothing crossed into the domain folder's trash"
+        );
+
+        // The emptied mount point counts as gone, so the next pass does not
+        // retire it again.
+        let report = run_pass(temp.path(), &|| false);
+        assert_eq!(report.removed_roots, 0, "{report:?}");
+    }
+
+    #[test]
     fn retention_reaper_resumes_retired_roots_without_a_pass() {
         let (temp, _, _, path) = due_cache_fixture();
         retire_directory(&path).unwrap();
@@ -4161,7 +4255,8 @@ fn clear_unknown_observation(storage: &Path, key: &str) -> io::Result<()> {
 fn cache_key_present(storage: &Path, key: &str, deadline: Instant) -> io::Result<bool> {
     for (directory, flat) in domain_paths(storage)? {
         if !flat {
-            if directory.join(key).try_exists()? {
+            let cache = directory.join(key);
+            if cache.try_exists()? && !emptied_mount_point(&cache) {
                 return Ok(true);
             }
         } else if directory.try_exists()? {

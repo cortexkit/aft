@@ -1350,8 +1350,10 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
         let _ = std::fs::remove_dir(&harness_tasks);
     }
 
-    match std::fs::rename(&root_tasks, &harness_tasks) {
-        Ok(()) => crate::slog_info!(
+    // The harness folder and the root normally share a volume, but a move
+    // that crosses volumes falls back to a copy instead of failing.
+    match crate::cross_volume::move_path(&root_tasks, &harness_tasks) {
+        Ok(_) => crate::slog_info!(
             "moved legacy root bash tasks into harness namespace: {}",
             harness_tasks.display()
         ),
@@ -1361,18 +1363,35 @@ pub fn repair_legacy_root_tasks(storage_root: &std::path::Path, harness: crate::
                 harness_tasks.display(),
                 error
             );
-            if crate::private_storage::create_dir_all(&harness_tasks).is_err() {
+            if let Err(error) = crate::private_storage::create_dir_all(&harness_tasks) {
+                crate::slog_warn!(
+                    "legacy root bash tasks kept in {}: cannot create {}: {}",
+                    root_tasks.display(),
+                    harness_tasks.display(),
+                    error
+                );
                 return;
             }
             if let Ok(entries) = std::fs::read_dir(&root_tasks) {
                 for entry in entries.flatten() {
                     let source = entry.path();
                     let target = harness_tasks.join(entry.file_name());
-                    if !target.exists() {
-                        let _ = std::fs::rename(source, target);
+                    if target.exists() {
+                        continue;
+                    }
+                    if let Err(error) = crate::cross_volume::move_path(&source, &target) {
+                        // The task stays readable at its legacy path; say so
+                        // instead of dropping the failure.
+                        crate::slog_warn!(
+                            "legacy bash task {} kept in place: cannot move it to {}: {}",
+                            source.display(),
+                            target.display(),
+                            error
+                        );
                     }
                 }
             }
+            // Removes the legacy folder only when every task left it.
             let _ = std::fs::remove_dir(&root_tasks);
         }
     }
@@ -1621,6 +1640,38 @@ mod shell_resolution_tests {
             pty.file_name().and_then(|name| name.to_str()),
             Some("sh"),
             "the PTY launcher must come from the bash resolver, not from $SHELL"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_root_task_repair_tests {
+    use std::fs;
+
+    use crate::harness::Harness;
+    use crate::walk_boundary::simulated_volumes::simulate;
+
+    #[test]
+    fn legacy_root_tasks_move_into_a_harness_folder_on_another_volume() {
+        let storage = tempfile::tempdir().unwrap();
+        let root_tasks = storage.path().join("bash-tasks");
+        fs::create_dir_all(root_tasks.join("task-1")).unwrap();
+        fs::write(root_tasks.join("task-1/meta.json"), b"{\"id\":1}").unwrap();
+        let harness_dir = storage.path().join(Harness::Opencode.storage_segment());
+        fs::create_dir_all(&harness_dir).unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume = simulate(&harness_dir, u64::MAX - 20);
+
+        super::repair_legacy_root_tasks(storage.path(), Harness::Opencode);
+
+        assert_eq!(
+            fs::read(harness_dir.join("bash-tasks/task-1/meta.json")).unwrap(),
+            b"{\"id\":1}",
+            "the task must reach the harness folder"
+        );
+        assert!(
+            !root_tasks.exists(),
+            "the legacy folder is removed after the copy"
         );
     }
 }

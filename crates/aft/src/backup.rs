@@ -2980,8 +2980,10 @@ impl BackupStore {
         if harness_backups.exists() {
             let _ = std::fs::remove_dir(&harness_backups);
         }
-        match std::fs::rename(&root_backups, &harness_backups) {
-            Ok(()) => {
+        // The harness folder and the root normally share a volume, but a move
+        // that crosses volumes falls back to a copy instead of failing.
+        match crate::cross_volume::move_path(&root_backups, &harness_backups) {
+            Ok(_) => {
                 crate::slog_info!(
                     "moved legacy root backups into harness namespace: {}",
                     harness_backups.display()
@@ -2993,18 +2995,35 @@ impl BackupStore {
                     harness_backups.display(),
                     error
                 );
-                if create_private_durable_dir(&harness_backups).is_err() {
+                if let Err(error) = create_private_durable_dir(&harness_backups) {
+                    crate::slog_warn!(
+                        "legacy root backups kept in {}: cannot create {}: {}",
+                        root_backups.display(),
+                        harness_backups.display(),
+                        error
+                    );
                     return;
                 }
                 if let Ok(entries) = std::fs::read_dir(&root_backups) {
                     for entry in entries.flatten() {
                         let source = entry.path();
                         let target = harness_backups.join(entry.file_name());
-                        if !target.exists() {
-                            let _ = std::fs::rename(source, target);
+                        if target.exists() {
+                            continue;
+                        }
+                        if let Err(error) = crate::cross_volume::move_path(&source, &target) {
+                            // The backup stays at its legacy path; say so
+                            // instead of dropping the failure.
+                            crate::slog_warn!(
+                                "legacy backup {} kept in place: cannot move it to {}: {}",
+                                source.display(),
+                                target.display(),
+                                error
+                            );
                         }
                     }
                 }
+                // Removes the legacy folder only when every backup left it.
                 let _ = std::fs::remove_dir(&root_backups);
             }
         }
@@ -7062,6 +7081,34 @@ mod tests {
         assert!(store.tracked_files(DEFAULT_SESSION_ID).is_empty());
         let _ = fs::remove_dir_all(&dir_a);
         let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn legacy_root_backups_move_into_a_harness_folder_on_another_volume() {
+        let storage = tempfile::tempdir().unwrap();
+        let root_backups = storage.path().join("backups");
+        fs::create_dir_all(root_backups.join("session-a")).unwrap();
+        fs::write(root_backups.join("session-a/meta.json"), b"{}").unwrap();
+        let harness = crate::harness::Harness::Opencode;
+        let harness_dir = storage.path().join(harness.storage_segment());
+        fs::create_dir_all(&harness_dir).unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume =
+            crate::walk_boundary::simulated_volumes::simulate(&harness_dir, u64::MAX - 21);
+
+        let mut store = BackupStore::new();
+        store.set_storage_dir_for_harness(storage.path().to_path_buf(), harness, 72);
+        store.repair_root_backups_if_needed();
+
+        assert_eq!(
+            fs::read(harness_dir.join("backups/session-a/meta.json")).unwrap(),
+            b"{}",
+            "the backup history must reach the harness folder"
+        );
+        assert!(
+            !root_backups.exists(),
+            "the legacy folder is removed after the copy"
+        );
     }
 
     #[test]
