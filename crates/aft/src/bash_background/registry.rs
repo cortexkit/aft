@@ -821,6 +821,10 @@ pub(crate) struct RegistryInner {
     gc_db_liveness_queries: AtomicU64,
     #[cfg(test)]
     pub(crate) child_polls: AtomicU64,
+    /// Snapshots built for any reader; tests count what a deferred wait's
+    /// observations cost.
+    #[cfg(test)]
+    pub(crate) snapshots_built: AtomicU64,
     /// Name of the thread the once-per-process persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
@@ -1234,6 +1238,8 @@ impl BgTaskRegistry {
                 gc_db_liveness_queries: AtomicU64::new(0),
                 #[cfg(test)]
                 child_polls: AtomicU64::new(0),
+                #[cfg(test)]
+                snapshots_built: AtomicU64::new(0),
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
@@ -1977,6 +1983,8 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         preview_bytes: usize,
     ) -> BgTaskSnapshot {
+        #[cfg(test)]
+        self.inner.snapshots_built.fetch_add(1, Ordering::Relaxed);
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(task, &mut snapshot);
         if let Ok(state) = task.lock_state() {
@@ -5470,6 +5478,23 @@ impl BgTaskRegistry {
             Duration::ZERO,
             true,
         )
+    }
+
+    /// Whether the task a held foreground bash call waits on has finished, or
+    /// is no longer registered for the session (the same answer
+    /// [`Self::status`] gives through its snapshot's status). It polls the
+    /// task's child, so a piped command's exit is noticed between watchdog
+    /// passes, but builds no snapshot: a snapshot opens task files on disk,
+    /// and every held call asks this once per poll interval.
+    pub(crate) fn wait_target_finished(&self, task_id: &str, session_id: &str) -> bool {
+        if validate_task_id(task_id).is_err() {
+            return true;
+        }
+        let Some(task) = self.task_for_session(task_id, session_id) else {
+            return true;
+        };
+        let _ = self.poll_task(&task);
+        task.is_terminal()
     }
 
     /// Read a finished task's files without registering tasks, rewriting records,
