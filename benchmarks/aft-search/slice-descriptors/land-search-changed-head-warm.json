@@ -1,0 +1,9 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "note": "Search caches admit at most 512 unique Git-diff and metadata-stale paths in the warm-load lane, including same-HEAD reloads. Admission uses metadata before reading content; larger refreshes fall back to the existing cold-build permit and full refresh. Strict verification retains its existing matching-metadata hash checks. Scoring and routing are unchanged; benchmark rows must remain byte-identical."
+}

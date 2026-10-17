@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/search_index.rs"
+  ],
+  "slices": [
+    "warm-refresh-root-alias-visibility"
+  ],
+  "note": "The ranking fence hit is crates/aft/src/search_index.rs. Cache loading now canonicalizes the project root before deriving cached file keys, so warm refreshes through symlink or Windows casing aliases keep cached edits as visible as new files. The admission budget, source bytes, query routing and ranking rules are unchanged; ranked rows for canonical checkouts must remain byte-identical to the committed reference. The alias regression covers cached edits, unchanged files, additions, subfolder scopes and persistence for both verification strategies."
+}

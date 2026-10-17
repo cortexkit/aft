@@ -706,6 +706,18 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Option::take releasing a warm-reload permit before a cold-build acquire; no list is cut",
     },
     ExclusionEntry {
+        file: "search_index.rs",
+        enclosing_item: "git_diff_within_path_limit",
+        location_or_primitive: "WARM_GIT_DIFF_PATH_LIMIT",
+        reason: "bounds the union of warm Git-diff and disk-stale paths; over-limit refreshes are rejected before content reads and configure falls back to a full cold rebuild, so no agent-visible list is truncated",
+    },
+    ExclusionEntry {
+        file: "search_index.rs",
+        enclosing_item: "verify_file_mtimes_with_budget",
+        location_or_primitive: "changed_paths.len() > limit",
+        reason: "admission budget for disk-only changes and Git-diff paths; an over-budget refresh returns a cache miss for a permitted full rebuild, not a truncated agent-visible list",
+    },
+    ExclusionEntry {
         file: "commands/semantic_search/lexical_lane.rs",
         enclosing_item: "reference_selected_pool",
         location_or_primitive: "commands::semantic_search::lexical_lane::reference_selected_pool",

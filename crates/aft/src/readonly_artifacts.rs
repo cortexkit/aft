@@ -644,6 +644,30 @@ mod tests {
         cache_dir
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn borrowed_search_keeps_plain_root_keys_for_disk_lookups() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let (_project, canonical_root) = fixture_project();
+        let root = crate::windows_path::normalize_windows_path(&canonical_root);
+        assert!(!root.to_string_lossy().starts_with(r"\\?\"));
+        let storage = tempfile::tempdir().expect("storage");
+        build_search_artifact(&canonical_root, storage.path());
+
+        let index = match open_search_index_read_only(&root, Some(storage.path())) {
+            ReadOnlyArtifact::Fresh(index) => index,
+            other => panic!("expected a fresh borrowed artifact, got {other:?}"),
+        };
+        assert!(index.path_to_id.contains_key(&root.join("src/lib.rs")));
+        assert_eq!(
+            index
+                .grep("readonly_needle", true, &[], &[], &root.join("src"), 10)
+                .matches
+                .len(),
+            1
+        );
+    }
+
     fn clone_checkout(root: &Path) -> (TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("create clone dir");
         let clone_root = temp.path().join("clone");

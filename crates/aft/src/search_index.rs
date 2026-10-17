@@ -64,6 +64,9 @@ pub enum ExactEvidenceScope {
 }
 
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+// The warm change budget admits at most 512 Git-diff or stat-stale paths.
+// Larger refreshes belong under the shared build limit, not the disk-load lane.
+const WARM_GIT_DIFF_PATH_LIMIT: usize = 512;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
@@ -1856,9 +1859,30 @@ impl SearchIndex {
         path: &Path,
         canonical_parents: &mut ParentCanonicalizationMemo,
     ) {
-        let canonical_path =
-            canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
+        let canonical_path = self.respell_under_stored_root(
+            canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents),
+        );
         self.remove_resolved_file(path, &canonical_path);
+    }
+
+    /// Spell a filesystem-canonical path the way this index's stored keys are
+    /// spelled, so an exact key lookup can find it.
+    ///
+    /// On Windows, `fs::canonicalize` returns a verbatim (`\\?\`) path, but an
+    /// index loaded by a read-only caller keeps a plain root and plain keys.
+    /// Only the lookup key is respelled here; the stored root and the keys it
+    /// owns keep the caller's convention. Elsewhere canonical paths already
+    /// match the stored keys, so the path is returned unchanged.
+    fn respell_under_stored_root(&self, path: PathBuf) -> PathBuf {
+        #[cfg(windows)]
+        if !self.project_root.as_os_str().is_empty() {
+            let root = crate::windows_path::normalize_windows_path(&self.project_root);
+            let normalized = crate::windows_path::normalize_windows_path(&path);
+            if let Ok(relative) = normalized.strip_prefix(&root) {
+                return self.project_root.join(relative);
+            }
+        }
+        path
     }
 
     fn remove_resolved_file(&mut self, path: &Path, canonical_path: &Path) {
@@ -1951,13 +1975,18 @@ impl SearchIndex {
     }
 
     pub(crate) fn apply_search_update(&mut self, update: PreparedSearchUpdate) {
-        self.remove_resolved_file(&update.path, &update.path);
-        match update.file {
+        let PreparedSearchUpdate { path, file } = update;
+        // Prepared updates use filesystem-canonical paths, but borrowed indexes
+        // can have a plain Windows root. Match the stored root's spelling before
+        // replacing its exact path key.
+        let path = self.respell_under_stored_root(path);
+        self.remove_resolved_file(&path, &path);
+        match file {
             PreparedSearchPath::Indexed(file) => {
-                self.index_prepared_new_file(&update.path, file);
+                self.index_prepared_new_file(&path, file);
             }
             PreparedSearchPath::Unindexed(metadata) => {
-                self.track_unindexed_file_with_metadata(&update.path, metadata);
+                self.track_unindexed_file_with_metadata(&path, metadata);
             }
             PreparedSearchPath::Skipped => {}
         }
@@ -2253,7 +2282,17 @@ impl SearchIndex {
         let mut root_bytes = vec![0u8; root_len];
         reader.read_exact(&mut root_bytes).ok()?;
         let stored_project_root = PathBuf::from(String::from_utf8(root_bytes).ok()?);
-        let project_root = current_canonical_root.to_path_buf();
+        // Resolve aliases before deriving cached keys so scoped queries can see
+        // both cached and new files. Keep the caller's Windows prefix convention:
+        // configure supplies verbatim roots, while read-only callers may supply
+        // plain canonical roots for disk-walk lookups shared with the semantic index.
+        let project_root = fs::canonicalize(current_canonical_root)
+            .unwrap_or_else(|_| current_canonical_root.to_path_buf());
+        #[cfg(windows)]
+        let project_root = match current_canonical_root.components().next() {
+            Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim() => project_root,
+            _ => crate::windows_path::normalize_windows_path(&project_root),
+        };
         // Snapshot paths are stored relative to the root that wrote them and
         // are re-rooted onto the loading root. That is only sound when both
         // roots sit at the same place in their checkouts: a snapshot written
@@ -2532,6 +2571,22 @@ impl SearchIndex {
         changed
     }
 
+    pub(crate) fn verify_against_disk_with_warm_budget(
+        &mut self,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> Option<bool> {
+        let changed = verify_file_mtimes_with_budget(
+            self,
+            verify_strategy,
+            HashSet::new(),
+            WARM_GIT_DIFF_PATH_LIMIT,
+        )?;
+        self.git_head = current_head;
+        self.ready = true;
+        Some(changed)
+    }
+
     /// Bring a borrowed (read-only) snapshot in line with the files that are
     /// actually on disk under this index's root, entirely in RAM.
     ///
@@ -2703,51 +2758,17 @@ impl SearchIndex {
         cache_dir: Option<&Path>,
         verify_strategy: cache_freshness::VerifyStrategy,
     ) -> Self {
-        if let Some(mut baseline) = baseline {
-            if baseline.max_file_size != max_file_size {
-                return match cache_dir {
-                    Some(cache_dir) => {
-                        SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
-                    }
-                    None => SearchIndex::build_with_limit(root, max_file_size),
-                };
-            }
-            baseline.project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
-            if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
-                return match cache_dir {
-                    Some(cache_dir) => {
-                        SearchIndex::build_with_limit_to_cache_dir(root, max_file_size, cache_dir)
-                    }
-                    None => SearchIndex::build_with_limit(root, max_file_size),
-                };
-            }
-            baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
-
-            if baseline.git_head == current_head || current_head.is_none() {
-                // HEAD matches, but files may have changed on disk since the index was
-                // last written (e.g., uncommitted edits, stash pop, manual file changes
-                // while OpenCode was closed). Verify mtimes and re-index stale files.
-                // Non-git projects also use this per-file (path, mtime, size)
-                // fingerprint so unchanged trees reuse the disk cache instead of
-                // rebuilding every configure.
-                baseline.git_head = current_head;
-                let _ = verify_file_mtimes(&mut baseline, verify_strategy);
-                baseline.ready = true;
-                return baseline;
-            }
-
-            if let (Some(previous), Some(current)) =
-                (baseline.git_head.clone(), current_head.clone())
-            {
-                let project_root = baseline.project_root.clone();
-                if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current) {
-                    baseline.git_head = Some(current);
-                    let _ = verify_file_mtimes(&mut baseline, verify_strategy);
-                    baseline.ready = true;
-                    return baseline;
-                }
-            }
+        if let Some(index) = baseline.and_then(|baseline| {
+            Self::refresh_cached_with_diff_limit(
+                baseline,
+                root,
+                max_file_size,
+                current_head,
+                verify_strategy,
+                None,
+            )
+        }) {
+            return index;
         }
 
         match cache_dir {
@@ -2756,6 +2777,91 @@ impl SearchIndex {
             }
             None => SearchIndex::build_with_limit(root, max_file_size),
         }
+    }
+
+    /// Verify or update an existing cache without falling through to a full
+    /// project build. The caller can acquire a cold-build permit on a miss.
+    pub(crate) fn refresh_cached_with_strategy(
+        baseline: Self,
+        root: &Path,
+        max_file_size: u64,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+    ) -> Option<Self> {
+        Self::refresh_cached_with_diff_limit(
+            baseline,
+            root,
+            max_file_size,
+            current_head,
+            verify_strategy,
+            Some(WARM_GIT_DIFF_PATH_LIMIT),
+        )
+    }
+
+    fn refresh_cached_with_diff_limit(
+        mut baseline: Self,
+        root: &Path,
+        max_file_size: u64,
+        current_head: Option<String>,
+        verify_strategy: cache_freshness::VerifyStrategy,
+        max_changed_paths: Option<usize>,
+    ) -> Option<Self> {
+        if baseline.max_file_size != max_file_size {
+            return None;
+        }
+        // Cached file keys use the loading root's lexical spelling. Replacing
+        // only the root with a Windows verbatim path makes the walk report every
+        // cached file as removed and re-added, incorrectly exhausting the budget.
+        // Keep that spelling; a different checkout must be re-rooted at load time.
+        if canonicalize_or_normalize(&baseline.project_root) != canonicalize_or_normalize(root) {
+            return None;
+        }
+        let current_ignore_rules_fingerprint = ignore_rules_fingerprint(&baseline.project_root);
+        if baseline.ignore_rules_fingerprint != current_ignore_rules_fingerprint {
+            return None;
+        }
+        baseline.ignore_rules_fingerprint = current_ignore_rules_fingerprint;
+
+        if let Some(limit) = max_changed_paths {
+            let diff_paths = if baseline.git_head == current_head || current_head.is_none() {
+                HashSet::new()
+            } else {
+                git_diff_paths(
+                    &baseline.project_root,
+                    baseline.git_head.as_deref()?,
+                    current_head.as_deref()?,
+                    Some(limit),
+                )?
+            };
+            verify_file_mtimes_with_budget(&mut baseline, verify_strategy, diff_paths, limit)?;
+            baseline.git_head = current_head;
+            baseline.ready = true;
+            return Some(baseline);
+        }
+
+        if baseline.git_head == current_head || current_head.is_none() {
+            // HEAD matches, but files may have changed on disk since the index was
+            // last written (e.g., uncommitted edits, stash pop, manual file changes
+            // while OpenCode was closed). Verify mtimes and re-index stale files.
+            // Non-git projects also use this per-file (path, mtime, size)
+            // fingerprint so unchanged trees reuse the disk cache instead of
+            // rebuilding every configure.
+            baseline.git_head = current_head;
+            let _ = verify_file_mtimes(&mut baseline, verify_strategy);
+            baseline.ready = true;
+            return Some(baseline);
+        }
+
+        if let (Some(previous), Some(current)) = (baseline.git_head.clone(), current_head.clone()) {
+            let project_root = baseline.project_root.clone();
+            if apply_git_diff_updates(&mut baseline, &project_root, &previous, &current, None) {
+                baseline.git_head = Some(current);
+                let _ = verify_file_mtimes(&mut baseline, verify_strategy);
+                baseline.ready = true;
+                return Some(baseline);
+            }
+        }
+        None
     }
 
     fn allocate_file_id_with_metadata(
@@ -4044,16 +4150,26 @@ fn read_search_corpus_file_inner(
         return SearchCorpusEligibility::Skipped;
     }
     #[cfg(test)]
+    cache_freshness::record_metadata_call(path);
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
+        _ => return SearchCorpusEligibility::Skipped,
+    };
+    read_search_corpus_file_with_metadata(path, max_file_size, classify_generated, metadata)
+}
+
+fn read_search_corpus_file_with_metadata(
+    path: &Path,
+    max_file_size: u64,
+    classify_generated: bool,
+    metadata: SearchFileMetadata,
+) -> SearchCorpusEligibility {
+    #[cfg(test)]
     AUDIT_IO_PROBE.with(|probe| {
         if let Some(probe) = probe.borrow_mut().as_mut() {
             probe();
         }
     });
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
-        _ => return SearchCorpusEligibility::Skipped,
-    };
-
     if metadata.size > max_file_size {
         return SearchCorpusEligibility::Unindexed(metadata);
     }
@@ -4065,6 +4181,8 @@ fn read_search_corpus_file_inner(
         Vec::with_capacity(usize::try_from(metadata.size.min(max_file_size)).unwrap_or(0));
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
+    #[cfg(test)]
+    cache_freshness::record_corpus_read(path);
     let read = crate::project_content::open(path).and_then(|file| {
         file.take(max_file_size.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -7628,6 +7746,141 @@ where
         .unwrap_or_else(|| path.to_path_buf())
 }
 
+/// Admit the union of Git-diff paths and disk-only changes before reading content.
+/// Keep the stat results for verification and indexing so neither pass re-reads files.
+fn verify_file_mtimes_with_budget(
+    index: &mut SearchIndex,
+    verify_strategy: cache_freshness::VerifyStrategy,
+    mut changed_paths: HashSet<PathBuf>,
+    limit: usize,
+) -> Option<bool> {
+    let current_files = walk_project_files_from_inner(
+        &index.project_root,
+        &index.project_root,
+        &PathFilters::default(),
+        None,
+        false,
+    )
+    .expect("unbounded project walk cannot exceed a file limit");
+    let current_file_set: HashSet<_> = current_files.iter().collect();
+    let mut removed_paths = Vec::new();
+    let mut to_stat = Vec::new();
+    for (file_id, entry) in index.files.iter().enumerate() {
+        if entry.path.as_os_str().is_empty() {
+            continue;
+        }
+        if !current_file_set.contains(&entry.path) {
+            removed_paths.push(entry.path.clone());
+            changed_paths.insert(entry.path.clone());
+        } else {
+            to_stat.push((
+                file_id,
+                entry.path.clone(),
+                FileFreshness {
+                    mtime: entry.modified,
+                    size: entry.size,
+                    content_hash: entry.content_hash,
+                },
+            ));
+        }
+    }
+    let new_paths: Vec<_> = current_files
+        .iter()
+        .filter(|path| !index.path_to_id.contains_key(*path))
+        .cloned()
+        .collect();
+    changed_paths.extend(new_paths.iter().cloned());
+    let stats = cache_freshness::stat_files_bounded(to_stat);
+    for (_, path, cached, metadata) in &stats {
+        if metadata.as_ref().is_none_or(|metadata| {
+            metadata.len() != cached.size
+                || metadata.modified().unwrap_or(UNIX_EPOCH) != cached.mtime
+        }) {
+            changed_paths.insert(path.clone());
+        }
+    }
+    if changed_paths.len() > limit {
+        return None;
+    }
+
+    enum VerifiedPath {
+        ContentFresh(usize, SearchFileMetadata),
+        Update(PreparedSearchUpdate),
+    }
+
+    // Strict verification also detects edits with restored size and mtime.
+    // Keep its reads in the bounded pool even when the stat pass found no changes.
+    let to_read = stats
+        .into_iter()
+        .filter(|(_, path, _, _)| {
+            verify_strategy == cache_freshness::VerifyStrategy::Strict
+                || changed_paths.contains(path)
+        })
+        .collect();
+    let max_file_size = index.max_file_size;
+    let verified = cache_freshness::verify_statted_files_bounded(
+        to_read,
+        |file_id, path, cached, metadata| {
+            let file = match metadata {
+                Some(metadata) => read_search_corpus_file_with_metadata(
+                    &path,
+                    max_file_size,
+                    false,
+                    search_file_metadata(&metadata),
+                ),
+                None => SearchCorpusEligibility::Skipped,
+            };
+            let file = match file {
+                SearchCorpusEligibility::Eligible(file) => {
+                    let content_hash = cache_freshness::hash_bytes(&file.bytes);
+                    if content_hash == cached.content_hash {
+                        return VerifiedPath::ContentFresh(file_id, file.metadata);
+                    }
+                    PreparedSearchPath::Indexed(PreparedIndexedFile {
+                        metadata: file.metadata,
+                        content_hash,
+                        trigram_map: trigram_filter_map(&file.bytes, true),
+                    })
+                }
+                SearchCorpusEligibility::Unindexed(metadata) => {
+                    PreparedSearchPath::Unindexed(metadata)
+                }
+                SearchCorpusEligibility::Skipped => PreparedSearchPath::Skipped,
+            };
+            VerifiedPath::Update(PreparedSearchUpdate { path, file })
+        },
+    );
+
+    let mut changed = false;
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
+    for path in removed_paths {
+        index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        changed = true;
+    }
+    for result in verified {
+        match result {
+            VerifiedPath::ContentFresh(file_id, metadata) => {
+                let entry = &index.files[file_id];
+                if metadata.modified != entry.modified || metadata.size != entry.size {
+                    let entry = &mut Arc::make_mut(&mut index.files)[file_id];
+                    entry.modified = metadata.modified;
+                    entry.size = metadata.size;
+                    changed = true;
+                }
+            }
+            VerifiedPath::Update(update) => {
+                index.apply_search_update(update);
+                changed = true;
+            }
+        }
+    }
+    for path in new_paths {
+        index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        changed = true;
+    }
+    Some(changed)
+}
+
 /// Verify stored file mtimes against disk. Re-index any files whose mtime changed
 /// since the index was last written. Also detect new files and deleted files.
 fn verify_file_mtimes(
@@ -7969,65 +8222,209 @@ fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn apply_git_diff_updates(index: &mut SearchIndex, root: &Path, from: &str, to: &str) -> bool {
+/// Run `git diff --name-status -z -M --relative from..to` from `root` and
+/// return its raw output.
+///
+/// The output is read NUL-delimited on purpose. Without `-z`, git quotes any
+/// name that holds non-ASCII bytes, a tab, a quote or a backslash
+/// (`core.quotePath`), so `café.rs` arrives as `"caf\303\251.rs"`. That
+/// string is not a real path: the edited file would be counted once under the
+/// quoted name and again under its real name from the disk walk, and the
+/// committed edit itself would never be matched to the cached file.
+///
+/// `--relative` matters when the search root is a subdirectory of the
+/// repository, such as one package of a monorepo opened on its own. Git
+/// otherwise names paths from the repository's top level (`packages/app/x.rs`)
+/// and lists changes anywhere in the repository; joined onto the search root
+/// those become paths that do not exist. With `--relative`, run from the root
+/// through `-C`, git lists only changes under the root, relative to it. At the
+/// top level of the repository it changes nothing.
+fn read_git_diff(
+    root: &Path,
+    from: &str,
+    to: &str,
+    max_changed_paths: Option<usize>,
+) -> Option<Vec<u8>> {
     if !crate::developer_tools::git_usable() {
-        return false;
+        return None;
     }
     let diff_range = format!("{}..{}", from, to);
     let output = match crate::effective_path::new_command("git")
         .arg("-C")
         .arg(root)
-        .args(["diff", "--name-status", "-M", &diff_range])
+        .args([
+            "diff",
+            "--name-status",
+            "-z",
+            "-M",
+            "--relative",
+            &diff_range,
+        ])
         .output()
     {
         Ok(output) => output,
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     if !output.status.success() {
-        return false;
+        return None;
     }
 
-    let Ok(diff) = String::from_utf8(output.stdout) else {
+    let diff = output.stdout;
+    if max_changed_paths.is_some_and(|limit| !git_diff_within_path_limit(&diff, limit)) {
+        return None;
+    }
+    Some(diff)
+}
+
+/// One record of `git diff --name-status -z` output, borrowing its raw bytes.
+struct GitNameStatusRecord<'a> {
+    /// Status letters, such as `M`, `A`, `D` or `R100` for a rename.
+    status: &'a [u8],
+    /// One path, or the old path then the new path for a rename or copy.
+    paths: Vec<&'a [u8]>,
+}
+
+/// Split `git diff --name-status -z` output into records.
+///
+/// In this format every field ends with a NUL byte: a status field, then one
+/// path field, or two (old then new) when the status is a rename (`R`) or a
+/// copy (`C`). Paths are never quoted or escaped. Returns `None` for output
+/// that does not follow this shape, so callers fall back to a full refresh
+/// instead of acting on a misread diff.
+fn parse_git_name_status_z(diff: &[u8]) -> Option<Vec<GitNameStatusRecord<'_>>> {
+    let body = match diff.split_last() {
+        None => return Some(Vec::new()),
+        Some((0, body)) => body,
+        Some(_) => return None,
+    };
+    let mut fields = body.split(|byte| *byte == 0);
+    let mut records = Vec::new();
+    while let Some(status) = fields.next() {
+        let path_count = match status.first()? {
+            b'R' | b'C' => 2,
+            _ => 1,
+        };
+        let paths = (0..path_count)
+            .map(|_| fields.next().filter(|path| !path.is_empty()))
+            .collect::<Option<Vec<_>>>()?;
+        records.push(GitNameStatusRecord { status, paths });
+    }
+    Some(records)
+}
+
+/// Turn one raw path from git's `-z` output into a relative path.
+///
+/// Git writes the bytes it stores for the name. On Unix those bytes are the
+/// file name itself; git for Windows stores and prints names as UTF-8, so a
+/// name that is not UTF-8 there is reported as `None`.
+#[cfg(unix)]
+fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn git_output_path(bytes: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+fn git_diff_paths(
+    root: &Path,
+    from: &str,
+    to: &str,
+    max_changed_paths: Option<usize>,
+) -> Option<HashSet<PathBuf>> {
+    let diff = read_git_diff(root, from, to, max_changed_paths)?;
+    let records = parse_git_name_status_z(&diff)?;
+    let mut canonical_parents = ParentCanonicalizationMemo::default();
+    let mut paths = HashSet::new();
+    for record in &records {
+        for raw_path in &record.paths {
+            let relative = git_output_path(raw_path)?;
+            if let Some(path) =
+                cached_path_under_root_with_memo(root, &relative, &mut canonical_parents)
+            {
+                paths.insert(path);
+            }
+        }
+    }
+    Some(paths)
+}
+
+fn apply_git_diff_updates(
+    index: &mut SearchIndex,
+    root: &Path,
+    from: &str,
+    to: &str,
+    max_changed_paths: Option<usize>,
+) -> bool {
+    let Some(diff) = read_git_diff(root, from, to, max_changed_paths) else {
+        return false;
+    };
+    let Some(records) = parse_git_name_status_z(&diff) else {
+        return false;
+    };
+    // Resolve every path before touching the index, so a name that cannot be
+    // decoded leaves the index as it was and the caller rebuilds instead.
+    let Some(records) = records
+        .iter()
+        .map(|record| {
+            let paths = record
+                .paths
+                .iter()
+                .map(|raw_path| git_output_path(raw_path))
+                .collect::<Option<Vec<_>>>()?;
+            Some((record.status, paths))
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
         return false;
     };
     let mut canonical_parents = ParentCanonicalizationMemo::default();
 
-    for line in diff.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let mut fields = line.split('\t');
-        let Some(status) = fields.next() else {
-            continue;
-        };
-
-        if status.starts_with('R') {
-            let Some(old_path) = fields.next().and_then(|path| {
-                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
-            }) else {
+    for (status, paths) in records {
+        let resolved: Vec<Option<PathBuf>> = paths
+            .iter()
+            .map(|path| cached_path_under_root_with_memo(root, path, &mut canonical_parents))
+            .collect();
+        let path = match (status.first(), resolved.as_slice()) {
+            (Some(b'R'), [Some(old_path), Some(new_path)]) => {
+                index.remove_file_with_canonicalization_memo(old_path, &mut canonical_parents);
+                index.update_file_with_canonicalization_memo(new_path, &mut canonical_parents);
                 continue;
-            };
-            let Some(new_path) = fields.next().and_then(|path| {
-                cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
-            }) else {
-                continue;
-            };
-            index.remove_file_with_canonicalization_memo(&old_path, &mut canonical_parents);
-            index.update_file_with_canonicalization_memo(&new_path, &mut canonical_parents);
-            continue;
-        }
-
-        let Some(path) = fields.next().and_then(|path| {
-            cached_path_under_root_with_memo(root, &PathBuf::from(path), &mut canonical_parents)
-        }) else {
-            continue;
+            }
+            // A copy leaves its source unchanged; only the new path changed.
+            (Some(b'C'), [_, Some(new_path)]) => new_path,
+            (Some(b'R' | b'C'), _) => continue,
+            (_, [Some(path)]) => path,
+            _ => continue,
         };
-        if status.starts_with('D') || !path.exists() {
-            index.remove_file_with_canonicalization_memo(&path, &mut canonical_parents);
+        if status.first() == Some(&b'D') || !path.exists() {
+            index.remove_file_with_canonicalization_memo(path, &mut canonical_parents);
         } else {
-            index.update_file_with_canonicalization_memo(&path, &mut canonical_parents);
+            index.update_file_with_canonicalization_memo(path, &mut canonical_parents);
         }
     }
 
     true
+}
+
+fn git_diff_within_path_limit(diff: &[u8], limit: usize) -> bool {
+    // Decide before touching source files. Each record is a status field plus
+    // one or two path fields, so more than twice the limit in fields already
+    // means more than `limit` paths; otherwise count the paths exactly, which
+    // includes both the old and the new path of a rename. Output that cannot
+    // be parsed is never admitted.
+    let fields = diff.iter().filter(|byte| **byte == 0).count();
+    fields <= limit.saturating_mul(2)
+        && parse_git_name_status_z(diff).is_some_and(|records| {
+            records
+                .iter()
+                .map(|record| record.paths.len())
+                .sum::<usize>()
+                <= limit
+        })
 }
 
 fn line_starts_bytes(content: &[u8]) -> Vec<usize> {
@@ -8225,6 +8622,49 @@ mod tests {
                 "direct corpus read opened {path:?}"
             );
         }
+    }
+
+    #[test]
+    fn warm_git_diff_budget_counts_both_rename_paths() {
+        let mut diff = (0..510)
+            .map(|i| format!("M\0file_{i}.rs\0"))
+            .collect::<String>();
+        diff.push_str("R100\0old.rs\0new.rs\0");
+        assert!(git_diff_within_path_limit(diff.as_bytes(), 512));
+        diff.push_str("A\0extra.rs\0");
+        assert!(!git_diff_within_path_limit(diff.as_bytes(), 512));
+        assert!(git_diff_within_path_limit(b"", 512));
+    }
+
+    #[test]
+    fn git_name_status_z_keeps_special_names_raw_and_pairs_rename_paths() {
+        let diff = b"M\0caf\xc3\xa9.rs\0R087\0old name.rs\0new\tname.rs\0A\0say \"hi\".rs\0";
+        let records = parse_git_name_status_z(diff).expect("well-formed output");
+        let parsed: Vec<(&[u8], Vec<&[u8]>)> = records
+            .iter()
+            .map(|record| (record.status, record.paths.clone()))
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                (&b"M"[..], vec!["café.rs".as_bytes()]),
+                (
+                    &b"R087"[..],
+                    vec![&b"old name.rs"[..], &b"new\tname.rs"[..]]
+                ),
+                (&b"A"[..], vec![&b"say \"hi\".rs"[..]]),
+            ]
+        );
+        assert_eq!(
+            git_output_path("café.rs".as_bytes()),
+            Some(PathBuf::from("café.rs"))
+        );
+        assert!(parse_git_name_status_z(b"").is_some_and(|records| records.is_empty()));
+        // A rename missing its new path, or output cut before its final NUL,
+        // is rejected rather than half-applied.
+        assert!(parse_git_name_status_z(b"R100\0old.rs\0").is_none());
+        assert!(parse_git_name_status_z(b"M\0file.rs").is_none());
+        assert!(!git_diff_within_path_limit(b"R100\0old.rs\0", 512));
     }
 
     #[test]
@@ -9079,6 +9519,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
+        let project = fs::canonicalize(&project).expect("canonical project root");
         let a = project.join("a.txt");
         let b = project.join("b.txt");
         fs::write(&a, "abc old").expect("write a");
@@ -9337,19 +9778,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
-        let file = project.join("src.txt");
-        fs::write(&file, "abcdef").expect("write source");
-        let mut index = SearchIndex::new();
-        index.project_root = project.clone();
-        {
-            let mut state = index.compaction_state.lock().expect("compaction state");
-            state.running = true;
+        let project = fs::canonicalize(&project).expect("canonical project root");
+        fs::write(project.join("src.txt"), "abcdef").expect("write source");
+        for root in [
+            project.clone(),
+            crate::inspect::job::normalize_path(&project),
+        ] {
+            let file = root.join("src.txt");
+            let mut index = SearchIndex::new();
+            index.project_root = root;
+            {
+                let mut state = index.compaction_state.lock().expect("compaction state");
+                state.running = true;
+            }
+            index.update_file(&file);
+            assert!(index.path_to_id.contains_key(&file));
+            let state = index.compaction_state.lock().expect("compaction state");
+            assert!(state.requested_again || !index.delta.postings.is_empty());
+            assert!(state.buffered_paths.contains(&file));
         }
-        index.update_file(&file);
-        let state = index.compaction_state.lock().expect("compaction state");
-        assert!(state.requested_again || !index.delta.postings.is_empty());
-        let canonical_file = fs::canonicalize(&file).expect("canonical source path");
-        assert!(state.buffered_paths.contains(&canonical_file));
     }
 
     fn cache_has_file_trigram_count_extension(cache_path: &Path) -> bool {
@@ -9550,6 +9997,292 @@ mod tests {
             .contains_key(&canonical_project.join("untracked.txt")));
         let matches = refreshed.grep("after local edit", true, &[], &[], &canonical_project, 10);
         assert_eq!(matches.matches.len(), 1);
+    }
+
+    /// File names that `git diff` quotes unless it is run with `-z`: non-ASCII
+    /// bytes everywhere, plus a tab, double quotes and a backslash where the
+    /// platform allows them in a file name. The space is never quoted and
+    /// serves as a control.
+    fn names_git_quotes() -> Vec<&'static str> {
+        let mut names = vec!["café.rs", "with space.rs"];
+        if cfg!(unix) {
+            names.extend(["tab\tname.rs", "say \"hi\".rs", "back\\slash.rs"]);
+        }
+        names
+    }
+
+    /// Commit everything in the working tree, rehashing every file.
+    ///
+    /// `git add` normally skips a file whose size and mtime match what the
+    /// index recorded, unless the file was written so close to the index that
+    /// the mtime cannot be trusted. On Linux and macOS git also compares the
+    /// change time, which every write updates; git for Windows has no such
+    /// time to compare. So on Windows an edit that keeps the size and restores
+    /// the old mtime is not staged, and the commit fails with nothing to
+    /// commit, unless the index is emptied first so every file is hashed
+    /// again.
+    fn git_commit_all_for_test(project: &Path, message: &str) {
+        assert!(git_command_for_test(project)
+            .args(["read-tree", "--empty"])
+            .status()
+            .expect("git read-tree")
+            .success());
+        assert!(git_command_for_test(project)
+            .args(["add", "-A"])
+            .status()
+            .expect("git add")
+            .success());
+        assert!(git_command_for_test(project)
+            .args(["commit", "--quiet", "-m", message])
+            .status()
+            .expect("git commit")
+            .success());
+    }
+
+    /// Move a file's mtime an hour into the past, so git trusts its recorded
+    /// size and mtime for the file instead of hashing it again. A same-size
+    /// edit that restores this mtime is then invisible to a plain `git add`
+    /// on Windows every time, not only when the index happens to be written
+    /// in a later clock tick than the file.
+    fn backdate_for_test(path: &Path) {
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(an_hour_ago))
+            .expect("backdate mtime");
+    }
+
+    /// A repository whose first commit holds every file already in `project`.
+    /// `core.quotePath` is set explicitly so git quotes non-ASCII names no
+    /// matter what the surrounding configuration says.
+    fn init_quoting_git_repo(project: &Path) -> String {
+        let mut init = Command::new("git");
+        assert!(crate::test_env::apply_hermetic_git_env(
+            init.arg("init").arg("--quiet").arg(project)
+        )
+        .status()
+        .expect("git init")
+        .success());
+        for args in [
+            ["config", "user.email", "aft@example.invalid"],
+            ["config", "user.name", "AFT Test"],
+            ["config", "core.quotePath", "true"],
+        ] {
+            assert!(git_command_for_test(project)
+                .args(args)
+                .status()
+                .expect("git config")
+                .success());
+        }
+        git_commit_all_for_test(project, "initial");
+        run_git(project, &["rev-parse", "HEAD"]).expect("initial head")
+    }
+
+    #[test]
+    fn warm_reload_counts_each_git_quoted_path_once_between_heads() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        let names = names_git_quotes();
+        for (ordinal, name) in names.iter().enumerate() {
+            fs::write(project.join(name), format!("// {ordinal}\n")).expect("write file");
+        }
+        let previous = init_quoting_git_repo(&project);
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = Some(previous.clone());
+
+        // Ordinary edits change size and mtime, so the disk walk reports each
+        // file too. The git diff must name the same paths, not quoted copies.
+        for (ordinal, name) in names.iter().enumerate() {
+            fs::write(
+                project.join(name),
+                format!("// {ordinal} QuotedPathNeedle after the edit\n"),
+            )
+            .expect("edit file");
+        }
+        git_commit_all_for_test(&project, "edit special names");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+
+        let expected: HashSet<PathBuf> = names
+            .iter()
+            .map(|name| cached_path_under_root(&project, Path::new(name)).expect("under root"))
+            .collect();
+        assert_eq!(
+            git_diff_paths(&project, &previous, &current, Some(names.len())),
+            Some(expected)
+        );
+        // A budget of exactly one path per edited file is enough only when no
+        // file is counted twice.
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            baseline,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current.clone()),
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(names.len()),
+        )
+        .expect("each edited file must count once against the warm budget");
+        assert_eq!(refreshed.git_head.as_deref(), Some(current.as_str()));
+        let result = refreshed.grep("QuotedPathNeedle", true, &[], &[], &canonical_project, 10);
+        assert_eq!(result.total_matches, names.len());
+    }
+
+    #[test]
+    fn warm_reload_reads_committed_edit_to_git_quoted_path_with_unchanged_stat() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        let names = names_git_quotes();
+        for (ordinal, name) in names.iter().enumerate() {
+            fs::write(project.join(name), format!("// {ordinal} QuotedOld\n")).expect("write");
+            backdate_for_test(&project.join(name));
+        }
+        let previous = init_quoting_git_repo(&project);
+        let mut baseline = SearchIndex::build(&project);
+        baseline.git_head = Some(previous.clone());
+
+        // Same size and the original mtime: the stat pass sees nothing, so
+        // only the git diff can tell the refresh to reread these files.
+        for (ordinal, name) in names.iter().enumerate() {
+            let path = project.join(name);
+            let modified = fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .expect("original mtime");
+            fs::write(&path, format!("// {ordinal} QuotedNew\n")).expect("edit file");
+            File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(modified))
+                .expect("restore mtime");
+        }
+        git_commit_all_for_test(&project, "same-size edits");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+        assert_ne!(previous, current, "git must record the same-size edits");
+
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            baseline,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current),
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(WARM_GIT_DIFF_PATH_LIMIT),
+        )
+        .expect("warm refresh");
+        let new = refreshed.grep("QuotedNew", true, &[], &[], &canonical_project, 10);
+        let mut found: Vec<_> = new
+            .matches
+            .iter()
+            .map(|matched| matched.file.file_name().unwrap().to_owned())
+            .collect();
+        found.sort();
+        let mut expected: Vec<_> = names.iter().map(std::ffi::OsString::from).collect();
+        expected.sort();
+        assert_eq!(found, expected, "every committed edit must be searchable");
+        let old = refreshed.grep("QuotedOld", true, &[], &[], &canonical_project, 10);
+        assert_eq!(old.total_matches, 0, "no stale content may remain");
+    }
+
+    #[test]
+    fn warm_reload_from_repository_subdirectory_counts_and_rereads_only_paths_under_root() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = dir.path().join("repo");
+        // The search root is one package of a larger repository.
+        let project = repo.join("packages").join("app");
+        let outside = repo.join("other").join("outside.rs");
+        let inside = project.join("inside.rs");
+        fs::create_dir_all(&project).expect("create project dir");
+        fs::create_dir_all(outside.parent().unwrap()).expect("create sibling dir");
+        fs::write(&inside, "// SubdirOld\n").expect("write inside");
+        backdate_for_test(&inside);
+        fs::write(&outside, "// OutsideOld\n").expect("write outside");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project");
+        init_quoting_git_repo(&repo);
+        let previous = run_git(&project, &["rev-parse", "HEAD"]).expect("previous head");
+        // One baseline for the budgeted warm lane, one for the unbudgeted refresh.
+        let mut budgeted = SearchIndex::build(&project);
+        budgeted.git_head = Some(previous.clone());
+        let mut unbudgeted = SearchIndex::build(&project);
+        unbudgeted.git_head = Some(previous.clone());
+
+        // Same size and the original mtime inside the root, so only the git
+        // diff can tell the refresh to reread it. The edit outside the root is
+        // an ordinary one.
+        let modified = fs::metadata(&inside)
+            .and_then(|metadata| metadata.modified())
+            .expect("original mtime");
+        fs::write(&inside, "// SubdirNew\n").expect("edit inside");
+        File::options()
+            .write(true)
+            .open(&inside)
+            .and_then(|file| file.set_modified(modified))
+            .expect("restore mtime");
+        fs::write(&outside, "// OutsideNew, a longer edit\n").expect("edit outside");
+        git_commit_all_for_test(&repo, "edit inside and outside the package");
+        let current = run_git(&project, &["rev-parse", "HEAD"]).expect("current head");
+
+        assert_eq!(
+            git_diff_paths(&project, &previous, &current, Some(1)),
+            Some(HashSet::from([cached_path_under_root(
+                &project,
+                Path::new("inside.rs")
+            )
+            .expect("under root")])),
+            "only the change under the root is reported, relative to the root"
+        );
+
+        let assert_only_inside_is_indexed_and_fresh = |index: &SearchIndex, lane: &str| {
+            let indexed: Vec<_> = index
+                .path_to_id
+                .keys()
+                .filter(|path| !path.as_os_str().is_empty())
+                .cloned()
+                .collect();
+            assert_eq!(
+                indexed,
+                vec![canonical_project.join("inside.rs")],
+                "{lane}: nothing outside the root may enter the index"
+            );
+            let new = index.grep("SubdirNew", true, &[], &[], &canonical_project, 10);
+            assert_eq!(
+                new.total_matches, 1,
+                "{lane}: the edit under the root is searchable"
+            );
+            let old = index.grep("SubdirOld", true, &[], &[], &canonical_project, 10);
+            assert_eq!(old.total_matches, 0, "{lane}: no stale content may remain");
+            let outside = index.grep("Outside", true, &[], &[], &canonical_project, 10);
+            assert_eq!(
+                outside.total_matches, 0,
+                "{lane}: outside content stays out"
+            );
+        };
+        // A budget of one path is enough only when the outside edit is not
+        // counted.
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            budgeted,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current.clone()),
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(1),
+        )
+        .expect("the edit outside the root must not count against the warm budget");
+        assert_only_inside_is_indexed_and_fresh(&refreshed, "budgeted");
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            unbudgeted,
+            &project,
+            DEFAULT_MAX_FILE_SIZE,
+            Some(current),
+            cache_freshness::VerifyStrategy::StatFirst,
+            None,
+        )
+        .expect("unbudgeted refresh");
+        assert_only_inside_is_indexed_and_fresh(&refreshed, "unbudgeted");
     }
 
     #[test]
@@ -11657,6 +12390,416 @@ mod tests {
 #[cfg(test)]
 mod warm_reload_verification_tests {
     use super::*;
+
+    /// `read_from_disk` resolves a root alias before deriving keys, so a caller
+    /// that removes a file by the alias spelling must still reach the cached
+    /// record. On Windows the alias is a case variant and the canonical
+    /// fallback is verbatim while a plain-root load stores plain keys.
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn remove_file_through_root_alias_supersedes_the_cached_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("checkout");
+        fs::create_dir_all(&real_root).unwrap();
+        #[cfg(unix)]
+        let alias_root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let alias_root = dir.path().join("CHECKOUT");
+        fs::write(real_root.join("cached.txt"), "AliasRemovalNeedle\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&real_root);
+        assert!(built.write_to_disk(cache.path(), None));
+
+        let mut index = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+        #[cfg(windows)]
+        assert!(!index.project_root.to_string_lossy().starts_with(r"\\?\"));
+        let stored_key = index.project_root.join("cached.txt");
+        let cached_id = index.path_to_id[&stored_key];
+        assert!(cached_id < index.base_file_count);
+
+        index.remove_file(&alias_root.join("cached.txt"));
+
+        assert!(!index.path_to_id.contains_key(&stored_key));
+        assert!(index.delta.superseded.contains(&cached_id));
+        assert!(index.delta.superseded_paths.contains(&stored_key));
+    }
+
+    /// Windows runners can hand out 8.3 short temp paths (`C:\Users\RUNNER~1`).
+    /// Loading from such a root resolves it to the long name, so removing a
+    /// file by its short spelling must still reach the long-name cached key.
+    #[test]
+    #[cfg(windows)]
+    fn remove_file_through_short_name_root_supersedes_the_cached_record() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Longer than eight characters, so the volume assigns it a short name
+        // when 8.3 name generation is enabled.
+        let real_root = dir.path().join("checkout_with_long_name");
+        fs::create_dir_all(&real_root).unwrap();
+        fs::write(real_root.join("cached.txt"), "ShortNameRemovalNeedle\n").unwrap();
+
+        let wide: Vec<u16> = real_root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buffer = vec![0u16; 1024];
+        // SAFETY: `wide` is NUL-terminated and `buffer` holds `buffer.len()` units.
+        let written = unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+                wide.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+            )
+        } as usize;
+        assert!(
+            written > 0 && written < buffer.len(),
+            "GetShortPathNameW failed"
+        );
+        let short_root = PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written]));
+        if short_root.file_name() == real_root.file_name() {
+            eprintln!(
+                "skipping: 8.3 short names are disabled on the volume holding {}",
+                real_root.display()
+            );
+            return;
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&real_root);
+        assert!(built.write_to_disk(cache.path(), None));
+
+        let mut index = SearchIndex::read_from_disk(cache.path(), &short_root).unwrap();
+        assert!(!index.project_root.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(index.project_root.file_name(), real_root.file_name());
+        let stored_key = index.project_root.join("cached.txt");
+        let cached_id = index.path_to_id[&stored_key];
+
+        index.remove_file(&short_root.join("cached.txt"));
+
+        assert!(!index.path_to_id.contains_key(&stored_key));
+        assert!(index.delta.superseded.contains(&cached_id));
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn warm_refresh_keeps_cached_and_new_files_visible_through_root_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("checkout");
+        fs::create_dir_all(real_root.join("src")).unwrap();
+        #[cfg(unix)]
+        let alias_root = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&real_root, &alias).unwrap();
+            alias
+        };
+        #[cfg(windows)]
+        let alias_root = dir.path().join("CHECKOUT");
+        let canonical_root = fs::canonicalize(&real_root).unwrap();
+        let plain_subfolder = crate::inspect::job::normalize_path(&canonical_root).join("src");
+        #[cfg(windows)]
+        assert!(!plain_subfolder.to_string_lossy().starts_with(r"\\?\"));
+        assert_ne!(alias_root, canonical_root);
+        assert_eq!(fs::canonicalize(&alias_root).unwrap(), canonical_root);
+        let changed = real_root.join("src/changed.rs");
+        fs::write(&changed, "fn before() {}\n").unwrap();
+        fs::write(
+            real_root.join("src/unchanged.rs"),
+            "// UnchangedAliasNeedle\n",
+        )
+        .unwrap();
+        let original_mtime =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&changed).unwrap());
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&real_root);
+        assert!(built.write_to_disk(cache.path(), None));
+        fs::write(&changed, "// ChangedAliasNeedle with different size\n").unwrap();
+        filetime::set_file_mtime(&changed, original_mtime).unwrap();
+        fs::write(real_root.join("src/new.rs"), "// NewAliasNeedle\n").unwrap();
+
+        for strategy in [
+            cache_freshness::VerifyStrategy::StatFirst,
+            cache_freshness::VerifyStrategy::Strict,
+        ] {
+            assert!(built.write_to_disk(cache.path(), None));
+            let baseline = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+            let loaded_root = crate::inspect::job::canonicalize_normalized(&alias_root);
+            assert_eq!(baseline.project_root, loaded_root);
+            #[cfg(windows)]
+            assert!(!baseline.project_root.to_string_lossy().starts_with(r"\\?\"));
+            let cached_path = loaded_root.join("src/changed.rs");
+            let cached_id = baseline.path_to_id[&cached_path];
+            let mut refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                baseline,
+                &alias_root,
+                DEFAULT_MAX_FILE_SIZE,
+                None,
+                strategy,
+                Some(2),
+            )
+            .expect("one cached edit and one new file fit the two-path budget");
+            assert!(refreshed.delta.superseded.contains(&cached_id));
+            assert!(refreshed.delta.superseded_paths.contains(&cached_path));
+            assert_eq!(refreshed.live_file_identities().len(), 3);
+            for persisted in [false, true] {
+                if persisted {
+                    assert!(refreshed.write_to_disk(cache.path(), None));
+                    let baseline = SearchIndex::read_from_disk(cache.path(), &alias_root).unwrap();
+                    assert_eq!(baseline.project_root, loaded_root);
+                    refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                        baseline,
+                        &alias_root,
+                        DEFAULT_MAX_FILE_SIZE,
+                        None,
+                        strategy,
+                        Some(0),
+                    )
+                    .expect("persisted canonical keys must fit a zero-path refresh budget");
+                }
+                for scope in [
+                    alias_root.clone(),
+                    canonical_root.join("src"),
+                    plain_subfolder.clone(),
+                ] {
+                    for needle in [
+                        "ChangedAliasNeedle",
+                        "UnchangedAliasNeedle",
+                        "NewAliasNeedle",
+                    ] {
+                        assert_eq!(
+                            refreshed.grep(needle, true, &[], &[], &scope, 10).matches.len(),
+                            1,
+                            "ready index must find {needle} through {scope:?} (persisted={persisted}, strategy={strategy:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn warm_refresh_preserves_loaded_path_keys_across_root_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let verbatim_root = fs::canonicalize(dir.path()).unwrap();
+        let plain_root = crate::inspect::job::normalize_path(&verbatim_root);
+        #[cfg(windows)]
+        assert_ne!(verbatim_root, plain_root);
+        fs::write(plain_root.join("unchanged.rs"), "fn unchanged() {}\n").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut built = SearchIndex::build(&plain_root);
+        assert!(built.write_to_disk(cache.path(), None));
+
+        for loading_root in [&plain_root, &verbatim_root] {
+            for refresh_root in [&plain_root, &verbatim_root] {
+                for strategy in [
+                    cache_freshness::VerifyStrategy::StatFirst,
+                    cache_freshness::VerifyStrategy::Strict,
+                ] {
+                    let baseline = SearchIndex::read_from_disk(cache.path(), loading_root).unwrap();
+                    let loaded_root = baseline.project_root.clone();
+                    let original_keys = baseline.path_to_id.clone();
+                    let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                        baseline,
+                        refresh_root,
+                        DEFAULT_MAX_FILE_SIZE,
+                        None,
+                        strategy,
+                        Some(0),
+                    )
+                    .expect("unchanged cached paths must fit a zero-path budget");
+                    assert!(refreshed.is_ready());
+                    assert_eq!(refreshed.project_root, loaded_root);
+                    assert_eq!(refreshed.project_root, *loading_root);
+                    assert_eq!(refreshed.path_to_id, original_keys);
+                    assert_eq!(
+                        refreshed
+                            .grep("unchanged", true, &[], &[], refresh_root, 10)
+                            .matches
+                            .len(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn warm_refresh_rejects_local_changes_before_source_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let touched = root.join("touched.rs");
+        fs::write(&touched, "fn before() {}\n").unwrap();
+        fs::write(root.join("resized.rs"), "fn before() {}\n").unwrap();
+        let baseline = SearchIndex::build(&root);
+        fs::write(&touched, "fn afterx() {}\n").unwrap();
+        filetime::set_file_mtime(&touched, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        fs::write(root.join("resized.rs"), "fn local_resize() {}\n").unwrap();
+        fs::write(root.join("new.rs"), "fn local_new() {}\n").unwrap();
+
+        audit_work_reset();
+        let watch = cache_freshness::watch_verify_stats(
+            &root,
+            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+        );
+        let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+            baseline,
+            &root,
+            DEFAULT_MAX_FILE_SIZE,
+            None,
+            cache_freshness::VerifyStrategy::StatFirst,
+            Some(2),
+        );
+        assert!(
+            refreshed.is_none(),
+            "three local changes exceed the two-path budget"
+        );
+        assert_eq!(
+            audit_work().corpus_opens,
+            0,
+            "admission must precede source reads"
+        );
+        let stats = watch.take_stats();
+        assert!(stats.hash_reads.is_empty());
+        assert!(stats.corpus_reads.is_empty());
+    }
+
+    #[test]
+    fn warm_refresh_reads_admitted_local_changes_once() {
+        for (strategy, preserve_mtime) in [
+            (cache_freshness::VerifyStrategy::StatFirst, false),
+            (cache_freshness::VerifyStrategy::Strict, false),
+            (cache_freshness::VerifyStrategy::Strict, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(dir.path()).unwrap();
+            let path = root.join("changed.rs");
+            fs::write(&path, "fn before() {}\n").unwrap();
+            let baseline = SearchIndex::build(&root);
+            let original_mtime =
+                filetime::FileTime::from_last_modification_time(&fs::metadata(&path).unwrap());
+            fs::write(&path, "fn afterx() {}\n").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                if preserve_mtime {
+                    original_mtime
+                } else {
+                    filetime::FileTime::from_unix_time(1, 0)
+                },
+            )
+            .unwrap();
+            audit_work_reset();
+            let watch = cache_freshness::watch_verify_stats(
+                &root,
+                cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+            );
+            let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                baseline,
+                &root,
+                DEFAULT_MAX_FILE_SIZE,
+                None,
+                strategy,
+                Some(1),
+            )
+            .expect("one local change fits the budget");
+            assert_eq!(audit_work().corpus_opens, 1);
+            let stats = watch.take_stats();
+            assert_eq!(
+                stats.corpus_reads.len(),
+                1,
+                "one content read for indexing and hashing"
+            );
+            assert_eq!(
+                stats.calls.len(),
+                1,
+                "reuse the admission stat for indexing"
+            );
+            assert!(
+                stats.hash_reads.is_empty(),
+                "verification must reuse the content read for indexing"
+            );
+            assert_eq!(
+                refreshed
+                    .grep("afterx", true, &[], &[], &root, 10)
+                    .matches
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn strict_warm_refresh_reads_in_bounded_workers_with_one_stat_and_read_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        for n in 0..32 {
+            fs::write(root.join(format!("file-{n}.rs")), "fn before() {}\n").unwrap();
+        }
+        let baseline = SearchIndex::build(&root);
+        for schedule in [
+            cache_freshness::VerifyScheduleForTest::SingleWorkerDrain,
+            cache_freshness::VerifyScheduleForTest::Concurrent,
+        ] {
+            let watch = cache_freshness::watch_verify_stats(&root, schedule);
+            let refreshed = SearchIndex::refresh_cached_with_diff_limit(
+                baseline.clone(),
+                &root,
+                DEFAULT_MAX_FILE_SIZE,
+                None,
+                cache_freshness::VerifyStrategy::Strict,
+                Some(0),
+            )
+            .expect("unchanged files fit even a zero-path budget");
+            let stats = watch.take_stats();
+            assert_eq!(stats.pool_size, Some(2));
+            assert_eq!(stats.calls.len(), 32, "one admission stat per cached file");
+            let stat_paths: HashSet<_> = stats.calls.iter().map(|(path, _)| path).collect();
+            assert_eq!(
+                stat_paths.len(),
+                32,
+                "each cached file is statted exactly once"
+            );
+            assert_eq!(
+                stats.corpus_reads.len(),
+                32,
+                "strict must read unchanged files"
+            );
+            assert!(
+                stats.hash_reads.is_empty(),
+                "hash the corpus read, not a second read"
+            );
+            let mut counts = HashMap::new();
+            let mut threads = HashSet::new();
+            for (path, thread) in stats.corpus_reads {
+                *counts.entry(path).or_insert(0) += 1;
+                threads.insert(thread);
+                assert_ne!(
+                    thread,
+                    std::thread::current().id(),
+                    "reads must run in the pool"
+                );
+            }
+            assert_eq!(counts.len(), refreshed.path_to_id.len());
+            assert!(counts.values().all(|count| *count == 1));
+            assert!(
+                threads.len() <= 2,
+                "reads must stay within the bounded pool"
+            );
+            match schedule {
+                cache_freshness::VerifyScheduleForTest::SingleWorkerDrain => {
+                    assert_eq!(threads.len(), 1);
+                }
+                cache_freshness::VerifyScheduleForTest::Concurrent => {
+                    assert_eq!(threads.len(), 2);
+                    assert!(stats.concurrent_reads);
+                }
+            }
+        }
+    }
 
     #[test]
     fn warm_verify_uses_bounded_workers_and_one_stat_per_indexed_file() {
