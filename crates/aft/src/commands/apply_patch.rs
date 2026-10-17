@@ -35,8 +35,6 @@ struct AppliedHunkResult {
     before: String,
     after: String,
     delete_lines: Option<usize>,
-    /// First parse-error line of a file this hunk created, when it does not parse.
-    syntax_error_line: Option<usize>,
 }
 
 struct DiffEntry {
@@ -326,6 +324,7 @@ fn write_patched_file(
     op_id: &str,
     description: &str,
     backed_paths: &mut HashSet<PathBuf>,
+    created_in_call: bool,
 ) -> Result<PatchedFile, String> {
     let existed = path.exists();
     let original = if existed {
@@ -348,18 +347,25 @@ fn write_patched_file(
     }
 
     let params = command_params(req);
-    let mut write_result =
-        match edit::write_format_validate_deferred(path, content, &ctx.config(), params) {
-            Ok(result) => result,
-            Err(error) => {
-                restore_pre_write_state(path, existed, original.as_deref());
-                if snapshot_taken {
-                    discard_latest_backup(ctx, req, op_id, path);
-                    backed_paths.remove(path);
-                }
-                return Err(error.to_string());
+    // A file this patch created has nothing from before the call to protect:
+    // it is never rolled back, and its final content is syntax-checked once
+    // after every hunk has run (see `created_file_syntax_errors`).
+    let written = if created_in_call {
+        edit::write_format_deferred_created(path, content, &ctx.config(), params)
+    } else {
+        edit::write_format_validate_deferred(path, content, &ctx.config(), params)
+    };
+    let mut write_result = match written {
+        Ok(result) => result,
+        Err(error) => {
+            restore_pre_write_state(path, existed, original.as_deref());
+            if snapshot_taken {
+                discard_latest_backup(ctx, req, op_id, path);
+                backed_paths.remove(path);
             }
-        };
+            return Err(error.to_string());
+        }
+    };
 
     if write_result.rolled_back {
         if snapshot_taken {
@@ -380,15 +386,12 @@ fn write_patched_file(
     Ok(PatchedFile {
         final_content,
         snapshot_taken,
-        syntax_error_line: write_result.syntax_error_line,
     })
 }
 
 struct PatchedFile {
     final_content: String,
     snapshot_taken: bool,
-    /// Set when the write created the file and the new file does not parse.
-    syntax_error_line: Option<usize>,
 }
 
 fn delete_file_with_backup(
@@ -576,12 +579,42 @@ fn add_failure(failures: &mut Vec<Value>, path: &str, error: String) {
     failures.push(json!({ "path": path, "error": error }));
 }
 
-/// Place the created-file syntax notice directly under the hunk's own
-/// "Created"/"Updated" line, because one patch can create several files and
-/// the notice itself does not name the file.
-fn push_created_syntax_error(output_lines: &mut Vec<String>, applied: &AppliedHunkResult) {
-    if let Some(line) = applied.syntax_error_line {
-        output_lines.push(edit::created_file_syntax_error_notice(line as u64));
+/// Check the final content of every file this patch created and still exists,
+/// and return the first parse-error line of each one that does not parse.
+///
+/// The check runs once per file after all hunks, because a later hunk in the
+/// same patch can fix, break, move or delete a file an earlier hunk created.
+fn created_file_syntax_errors(created: &HashMap<PathBuf, usize>) -> HashMap<PathBuf, usize> {
+    created
+        .keys()
+        .filter_map(|path| {
+            let content = fs::read_to_string(path).ok()?;
+            let line = edit::check_created_file_syntax(path, &content).first_error_line?;
+            Some((path.clone(), line))
+        })
+        .collect()
+}
+
+/// Put the created-file syntax notice directly under the reply line that
+/// created each broken file ("Created" or "Updated and moved"), because one
+/// patch can create several files and the notice itself does not name the
+/// file. `created` maps each created file to the index of that reply line.
+fn insert_created_syntax_notices(
+    output_lines: &mut Vec<String>,
+    created: &HashMap<PathBuf, usize>,
+    errors: &HashMap<PathBuf, usize>,
+) {
+    let mut notices: Vec<(usize, usize)> = errors
+        .iter()
+        .filter_map(|(path, error_line)| Some((*created.get(path)?, *error_line)))
+        .collect();
+    // Insert from the bottom up so earlier reply-line indices stay valid.
+    notices.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (reply_index, error_line) in notices {
+        output_lines.insert(
+            reply_index + 1,
+            edit::created_file_syntax_error_notice(error_line as u64),
+        );
     }
 }
 
@@ -618,6 +651,7 @@ fn apply_add(
         op_id,
         "apply_patch: file created by add hunk",
         backed_paths,
+        true,
     )?;
     Ok(AppliedHunkResult {
         index: 0,
@@ -628,7 +662,6 @@ fn apply_add(
         before: String::new(),
         after: written.final_content,
         delete_lines: None,
-        syntax_error_line: written.syntax_error_line,
     })
 }
 
@@ -660,10 +693,12 @@ fn apply_delete(
         before,
         after: String::new(),
         delete_lines: Some(deletions),
-        syntax_error_line: None,
     })
 }
 
+/// `target_created_in_call` is true when the file this hunk writes (the move
+/// destination, or the source when there is no move) did not exist before
+/// this patch started.
 fn apply_update(
     req: &RawRequest,
     ctx: &AppContext,
@@ -671,6 +706,7 @@ fn apply_update(
     chunks: &[crate::patch::parser::UpdateFileChunk],
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
+    target_created_in_call: bool,
 ) -> Result<AppliedHunkResult, String> {
     let original = fs::read_to_string(&resolved.source.abs)
         .map_err(|error| format!("failed to read file: {error}"))?;
@@ -686,6 +722,7 @@ fn apply_update(
             new_content,
             op_id,
             backed_paths,
+            target_created_in_call,
         )
     } else {
         let written = write_patched_file(
@@ -696,6 +733,7 @@ fn apply_update(
             op_id,
             "apply_patch: pre-update backup",
             backed_paths,
+            target_created_in_call,
         )?;
         Ok(AppliedHunkResult {
             index: 0,
@@ -706,7 +744,6 @@ fn apply_update(
             before: original,
             after: written.final_content,
             delete_lines: None,
-            syntax_error_line: written.syntax_error_line,
         })
     }
 }
@@ -720,6 +757,7 @@ fn apply_move_update(
     new_content: String,
     op_id: &str,
     backed_paths: &mut HashSet<PathBuf>,
+    dest_created_in_call: bool,
 ) -> Result<AppliedHunkResult, String> {
     let dest_existed = dest.abs.exists();
     let dest_snapshot = if dest_existed {
@@ -739,6 +777,7 @@ fn apply_move_update(
         op_id,
         "apply_patch: move destination backup",
         backed_paths,
+        dest_created_in_call,
     ) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -795,7 +834,6 @@ fn apply_move_update(
         before: original,
         after: written.final_content,
         delete_lines: None,
-        syntax_error_line: written.syntax_error_line,
     })
 }
 
@@ -834,7 +872,13 @@ fn report_key(applied: &AppliedHunkResult) -> String {
     }
 }
 
-fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String, Vec<Value>) {
+/// `created_errors` holds the final first parse-error line of each file this
+/// patch created that does not parse (see `created_file_syntax_errors`).
+fn metadata_files(
+    applied: &[AppliedHunkResult],
+    root: Option<&Path>,
+    created_errors: &HashMap<PathBuf, usize>,
+) -> (String, Vec<Value>) {
     let mut entries: Vec<(String, DiffEntry)> = Vec::new();
 
     for applied_hunk in applied {
@@ -847,7 +891,6 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
             entry.last_kind = applied_hunk.kind;
             entry.after = applied_hunk.after.clone();
             entry.hunk_count += 1;
-            entry.syntax_error_line = applied_hunk.syntax_error_line;
         } else {
             entries.push((
                 key,
@@ -860,9 +903,21 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
                     after: applied_hunk.after.clone(),
                     delete_lines: applied_hunk.delete_lines,
                     hunk_count: 1,
-                    syntax_error_line: applied_hunk.syntax_error_line,
+                    syntax_error_line: None,
                 },
             ));
+        }
+    }
+
+    // Carry each broken created file's error line on the last entry that
+    // ends at that path, so a file reported by several entries (for example
+    // moved onto, then updated) carries it once.
+    let mut marked = HashSet::new();
+    for (_, entry) in entries.iter_mut().rev() {
+        if let Some(line) = created_errors.get(&entry.display_path) {
+            if marked.insert(entry.display_path.clone()) {
+                entry.syntax_error_line = Some(*line);
+            }
         }
     }
 
@@ -931,6 +986,11 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     let mut output_lines = Vec::new();
     let mut failures = Vec::new();
     let mut applied = Vec::new();
+    // Files this patch created that still exist, each mapped to the index of
+    // the reply line that created it. A later hunk that deletes or moves the
+    // file away removes it; the syntax check reads the final content after
+    // the loop.
+    let mut created: HashMap<PathBuf, usize> = HashMap::new();
 
     for (index, resolved_hunk) in resolved.iter().enumerate() {
         match &resolved_hunk.hunk {
@@ -946,8 +1006,8 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                 ) {
                     Ok(mut result) => {
                         result.index = index;
+                        created.insert(resolved_hunk.source.abs.clone(), output_lines.len());
                         output_lines.push(format!("Created {path}"));
-                        push_created_syntax_error(&mut output_lines, &result);
                         applied.push(result);
                     }
                     Err(error) => {
@@ -960,6 +1020,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                 match apply_delete(req, ctx, resolved_hunk, path, &op_id, &mut backed_paths) {
                     Ok(mut result) => {
                         result.index = index;
+                        created.remove(&resolved_hunk.source.abs);
                         output_lines.push(format!("Deleted {path}"));
                         applied.push(result);
                     }
@@ -973,24 +1034,45 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                 path,
                 move_path,
                 chunks,
-            } => match apply_update(req, ctx, resolved_hunk, chunks, &op_id, &mut backed_paths) {
-                Ok(mut result) => {
-                    result.index = index;
-                    if let (Some(_), Some(move_path)) = (&resolved_hunk.move_dest, move_path) {
-                        output_lines.push(format!("Updated and moved {path} → {move_path}"));
-                    } else {
-                        output_lines.push(format!("Updated {path}"));
+            } => {
+                let target_created_in_call = match &resolved_hunk.move_dest {
+                    Some(dest) => created.contains_key(&dest.abs) || !dest.abs.exists(),
+                    None => created.contains_key(&resolved_hunk.source.abs),
+                };
+                match apply_update(
+                    req,
+                    ctx,
+                    resolved_hunk,
+                    chunks,
+                    &op_id,
+                    &mut backed_paths,
+                    target_created_in_call,
+                ) {
+                    Ok(mut result) => {
+                        result.index = index;
+                        if let (Some(dest), Some(move_path)) = (&resolved_hunk.move_dest, move_path)
+                        {
+                            created.remove(&resolved_hunk.source.abs);
+                            if target_created_in_call {
+                                created.insert(dest.abs.clone(), output_lines.len());
+                            }
+                            output_lines.push(format!("Updated and moved {path} → {move_path}"));
+                        } else {
+                            output_lines.push(format!("Updated {path}"));
+                        }
+                        applied.push(result);
                     }
-                    push_created_syntax_error(&mut output_lines, &result);
-                    applied.push(result);
+                    Err(error) => {
+                        output_lines.push(format!("Failed to update {path}: {error}"));
+                        add_failure(&mut failures, path, error);
+                    }
                 }
-                Err(error) => {
-                    output_lines.push(format!("Failed to update {path}: {error}"));
-                    add_failure(&mut failures, path, error);
-                }
-            },
+            }
         }
     }
+
+    let created_errors = created_file_syntax_errors(&created);
+    insert_created_syntax_notices(&mut output_lines, &created, &created_errors);
 
     if !failures.is_empty() {
         let partial = failures.len() < resolved.len();
@@ -1011,7 +1093,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     }
 
     let root = project_root_for_relative_paths(ctx);
-    let (diff, mut files) = metadata_files(&applied, root.as_deref());
+    let (diff, mut files) = metadata_files(&applied, root.as_deref(), &created_errors);
     // A partial patch keeps successful writes, but is not a completed project
     // mutation. Do not run checkers when any hunk failed or rolled back.
     if failures.is_empty() {
@@ -1097,11 +1179,10 @@ mod tests {
                 before: "original\n".into(),
                 after: after.into(),
                 delete_lines: None,
-                syntax_error_line: None,
             })
             .collect();
         edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));
-        let (diff, files) = metadata_files(&applied, None);
+        let (diff, files) = metadata_files(&applied, None, &HashMap::new());
         assert_eq!(
             files,
             vec![

@@ -256,3 +256,188 @@ fn swift_new_file_swiftc_accepts_has_no_syntax_line() {
     assert!(!text(&resp).contains("Syntax check"), "{}", text(&resp));
     assert!(aft.shutdown().success());
 }
+
+/// Patch text that adds `path` with `content`, followed by `rest` (more hunks).
+fn add_then(path: &str, content: &str, rest: &str) -> String {
+    let mut patch = format!("*** Begin Patch\n*** Add File: {path}\n");
+    for line in content.lines() {
+        patch.push_str(&format!("+{line}\n"));
+    }
+    patch.push_str(rest);
+    patch.push_str("*** End Patch");
+    patch
+}
+
+fn metadata_syntax_line(resp: &Value, rel: &str) -> Option<Value> {
+    let files = resp["metadata"]["files"]
+        .as_array()
+        .expect("metadata.files");
+    let entries: Vec<&Value> = files
+        .iter()
+        .filter(|file| file["relativePath"] == rel)
+        .collect();
+    assert_eq!(entries.len(), 1, "one metadata entry for {rel}: {files:?}");
+    entries[0].get("syntax_error_line").cloned()
+}
+
+/// A later hunk that updates a broken new file without fixing it: the notice
+/// stays under the Created line but names the error line of the final file,
+/// and metadata keeps `syntax_error_line`.
+#[test]
+fn apply_patch_add_broken_then_update_still_broken_reports_final_error_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    let patch = add_then(
+        "src/bad.ts",
+        BROKEN_TS,
+        "*** Update File: src/bad.ts\n@@\n+export const zero = 0;\n+export const alsoZero = 0;\n export const first = 1;\n",
+    );
+
+    let resp = tool_call(
+        &mut aft,
+        "patch-add-broken-update-broken",
+        "apply_patch",
+        json!({ "patchText": patch }),
+    );
+    let reply = text(&resp);
+    let notice = syntax_notice(5);
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["Created src/bad.ts", notice.as_str(), "Updated src/bad.ts"],
+        "{reply}"
+    );
+    assert_eq!(metadata_syntax_line(&resp, "src/bad.ts"), Some(json!(5)));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("src/bad.ts")).unwrap(),
+        format!("export const zero = 0;\nexport const alsoZero = 0;\n{BROKEN_TS}")
+    );
+    assert!(aft.shutdown().success());
+}
+
+/// A later hunk fixes the broken new file: no notice and no metadata field.
+#[test]
+fn apply_patch_add_broken_then_update_fixed_has_no_syntax_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    let patch = add_then(
+        "src/bad.ts",
+        BROKEN_TS,
+        "*** Update File: src/bad.ts\n@@\n export const second = 2;\n-export function broken( {{\n+export function fixed() {}\n",
+    );
+
+    let resp = tool_call(
+        &mut aft,
+        "patch-add-broken-update-fixed",
+        "apply_patch",
+        json!({ "patchText": patch }),
+    );
+    let reply = text(&resp);
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["Created src/bad.ts", "Updated src/bad.ts"],
+        "{reply}"
+    );
+    assert_eq!(metadata_syntax_line(&resp, "src/bad.ts"), None);
+    assert!(aft.shutdown().success());
+}
+
+/// A later hunk breaks a valid new file. The file did not exist before the
+/// patch, so the update is kept rather than rolled back, and the notice
+/// appears under the Created line.
+#[test]
+fn apply_patch_add_valid_then_update_broken_reports_under_created_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    let patch = add_then(
+        "src/good.ts",
+        VALID_TS,
+        "*** Update File: src/good.ts\n@@\n export const value = 1;\n+export function broken( {{\n",
+    );
+
+    let resp = tool_call(
+        &mut aft,
+        "patch-add-valid-update-broken",
+        "apply_patch",
+        json!({ "patchText": patch }),
+    );
+    let reply = text(&resp);
+    let notice = syntax_notice(2);
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "Created src/good.ts",
+            notice.as_str(),
+            "Updated src/good.ts"
+        ],
+        "{reply}"
+    );
+    assert_eq!(metadata_syntax_line(&resp, "src/good.ts"), Some(json!(2)));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("src/good.ts")).unwrap(),
+        "export const value = 1;\nexport function broken( {{\n"
+    );
+    assert!(aft.shutdown().success());
+}
+
+/// A broken new file that a later hunk deletes gets no notice.
+#[test]
+fn apply_patch_add_broken_then_delete_has_no_syntax_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    let patch = add_then("src/bad.ts", BROKEN_TS, "*** Delete File: src/bad.ts\n");
+
+    let resp = tool_call(
+        &mut aft,
+        "patch-add-broken-delete",
+        "apply_patch",
+        json!({ "patchText": patch }),
+    );
+    let reply = text(&resp);
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["Created src/bad.ts", "Deleted src/bad.ts"],
+        "{reply}"
+    );
+    assert_eq!(metadata_syntax_line(&resp, "src/bad.ts"), None);
+    assert!(aft.shutdown().success());
+}
+
+/// A broken new file moved to a new path: the notice follows the file to the
+/// line that created its final path.
+#[test]
+fn apply_patch_add_broken_then_move_reports_under_moved_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut aft = configured(dir.path());
+    let patch = add_then(
+        "src/bad.ts",
+        BROKEN_TS,
+        "*** Update File: src/bad.ts\n*** Move to: src/moved.ts\n@@\n export const first = 1;\n+export const extra = 1;\n",
+    );
+
+    let resp = tool_call(
+        &mut aft,
+        "patch-add-broken-move",
+        "apply_patch",
+        json!({ "patchText": patch }),
+    );
+    let reply = text(&resp);
+    let notice = syntax_notice(4);
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "Created src/bad.ts",
+            "Updated and moved src/bad.ts → src/moved.ts",
+            notice.as_str()
+        ],
+        "{reply}"
+    );
+    assert_eq!(metadata_syntax_line(&resp, "src/moved.ts"), Some(json!(4)));
+    assert_eq!(metadata_syntax_line(&resp, "src/bad.ts"), None);
+    assert!(!dir.path().join("src/bad.ts").exists());
+    assert!(aft.shutdown().success());
+}

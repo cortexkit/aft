@@ -886,7 +886,7 @@ pub fn write_format_validate(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, false, None)
+    write_format_validate_impl(path, content, config, params, false, None, false)
 }
 
 /// Reuse the captured original only while its strong file identity still matches.
@@ -904,7 +904,7 @@ pub(crate) fn write_format_validate_observed(
         .and(observation.version)
         .filter(|version| Some(*version) == crate::backup::DiskFileVersion::of_path(path))
         .map(|_| original);
-    write_format_validate_impl(path, content, config, params, false, pre)
+    write_format_validate_impl(path, content, config, params, false, pre, false)
 }
 
 /// Write, format and syntax-check now; the caller checks the completed project
@@ -915,7 +915,22 @@ pub(crate) fn write_format_validate_deferred(
     config: &Config,
     params: &serde_json::Value,
 ) -> Result<WriteResult, AftError> {
-    write_format_validate_impl(path, content, config, params, true, None)
+    write_format_validate_impl(path, content, config, params, true, None, false)
+}
+
+/// Write and format a file that did not exist before the caller's
+/// multi-step operation started, even if an earlier step of that operation
+/// already wrote it. There is no earlier content to protect, so an invalid
+/// result is never rolled back, and no syntax check runs here: the caller
+/// checks the file's final content once with [`check_created_file_syntax`]
+/// after its last step. `syntax_valid` and `syntax_error_line` are `None`.
+pub(crate) fn write_format_deferred_created(
+    path: &Path,
+    content: &str,
+    config: &Config,
+    params: &serde_json::Value,
+) -> Result<WriteResult, AftError> {
+    write_format_validate_impl(path, content, config, params, true, None, true)
 }
 
 mod swift;
@@ -927,11 +942,14 @@ fn write_format_validate_impl(
     params: &serde_json::Value,
     defer_full_validation: bool,
     captured_original: Option<&str>,
+    syntax_checked_by_caller: bool,
 ) -> Result<WriteResult, AftError> {
     // A file this call creates has no prior content: it cannot be rolled back
     // to anything, so an invalid result is kept and reported through
-    // `syntax_error_line` instead.
-    let existed = captured_original.is_some() || path.exists();
+    // `syntax_error_line` instead. With `syntax_checked_by_caller`, the file
+    // was created earlier in the caller's own multi-step operation: it also
+    // has no prior content to protect, and the caller checks its syntax.
+    let existed = !syntax_checked_by_caller && (captured_original.is_some() || path.exists());
     let pre_write_content = if let Some(source) = captured_original {
         Some(std::borrow::Cow::Borrowed(source))
     } else if existed {
@@ -965,6 +983,7 @@ fn write_format_validate_impl(
     let syntax_valid = final_text
         .as_ref()
         .map(|observed| observed.text.as_str())
+        .filter(|_| !syntax_checked_by_caller)
         .and_then(|source| {
             if !existed {
                 let check = check_created_file_syntax(path, source);
