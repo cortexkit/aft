@@ -6,6 +6,7 @@ import {
   bashHostFallbackAskPattern,
   classifyBashHostFallbackError,
   coerceBoolean,
+  isLiveBackgroundTaskReply,
   LONGEST_TIMER_DELAY_MS,
   maybeAppendGrepSearchHint,
   runBashHostFallback,
@@ -17,6 +18,7 @@ import {
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+
 import { trackBgTask } from "../bg-notifications.js";
 import { remoteRunsOffered, resolveBashConfig, toolEnabled } from "../config.js";
 import { flushLog, sessionLog } from "../logger.js";
@@ -36,10 +38,11 @@ const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 // The margin gives Rust time to promote or finalize the task and deliver the
 // final response after the server's foreground wait window or hard kill timeout.
 const BASH_TRANSPORT_MARGIN_MS = 10_000;
+// Mirrors Rust's REMOTE_INPUT_CAPTURE_WAIT: runon launch replies may wait for capture.
+const REMOTE_INPUT_CAPTURE_WAIT_MS = 60_000;
 const ABORT_REGISTRATION_WAIT_MS = 5_000;
 const ABORT_REGISTRATION_POLL_MS = 25;
 const ABORT_ATTEMPT_TIMEOUT_MS = 1_000;
-
 // Test-only override for the foreground wait window. Production resolves the
 // window from config (floored at 5000ms), but bun caps each test at 5000ms, so
 // promotion tests need a sub-floor window to exercise the promote path
@@ -60,6 +63,7 @@ function orchestratedTransportTimeoutMs(
   effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
   workerWaitMaxMs?: number,
+  runon = false,
 ): number {
   const blocking = blockToCompletion || wait;
   let waitBudget = blocking ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
@@ -68,10 +72,15 @@ function orchestratedTransportTimeoutMs(
   if (blocking && workerWaitMaxMs !== undefined) {
     waitBudget = Math.min(effectiveTimeout ?? workerWaitMaxMs, workerWaitMaxMs);
   }
-  // A blocking `runon` call needs this same budget and no more: the engine
-  // hands a remote task back at it (never later than 30 minutes) even while
-  // the job is still queued on the runner, because a remote command's
-  // `timeout` only starts once the runner runs it. The margin covers that reply.
+  if (runon) {
+    // Capture shares the command timeout, but can outlast the foreground window.
+    const captureBudget = Math.min(
+      effectiveTimeout ?? REMOTE_INPUT_CAPTURE_WAIT_MS,
+      REMOTE_INPUT_CAPTURE_WAIT_MS,
+      blocking ? (workerWaitMaxMs ?? REMOTE_INPUT_CAPTURE_WAIT_MS) : REMOTE_INPUT_CAPTURE_WAIT_MS,
+    );
+    waitBudget = Math.max(waitBudget, captureBudget);
+  }
   // A configured limit can exceed what a JavaScript timer accepts.
   return Math.min(waitBudget + BASH_TRANSPORT_MARGIN_MS, LONGEST_TIMER_DELAY_MS);
 }
@@ -287,7 +296,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting (it blocks up to bash.worker_wait_max_ms, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; ${autoPromote}. Use background: true yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitDescription(watchToolRegistered, status, role)} Do not change or delete files a background command uses until it finishes. A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(status, write)}.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   const outputRules = backgroundOn
     ? " Finished output expires after the task is 24 hours old and its completion has been delivered; under project-root restrictions, only the starting session can read output outside the project—copy cited lines into your report."
@@ -721,6 +730,7 @@ export function createBashTool(
               rawTimeout,
               foregroundWaitMs,
               workerWaitMaxMs,
+              runon !== undefined,
             ),
             onProgress: ({ text }) => {
               accumulatedOutput = preview(accumulatedOutput + text);
@@ -774,7 +784,7 @@ export function createBashTool(
       if (!usedHostFallback && hostFallbackActive) hostFallbackActive = false;
 
       const uiTitle = description ?? shortenCommand(command);
-      if (data.status === "running" && typeof data.task_id === "string") {
+      if (isLiveBackgroundTaskReply(data)) {
         const taskId = data.task_id;
         trackBgTask(context.sessionID, taskId);
         await trackV2BackgroundTask(ctx, context, taskId, startedEpoch);

@@ -3,6 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+  isLiveBackgroundTaskReply,
+  isTerminalStatus,
+  TERMINAL_BG_TASK_STATUSES,
+} from "../bash-format.js";
+import {
   abortableSleep,
   commandInvokesCodeSearch,
   formatWaitDuration,
@@ -22,6 +27,24 @@ const AFT_SEARCH_HINT =
   "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";
 const GREP_TOOL_HINT =
   "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `grep` tool instead (indexed and ranked).";
+
+test("terminal background task statuses match Rust BgTaskStatus wire names", () => {
+  expect([...TERMINAL_BG_TASK_STATUSES]).toEqual([
+    "completed",
+    "failed",
+    "killed",
+    "timed_out",
+    "fate_unknown",
+  ]);
+  for (const status of TERMINAL_BG_TASK_STATUSES) {
+    expect(isTerminalStatus(status)).toBe(true);
+    expect(isLiveBackgroundTaskReply({ task_id: "bash-terminal", status })).toBe(false);
+  }
+  for (const status of ["starting", "running", "killing"]) {
+    expect(isTerminalStatus(status)).toBe(false);
+    expect(isLiveBackgroundTaskReply({ task_id: "bash-live", status })).toBe(true);
+  }
+});
 
 describe("formatWatchWaited", () => {
   test("prints the real elapsed time next to a limit below the cap", () => {

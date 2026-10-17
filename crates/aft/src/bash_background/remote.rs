@@ -226,6 +226,10 @@ fn local_os_name() -> &'static str {
 struct ReattachBudget {
     limit: Duration,
     deadline: Option<tokio::time::Instant>,
+    #[cfg(test)]
+    clock: Option<Arc<tests::ReattachClock>>,
+    #[cfg(test)]
+    clock_deadline: Option<Duration>,
 }
 
 #[cfg(unix)]
@@ -238,11 +242,20 @@ impl ReattachBudget {
         Self {
             limit,
             deadline: None,
+            #[cfg(test)]
+            clock: tests::reattach_clock(_root),
+            #[cfg(test)]
+            clock_deadline: None,
         }
     }
 
     fn reset(&mut self) {
         self.deadline = None;
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            self.clock_deadline = None;
+            clock.resets.send_modify(|resets| *resets += 1);
+        }
     }
 
     fn expired(job_id: Uuid) -> String {
@@ -250,6 +263,17 @@ impl ReattachBudget {
     }
 
     fn check(&self, job_id: Uuid) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            return if self
+                .clock_deadline
+                .is_some_and(|deadline| clock.now() >= deadline)
+            {
+                Err(Self::expired(job_id))
+            } else {
+                Ok(())
+            };
+        }
         if self
             .deadline
             .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
@@ -265,6 +289,18 @@ impl ReattachBudget {
         attempt: impl std::future::Future<Output = T>,
     ) -> Result<T, String> {
         self.check(job_id)?;
+        #[cfg(test)]
+        if let Some(clock) = &self.clock {
+            let deadline = *self
+                .clock_deadline
+                .get_or_insert_with(|| clock.now() + self.limit);
+            clock.waits.send_modify(|waits| *waits += 1);
+            let mut ticks = clock.ticks.subscribe();
+            return tokio::select! {
+                value = attempt => Ok(value),
+                _ = ticks.wait_for(|now| *now >= deadline) => Err(Self::expired(job_id)),
+            };
+        }
         let deadline = *self
             .deadline
             .get_or_insert_with(|| tokio::time::Instant::now() + self.limit);
@@ -399,8 +435,9 @@ pub(crate) struct RemoteTask {
 /// caller whose blocking wait ended what the job is doing now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RemotePhase {
-    /// The runner has not accepted the job yet (it is still being submitted
-    /// or uploaded), or AFT restarted without learning its queue position.
+    /// Inputs are still being submitted; the runner has not accepted the job.
+    Submitting,
+    /// Accepted, but no queue position was retained across a restart.
     WaitingOnRunner,
     /// Accepted at this queue position, and nothing has shown it started.
     Queued { position: u32 },
@@ -414,7 +451,9 @@ impl RemotePhase {
     /// New runners explicitly report `Started`; output remains evidence of
     /// execution for older runners that do not send that record.
     pub(crate) fn of(remote: &RemoteTask) -> Self {
-        if remote.started.is_some() || remote.output_received {
+        if !remote.accepted {
+            Self::Submitting
+        } else if remote.started.is_some() || remote.output_received {
             Self::Running
         } else if let (Some(_), Some(position)) = (remote.job_id, remote.queue_position) {
             Self::Queued { position }
@@ -426,6 +465,7 @@ impl RemotePhase {
     /// A stable machine-readable name for replies.
     pub(crate) fn tag(self) -> &'static str {
         match self {
+            Self::Submitting => "submitting",
             Self::WaitingOnRunner => "waiting_on_runner",
             Self::Queued { .. } => "queued",
             Self::Running => "running",
@@ -435,6 +475,7 @@ impl RemotePhase {
     /// The phase in words, naming the runner.
     pub(crate) fn describe(self) -> String {
         match self {
+            Self::Submitting => "submitting to ck-motor (capturing inputs; not accepted yet)".to_string(),
             Self::WaitingOnRunner => {
                 "waiting on the runner (ck-motor has not reported a queue position or any output yet)"
                     .to_string()
@@ -464,13 +505,14 @@ impl RemoteProgress {
 }
 
 /// Where a still-running remote task is, for bash_status and bash_watch:
+/// `submitting to the runner (capturing inputs)` before acceptance, then
 /// `queued on the runner (N s, position P)` until the runner reports that the
 /// command started, then `the runner stops it N s after it started`, because
 /// the runner enforces the timeout from start, not from queue entry.
 ///
 /// It is read from the task's persisted record, so it reads the same after an
-/// AFT restart. `None` for a local task, a finished task, or a `runon` task the
-/// runner refused (whether or not it then ran locally).
+/// AFT restart. `None` for a local task, a finished task, or a final refusal;
+/// a draining refusal awaiting retry is still submitting inputs.
 pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) -> Option<String> {
     if metadata.is_terminal() || metadata.child_pid.is_some() {
         return None;
@@ -478,8 +520,11 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
     let remote = metadata
         .remote
         .as_ref()
-        .filter(|remote| remote.terminal.is_none())?;
+        .filter(|remote| remote.terminal.is_none() || !remote.accepted && remote.retry.is_some())?;
     let phase = RemotePhase::of(remote);
+    if phase == RemotePhase::Submitting {
+        return Some("submitting to the runner (capturing inputs; not accepted yet)".to_string());
+    }
     if phase == RemotePhase::Running {
         // The request asks the runner for this many whole seconds (see
         // `spawn_remote`), so round up the same way.
@@ -491,8 +536,7 @@ pub(crate) fn remote_phase_note(metadata: &super::PersistedTask, now_ms: u64) ->
             None => "running on the runner".to_string(),
         });
     }
-    // Counted from when AFT created the task: the job enters the queue as soon
-    // as it is submitted.
+    // The persisted task creation time includes submission as well as queueing.
     let queued_s = now_ms.saturating_sub(metadata.started_at) / 1000;
     Some(match phase {
         RemotePhase::Queued { position } => {
@@ -932,7 +976,11 @@ impl OutputSink for TaskSink {
             *existing = note + &suffix;
         }
         self.registry
-            .persist_task_locked(&self.task, &state.metadata, &mut db)
+            .persist_task_locked(&self.task, &state.metadata, &mut db)?;
+        // The remote executor's Accepted record confirms inputs were captured.
+        // Refusals skip Accepted; those callers wait for a settled terminal error.
+        self.task.remote_launch_ready.store(true, Ordering::Release);
+        Ok(())
     }
     fn started(&mut self, started: &Started) -> io::Result<()> {
         // Runner wall-clock time is display data, not a local watchdog deadline.
@@ -1360,6 +1408,9 @@ impl BgTaskRegistry {
                         .unwrap_or(Verdict::OutcomeUnknown);
                     registry.remote_terminal(&task, verdict, Some(error));
                 }
+                // Refusals must be rendered from their settled terminal state,
+                // not raced against the worker that is still recording them.
+                task.remote_launch_ready.store(true, Ordering::Release);
             })
             .map_err(|e| e.to_string())?;
         Ok(())

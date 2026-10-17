@@ -1,7 +1,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
+import { TERMINAL_BG_TASK_STATUSES } from "./bash-format.js";
 import { binaryContentHash, binaryStampKey, peekBinaryContentHash } from "./binary-identity.js";
 import { type ChildProcess, spawn } from "./child-process.js";
 import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
@@ -23,12 +25,8 @@ const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 const MALFORMED_STDOUT_LOG_CHARS = 512;
 const HASHLINE_REGISTRATION_LOG_INTERVAL_MS = 60_000;
 const HASHLINE_REGISTRATION_LOG_STATE_LIMIT = 256;
-const TERMINAL_BASH_STATUSES = new Set([
-  "completed",
-  "failed",
-  "killed",
-  "timed_out",
-  "fate_unknown",
+const TERMINAL_BASH_STATUSES = new Set<string>([
+  ...TERMINAL_BG_TASK_STATUSES,
   // Historical/defensive aliases seen in plugin-side compatibility code.
   "cancelled",
   "timeout",

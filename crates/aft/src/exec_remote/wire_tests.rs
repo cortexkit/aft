@@ -82,8 +82,8 @@ pub(crate) enum Script {
     TransientTerminalGap,
     TerminalGapOnce,
     Continuous,
-    GappedAttach(Duration),
-    GappedCancel(Duration),
+    GappedAttach,
+    GappedCancel,
     AttachDisconnected,
     /// Accepted, then exited 0 with the published `all` report: changed files,
     /// changed Git state, untracked files and ignored writes.
@@ -99,8 +99,20 @@ pub(crate) enum Script {
         queue: Duration,
         run: Duration,
     },
+    /// Accepted immediately; output and terminal each require a test release.
+    GatedStages {
+        position: u32,
+    },
+    /// Accepted, then refused before start (`unreachable`): the runner took
+    /// the inputs but never ran the command.
+    AcceptedThenRefused,
     /// Withhold the first stream record until `Daemon::acceptance_gate` is notified.
     GatedAcceptance,
+    /// Drop the connection on the first `exec.run`, before any stream record:
+    /// the runner never sends `Accepted`, so the caller cannot know the outcome.
+    DropBeforeAccepted,
+    /// Refuse once while draining, then gate the retry's first record.
+    DrainingGatedAcceptance,
     NetworkGranted,
     NetworkUnknown,
     NetworkLost,
@@ -117,8 +129,39 @@ pub(crate) struct Daemon {
     pub(crate) log: Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) acceptance_gate: Arc<tokio::sync::Notify>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) output_gate: Arc<tokio::sync::Notify>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) completion_gate: Arc<tokio::sync::Notify>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    requests: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
     _dir: tempfile::TempDir,
+}
+
+impl Daemon {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) async fn wait_for_requests(&self, method: &str, count: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let notified = self.requests.notified();
+                if self
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, body)| body["method"] == method)
+                    .count()
+                    >= count
+                {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("fake runner must receive the expected request");
+    }
 }
 
 impl Drop for Daemon {
@@ -149,6 +192,12 @@ pub(crate) async fn daemon_with_capabilities(
     let server_log = Arc::clone(&log);
     let acceptance_gate = Arc::new(tokio::sync::Notify::new());
     let server_acceptance_gate = acceptance_gate.clone();
+    let output_gate = Arc::new(tokio::sync::Notify::new());
+    let server_output_gate = output_gate.clone();
+    let completion_gate = Arc::new(tokio::sync::Notify::new());
+    let server_completion_gate = completion_gate.clone();
+    let requests = Arc::new(tokio::sync::Notify::new());
+    let server_requests = requests.clone();
     let server_key = key.clone();
     let claims: Vec<String> = claims.iter().map(|claim| (*claim).to_string()).collect();
     let server = tokio::spawn(async move {
@@ -173,6 +222,7 @@ pub(crate) async fn daemon_with_capabilities(
                 let header = frame.header;
                 let body: Value = serde_json::from_slice(&frame.body).unwrap_or(Value::Null);
                 server_log.lock().unwrap().push((header, body.clone()));
+                server_requests.notify_one();
                 let reply = |ty, value: Value| {
                     Frame::build_with_version(
                         header.ver,
@@ -201,13 +251,18 @@ pub(crate) async fn daemon_with_capabilities(
                         "exec.run" | "exec.attach" => {
                             let attaching = body["method"] == "exec.attach";
                             if !attaching { runs += 1; }
-                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } if runs <= refusals);
+                            let draining = matches!(script, Script::Draining { refusals, .. } | Script::DiskFull { refusals, .. } if runs <= refusals)
+                                || matches!(script, Script::DrainingGatedAcceptance) && runs == 1;
                             if attaching && matches!(script, Script::AttachDisconnected) {
                                 // Drop the route and listener; later attach calls and connects fail.
                                 return;
                             }
-                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance) {
-                                let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } = script { position } else { 1 });
+                            if !attaching && matches!(script, Script::DropBeforeAccepted) {
+                                // Drop the connection and listener with the run in flight.
+                                return;
+                            }
+                            if !attaching && !draining && !matches!(script, Script::Refused | Script::KnownRefused | Script::WorkspaceSetupRefused | Script::RefusedWithDetail | Script::NetworkUnsupported | Script::GatedAcceptance | Script::DrainingGatedAcceptance) {
+                                let mut accepted = Accepted::new(id(), if let Script::Staged { position, .. } | Script::GatedStages { position } = script { position } else { 1 });
                                 if matches!(script, Script::Windows { acknowledge: true, .. }) {
                                     accepted = accepted.with_platform(Platform::Windows);
                                 }
@@ -232,7 +287,7 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Lost | Script::NetworkLost => Outcome::OutcomeUnknown,
                                     Script::NetworkUnsupported => Outcome::RefusedBeforeStart { reason: RefusalReason::NetworkUnsupported },
                                     Script::Refused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unknown("future_refusal".into()) },
-                                    Script::KnownRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
+                                    Script::KnownRefused | Script::AcceptedThenRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::Unreachable },
                                     Script::WorkspaceSetupRefused => Outcome::RefusedBeforeStart { reason: RefusalReason::WorkspaceSetupFailed },
                                     Script::RefusedWithDetail => Outcome::RefusedBeforeStart { reason: RefusalReason::RunnerDraining },
                                     Script::FutureOutcome => Outcome::Unknown { kind:"future_outcome".into() },
@@ -241,8 +296,8 @@ pub(crate) async fn daemon_with_capabilities(
                                     Script::Windows { code: None, .. } => Outcome::OutcomeUnknown,
                                     _ => Outcome::Exit { code: 0 },
                                 }};
-                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel(_) | Script::Staged { .. } | Script::Started | Script::GatedAcceptance) && !attaching { /* held-open run stream */ }
-                            else if attaching && matches!(script, Script::GappedAttach(_) | Script::GappedCancel(_)) { /* delayed producer below */ }
+                            if matches!(script, Script::Cancel | Script::Continuous | Script::GappedCancel | Script::Staged { .. } | Script::GatedStages { .. } | Script::Started | Script::GatedAcceptance | Script::DrainingGatedAcceptance) && !attaching && !draining { /* held-open run stream */ }
+                            else if attaching && matches!(script, Script::GappedAttach | Script::GappedCancel) { /* output is sent below; completion waits for the test's release */ }
                             else {
                                 if matches!(script, Script::Restart) {
                                     let from = if attaching { body["params"]["from_seq"].as_u64().unwrap() } else { 0 };
@@ -267,7 +322,7 @@ pub(crate) async fn daemon_with_capabilities(
                                          replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Output(Output::new(seq, OutputStream::Stdout, BytePayload(vec![b'A' + seq as u8])))).unwrap()));
                                      }
                                  }
-                                 if !matches!(script, Script::MissingTerminal) && !(attaching && matches!(script, Script::TerminalGapOnce)) && (!matches!(script, Script::Restart | Script::AttachRefused | Script::GappedAttach(_) | Script::AttachDisconnected) || attaching) {
+                                 if !matches!(script, Script::MissingTerminal) && !(attaching && matches!(script, Script::TerminalGapOnce)) && (!matches!(script, Script::Restart | Script::AttachRefused | Script::GappedAttach | Script::AttachDisconnected) || attaching) {
                                     let mut terminal = TerminalRecord::new(id(), outcome, 1, 0, 0);
                                     if matches!(script, Script::RefusedWithDetail) {
                                         let mut value = serde_json::to_value(&terminal).unwrap();
@@ -277,7 +332,10 @@ pub(crate) async fn daemon_with_capabilities(
                                     if matches!(script, Script::NetworkUnsupported) {
                                         terminal.refusal_detail = Some("outbound access disabled by runner policy".into());
                                     }
-                                    if draining {
+                                     if draining {
+                                         if matches!(script, Script::DrainingGatedAcceptance) {
+                                             terminal.retry_after_ms = Some(50);
+                                         }
                                         if let Script::Draining { retry_after_ms, .. } | Script::DiskFull { retry_after_ms, .. } = script {
                                             terminal.retry_after_ms = retry_after_ms;
                                             terminal.refusal_detail = Some("maintenance".into());
@@ -308,7 +366,10 @@ pub(crate) async fn daemon_with_capabilities(
                         .await
                         .unwrap();
                 }
-                if matches!(script, Script::GatedAcceptance) && body["method"] == "exec.run" {
+                if (matches!(script, Script::GatedAcceptance)
+                    || matches!(script, Script::DrainingGatedAcceptance) && runs > 1)
+                    && body["method"] == "exec.run"
+                {
                     let writer = writer.clone();
                     let gate = server_acceptance_gate.clone();
                     producers.push(tokio::spawn(async move {
@@ -329,8 +390,9 @@ pub(crate) async fn daemon_with_capabilities(
                     }));
                 }
                 if body["method"] == "exec.attach" {
-                    if let Script::GappedAttach(gap) | Script::GappedCancel(gap) = script {
+                    if matches!(script, Script::GappedAttach | Script::GappedCancel) {
                         let writer = writer.clone();
+                        let gate = server_completion_gate.clone();
                         let seq = body["params"]["from_seq"].as_u64().unwrap();
                         producers.push(tokio::spawn(async move {
                             let data = |record| {
@@ -356,8 +418,8 @@ pub(crate) async fn daemon_with_capabilities(
                             {
                                 return;
                             }
-                            tokio::time::sleep(gap).await;
-                            if matches!(script, Script::GappedCancel(_)) || seq == 2 {
+                            gate.notified().await;
+                            if matches!(script, Script::GappedCancel) || seq == 2 {
                                 let outcome = if cancelled {
                                     Outcome::Signal { signal: 15 }
                                 } else {
@@ -392,10 +454,12 @@ pub(crate) async fn daemon_with_capabilities(
                         }));
                     }
                 }
-                if let (Script::Staged { queue, run, .. }, "exec.run") =
-                    (script, body["method"].as_str().unwrap_or_default())
+                if matches!(script, Script::Staged { .. } | Script::GatedStages { .. })
+                    && body["method"] == "exec.run"
                 {
                     let writer = writer.clone();
+                    let output_gate = server_output_gate.clone();
+                    let completion_gate = server_completion_gate.clone();
                     producers.push(tokio::spawn(async move {
                         let data = |record| {
                             Frame::build_with_version(
@@ -409,7 +473,11 @@ pub(crate) async fn daemon_with_capabilities(
                             )
                             .unwrap()
                         };
-                        tokio::time::sleep(queue).await;
+                        if let Script::Staged { queue, .. } = script {
+                            tokio::time::sleep(queue).await;
+                        } else {
+                            output_gate.notified().await;
+                        }
                         let output = data(StreamRecord::Output(Output::new(
                             0,
                             OutputStream::Stdout,
@@ -421,7 +489,11 @@ pub(crate) async fn daemon_with_capabilities(
                         {
                             return;
                         }
-                        tokio::time::sleep(run).await;
+                        if let Script::Staged { run, .. } = script {
+                            tokio::time::sleep(run).await;
+                        } else {
+                            completion_gate.notified().await;
+                        }
                         let terminal =
                             TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 1, 0, 0);
                         let end = Frame::build_with_version(
@@ -514,6 +586,9 @@ pub(crate) async fn daemon_with_capabilities(
         connection,
         log,
         acceptance_gate,
+        output_gate,
+        completion_gate,
+        requests,
         server,
         _dir: dir,
     }

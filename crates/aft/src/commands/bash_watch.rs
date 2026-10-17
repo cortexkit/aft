@@ -575,6 +575,11 @@ impl WatchJob {
                     Value::String(matched.clone())
                 ));
             }
+            WaitReason::Timeout if snapshot.phase == Some("submitting") => {
+                text.push_str(&format!(
+                    "\n{waited_text}; timeout reached without match. The task is still submitting; the runner has not confirmed input capture. Call bash_watch again to keep waiting."
+                ));
+            }
             WaitReason::Timeout if self.worker => {
                 text.push_str(&format!(
                     "\n{waited_text}; timeout reached without match. {}",
@@ -642,7 +647,7 @@ impl WatchJob {
             return String::new();
         }
         // A remote task has no AFT kill clock: say where it is on the build
-        // server instead (queued, or when the runner stops it).
+        // server instead (capturing inputs, queued, or when the runner stops it).
         if let Some(note) = &snapshot.remote_phase_note {
             return remote_phase_sentence(note);
         }

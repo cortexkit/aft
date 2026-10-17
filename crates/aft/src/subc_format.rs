@@ -1086,9 +1086,8 @@ fn format_bash_status(
     if let Some(summary) = data.get("live_descendants_summary").and_then(Value::as_str) {
         text.push_str(&format!(" · {summary}"));
     }
-    // A remote task's build-server status note: that it is still queued (and
-    // for how long), or when the runner will stop it. Without this note a
-    // queued job would show as plain "running".
+    // A remote task's phase note distinguishes input capture from queueing
+    // and reports the runner's stop deadline once execution starts.
     if let Some(note) = data.get("remote_phase_note").and_then(Value::as_str) {
         text.push_str(&format!(" · {note}"));
     }

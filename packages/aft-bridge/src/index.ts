@@ -13,9 +13,11 @@ export { setActiveLogger } from "./active-logger.js";
 export {
   formatForegroundResult,
   formatSeconds,
+  isLiveBackgroundTaskReply,
   isTerminalStatus,
   monotonicNowMs,
   sleep,
+  TERMINAL_BG_TASK_STATUSES,
 } from "./bash-format.js";
 export {
   abortableSleep,

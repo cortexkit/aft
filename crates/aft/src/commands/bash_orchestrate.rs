@@ -705,7 +705,7 @@ pub(crate) fn promote_bash(
     bash_watch_available: bool,
     capped_worker_wait: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) if capped_worker_wait => {
             if worker_session {
                 ctx.bash_background().renew_hard_kill(
@@ -763,7 +763,8 @@ pub(crate) fn promote_bash(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
-    }
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
 pub(crate) fn detach_wait_mode_bash(
@@ -774,7 +775,7 @@ pub(crate) fn detach_wait_mode_bash(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => wait_detach_response(
             request_id,
             task_id,
@@ -788,7 +789,8 @@ pub(crate) fn detach_wait_mode_bash(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
-    }
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
 /// How long a blocking call (`wait: true` or `block_to_completion`) on a
@@ -825,7 +827,7 @@ pub(crate) fn format_remote_handback_message(
     let job = progress
         .and_then(|progress| progress.job_id)
         .map_or_else(|| "not assigned yet".to_string(), |id| id.to_string());
-    let phase = progress.map_or(RemotePhase::WaitingOnRunner, |progress| progress.phase);
+    let phase = progress.map_or(RemotePhase::Submitting, |progress| progress.phase);
     format!(
         "The remote command did not finish within {}, the longest this call waits, so it now runs in the background as {}\nIt was not killed. Remote job: {job}. Phase: {}. Its `timeout` counts from when it starts running on ck-motor; a job that waits too long in ck-motor's queue is refused without running.",
         format_wait_limit(waited_ms),
@@ -846,7 +848,7 @@ pub(crate) fn handback_remote_bash(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => {
             let progress = ctx.bash_background().remote_progress(task_id, session_id);
             let output = format!(
@@ -862,7 +864,7 @@ pub(crate) fn handback_remote_bash(
             );
             let phase = progress
                 .as_ref()
-                .map_or(RemotePhase::WaitingOnRunner, |progress| progress.phase);
+                .map_or(RemotePhase::Submitting, |progress| progress.phase);
             let queue_position = match phase {
                 RemotePhase::Queued { position } => Some(position),
                 _ => None,
@@ -872,7 +874,7 @@ pub(crate) fn handback_remote_bash(
                 json!({
                     "output": output,
                     "task_id": task_id,
-                    "status": "running",
+                    "status": if phase == RemotePhase::Submitting { "starting" } else { "running" },
                     "remote_job_id": progress
                         .as_ref()
                         .and_then(|progress| progress.job_id)
@@ -888,7 +890,8 @@ pub(crate) fn handback_remote_bash(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
-    }
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
 /// Hands a still-running foreground command to the background because the
@@ -902,7 +905,7 @@ pub(crate) fn detach_bash_for_module_drain(
     worker_session: bool,
     bash_watch_available: bool,
 ) -> Response {
-    match ctx.bash_background().promote(task_id, session_id) {
+    let response = match ctx.bash_background().promote(task_id, session_id) {
         Ok(_) => {
             let snapshot = ctx
                 .bash_background()
@@ -940,9 +943,97 @@ pub(crate) fn detach_bash_for_module_drain(
             crate::commands::bash_status::format_unknown_task_message(task_id),
         ),
         Err(message) => Response::error(request_id, "execution_failed", message),
+    };
+    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
+}
+
+pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running.";
+
+/// Keep launch, detach and recovered status replies consistent until the runner's
+/// Accepted stream record confirms input capture. The warning tells the caller to
+/// wait for the job to be queued or running, which is true only for a task still
+/// in flight; a reply that already carries a finished status is returned as is.
+pub(crate) fn with_capture_warning(response: &Response) -> Response {
+    let mut response = Response {
+        id: response.id.clone(),
+        success: response.success,
+        data: response.data.clone(),
+    };
+    if !reply_announces_live_task(&response) {
+        return response;
+    }
+    response.data["status"] = json!("starting");
+    response.data["phase"] = json!("submitting");
+    if response.data.get("remote_phase").is_some() {
+        response.data["remote_phase"] = json!("submitting");
+    }
+    let field =
+        if response.data.get("output").is_none() && response.data.get("output_preview").is_some() {
+            "output_preview"
+        } else {
+            "output"
+        };
+    let output = response.data[field].as_str().unwrap_or("");
+    if !output.ends_with(REMOTE_INPUT_CAPTURE_WARNING) {
+        response.data[field] = json!(format!("{output}\n{REMOTE_INPUT_CAPTURE_WARNING}"));
+    }
+    response
+}
+
+/// The reply for an explicit `runon` task whose runner has not confirmed input
+/// capture. A reply that would announce a live task (status `running` or
+/// `starting`, or no status at all) is checked against the task's saved state first: a task that already ended
+/// (refused, failed, outcome unknown, killed or completed) before `Accepted`
+/// shows that saved outcome, rendered as a finished command's reply with its
+/// advice and without the capture warning, so the caller is never told to wait
+/// for queued or running states the task will not reach. A task still in
+/// flight gets the `starting` reply with the capture warning.
+pub(crate) fn runon_uncaptured_reply(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: &Response,
+) -> Response {
+    if reply_announces_live_task(response) {
+        if let Some(snapshot) = registry
+            .observed_status(
+                task_id,
+                session,
+                crate::bash_background::output::RUNNING_OUTPUT_PREVIEW_BYTES,
+            )
+            .filter(|snapshot| snapshot.info.status.is_terminal())
+        {
+            return foreground_result_response(&response.id, snapshot);
+        }
+    }
+    with_capture_warning(response)
+}
+
+/// Whether this reply describes a task still in flight (`running`, `starting`,
+/// or no status at all), which `with_capture_warning` presents as `starting`.
+pub(crate) fn reply_announces_live_task(response: &Response) -> bool {
+    matches!(
+        response.data["status"].as_str(),
+        None | Some("running" | "starting")
+    )
+}
+
+pub(crate) fn with_runon_capture_state(
+    registry: &crate::bash_background::BgTaskRegistry,
+    task_id: &str,
+    session: &str,
+    response: Response,
+) -> Response {
+    if registry.runon_inputs_captured(task_id, session) == Some(false) {
+        runon_uncaptured_reply(registry, task_id, session, &response)
+    } else {
+        response
     }
 }
 
+/// A finished task's reply. It never carries the input-capture warning: that
+/// warning asks the caller to wait for queued or running states a finished task
+/// will not reach, even when the runner never confirmed capture.
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
     let task_line = foreground_task_line(&snapshot);
     let (output, foreground_envelope) =
@@ -1231,6 +1322,7 @@ mod tests {
             sandbox_native: false,
             sandbox_unavailable: false,
             remote_refusal: None,
+            remote_inputs_captured: None,
             phase: None,
             live_descendants: Some(Vec::new()),
             live_descendants_omitted: 0,

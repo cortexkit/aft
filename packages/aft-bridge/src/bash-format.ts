@@ -29,13 +29,30 @@ export function formatForegroundResult(data: Record<string, unknown>): string {
   return rendered;
 }
 
+export const TERMINAL_BG_TASK_STATUSES = Object.freeze([
+  "completed",
+  "failed",
+  "killed",
+  "timed_out",
+  "fate_unknown",
+] as const);
+
+const terminalBgTaskStatusSet = new Set<string>(TERMINAL_BG_TASK_STATUSES);
+
 export function isTerminalStatus(status: unknown): boolean {
+  return typeof status === "string" && terminalBgTaskStatusSet.has(status);
+}
+
+export function isLiveBackgroundTaskReply(
+  reply: unknown,
+): reply is Record<string, unknown> & { task_id: string; status: string } {
+  if (!reply || typeof reply !== "object" || Array.isArray(reply)) return false;
+  const response = reply as Record<string, unknown>;
   return (
-    status === "completed" ||
-    status === "failed" ||
-    status === "killed" ||
-    status === "timed_out" ||
-    status === "fate_unknown"
+    typeof response.task_id === "string" &&
+    response.task_id.length > 0 &&
+    typeof response.status === "string" &&
+    !terminalBgTaskStatusSet.has(response.status)
   );
 }
 

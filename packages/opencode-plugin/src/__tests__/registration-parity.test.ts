@@ -750,3 +750,16 @@ describe("truncation contract description parity", () => {
     }
   });
 });
+
+describe("background input guidance parity", () => {
+  test("both bash descriptions protect background command inputs", () => {
+    const sentence = "Do not change or delete files a background command uses until it finishes.";
+    const opencode = openCodeTools(profileConfigs["REG-V049-OC-ALL"]) as Record<
+      string,
+      { description?: string }
+    >;
+    const pi = capturePiTools(profileConfigs["REG-V049-PI-ALL"]);
+    expect(opencode.bash?.description).toContain(sentence);
+    expect((pi.get("bash") as { description?: string })?.description).toContain(sentence);
+  });
+});

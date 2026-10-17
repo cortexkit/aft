@@ -40,6 +40,7 @@ import {
 } from "@cortexkit/subc-client";
 
 import { log, warn } from "./active-logger.js";
+import { isTerminalStatus } from "./bash-format.js";
 import type { StatusSnapshot } from "./bridge.js";
 import { isRouteOpenReloadWindowError, isRouteRequestReloadRefusal } from "./error-contract.js";
 import {
@@ -1987,7 +1988,7 @@ export class SubcTransportPool implements AftTransportPool {
     }
     if (typeof data.task_id === "string") {
       // Terminal tasks remain pinned until the daemon explicitly ACKs them.
-      const terminal = ["completed", "failed", "killed", "timed_out"].includes(String(data.status));
+      const terminal = isTerminalStatus(data.status);
       const running = ["starting", "running", "killing"].includes(String(data.status));
       record.backgroundTasks.set(
         data.task_id,

@@ -10,6 +10,7 @@ import {
   formatWatchWaited,
   interruptedWatchTail,
   isBridgeTransportTimeout,
+  isLiveBackgroundTaskReply,
   isTerminalStatus,
   LONGEST_TIMER_DELAY_MS,
   maxWatchTimeoutMs,
@@ -39,6 +40,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+
 import {
   consumeBgCompletion,
   markBgCompletionDelivered,
@@ -119,6 +121,8 @@ const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
 // The margin gives Rust time to promote or finalize the task and deliver the
 // final response after the server's foreground wait window or hard kill timeout.
 const BASH_TRANSPORT_MARGIN_MS = 10_000;
+// Mirrors Rust's REMOTE_INPUT_CAPTURE_WAIT: runon launch replies may wait for capture.
+const REMOTE_INPUT_CAPTURE_WAIT_MS = 60_000;
 
 function orchestratedTransportTimeoutMs(
   blockToCompletion: boolean,
@@ -126,6 +130,7 @@ function orchestratedTransportTimeoutMs(
   effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
   workerWaitMaxMs?: number,
+  runon = false,
 ): number {
   const blocking = blockToCompletion || wait;
   let waitBudget = blocking ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
@@ -134,10 +139,15 @@ function orchestratedTransportTimeoutMs(
   if (blocking && workerWaitMaxMs !== undefined) {
     waitBudget = Math.min(effectiveTimeout ?? workerWaitMaxMs, workerWaitMaxMs);
   }
-  // A blocking `runon` call needs this same budget and no more: the engine
-  // hands a remote task back at it (never later than 30 minutes) even while
-  // the job is still queued on the runner, because a remote command's
-  // `timeout` only starts once the runner runs it. The margin covers that reply.
+  if (runon) {
+    // Capture shares the command timeout, but can outlast the foreground window.
+    const captureBudget = Math.min(
+      effectiveTimeout ?? REMOTE_INPUT_CAPTURE_WAIT_MS,
+      REMOTE_INPUT_CAPTURE_WAIT_MS,
+      blocking ? (workerWaitMaxMs ?? REMOTE_INPUT_CAPTURE_WAIT_MS) : REMOTE_INPUT_CAPTURE_WAIT_MS,
+    );
+    waitBudget = Math.max(waitBudget, captureBudget);
+  }
   // A configured limit can exceed what a JavaScript timer accepts.
   return Math.min(waitBudget + BASH_TRANSPORT_MARGIN_MS, LONGEST_TIMER_DELAY_MS);
 }
@@ -724,7 +734,7 @@ export function registerBashTool(
     ? "Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`."
     : "Because `bash.detach_on_user_message` is false, a new message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`.";
   const tasksSentence = bashCfg.background
-    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting (it blocks up to \`bash.worker_wait_max_ms\`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
+    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting (it blocks up to \`bash.worker_wait_max_ms\`, 30 minutes by default, then reports the command is still running; watch again to keep waiting); ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; ${backgroundWaitSentence(companions)} Do not change or delete files a background command uses until it finishes. A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background${ptyDriveClause(companions)}.`
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   const remoteRuns = () => !isPowerShell && remoteRunsOffered(ctx.config);
   pi.registerTool<typeof BashParams, BashDetails>({
@@ -881,6 +891,7 @@ export function registerBashTool(
               timeout,
               foregroundWaitMs,
               workerWaitMaxMs,
+              params.runon !== undefined,
             ),
             onProgress: ({ text }) => {
               streamed = appendBashStreamTail(streamed, text);
@@ -947,16 +958,16 @@ export function registerBashTool(
       if (!usedHostFallback && hostFallbackActive) hostFallbackActive = false;
 
       const taskId = response.task_id as string | undefined;
-      if (response.status === "running" && taskId) {
-        trackBgTask(resolveSessionId(extCtx), taskId);
+      if (isLiveBackgroundTaskReply(response)) {
+        trackBgTask(resolveSessionId(extCtx), response.task_id);
         // The Rust engine words this hand-off text for the caller's role
         // (worker_session, which callBridge adds to every request). It cannot
         // assume the host has bash_watch, so a worker is told here how to
         // wait on the task it now holds.
         const handOff = (response.output as string | undefined) ?? "";
         return bashResult(
-          isWorker ? handOff + workerBackgroundTaskNote(taskId, "task_id") : handOff,
-          { task_id: taskId },
+          isWorker ? handOff + workerBackgroundTaskNote(response.task_id, "task_id") : handOff,
+          { task_id: response.task_id },
         );
       }
 

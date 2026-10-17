@@ -17,6 +17,8 @@ import { type ToolContext, tool } from "@opencode-ai/plugin";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   __resetBgNotificationStateForTests,
+  appendInTurnBgCompletions,
+  handlePushedBgCompletion,
   sessionBgStates,
   trackBgTask,
 } from "../bg-notifications.js";
@@ -396,6 +398,30 @@ describe("OpenCode bash adapter", () => {
       await expect(
         dead.tool.execute({ command: "printf no", runon }, createMockSdkContext({})),
       ).rejects.toThrow("runon is unsupported, and the command was not run locally");
+    }
+  });
+
+  test("runon launch transport covers capture without extending local budgets", async () => {
+    const { calls, tool: bash } = createHarness(
+      () => ({ success: true, output: "queued", status: "running", task_id: "bash-capture" }),
+      undefined,
+      false,
+      {
+        subc: { connection_file: "/run/subc-connection.json" },
+        remote_exec: { enabled: true },
+        bash: { runon_enabled: true },
+      } as PluginContext["config"],
+    );
+    for (const [runon, timeout, expected] of [
+      ["linux", undefined, 70_000],
+      ["linux", 20_000, 30_000],
+      [undefined, undefined, 25_000],
+    ] as const) {
+      await bash.execute(
+        { command: "uname -s", background: true, runon, timeout },
+        createMockSdkContext({}),
+      );
+      expect(calls.at(-1)?.options?.transportTimeoutMs).toBe(expected);
     }
   });
 
@@ -2720,6 +2746,73 @@ describe("OpenCode bash adapter — subagent gating", () => {
     // A worker's call is handed back at the worker wait limit (30 minutes by
     // default) when its timeout is longer.
     expect(worker.calls[0].options?.transportTimeoutMs).toBe(1_800_000 + 10_000);
+  });
+
+  test("starting runon hand-back tracks its later completion for reminder delivery", async () => {
+    const sessionID = "ses_starting_runon";
+    const taskId = "bash-starting-runon";
+    const config = {
+      subc: { connection_file: "/run/subc-connection.json" },
+      remote_exec: { enabled: true },
+      bash: { runon_enabled: true },
+    } as PluginContext["config"];
+    __resetBgNotificationStateForTests();
+    _resetSubagentCacheForTest();
+    const harness = createHarness(
+      (command) =>
+        command === "bash"
+          ? { success: true, status: "starting", task_id: taskId, output: "submitting" }
+          : { success: true, bg_completions: [], acked_task_ids: [taskId] },
+      undefined,
+      false,
+      config,
+    );
+
+    await harness.tool.execute(
+      { command: "cargo test", runon: "linux", wait: true },
+      createMockSdkContext({ sessionID }),
+    );
+    const state = sessionBgStates.get(sessionID);
+    expect(state?.outstandingTaskIds.has(taskId)).toBe(true);
+
+    await handlePushedBgCompletion(
+      {
+        ctx: harness.ctx,
+        directory: PROJECT_CWD,
+        sessionID,
+        client: { session: { promptAsync: async () => ({}) } },
+      },
+      { task_id: taskId, status: "completed", exit_code: 0, command: "cargo test" },
+    );
+    expect(state?.unknownCompletions).toEqual([]);
+    const nextToolResult = { output: "next tool result" };
+    await appendInTurnBgCompletions(
+      { ctx: harness.ctx, directory: PROJECT_CWD, sessionID },
+      nextToolResult,
+    );
+    expect(nextToolResult.output).toContain("<system-reminder>");
+    expect(nextToolResult.output).toContain(`- task ${taskId} (exit 0)`);
+  });
+
+  test("terminal bash replies do not track their task id", async () => {
+    const sessionID = "ses_terminal_runon";
+    const taskId = "bash-terminal-runon";
+    __resetBgNotificationStateForTests();
+    _resetSubagentCacheForTest();
+    const harness = createHarness(() => ({
+      success: true,
+      status: "completed",
+      task_id: taskId,
+      output: "finished",
+      exit_code: 0,
+    }));
+
+    await harness.tool.execute(
+      { command: "true", wait: true },
+      createMockSdkContext({ sessionID }),
+    );
+
+    expect(Boolean(sessionBgStates.get(sessionID)?.outstandingTaskIds.has(taskId))).toBe(false);
   });
 
   test("head and worker runon transport budgets cover a short configured blocking cap", async () => {

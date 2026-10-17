@@ -147,6 +147,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let task_session = worker_owner.as_deref().unwrap_or(req.session());
     match snapshot {
         Some(mut snapshot) => {
+            let inputs_captured = snapshot.remote_inputs_captured;
+            // The capture warning asks the caller to wait for queued or running,
+            // so it is added only while the task is not terminal; a terminal
+            // task's reply is returned without it.
+            let in_flight = !snapshot.info.status.is_terminal();
             let pty_raw = maybe_render_pty_screen(
                 ctx,
                 task_session,
@@ -159,7 +164,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 ctx.bash_background()
                     .append_db_hint(&task_id, &mut snapshot.output_preview);
             }
-            if let Some(refusal) = &snapshot.remote_refusal {
+            let response = if let Some(refusal) = &snapshot.remote_refusal {
                 Response::error_with_data(&req.id, refusal.code, &refusal.message, json!(snapshot))
             } else if snapshot.sandbox_native
                 && snapshot.sandbox_unavailable
@@ -247,6 +252,11 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     }
                 }
                 Response::success(&req.id, data)
+            };
+            if inputs_captured == Some(false) && in_flight {
+                super::bash_orchestrate::with_capture_warning(&response)
+            } else {
+                response
             }
         }
         None => {

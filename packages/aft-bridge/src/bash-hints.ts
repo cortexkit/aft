@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { isTerminalStatus } from "./bash-format.js";
 import { relativePathEscapesRoot } from "./path-display.js";
 
 // Helpers for the bash-output hint nudges appended to bash tool results.
@@ -198,7 +199,7 @@ export function taskKillDeadlineText(
   }
   // A terminal task's deadline no longer matters; an unknown state (the
   // bridge stayed busy) has none to report.
-  if (isTerminalTaskStatus(data.status) || typeof data.status !== "string") return "";
+  if (isTerminalStatus(data.status) || typeof data.status !== "string") return "";
   if (data.status === "unknown") return "";
   // A remote task has no AFT hard-kill deadline (`hard_kill`); report its
   // build-server status note instead (still queued, or when the runner will
@@ -240,7 +241,7 @@ export function taskKillDeadlineText(
  * deadline. Five seconds covers the slowest status poll and kill publication.
  */
 export function taskKillDeadlineWithinHandoffMargin(data: Record<string, unknown>): boolean {
-  if (typeof data.status !== "string" || isTerminalTaskStatus(data.status)) return false;
+  if (typeof data.status !== "string" || isTerminalStatus(data.status)) return false;
   const hardKill = data.hard_kill as { limit_ms?: unknown } | undefined;
   const limitMs = hardKill?.limit_ms;
   const elapsedMs = data.elapsed_ms;
@@ -273,16 +274,6 @@ function formatApproximateRemaining(ms: number): string {
     return `${minutes} minute${minutes === 1 ? "" : "s"}`;
   }
   return formatWaitDuration(ms);
-}
-
-function isTerminalTaskStatus(status: unknown): boolean {
-  return (
-    status === "completed" ||
-    status === "failed" ||
-    status === "killed" ||
-    status === "timed_out" ||
-    status === "fate_unknown"
-  );
 }
 
 /** Most lines of a still-running command's output shown to a worker. */

@@ -573,7 +573,11 @@ pub struct BgTaskSnapshot {
     /// An explicit remote demand was refused before the command started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_refusal: Option<RemoteRefusal>,
-    /// The runner confirmed execution began; older runners omit this phase.
+    /// Whether the runner confirmed input capture, retained through disk recovery.
+    #[serde(skip)]
+    pub(crate) remote_inputs_captured: Option<bool>,
+    /// The remote stream's phase: submitting, queued, waiting on a retained job,
+    /// or running after execution evidence. Local and finished tasks omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<&'static str>,
     pub live_descendants: Option<Vec<LiveDescendant>>,
@@ -596,8 +600,8 @@ pub struct BgTaskSnapshot {
     /// runner has accepted it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_job_id: Option<String>,
-    /// Where a still-running remote task is on the build server: queued (and
-    /// for how long), or running with the runner's stop deadline.
+    /// Where a live remote task is: capturing inputs, queued (and for how long),
+    /// or running with the runner's stop deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_phase_note: Option<String>,
 }
@@ -921,6 +925,9 @@ pub(crate) struct BgTask {
     #[cfg(unix)]
     adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
     pub(crate) state: Mutex<BgTaskState>,
+    /// The remote worker has observed a stream record or settled a submission
+    /// failure. Kept in memory: launch callers need this only in this process.
+    pub(crate) remote_launch_ready: AtomicBool,
     /// Cache construction is serialized independently of task state: renderers
     /// can read artifacts and invoke callbacks without holding the state lock.
     terminal_render: Mutex<()>,
@@ -1992,6 +1999,32 @@ impl BgTaskRegistry {
         let task = self.task_for_session(task_id, session)?;
         let state = task.lock_state().ok()?;
         rendered_execution_note(&state.metadata)
+    }
+
+    /// `None` means this was not an explicit runon request. Local commands and
+    /// commands routed remotely by legacy configuration retain immediate launches.
+    pub(crate) fn runon_launch_pending(&self, task_id: &str, session: &str) -> Option<bool> {
+        let task = self.task_for_session(task_id, session)?;
+        let state = task.lock_state().ok()?;
+        state
+            .metadata
+            .remote
+            .as_ref()
+            .filter(|r| r.explicit_runon)?;
+        Some(!task.remote_launch_ready.load(Ordering::Acquire))
+    }
+
+    /// Only the remote stream's `Accepted` record proves the runner copied inputs;
+    /// the dispatch worker can also finish after an uncaptured refusal or error.
+    pub(crate) fn runon_inputs_captured(&self, task_id: &str, session: &str) -> Option<bool> {
+        let task = self.task_for_session(task_id, session)?;
+        let state = task.lock_state().ok()?;
+        let remote = state
+            .metadata
+            .remote
+            .as_ref()
+            .filter(|r| r.explicit_runon)?;
+        Some(remote.accepted)
     }
 
     pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
@@ -3404,6 +3437,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -3743,6 +3777,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -3987,6 +4022,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -7762,6 +7798,7 @@ impl BgTaskRegistry {
             kill_settled: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            remote_launch_ready: AtomicBool::new(false),
             terminal_render: Mutex::new(()),
             state: Mutex::new(BgTaskState {
                 temp_cleanup: None,
@@ -10755,6 +10792,11 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
     let hard_kill =
         HardKillDeadline::from_metadata(metadata.timeout_ms, metadata.default_hard_kill);
     let remote_refusal = remote::remote_refusal(&metadata);
+    let remote_inputs_captured = metadata
+        .remote
+        .as_ref()
+        .filter(|r| r.explicit_runon)
+        .map(|r| r.accepted);
     let remote_job_id = remote_job_id(&metadata);
     BgTaskSnapshot {
         info: BgTaskInfo {
@@ -10783,6 +10825,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
         remote_refusal,
+        remote_inputs_captured,
         phase: None,
         live_descendants: metadata.live_descendants.clone(),
         live_descendants_omitted: metadata.live_descendants_omitted,
@@ -10865,7 +10908,15 @@ impl BgTask {
         BgTaskSnapshot {
             info: BgTaskInfo {
                 task_id: self.task_id.clone(),
-                status: metadata.status.clone(),
+                status: if !metadata.is_terminal()
+                    && metadata.child_pid.is_none()
+                    && metadata.remote.as_ref().is_some_and(|r| {
+                        remote::RemotePhase::of(r) == remote::RemotePhase::Submitting
+                    }) {
+                    BgTaskStatus::Starting
+                } else {
+                    metadata.status.clone()
+                },
                 command: metadata.command.clone(),
                 mode: metadata.mode.clone(),
                 started_at: metadata.started_at,
@@ -10898,12 +10949,17 @@ impl BgTask {
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
             remote_refusal: remote::remote_refusal(metadata),
+            remote_inputs_captured: metadata
+                .remote
+                .as_ref()
+                .filter(|r| r.explicit_runon)
+                .map(|r| r.accepted),
             phase: metadata
                 .remote
                 .as_ref()
-                .filter(|remote| remote.started.is_some())
+                .filter(|_| metadata.child_pid.is_none())
                 .filter(|_| !metadata.is_terminal())
-                .map(|_| "running"),
+                .map(|remote| remote::RemotePhase::of(remote).tag()),
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
             live_descendants_summary: live_descendants_summary(metadata),
