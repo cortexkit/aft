@@ -825,6 +825,11 @@ fn fallback_target_walk_builder(
     crate::context::apply_project_ignore_rules(&mut builder, search_root)
         .parents(true)
         .filter_entry(move |entry| {
+            // Entries this filter drops never reach the walk's own loop, so
+            // count them as progress here; past the walk's deadline, skip them.
+            if !crate::bounded_io::walk_entry(entry.path()) {
+                return false;
+            }
             let file_type = entry.file_type();
             if crate::project_content::is_excluded_with_file_type(entry.path(), file_type.as_ref())
             {

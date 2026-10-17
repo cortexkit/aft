@@ -2490,6 +2490,11 @@ fn collect_outline_files_with_device_lookup<F>(
         let boundary_failed = Arc::clone(&boundary_failed);
         let boundary = *boundary;
         builder.filter_entry(move |entry| {
+            // Entries this filter drops never reach the walk's loop below, so
+            // count them as progress here.
+            if !crate::bounded_io::walk_entry(entry.path()) {
+                return false;
+            }
             if !crate::bash_background::registry::safe_task_entry(entry.path()) {
                 return false;
             }
@@ -2548,6 +2553,10 @@ fn collect_outline_files_with_device_lookup<F>(
         }
     }
     *skipped_foreign_mounts += skipped_mounts.load(Ordering::Relaxed);
+    // The filter above skips every entry once the walk's deadline passes.
+    if control.cut_short() {
+        *walk_truncated = true;
+    }
     if boundary_failed.load(Ordering::Relaxed) {
         *collection_truncated = true;
     }
@@ -2576,14 +2585,25 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             return entries_examined;
         }
         control.reached(&current);
-        let Ok(entries) = std::fs::read_dir(&current) else {
+        let Ok(reader) = std::fs::read_dir(&current) else {
             *collection_truncated = true;
             continue;
         };
         let remaining = ENTRY_BUDGET.saturating_sub(entries_examined);
-        let mut entries = entries
-            .take(remaining.saturating_add(1))
-            .collect::<Vec<_>>();
+        let mut reader = reader.take(remaining.saturating_add(1));
+        let mut entries = Vec::new();
+        loop {
+            // Every entry read is its own call; record each one so a large
+            // directory that keeps answering is slow, not stalled.
+            if control.entry(&current) {
+                *walk_truncated = true;
+                return entries_examined;
+            }
+            let Some(entry) = reader.next() else {
+                break;
+            };
+            entries.push(entry);
+        }
         entries_examined += entries.len();
         if entries.len() > remaining {
             entries.truncate(remaining);
@@ -2603,7 +2623,14 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         let mut child_directories = Vec::new();
         let mut child_files = Vec::new();
         for entry in entries {
-            if !crate::bash_background::registry::safe_task_entry(&entry.path()) {
+            let path = entry.path();
+            // The task-bundle check and the type check can each touch the
+            // filesystem; a stall here names this entry.
+            if control.entry(&path) {
+                *walk_truncated = true;
+                return entries_examined;
+            }
+            if !crate::bash_background::registry::safe_task_entry(&path) {
                 continue;
             }
             let Ok(file_type) = entry.file_type() else {
@@ -2614,9 +2641,9 @@ fn collect_outline_files_breadth_first_with_device_lookup(
                 continue;
             }
             if file_type.is_dir() {
-                child_directories.push(entry.path());
+                child_directories.push(path);
             } else if file_type.is_file() {
-                child_files.push(entry.path());
+                child_files.push(path);
             }
         }
 
@@ -4896,6 +4923,86 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
         let text = body.to_string();
         assert!(text.contains("pkg_"), "the walked part is outlined: {text}");
         assert!(!text.contains("read_blocked"), "{text}");
+    }
+
+    fn files_mode_request(root: &Path) -> (AppContext, RawRequest) {
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        );
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "files-mode-walk", "command": "outline", "directory": root, "files": true
+        }))
+        .expect("request");
+        (ctx, request)
+    }
+
+    /// Runs `request` with a 200 ms stall window inside a 20 s budget, so only
+    /// a stall, never the budget, can end the walk early.
+    fn outline_with_short_stall_window(ctx: &AppContext, request: &RawRequest) -> Response {
+        crate::bounded_io::with_single_access_budget(std::time::Duration::from_millis(200), || {
+            crate::bounded_io::with_budget(
+                Some(crate::bounded_io::Budget::after(
+                    std::time::Duration::from_secs(20),
+                )),
+                || handle_outline(request, ctx),
+            )
+        })
+    }
+
+    #[test]
+    fn slow_entries_of_one_large_directory_are_progress_not_a_stall() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        for index in 0..40 {
+            std::fs::write(root.join(format!("file_{index:02}.rs")), "pub fn f() {}\n")
+                .expect("write file");
+        }
+        // All in one directory: 40 entry reads and 40 type checks at 10 ms
+        // each is about 0.8 s without reaching a new directory, four times
+        // the stall window. Each call still returns, so this is not a stall.
+        let _slow =
+            crate::bounded_io::slow_walk_entries(&root, std::time::Duration::from_millis(10));
+        let (ctx, request) = files_mode_request(&root);
+        let response = outline_with_short_stall_window(&ctx, &request);
+        let body = &response.data;
+        assert!(response.success, "{body}");
+        assert_eq!(body["complete"], true, "{body}");
+        assert_eq!(body["files"].as_array().map(Vec::len), Some(40), "{body}");
+        assert!(!body.to_string().contains("read_blocked"), "{body}");
+    }
+
+    #[test]
+    fn hung_entry_check_is_read_blocked_naming_that_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            std::fs::write(root.join(name), "pub fn f() {}\n").expect("write file");
+        }
+        let hung = root.join("c.rs");
+        let mut stall = crate::bounded_io::stall_walk_entry(&hung);
+        let (ctx, request) = files_mode_request(&root);
+        let response = outline_with_short_stall_window(&ctx, &request);
+        let blocked = stall
+            .blocked
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the walk reached the hung entry");
+        stall.release();
+        assert_eq!(blocked, hung);
+        // No file was collected before the stall, so the reply is the error.
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "read_blocked", "{:?}", response.data);
+        let message = response.data["message"].as_str().unwrap_or_default();
+        assert!(
+            message.starts_with(&format!(
+                "read_blocked: {}: OS access did not finish within ",
+                hung.display()
+            )),
+            "{message}"
+        );
     }
 
     #[test]

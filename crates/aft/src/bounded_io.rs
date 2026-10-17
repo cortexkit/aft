@@ -670,6 +670,23 @@ impl WalkControl {
         #[cfg(test)]
         regression_tests::before_walk_access(path);
     }
+    /// Records one more entry of a directory the walk is reading or checking,
+    /// and names `path` as the call about to run. A large directory makes
+    /// many calls between `reached` updates (one per entry read, one per type
+    /// check); each returns promptly, but together they can outlast the stall
+    /// window. Counting each one as progress means only a single call that
+    /// does not return is reported as a stall. Returns true when the walk must
+    /// stop now, like `advance`.
+    pub(crate) fn entry(&self, path: &Path) -> bool {
+        let mut current = self.current.lock().unwrap_or_else(|e| e.into_inner());
+        current.clear();
+        current.push(path);
+        drop(current);
+        self.step();
+        #[cfg(test)]
+        regression_tests::before_walk_entry(path);
+        self.expired()
+    }
     /// True when a call inside the walk was refused at the walk's deadline.
     pub(crate) fn cut_short(&self) -> bool {
         self.cut.load(Ordering::Relaxed)
@@ -753,6 +770,32 @@ pub(crate) fn walk_reached(path: &Path) {
             walk.reached(path);
         }
     });
+}
+
+/// Inside a walk's helper, records that the walk examined one more entry,
+/// such as in a walker's entry filter, which also sees the entries the walk's
+/// own loop never receives. Without this, a directory of many filtered-out
+/// entries would look like one call making no progress. It does not rename
+/// the walk's current path: the filter runs between the walker's own calls.
+///
+/// Returns false once the walk's deadline has passed: the caller skips the
+/// entry, and the walk is marked cut short so it reports itself truncated.
+/// Outside a walk it does nothing and returns true.
+pub(crate) fn walk_entry(_path: &Path) -> bool {
+    WALK.with(|walk| {
+        let walk = walk.borrow();
+        let Some(walk) = walk.as_ref() else {
+            return true;
+        };
+        walk.step();
+        #[cfg(test)]
+        regression_tests::before_walk_entry(_path);
+        if walk.expired() {
+            walk.cut.store(true, Ordering::Relaxed);
+            return false;
+        }
+        true
+    })
 }
 
 /// Runs a whole directory walk on a helper thread.
@@ -1241,7 +1284,8 @@ mod regression_tests;
 pub(crate) use regression_tests::stall_helper;
 #[cfg(test)]
 pub(crate) use regression_tests::{
-    block_stat, slow_walk, stall_walk_at, with_single_access_budget,
+    block_stat, slow_walk, slow_walk_entries, stall_walk_at, stall_walk_entry,
+    with_single_access_budget,
 };
 #[cfg(all(test, unix))]
 pub(crate) fn stall_helper_if_requested(path: &Path) {

@@ -32,11 +32,15 @@ pub(crate) fn with_single_access_budget<T>(budget: Duration, work: impl FnOnce()
     work()
 }
 
-/// A test hook on the per-directory calls a walk makes under `roots`.
+/// A test hook on the per-directory calls a walk makes under `roots`, or with
+/// `entries`, on the per-entry calls inside one directory.
 struct WalkHook {
     roots: Vec<PathBuf>,
+    entries: bool,
     delay: Duration,
     block_at: Option<usize>,
+    /// For an entry hook: block the call for exactly this path (one of `roots`).
+    block_exact: bool,
     seen: AtomicUsize,
     blocked: Mutex<Option<Sender<PathBuf>>>,
     release: Mutex<Option<Receiver<()>>>,
@@ -68,7 +72,13 @@ impl Drop for WalkHookGuard {
     }
 }
 
-fn walk_hook(root: &Path, delay: Duration, block_at: Option<usize>) -> WalkHookGuard {
+fn walk_hook(
+    root: &Path,
+    entries: bool,
+    delay: Duration,
+    block_at: Option<usize>,
+    block_exact: bool,
+) -> WalkHookGuard {
     let mut roots = vec![root.to_path_buf()];
     if let Ok(canonical) = std::fs::canonicalize(root) {
         roots.push(canonical);
@@ -77,8 +87,10 @@ fn walk_hook(root: &Path, delay: Duration, block_at: Option<usize>) -> WalkHookG
     let (release, release_rx) = channel();
     let hook = Arc::new(WalkHook {
         roots,
+        entries,
         delay,
         block_at,
+        block_exact,
         seen: AtomicUsize::new(0),
         blocked: Mutex::new(Some(blocked_tx)),
         release: Mutex::new(Some(release_rx)),
@@ -94,27 +106,55 @@ fn walk_hook(root: &Path, delay: Duration, block_at: Option<usize>) -> WalkHookG
 /// Slows every per-directory call a walk makes under `root` by `delay`. The
 /// walk keeps making progress, so it is slow, not stalled.
 pub(crate) fn slow_walk(root: &Path, delay: Duration) -> WalkHookGuard {
-    walk_hook(root, delay, None)
+    walk_hook(root, false, delay, None, false)
+}
+
+/// Slows every per-entry call a walk makes under `root` by `delay`: each entry
+/// read, type check, or filter inside a directory. Each call returns, so the
+/// walk is slow, not stalled, however many entries one directory holds.
+pub(crate) fn slow_walk_entries(root: &Path, delay: Duration) -> WalkHookGuard {
+    walk_hook(root, true, delay, None, false)
+}
+
+/// Blocks the per-entry call a walk makes for exactly `path` until the guard
+/// is released or dropped: one entry whose check never returns.
+pub(crate) fn stall_walk_entry(path: &Path) -> WalkHookGuard {
+    walk_hook(path, true, Duration::ZERO, None, true)
 }
 
 /// Blocks the `access`th per-directory call a walk makes under `root` until
 /// the guard is released or dropped: one call that stops making progress.
 pub(crate) fn stall_walk_at(root: &Path, access: usize) -> WalkHookGuard {
-    walk_hook(root, Duration::ZERO, Some(access))
+    walk_hook(root, false, Duration::ZERO, Some(access), false)
 }
 
 pub(super) fn before_walk_access(path: &Path) {
+    run_walk_hook(path, false);
+}
+
+pub(super) fn before_walk_entry(path: &Path) {
+    run_walk_hook(path, true);
+}
+
+fn run_walk_hook(path: &Path, entries: bool) {
     let hook = WALK_HOOKS
         .lock()
         .unwrap()
         .iter()
-        .find(|hook| hook.roots.iter().any(|root| path.starts_with(root)))
+        .find(|hook| {
+            hook.entries == entries && hook.roots.iter().any(|root| path.starts_with(root))
+        })
         .cloned();
     let Some(hook) = hook else {
         return;
     };
     let seen = hook.seen.fetch_add(1, Ordering::Relaxed) + 1;
-    if hook.block_at == Some(seen) {
+    let block = if hook.block_exact {
+        hook.roots.iter().any(|root| path == root)
+    } else {
+        hook.block_at == Some(seen)
+    };
+    if block {
         if let Some(blocked) = hook.blocked.lock().unwrap().take() {
             let _ = blocked.send(path.to_path_buf());
         }

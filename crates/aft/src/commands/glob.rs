@@ -950,6 +950,34 @@ mod tests {
     }
 
     #[test]
+    fn many_filtered_entries_in_one_directory_are_progress_not_a_stall() {
+        let (_dir, ctx, registry) = registry_fixture(1);
+        let junk = registry.join("junk");
+        std::fs::create_dir(&junk).unwrap();
+        // macOS resource-fork companions: the walker's entry filter drops
+        // every one, so none of them reaches the walk's own loop.
+        for index in 0..40 {
+            std::fs::write(junk.join(format!("._resource_{index:02}")), "").unwrap();
+        }
+        // 40 entries at 15 ms each is 0.6 s inside one directory, three times
+        // the stall window, while every check returns.
+        let _slow = crate::bounded_io::slow_walk_entries(&junk, Duration::from_millis(15));
+        let request = glob_request(&registry, "**/lib.rs");
+        let response =
+            crate::bounded_io::with_single_access_budget(Duration::from_millis(200), || {
+                crate::bounded_io::with_budget(
+                    Some(crate::bounded_io::Budget::after(Duration::from_secs(20))),
+                    || handle_glob(&request, &ctx),
+                )
+            });
+        let body = &response.data;
+        assert!(response.success, "{body}");
+        assert_ne!(body["complete"], false, "{body}");
+        assert_eq!(body["files"].as_array().map(Vec::len), Some(1), "{body}");
+        assert!(!body.to_string().contains("read_blocked"), "{body}");
+    }
+
+    #[test]
     fn stalled_single_stat_is_read_blocked_with_hint_naming_its_path() {
         let (_dir, ctx, registry) = registry_fixture(1);
         let target = registry.join("crate-000");
