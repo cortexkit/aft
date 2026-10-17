@@ -46,6 +46,7 @@ mod config_parity_test;
 mod configure_test;
 mod conflicts_discovery_test;
 mod crash_diagnostics;
+mod created_file_syntax_test;
 mod cuda_test;
 mod db_migration_race_test;
 mod db_read_fallback_test;

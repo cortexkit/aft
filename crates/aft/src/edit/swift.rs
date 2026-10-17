@@ -70,6 +70,22 @@ pub(super) fn confirm_if_needed(
         return is_valid;
     }
 
+    confirm_with_compiler(path, source, is_valid)
+}
+
+/// Confirm a tree-sitter error in a Swift file that the current call created.
+///
+/// There is no original to compare against, so the compiler's verdict on the
+/// new content decides directly. When `swiftc` is unavailable or fails, the
+/// tree-sitter verdict stands.
+pub(super) fn confirm_created(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("swift") || is_valid != Some(false) {
+        return is_valid;
+    }
+    confirm_with_compiler(path, source, is_valid)
+}
+
+fn confirm_with_compiler(path: &Path, source: &str, is_valid: Option<bool>) -> Option<bool> {
     let outcome = parse(source);
     match outcome {
         ParseOutcome::Exited(Some(0)) => {
@@ -433,6 +449,46 @@ mod tests {
                     assert_eq!(calls.get(), 2);
                 },
             );
+        }
+    }
+
+    #[test]
+    fn swift_parser_created_file_uses_compiler_verdict() {
+        for (outcome, valid, line) in [
+            (ParseOutcome::Exited(Some(0)), Some(true), None),
+            (ParseOutcome::Exited(Some(1)), Some(false), Some(1)),
+            (ParseOutcome::Missing, Some(false), Some(1)),
+        ] {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let count = calls.clone();
+            let mut outcome = Some(outcome);
+            with_runner(
+                Box::new(move |source| {
+                    count.set(count.get() + 1);
+                    assert_eq!(source, TUPLE);
+                    outcome.take().expect("one compiler call per created file")
+                }),
+                || {
+                    let temp = tempfile::tempdir().unwrap();
+                    let path = temp.path().join("new.swift");
+                    assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
+                    let result = write_format_validate(
+                        &path,
+                        TUPLE,
+                        &Config {
+                            format_on_edit: false,
+                            ..Config::default()
+                        },
+                        &serde_json::json!({}),
+                    )
+                    .unwrap();
+                    assert!(!result.rolled_back);
+                    assert_eq!(result.syntax_valid, valid);
+                    assert_eq!(result.syntax_error_line, line);
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
+                },
+            );
+            assert_eq!(calls.get(), 1);
         }
     }
 

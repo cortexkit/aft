@@ -35,6 +35,8 @@ struct AppliedHunkResult {
     before: String,
     after: String,
     delete_lines: Option<usize>,
+    /// First parse-error line of a file this hunk created, when it does not parse.
+    syntax_error_line: Option<usize>,
 }
 
 struct DiffEntry {
@@ -46,6 +48,7 @@ struct DiffEntry {
     after: String,
     delete_lines: Option<usize>,
     hunk_count: usize,
+    syntax_error_line: Option<usize>,
 }
 
 fn path_string(path: &Path) -> String {
@@ -323,7 +326,7 @@ fn write_patched_file(
     op_id: &str,
     description: &str,
     backed_paths: &mut HashSet<PathBuf>,
-) -> Result<(String, bool), String> {
+) -> Result<PatchedFile, String> {
     let existed = path.exists();
     let original = if existed {
         Some(
@@ -374,7 +377,18 @@ fn write_patched_file(
     };
     ctx.lsp_notify_watched_config_file(path, change_type);
     write_result.lsp_outcome = ctx.lsp_post_write(path, &final_content, params);
-    Ok((final_content, snapshot_taken))
+    Ok(PatchedFile {
+        final_content,
+        snapshot_taken,
+        syntax_error_line: write_result.syntax_error_line,
+    })
+}
+
+struct PatchedFile {
+    final_content: String,
+    snapshot_taken: bool,
+    /// Set when the write created the file and the new file does not parse.
+    syntax_error_line: Option<usize>,
 }
 
 fn delete_file_with_backup(
@@ -562,6 +576,15 @@ fn add_failure(failures: &mut Vec<Value>, path: &str, error: String) {
     failures.push(json!({ "path": path, "error": error }));
 }
 
+/// Place the created-file syntax notice directly under the hunk's own
+/// "Created"/"Updated" line, because one patch can create several files and
+/// the notice itself does not name the file.
+fn push_created_syntax_error(output_lines: &mut Vec<String>, applied: &AppliedHunkResult) {
+    if let Some(line) = applied.syntax_error_line {
+        output_lines.push(edit::created_file_syntax_error_notice(line as u64));
+    }
+}
+
 fn failure_paths(failures: &[Value]) -> String {
     failures
         .iter()
@@ -587,7 +610,7 @@ fn apply_add(
     }
 
     let after = ensure_trailing_newline(contents);
-    let (final_content, _) = write_patched_file(
+    let written = write_patched_file(
         req,
         ctx,
         &resolved.source.abs,
@@ -603,8 +626,9 @@ fn apply_add(
         display_path: resolved.source.abs.clone(),
         move_path: None,
         before: String::new(),
-        after: final_content,
+        after: written.final_content,
         delete_lines: None,
+        syntax_error_line: written.syntax_error_line,
     })
 }
 
@@ -636,6 +660,7 @@ fn apply_delete(
         before,
         after: String::new(),
         delete_lines: Some(deletions),
+        syntax_error_line: None,
     })
 }
 
@@ -663,7 +688,7 @@ fn apply_update(
             backed_paths,
         )
     } else {
-        let (final_content, _) = write_patched_file(
+        let written = write_patched_file(
             req,
             ctx,
             &resolved.source.abs,
@@ -679,8 +704,9 @@ fn apply_update(
             display_path: resolved.source.abs.clone(),
             move_path: None,
             before: original,
-            after: final_content,
+            after: written.final_content,
             delete_lines: None,
+            syntax_error_line: written.syntax_error_line,
         })
     }
 }
@@ -705,7 +731,7 @@ fn apply_move_update(
         None
     };
 
-    let (final_content, dest_snapshot_taken) = match write_patched_file(
+    let written = match write_patched_file(
         req,
         ctx,
         &dest.abs,
@@ -722,6 +748,7 @@ fn apply_move_update(
             return Err(error);
         }
     };
+    let dest_snapshot_taken = written.snapshot_taken;
 
     let source_snapshot_taken = if backed_paths.contains(&resolved.source.abs) {
         false
@@ -766,8 +793,9 @@ fn apply_move_update(
         display_path: dest.abs.clone(),
         move_path: Some(dest.abs.clone()),
         before: original,
-        after: final_content,
+        after: written.final_content,
         delete_lines: None,
+        syntax_error_line: written.syntax_error_line,
     })
 }
 
@@ -819,6 +847,7 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
             entry.last_kind = applied_hunk.kind;
             entry.after = applied_hunk.after.clone();
             entry.hunk_count += 1;
+            entry.syntax_error_line = applied_hunk.syntax_error_line;
         } else {
             entries.push((
                 key,
@@ -831,6 +860,7 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
                     after: applied_hunk.after.clone(),
                     delete_lines: applied_hunk.delete_lines,
                     hunk_count: 1,
+                    syntax_error_line: applied_hunk.syntax_error_line,
                 },
             ));
         }
@@ -878,6 +908,9 @@ fn metadata_files(applied: &[AppliedHunkResult], root: Option<&Path>) -> (String
             if let Some(move_path) = entry.move_path {
                 value["movePath"] = json!(display_slash(&move_path));
             }
+            if let Some(line) = entry.syntax_error_line {
+                value[edit::CREATED_SYNTAX_ERROR_LINE_FIELD] = json!(line);
+            }
             value
         })
         .collect::<Vec<_>>();
@@ -914,6 +947,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     Ok(mut result) => {
                         result.index = index;
                         output_lines.push(format!("Created {path}"));
+                        push_created_syntax_error(&mut output_lines, &result);
                         applied.push(result);
                     }
                     Err(error) => {
@@ -947,6 +981,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     } else {
                         output_lines.push(format!("Updated {path}"));
                     }
+                    push_created_syntax_error(&mut output_lines, &result);
                     applied.push(result);
                 }
                 Err(error) => {
@@ -1062,6 +1097,7 @@ mod tests {
                 before: "original\n".into(),
                 after: after.into(),
                 delete_lines: None,
+                syntax_error_line: None,
             })
             .collect();
         edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));
