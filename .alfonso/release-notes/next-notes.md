@@ -19,6 +19,7 @@
 - edit: multi-item `edits[]` and line-range edits now work on existing files whose paths contain glob characters, such as Next.js `app/[id]/page.tsx`, instead of being refused as glob targets; real globs behave as before. Thanks for the report (#486).
 - aft_zoom: when the call graph store is momentarily busy, zoom now reports the call graph as building (retry shortly), as `aft_callgraph` does, instead of unavailable.
 - gh shim (manifest 19): `gh workflow disable` and `gh workflow enable` run under the operator bypass, like `run cancel`, and are refused as undeclared on older manifests.
+- Daemon CPU on macOS: formatters, checkers and git probes no longer fork the daemon (they start through posix_spawn), and the per-edit git root-commit probe is reused until the repository's git files change; forking a large multi-threaded daemon took every malloc lock and stalled allocation process-wide.
 
 ## Sandbox profiles
 
