@@ -75,7 +75,8 @@ fn read_with(
     if crate::db::file_identity::is_live_sqlite_handle(&metadata) {
         return Err(ReadExactRefusal::AccessDenied);
     }
-    // The opened file's real location is judged again.
+    // Where the open file really is, asked of the handle, must still be inside
+    // the checkout and allowed by the policy, like the requested path above.
     let opened = opened_location(&file).map_err(|_| ReadExactRefusal::IoError)?;
     let opened = crate::inspect::job::normalize_path(&opened);
     if !opened.starts_with(&bind_root)
