@@ -929,7 +929,8 @@ fn write_format_validate_impl(
     captured_original: Option<&str>,
 ) -> Result<WriteResult, AftError> {
     // A file this call creates has no prior content: it cannot be rolled back
-    // to anything, so an invalid result is reported instead (see below).
+    // to anything, so an invalid result is kept and reported through
+    // `syntax_error_line` instead.
     let existed = captured_original.is_some() || path.exists();
     let pre_write_content = if let Some(source) = captured_original {
         Some(std::borrow::Cow::Borrowed(source))

@@ -364,8 +364,8 @@ pub(crate) fn format_response_unbounded(
 
 /// The final reply line for an `edit`/`write` call that created a file which
 /// does not parse. The command handlers set `syntax_error_line` only for a
-/// file they created; `created` and `syntax_valid` are checked as well so an
-/// existing file (which is rolled back instead) can never get this line.
+/// file they created; `created` and `syntax_valid` are checked as well so a
+/// file that existed before the call can never get this line.
 fn created_file_syntax_error_line(data: &Value) -> Option<String> {
     if data.get("created").and_then(Value::as_bool) != Some(true)
         || data.get("syntax_valid").and_then(Value::as_bool) != Some(false)
