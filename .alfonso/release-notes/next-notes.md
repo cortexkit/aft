@@ -18,6 +18,7 @@
 - Semantic search: when Synapse announces a timed embedding-model pause (`lane_paused`), indexing waits it out and resumes where it stopped instead of failing or re-embedding finished work, without holding build slots or locks. Searches meanwhile use keyword search with "Semantic search unavailable: the embedding model is paused; using keyword search only.", and health shows the semantic index as paused until the announced time.
 - edit: multi-item `edits[]` and line-range edits now work on existing files whose paths contain glob characters, such as Next.js `app/[id]/page.tsx`, instead of being refused as glob targets; real globs behave as before. Thanks for the report (#486).
 - gh shim (manifest 19): `gh workflow disable` and `gh workflow enable` run under the operator bypass, like `run cancel`, and are refused as undeclared on older manifests.
+- Storage on several volumes: legacy folder moves, state-file repair and filter-folder repair fall back to copying (or keep the original and say so) when a storage folder sits on another volume, retention retires a cache folder that is itself a mount point by emptying it on its own volume, and the storage migration checks free space on each destination volume.
 
 ## Sandbox profiles
 

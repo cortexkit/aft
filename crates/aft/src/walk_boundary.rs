@@ -133,16 +133,97 @@ pub(crate) fn same_filesystem_device(root_device: u64, child_device: u64) -> boo
 pub(crate) fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
     use std::os::unix::fs::MetadataExt;
 
-    Ok(Some(std::fs::metadata(path)?.dev()))
+    let metadata = std::fs::metadata(path)?;
+    #[cfg(test)]
+    if let Some(device) = simulated_volumes::device_of(path) {
+        return Ok(Some(device));
+    }
+    Ok(Some(metadata.dev()))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn filesystem_device_id(_path: &Path) -> io::Result<Option<u64>> {
+pub(crate) fn filesystem_device_id(path: &Path) -> io::Result<Option<u64>> {
     // Standard metadata on non-Unix platforms has file attributes but no
     // reliable volume identifier, so this raw-directory-walk check is a no-op.
     // Recursive walks using `ignore::WalkBuilder` still enforce their own
     // cross-filesystem restriction.
+    #[cfg(test)]
+    {
+        std::fs::metadata(path)?;
+        if let Some(device) = simulated_volumes::device_of(path) {
+            return Ok(Some(device));
+        }
+    }
+    let _ = path;
     Ok(None)
+}
+
+/// Test seam that makes chosen folders look like separate volumes.
+///
+/// CI has no second filesystem to mount, so tests register a folder with a
+/// made-up device number. `filesystem_device_id` then reports that number for
+/// the folder and everything under it, and `crate::cross_volume::rename`
+/// refuses a move between two different simulated devices with the same
+/// cross-device error the kernel returns. Registrations are keyed by path, so
+/// tests running in parallel in their own temporary folders do not see each
+/// other's volumes.
+#[cfg(test)]
+pub(crate) mod simulated_volumes {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn registry() -> &'static Mutex<Vec<(PathBuf, u64)>> {
+        static VOLUMES: OnceLock<Mutex<Vec<(PathBuf, u64)>>> = OnceLock::new();
+        VOLUMES.get_or_init(Default::default)
+    }
+
+    /// Removes its registration when dropped.
+    #[must_use]
+    pub(crate) struct SimulatedVolume {
+        paths: Vec<PathBuf>,
+    }
+
+    impl Drop for SimulatedVolume {
+        fn drop(&mut self) {
+            registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(path, _)| !self.paths.contains(path));
+        }
+    }
+
+    /// Report `path` and everything below it as device `device`.
+    pub(crate) fn simulate(path: &Path, device: u64) -> SimulatedVolume {
+        let mut paths = vec![path.to_path_buf()];
+        // Register the resolved spelling too (macOS /var is /private/var), so
+        // a caller that canonicalized the path still matches.
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            if canonical != path {
+                paths.push(canonical);
+            }
+        }
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(paths.iter().map(|path| (path.clone(), device)));
+        SimulatedVolume { paths }
+    }
+
+    /// The simulated device of the innermost registered folder containing
+    /// `path`, or `None` when no registered folder contains it.
+    pub(crate) fn device_of(path: &Path) -> Option<u64> {
+        let volumes = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if volumes.is_empty() {
+            return None;
+        }
+        volumes
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, device)| *device)
+    }
 }
 
 #[cfg(test)]

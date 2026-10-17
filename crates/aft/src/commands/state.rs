@@ -320,12 +320,32 @@ fn repair_root_scoped_harness_file(
     }
 
     if let Some(parent) = harness_path.parent() {
-        if crate::private_storage::create_dir_all(parent).is_err() {
-            return harness_path;
+        if let Err(error) = crate::private_storage::create_dir_all(parent) {
+            crate::slog_warn!(
+                "keeping {} at the storage root: cannot create {}: {}",
+                root_path.display(),
+                parent.display(),
+                error
+            );
+            return root_path;
         }
     }
-    let _ = fs::rename(root_path, &harness_path);
-    harness_path
+    // The harness folder and the root normally share a volume, but a move
+    // that crosses volumes falls back to a copy instead of failing. If the
+    // move still fails, keep using the root file rather than pointing at a
+    // harness path that holds nothing.
+    match crate::cross_volume::move_path(&root_path, &harness_path) {
+        Ok(_) => harness_path,
+        Err(error) => {
+            crate::slog_warn!(
+                "keeping {} at the storage root: cannot move it to {}: {}",
+                root_path.display(),
+                harness_path.display(),
+                error
+            );
+            root_path
+        }
+    }
 }
 
 fn legacy_host_path(ctx: &AppContext, key: &str) -> Option<PathBuf> {
@@ -450,5 +470,27 @@ mod tests {
         assert!(set_response.success);
         let path = temp.path().join("trusted-filter-projects.json");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[]");
+    }
+
+    #[test]
+    fn root_state_file_moves_into_a_harness_folder_on_another_volume() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = test_context();
+        ctx.update_config(|config| {
+            config.storage_dir = Some(temp.path().to_path_buf());
+        });
+        std::fs::write(temp.path().join("last_announced_version"), "0.40.0").unwrap();
+        let harness_dir = temp.path().join("opencode");
+        std::fs::create_dir_all(&harness_dir).unwrap();
+        // Every rename from the root into the harness folder now fails with EXDEV.
+        let _volume =
+            crate::walk_boundary::simulated_volumes::simulate(&harness_dir, u64::MAX - 22);
+
+        let path = legacy_harness_path(&ctx, Harness::Opencode, "last_announced_version")
+            .expect("known key");
+
+        assert_eq!(path, harness_dir.join("last_announced_version"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "0.40.0");
+        assert!(!temp.path().join("last_announced_version").exists());
     }
 }
