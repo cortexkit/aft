@@ -107,6 +107,11 @@ pub(crate) struct RootMemoryRollup {
     /// rollup instead of creating a separate standing-memory table.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) standing: Option<bool>,
+    /// How long ago the index walks behind this row were made, when the
+    /// health rollup reused an earlier walk (0 for a walk made now). Unset
+    /// outside the health rollup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) measured_age_ms: Option<u64>,
 }
 
 impl RootMemoryRollup {
@@ -129,7 +134,14 @@ impl RootMemoryRollup {
             busy_subsystems,
             not_estimated_subsystems,
             standing: None,
+            measured_age_ms: None,
         }
+    }
+
+    /// Record how old the index walks behind this row are.
+    pub(crate) fn with_measured_age_ms(mut self, age_ms: u64) -> Self {
+        self.measured_age_ms = Some(age_ms);
+        self
     }
 
     /// Attribute this existing per-root rollup to a configured standing entry.

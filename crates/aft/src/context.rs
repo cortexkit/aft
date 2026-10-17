@@ -997,6 +997,28 @@ struct ConfigureWarmState {
 /// look unchanged. A bound on how late a missed change can show.
 const PATH_STATUS_REREAD_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long the health rollup reuses a root's index memory walk while the
+/// indexes' shape counters stay the same. A bound on how late an in-place
+/// change that leaves every counter alone can show.
+const HEALTH_MEMORY_REUSE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The three per-entry index walks of a memory estimate (semantic, trigram,
+/// symbols), with the shape counters read just before them.
+#[derive(Clone, Debug)]
+struct WalkedMemory {
+    shape: Option<MemoryShape>,
+    measured_at: Instant,
+    /// The semantic walk before the live worker bytes are added.
+    semantic: crate::memory::MemoryEstimate,
+    trigram: crate::memory::MemoryEstimate,
+    symbols: crate::memory::MemoryEstimate,
+}
+
+/// Counters of the semantic index, trigram index and symbol cache that move
+/// when their memory walks would most likely change (see each type's
+/// `memory_shape`). A missing index counts as its own shape.
+type MemoryShape = (Option<[u64; 9]>, Option<[u64; 11]>, [u64; 3]);
+
 /// Length and modification time of a view's derived database and of its
 /// write-ahead log, `None` for a file that does not exist.
 type PathStatusFiles = [Option<(u64, Option<std::time::SystemTime>)>; 2];
@@ -3499,6 +3521,10 @@ pub struct AppContext {
     /// rollup reopens the database only after it changed (see
     /// `view_path_status_summary`).
     view_path_status_cache: parking_lot::Mutex<Option<PathStatusCache>>,
+    /// The last index memory walk the health rollup made for this root, so a
+    /// rollup can reuse it while the indexes keep their shape (see
+    /// `health_memory_root_snapshot_and_rollup`).
+    health_memory_walk: parking_lot::Mutex<Option<WalkedMemory>>,
     /// At most one diagnostics collector may outlive its caller's budget.
     /// Later edits queue their latest disk contents instead of growing a pool
     /// of threads waiting on a slow handshake or the same manager mutex.
@@ -4234,6 +4260,7 @@ impl AppContext {
             project_applicability_epoch: Arc::new(AtomicU64::new(0)),
             project_applicability_progress: Arc::default(),
             view_path_status_cache: parking_lot::Mutex::new(None),
+            health_memory_walk: parking_lot::Mutex::new(None),
             lsp_post_edit_worker_running: Arc::new(AtomicBool::new(false)),
             lsp_watcher_forward_slot: Default::default(),
             lsp_watcher_forward_helpers_spawned: AtomicUsize::new(0),
@@ -12598,9 +12625,34 @@ impl AppContext {
     }
 
     fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 10] {
+        self.memory_estimates_from(self.walk_index_memory(None))
+    }
+
+    /// The shape counters of this root's semantic index, trigram index and
+    /// symbol cache, or `None` when any of them is locked (its estimate would
+    /// then be `busy`, which is never reused).
+    fn memory_shape(&self) -> Option<MemoryShape> {
+        let semantic = self
+            .semantic_index
+            .try_read()
+            .ok()?
+            .as_ref()
+            .map(SemanticIndex::memory_shape);
+        let trigram = match self.search_index.try_read().ok()?.as_ref() {
+            Some(index) => Some(index.memory_shape()?),
+            None => None,
+        };
+        let symbols = self.symbol_cache.try_read().ok()?.memory_shape();
+        Some((semantic, trigram, symbols))
+    }
+
+    /// Walk every entry of the semantic index, trigram index and symbol cache
+    /// for their memory estimates. These are the costly parts of an estimate.
+    fn walk_index_memory(&self, shape: Option<MemoryShape>) -> WalkedMemory {
         #[cfg(test)]
         MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
-        let mut semantic = match self.semantic_index.try_read() {
+        let measured_at = Instant::now();
+        let semantic = match self.semantic_index.try_read() {
             Ok(index) => index
                 .as_ref()
                 .map(SemanticIndex::estimated_memory)
@@ -12612,23 +12664,6 @@ impl AppContext {
                 .unwrap_or_else(|| crate::memory::MemoryEstimate::estimated(0).count("entries", 0)),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
         };
-        let worker_bytes = self.semantic_worker_bytes.load(Ordering::Relaxed);
-        if let Some(serving_bytes) = semantic.estimated_bytes {
-            semantic
-                .counts
-                .insert("serving_index_bytes".into(), serving_bytes);
-            semantic.estimated_bytes = Some(serving_bytes.saturating_add(worker_bytes));
-        } else {
-            // A busy serving index must not hide the independently observed worker.
-            semantic.estimated_bytes = Some(worker_bytes);
-            semantic.bytes_status = "partial";
-            semantic
-                .not_estimated
-                .push("serving_semantic_index_busy".into());
-        }
-        semantic
-            .counts
-            .insert("worker_index_bytes".into(), worker_bytes);
         let trigram = match self.search_index.try_read() {
             Ok(index) => index
                 .as_ref()
@@ -12646,6 +12681,41 @@ impl AppContext {
             Err(TryLockError::Poisoned(error)) => error.into_inner().estimated_memory(),
             Err(TryLockError::WouldBlock) => crate::memory::MemoryEstimate::busy(),
         };
+        WalkedMemory {
+            shape,
+            measured_at,
+            semantic,
+            trigram,
+            symbols,
+        }
+    }
+
+    /// A full memory estimate from index walks (fresh or reused) plus the
+    /// cheap subsystem estimates, which are always taken now.
+    fn memory_estimates_from(&self, walked: WalkedMemory) -> [crate::memory::MemoryEstimate; 10] {
+        let WalkedMemory {
+            mut semantic,
+            trigram,
+            symbols,
+            ..
+        } = walked;
+        let worker_bytes = self.semantic_worker_bytes.load(Ordering::Relaxed);
+        if let Some(serving_bytes) = semantic.estimated_bytes {
+            semantic
+                .counts
+                .insert("serving_index_bytes".into(), serving_bytes);
+            semantic.estimated_bytes = Some(serving_bytes.saturating_add(worker_bytes));
+        } else {
+            // A busy serving index must not hide the independently observed worker.
+            semantic.estimated_bytes = Some(worker_bytes);
+            semantic.bytes_status = "partial";
+            semantic
+                .not_estimated
+                .push("serving_semantic_index_busy".into());
+        }
+        semantic
+            .counts
+            .insert("worker_index_bytes".into(), worker_bytes);
         let callgraph = match self.callgraph_store.try_read() {
             Ok(store) => store
                 .as_ref()
@@ -12806,17 +12876,47 @@ impl AppContext {
     }
 
     /// Both [`Self::memory_root_snapshot`] and the health rollup's
-    /// pre-aggregated root memory from one estimate. Each estimate walks every entry of the root's
-    /// resident indexes, so the health rollup, which needs both every few
-    /// seconds for every root, takes them from one walk instead of two.
+    /// pre-aggregated root memory from one estimate, for the health rollup.
+    ///
+    /// The index walks inside an estimate visit every entry of the root's
+    /// resident indexes, and the rollup asks for every root every few seconds.
+    /// So the last walk is reused while the indexes' shape counters stay the
+    /// same, for at most [`HEALTH_MEMORY_REUSE_INTERVAL`]; the cheap
+    /// subsystem estimates are always taken now. The rollup's
+    /// `measured_age_ms` says how old the walked figures are.
     pub(crate) fn memory_root_snapshot_and_rollup(
         &self,
     ) -> (
         crate::memory::RootMemorySnapshot,
         crate::memory::RootMemoryRollup,
     ) {
-        let estimates = self.memory_estimates();
-        let rollup = Self::memory_root_rollup_from(&estimates);
+        let shape = self.memory_shape();
+        let cached = self.health_memory_walk.lock().clone();
+        let walked = match cached {
+            Some(cached)
+                if shape.is_some()
+                    && cached.shape == shape
+                    && cached.measured_at.elapsed() < HEALTH_MEMORY_REUSE_INTERVAL =>
+            {
+                cached
+            }
+            _ => {
+                let walked = self.walk_index_memory(shape);
+                // A walk that found an index locked is never reused, so the
+                // next rollup tries again rather than serving `busy` for 30 s.
+                let reusable = shape.is_some()
+                    && [&walked.semantic, &walked.trigram, &walked.symbols]
+                        .iter()
+                        .all(|estimate| estimate.status != "busy");
+                *self.health_memory_walk.lock() = reusable.then(|| walked.clone());
+                walked
+            }
+        };
+        let measured_age_ms =
+            u64::try_from(walked.measured_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let estimates = self.memory_estimates_from(walked);
+        let rollup =
+            Self::memory_root_rollup_from(&estimates).with_measured_age_ms(measured_age_ms);
         (Self::memory_root_snapshot_from(estimates), rollup)
     }
 
