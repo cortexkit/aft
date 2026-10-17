@@ -3889,6 +3889,7 @@ mod route_tests {
             false,
             1024 * 1024,
             &drain::ModuleDrainWindow::default(),
+            None,
         )
         .await
         .unwrap();

@@ -624,6 +624,36 @@ fn refresh_sidecar_identities() {
     }
 }
 
+/// Whether an already-open file is a live SQLite database or sidecar, judged
+/// by the handle's own identity (`metadata` must come from the open handle):
+/// its device and inode, plus its birth time where the filesystem records
+/// one, exactly as the registry keys live files. Unlike the path checks above
+/// there is no link-count shortcut: by the time a file is open, the names
+/// that made it look innocent may already be gone. Birth time keeps a
+/// recycled inode of an unlinked sidecar from refusing an unrelated file.
+///
+/// Always false where the registry records no file identities (Windows),
+/// whose SQLite locks are not released by closing another handle.
+pub(crate) fn is_live_sqlite_handle(metadata: &std::fs::Metadata) -> bool {
+    let Some(identity) = LiveFileIdentity::from_metadata(metadata) else {
+        return false;
+    };
+    let known = || {
+        live_files()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .identities
+            .contains_key(&identity)
+    };
+    if known() {
+        return true;
+    }
+    // Sidecars created after their database opened are learned only here.
+    #[cfg(unix)]
+    refresh_sidecar_identities();
+    known()
+}
+
 /// Called under the filesystem gate before unlinking a whole cache directory.
 /// Consult the registry, not a pre-gate directory inventory: another opener may
 /// have created a new database after that inventory was collected.
